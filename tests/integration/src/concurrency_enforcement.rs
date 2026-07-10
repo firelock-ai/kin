@@ -12,6 +12,7 @@
 
 use std::path::PathBuf;
 
+use kin_daemon::session_registry::IntentRegistrationResult;
 use kin_daemon::traffic_adapter::CoordinatorTrafficChecker;
 use kin_daemon::SessionCoordinator;
 use kin_model::session::{IntentScope, LockType, SessionCapabilities, SessionTransport};
@@ -20,6 +21,13 @@ use kin_reconcile::collision::{CollisionCheck, TrafficChecker};
 use kin_reconcile::{ReconcileError, Reconciler};
 
 use crate::helpers::{init_kin_repo, make_entity};
+
+fn writable_capabilities() -> SessionCapabilities {
+    SessionCapabilities {
+        can_write: true,
+        ..SessionCapabilities::default()
+    }
+}
 
 // -----------------------------------------------------------------------
 // 1. CoordinatorTrafficChecker blocks hard-locked scope
@@ -37,7 +45,7 @@ fn coordinator_checker_blocks_hard_locked_scope() {
             SessionTransport::Mcp,
             None,
             PathBuf::from("/project"),
-            SessionCapabilities::default(),
+            writable_capabilities(),
         )
         .unwrap();
 
@@ -55,7 +63,7 @@ fn coordinator_checker_blocks_hard_locked_scope() {
     let entity_id = EntityId::new();
 
     // Session 1 takes a hard lock on the entity.
-    coord
+    let registration = coord
         .register_intent(
             &s1,
             vec![IntentScope::Entity(entity_id)],
@@ -64,6 +72,10 @@ fn coordinator_checker_blocks_hard_locked_scope() {
             None,
         )
         .unwrap();
+    assert!(matches!(
+        registration,
+        IntentRegistrationResult::Registered { .. }
+    ));
 
     // Session 2 tries to check traffic on the same scope.
     let checker = CoordinatorTrafficChecker::new(graph.clone());
@@ -99,7 +111,7 @@ fn coordinator_checker_allows_disjoint_scopes() {
             SessionTransport::Mcp,
             None,
             PathBuf::from("/project"),
-            SessionCapabilities::default(),
+            writable_capabilities(),
         )
         .unwrap();
 
@@ -107,7 +119,7 @@ fn coordinator_checker_allows_disjoint_scopes() {
     let entity_b = EntityId::new();
 
     // Session 1 hard-locks entity A.
-    coord
+    let registration = coord
         .register_intent(
             &s1,
             vec![IntentScope::Entity(entity_a)],
@@ -116,6 +128,10 @@ fn coordinator_checker_allows_disjoint_scopes() {
             None,
         )
         .unwrap();
+    assert!(matches!(
+        registration,
+        IntentRegistrationResult::Registered { .. }
+    ));
 
     // Check traffic on entity B — should be clear.
     let checker = CoordinatorTrafficChecker::new(graph.clone());
@@ -147,14 +163,14 @@ fn coordinator_checker_allows_own_session() {
             SessionTransport::Mcp,
             None,
             PathBuf::from("/project"),
-            SessionCapabilities::default(),
+            writable_capabilities(),
         )
         .unwrap();
 
     let entity_id = EntityId::new();
 
     // Session 1 hard-locks the entity.
-    coord
+    let registration = coord
         .register_intent(
             &s1,
             vec![IntentScope::Entity(entity_id)],
@@ -163,6 +179,10 @@ fn coordinator_checker_allows_own_session() {
             None,
         )
         .unwrap();
+    assert!(matches!(
+        registration,
+        IntentRegistrationResult::Registered { .. }
+    ));
 
     // Session 1 checks traffic on the same entity — should NOT be blocked.
     let checker = CoordinatorTrafficChecker::new(graph.clone());
@@ -200,7 +220,7 @@ fn coordinator_checker_warns_on_soft_lease() {
     let entity_id = EntityId::new();
 
     // Session 1 takes a soft lock on the entity.
-    coord
+    let registration = coord
         .register_intent(
             &s1,
             vec![IntentScope::Entity(entity_id)],
@@ -209,6 +229,10 @@ fn coordinator_checker_warns_on_soft_lease() {
             None,
         )
         .unwrap();
+    assert!(matches!(
+        registration,
+        IntentRegistrationResult::Registered { .. }
+    ));
 
     // Another session checks traffic — should get warnings, not blocked.
     let checker = CoordinatorTrafficChecker::new(graph.clone());
@@ -243,7 +267,7 @@ fn reconciler_with_coordinator_checker_blocks_hard_lock() {
             SessionTransport::Mcp,
             None,
             PathBuf::from("/project"),
-            SessionCapabilities::default(),
+            writable_capabilities(),
         )
         .unwrap();
 
@@ -251,7 +275,7 @@ fn reconciler_with_coordinator_checker_blocks_hard_lock() {
     let entity_id = entity.id;
 
     // Session 1 hard-locks the entity.
-    coord
+    let registration = coord
         .register_intent(
             &s1,
             vec![IntentScope::Entity(entity_id)],
@@ -260,6 +284,10 @@ fn reconciler_with_coordinator_checker_blocks_hard_lock() {
             None,
         )
         .unwrap();
+    assert!(matches!(
+        registration,
+        IntentRegistrationResult::Registered { .. }
+    ));
 
     // Set up reconciler with the coordinator-backed traffic checker.
     let checker = CoordinatorTrafficChecker::new(graph.clone());
