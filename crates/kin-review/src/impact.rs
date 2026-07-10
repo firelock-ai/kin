@@ -431,9 +431,11 @@ pub fn analyze_impact_at<I: ImpactGraph>(
                 // consumer edge. A single caller can invoke the same target many
                 // times, so relation evidence is a per-site set rather than a
                 // scalar. A rename is only provably safe when every counted
-                // consumer is a call and every occurrence carries shape evidence;
-                // a non-call edge, an older empty edge, or an explicit unshaped
-                // occurrence leaves it unprovable.
+                // consumer is a call and every occurrence carries shape evidence
+                // stamped by the complete-occurrence aggregator. A non-call edge,
+                // an older empty edge, an explicit unshaped occurrence, or legacy
+                // first-occurrence evidence without the marker leaves it
+                // unprovable.
                 if rel.kind == RelationKind::Calls {
                     if rel.evidence.is_empty() {
                         ent_all_consumers_shaped_calls = false;
@@ -441,6 +443,11 @@ pub fn analyze_impact_at<I: ImpactGraph>(
                     for evidence in &rel.evidence {
                         match evidence.call_shape.as_ref() {
                             Some(shape) => {
+                                if evidence.parser_rule.as_deref()
+                                    != Some(kin_index::CALL_SHAPE_EVIDENCE_AGGREGATION_V1)
+                                {
+                                    ent_all_consumers_shaped_calls = false;
+                                }
                                 for keyword in &shape.keywords {
                                     ent_caller_keyword_names.insert(keyword.clone());
                                 }
@@ -1020,6 +1027,9 @@ mod tests {
             evidence: shapes
                 .into_iter()
                 .map(|call_shape| RelationEvidence {
+                    parser_rule: call_shape
+                        .as_ref()
+                        .map(|_| kin_index::CALL_SHAPE_EVIDENCE_AGGREGATION_V1.to_string()),
                     call_shape,
                     ..RelationEvidence::default()
                 })
@@ -1150,6 +1160,31 @@ mod tests {
         assert!(
             !summary.all_consumers_shaped_calls,
             "one unshaped occurrence makes the entire rename proof incomplete"
+        );
+    }
+
+    #[test]
+    fn harvest_fails_closed_when_shape_lacks_complete_aggregation_marker() {
+        let target = target_entity(RENAME_NEW);
+        let caller = entity_in_file("caller", "src/caller.py", 1);
+        let mut legacy =
+            calls_with_shape(&caller, &target, CallArgShape::new(2, vec![], false, false));
+        legacy.evidence[0].parser_rule = None;
+
+        let mut graph = MockImpactGraph::default();
+        graph.entities.insert(target.id, target.clone());
+        graph.entities.insert(caller.id, caller);
+        graph.inbound.insert(target.id, vec![legacy]);
+        let diff = SemanticDiff {
+            entity_changes: vec![modified(&target)],
+            ..Default::default()
+        };
+        let report = analyze_impact_at(&graph, &diff).unwrap();
+        let summary = &report.entity_impact(&target.id).unwrap().call_shapes;
+
+        assert!(
+            !summary.all_consumers_shaped_calls,
+            "a v0.2.15 shaped record without the aggregation marker is incomplete proof"
         );
     }
 

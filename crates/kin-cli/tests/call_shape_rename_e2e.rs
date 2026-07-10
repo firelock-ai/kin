@@ -22,7 +22,7 @@
 //! re-blocked the positional-safe rename with no test to catch it.
 
 use kin_db::{EntityStore, InMemoryGraph};
-use kin_index::{link_cross_file, FileParseData};
+use kin_index::{link_cross_file, FileParseData, CALL_SHAPE_EVIDENCE_AGGREGATION_V1};
 use kin_model::review::{RiskLevel, RiskSummary};
 use kin_model::{Entity, FilePathId, GraphNodeId, ParseState, RelationKind};
 use kin_parser::{LanguageAdapter, PythonAdapter};
@@ -395,6 +395,24 @@ def caller_two():
     return target(2, "explicit")
 "#;
 
+const PARSED_SYNC_RENAME: &str = "\
+def target(ext, args):
+    return ext, args
+
+
+def caller():
+    return target(1, 2)
+";
+
+const PARSED_ASYNC_RENAME: &str = "\
+async def target(ext, lines):
+    return ext, lines
+
+
+def caller():
+    return target(1, 2)
+";
+
 const LATIN1_DEFAULT_CHANGE_OLD: &[u8] = b"# coding: latin-1\ndef target(ext, args=\"x  \xff y\"):\n    return ext, args\n\n\ndef caller_one():\n    return target(1)\n\n\ndef caller_two():\n    return target(2, \"explicit\")\n";
 
 const LATIN1_DEFAULT_WHITESPACE_CHANGE_NEW: &[u8] = b"# coding: latin-1\ndef target(ext, lines=\"x \xff y\"):\n    return ext, lines\n\n\ndef caller_one():\n    return target(1)\n\n\ndef caller_two():\n    return target(2, \"explicit\")\n";
@@ -619,6 +637,9 @@ fn e2e_same_caller_all_positional_shapes_remain_neutral_and_deterministic() {
         "occurrence counts retain every call site"
     );
     assert!(forward_evidence.iter().all(|evidence| {
+        evidence.parser_rule.as_deref() == Some(CALL_SHAPE_EVIDENCE_AGGREGATION_V1)
+    }));
+    assert!(forward_evidence.iter().all(|evidence| {
         evidence
             .call_shape
             .as_ref()
@@ -637,6 +658,90 @@ fn e2e_same_caller_all_positional_shapes_remain_neutral_and_deterministic() {
                 .as_ref()
                 .is_some_and(|shape| shape.positional == 2 && !shape.has_var_positional)
     }));
+}
+
+#[test]
+fn e2e_legacy_serialized_single_shape_evidence_stays_blocking() {
+    let files = vec![parse_python("mod.py", SAME_CALLER_POSITIONAL_THEN_KEYWORD)];
+    let target = find_entity(&files, "target");
+    let relations = link_cross_file(&files);
+    let mut legacy_edge = relations
+        .iter()
+        .find(|relation| {
+            relation.kind == RelationKind::Calls && relation.dst == GraphNodeId::Entity(target.id)
+        })
+        .expect("fresh logical caller-target edge")
+        .clone();
+    let first_positional = legacy_edge
+        .evidence
+        .iter()
+        .find(|evidence| {
+            evidence.call_shape.as_ref().is_some_and(|shape| {
+                shape.positional == 2 && shape.keywords.is_empty() && !shape.has_var_keyword
+            })
+        })
+        .expect("positional occurrence")
+        .clone();
+    legacy_edge.evidence = vec![first_positional];
+
+    // v0.2.15 stored this shaped first occurrence without any completeness
+    // provenance. Round-trip the edge with that field absent to exercise the
+    // same backward-compatible serde path an upgraded graph takes.
+    let mut serialized = serde_json::to_value(&legacy_edge).expect("serialize relation");
+    let records = serialized
+        .get_mut("evidence")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("serialized evidence array");
+    records[0]
+        .as_object_mut()
+        .expect("serialized evidence record")
+        .remove("parser_rule");
+    let legacy_edge: kin_model::Relation =
+        serde_json::from_value(serialized).expect("deserialize legacy relation");
+    assert!(legacy_edge.evidence[0].call_shape.is_some());
+    assert!(legacy_edge.evidence[0].parser_rule.is_none());
+
+    let graph = InMemoryGraph::new();
+    for entity in files.iter().flat_map(|file| file.entities.iter()) {
+        graph.upsert_entity(entity).expect("upsert entity");
+    }
+    graph
+        .upsert_relation(&legacy_edge)
+        .expect("upsert legacy relation");
+    let diff = rename_diff(&files, "def target(ext, args)", "def target(ext, lines)");
+    let impact = analyze_impact(&graph, &diff).expect("analyze legacy impact");
+    assert!(
+        !impact
+            .entity_impact(&target.id)
+            .expect("target impact")
+            .call_shapes
+            .all_consumers_shaped_calls,
+        "legacy first-occurrence evidence is shaped but not complete"
+    );
+    let inline_comments = collect_inline_comments(&diff, &impact);
+    assert!(inline_comments
+        .iter()
+        .any(|comment| comment.kind == InlineCommentKind::Breaking));
+    let review = Review {
+        base: None,
+        head: None,
+        diff,
+        impact,
+        risk: RiskSummary {
+            overall_risk: RiskLevel::Low,
+            breaking_changes: vec![],
+            test_coverage_gaps: vec![],
+            contract_violations: vec![],
+            work_risks: vec![],
+            notes: vec![],
+        },
+        inline_comments,
+    };
+    assert_eq!(
+        derive_shadow_policy(&review, &[], &[]).verdict,
+        ShadowGateVerdict::WouldBlock,
+        "an upgraded v0.2.15 edge must fail closed until it is re-linked"
+    );
 }
 
 #[test]
@@ -674,6 +779,26 @@ fn e2e_parsed_sources_preserve_and_block_changed_string_default() {
         ShadowGateVerdict::WouldBlock,
         "a parsed rename plus semantic string-default change must stay blocking"
     );
+}
+
+#[test]
+fn e2e_parsed_sync_async_rename_stays_blocking_in_both_directions() {
+    for (label, old_source, new_source) in [
+        ("sync-to-async", PARSED_SYNC_RENAME, PARSED_ASYNC_RENAME),
+        ("async-to-sync", PARSED_ASYNC_RENAME, PARSED_SYNC_RENAME),
+    ] {
+        let (verdict, old_signature, new_signature) =
+            link_and_shadow_verdict_from_sources(old_source, new_source);
+        assert_ne!(
+            old_signature.starts_with("async def"),
+            new_signature.starts_with("async def")
+        );
+        assert_eq!(
+            verdict,
+            ShadowGateVerdict::WouldBlock,
+            "{label} changes the callable runtime mode and cannot be neutralized by positional call evidence"
+        );
+    }
 }
 
 #[test]

@@ -18,6 +18,18 @@ use kin_model::{
 };
 use kin_parser::{CallArgShape, ExtractedRelation, FileImport};
 
+/// Persisted provenance marker for call-shape evidence produced by a linker
+/// that preserves every occurrence on one logical `(src, dst, Calls)` edge.
+///
+/// v0.2.15 could persist one shaped occurrence while silently dropping later
+/// calls from the same caller to the same target. Those legacy records already
+/// have `call_shape: Some(_)`, so shape presence alone cannot certify complete
+/// evidence after an upgrade. New full-file batch and incremental linking stamp
+/// every shaped record with this marker; review requires it before a rename may
+/// be neutralized. `parser_rule` is defaultable in storage, making an older
+/// record's absent marker a conservative, backward-compatible `unknown`.
+pub const CALL_SHAPE_EVIDENCE_AGGREGATION_V1: &str = "call_shape_aggregation_v1";
+
 /// Result of resolving a single unresolved relation.
 #[derive(Debug)]
 pub enum LinkingOutcome {
@@ -2343,6 +2355,7 @@ fn make_relation(
 pub(crate) fn call_shape_evidence(shape: Option<&CallArgShape>) -> Vec<RelationEvidence> {
     match shape {
         Some(shape) => vec![RelationEvidence {
+            parser_rule: Some(CALL_SHAPE_EVIDENCE_AGGREGATION_V1.to_string()),
             call_shape: Some(kin_model::CallArgShape::new(
                 shape.positional,
                 shape.keywords.clone(),

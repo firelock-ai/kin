@@ -165,16 +165,46 @@ fn python_none_type_spelling_neutral(old: &str, new: &str) -> bool {
     fn fold(signature: &str) -> String {
         signature.replace("type(None)", "types.NoneType")
     }
+    let old_has_def = find_python_def_keyword(old).is_some();
+    let new_has_def = find_python_def_keyword(new).is_some();
+    if old_has_def || new_has_def {
+        // A function declaration must pass the same header validator as every
+        // other Python-neutral path. This prevents the exact NoneType spelling
+        // fold from becoming a side door around an unknown pre-def prefix.
+        if !old_has_def
+            || !new_has_def
+            || python_signature_parts(old).is_none()
+            || python_signature_parts(new).is_none()
+        {
+            return false;
+        }
+    }
     fold(old) == fold(new)
 }
 
-/// The callable name and normalized parameter list of a Python `def`, or
-/// `None` when the text is not one. Annotations and non-semantic whitespace are
-/// normalized away so two annotation-only variants compare equal. Ambiguous
-/// comments or malformed syntax fail closed.
-fn python_signature_parts(signature: &str) -> Option<(String, Vec<String>)> {
+/// The runtime declaration mode, callable name, and normalized parameter list
+/// of a Python `def`, or `None` when the text is not one. Python permits exactly
+/// one meaningful header prefix here: `async`. Recording it explicitly keeps a
+/// sync/async transition out of every runtime-neutral classifier. Any other
+/// pre-`def` text is not a declaration shape this scanner can prove, so it fails
+/// closed instead of being silently discarded. Annotations and non-semantic
+/// whitespace are normalized away so two annotation-only variants compare
+/// equal; ambiguous comments or malformed syntax likewise fail closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PythonSignatureParts {
+    is_async: bool,
+    name: String,
+    params: Vec<String>,
+}
+
+fn python_signature_parts(signature: &str) -> Option<PythonSignatureParts> {
     let signature = signature.trim();
     let def_pos = find_python_def_keyword(signature)?;
+    let is_async = match signature[..def_pos].trim() {
+        "" => false,
+        "async" => true,
+        _ => return None,
+    };
     let mut name_start = def_pos + "def".len();
     while signature
         .as_bytes()
@@ -195,12 +225,17 @@ fn python_signature_parts(signature: &str) -> Option<(String, Vec<String>)> {
         .into_iter()
         .map(|param| normalize_python_param(&param))
         .collect::<Option<Vec<_>>>()?;
-    Some((name.to_string(), params))
+    Some(PythonSignatureParts {
+        is_async,
+        name: name.to_string(),
+        params,
+    })
 }
 
-/// Find the first standalone Python `def` token outside quoted text. An
-/// unquoted `#` before the declaration is ambiguous after production signature
-/// whitespace canonicalization has removed line boundaries, so fail closed.
+/// Find the first standalone Python `def` token outside quoted text. Prefix
+/// validation belongs to [`python_signature_parts`]: an unquoted comment or any
+/// other text before the declaration remains in that prefix and therefore fails
+/// closed instead of hiding the declaration from sibling classifiers.
 fn find_python_def_keyword(signature: &str) -> Option<usize> {
     let bytes = signature.as_bytes();
     let mut i = 0usize;
@@ -208,9 +243,6 @@ fn find_python_def_keyword(signature: &str) -> Option<usize> {
         if matches!(bytes[i], b'\'' | b'"') {
             i = python_quote_end(bytes, i)?;
             continue;
-        }
-        if bytes[i] == b'#' {
-            return None;
         }
         if bytes[i..].starts_with(b"def")
             && (i == 0 || !python_identifier_byte(bytes[i - 1]))
@@ -231,21 +263,19 @@ fn find_python_def_keyword(signature: &str) -> Option<usize> {
 /// renaming, retyping, or removing a parameter — or appending a required one —
 /// is never neutral.
 fn python_signatures_runtime_neutral(old: &str, new: &str) -> bool {
-    let (Some((old_name, old_params)), Some((new_name, new_params))) =
-        (python_signature_parts(old), python_signature_parts(new))
-    else {
+    let (Some(old), Some(new)) = (python_signature_parts(old), python_signature_parts(new)) else {
         return false;
     };
-    if old_name != new_name {
+    if old.is_async != new.is_async || old.name != new.name {
         return false;
     }
-    if old_params == new_params {
+    if old.params == new.params {
         return true;
     }
-    if new_params.len() <= old_params.len() || new_params[..old_params.len()] != old_params[..] {
+    if new.params.len() <= old.params.len() || new.params[..old.params.len()] != old.params[..] {
         return false;
     }
-    new_params[old_params.len()..]
+    new.params[old.params.len()..]
         .iter()
         .all(|param| python_param_adds_no_required_arg(param))
 }
@@ -321,10 +351,10 @@ fn python_param_default(param: &str) -> Option<&str> {
 }
 
 /// When `old` → `new` is an arity-preserving pure parameter RENAME of the same
-/// Python `def` — same callable name, same parameter count, every position
-/// keeps its role, and at least one normal parameter's identifier changes —
-/// returns the OLD identifiers of the renamed normal positions. Returns `None`
-/// otherwise.
+/// Python `def` — same sync/async mode, same callable name, same parameter
+/// count, every position keeps its role, and at least one normal parameter's
+/// identifier changes — returns the OLD identifiers of the renamed normal
+/// positions. Returns `None` otherwise.
 ///
 /// The result is the set of names whose by-keyword call sites a rename could
 /// strand, so a caller-shape check can decide whether the rename is actually
@@ -348,12 +378,14 @@ pub fn arity_preserving_rename(old: &str, new: &str) -> Option<Vec<String>> {
     if old == new {
         return None;
     }
-    let (old_name, old_params) = python_signature_parts(old)?;
-    let (new_name, new_params) = python_signature_parts(new)?;
-    if old_name != new_name || old_params.len() != new_params.len() {
+    let old = python_signature_parts(old)?;
+    let new = python_signature_parts(new)?;
+    if old.is_async != new.is_async || old.name != new.name || old.params.len() != new.params.len()
+    {
         return None;
     }
-    let old_identifiers: std::collections::BTreeSet<&str> = old_params
+    let old_identifiers: std::collections::BTreeSet<&str> = old
+        .params
         .iter()
         .map(|p| python_param_identifier(p))
         .filter(|id| !id.is_empty())
@@ -361,7 +393,7 @@ pub fn arity_preserving_rename(old: &str, new: &str) -> Option<Vec<String>> {
 
     let mut renamed = Vec::new();
     let mut saw_rename = false;
-    for (old_param, new_param) in old_params.iter().zip(new_params.iter()) {
+    for (old_param, new_param) in old.params.iter().zip(new.params.iter()) {
         if python_param_default(old_param) != python_param_default(new_param) {
             // Adding, removing, or changing any default changes the callable's
             // runtime contract. Positional call-shape evidence can prove a
@@ -1437,6 +1469,57 @@ mod tests {
     }
 
     #[test]
+    fn positional_rename_with_async_mode_change_stays_breaking_inline() {
+        let mut old = test_entity_with_span("target", "src/mod.py", 1, 2);
+        old.language = LanguageId::Python;
+        old.signature = "def target(ext, args)".to_string();
+        let mut new = old.clone();
+        new.signature = "async def target(ext, lines)".to_string();
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 1,
+                strong_consumer_count: 1,
+                contract_consumer_count: 0,
+                consumer_files: vec!["src/caller.py".to_string()],
+                covering_tests: 0,
+                consumers_migrated_in_diff: 0,
+                call_shapes: ConsumerCallShapeSummary {
+                    all_consumers_shaped_calls: true,
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        };
+
+        let comments = collect_inline_comments(&diff, &impact);
+        assert!(
+            comments
+                .iter()
+                .any(|comment| comment.kind == InlineCommentKind::Breaking),
+            "sync-to-async must keep the inline channel blocking: {comments:?}"
+        );
+        assert!(
+            comments.iter().all(|comment| !comment
+                .message
+                .contains("pass positionally — no runtime break")),
+            "an async-mode change must never carry rename-neutral proof: {comments:?}"
+        );
+    }
+
+    #[test]
     fn collector_only_rename_is_neutral_but_role_change_breaks_inline() {
         let mut old = test_entity_with_span("target", "src/mod.py", 1, 2);
         old.language = LanguageId::Python;
@@ -2259,6 +2342,44 @@ mod tests {
         assert!(!signature_runtime_neutral(
             "class Item(Node, Request)",
             "class Item(Node)"
+        ));
+    }
+
+    #[test]
+    fn python_declaration_mode_and_unknown_headers_fail_closed() {
+        assert!(signature_runtime_neutral(
+            "async def target(value)",
+            "async def target(value: int)"
+        ));
+        assert!(!signature_runtime_neutral(
+            "def target(value)",
+            "async def target(value)"
+        ));
+        assert_eq!(
+            arity_preserving_rename("def target(ext, args)", "async def target(ext, lines)"),
+            None,
+            "sync-to-async is a runtime contract change, not a pure rename"
+        );
+        assert_eq!(
+            arity_preserving_rename("async def target(ext, args)", "def target(ext, lines)"),
+            None,
+            "async-to-sync is a runtime contract change, not a pure rename"
+        );
+        assert_eq!(
+            arity_preserving_rename(
+                "decorated def target(ext, args)",
+                "decorated def target(ext, lines)"
+            ),
+            None,
+            "unrecognized pre-def text cannot enter a neutral classifier"
+        );
+        assert!(!signature_runtime_neutral(
+            "decorated def target(value=type(None))",
+            "decorated def target(value=types.NoneType)"
+        ));
+        assert!(!signature_runtime_neutral(
+            "# stale comment def target(value=type(None))",
+            "# stale comment def target(value=types.NoneType)"
         ));
     }
 
