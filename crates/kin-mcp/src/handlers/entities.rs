@@ -95,7 +95,12 @@ the fused pipeline (also selectable per call with `pipeline: \"fused\"`). Every 
 carries an additive `match_evidence` object explaining why it ranked — the ranker that \
 produced it, the score source, whether the query matched the entity name, and the \
 ranking signals that applied — derived from graph-owned retrieval data, never a \
-working-tree read. Both pipelines report semantic_coverage — the fraction of the graph \
+working-tree read. Pass an optional `queries` array of additional query variants to fan \
+out: `query` plus each variant are retrieved independently and their rankings RRF-fused \
+into one deduped result, with each hit's `match_evidence.matched_variants` naming the \
+variants that surfaced it (diverse variants — identifiers, behavior, subsystem — recover \
+more than any single phrasing); multi-query fusion always uses the fused pipeline. Both \
+pipelines report semantic_coverage — the fraction of the graph \
 that has embeddings indexed; the fused arm additionally reports a `degradations` array \
 naming any retrieval capability that could not fully run (empty vector index, reranker \
 model not cached, …), so a thin result set is attributable instead of silent. Requires \

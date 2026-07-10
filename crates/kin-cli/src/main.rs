@@ -216,6 +216,13 @@ enum Command {
     Locate {
         /// Problem text (inline)
         text: Option<String>,
+        /// Additional query variant(s) for multi-query fan-out (repeatable).
+        /// The primary text plus each variant are retrieved independently and
+        /// their rankings RRF-fused into one deduped result. Diverse variants
+        /// (identifiers, behavior, subsystem) recover more relevant files than
+        /// any single phrasing. Omit for a normal single-query locate.
+        #[arg(long = "query", value_name = "QUERY")]
+        query: Vec<String>,
         /// Read problem text from file
         #[arg(long)]
         file: Option<String>,
@@ -1992,6 +1999,7 @@ fn main() -> Result<()> {
                 }
                 Command::Locate {
                     text,
+                    query,
                     file,
                     stdin,
                     json,
@@ -2050,6 +2058,7 @@ fn main() -> Result<()> {
                         // print gold file comparison to stderr.
                         let result = commands::locate::capture(
                             &problem_text,
+                            query.clone(),
                             true, // always explain in diagnose mode
                             max_files_val,
                             max_files_explicit,
@@ -2169,6 +2178,7 @@ fn main() -> Result<()> {
                     } else {
                         commands::locate::run(
                             &problem_text,
+                            query,
                             json,
                             explain,
                             max_files_val,
