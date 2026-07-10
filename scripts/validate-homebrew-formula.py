@@ -26,7 +26,10 @@ BLOCK_COMMENT_RE = re.compile(r"^=(?:begin|end)\b")
 PERCENT_LITERAL_RE = re.compile(r"(?<![\w%])%(?:[qQwWiIrxs])?[^\w\s=]")
 GENERIC_CLASS_RE = re.compile(r"^class\b")
 ON_PLATFORM_RE = re.compile(r"^(on_[A-Za-z0-9_!?]+)\b")
-FORMULA_METADATA_RE = re.compile(r"^(?:desc|homepage|license)\b")
+FORMULA_METADATA_PREFIX_RE = re.compile(r"^(?:desc|homepage|license)\b")
+FORMULA_METADATA_RE = re.compile(
+    r"""^(?:desc|homepage|license)\s+(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')$"""
+)
 INSTALL_BLOCK_RE = re.compile(r"^def\s+install$")
 TEST_BLOCK_RE = re.compile(r"^test\s+do$")
 CHECKSUM_RE = re.compile(r"^\s*([0-9A-Fa-f]{64})[ \t]+\*?([^ \t]+)[ \t]*$")
@@ -169,6 +172,8 @@ def reject_unsupported_ruby_syntax(line: str, code: str, line_number: int) -> No
         reason = "Ruby percent literals"
     elif "/" in structure:
         reason = "Ruby regular expressions and division expressions"
+    elif ";" in structure:
+        reason = "multiple Ruby statements"
     elif structure.endswith("\\"):
         reason = "Ruby line continuations"
     elif INLINE_END_RE.search(structure) and code != "end":
@@ -419,7 +424,12 @@ def parse_formula(formula: str, expected_version: str) -> dict[str, FormulaPair]
                 )
             blocks.append(RubyBlock("do", code, line_number))
             continue
-        if is_direct_kin_scope(blocks) and FORMULA_METADATA_RE.match(code):
+        if is_direct_kin_scope(blocks) and FORMULA_METADATA_PREFIX_RE.match(code):
+            if not FORMULA_METADATA_RE.fullmatch(code):
+                raise ValidationError(
+                    "formula metadata directives must use one canonical quoted-string "
+                    f"statement at formula line {line_number}"
+                )
             continue
         if not blocks or blocks[-1].kind in {"kin_class", "os", "arch"}:
             raise ValidationError(

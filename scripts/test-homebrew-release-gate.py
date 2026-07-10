@@ -566,6 +566,27 @@ def test_platform_dsl_cannot_be_shadowed_by_class_method() -> None:
     )
 
 
+def test_metadata_cannot_append_a_dsl_shadowing_statement() -> None:
+    formula = current_real_formula_shape().replace(
+        '  desc "Semantic system of record for software work"',
+        '  desc "Semantic system of record for software work"; '
+        "define_singleton_method(:version, method(:puts))",
+        1,
+    )
+    assert_validator_rejects(formula, "multiple Ruby statements")
+
+
+def test_metadata_requires_one_canonical_quoted_string() -> None:
+    formula = current_real_formula_shape().replace(
+        '  license "Apache-2.0"',
+        '  license("Apache-2.0")',
+        1,
+    )
+    assert_validator_rejects(
+        formula, "metadata directives must use one canonical quoted-string statement"
+    )
+
+
 def test_ruby_data_section_is_rejected_fail_closed() -> None:
     formula = current_real_formula_shape() + '__END__\nversion "1.2.3"\n'
     assert_validator_rejects(formula, "Ruby data sections")
@@ -719,6 +740,8 @@ def main() -> None:
         test_reopened_kin_class_is_rejected,
         test_version_dsl_cannot_be_shadowed_by_class_method,
         test_platform_dsl_cannot_be_shadowed_by_class_method,
+        test_metadata_cannot_append_a_dsl_shadowing_statement,
+        test_metadata_requires_one_canonical_quoted_string,
         test_ruby_data_section_is_rejected_fail_closed,
         test_duplicate_empty_os_block_fails,
         test_duplicate_empty_arch_block_fails,
