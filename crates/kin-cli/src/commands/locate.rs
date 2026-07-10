@@ -71,6 +71,11 @@ pub struct LocateResult {
     /// tell a strong answer from a degraded one without parsing logs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degradations: Vec<RetrievalDegradation>,
+    /// In multi-query fusion mode, the ordered query variants whose per-variant
+    /// rankings were RRF-fused into this result (index 0 is the primary query).
+    /// Empty for a single-query locate, so single-query output is byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queries: Vec<String>,
 }
 
 /// One retrieval capability that did not fully run for a query, with the
@@ -120,7 +125,7 @@ impl LocateResult {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct LocateFileEntry {
     pub path: String,
     pub score: f32,
@@ -146,6 +151,11 @@ pub struct LocateFileEntry {
     /// Per-stage score breakdown (only with --explain).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score_breakdown: Option<std::collections::HashMap<String, f32>>,
+    /// Under multi-query RRF fusion, the query variants that surfaced this file
+    /// (each is one of [`LocateResult::queries`]). Empty (and omitted) for a
+    /// single-query locate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_queries: Vec<String>,
 }
 
 /// A single ranked symbol (graph entity) attributed to a file by `kin locate`.
@@ -223,6 +233,12 @@ pub struct LocateEntity {
     pub body: Option<String>,
     /// Where this entity lives. The file is provenance, not the result.
     pub provenance: LocateProvenance,
+    /// Under multi-query RRF fusion, the query variants that surfaced this entity
+    /// (each is one of [`LocateResult::queries`]). Travels with the entity through
+    /// paging and the daemon ranking cache so a paged hit keeps its attribution.
+    /// Empty (and omitted) for a single-query locate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_queries: Vec<String>,
 }
 
 /// Provenance for a [`LocateEntity`]: the file (and resolution origin) the entity
@@ -1153,8 +1169,10 @@ pub struct LocatePaging {
     pub page_size: Option<usize>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     text: &str,
+    queries: Vec<String>,
     json: bool,
     explain: bool,
     max_files: usize,
@@ -1173,6 +1191,7 @@ pub async fn run(
     .entered();
     let result = capture(
         text,
+        queries,
         explain,
         max_files,
         max_files_explicit,
@@ -1188,8 +1207,10 @@ pub async fn run(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn capture(
     text: &str,
+    queries: Vec<String>,
     explain: bool,
     max_files: usize,
     max_files_explicit: bool,
@@ -1208,6 +1229,7 @@ pub async fn capture(
     let result = try_locate_via_daemon(
         &layout,
         text,
+        queries,
         explain,
         max_files,
         max_files_explicit,
@@ -1289,9 +1311,11 @@ fn emit_telemetry_disclosure_once() {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn try_locate_via_daemon(
     layout: &kin_core::KinLayout,
     text: &str,
+    queries: Vec<String>,
     explain: bool,
     max_files: usize,
     max_files_explicit: bool,
@@ -1310,6 +1334,7 @@ async fn try_locate_via_daemon(
     let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
     let request = crate::daemon_client::LocateRequest {
         text: text.to_string(),
+        queries,
         explain,
         max_files,
         max_files_explicit,
@@ -14877,6 +14902,7 @@ pub fn build_entity_view(
                         origin: sym.origin.clone(),
                         cosine: sym.cosine,
                     },
+                    matched_queries: Vec::new(),
                 },
             ));
         }
@@ -14975,6 +15001,146 @@ pub fn apply_entity_page(
     });
 }
 
+/// Reciprocal-rank-fusion constant `k` (`KIN_LOCATE_RRF_K`, default 60). Larger
+/// `k` flattens the rank-position weighting; the standard literature value is 60.
+/// Floored at 1 so the denominator can never collapse. Shares the same knob the
+/// internal signal-fusion RRF reads, so both fusions stay on one constant.
+pub fn locate_rrf_k() -> f64 {
+    locate_env_f32("KIN_LOCATE_RRF_K", 60.0).max(1.0) as f64
+}
+
+/// Reciprocal Rank Fusion over several already-ranked item lists. Each item
+/// contributes `1 / (k + rank + 1)` (0-based `rank`) to the fused score of its
+/// dedup key; contributions from every list that surfaced the key are summed.
+/// Returns one entry per distinct key: the best-ranked record (lowest rank, ties
+/// broken by lowest list index), the sorted indices of the lists that surfaced
+/// it, and the fused score. Order of the returned Vec is unspecified — the caller
+/// applies a total-order sort — but the computation is fully deterministic for a
+/// given input. Pure: no graph, no clock, no randomness.
+pub fn rrf_fuse<T, K, FKey>(
+    per_list: &[Vec<T>],
+    key_of: FKey,
+    rrf_k: f64,
+) -> Vec<(T, Vec<usize>, f64)>
+where
+    T: Clone,
+    K: Eq + std::hash::Hash,
+    FKey: Fn(&T) -> K,
+{
+    // (fused_score, contributing list indices, best_rank, best_list, best_record)
+    let mut acc: HashMap<K, (f64, Vec<usize>, usize, usize, T)> = HashMap::new();
+    for (list_idx, items) in per_list.iter().enumerate() {
+        for (rank, item) in items.iter().enumerate() {
+            let key = key_of(item);
+            let contribution = 1.0 / (rrf_k + rank as f64 + 1.0);
+            match acc.get_mut(&key) {
+                Some(entry) => {
+                    entry.0 += contribution;
+                    if !entry.1.contains(&list_idx) {
+                        entry.1.push(list_idx);
+                    }
+                    if rank < entry.2 || (rank == entry.2 && list_idx < entry.3) {
+                        entry.2 = rank;
+                        entry.3 = list_idx;
+                        entry.4 = item.clone();
+                    }
+                }
+                None => {
+                    acc.insert(
+                        key,
+                        (contribution, vec![list_idx], rank, list_idx, item.clone()),
+                    );
+                }
+            }
+        }
+    }
+    acc.into_values()
+        .map(|(score, mut lists, _, _, record)| {
+            lists.sort_unstable();
+            (record, lists, score)
+        })
+        .collect()
+}
+
+/// The file path a located entity resolves to, for a stable fusion tie-break.
+fn locate_entity_tiebreak_path(entity: &LocateEntity) -> &str {
+    entity.provenance.file.as_deref().unwrap_or("")
+}
+
+/// Fuse the per-variant [`LocateResult`]s of a multi-query locate into a single
+/// deduped result via Reciprocal Rank Fusion. `variants` is the ordered variant
+/// text (index-aligned with `results`; index 0 is the primary query). Entities
+/// are fused by `entity_id`, files by path; each fused hit records which variant
+/// texts surfaced it in `matched_queries`. Ordering is RRF-score-descending with
+/// deterministic tie-breaks (entities by file path then id; files by path). The
+/// per-hit composite `score` is preserved from the hit's best-ranked variant —
+/// array order carries the fused ranking. `degradations` are unioned; the debug
+/// object and semantic coverage are taken from the primary variant. With a single
+/// variant this returns that result unchanged (no fusion, no attribution).
+pub fn fuse_locate_results(
+    variants: Vec<String>,
+    results: Vec<LocateResult>,
+    rrf_k: f64,
+) -> LocateResult {
+    if variants.len() <= 1 || results.len() <= 1 {
+        return results.into_iter().next().unwrap_or_default();
+    }
+
+    let entity_lists: Vec<Vec<LocateEntity>> = results.iter().map(|r| r.entities.clone()).collect();
+    let file_lists: Vec<Vec<LocateFileEntry>> = results.iter().map(|r| r.files.clone()).collect();
+
+    let mut fused_entities = rrf_fuse(&entity_lists, |e| e.entity_id.clone(), rrf_k);
+    fused_entities.sort_by(|(a, _, sa), (b, _, sb)| {
+        sb.partial_cmp(sa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| locate_entity_tiebreak_path(a).cmp(locate_entity_tiebreak_path(b)))
+            .then_with(|| a.entity_id.cmp(&b.entity_id))
+    });
+    let entities: Vec<LocateEntity> = fused_entities
+        .into_iter()
+        .map(|(mut entity, lists, _)| {
+            entity.matched_queries = lists.iter().map(|&i| variants[i].clone()).collect();
+            entity
+        })
+        .collect();
+
+    let mut fused_files = rrf_fuse(&file_lists, |f| f.path.clone(), rrf_k);
+    fused_files.sort_by(|(a, _, sa), (b, _, sb)| {
+        sb.partial_cmp(sa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    let files: Vec<LocateFileEntry> = fused_files
+        .into_iter()
+        .map(|(mut file, lists, _)| {
+            file.matched_queries = lists.iter().map(|&i| variants[i].clone()).collect();
+            file
+        })
+        .collect();
+
+    let mut degradations: Vec<RetrievalDegradation> = Vec::new();
+    for result in &results {
+        for degradation in &result.degradations {
+            if !degradations.contains(degradation) {
+                degradations.push(degradation.clone());
+            }
+        }
+    }
+
+    let primary = results.into_iter().next().unwrap_or_default();
+    LocateResult {
+        entities,
+        next_cursor: None,
+        page: 0,
+        total_ranked: 0,
+        files,
+        debug: primary.debug,
+        semantic_coverage: primary.semantic_coverage,
+        degradations,
+        queries: variants,
+    }
+}
+
 fn build_result(
     results: &[(String, f32)],
     all_hits: &[HashMap<String, Vec<FileHit>>],
@@ -15027,6 +15193,7 @@ fn build_result(
             } else {
                 None
             },
+            matched_queries: Vec::new(),
         })
         .collect();
 
@@ -15199,6 +15366,7 @@ mod tests {
                 origin: "vector".to_string(),
                 cosine: Some(0.5),
             },
+            matched_queries: Vec::new(),
         }
     }
 
@@ -15331,6 +15499,129 @@ mod tests {
         assert_ne!(a, locate_cursor_key("find the parser", Some("main"), 42));
     }
 
+    fn fusion_entity(id: &str, path: &str, score: f32) -> LocateEntity {
+        LocateEntity {
+            entity_id: id.to_string(),
+            kind: "function".to_string(),
+            name: id.to_string(),
+            signature: String::new(),
+            score,
+            definition: true,
+            span: None,
+            body: None,
+            provenance: LocateProvenance {
+                file: Some(path.to_string()),
+                origin: String::new(),
+                cosine: None,
+            },
+            matched_queries: Vec::new(),
+        }
+    }
+
+    fn fusion_result(entities: Vec<LocateEntity>) -> LocateResult {
+        LocateResult {
+            entities,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rrf_fuse_sums_contributions_and_attributes_lists() {
+        // "a" is rank 0 in list 0 and rank 1 in list 1; "b" only in list 1.
+        let lists = vec![vec!["a", "c"], vec!["b", "a"]];
+        let mut fused = rrf_fuse(&lists, |s| s.to_string(), 60.0);
+        fused.sort_by(|(_, _, sa), (_, _, sb)| {
+            sb.partial_cmp(sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        // "a" surfaced in both lists → highest fused score and both list indices.
+        let (top, lists_of_top, _score) = &fused[0];
+        assert_eq!(*top, "a");
+        assert_eq!(lists_of_top, &vec![0, 1]);
+        // Singleton keys carry exactly one contributing list.
+        let b = fused.iter().find(|(k, _, _)| *k == "b").unwrap();
+        assert_eq!(b.1, vec![1]);
+    }
+
+    #[test]
+    fn fuse_locate_results_single_variant_is_passthrough() {
+        let result = fusion_result(vec![
+            fusion_entity("e1", "src/a.rs", 2.0),
+            fusion_entity("e2", "src/b.rs", 1.0),
+        ]);
+        let fused =
+            fuse_locate_results(vec!["only query".to_string()], vec![result], locate_rrf_k());
+        // No fusion: order and records untouched, no attribution emitted.
+        assert_eq!(fused.entities.len(), 2);
+        assert_eq!(fused.entities[0].entity_id, "e1");
+        assert!(fused.queries.is_empty());
+        assert!(fused.entities.iter().all(|e| e.matched_queries.is_empty()));
+    }
+
+    #[test]
+    fn fuse_locate_results_unions_and_attributes_variants() {
+        // v0 ranks e1 > e2; v1 ranks e3 > e1. e1 appears in both → should win.
+        let v0 = fusion_result(vec![
+            fusion_entity("e1", "src/one.rs", 5.0),
+            fusion_entity("e2", "src/two.rs", 4.0),
+        ]);
+        let v1 = fusion_result(vec![
+            fusion_entity("e3", "src/three.rs", 5.0),
+            fusion_entity("e1", "src/one.rs", 3.0),
+        ]);
+        let variants = vec!["identifier query".to_string(), "behavior query".to_string()];
+        let fused = fuse_locate_results(variants.clone(), vec![v0, v1], 60.0);
+
+        assert_eq!(fused.queries, variants);
+        // e1 (in both variants) fuses to the top.
+        assert_eq!(fused.entities[0].entity_id, "e1");
+        assert_eq!(
+            fused.entities[0].matched_queries,
+            vec!["identifier query".to_string(), "behavior query".to_string()]
+        );
+        // Union covers every distinct entity across the variants.
+        let ids: Vec<&str> = fused
+            .entities
+            .iter()
+            .map(|e| e.entity_id.as_str())
+            .collect();
+        assert!(ids.contains(&"e1") && ids.contains(&"e2") && ids.contains(&"e3"));
+        // Single-variant hits attribute to exactly the variant that surfaced them.
+        let e2 = fused.entities.iter().find(|e| e.entity_id == "e2").unwrap();
+        assert_eq!(e2.matched_queries, vec!["identifier query".to_string()]);
+        let e3 = fused.entities.iter().find(|e| e.entity_id == "e3").unwrap();
+        assert_eq!(e3.matched_queries, vec!["behavior query".to_string()]);
+    }
+
+    #[test]
+    fn fuse_locate_results_is_deterministic() {
+        let build = || {
+            vec![
+                fusion_result(vec![
+                    fusion_entity("e1", "src/one.rs", 5.0),
+                    fusion_entity("e2", "src/two.rs", 4.0),
+                ]),
+                fusion_result(vec![
+                    fusion_entity("e2", "src/two.rs", 3.0),
+                    fusion_entity("e3", "src/three.rs", 2.0),
+                ]),
+            ]
+        };
+        let variants = vec!["q0".to_string(), "q1".to_string()];
+        let first = fuse_locate_results(variants.clone(), build(), 60.0);
+        let second = fuse_locate_results(variants, build(), 60.0);
+        let first_ids: Vec<&str> = first
+            .entities
+            .iter()
+            .map(|e| e.entity_id.as_str())
+            .collect();
+        let second_ids: Vec<&str> = second
+            .entities
+            .iter()
+            .map(|e| e.entity_id.as_str())
+            .collect();
+        assert_eq!(first_ids, second_ids);
+    }
+
     #[test]
     fn build_entity_view_is_noop_when_snippets_disabled() {
         let graph = kin_db::InMemoryGraph::new();
@@ -15345,6 +15636,7 @@ mod tests {
                 provenance: None,
                 signal_scores: None,
                 score_breakdown: None,
+                matched_queries: Vec::new(),
             }],
             ..Default::default()
         };
@@ -22349,6 +22641,7 @@ mod tests {
                 provenance: None,
                 signal_scores: None,
                 score_breakdown: None,
+                matched_queries: Vec::new(),
             }],
             debug: None,
             semantic_coverage: None,

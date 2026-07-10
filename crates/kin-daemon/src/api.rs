@@ -3081,6 +3081,12 @@ async fn locate(
         state.graph.compute_root_hash()
     );
 
+    // Multi-query fan-out: primary text plus any additional variants, deduped.
+    // Two-or-more distinct variants trigger RRF fusion; otherwise the single
+    // path runs exactly as before (byte-identical).
+    let variants = build_locate_variants(&req.text, &req.queries);
+    let multi_query = variants.len() >= 2;
+
     let mut result = if let Some(reference) = req.reference.as_deref() {
         // Explicit --ref always takes precedence over session scope.
         // Locating at an unimported Git ref lazily imports its full ancestry;
@@ -3106,41 +3112,75 @@ async fn locate(
             state.mark_clean();
         }
         let head = resolved.head;
-        kin_cli::commands::locate::run_with_graph_capture_at_ref(
-            &state.layout,
-            state.graph.as_ref(),
-            state.blobs.as_ref(),
-            &head,
-            reference,
-            &req.text,
-            req.explain,
-            req.max_files,
-            req.max_files_explicit,
-            snippet_opts,
-        )
-        .map_err(|error| error.to_string())
+        if multi_query {
+            run_multiquery_locate_at_ref(
+                &state,
+                &head,
+                reference,
+                &variants,
+                req.explain,
+                req.max_files,
+                req.max_files_explicit,
+                snippet_opts,
+            )
+        } else {
+            kin_cli::commands::locate::run_with_graph_capture_at_ref(
+                &state.layout,
+                state.graph.as_ref(),
+                state.blobs.as_ref(),
+                &head,
+                reference,
+                &req.text,
+                req.explain,
+                req.max_files,
+                req.max_files_explicit,
+                snippet_opts,
+            )
+            .map_err(|error| error.to_string())
+        }
     } else {
         // Use scoped graph if session has a temporal scope, otherwise HEAD.
         let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-        run_fused_locate_for_state(
-            &state,
-            session_id.as_ref(),
-            graph.as_ref(),
-            &req.text,
-            req.explain,
-            req.max_files,
-            req.max_files_explicit,
-            snippet_opts,
-        )
-        .await
+        if multi_query {
+            run_multiquery_fused_locate(
+                &state,
+                session_id.as_ref(),
+                graph.as_ref(),
+                &variants,
+                req.explain,
+                req.max_files,
+                req.max_files_explicit,
+                snippet_opts,
+            )
+            .await
+        } else {
+            run_fused_locate_for_state(
+                &state,
+                session_id.as_ref(),
+                graph.as_ref(),
+                &req.text,
+                req.explain,
+                req.max_files,
+                req.max_files_explicit,
+                snippet_opts,
+            )
+            .await
+        }
     }
     .map_err(internal_error)?;
 
     // Cache the full entity ranking and window page 0 so a follow-up `--next`
     // pages it from cache without re-running retrieval. Keyed by
-    // (query, ref/scope, graph-version) so any edit invalidates the page.
+    // (query, ref/scope, graph-version) so any edit invalidates the page. A
+    // multi-query ranking keys off the joined variants so it cannot collide with
+    // any single-variant cursor.
+    let key_text = if multi_query {
+        multiquery_cursor_text(&variants)
+    } else {
+        req.text.clone()
+    };
     let key = kin_cli::commands::locate::locate_cursor_key(
-        &req.text,
+        &key_text,
         scope_token.as_deref(),
         graph_version,
     );
@@ -3212,6 +3252,126 @@ async fn run_fused_locate_for_state(
         snippet_opts,
     )
     .map_err(|error| error.to_string())
+}
+
+/// Build the ordered, deduped query-variant list for a multi-query locate: the
+/// primary query first (when non-empty), then each extra variant, trimmed and
+/// de-duplicated exactly so the same phrasing is never retrieved twice. A result
+/// with fewer than two entries means a single-query locate (no fan-out).
+fn build_locate_variants(primary: &str, extra: &[String]) -> Vec<String> {
+    let mut variants: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for candidate in std::iter::once(primary).chain(extra.iter().map(String::as_str)) {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            variants.push(trimmed.to_string());
+        }
+    }
+    variants
+}
+
+/// Canonical cursor-key text for a multi-query ranking: the variants joined by a
+/// unit-separator control char so a fused ranking can never collide with any
+/// single-variant ranking's cursor key.
+fn multiquery_cursor_text(variants: &[String]) -> String {
+    variants.join("\u{1f}")
+}
+
+/// Read a JSON string-array MCP argument into an owned `Vec<String>`, dropping
+/// non-string and blank entries. Absent or non-array → empty (single-query).
+fn arg_string_array(arguments: &HashMap<String, serde_json::Value>, key: &str) -> Vec<String> {
+    arguments
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Fan out a multi-query locate over daemon state: retrieve each variant through
+/// the same fused pipeline `run_fused_locate_for_state` serves, then RRF-fuse the
+/// per-variant rankings into one deduped result with per-hit variant attribution.
+/// Variants are retrieved in order so the fusion is fully deterministic.
+#[allow(clippy::too_many_arguments)]
+async fn run_multiquery_fused_locate(
+    state: &Arc<DaemonState>,
+    session_id: Option<&SessionId>,
+    graph: &kin_db::InMemoryGraph,
+    variants: &[String],
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+    snippet_opts: kin_cli::commands::locate::SnippetOptions,
+) -> Result<kin_cli::commands::locate::LocateResult, String> {
+    let mut per_variant = Vec::with_capacity(variants.len());
+    for variant in variants {
+        per_variant.push(
+            run_fused_locate_for_state(
+                state,
+                session_id,
+                graph,
+                variant,
+                explain,
+                max_files,
+                max_files_explicit,
+                snippet_opts,
+            )
+            .await?,
+        );
+    }
+    Ok(kin_cli::commands::locate::fuse_locate_results(
+        variants.to_vec(),
+        per_variant,
+        kin_cli::commands::locate::locate_rrf_k(),
+    ))
+}
+
+/// Fan out a multi-query locate at an explicit ref: retrieve each variant against
+/// the resolved head graph, then RRF-fuse. Mirrors `run_multiquery_fused_locate`
+/// for the `--ref` path so multi-query is honored there too rather than silently
+/// dropping the extra variants.
+#[allow(clippy::too_many_arguments)]
+fn run_multiquery_locate_at_ref(
+    state: &Arc<DaemonState>,
+    head: &kin_model::SemanticChangeId,
+    reference: &str,
+    variants: &[String],
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+    snippet_opts: kin_cli::commands::locate::SnippetOptions,
+) -> Result<kin_cli::commands::locate::LocateResult, String> {
+    let mut per_variant = Vec::with_capacity(variants.len());
+    for variant in variants {
+        per_variant.push(
+            kin_cli::commands::locate::run_with_graph_capture_at_ref(
+                &state.layout,
+                state.graph.as_ref(),
+                state.blobs.as_ref(),
+                head,
+                reference,
+                variant,
+                explain,
+                max_files,
+                max_files_explicit,
+                snippet_opts,
+            )
+            .map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(kin_cli::commands::locate::fuse_locate_results(
+        variants.to_vec(),
+        per_variant,
+        kin_cli::commands::locate::locate_rrf_k(),
+    ))
 }
 
 /// Insert a full locate ranking into the paging cache, evicting the oldest entry
@@ -3617,6 +3777,17 @@ async fn embed(
                 .save_snapshot()
                 .map_err(|error| format!("embed snapshot save failed: {error:#}"))?;
             state_for_embed.mark_clean();
+            // A time-limited pass stopped mid-drain, so the throttled per-batch
+            // sidecar flush may not have captured the vectors embedded since the
+            // last throttle tick. Force one sidecar write at the pass boundary so
+            // a graceful daemon exit before the next pass resumes with the full
+            // pass persisted. A pass that drained the queue already wrote the
+            // sidecar unconditionally, so this only fires when work remains.
+            if result.result.time_limited {
+                state_for_embed
+                    .persist_vector_sidecar()
+                    .map_err(|error| format!("embed sidecar persist failed: {error:#}"))?;
+            }
         }
         Ok::<_, String>(result)
     })
@@ -4270,6 +4441,11 @@ fn fused_match_evidence(
     if let Some(cosine) = entity.provenance.cosine {
         evidence["seed_cosine"] = json!(cosine);
     }
+    // Under multi-query fusion, report which query variants surfaced this hit.
+    // Absent for a single-query locate, so the evidence object is unchanged.
+    if !entity.matched_queries.is_empty() {
+        evidence["matched_variants"] = json!(entity.matched_queries);
+    }
     evidence
 }
 
@@ -4812,22 +4988,42 @@ async fn build_fused_semantic_locate_result(
         kin_cli::commands::locate::SnippetOptions::default()
     };
 
+    // Multi-query fan-out: `query` plus any additional `queries` variants,
+    // deduped. Two-or-more distinct variants trigger RRF fusion; otherwise the
+    // single fused path runs exactly as before.
+    let variants = build_locate_variants(&query, &arg_string_array(arguments, "queries"));
+    let multi_query = variants.len() >= 2;
+
     // The agent asked for `limit` ranked hits; give the fused pipeline the
     // same number of file slots EXPLICITLY so the adaptive cap cannot shrink
     // the pool below what the caller asked to see (the graph-native entity
     // ranking is projected from the file ranking).
-    let mut locate_result = match run_fused_locate_for_state(
-        state,
-        session_id,
-        graph,
-        &query,
-        explain,
-        limit,
-        true,
-        snippet_opts,
-    )
-    .await
-    {
+    let run_result = if multi_query {
+        run_multiquery_fused_locate(
+            state,
+            session_id,
+            graph,
+            &variants,
+            explain,
+            limit,
+            true,
+            snippet_opts,
+        )
+        .await
+    } else {
+        run_fused_locate_for_state(
+            state,
+            session_id,
+            graph,
+            &query,
+            explain,
+            limit,
+            true,
+            snippet_opts,
+        )
+        .await
+    };
+    let mut locate_result = match run_result {
         Ok(result) => result,
         Err(error) => {
             return kin_mcp::ToolCallResult::error(format!("fused locate failed: {error}"));
@@ -4836,9 +5032,19 @@ async fn build_fused_semantic_locate_result(
 
     // Cache the full entity ranking and window page 0 so a follow-up cursor
     // pages it from cache without re-running retrieval — the same paging the
-    // `POST /locate` endpoint and the cosine arm provide (arm-symmetric).
-    let key =
-        kin_cli::commands::locate::locate_cursor_key(&query, scope_token.as_deref(), graph_version);
+    // `POST /locate` endpoint and the cosine arm provide (arm-symmetric). A
+    // multi-query ranking keys off the joined variants so it cannot collide with
+    // any single-variant cursor.
+    let key_text = if multi_query {
+        multiquery_cursor_text(&variants)
+    } else {
+        query.clone()
+    };
+    let key = kin_cli::commands::locate::locate_cursor_key(
+        &key_text,
+        scope_token.as_deref(),
+        graph_version,
+    );
     cache_locate_ranking(state, &key, &locate_result.entities, graph_version);
     kin_cli::commands::locate::apply_entity_page(&mut locate_result, &key, 0, page_size);
 
@@ -5113,16 +5319,33 @@ async fn mcp_tools_call(
             .arguments
             .get("pipeline")
             .and_then(serde_json::Value::as_str);
+        // Multi-query fan-out (`queries`) is inherently a multi-signal fusion, so
+        // it is served by the fused arm regardless of the default profile — the
+        // legacy single-vector cosine arm does not fuse variant rankings. An
+        // explicit `pipeline: "cosine"` alongside `queries` is a genuine conflict
+        // and is rejected rather than silently dropping the extra variants.
+        let has_extra_queries = !arg_string_array(&request.arguments, "queries").is_empty();
         let use_fused = match pipeline_override {
             Some(value) if value.eq_ignore_ascii_case("fused") => true,
-            Some(value) if value.eq_ignore_ascii_case("cosine") => false,
+            Some(value) if value.eq_ignore_ascii_case("cosine") => {
+                if has_extra_queries {
+                    return Ok(Json(kin_mcp::ToolCallResult::error(
+                        "multi-query `queries` requires the fused pipeline; omit `pipeline` \
+                         or set it to \"fused\""
+                            .to_string(),
+                    )));
+                }
+                false
+            }
             Some(other) => {
                 return Ok(Json(kin_mcp::ToolCallResult::error(format!(
                     "invalid pipeline '{other}': expected \"fused\" or \"cosine\""
                 ))));
             }
             None => {
-                kin_cli::retrieval_profile::RetrievalProfile::from_env().semantic_locate_fused()
+                has_extra_queries
+                    || kin_cli::retrieval_profile::RetrievalProfile::from_env()
+                        .semantic_locate_fused()
             }
         };
         if use_fused {
@@ -8075,6 +8298,7 @@ mod tests {
                 origin: "vector".into(),
                 cosine: Some(0.42),
             },
+            matched_queries: Vec::new(),
         };
         let ev = fused_match_evidence("parse the request", &with_explain);
         assert_eq!(ev["ranker"], json!("fused-v1"));
@@ -8101,6 +8325,85 @@ mod tests {
     }
 
     #[test]
+    fn build_locate_variants_dedups_and_keeps_primary_first() {
+        // Primary first, blanks dropped, exact duplicates collapsed, order stable.
+        let variants = build_locate_variants(
+            "primary query",
+            &[
+                "  ".to_string(),
+                "variant two".to_string(),
+                "primary query".to_string(),
+                "variant three".to_string(),
+                "variant two".to_string(),
+            ],
+        );
+        assert_eq!(
+            variants,
+            vec![
+                "primary query".to_string(),
+                "variant two".to_string(),
+                "variant three".to_string(),
+            ]
+        );
+        // An empty primary with variants yields a variant-only list.
+        assert_eq!(
+            build_locate_variants("", &["only".to_string()]),
+            vec!["only".to_string()]
+        );
+        // No variants → the single primary; a single entry means no fan-out.
+        assert_eq!(build_locate_variants("solo", &[]), vec!["solo".to_string()]);
+    }
+
+    #[test]
+    fn arg_string_array_reads_only_string_items() {
+        let mut args: HashMap<String, serde_json::Value> = HashMap::new();
+        args.insert(
+            "queries".to_string(),
+            json!(["alpha", 7, "beta", null, "gamma"]),
+        );
+        assert_eq!(
+            arg_string_array(&args, "queries"),
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+        );
+        // Absent or non-array → empty (a single-query call).
+        assert!(arg_string_array(&args, "missing").is_empty());
+        args.insert("queries".to_string(), json!("not-an-array"));
+        assert!(arg_string_array(&args, "queries").is_empty());
+    }
+
+    #[test]
+    fn fused_match_evidence_reports_matched_variants_under_fusion() {
+        use kin_cli::commands::locate::{LocateEntity, LocateProvenance};
+        let mut entity = LocateEntity {
+            entity_id: "e1".into(),
+            kind: "function".into(),
+            name: "parse_request".into(),
+            signature: String::new(),
+            score: 0.9,
+            definition: true,
+            span: None,
+            body: None,
+            provenance: LocateProvenance {
+                file: Some("src/lib.rs".into()),
+                origin: String::new(),
+                cosine: None,
+            },
+            matched_queries: Vec::new(),
+        };
+        // No attribution → no matched_variants key (single-query byte-identical).
+        assert!(fused_match_evidence("q", &entity)
+            .get("matched_variants")
+            .is_none());
+        // With attribution → the variant texts are surfaced additively.
+        entity.matched_queries = vec!["ParseRequest".into(), "parse the request".into()];
+        let ev = fused_match_evidence("q", &entity);
+        assert_eq!(
+            ev["matched_variants"],
+            json!(["ParseRequest", "parse the request"])
+        );
+    }
+
+    #[test]
     fn fused_payload_attaches_match_evidence_additively_and_in_order() {
         use kin_cli::commands::locate::{LocateEntity, LocateProvenance, LocateResult};
         let mk = |id: &str, name: &str| LocateEntity {
@@ -8117,6 +8420,7 @@ mod tests {
                 origin: String::new(),
                 cosine: None,
             },
+            matched_queries: Vec::new(),
         };
         let result = LocateResult {
             entities: vec![mk("a", "alpha"), mk("b", "beta")],
@@ -10019,7 +10323,7 @@ mod tests {
     }
 
     #[test]
-    fn foreground_embed_batch_flush_defers_sidecar_while_queue_pending() {
+    fn foreground_embed_batch_flush_checkpoints_sidecar_on_throttle() {
         let state = test_state();
         state
             .graph
@@ -10034,11 +10338,23 @@ mod tests {
         state.graph.queue_missing_for_embedding();
         assert!(state.graph.pending_embeddings() > 0);
 
+        // The first in-run flush checkpoints the sidecar so persisted coverage
+        // tracks compute from the first batch (the persist-wedge fix).
+        std::fs::remove_file(&vector_path).unwrap();
+        persist_foreground_embed_batch(state.as_ref()).unwrap();
+        assert!(
+            vector_path.exists(),
+            "the first foreground per-batch flush must checkpoint the sidecar"
+        );
+
+        // An immediate follow-up flush is throttled (within the interval and the
+        // batch backstop), so a long run is not billed a full index serialize on
+        // every batch while work is still pending.
         std::fs::remove_file(&vector_path).unwrap();
         persist_foreground_embed_batch(state.as_ref()).unwrap();
         assert!(
             !vector_path.exists(),
-            "foreground per-batch flush must defer the sidecar while work is pending"
+            "an immediate follow-up foreground flush must be throttled while work is pending"
         );
     }
 
@@ -12779,6 +13095,7 @@ mod tests {
                     .body(Body::from(
                         serde_json::to_string(&kin_cli::daemon_client::LocateRequest {
                             text: "parse config".to_string(),
+                            queries: Vec::new(),
                             explain: false,
                             max_files: 10,
                             max_files_explicit: true,
@@ -12968,6 +13285,7 @@ mod tests {
                     .body(Body::from(
                         serde_json::to_string(&kin_cli::daemon_client::LocateRequest {
                             text: "parse config".to_string(),
+                            queries: Vec::new(),
                             explain: false,
                             max_files: 10,
                             max_files_explicit: true,
