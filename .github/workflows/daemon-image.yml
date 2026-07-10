@@ -55,28 +55,52 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push (linux/amd64)
+      - name: Build locally for provenance verification (linux/amd64)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          push: true
+          push: false
+          load: true
           platforms: linux/amd64
           # Single-arch manifest (no attestation index) for predictable GKE pulls.
           provenance: false
+          build-args: |
+            KIN_BUILD_GIT_SHA=${{ github.sha }}
+            KIN_BUILD_DIRTY=false
+            KIN_BUILD_BRANCH=${{ github.ref_name }}
           tags: |
             ${{ env.IMAGE }}:${{ github.sha }}
-            ${{ env.IMAGE }}:latest
             ghcr.io/firelock-ai/kin:${{ github.sha }}
-            ghcr.io/firelock-ai/kin:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Verify image embeds exact source provenance
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: bash scripts/verify-container-build-info.sh "${IMAGE}:${EXPECTED_SHA}" "$EXPECTED_SHA"
+
+      - name: Push only the verified image
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker push "${IMAGE}:${EXPECTED_SHA}"
+          docker push "ghcr.io/firelock-ai/kin:${EXPECTED_SHA}"
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            docker tag "${IMAGE}:${EXPECTED_SHA}" "${IMAGE}:latest"
+            docker tag "ghcr.io/firelock-ai/kin:${EXPECTED_SHA}" "ghcr.io/firelock-ai/kin:latest"
+            docker push "${IMAGE}:latest"
+            docker push "ghcr.io/firelock-ai/kin:latest"
+          fi
 
       - name: Summary
         run: |
           {
             echo "Pushed \`${IMAGE}:${GITHUB_SHA}\`"
-            echo "Pushed \`${IMAGE}:latest\`"
             echo "Pushed \`ghcr.io/firelock-ai/kin:${GITHUB_SHA}\` (public)"
-            echo "Pushed \`ghcr.io/firelock-ai/kin:latest\` (public)"
+            if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+              echo "Pushed \`${IMAGE}:latest\`"
+              echo "Pushed \`ghcr.io/firelock-ai/kin:latest\` (public)"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"

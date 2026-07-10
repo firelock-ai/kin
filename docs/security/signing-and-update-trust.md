@@ -199,10 +199,14 @@ spctl --assess --type execute --verbose ./kin
   credentials fail the tagged workflow, and publication cannot proceed. Manual
   branch workflows may build unsigned binaries for diagnostics but cannot
   publish a GitHub release.
-- **Linux/Windows have one integrity layer.** They are protected by the SHA-256
-  checksum and the release host, not by an OS code signature from this pipeline.
-  The checksum protects integrity (tamper-evidence) but not authorship
-  attribution the way a code signature does.
+- **Linux/Windows have checksum plus workflow-attestation layers.** They do not
+  carry an OS code signature from this pipeline, but the release gate verifies
+  both the published SHA-256 sidecar and a GitHub artifact attestation pinned to
+  this repository, the release workflow, the source tag, and the source commit.
+  The installer itself performs the checksum verification; users who want the
+  separate authorship/provenance check can run `gh attestation verify`.
 - **npm and Homebrew distribution** are downstream of the GitHub release. The
-  npm wrapper publishes via OIDC Trusted Publishing (no long-lived `NPM_TOKEN`),
-  and the Homebrew tap consumes the published archives and their checksums.
+  initial npm candidate publish uses OIDC Trusted Publishing. A scoped
+  `NPM_TOKEN` is still required for npm dist-tag restoration and promotion,
+  operations npm's trusted-publishing flow does not authorize. The Homebrew tap
+  consumes the published archives and their checksums.

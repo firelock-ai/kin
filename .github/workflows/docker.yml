@@ -36,8 +36,17 @@ jobs:
           # below can `docker run` it. Single-platform, so `load` is supported.
           load: true
           tags: kin:ci
+          build-args: |
+            KIN_BUILD_GIT_SHA=${{ github.sha }}
+            KIN_BUILD_DIRTY=false
+            KIN_BUILD_BRANCH=${{ github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Verify container build provenance
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: bash scripts/verify-container-build-info.sh kin:ci "$EXPECTED_SHA"
 
       # Container-level smoke on the freshly built image. Proves the entrypoint
       # boots the daemon in local mode with NO /workspace volume — the case that
