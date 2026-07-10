@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use kin_blobs::BlobStore;
 use kin_core::KinLayout;
 use kin_db::StorageBackend;
-use kin_model::{EntityId, EntityStore, FilePathId, GraphOverlay, WorkingCopy};
+use kin_model::{
+    EntityId, EntityStore, FilePathId, GraphOverlay, Hash256, SemanticChangeId, WorkingCopy,
+};
 use kin_projection::ProjectionState;
 use kin_reconcile::Reconciler;
 use tokio::sync::RwLock;
@@ -251,6 +253,28 @@ pub struct SpineRefreshOutcome {
     pub cross_repo_edges: usize,
 }
 
+/// Exact graph identity for a materialized committed VFS tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VfsTreeCacheKey {
+    pub head: Option<SemanticChangeId>,
+    pub version: u64,
+}
+
+/// Graph-derived file tree and timestamps shared by the VFS endpoints.
+#[derive(Debug)]
+pub(crate) struct VfsTreeSnapshot {
+    pub key: VfsTreeCacheKey,
+    pub files: Arc<HashMap<FilePathId, Hash256>>,
+    pub timestamps: Arc<HashMap<FilePathId, u64>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct VfsTreeBuildTestHook {
+    pub materialized: Arc<std::sync::Barrier>,
+    pub resume: Arc<std::sync::Barrier>,
+}
+
 /// Shared daemon state. All mutable state is behind RwLock for
 /// concurrent access from the reconciliation loop and API handlers.
 pub struct DaemonState {
@@ -280,6 +304,16 @@ pub struct DaemonState {
     /// Incremented on every graph mutation (reconcile, commit, overlay update).
     /// Unlike entity_count, this never decreases on deletions.
     pub vfs_version: AtomicU64,
+    /// Materialized committed VFS view keyed by exact graph head + monotonic version.
+    /// Endpoint handlers never return this entry unless its key still matches live graph truth.
+    pub(crate) vfs_tree_cache: std::sync::RwLock<Option<Arc<VfsTreeSnapshot>>>,
+    /// Single-flight coordinator for cold VFS materialization. Waiters recheck the cache after
+    /// acquiring this lock, so one exact head/version is replayed at most once.
+    pub(crate) vfs_tree_build_lock: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    pub(crate) vfs_tree_build_count: AtomicU64,
+    #[cfg(test)]
+    pub(crate) vfs_tree_build_test_hook: std::sync::Mutex<Option<VfsTreeBuildTestHook>>,
     /// Broadcast channel for SSE invalidation events.
     /// Subscribers (VFS daemon, spine, KinLab) receive real-time notifications.
     pub event_tx: tokio::sync::broadcast::Sender<DaemonEvent>,
@@ -647,6 +681,12 @@ impl DaemonState {
             storage_backend: None,
             snapshot_generation: AtomicU64::new(0),
             vfs_version: AtomicU64::new(persisted_vfs_version),
+            vfs_tree_cache: std::sync::RwLock::new(None),
+            vfs_tree_build_lock: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            vfs_tree_build_count: AtomicU64::new(0),
+            #[cfg(test)]
+            vfs_tree_build_test_hook: std::sync::Mutex::new(None),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
             session_scopes: RwLock::new(HashMap::new()),
@@ -785,6 +825,12 @@ impl DaemonState {
             storage_backend: Some(backend),
             snapshot_generation: AtomicU64::new(generation),
             vfs_version: AtomicU64::new(persisted_vfs_version),
+            vfs_tree_cache: std::sync::RwLock::new(None),
+            vfs_tree_build_lock: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            vfs_tree_build_count: AtomicU64::new(0),
+            #[cfg(test)]
+            vfs_tree_build_test_hook: std::sync::Mutex::new(None),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
             session_scopes: RwLock::new(HashMap::new()),
@@ -1306,6 +1352,15 @@ impl DaemonState {
     /// Also marks the graph as dirty for background persistence.
     pub fn bump_version(&self) {
         let v = self.vfs_version.fetch_add(1, Ordering::SeqCst) + 1;
+        // Retire the old materialization at the same publication boundary. Requests that
+        // already cloned it may finish against the pre-mutation head; every request that
+        // observes the new version must rebuild or reuse a snapshot with the new key.
+        let mut cache = self
+            .vfs_tree_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *cache = None;
+        drop(cache);
         self.mark_dirty();
         // Persist asynchronously — don't block the mutation path.
         let path = self.layout.root().join("vfs_version");
@@ -1601,6 +1656,32 @@ impl DaemonState {
             self.write_generation_marker(generation);
         }
         Ok(outcome.status.pending)
+    }
+
+    /// Force the derived vector sidecar to disk regardless of the in-run flush
+    /// throttle.
+    ///
+    /// While an embed drains, `flush_embed_progress` checkpoints the sidecar on a
+    /// throttle rather than every batch, so a pass that ends time-limited (queue
+    /// not yet drained) can leave the vectors embedded since the last throttle
+    /// tick in memory only. Calling this at a pass boundary lands them durably,
+    /// so a graceful daemon exit before the next pass resumes with the full pass
+    /// persisted instead of re-deriving that last window. The vector index is a
+    /// pure sidecar (not in the merkle root), so this never advances the graph
+    /// generation. Cost is one index serialize per time-limited pass, not per
+    /// batch.
+    pub fn persist_vector_sidecar(&self) -> Result<()> {
+        let _persist_guard = self
+            .persist_lock
+            .lock()
+            .map_err(|_| DaemonError::Io(std::io::Error::other("persist lock poisoned")))?;
+        let embedder_identity = kin_buildinfo::sha_with_dirty(kin_buildinfo::get());
+        kin_db::SnapshotManager::save_vector_index_for_graph(
+            self.layout.kindb_snapshot_path(),
+            self.graph.as_ref(),
+            Some(embedder_identity.as_str()),
+        )
+        .map_err(DaemonError::from)
     }
 
     fn save_read_index(&self) -> Result<()> {
@@ -2060,6 +2141,12 @@ mod tests {
             storage_backend: None,
             snapshot_generation: AtomicU64::new(0),
             vfs_version: AtomicU64::new(0),
+            vfs_tree_cache: std::sync::RwLock::new(None),
+            vfs_tree_build_lock: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            vfs_tree_build_count: AtomicU64::new(0),
+            #[cfg(test)]
+            vfs_tree_build_test_hook: std::sync::Mutex::new(None),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
             session_scopes: RwLock::new(HashMap::new()),
