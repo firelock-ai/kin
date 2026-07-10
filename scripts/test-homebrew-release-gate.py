@@ -612,7 +612,24 @@ def test_escaped_character_literals_cannot_hide_comment_boundaries() -> None:
 
 
 def test_numeric_and_variable_ternaries_cannot_bypass_question_guard() -> None:
-    for condition in ("1", "1_000", "0xff", "@ivar", "@@cvar", "$gvar"):
+    for condition in (
+        "1",
+        "1_000",
+        "0xff",
+        "@ivar",
+        "@@cvar",
+        "$gvar",
+        "$-a",
+        "$-d",
+        "$-F",
+        "$-i",
+        "$-I",
+        "$-l",
+        "$-p",
+        "$-v",
+        "$-w",
+        "$-W",
+    ):
         formula = current_real_formula_shape().replace(
             '    bin.install "kin"',
             f'    value = {condition}?2:3\n    bin.install "kin"',

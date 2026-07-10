@@ -99,8 +99,9 @@ def question_follows_predicate_identifier(line: str, index: int) -> bool:
     ternaries after numeric, instance, class, and global variables (for example
     ``1?2:3`` and ``@flag?2:3``). Predicate method names instead end in an
     identifier whose first character is alphabetic or ``_`` and whose token is
-    not introduced by a variable sigil. Qualified calls such as ``File.exist?``
-    and identifiers containing digits such as ``ready1?`` remain supported.
+    not introduced by a variable sigil, including Ruby's ``$-w`` option-global
+    form. Qualified calls such as ``File.exist?`` and identifiers containing
+    digits such as ``ready1?`` remain supported.
     """
 
     start = index
@@ -109,7 +110,9 @@ def question_follows_predicate_identifier(line: str, index: int) -> bool:
     identifier = line[start:index]
     if not identifier or not (identifier[0].isalpha() or identifier[0] == "_"):
         return False
-    return start == 0 or line[start - 1] not in {"@", "$"}
+    if start > 0 and line[start - 1] in {"@", "$"}:
+        return False
+    return start < 2 or line[start - 2 : start] != "$-"
 
 
 def scan_ruby_line(line: str) -> RubyLineScan:
