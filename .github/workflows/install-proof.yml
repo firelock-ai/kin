@@ -90,9 +90,14 @@ jobs:
           esac
 
           installed_version="$(kin --version | awk '{print $2}')"
+          installed_daemon_version="$(kin-daemon --version | awk '{print $2}')"
           expected_version="${expected_tag#v}"
           if [ "$installed_version" != "$expected_version" ]; then
             echo "installed kin $installed_version, expected latest release $expected_version" >&2
+            exit 1
+          fi
+          if [ "$installed_daemon_version" != "$expected_version" ]; then
+            echo "installed kin-daemon $installed_daemon_version, expected latest release $expected_version" >&2
             exit 1
           fi
           printf '%s\n' "$expected_version" > expected-version.txt
