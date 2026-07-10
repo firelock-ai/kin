@@ -3617,6 +3617,17 @@ async fn embed(
                 .save_snapshot()
                 .map_err(|error| format!("embed snapshot save failed: {error:#}"))?;
             state_for_embed.mark_clean();
+            // A time-limited pass stopped mid-drain, so the throttled per-batch
+            // sidecar flush may not have captured the vectors embedded since the
+            // last throttle tick. Force one sidecar write at the pass boundary so
+            // a graceful daemon exit before the next pass resumes with the full
+            // pass persisted. A pass that drained the queue already wrote the
+            // sidecar unconditionally, so this only fires when work remains.
+            if result.result.time_limited {
+                state_for_embed
+                    .persist_vector_sidecar()
+                    .map_err(|error| format!("embed sidecar persist failed: {error:#}"))?;
+            }
         }
         Ok::<_, String>(result)
     })

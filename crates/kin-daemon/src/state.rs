@@ -1603,6 +1603,32 @@ impl DaemonState {
         Ok(outcome.status.pending)
     }
 
+    /// Force the derived vector sidecar to disk regardless of the in-run flush
+    /// throttle.
+    ///
+    /// While an embed drains, `flush_embed_progress` checkpoints the sidecar on a
+    /// throttle rather than every batch, so a pass that ends time-limited (queue
+    /// not yet drained) can leave the vectors embedded since the last throttle
+    /// tick in memory only. Calling this at a pass boundary lands them durably,
+    /// so a graceful daemon exit before the next pass resumes with the full pass
+    /// persisted instead of re-deriving that last window. The vector index is a
+    /// pure sidecar (not in the merkle root), so this never advances the graph
+    /// generation. Cost is one index serialize per time-limited pass, not per
+    /// batch.
+    pub fn persist_vector_sidecar(&self) -> Result<()> {
+        let _persist_guard = self
+            .persist_lock
+            .lock()
+            .map_err(|_| DaemonError::Io(std::io::Error::other("persist lock poisoned")))?;
+        let embedder_identity = kin_buildinfo::sha_with_dirty(kin_buildinfo::get());
+        kin_db::SnapshotManager::save_vector_index_for_graph(
+            self.layout.kindb_snapshot_path(),
+            self.graph.as_ref(),
+            Some(embedder_identity.as_str()),
+        )
+        .map_err(DaemonError::from)
+    }
+
     fn save_read_index(&self) -> Result<()> {
         let index =
             kin_db::ReadIndex::from_graph(self.graph.as_ref()).map_err(DaemonError::from)?;
