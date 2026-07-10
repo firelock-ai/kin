@@ -504,6 +504,7 @@ pub async fn run(
     // 2. Run locate with explain=true and wider max_files
     let result = crate::commands::locate::capture(
         &query_text,
+        Vec::new(),
         true,
         max_files,
         true,

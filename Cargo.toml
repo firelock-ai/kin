@@ -143,7 +143,7 @@ kin-lsp = { version = "0.2.2", registry = "kin" }
 # backend on every target (incl. Linux, where it cannot compile). Metal is re-enabled
 # additively on macOS via a `[target.'cfg(target_os = "macos")'.dependencies]` block in the
 # binary/runtime crates (kin-cli, kin-daemon). Feature unification makes that additive.
-kin-db = { version = "0.2.31", registry = "kin", default-features = false, features = ["vector", "embeddings"] }
+kin-db = { version = "0.2.33", registry = "kin", default-features = false, features = ["vector", "embeddings"] }
 kin-vfs-core = { version = "0.1.2", registry = "kin" }
 
 [profile.release]

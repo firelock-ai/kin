@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::state::{
     CachedLocateRanking, CachedSemanticPage, DaemonEvent, DaemonState, ProjectionChangedSet,
-    LOCATE_RANKING_CACHE_CAP,
+    VfsTreeCacheKey, VfsTreeSnapshot, LOCATE_RANKING_CACHE_CAP,
 };
 
 use axum::extract::{Path, Query, State};
@@ -3081,6 +3081,12 @@ async fn locate(
         state.graph.compute_root_hash()
     );
 
+    // Multi-query fan-out: primary text plus any additional variants, deduped.
+    // Two-or-more distinct variants trigger RRF fusion; otherwise the single
+    // path runs exactly as before (byte-identical).
+    let variants = build_locate_variants(&req.text, &req.queries);
+    let multi_query = variants.len() >= 2;
+
     let mut result = if let Some(reference) = req.reference.as_deref() {
         // Explicit --ref always takes precedence over session scope.
         // Locating at an unimported Git ref lazily imports its full ancestry;
@@ -3106,41 +3112,75 @@ async fn locate(
             state.mark_clean();
         }
         let head = resolved.head;
-        kin_cli::commands::locate::run_with_graph_capture_at_ref(
-            &state.layout,
-            state.graph.as_ref(),
-            state.blobs.as_ref(),
-            &head,
-            reference,
-            &req.text,
-            req.explain,
-            req.max_files,
-            req.max_files_explicit,
-            snippet_opts,
-        )
-        .map_err(|error| error.to_string())
+        if multi_query {
+            run_multiquery_locate_at_ref(
+                &state,
+                &head,
+                reference,
+                &variants,
+                req.explain,
+                req.max_files,
+                req.max_files_explicit,
+                snippet_opts,
+            )
+        } else {
+            kin_cli::commands::locate::run_with_graph_capture_at_ref(
+                &state.layout,
+                state.graph.as_ref(),
+                state.blobs.as_ref(),
+                &head,
+                reference,
+                &req.text,
+                req.explain,
+                req.max_files,
+                req.max_files_explicit,
+                snippet_opts,
+            )
+            .map_err(|error| error.to_string())
+        }
     } else {
         // Use scoped graph if session has a temporal scope, otherwise HEAD.
         let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-        run_fused_locate_for_state(
-            &state,
-            session_id.as_ref(),
-            graph.as_ref(),
-            &req.text,
-            req.explain,
-            req.max_files,
-            req.max_files_explicit,
-            snippet_opts,
-        )
-        .await
+        if multi_query {
+            run_multiquery_fused_locate(
+                &state,
+                session_id.as_ref(),
+                graph.as_ref(),
+                &variants,
+                req.explain,
+                req.max_files,
+                req.max_files_explicit,
+                snippet_opts,
+            )
+            .await
+        } else {
+            run_fused_locate_for_state(
+                &state,
+                session_id.as_ref(),
+                graph.as_ref(),
+                &req.text,
+                req.explain,
+                req.max_files,
+                req.max_files_explicit,
+                snippet_opts,
+            )
+            .await
+        }
     }
     .map_err(internal_error)?;
 
     // Cache the full entity ranking and window page 0 so a follow-up `--next`
     // pages it from cache without re-running retrieval. Keyed by
-    // (query, ref/scope, graph-version) so any edit invalidates the page.
+    // (query, ref/scope, graph-version) so any edit invalidates the page. A
+    // multi-query ranking keys off the joined variants so it cannot collide with
+    // any single-variant cursor.
+    let key_text = if multi_query {
+        multiquery_cursor_text(&variants)
+    } else {
+        req.text.clone()
+    };
     let key = kin_cli::commands::locate::locate_cursor_key(
-        &req.text,
+        &key_text,
         scope_token.as_deref(),
         graph_version,
     );
@@ -3212,6 +3252,126 @@ async fn run_fused_locate_for_state(
         snippet_opts,
     )
     .map_err(|error| error.to_string())
+}
+
+/// Build the ordered, deduped query-variant list for a multi-query locate: the
+/// primary query first (when non-empty), then each extra variant, trimmed and
+/// de-duplicated exactly so the same phrasing is never retrieved twice. A result
+/// with fewer than two entries means a single-query locate (no fan-out).
+fn build_locate_variants(primary: &str, extra: &[String]) -> Vec<String> {
+    let mut variants: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for candidate in std::iter::once(primary).chain(extra.iter().map(String::as_str)) {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            variants.push(trimmed.to_string());
+        }
+    }
+    variants
+}
+
+/// Canonical cursor-key text for a multi-query ranking: the variants joined by a
+/// unit-separator control char so a fused ranking can never collide with any
+/// single-variant ranking's cursor key.
+fn multiquery_cursor_text(variants: &[String]) -> String {
+    variants.join("\u{1f}")
+}
+
+/// Read a JSON string-array MCP argument into an owned `Vec<String>`, dropping
+/// non-string and blank entries. Absent or non-array → empty (single-query).
+fn arg_string_array(arguments: &HashMap<String, serde_json::Value>, key: &str) -> Vec<String> {
+    arguments
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Fan out a multi-query locate over daemon state: retrieve each variant through
+/// the same fused pipeline `run_fused_locate_for_state` serves, then RRF-fuse the
+/// per-variant rankings into one deduped result with per-hit variant attribution.
+/// Variants are retrieved in order so the fusion is fully deterministic.
+#[allow(clippy::too_many_arguments)]
+async fn run_multiquery_fused_locate(
+    state: &Arc<DaemonState>,
+    session_id: Option<&SessionId>,
+    graph: &kin_db::InMemoryGraph,
+    variants: &[String],
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+    snippet_opts: kin_cli::commands::locate::SnippetOptions,
+) -> Result<kin_cli::commands::locate::LocateResult, String> {
+    let mut per_variant = Vec::with_capacity(variants.len());
+    for variant in variants {
+        per_variant.push(
+            run_fused_locate_for_state(
+                state,
+                session_id,
+                graph,
+                variant,
+                explain,
+                max_files,
+                max_files_explicit,
+                snippet_opts,
+            )
+            .await?,
+        );
+    }
+    Ok(kin_cli::commands::locate::fuse_locate_results(
+        variants.to_vec(),
+        per_variant,
+        kin_cli::commands::locate::locate_rrf_k(),
+    ))
+}
+
+/// Fan out a multi-query locate at an explicit ref: retrieve each variant against
+/// the resolved head graph, then RRF-fuse. Mirrors `run_multiquery_fused_locate`
+/// for the `--ref` path so multi-query is honored there too rather than silently
+/// dropping the extra variants.
+#[allow(clippy::too_many_arguments)]
+fn run_multiquery_locate_at_ref(
+    state: &Arc<DaemonState>,
+    head: &kin_model::SemanticChangeId,
+    reference: &str,
+    variants: &[String],
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+    snippet_opts: kin_cli::commands::locate::SnippetOptions,
+) -> Result<kin_cli::commands::locate::LocateResult, String> {
+    let mut per_variant = Vec::with_capacity(variants.len());
+    for variant in variants {
+        per_variant.push(
+            kin_cli::commands::locate::run_with_graph_capture_at_ref(
+                &state.layout,
+                state.graph.as_ref(),
+                state.blobs.as_ref(),
+                head,
+                reference,
+                variant,
+                explain,
+                max_files,
+                max_files_explicit,
+                snippet_opts,
+            )
+            .map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(kin_cli::commands::locate::fuse_locate_results(
+        variants.to_vec(),
+        per_variant,
+        kin_cli::commands::locate::locate_rrf_k(),
+    ))
 }
 
 /// Insert a full locate ranking into the paging cache, evicting the oldest entry
@@ -3617,6 +3777,17 @@ async fn embed(
                 .save_snapshot()
                 .map_err(|error| format!("embed snapshot save failed: {error:#}"))?;
             state_for_embed.mark_clean();
+            // A time-limited pass stopped mid-drain, so the throttled per-batch
+            // sidecar flush may not have captured the vectors embedded since the
+            // last throttle tick. Force one sidecar write at the pass boundary so
+            // a graceful daemon exit before the next pass resumes with the full
+            // pass persisted. A pass that drained the queue already wrote the
+            // sidecar unconditionally, so this only fires when work remains.
+            if result.result.time_limited {
+                state_for_embed
+                    .persist_vector_sidecar()
+                    .map_err(|error| format!("embed sidecar persist failed: {error:#}"))?;
+            }
         }
         Ok::<_, String>(result)
     })
@@ -4270,6 +4441,11 @@ fn fused_match_evidence(
     if let Some(cosine) = entity.provenance.cosine {
         evidence["seed_cosine"] = json!(cosine);
     }
+    // Under multi-query fusion, report which query variants surfaced this hit.
+    // Absent for a single-query locate, so the evidence object is unchanged.
+    if !entity.matched_queries.is_empty() {
+        evidence["matched_variants"] = json!(entity.matched_queries);
+    }
     evidence
 }
 
@@ -4812,22 +4988,42 @@ async fn build_fused_semantic_locate_result(
         kin_cli::commands::locate::SnippetOptions::default()
     };
 
+    // Multi-query fan-out: `query` plus any additional `queries` variants,
+    // deduped. Two-or-more distinct variants trigger RRF fusion; otherwise the
+    // single fused path runs exactly as before.
+    let variants = build_locate_variants(&query, &arg_string_array(arguments, "queries"));
+    let multi_query = variants.len() >= 2;
+
     // The agent asked for `limit` ranked hits; give the fused pipeline the
     // same number of file slots EXPLICITLY so the adaptive cap cannot shrink
     // the pool below what the caller asked to see (the graph-native entity
     // ranking is projected from the file ranking).
-    let mut locate_result = match run_fused_locate_for_state(
-        state,
-        session_id,
-        graph,
-        &query,
-        explain,
-        limit,
-        true,
-        snippet_opts,
-    )
-    .await
-    {
+    let run_result = if multi_query {
+        run_multiquery_fused_locate(
+            state,
+            session_id,
+            graph,
+            &variants,
+            explain,
+            limit,
+            true,
+            snippet_opts,
+        )
+        .await
+    } else {
+        run_fused_locate_for_state(
+            state,
+            session_id,
+            graph,
+            &query,
+            explain,
+            limit,
+            true,
+            snippet_opts,
+        )
+        .await
+    };
+    let mut locate_result = match run_result {
         Ok(result) => result,
         Err(error) => {
             return kin_mcp::ToolCallResult::error(format!("fused locate failed: {error}"));
@@ -4836,9 +5032,19 @@ async fn build_fused_semantic_locate_result(
 
     // Cache the full entity ranking and window page 0 so a follow-up cursor
     // pages it from cache without re-running retrieval — the same paging the
-    // `POST /locate` endpoint and the cosine arm provide (arm-symmetric).
-    let key =
-        kin_cli::commands::locate::locate_cursor_key(&query, scope_token.as_deref(), graph_version);
+    // `POST /locate` endpoint and the cosine arm provide (arm-symmetric). A
+    // multi-query ranking keys off the joined variants so it cannot collide with
+    // any single-variant cursor.
+    let key_text = if multi_query {
+        multiquery_cursor_text(&variants)
+    } else {
+        query.clone()
+    };
+    let key = kin_cli::commands::locate::locate_cursor_key(
+        &key_text,
+        scope_token.as_deref(),
+        graph_version,
+    );
     cache_locate_ranking(state, &key, &locate_result.entities, graph_version);
     kin_cli::commands::locate::apply_entity_page(&mut locate_result, &key, 0, page_size);
 
@@ -5113,16 +5319,33 @@ async fn mcp_tools_call(
             .arguments
             .get("pipeline")
             .and_then(serde_json::Value::as_str);
+        // Multi-query fan-out (`queries`) is inherently a multi-signal fusion, so
+        // it is served by the fused arm regardless of the default profile — the
+        // legacy single-vector cosine arm does not fuse variant rankings. An
+        // explicit `pipeline: "cosine"` alongside `queries` is a genuine conflict
+        // and is rejected rather than silently dropping the extra variants.
+        let has_extra_queries = !arg_string_array(&request.arguments, "queries").is_empty();
         let use_fused = match pipeline_override {
             Some(value) if value.eq_ignore_ascii_case("fused") => true,
-            Some(value) if value.eq_ignore_ascii_case("cosine") => false,
+            Some(value) if value.eq_ignore_ascii_case("cosine") => {
+                if has_extra_queries {
+                    return Ok(Json(kin_mcp::ToolCallResult::error(
+                        "multi-query `queries` requires the fused pipeline; omit `pipeline` \
+                         or set it to \"fused\""
+                            .to_string(),
+                    )));
+                }
+                false
+            }
             Some(other) => {
                 return Ok(Json(kin_mcp::ToolCallResult::error(format!(
                     "invalid pipeline '{other}': expected \"fused\" or \"cosine\""
                 ))));
             }
             None => {
-                kin_cli::retrieval_profile::RetrievalProfile::from_env().semantic_locate_fused()
+                has_extra_queries
+                    || kin_cli::retrieval_profile::RetrievalProfile::from_env()
+                        .semantic_locate_fused()
             }
         };
         if use_fused {
@@ -6173,53 +6396,154 @@ fn resolve_branch_head(
     }
 }
 
-/// Build the current file tree from the graph's active branch.
-///
-/// Uses `kin_core::build_file_tree` with the genesis change and the current
-/// branch head. Falls back to `main`, then to the first branch, and finally to
-/// an empty tree if no branch exists yet.
-fn build_current_file_tree(
-    state: &DaemonState,
-) -> Result<HashMap<FilePathId, kin_model::Hash256>, (StatusCode, String)> {
-    let Some((genesis_id, head_id)) = resolve_branch_head(state)? else {
-        return Ok(HashMap::new());
-    };
-
-    kin_core::build_file_tree(state.graph.as_ref(), &genesis_id, &head_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+/// Capture an exact VFS cache key without straddling a graph-version change.
+fn current_vfs_cache_key(state: &DaemonState) -> Result<VfsTreeCacheKey, (StatusCode, String)> {
+    for _ in 0..8 {
+        let version_before = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+        let head = resolve_branch_head(state)?.map(|(_, head)| head);
+        let version_after = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+        if version_before == version_after {
+            return Ok(VfsTreeCacheKey {
+                head,
+                version: version_after,
+            });
+        }
+    }
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "graph changed repeatedly while resolving the VFS snapshot key; retry".to_string(),
+    ))
 }
 
-/// Walk the SemanticChange DAG and collect the last-modified epoch timestamp
-/// for each file path.  Uses the same branch resolution as `build_current_file_tree`.
-fn build_current_file_timestamps(
+/// Materialize one committed VFS snapshot for an already-captured graph key.
+fn build_vfs_tree_snapshot(
     state: &DaemonState,
-) -> Result<HashMap<FilePathId, u64>, (StatusCode, String)> {
+    key: VfsTreeCacheKey,
+) -> Result<VfsTreeSnapshot, (StatusCode, String)> {
     use kin_model::ArtifactDeltaKind;
 
-    let Some((genesis_id, head_id)) = resolve_branch_head(state)? else {
-        return Ok(HashMap::new());
+    let Some(head_id) = key.head.clone() else {
+        return Ok(VfsTreeSnapshot {
+            key,
+            files: Arc::new(HashMap::new()),
+            timestamps: Arc::new(HashMap::new()),
+        });
     };
-
+    let genesis_id = kin_core::build_genesis_change().id;
     let changes = state
         .graph
         .get_changes_since(&genesis_id, &head_id)
         .map_err(internal_error)?;
 
+    let mut files: HashMap<FilePathId, kin_model::Hash256> = HashMap::new();
     let mut timestamps: HashMap<FilePathId, u64> = HashMap::new();
     for change in &changes {
         let epoch_secs = change.timestamp.0.timestamp() as u64;
         for delta in &change.artifact_deltas {
             match delta.kind {
                 ArtifactDeltaKind::Added | ArtifactDeltaKind::Modified => {
+                    if let Some(hash) = delta.new_hash {
+                        files.insert(delta.file_id.clone(), hash);
+                    }
                     timestamps.insert(delta.file_id.clone(), epoch_secs);
                 }
                 ArtifactDeltaKind::Removed => {
+                    files.remove(&delta.file_id);
                     timestamps.remove(&delta.file_id);
                 }
             }
         }
     }
-    Ok(timestamps)
+
+    #[cfg(test)]
+    {
+        state
+            .vfs_tree_build_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let hook = state
+            .vfs_tree_build_test_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook.materialized.wait();
+            hook.resume.wait();
+        }
+    }
+
+    Ok(VfsTreeSnapshot {
+        key,
+        files: Arc::new(files),
+        timestamps: Arc::new(timestamps),
+    })
+}
+
+/// Return the graph-derived VFS snapshot for the exact current head/version.
+///
+/// Cache misses build on the blocking pool. The key is checked again after the build and under
+/// the cache write lock, so a concurrent head change can never publish or return a stale view.
+async fn current_vfs_snapshot(
+    state: &Arc<DaemonState>,
+) -> Result<Arc<VfsTreeSnapshot>, (StatusCode, String)> {
+    for _ in 0..8 {
+        let mut key = current_vfs_cache_key(state)?;
+        if let Some(snapshot) = read_recover(&state.vfs_tree_cache).as_ref() {
+            if snapshot.key == key {
+                return Ok(Arc::clone(snapshot));
+            }
+        }
+
+        // Serialize cold fills, then recheck both graph identity and the cache. All waiters for
+        // one head/version reuse the first fill instead of replaying the DAG independently.
+        let _build_guard = state.vfs_tree_build_lock.lock().await;
+        key = current_vfs_cache_key(state)?;
+        if let Some(snapshot) = read_recover(&state.vfs_tree_cache).as_ref() {
+            if snapshot.key == key {
+                return Ok(Arc::clone(snapshot));
+            }
+        }
+
+        let build_state = Arc::clone(state);
+        let build_key = key.clone();
+        let snapshot =
+            tokio::task::spawn_blocking(move || build_vfs_tree_snapshot(&build_state, build_key))
+                .await
+                .map_err(|error| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("VFS snapshot build task failed: {error}"),
+                    )
+                })??;
+
+        // Recheck the complete graph identity after replay. This is deliberately outside the
+        // cache lock to avoid a cache->graph lock-order inversion with mutation paths.
+        if current_vfs_cache_key(state)? != key {
+            continue;
+        }
+
+        let snapshot = Arc::new(snapshot);
+        let mut cache = write_recover(&state.vfs_tree_cache);
+        // A mutation can land between the full-key check above and this lock. Version is the
+        // publication/CAS token: bump_version increments it before taking this same write lock
+        // to clear the cache. Therefore an old builder can publish only before the mutation
+        // boundary completes; after a completed invalidation it is discarded here.
+        let published_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+        if published_version != key.version {
+            continue;
+        }
+        if let Some(existing) = cache.as_ref() {
+            if existing.key == key {
+                return Ok(Arc::clone(existing));
+            }
+        }
+        *cache = Some(Arc::clone(&snapshot));
+        return Ok(snapshot);
+    }
+
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "graph kept changing while materializing the VFS snapshot; retry".to_string(),
+    ))
 }
 
 /// GET /vfs/version — monotonic counter that increments on graph mutations.
@@ -6234,8 +6558,8 @@ async fn vfs_version(State(state): State<Arc<DaemonState>>) -> impl IntoResponse
 async fn vfs_tree(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let mut tree = build_current_file_tree(&state)?;
-    let timestamps = build_current_file_timestamps(&state)?;
+    let snapshot = current_vfs_snapshot(&state).await?;
+    let mut tree = (*snapshot.files).clone();
 
     // Merge overlay: add files for new entities, remove deleted entities' files.
     let wc = state.working_copy.read().await;
@@ -6264,9 +6588,10 @@ async fn vfs_tree(
         .map(|(path, hash)| (path.0, hash.to_string()))
         .collect();
 
-    let ts: HashMap<String, u64> = timestamps
-        .into_iter()
-        .map(|(path, epoch)| (path.0, epoch))
+    let ts: HashMap<String, u64> = snapshot
+        .timestamps
+        .iter()
+        .map(|(path, epoch)| (path.0.clone(), *epoch))
         .collect();
 
     Ok(Json(json!({ "files": files, "timestamps": ts })))
@@ -6277,8 +6602,9 @@ async fn vfs_stat(
     Path(path): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let tree = build_current_file_tree(&state)?;
-    let timestamps = build_current_file_timestamps(&state)?;
+    let snapshot = current_vfs_snapshot(&state).await?;
+    let tree = &snapshot.files;
+    let timestamps = &snapshot.timestamps;
 
     // Check if the path is a file.
     let file_id = FilePathId::new(&path);
@@ -6346,7 +6672,8 @@ async fn vfs_read(
     Query(params): Query<VfsReadParams>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let tree = build_current_file_tree(&state)?;
+    let snapshot = current_vfs_snapshot(&state).await?;
+    let tree = &snapshot.files;
 
     let file_id = FilePathId::new(&path);
     let hash = tree
@@ -6418,7 +6745,8 @@ async fn vfs_readdir(
     Path(path): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let tree = build_current_file_tree(&state)?;
+    let snapshot = current_vfs_snapshot(&state).await?;
+    let tree = &snapshot.files;
 
     let prefix = if path.is_empty() || path == "." {
         String::new()
@@ -7447,10 +7775,10 @@ fn repo_name(state: &DaemonState) -> String {
 /// Collect the current file tree contents as (path, bytes) pairs.
 fn collect_archive_files(
     state: &DaemonState,
+    snapshot: &VfsTreeSnapshot,
 ) -> Result<Vec<(String, Vec<u8>)>, (StatusCode, String)> {
-    let tree = build_current_file_tree(state)?;
-    let mut files: Vec<(String, Vec<u8>)> = Vec::with_capacity(tree.len());
-    for (file_id, hash) in &tree {
+    let mut files: Vec<(String, Vec<u8>)> = Vec::with_capacity(snapshot.files.len());
+    for (file_id, hash) in snapshot.files.iter() {
         let blob_hash = kin_blobs::Hash256(hash.0);
         let data = state.blobs.read(&blob_hash).map_err(|e| {
             (
@@ -7469,7 +7797,8 @@ async fn archive_tar_gz(
     Path(git_ref): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let files = collect_archive_files(&state)?;
+    let snapshot = current_vfs_snapshot(&state).await?;
+    let files = collect_archive_files(&state, &snapshot)?;
     let name = repo_name(&state);
     let prefix = format!("{name}-{git_ref}/");
 
@@ -7521,7 +7850,8 @@ async fn archive_zip(
     Path(git_ref): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let files = collect_archive_files(&state)?;
+    let snapshot = current_vfs_snapshot(&state).await?;
+    let files = collect_archive_files(&state, &snapshot)?;
     let name = repo_name(&state);
     let prefix = format!("{name}-{git_ref}/");
 
@@ -7968,6 +8298,7 @@ mod tests {
                 origin: "vector".into(),
                 cosine: Some(0.42),
             },
+            matched_queries: Vec::new(),
         };
         let ev = fused_match_evidence("parse the request", &with_explain);
         assert_eq!(ev["ranker"], json!("fused-v1"));
@@ -7994,6 +8325,85 @@ mod tests {
     }
 
     #[test]
+    fn build_locate_variants_dedups_and_keeps_primary_first() {
+        // Primary first, blanks dropped, exact duplicates collapsed, order stable.
+        let variants = build_locate_variants(
+            "primary query",
+            &[
+                "  ".to_string(),
+                "variant two".to_string(),
+                "primary query".to_string(),
+                "variant three".to_string(),
+                "variant two".to_string(),
+            ],
+        );
+        assert_eq!(
+            variants,
+            vec![
+                "primary query".to_string(),
+                "variant two".to_string(),
+                "variant three".to_string(),
+            ]
+        );
+        // An empty primary with variants yields a variant-only list.
+        assert_eq!(
+            build_locate_variants("", &["only".to_string()]),
+            vec!["only".to_string()]
+        );
+        // No variants → the single primary; a single entry means no fan-out.
+        assert_eq!(build_locate_variants("solo", &[]), vec!["solo".to_string()]);
+    }
+
+    #[test]
+    fn arg_string_array_reads_only_string_items() {
+        let mut args: HashMap<String, serde_json::Value> = HashMap::new();
+        args.insert(
+            "queries".to_string(),
+            json!(["alpha", 7, "beta", null, "gamma"]),
+        );
+        assert_eq!(
+            arg_string_array(&args, "queries"),
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+        );
+        // Absent or non-array → empty (a single-query call).
+        assert!(arg_string_array(&args, "missing").is_empty());
+        args.insert("queries".to_string(), json!("not-an-array"));
+        assert!(arg_string_array(&args, "queries").is_empty());
+    }
+
+    #[test]
+    fn fused_match_evidence_reports_matched_variants_under_fusion() {
+        use kin_cli::commands::locate::{LocateEntity, LocateProvenance};
+        let mut entity = LocateEntity {
+            entity_id: "e1".into(),
+            kind: "function".into(),
+            name: "parse_request".into(),
+            signature: String::new(),
+            score: 0.9,
+            definition: true,
+            span: None,
+            body: None,
+            provenance: LocateProvenance {
+                file: Some("src/lib.rs".into()),
+                origin: String::new(),
+                cosine: None,
+            },
+            matched_queries: Vec::new(),
+        };
+        // No attribution → no matched_variants key (single-query byte-identical).
+        assert!(fused_match_evidence("q", &entity)
+            .get("matched_variants")
+            .is_none());
+        // With attribution → the variant texts are surfaced additively.
+        entity.matched_queries = vec!["ParseRequest".into(), "parse the request".into()];
+        let ev = fused_match_evidence("q", &entity);
+        assert_eq!(
+            ev["matched_variants"],
+            json!(["ParseRequest", "parse the request"])
+        );
+    }
+
+    #[test]
     fn fused_payload_attaches_match_evidence_additively_and_in_order() {
         use kin_cli::commands::locate::{LocateEntity, LocateProvenance, LocateResult};
         let mk = |id: &str, name: &str| LocateEntity {
@@ -8010,6 +8420,7 @@ mod tests {
                 origin: String::new(),
                 cosine: None,
             },
+            matched_queries: Vec::new(),
         };
         let result = LocateResult {
             entities: vec![mk("a", "alpha"), mk("b", "beta")],
@@ -8423,6 +8834,47 @@ mod tests {
             })
             .unwrap();
         kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
+    }
+
+    fn advance_branch_with_file(
+        state: &Arc<DaemonState>,
+        rel_path: &str,
+        content: &[u8],
+        id_byte: u8,
+    ) {
+        let branch_name = BranchName::new("main");
+        let parent = state
+            .graph
+            .get_branch(&branch_name)
+            .unwrap()
+            .expect("main branch")
+            .head;
+        let blob_hash = state.blobs.write(content).unwrap();
+        let change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
+            parents: vec![parent],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "advance test branch".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![ArtifactDelta {
+                file_id: FilePathId::new(rel_path),
+                kind: ArtifactDeltaKind::Added,
+                old_hash: None,
+                new_hash: Some(blob_hash),
+            }],
+            projected_files: vec![FilePathId::new(rel_path)],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(branch_name.clone()),
+        };
+        state.graph.create_change(&change).unwrap();
+        state
+            .graph
+            .update_branch_head(&branch_name, &change.id)
+            .unwrap();
     }
 
     #[tokio::test]
@@ -9871,7 +10323,7 @@ mod tests {
     }
 
     #[test]
-    fn foreground_embed_batch_flush_defers_sidecar_while_queue_pending() {
+    fn foreground_embed_batch_flush_checkpoints_sidecar_on_throttle() {
         let state = test_state();
         state
             .graph
@@ -9886,11 +10338,23 @@ mod tests {
         state.graph.queue_missing_for_embedding();
         assert!(state.graph.pending_embeddings() > 0);
 
+        // The first in-run flush checkpoints the sidecar so persisted coverage
+        // tracks compute from the first batch (the persist-wedge fix).
+        std::fs::remove_file(&vector_path).unwrap();
+        persist_foreground_embed_batch(state.as_ref()).unwrap();
+        assert!(
+            vector_path.exists(),
+            "the first foreground per-batch flush must checkpoint the sidecar"
+        );
+
+        // An immediate follow-up flush is throttled (within the interval and the
+        // batch backstop), so a long run is not billed a full index serialize on
+        // every batch while work is still pending.
         std::fs::remove_file(&vector_path).unwrap();
         persist_foreground_embed_batch(state.as_ref()).unwrap();
         assert!(
             !vector_path.exists(),
-            "foreground per-batch flush must defer the sidecar while work is pending"
+            "an immediate follow-up foreground flush must be throttled while work is pending"
         );
     }
 
@@ -10614,6 +11078,179 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["files"].as_object().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn vfs_snapshot_reuses_materialization_at_the_same_graph_key() {
+        let state = test_state();
+        install_branch_file(&state, "src/one.rs", b"one");
+        state.bump_version();
+
+        let first = current_vfs_snapshot(&state).await.unwrap();
+        let second = current_vfs_snapshot(&state).await.unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(first.files.contains_key(&FilePathId::new("src/one.rs")));
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_vfs_readers_single_flight_one_materialization() {
+        use std::sync::atomic::Ordering;
+
+        const READERS: usize = 24;
+        let state = test_state();
+        install_branch_file(&state, "src/one.rs", b"one");
+        state.bump_version();
+
+        let start = Arc::new(tokio::sync::Barrier::new(READERS));
+        let mut readers = Vec::new();
+        for _ in 0..READERS {
+            let state = Arc::clone(&state);
+            let start = Arc::clone(&start);
+            readers.push(tokio::spawn(async move {
+                start.wait().await;
+                current_vfs_snapshot(&state).await.unwrap()
+            }));
+        }
+
+        let mut snapshots = Vec::new();
+        for reader in readers {
+            snapshots.push(reader.await.unwrap());
+        }
+        let first = &snapshots[0];
+        assert!(snapshots
+            .iter()
+            .all(|snapshot| Arc::ptr_eq(first, snapshot)));
+        assert_eq!(state.vfs_tree_build_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn old_vfs_builder_held_across_invalidation_cannot_publish_stale_snapshot() {
+        use std::sync::atomic::Ordering;
+
+        let state = test_state();
+        install_branch_file(&state, "src/one.rs", b"one");
+        state.bump_version();
+
+        let materialized = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        *state
+            .vfs_tree_build_test_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(crate::state::VfsTreeBuildTestHook {
+                materialized: Arc::clone(&materialized),
+                resume: Arc::clone(&resume),
+            });
+
+        let old_builder = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { current_vfs_snapshot(&state).await.unwrap() })
+        };
+        tokio::task::spawn_blocking(move || materialized.wait())
+            .await
+            .unwrap();
+
+        // The first build has materialized the old head but has not reached publication.
+        // Complete a head change and cache invalidation before allowing it to continue.
+        advance_branch_with_file(&state, "src/two.rs", b"two", 0x7a);
+        state.bump_version();
+        tokio::task::spawn_blocking(move || resume.wait())
+            .await
+            .unwrap();
+
+        let observed = old_builder.await.unwrap();
+        assert!(observed.files.contains_key(&FilePathId::new("src/one.rs")));
+        assert!(observed.files.contains_key(&FilePathId::new("src/two.rs")));
+        assert_eq!(state.vfs_tree_build_count.load(Ordering::SeqCst), 2);
+
+        let cached = read_recover(&state.vfs_tree_cache)
+            .as_ref()
+            .cloned()
+            .expect("new-head snapshot cached");
+        assert!(Arc::ptr_eq(&observed, &cached));
+        assert_eq!(observed.key, current_vfs_cache_key(&state).unwrap());
+    }
+
+    #[tokio::test]
+    async fn vfs_snapshot_invalidates_on_head_change_without_serving_stale_tree() {
+        let state = test_state();
+        install_branch_file(&state, "src/one.rs", b"one");
+        state.bump_version();
+        let first = current_vfs_snapshot(&state).await.unwrap();
+
+        advance_branch_with_file(&state, "src/two.rs", b"two", 0x78);
+        state.bump_version();
+
+        assert!(read_recover(&state.vfs_tree_cache).is_none());
+
+        let refreshed = current_vfs_snapshot(&state).await.unwrap();
+        assert!(!Arc::ptr_eq(&first, &refreshed));
+        assert_ne!(first.key, refreshed.key);
+        assert!(refreshed.files.contains_key(&FilePathId::new("src/one.rs")));
+        assert!(refreshed.files.contains_key(&FilePathId::new("src/two.rs")));
+
+        let mut readers = Vec::new();
+        for _ in 0..16 {
+            let state = Arc::clone(&state);
+            readers.push(tokio::spawn(async move {
+                current_vfs_snapshot(&state).await.unwrap()
+            }));
+        }
+        for reader in readers {
+            let observed = reader.await.unwrap();
+            assert_eq!(observed.key, refreshed.key);
+            assert!(Arc::ptr_eq(&observed, &refreshed));
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_vfs_readers_never_reuse_the_old_head_after_invalidation() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        const READERS: usize = 16;
+        let state = test_state();
+        install_branch_file(&state, "src/one.rs", b"one");
+        state.bump_version();
+        let old = current_vfs_snapshot(&state).await.unwrap();
+
+        let start = Arc::new(tokio::sync::Barrier::new(READERS + 1));
+        let invalidated = Arc::new(AtomicBool::new(false));
+        let post_invalidation_reads = Arc::new(AtomicUsize::new(0));
+        let mut readers = Vec::new();
+        for _ in 0..READERS {
+            let state = Arc::clone(&state);
+            let start = Arc::clone(&start);
+            let invalidated = Arc::clone(&invalidated);
+            let post_invalidation_reads = Arc::clone(&post_invalidation_reads);
+            let old_key = old.key.clone();
+            readers.push(tokio::spawn(async move {
+                start.wait().await;
+                loop {
+                    let began_after_invalidation = invalidated.load(Ordering::Acquire);
+                    let observed = current_vfs_snapshot(&state).await.unwrap();
+                    if began_after_invalidation {
+                        assert_ne!(observed.key, old_key);
+                        assert!(observed.files.contains_key(&FilePathId::new("src/two.rs")));
+                        post_invalidation_reads.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        // Release the readers against the warm old-head cache, then publish a new head while
+        // those tasks are actively issuing snapshot requests.
+        start.wait().await;
+        advance_branch_with_file(&state, "src/two.rs", b"two", 0x79);
+        state.bump_version();
+        invalidated.store(true, Ordering::Release);
+
+        for reader in readers {
+            reader.await.unwrap();
+        }
+        assert_eq!(post_invalidation_reads.load(Ordering::Relaxed), READERS);
     }
 
     #[tokio::test]
@@ -12458,6 +13095,7 @@ mod tests {
                     .body(Body::from(
                         serde_json::to_string(&kin_cli::daemon_client::LocateRequest {
                             text: "parse config".to_string(),
+                            queries: Vec::new(),
                             explain: false,
                             max_files: 10,
                             max_files_explicit: true,
@@ -12647,6 +13285,7 @@ mod tests {
                     .body(Body::from(
                         serde_json::to_string(&kin_cli::daemon_client::LocateRequest {
                             text: "parse config".to_string(),
+                            queries: Vec::new(),
                             explain: false,
                             max_files: 10,
                             max_files_explicit: true,

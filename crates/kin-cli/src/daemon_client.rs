@@ -163,6 +163,12 @@ pub struct DaemonClient {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocateRequest {
     pub text: String,
+    /// Additional query variants for multi-query fan-out. When non-empty the
+    /// daemon retrieves `text` plus each variant independently and RRF-fuses the
+    /// rankings into one deduped result, with per-hit variant attribution. Empty
+    /// (the default) is a single-query locate, serialized identically to before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queries: Vec<String>,
     pub explain: bool,
     pub max_files: usize,
     pub max_files_explicit: bool,
