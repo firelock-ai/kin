@@ -6889,12 +6889,95 @@ fn curate_search_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<
             });
         }
         fallback.truncate(locate_env_usize("KIN_LOCATE_FALLBACK_TERM_LIMIT", 6));
-        return Ok(fallback);
+        return Ok(augment_terms_with_query_identifiers(text, fallback));
     }
 
     // Skip graph expansion — it adds noise terms that dilute specificity.
     // The entity-first pipeline handles graph exploration in Phase 2.
-    Ok(curated)
+    Ok(augment_terms_with_query_identifiers(text, curated))
+}
+
+/// Identifier tokens pulled straight out of the raw query. This keeps a long,
+/// prose-heavy problem statement from being distilled down to one or two generic
+/// tokens: a multi-sentence issue whose curated terms collapse to a single
+/// domain word (e.g. `["behavior"]`) starves both the text and vector tracks of
+/// the actual symbols to anchor on. Only genuinely identifier-shaped tokens
+/// survive — CamelCase, snake_case, SCREAMING_SNAKE, dotted/qualified, and
+/// CLI-flag forms — while stopwords, generic code modifiers, numerics, and issue
+/// boilerplate are dropped. Pure lexical: no graph lookups, no network, no
+/// model — fully deterministic for a given query.
+fn preserved_query_identifiers(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for term in extract_search_terms(text) {
+        // Keep only compound/symbolic identifiers, not bare prose words, so the
+        // augmentation anchors on code entities rather than English.
+        if !is_symbolic_search_term(&term) {
+            continue;
+        }
+        let canonical = term.to_ascii_lowercase();
+        if is_english_stopword(&canonical)
+            || is_generic_code_modifier_term(&canonical)
+            || is_numeric_issue_term(&canonical)
+            || is_issue_boilerplate_term(&canonical)
+            || is_noise_term(&canonical)
+        {
+            continue;
+        }
+        if seen.insert(canonical) {
+            out.push(term);
+        }
+    }
+    out
+}
+
+/// Union identifier tokens from the raw query into the curated term set,
+/// front-loading them so they survive the downstream `take(N)` that the vector
+/// track applies before embedding. Curated terms (which passed the graph-support
+/// gate) are always retained by reserving slots for them. Deterministic and
+/// order-stable. `KIN_LOCATE_PRESERVE_QUERY_IDENTIFIERS` is OFF by default, so
+/// the returned set is byte-identical to `curated` unless the lever is set.
+fn augment_terms_with_query_identifiers(text: &str, curated: Vec<String>) -> Vec<String> {
+    if !locate_env_bool("KIN_LOCATE_PRESERVE_QUERY_IDENTIFIERS", false) {
+        return curated;
+    }
+    let limit = locate_env_usize("KIN_LOCATE_QUERY_IDENTIFIER_LIMIT", 10);
+    merge_query_identifier_terms(preserved_query_identifiers(text), curated, limit)
+}
+
+/// Pure merge used by [`augment_terms_with_query_identifiers`]: prepend as many
+/// query-identifier tokens as fit once room is reserved for the curated set, then
+/// append the curated terms, deduping case-insensitively and capping at `limit`.
+/// Curated terms are never evicted by the identifiers.
+fn merge_query_identifier_terms(
+    identifiers: Vec<String>,
+    curated: Vec<String>,
+    limit: usize,
+) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let curated_reserve = curated.len().min(limit);
+    let identifier_budget = limit.saturating_sub(curated_reserve);
+    let mut merged = Vec::with_capacity(limit);
+    let mut seen = HashSet::new();
+    for term in identifiers {
+        if merged.len() >= identifier_budget {
+            break;
+        }
+        if seen.insert(term.to_ascii_lowercase()) {
+            merged.push(term);
+        }
+    }
+    for term in curated {
+        if merged.len() >= limit {
+            break;
+        }
+        if seen.insert(term.to_ascii_lowercase()) {
+            merged.push(term);
+        }
+    }
+    merged
 }
 
 fn term_has_graph_support(
@@ -19013,6 +19096,149 @@ mod tests {
             .any(|term| term.eq_ignore_ascii_case("serialise")));
         assert!(!terms.iter().any(|term| term.eq_ignore_ascii_case("empty")));
         assert!(!terms.iter().any(|term| term.eq_ignore_ascii_case("commit")));
+    }
+
+    #[test]
+    fn preserved_query_identifiers_preserves_identifiers_from_prose() {
+        // A multi-sentence problem statement whose curated terms would otherwise
+        // collapse to a generic domain word. The identifier-bearing tokens must
+        // survive: CamelCase, snake_case, and the qualified pair.
+        let text = "Stale package entries linger in the scan report after a purge.\n\n\
+             The ScanReport keeps them because RemoveStalePackFromReport never runs \
+             during finalize. Update purge_stale_entries so the report stays consistent.";
+        let terms = preserved_query_identifiers(text);
+
+        assert!(terms.iter().any(|t| t == "ScanReport"), "{terms:?}");
+        assert!(
+            terms.iter().any(|t| t == "RemoveStalePackFromReport"),
+            "{terms:?}"
+        );
+        assert!(
+            terms.iter().any(|t| t == "purge_stale_entries"),
+            "{terms:?}"
+        );
+        // Bare prose words are not identifier-shaped and must be dropped.
+        for prose in ["stale", "package", "report", "update", "during", "the"] {
+            assert!(
+                !terms.iter().any(|t| t.eq_ignore_ascii_case(prose)),
+                "prose term {prose} leaked into {terms:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserved_query_identifiers_is_deterministic() {
+        let text = "The ScanReport keeps them because RemoveStalePackFromReport never \
+             runs during finalize. Update purge_stale_entries and RefreshReport.";
+        let first = preserved_query_identifiers(text);
+        let second = preserved_query_identifiers(text);
+        assert_eq!(first, second);
+        // Order is stable across the identifier kinds encountered in the text.
+        assert!(first.len() >= 3, "{first:?}");
+    }
+
+    #[test]
+    fn preserved_query_identifiers_drops_stopwords_numerics_and_modifiers() {
+        // Numerics, stopwords, and generic code modifiers must never be treated
+        // as entity anchors even when adjacent to real identifiers.
+        let text = "When public and private members change, issue 12345 breaks ScanReport.";
+        let terms = preserved_query_identifiers(text);
+        assert!(terms.iter().any(|t| t == "ScanReport"), "{terms:?}");
+        for dropped in ["public", "private", "12345", "when", "and"] {
+            assert!(
+                !terms.iter().any(|t| t.eq_ignore_ascii_case(dropped)),
+                "{dropped} leaked into {terms:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserved_query_identifiers_short_prose_query_yields_nothing() {
+        // A short natural-language query with no identifier-shaped tokens must
+        // contribute nothing — the augmentation only fires on real symbols.
+        assert!(preserved_query_identifiers("fix the failing case").is_empty());
+        // A short query that names one symbol keeps exactly that symbol.
+        assert_eq!(
+            preserved_query_identifiers("call ScanReport"),
+            vec!["ScanReport".to_string()]
+        );
+    }
+
+    #[test]
+    fn merge_query_identifier_terms_prepends_identifiers_and_keeps_curated() {
+        // The collapse case: curated distilled down to one generic token; the
+        // identifiers must be front-loaded so the vector track's take(N) sees
+        // them, and the curated token must still be retained.
+        let merged = merge_query_identifier_terms(
+            vec![
+                "RemoveStalePackFromReport".to_string(),
+                "ScanReport".to_string(),
+            ],
+            vec!["behavior".to_string()],
+            10,
+        );
+        assert_eq!(
+            merged,
+            vec![
+                "RemoveStalePackFromReport".to_string(),
+                "ScanReport".to_string(),
+                "behavior".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_query_identifier_terms_dedups_case_insensitively() {
+        let merged = merge_query_identifier_terms(
+            vec!["ScanReport".to_string(), "scanreport".to_string()],
+            vec!["ScanReport".to_string(), "behavior".to_string()],
+            10,
+        );
+        assert_eq!(
+            merged,
+            vec!["ScanReport".to_string(), "behavior".to_string()]
+        );
+    }
+
+    #[test]
+    fn merge_query_identifier_terms_never_evicts_curated() {
+        // Even with more identifiers than the cap, every curated term survives
+        // because slots are reserved for the graph-supported set.
+        let identifiers: Vec<String> = (0..20).map(|i| format!("SymbolNum{i}")).collect();
+        let curated = vec![
+            "AlphaType".to_string(),
+            "beta_handler".to_string(),
+            "GammaModule".to_string(),
+        ];
+        let merged = merge_query_identifier_terms(identifiers, curated.clone(), 6);
+        assert_eq!(merged.len(), 6);
+        for term in &curated {
+            assert!(
+                merged.contains(term),
+                "curated {term} evicted from {merged:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_query_identifier_terms_zero_limit_is_empty() {
+        assert!(merge_query_identifier_terms(
+            vec!["ScanReport".to_string()],
+            vec!["behavior".to_string()],
+            0
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn augment_terms_with_query_identifiers_off_is_byte_identical() {
+        // Default (lever unset) must return the curated set untouched.
+        let curated = vec!["behavior".to_string(), "ScanReport".to_string()];
+        let out = augment_terms_with_query_identifiers(
+            "The ScanReport keeps RemoveStalePackFromReport stale entries around.",
+            curated.clone(),
+        );
+        assert_eq!(out, curated);
     }
 
     #[test]
