@@ -223,6 +223,9 @@ mod tests {
         assert_eq!(resolve_repo_override(None), None);
     }
 
+    // Serialized against every other test that mutates the process-global
+    // `KIN_DAEMON_URL` (its sibling below, and the init bootstrap test) so a
+    // concurrent set/remove from another test can never be observed mid-body.
     #[tokio::test]
     #[serial]
     async fn bind_daemon_reports_missing_repo_without_hard_error() {

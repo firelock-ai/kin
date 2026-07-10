@@ -41,6 +41,27 @@ pub const SHADOW_GATE_REPORT_SCHEMA_VERSION: u32 = 1;
 /// Enforcement label carried by every shadow report.
 pub const SHADOW_ENFORCEMENT_REPORT_ONLY: &str = "report_only";
 
+/// In-range committed-change count above which an empty blast radius is
+/// attributed to a deep-history substrate-fidelity ceiling rather than treated
+/// as proven isolation.
+///
+/// A review whose base..head range spans this many committed changes reaches
+/// far enough back that the persisted graph substrate it reads at the head ref
+/// — replayed faithfully, but built long ago — drifts further from what a live
+/// re-index would produce than a nearby range does (FIR-1267): the deeper the
+/// range, the more the persisted relation closure and entity roles diverge.
+/// When such a range ALSO
+/// yields an empty blast radius, that emptiness is more plausibly a ceiling of
+/// the historical substrate than evidence the change is genuinely isolated, so
+/// the report attributes it explicitly (a non-demoting `deep_history_impact_ceiling`
+/// gap) instead of leaving it folded into the generic `impact_signal_absent`.
+///
+/// This threshold is a RANGE-DEPTH PROXY, not a measurement of reconstruction:
+/// it gates only whether the attribution gap is emitted. The raw in-range
+/// change count is always stamped on the report (`range_depth.in_range_changes`)
+/// so downstream scoring can apply its own policy to the exact number.
+pub const DEEP_HISTORY_IMPACT_CEILING_THRESHOLD: usize = 1000;
+
 /// Inputs for one shadow gate evaluation.
 #[derive(Debug, Clone)]
 pub struct ShadowRequest {
@@ -213,8 +234,8 @@ pub struct ShadowRepairItem {
 pub struct ShadowEvidenceGap {
     /// "artifact_only_change" | "entity_inert_change" | "missing_span"
     /// | "actor_attribution_unavailable" | "impact_signal_absent"
-    /// | "cross_repo_not_evaluated" | "ref_state_unavailable"
-    /// | "base_not_on_head_ancestry"
+    /// | "deep_history_impact_ceiling" | "cross_repo_not_evaluated"
+    /// | "ref_state_unavailable" | "base_not_on_head_ancestry"
     pub kind: String,
     pub subject: String,
     pub detail: String,
@@ -251,6 +272,29 @@ pub struct ShadowAuditEvidence {
     pub head_approvals: Vec<ShadowApproval>,
 }
 
+/// Provenance for how deep the reviewed `base..head` range reaches, stamped on
+/// every report so downstream scoring can attribute an accepted historical-
+/// substrate ceiling (FIR-1267) instead of scoring a deep-history row as clean.
+///
+/// The raw count is ALWAYS present and independent of any threshold; the
+/// threshold gates only the non-demoting `deep_history_impact_ceiling` evidence
+/// gap, never this data. A scorer may read `in_range_changes` and apply its own
+/// policy, or trust `is_deep_history` for the report's own default policy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShadowRangeDepth {
+    /// Count of committed semantic changes in the reviewed `base..head` range
+    /// (the same range the audit records as `changes_in_range`).
+    pub in_range_changes: usize,
+    /// The documented threshold this report used to decide `is_deep_history`.
+    pub deep_history_threshold: usize,
+    /// `in_range_changes > deep_history_threshold`. When this is true AND the
+    /// blast radius is empty, the report carries a non-demoting
+    /// `deep_history_impact_ceiling` gap attributing the empty impact to a
+    /// range-depth proxy for historical-substrate fidelity rather than to
+    /// proven isolation.
+    pub is_deep_history: bool,
+}
+
 /// The complete shadow-mode merge-gate report.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShadowGateReport {
@@ -264,6 +308,11 @@ pub struct ShadowGateReport {
     pub repair_context: Vec<ShadowRepairItem>,
     pub evidence_gaps: Vec<ShadowEvidenceGap>,
     pub audit: ShadowAuditEvidence,
+    /// Range-depth provenance (see [`ShadowRangeDepth`]). Additive and
+    /// `serde(default)` so a report serialized before this field existed still
+    /// deserializes.
+    #[serde(default)]
+    pub range_depth: ShadowRangeDepth,
 }
 
 /// Build a shadow-mode merge-gate report for a resolved base..head range.
@@ -535,6 +584,17 @@ fn assemble_report_with_changes<G: GraphStore>(
     let repair_context = collect_repair_context(&policy.findings, &review);
     let audit = collect_audit_evidence(store, request, &review, changes.len())?;
 
+    // Range-depth provenance is stamped on every report from the same in-range
+    // change count the audit records. Always present and threshold-independent;
+    // the threshold decides only `is_deep_history` (and thus whether the
+    // non-demoting `deep_history_impact_ceiling` gap fires in
+    // `collect_evidence_gaps`), never whether the raw count is reported.
+    let range_depth = ShadowRangeDepth {
+        in_range_changes: changes.len(),
+        deep_history_threshold: DEEP_HISTORY_IMPACT_CEILING_THRESHOLD,
+        is_deep_history: changes.len() > DEEP_HISTORY_IMPACT_CEILING_THRESHOLD,
+    };
+
     Ok(ShadowGateReport {
         schema_version: SHADOW_GATE_REPORT_SCHEMA_VERSION,
         mode: "shadow".to_string(),
@@ -553,6 +613,7 @@ fn assemble_report_with_changes<G: GraphStore>(
         repair_context,
         evidence_gaps,
         audit,
+        range_depth,
     })
 }
 
@@ -803,6 +864,11 @@ fn is_blocking(kind: InlineCommentKind) -> bool {
 ///   itself remains the honest record of the deficit, and the coverage-gap
 ///   channel is suppressed on the same condition so the empty channel is
 ///   never double-counted.
+/// - `deep_history_impact_ceiling` is reported but never demotes: it is a
+///   range-depth PROXY attributing an empty blast radius on a deep range to a
+///   historical-substrate ceiling (FIR-1267). Absence of evidence is not
+///   evidence of risk, so it makes the ceiling attributable without changing
+///   the verdict.
 /// - Structural v1 limits (cross-repo not evaluated, attribution
 ///   unavailable) are constant framing, reported but never demoting.
 fn gap_blocks_pass(gap: &ShadowEvidenceGap) -> bool {
@@ -824,6 +890,22 @@ fn artifact_subject_is_source_class(subject: &str) -> bool {
         kin_index::FileClassification::EntitySource
             | kin_index::FileClassification::ShallowSyntax { .. }
     )
+}
+
+/// Derive the shadow gate policy from an already-assembled [`Review`].
+///
+/// The production path materializes ref-state to build the `Review`,
+/// `evidence_gaps`, and `changed_entities` before running the internal policy
+/// step. Callers and tests that already hold a `Review` (diff + impact + inline
+/// comments) — a review-only re-evaluation over an existing prepared graph, or
+/// an end-to-end gate assertion — derive the same verdict here without
+/// re-materializing ref-state. Mirrors the crate-public [`crate::derive_decision`].
+pub fn derive_shadow_policy(
+    review: &Review,
+    evidence_gaps: &[ShadowEvidenceGap],
+    changed_entities: &[ShadowChangedEntity],
+) -> ShadowPolicyResult {
+    derive_policy(review, evidence_gaps, changed_entities)
 }
 
 fn derive_policy(
@@ -889,36 +971,64 @@ fn derive_policy(
         let mut surface_candidates: Vec<_> = review.diff.entity_changes.iter().collect();
         surface_candidates.sort_by_key(|change| change.entity_id);
         for change in surface_candidates {
-            let (name, location, surface_changed, demote_removal) = match &change.kind {
-                EntityChangeKind::Modified { old, new } => (
-                    new.name.clone(),
-                    new.span
-                        .as_ref()
-                        .map(|span| (span.file.to_string(), span.start_line)),
-                    (old.signature != new.signature
-                        && !crate::inline::signature_runtime_neutral(
+            let (name, location, surface_changed, demote_removal, rename_neutral) =
+                match &change.kind {
+                    EntityChangeKind::Modified { old, new } => {
+                        // An arity-preserving parameter rename whose graph-known
+                        // call sites all pass positionally strands no consumer.
+                        // Mirror the inline signature-change channel (inline.rs)
+                        // so this shadow downstream_risk channel demotes the same
+                        // runtime-neutral rename instead of re-blocking it. Reuse
+                        // the shipped classifiers (single source of truth); they
+                        // are Python-only, so a non-Python rename yields `None`
+                        // here and stays blocking.
+                        let rename_neutral = match crate::inline::arity_preserving_rename(
                             &old.signature,
                             &new.signature,
-                        ))
-                        || old.visibility != new.visibility,
-                    false,
-                ),
-                EntityChangeKind::Removed(id) => {
-                    let id_string = id.to_string();
-                    let unresolvable = unresolvable_removed.contains(id_string.as_str());
-                    let name = resolved_names
-                        .get(id_string.as_str())
-                        .map(|name| name.to_string())
-                        .unwrap_or(id_string);
-                    // Same-diff remove + re-add of the same entity name is a
-                    // move; the surviving entity carries any surface risk.
-                    if added_names.contains(name.as_str()) {
-                        continue;
+                        ) {
+                            Some(renamed) => {
+                                let summary = review
+                                    .impact
+                                    .entity_impact(&change.entity_id)
+                                    .map(|entry| entry.call_shapes.clone())
+                                    .unwrap_or_default();
+                                crate::inline::rename_is_runtime_neutral_for_consumers(
+                                    &renamed, &summary,
+                                )
+                            }
+                            None => false,
+                        };
+                        (
+                            new.name.clone(),
+                            new.span
+                                .as_ref()
+                                .map(|span| (span.file.to_string(), span.start_line)),
+                            (old.signature != new.signature
+                                && !crate::inline::signature_runtime_neutral(
+                                    &old.signature,
+                                    &new.signature,
+                                ))
+                                || old.visibility != new.visibility,
+                            false,
+                            rename_neutral,
+                        )
                     }
-                    (name, None, true, unresolvable)
-                }
-                EntityChangeKind::Added(_) => continue,
-            };
+                    EntityChangeKind::Removed(id) => {
+                        let id_string = id.to_string();
+                        let unresolvable = unresolvable_removed.contains(id_string.as_str());
+                        let name = resolved_names
+                            .get(id_string.as_str())
+                            .map(|name| name.to_string())
+                            .unwrap_or(id_string);
+                        // Same-diff remove + re-add of the same entity name is a
+                        // move; the surviving entity carries any surface risk.
+                        if added_names.contains(name.as_str()) {
+                            continue;
+                        }
+                        (name, None, true, unresolvable, false)
+                    }
+                    EntityChangeKind::Added(_) => continue,
+                };
             if !surface_changed {
                 continue;
             }
@@ -946,17 +1056,29 @@ fn derive_policy(
             if already_blocking {
                 continue;
             }
-            // An unresolvable removal reports its downstream risk as attention,
-            // not a would_block: naming the severed surface as a raw UUID is
-            // not enough proof to certify a blocking breakage.
+            // Demote (do not suppress) this downstream risk to attention when we
+            // cannot certify a block: an unresolvable removal (severed surface
+            // named only as a raw UUID) or an arity-preserving rename proven
+            // runtime-neutral by its call sites. The contract surface genuinely
+            // changed, so the finding stays visible evidence; it just no longer
+            // gates. A rename carries the positional-safety proof in its message
+            // for parity with the inline signature-change channel.
+            let demote = demote_removal || rename_neutral;
             findings.push(ShadowPolicyFinding {
                 kind: "downstream_risk".to_string(),
-                severity: if demote_removal { "warning" } else { "error" }.to_string(),
-                blocking: !demote_removal,
-                message: format!(
-                    "Contract surface of `{}` changed with {} graph-known downstream entity(ies)",
-                    name, entity_consumers
-                ),
+                severity: if demote { "warning" } else { "error" }.to_string(),
+                blocking: !demote,
+                message: if rename_neutral {
+                    format!(
+                        "Contract surface of `{}` changed with {} graph-known downstream entity(ies); all {} graph-known call site(s) pass positionally — no runtime break",
+                        name, entity_consumers, entity_consumers
+                    )
+                } else {
+                    format!(
+                        "Contract surface of `{}` changed with {} graph-known downstream entity(ies)",
+                        name, entity_consumers
+                    )
+                },
                 file: location.as_ref().map(|(file, _)| file.clone()),
                 line: location.as_ref().map(|(_, line)| *line),
             });
@@ -1401,6 +1523,34 @@ fn collect_evidence_gaps<G: GraphStore>(
                      repository before treating the empty blast radius as proof of isolation"
                 .to_string(),
         });
+
+        // A deep base..head range reaches far enough back that the persisted
+        // graph substrate the review replays at head drifts further from a live
+        // re-index than a nearby range does (FIR-1267). When such a range ALSO
+        // yields an empty blast radius (the condition above), attribute that
+        // emptiness explicitly to the range-depth ceiling instead of leaving it
+        // folded into the generic impact_signal_absent gap. This is a
+        // RANGE-DEPTH PROXY, not a measurement of reconstruction, and it is
+        // NON-DEMOTING (`gap_blocks_pass` returns false for this kind): it never
+        // changes the verdict, only makes the ceiling attributable to scoring.
+        // The raw range depth is stamped on the report regardless (`range_depth`).
+        if changes.len() > DEEP_HISTORY_IMPACT_CEILING_THRESHOLD {
+            gaps.push(ShadowEvidenceGap {
+                kind: "deep_history_impact_ceiling".to_string(),
+                subject: "blast_radius".to_string(),
+                detail: format!(
+                    "reviewed range spans {} committed changes (over the {} deep-history \
+                     threshold). This is a RANGE-DEPTH PROXY for historical-substrate fidelity \
+                     (FIR-1267): across a range this deep the graph state materialized at the \
+                     head ref is a less faithful representation than a live re-index, so an empty \
+                     blast radius is more plausibly a substrate ceiling than proof the change is \
+                     isolated. Reported as an accepted ceiling and NON-DEMOTING; the raw range \
+                     depth is stamped on the report for scoring",
+                    changes.len(),
+                    DEEP_HISTORY_IMPACT_CEILING_THRESHOLD
+                ),
+            });
+        }
     }
 
     // Actor attribution requires recorded audit events; absence is a gap, not
@@ -2161,6 +2311,180 @@ mod tests {
             &[],
         );
         assert_eq!(policy.verdict, ShadowGateVerdict::Pass);
+    }
+
+    fn low_risk() -> kin_model::review::RiskSummary {
+        kin_model::review::RiskSummary {
+            overall_risk: kin_model::review::RiskLevel::Low,
+            breaking_changes: vec![],
+            test_coverage_gaps: vec![],
+            contract_violations: vec![],
+            work_risks: vec![],
+            notes: vec![],
+        }
+    }
+
+    fn review_with_impact(impact: ImpactReport) -> Review {
+        Review {
+            base: None,
+            head: None,
+            diff: SemanticDiff::default(),
+            impact,
+            risk: low_risk(),
+            inline_comments: vec![],
+        }
+    }
+
+    // A range of `n` committed changes. Ids may repeat: only the count feeds the
+    // deep-history gate, and the changes carry no artifact deltas so they add no
+    // other gaps.
+    fn range_of(n: usize) -> Vec<SemanticChange> {
+        (0..n)
+            .map(|i| change_with_deltas(change_id((i % 251) as u8), vec![], vec![], vec![], vec![]))
+            .collect()
+    }
+
+    fn one_changed_entity() -> Vec<ShadowChangedEntity> {
+        vec![ShadowChangedEntity {
+            entity_id: "e1".to_string(),
+            name: "foo".to_string(),
+            kind: "Function".to_string(),
+            change: "modified".to_string(),
+            file: Some("src/lib.rs".to_string()),
+            start_line: Some(1),
+            end_line: Some(2),
+            signature_changed: false,
+            visibility_changed: false,
+            role: EntityRole::Source,
+        }]
+    }
+
+    #[test]
+    fn deep_history_impact_ceiling_gap_fires_only_on_deep_empty_range() {
+        let changed = one_changed_entity();
+        let has_ceiling = |gaps: &[ShadowEvidenceGap]| {
+            gaps.iter().any(|g| g.kind == "deep_history_impact_ceiling")
+        };
+
+        // Deep range + empty blast radius + changed entities -> ceiling attributed,
+        // riding ALONGSIDE the generic empty-impact gap (never replacing it, so
+        // the existing relation_channel_absent gate logic is untouched).
+        let deep = range_of(DEEP_HISTORY_IMPACT_CEILING_THRESHOLD + 1);
+        let (gaps, _) = collect_evidence_gaps::<InMemoryGraph>(
+            &review_with_impact(ImpactReport::default()),
+            &deep,
+            &changed,
+            None,
+            None,
+        );
+        assert!(
+            has_ceiling(&gaps),
+            "a deep range with an empty blast radius must attribute the ceiling"
+        );
+        assert!(gaps.iter().any(|g| g.kind == "impact_signal_absent"));
+
+        // A range AT the threshold (not over it) attributes no ceiling.
+        let shallow = range_of(DEEP_HISTORY_IMPACT_CEILING_THRESHOLD);
+        let (gaps, _) = collect_evidence_gaps::<InMemoryGraph>(
+            &review_with_impact(ImpactReport::default()),
+            &shallow,
+            &changed,
+            None,
+            None,
+        );
+        assert!(
+            !has_ceiling(&gaps),
+            "a range at the threshold must not attribute a ceiling"
+        );
+        assert!(gaps.iter().any(|g| g.kind == "impact_signal_absent"));
+
+        // Deep range but a NON-empty blast radius: impact was proven, so there is
+        // nothing to attribute to a substrate ceiling.
+        let mut nonempty = ImpactReport::default();
+        nonempty.affected_callers = vec![entity_with_span(
+            "consumer",
+            "src/c.rs",
+            1,
+            EntityRole::Source,
+        )];
+        let (gaps, _) = collect_evidence_gaps::<InMemoryGraph>(
+            &review_with_impact(nonempty),
+            &deep,
+            &changed,
+            None,
+            None,
+        );
+        assert!(
+            !has_ceiling(&gaps),
+            "a non-empty blast radius must not attribute a ceiling"
+        );
+    }
+
+    #[test]
+    fn deep_history_impact_ceiling_gap_is_non_demoting() {
+        let ceiling = ShadowEvidenceGap {
+            kind: "deep_history_impact_ceiling".to_string(),
+            subject: "blast_radius".to_string(),
+            detail: "range-depth proxy".to_string(),
+        };
+        // The gate never fails to certify a pass over an accepted ceiling.
+        assert!(!gap_blocks_pass(&ceiling));
+
+        // And it leaves the verdict a would-be pass produces exactly as it was.
+        let review = review_with_impact(ImpactReport::default());
+        let baseline = derive_policy(&review, &[], &[]);
+        let with_ceiling = derive_policy(&review, std::slice::from_ref(&ceiling), &[]);
+        assert_eq!(baseline.verdict, ShadowGateVerdict::Pass);
+        assert_eq!(
+            with_ceiling.verdict, baseline.verdict,
+            "the ceiling attribution must not change the verdict"
+        );
+    }
+
+    #[test]
+    fn report_stamps_range_depth_and_round_trips() {
+        let (graph, base_id, head_id) = signature_change_graph();
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+
+        // T1b: the raw in-range count is always stamped, mirrors the audit
+        // count, and records the threshold used. This fixture's range is shallow.
+        assert_eq!(
+            report.range_depth.in_range_changes,
+            report.audit.changes_in_range
+        );
+        assert_eq!(
+            report.range_depth.deep_history_threshold,
+            DEEP_HISTORY_IMPACT_CEILING_THRESHOLD
+        );
+        assert!(!report.range_depth.is_deep_history);
+        assert!(report
+            .evidence_gaps
+            .iter()
+            .all(|g| g.kind != "deep_history_impact_ceiling"));
+
+        // JSON round-trip: the additive field survives serialize -> deserialize.
+        let json = serde_json::to_string(&report).unwrap();
+        let parsed: ShadowGateReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.range_depth.in_range_changes,
+            report.range_depth.in_range_changes
+        );
+        assert_eq!(
+            parsed.range_depth.deep_history_threshold,
+            DEEP_HISTORY_IMPACT_CEILING_THRESHOLD
+        );
+        assert_eq!(
+            parsed.range_depth.is_deep_history,
+            report.range_depth.is_deep_history
+        );
+
+        // A payload serialized before the field existed still deserializes: the
+        // field is serde(default). Drop it from the JSON and re-parse.
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value.as_object_mut().unwrap().remove("range_depth");
+        let legacy: ShadowGateReport = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.range_depth.in_range_changes, 0);
+        assert!(!legacy.range_depth.is_deep_history);
     }
 
     #[test]
@@ -3222,6 +3546,214 @@ mod tests {
             .expect("resolvable removal with a consumer carries a downstream risk");
         assert!(finding.blocking);
         assert_eq!(policy.verdict, ShadowGateVerdict::WouldBlock);
+    }
+
+    /// Build a Review for an arity-preserving positional rename
+    /// (`def makefile_target(ext, args)` → `def makefile_target(ext, lines)`)
+    /// with 3 graph-known consumers whose call shapes are `call_shapes`. Exercises
+    /// the shadow `downstream_risk` channel in isolation (no inline comments).
+    fn positional_rename_review(call_shapes: crate::impact::ConsumerCallShapeSummary) -> Review {
+        use crate::diff::{EntityChange, EntityChangeKind, SemanticDiff};
+        use crate::impact::{EntityImpact, ImpactReport};
+        use kin_model::review::{RiskLevel, RiskSummary};
+
+        let mut old = entity_with_span(
+            "makefile_target",
+            "src/pytester.py",
+            610,
+            EntityRole::Source,
+        );
+        old.signature = "def makefile_target(ext, args)".to_string();
+        let mut new = old.clone();
+        new.signature = "def makefile_target(ext, lines)".to_string();
+
+        Review {
+            base: None,
+            head: None,
+            diff: SemanticDiff {
+                base: None,
+                head: None,
+                entity_changes: vec![EntityChange {
+                    entity_id: new.id,
+                    kind: EntityChangeKind::Modified {
+                        old,
+                        new: new.clone(),
+                    },
+                }],
+                relation_changes: vec![],
+            },
+            impact: ImpactReport {
+                entity_impacts: vec![EntityImpact {
+                    entity_id: new.id,
+                    consumer_count: 3,
+                    strong_consumer_count: 3,
+                    contract_consumer_count: 0,
+                    consumer_files: vec![
+                        "src/pytester.py".to_string(),
+                        "src/pytester.py".to_string(),
+                        "src/pytester.py".to_string(),
+                    ],
+                    covering_tests: 0,
+                    consumers_migrated_in_diff: 0,
+                    call_shapes,
+                }],
+                ..Default::default()
+            },
+            risk: RiskSummary {
+                overall_risk: RiskLevel::Low,
+                breaking_changes: vec![],
+                test_coverage_gaps: vec![],
+                contract_violations: vec![],
+                work_risks: vec![],
+                notes: vec![],
+            },
+            inline_comments: vec![],
+        }
+    }
+
+    #[test]
+    fn shadow_downstream_risk_demotes_runtime_neutral_positional_rename() {
+        // FIR-1440: the shadow `downstream_risk` channel is a SEPARATE gate from
+        // the inline signature-change channel. An arity-preserving rename whose
+        // graph-known call sites all pass positionally is runtime-neutral, yet
+        // pre-fix this channel still emitted a BLOCKING downstream_risk (verdict
+        // WouldBlock) because it consulted only `signature_runtime_neutral`, not
+        // the rename classifiers. Post-fix it demotes to a non-blocking warning
+        // (verdict NeedsAttention), matching the inline channel.
+        let call_shapes = crate::impact::ConsumerCallShapeSummary {
+            caller_keyword_names: std::collections::BTreeSet::new(),
+            any_var_keyword_caller: false,
+            all_consumers_shaped_calls: true,
+        };
+        let review = positional_rename_review(call_shapes);
+        let policy = derive_policy(&review, &[], &[]);
+        let finding = policy
+            .findings
+            .iter()
+            .find(|f| f.kind == "downstream_risk")
+            .expect("a renamed contract surface with 3 consumers carries a downstream risk");
+        // GREEN (post-fix): demoted to attention. Pre-fix this was blocking/error
+        // with a WouldBlock verdict — the shipped FIR-1440 bug.
+        assert!(
+            !finding.blocking,
+            "a positional-safe rename must not block the shadow gate"
+        );
+        assert_eq!(finding.severity, "warning");
+        assert!(
+            finding
+                .message
+                .contains("pass positionally — no runtime break"),
+            "the demoted message carries the positional-safety proof for parity with \
+             the inline channel; got: {}",
+            finding.message
+        );
+        assert!(
+            finding
+                .message
+                .contains("3 graph-known downstream entity(ies)"),
+            "message names the consumer count; got: {}",
+            finding.message
+        );
+        assert_eq!(policy.verdict, ShadowGateVerdict::NeedsAttention);
+        assert_ne!(policy.verdict, ShadowGateVerdict::WouldBlock);
+    }
+
+    /// Negative-control helper: a rename we cannot prove runtime-neutral must keep
+    /// blocking the shadow gate — guards against over-suppression.
+    fn assert_positional_rename_stays_blocking(
+        call_shapes: crate::impact::ConsumerCallShapeSummary,
+        case: &str,
+    ) {
+        let review = positional_rename_review(call_shapes);
+        let policy = derive_policy(&review, &[], &[]);
+        let finding = policy
+            .findings
+            .iter()
+            .find(|f| f.kind == "downstream_risk")
+            .unwrap_or_else(|| panic!("{case}: expected a downstream_risk finding"));
+        assert!(
+            finding.blocking,
+            "{case}: an unprovable rename must stay blocking (no over-suppression)"
+        );
+        assert_eq!(finding.severity, "error", "{case}: stays error severity");
+        assert!(
+            !finding.message.contains("no runtime break"),
+            "{case}: must not carry the positional-safe proof"
+        );
+        assert_eq!(
+            policy.verdict,
+            ShadowGateVerdict::WouldBlock,
+            "{case}: a rename that is not provably neutral still blocks"
+        );
+    }
+
+    #[test]
+    fn shadow_downstream_risk_blocks_keyword_caller_rename() {
+        // A consumer passes the RENAMED parameter (`args`) by keyword, so the
+        // rename strands it. Stays blocking.
+        let mut kw = std::collections::BTreeSet::new();
+        kw.insert("args".to_string());
+        assert_positional_rename_stays_blocking(
+            crate::impact::ConsumerCallShapeSummary {
+                caller_keyword_names: kw,
+                any_var_keyword_caller: false,
+                all_consumers_shaped_calls: true,
+            },
+            "keyword-caller",
+        );
+    }
+
+    #[test]
+    fn shadow_downstream_risk_blocks_var_keyword_caller_rename() {
+        // A consumer forwards `**kwargs`; its keyword set is unknown and could
+        // carry the renamed name. Stays blocking.
+        assert_positional_rename_stays_blocking(
+            crate::impact::ConsumerCallShapeSummary {
+                caller_keyword_names: std::collections::BTreeSet::new(),
+                any_var_keyword_caller: true,
+                all_consumers_shaped_calls: true,
+            },
+            "var-keyword-caller",
+        );
+    }
+
+    #[test]
+    fn shadow_downstream_risk_blocks_unshaped_consumer_rename() {
+        // A counted consumer carries no call-shape evidence (non-call edge or an
+        // uncaptured shape), so the rename cannot be proven safe. Stays blocking.
+        assert_positional_rename_stays_blocking(
+            crate::impact::ConsumerCallShapeSummary {
+                caller_keyword_names: std::collections::BTreeSet::new(),
+                any_var_keyword_caller: false,
+                all_consumers_shaped_calls: false,
+            },
+            "unshaped-consumer",
+        );
+    }
+
+    #[test]
+    fn shadow_demoted_rename_message_is_deterministic() {
+        // The demoted message reads only a count and sorted BTreeSet call_shapes,
+        // so repeated evaluation must be byte-identical (citable-gate determinism).
+        let call_shapes = crate::impact::ConsumerCallShapeSummary {
+            caller_keyword_names: std::collections::BTreeSet::new(),
+            any_var_keyword_caller: false,
+            all_consumers_shaped_calls: true,
+        };
+        let message_of = || {
+            let review = positional_rename_review(call_shapes.clone());
+            derive_policy(&review, &[], &[])
+                .findings
+                .into_iter()
+                .find(|f| f.kind == "downstream_risk")
+                .expect("downstream_risk present")
+                .message
+        };
+        assert_eq!(
+            message_of(),
+            message_of(),
+            "the demoted rename message must be byte-identical across runs"
+        );
     }
 
     #[test]

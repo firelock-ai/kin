@@ -3835,10 +3835,22 @@ async fn blame(
     let execution =
         kin_cli::commands::blame::execute_blame_request(&state.layout, graph.as_ref(), &req)
             .map_err(internal_error)?;
-    if execution.hydrated_git_history {
+    if execution.hydrated_changes > 0 {
+        tracing::info!(
+            hydrated_changes = execution.hydrated_changes,
+            "blame hydrated historical changes into the graph"
+        );
         state.bump_version();
         state.save_snapshot().map_err(internal_error)?;
         state.mark_clean();
+        // A live SSE subscriber (e.g. the VFS daemon) should hear about this
+        // graph growth exactly like any other root change — otherwise a
+        // hydration-only blame is invisible to anything watching /events in
+        // real time, even though it just persisted a potentially large import.
+        state.emit_event(DaemonEvent::GraphRootChanged {
+            old_root_hash: None,
+            new_root_hash: "blame-hydration".to_string(),
+        });
     }
     Ok(Json(execution.response))
 }
@@ -3875,10 +3887,22 @@ async fn history(
     let execution =
         kin_cli::commands::history::execute_history_request(&state.layout, graph.as_ref(), &req)
             .map_err(internal_error)?;
-    if execution.hydrated_git_history {
+    if execution.hydrated_changes > 0 {
+        tracing::info!(
+            hydrated_changes = execution.hydrated_changes,
+            "history hydrated historical changes into the graph"
+        );
         state.bump_version();
         state.save_snapshot().map_err(internal_error)?;
         state.mark_clean();
+        // A live SSE subscriber (e.g. the VFS daemon) should hear about this
+        // graph growth exactly like any other root change — otherwise a
+        // hydration-only history is invisible to anything watching /events in
+        // real time, even though it just persisted a potentially large import.
+        state.emit_event(DaemonEvent::GraphRootChanged {
+            old_root_hash: None,
+            new_root_hash: "history-hydration".to_string(),
+        });
     }
     Ok(Json(execution.response))
 }
@@ -10448,6 +10472,82 @@ mod tests {
             .lines
             .iter()
             .any(|line| line.contains("add handler")));
+    }
+
+    // A blame/history request that resolves an already-present head imports
+    // nothing (hydrated_changes == 0), so neither handler may broadcast a
+    // hydration `GraphRootChanged`. A spurious event would wake every /events
+    // subscriber (the VFS daemon) for a read-only query that grew no graph
+    // state. This guards the gate on the new truthful count: the event fires
+    // only when an import actually happened.
+    #[tokio::test]
+    async fn warm_blame_and_history_emit_no_graph_root_changed_event() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let entity = test_entity("handler", "src/lib.py");
+        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x43; 32]));
+        state
+            .graph
+            .create_change(&SemanticChange {
+                id: change_id,
+                parents: vec![],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "add handler".to_string(),
+                entity_deltas: vec![EntityDelta::Added(entity.clone())],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+        state.graph.upsert_entity(&entity).unwrap();
+        state
+            .graph
+            .create_branch(&Branch {
+                name: BranchName::new("main"),
+                head: change_id,
+            })
+            .unwrap();
+        kin_core::write_current_branch(&state.layout, &BranchName::new("main")).unwrap();
+
+        // Subscribe before issuing any request so every broadcast is observable.
+        let mut events = state.event_tx.subscribe();
+        let app = router(state);
+
+        for endpoint in ["/blame", "/history"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(endpoint)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({ "entity": "handler" }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint} must succeed");
+        }
+
+        // No reference was supplied, so resolution imported nothing: neither
+        // handler may have broadcast a hydration GraphRootChanged.
+        loop {
+            match events.try_recv() {
+                Ok(DaemonEvent::GraphRootChanged { new_root_hash, .. }) => panic!(
+                    "warm blame/history must not emit GraphRootChanged, got new_root_hash={new_root_hash:?}"
+                ),
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
     }
 
     #[tokio::test]

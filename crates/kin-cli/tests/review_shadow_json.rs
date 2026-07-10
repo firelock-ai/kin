@@ -165,6 +165,46 @@ fn run_shadow_json(repo: &Path, base: &str, head: &str) -> Value {
     serde_json::from_slice(&output.stdout).expect("shadow report must be valid JSON on stdout")
 }
 
+/// Every shadow report stamps `range_depth` provenance (T1b): the raw in-range
+/// change count, the documented threshold, and whether the range is deep. The
+/// count is always present and threshold-independent; the threshold gates only
+/// the non-demoting `deep_history_impact_ceiling` gap, which a shallow fixture
+/// range like this one never carries. Proves the additive field survives the
+/// real CLI JSON serialization end to end.
+#[test]
+fn shadow_report_stamps_range_depth_provenance() {
+    let dir = tempdir().expect("tempdir");
+    let repo = dir.path();
+    let (base, head, _artifact_head) = setup_fixture_repo(repo);
+    kin_init(repo);
+
+    let report = run_shadow_json(repo, &base, &head);
+
+    let range_depth = report
+        .get("range_depth")
+        .expect("shadow report must stamp range_depth provenance");
+    assert!(
+        range_depth["in_range_changes"].as_u64().is_some(),
+        "range_depth.in_range_changes must be a present count: {range_depth}"
+    );
+    assert_eq!(
+        range_depth["deep_history_threshold"].as_u64(),
+        Some(1000),
+        "range_depth records the documented deep-history threshold"
+    );
+    assert_eq!(
+        range_depth["is_deep_history"].as_bool(),
+        Some(false),
+        "a shallow two-commit range must not be flagged deep-history"
+    );
+    let gaps = report["evidence_gaps"].as_array().unwrap();
+    assert!(
+        gaps.iter()
+            .all(|gap| gap["kind"] != "deep_history_impact_ceiling"),
+        "a shallow range must not attribute a deep-history ceiling: {gaps:?}"
+    );
+}
+
 #[test]
 fn shadow_report_end_to_end_change_in_report_out() {
     let dir = tempdir().expect("tempdir");
@@ -559,5 +599,97 @@ fn shadow_report_unknown_abbreviated_sha_fails_friendly() {
     assert!(
         !stderr.contains("HTTP 500"),
         "unknown abbreviated shas must not surface as opaque server errors: {stderr}"
+    );
+}
+
+/// Fixture: base defines `compute_total` plus a single-header amalgamated copy
+/// under `single_include/` that "consumes" it; head changes `compute_total`'s
+/// signature. The amalgamated bundle is a byte-regenerated copy of the sources,
+/// so `classify_file_role` maps `single_include/*` to `Generated` and it must
+/// never count as an independent breaking consumer.
+fn setup_generated_consumer_repo(repo: &Path) -> (String, String) {
+    std::fs::create_dir_all(repo.join("src")).expect("create src");
+    std::fs::create_dir_all(repo.join("single_include")).expect("create single_include");
+    std::fs::write(
+        repo.join("src/billing.rs"),
+        "pub fn compute_total(amount: u64) -> u64 {\n    amount + fee()\n}\n\nfn fee() -> u64 {\n    3\n}\n",
+    )
+    .expect("write billing.rs");
+    std::fs::write(
+        repo.join("single_include/billing_amalgamated.rs"),
+        "use crate::billing::compute_total;\n\npub fn bundled_total(amount: u64) -> u64 {\n    compute_total(amount)\n}\n",
+    )
+    .expect("write amalgamated bundle");
+    std::fs::write(repo.join("src/lib.rs"), "pub mod billing;\n").expect("write lib.rs");
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.email", "shadow-test@example.com"]);
+    run_git(repo, &["config", "user.name", "Shadow Test"]);
+    run_git(repo, &["add", "-A"]);
+    run_git(
+        repo,
+        &["commit", "-m", "base: billing with amalgamated bundle"],
+    );
+    let base = git_head(repo);
+
+    std::fs::write(
+        repo.join("src/billing.rs"),
+        "pub fn compute_total(amount: u64, currency: &str) -> u64 {\n    let _ = currency;\n    amount + fee()\n}\n\nfn fee() -> u64 {\n    3\n}\n",
+    )
+    .expect("rewrite billing.rs");
+    run_git(repo, &["add", "-A"]);
+    run_git(
+        repo,
+        &["commit", "-m", "head: change compute_total signature"],
+    );
+    let head = git_head(repo);
+
+    (base, head)
+}
+
+/// FIR-1267 (687 false would_block), end-to-end: a signature change whose only
+/// cross-file consumer is a generated single-header copy must not raise a
+/// blocking breaking finding. This exercises the same `Generated`-consumer
+/// exclusion through the full CLI + graph gate that
+/// `ref_view::tests::generated_consumer_excluded_at_historical_ref` proves for
+/// the historical-ref reconstruction path.
+#[test]
+fn shadow_generated_copy_consumer_does_not_block() {
+    let dir = tempdir().expect("tempdir");
+    let repo = dir.path();
+    let (base, head) = setup_generated_consumer_repo(repo);
+    kin_init(repo);
+
+    let report = run_shadow_json(repo, &base, &head);
+
+    // The signature change is still captured as a real change...
+    let changed = report["changed_entities"].as_array().unwrap();
+    assert!(
+        changed
+            .iter()
+            .any(|entity| entity["name"] == "compute_total" && entity["signature_changed"] == true),
+        "compute_total signature change must be captured: {report}"
+    );
+
+    // ...but its only consumer is a generated copy, so the verdict must not block.
+    let verdict = report["policy"]["verdict"].as_str().unwrap();
+    assert_ne!(
+        verdict, "would_block",
+        "a signature change whose only consumer is a generated single-header copy \
+         must not block: {report}"
+    );
+
+    // And no blocking breaking finding may be raised on the generated consumer.
+    let blocking_breaking =
+        report["policy"]["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| {
+                finding["blocking"].as_bool().unwrap_or(false) && finding["kind"] == "breaking"
+            });
+    assert!(
+        !blocking_breaking,
+        "generated-copy-only consumer must not produce a blocking breaking finding: {report}"
     );
 }
