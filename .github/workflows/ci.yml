@@ -98,6 +98,9 @@ jobs:
       - name: Validate installer checksum fixtures
         run: python3 scripts/test-install-checksum.py
 
+      - name: Validate mandatory Homebrew release outcome gate
+        run: python3 scripts/test-homebrew-release-gate.py
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.96.0
         with:
