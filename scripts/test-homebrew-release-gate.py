@@ -52,6 +52,13 @@ args_path = pathlib.Path(os.environ["FAKE_CURL_ARGS"])
 with args_path.open("a", encoding="utf-8") as handle:
     handle.write(" ".join(sys.argv[1:]) + "\n")
 
+try:
+    output_index = sys.argv.index("--output")
+    output_path = pathlib.Path(sys.argv[output_index + 1])
+except (ValueError, IndexError):
+    print("fake curl requires an --output destination", file=sys.stderr)
+    raise SystemExit(22)
+
 url = sys.argv[-1]
 if "kind=formula" in url:
     kind = "formula"
@@ -196,9 +203,17 @@ if kind == "formula":
     success_after = int(os.environ.get("FAKE_CURL_SUCCESS_AFTER", "1"))
     ready = state["formula"] >= success_after
     mode = os.environ.get("FAKE_FORMULA_MODE", "valid") if ready else "stale_version"
-    print(render_formula(mode, ready))
+    payload = render_formula(mode, ready).encode() + b"\n"
+    if mode == "raw_nul":
+        payload = payload[:-1] + b"\0\n"
 else:
-    print(render_sidecar(os.environ.get("FAKE_SIDECAR_MODE", "valid"), artifact))
+    payload = (
+        render_sidecar(os.environ.get("FAKE_SIDECAR_MODE", "valid"), artifact).encode()
+        + b"\n"
+    )
+    if os.environ.get("FAKE_SIDECAR_NUL_ARTIFACT") == artifact:
+        payload = payload[:-1] + b"\0\n"
+output_path.write_bytes(payload)
 """
 
 
@@ -210,6 +225,7 @@ def verifier_env(
     success_after: int,
     formula_mode: str = "valid",
     sidecar_mode: str = "valid",
+    sidecar_nul_artifact: str = "",
 ) -> dict[str, str]:
     env = os.environ.copy()
     env.pop("KIN_CI_BOT_TOKEN", None)
@@ -221,6 +237,7 @@ def verifier_env(
             "FAKE_CURL_SUCCESS_AFTER": str(success_after),
             "FAKE_FORMULA_MODE": formula_mode,
             "FAKE_SIDECAR_MODE": sidecar_mode,
+            "FAKE_SIDECAR_NUL_ARTIFACT": sidecar_nul_artifact,
             "EXPECTED_FORMULA_VERSION": "1.2.3",
             "KIN_HOMEBREW_VERIFY_MAX_WAIT_SECONDS": "10",
             "KIN_HOMEBREW_VERIFY_MAX_ATTEMPTS": "3",
@@ -236,6 +253,7 @@ def run_verifier(
     success_after: int = 1,
     formula_mode: str = "valid",
     sidecar_mode: str = "valid",
+    sidecar_nul_artifact: str = "",
 ) -> tuple[subprocess.CompletedProcess[str], str, dict[str, int]]:
     with tempfile.TemporaryDirectory() as directory:
         temp = Path(directory)
@@ -258,6 +276,7 @@ def run_verifier(
                 success_after=success_after,
                 formula_mode=formula_mode,
                 sidecar_mode=sidecar_mode,
+                sidecar_nul_artifact=sidecar_nul_artifact,
             ),
         )
         curl_args = args.read_text(encoding="utf-8")
@@ -269,11 +288,13 @@ def assert_bounded_failure(
     *,
     formula_mode: str = "valid",
     sidecar_mode: str = "valid",
+    sidecar_nul_artifact: str = "",
     expected_error: str,
 ) -> None:
     result, _, attempts = run_verifier(
         formula_mode=formula_mode,
         sidecar_mode=sidecar_mode,
+        sidecar_nul_artifact=sidecar_nul_artifact,
     )
     assert result.returncode == 1, result.stdout + result.stderr
     assert attempts == {"formula": 3, "checksums": 12}, attempts
@@ -402,8 +423,24 @@ def test_exact_public_formula_and_checksums_succeed_without_token() -> None:
     assert all("Cache-Control: no-cache" in line for line in lines)
     assert all("--connect-timeout 1" in line for line in lines)
     assert all("--max-time 1" in line for line in lines)
+    assert all("--output" in line for line in lines)
     assert "Authorization" not in curl_args
     assert "exactly matches Kin v1.2.3" in result.stdout
+
+
+def test_raw_nul_in_formula_fails_before_parsing() -> None:
+    assert_bounded_failure(
+        formula_mode="raw_nul",
+        expected_error="public formula contains a NUL byte",
+    )
+
+
+def test_raw_nul_in_each_release_sidecar_fails_before_parsing() -> None:
+    for artifact in FIXTURE_CHECKSUMS:
+        assert_bounded_failure(
+            sidecar_nul_artifact=artifact,
+            expected_error=f"public {artifact} contains a NUL byte",
+        )
 
 
 def test_poll_then_exact_success() -> None:
@@ -732,6 +769,8 @@ def main() -> None:
     assert VALIDATOR.is_file(), f"missing validator: {VALIDATOR}"
     tests = (
         test_exact_public_formula_and_checksums_succeed_without_token,
+        test_raw_nul_in_formula_fails_before_parsing,
+        test_raw_nul_in_each_release_sidecar_fails_before_parsing,
         test_poll_then_exact_success,
         test_polling_is_bounded_by_attempt_limit,
         test_stale_formula_checksum_fails,

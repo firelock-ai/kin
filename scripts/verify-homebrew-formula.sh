@@ -66,6 +66,18 @@ deadline=$((SECONDS + max_wait_seconds))
 checks=0
 last_error="verification did not run"
 
+# Public response bodies must never pass through shell variables: Bash strings
+# cannot represent NUL bytes and would silently normalize the bytes before the
+# validator sees them. Keep every fetch in a private directory and hand the
+# validator explicit file boundaries instead.
+umask 077
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/kin-homebrew-verify.XXXXXX")"
+# shellcheck disable=SC2329 # Invoked indirectly by the EXIT trap below.
+cleanup() {
+  rm -rf -- "$tmp_dir"
+}
+trap cleanup EXIT
+
 cache_busted_url() {
   local base_url="$1"
   local kind="$2"
@@ -80,6 +92,7 @@ cache_busted_url() {
 
 fetch_public() {
   local url="$1"
+  local destination="$2"
   local remaining request_timeout
   remaining=$((deadline - SECONDS))
   if ((remaining <= 0)); then
@@ -97,6 +110,7 @@ fetch_public() {
     --max-time "$request_timeout" \
     -H "Cache-Control: no-cache" \
     -H "Pragma: no-cache" \
+    --output "$destination" \
     "$url"
 }
 
@@ -112,34 +126,34 @@ for ((attempt = 1; attempt <= max_attempts; attempt++)); do
   fi
   checks="$attempt"
 
+  attempt_dir="${tmp_dir}/attempt-${attempt}"
+  mkdir -m 700 -- "$attempt_dir"
   formula_attempt_url="$(cache_busted_url "$formula_url" formula "$attempt")"
+  formula_path="${attempt_dir}/Formula-kin.rb"
 
-  formula=""
-  sidecars=()
-  if ! formula="$(fetch_public "$formula_attempt_url")"; then
+  sidecar_paths=()
+  if ! fetch_public "$formula_attempt_url" "$formula_path"; then
     last_error="the token-free public formula request failed"
   else
     checksums_ready=true
     for artifact in "${artifacts[@]}"; do
       checksum_url="${release_base_url}/${artifact}.sha256"
       checksum_attempt_url="$(cache_busted_url "$checksum_url" "checksum-${artifact}" "$attempt")"
-      sidecar=""
-      if ! sidecar="$(fetch_public "$checksum_attempt_url")"; then
+      sidecar_path="${attempt_dir}/${artifact}.sha256"
+      if ! fetch_public "$checksum_attempt_url" "$sidecar_path"; then
         last_error="the token-free public release checksum request failed for ${artifact}"
         checksums_ready=false
         break
       fi
-      sidecars+=("$sidecar")
+      sidecar_paths+=("$sidecar_path")
     done
 
     if [[ "$checksums_ready" == true ]]; then
       validation_error=""
-      if validation_error="$({
-        printf '%s\0' "$formula"
-        for sidecar in "${sidecars[@]}"; do
-          printf '%s\0' "$sidecar"
-        done
-      } | python3 "$validator" "$version" 2>&1)"; then
+      if validation_error="$(
+        python3 "$validator" "$version" --files \
+          "$formula_path" "${sidecar_paths[@]}" 2>&1
+      )"; then
         echo "Confirmed public firelock-ai/homebrew-kin Formula/kin.rb exactly matches Kin v${version} and all four public release checksums"
         exit 0
       fi

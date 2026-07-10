@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 
 VERSION_RE = re.compile(r'^\s*version\s+"([^"]+)"\s*(?:#.*)?$')
@@ -543,27 +544,69 @@ def validate(formula: str, sidecars: list[str], expected_version: str) -> None:
             )
 
 
-def main() -> int:
-    if len(sys.argv) != 2:
-        print(f"usage: {sys.argv[0]} <expected-version>", file=sys.stderr)
-        return 2
-    payload = sys.stdin.buffer.read()
-    parts = payload.split(b"\0")
-    if parts and parts[-1] == b"":
-        parts.pop()
+def decode_payloads(payloads: list[bytes]) -> tuple[str, list[str]]:
+    labels = ["formula", *ARTIFACT_ORDER]
+    expected_parts = len(labels)
+    if len(payloads) != expected_parts:
+        raise ValidationError(
+            f"expected formula and {len(ARTIFACT_ORDER)} checksum sidecars; "
+            f"found {max(0, len(payloads) - 1)} sidecars"
+        )
+
+    decoded: list[str] = []
+    for label, payload in zip(labels, payloads, strict=True):
+        if b"\0" in payload:
+            raise ValidationError(f"public {label} contains a NUL byte")
+        try:
+            decoded.append(payload.decode("utf-8", errors="strict"))
+        except UnicodeDecodeError as error:
+            raise ValidationError(
+                f"public {label} is not valid UTF-8: {error}"
+            ) from error
+    return decoded[0], decoded[1:]
+
+
+def read_file_payloads(paths: list[str]) -> list[bytes]:
     expected_parts = 1 + len(ARTIFACT_ORDER)
-    if len(parts) != expected_parts:
+    if len(paths) != expected_parts:
+        raise ValidationError(
+            f"expected one formula file and {len(ARTIFACT_ORDER)} checksum "
+            f"sidecar files; found {max(0, len(paths) - 1)} sidecar files"
+        )
+    payloads: list[bytes] = []
+    for path in paths:
+        try:
+            payloads.append(Path(path).read_bytes())
+        except OSError as error:
+            raise ValidationError(
+                f"could not read public payload file {path!r}: {error}"
+            ) from error
+    return payloads
+
+
+def main() -> int:
+    if len(sys.argv) == 2:
+        payload = sys.stdin.buffer.read()
+        payloads = payload.split(b"\0")
+        if payloads and payloads[-1] == b"":
+            payloads.pop()
+    elif len(sys.argv) >= 3 and sys.argv[2] == "--files":
+        try:
+            payloads = read_file_payloads(sys.argv[3:])
+        except ValidationError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 2
+    else:
         print(
-            f"error: expected NUL-delimited formula and {len(ARTIFACT_ORDER)} "
-            f"checksum sidecars; found {max(0, len(parts) - 1)} sidecars",
+            f"usage: {sys.argv[0]} <expected-version> "
+            "[--files <formula> <four-checksum-sidecars>]",
             file=sys.stderr,
         )
         return 2
     try:
-        formula = parts[0].decode("utf-8", errors="strict")
-        sidecars = [part.decode("utf-8", errors="strict") for part in parts[1:]]
+        formula, sidecars = decode_payloads(payloads)
         validate(formula, sidecars, sys.argv[1])
-    except (UnicodeDecodeError, ValidationError) as error:
+    except ValidationError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
     return 0
