@@ -165,7 +165,7 @@
       "note": "kin depends directly on the standalone kin-lsp repo."
     },
     {
-      "name": "infra",
+      "name": "kin-infra",
       "layer": "proprietary",
       "role": "deployment-and-ops",
       "dependsOn": [
