@@ -128,29 +128,19 @@ fn resolve_ref_importing_git_if_needed_with_mode(
     reference: Option<&str>,
     enrich_semantics: bool,
 ) -> Result<ResolvedRef> {
-    match resolve_ref(graph, layout, reference) {
-        Ok(head) => Ok(ResolvedRef {
-            head,
-            hydrated_git_history: false,
-            hydrated_changes: 0,
-        }),
-        Err(original_err) => {
-            let Some(reference) = reference else {
-                return Err(original_err);
-            };
-            let Some(git_oid) = extract_git_ref(reference) else {
-                return Err(original_err);
-            };
-            let hydrated_changes =
-                hydrate_imported_git_ref(graph, layout, git_oid, enrich_semantics)?;
-            let head = resolve_ref(graph, layout, Some(reference))?;
-            Ok(ResolvedRef {
-                head,
-                hydrated_git_history: hydrated_changes > 0,
-                hydrated_changes,
-            })
+    let mut hydrated_changes = 0usize;
+    if let Some(git_oid) = reference.and_then(extract_git_ref) {
+        let imported_change_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid)?;
+        if !imported_git_history_is_closed(graph, imported_change_id)? {
+            hydrated_changes = hydrate_imported_git_ref(graph, layout, git_oid, enrich_semantics)?;
         }
     }
+    let head = resolve_ref(graph, layout, reference)?;
+    Ok(ResolvedRef {
+        head,
+        hydrated_git_history: hydrated_changes > 0,
+        hydrated_changes,
+    })
 }
 
 pub(crate) fn resolve_entity_query<G>(graph: &G, entity_query: &str) -> Result<Entity>
@@ -468,7 +458,44 @@ pub fn git_ref_requires_hydration(graph: &kin_db::InMemoryGraph, reference: &str
     let Ok(imported_change_id) = kin_git::semantic_change_id_from_git_oid_hex(git_oid) else {
         return false;
     };
-    !matches!(graph.get_change(&imported_change_id), Ok(Some(_)))
+    !matches!(
+        imported_git_history_is_closed(graph, imported_change_id),
+        Ok(true)
+    )
+}
+
+/// A Git-derived head is reusable only when every reachable parent exists down
+/// to Kin's canonical genesis. Presence of the target alone is insufficient:
+/// an interrupted/older hydration can leave `H` stored while an ancestor `M`
+/// is absent, and resolving `H` must repair that closure rather than silently
+/// accepting the partial graph.
+fn imported_git_history_is_closed(
+    graph: &kin_db::InMemoryGraph,
+    head: SemanticChangeId,
+) -> Result<bool> {
+    let genesis_id = kin_core::build_genesis_change().id;
+    let mut stack = vec![head];
+    let mut visited = std::collections::HashSet::new();
+    let mut reached_genesis = false;
+
+    while let Some(change_id) = stack.pop() {
+        if change_id == genesis_id {
+            reached_genesis = true;
+            continue;
+        }
+        if !visited.insert(change_id) {
+            continue;
+        }
+        let Some(change) = graph.get_change(&change_id)? else {
+            return Ok(false);
+        };
+        if change.parents.is_empty() {
+            return Ok(false);
+        }
+        stack.extend(change.parents);
+    }
+
+    Ok(reached_genesis)
 }
 
 /// Lazily import the Git ancestry of `git_oid` into `graph`, returning the
@@ -483,9 +510,6 @@ fn hydrate_imported_git_ref(
     enrich_semantics: bool,
 ) -> Result<usize> {
     let imported_change_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid)?;
-    if graph.get_change(&imported_change_id)?.is_some() {
-        return Ok(0);
-    }
 
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
         .context("open blob store for imported Git ref hydration")?;
@@ -519,10 +543,10 @@ fn hydrate_imported_git_ref(
         }
     }
 
-    if graph.get_change(&imported_change_id)?.is_none() {
+    if !imported_git_history_is_closed(graph, imported_change_id)? {
         return Err(ref_error(
             git_oid,
-            "imported Git commit not found after hydration",
+            "imported Git commit history remained incomplete after hydration",
         ));
     }
 
@@ -625,6 +649,82 @@ mod tests {
         // Keep the tempdir alive by leaking it for the test process lifetime.
         let leaked = temp.keep();
         kin_core::KinLayout::new(leaked.join(".kin"))
+    }
+
+    fn git(repo: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn git_hydration_repairs_present_head_with_missing_parent_closure() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Kin Test"]);
+        std::fs::write(repo.path().join("fixture.txt"), "parent\n").unwrap();
+        git(repo.path(), &["add", "fixture.txt"]);
+        git(repo.path(), &["commit", "-qm", "parent"]);
+        let parent_oid = git(repo.path(), &["rev-parse", "HEAD"]);
+        std::fs::write(repo.path().join("fixture.txt"), "head\n").unwrap();
+        git(repo.path(), &["commit", "-qam", "head"]);
+        let head_oid = git(repo.path(), &["rev-parse", "HEAD"]);
+
+        let layout = kin_core::KinLayout::new(repo.path().join(".kin"));
+        std::fs::create_dir_all(layout.objects_dir()).unwrap();
+        let graph = InMemoryGraph::new();
+        let genesis = kin_core::build_genesis_change();
+        graph.create_change(&genesis).unwrap();
+        let head_id = kin_git::semantic_change_id_from_git_oid_hex(&head_oid).unwrap();
+        let parent_id = kin_git::semantic_change_id_from_git_oid_hex(&parent_oid).unwrap();
+        graph
+            .create_change(&SemanticChange {
+                id: head_id,
+                parents: vec![parent_id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "partial imported head".to_string(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        assert!(git_ref_requires_hydration(&graph, &head_oid));
+        let resolved = resolve_ref_importing_git_if_needed_for_locate_with_report(
+            &graph,
+            &layout,
+            Some(&head_oid),
+        )
+        .unwrap();
+        assert_eq!(resolved.head, head_id);
+        assert!(resolved.hydrated_git_history);
+        assert!(resolved.hydrated_changes >= 1);
+        assert!(graph.get_change(&parent_id).unwrap().is_some());
+        assert!(!git_ref_requires_hydration(&graph, &head_oid));
+
+        let parent = resolve_ref_importing_git_if_needed_for_locate(
+            &graph,
+            &layout,
+            Some(&format!("{head_oid}~1")),
+        )
+        .unwrap();
+        assert_eq!(parent, parent_id);
     }
 
     #[test]

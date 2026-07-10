@@ -276,6 +276,18 @@ pub(crate) struct VfsTreeSnapshot {
     pub missing_parent_ids: Arc<HashSet<SemanticChangeId>>,
 }
 
+pub(crate) type VfsTreeBuildResult =
+    std::result::Result<Arc<VfsTreeSnapshot>, (axum::http::StatusCode, String)>;
+
+/// One daemon-owned VFS materialization flight. The receiver is retained in
+/// state so dropping/cancelling the request that started the build cannot cancel
+/// the build or let a second request launch a duplicate O(history) replay.
+#[derive(Clone)]
+pub(crate) struct VfsTreeBuildFlight {
+    pub token: Arc<()>,
+    pub receiver: tokio::sync::watch::Receiver<Option<VfsTreeBuildResult>>,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct VfsTreeBuildTestHook {
@@ -289,27 +301,42 @@ pub(crate) struct VfsTreeBuildTestHook {
 /// builders that straddle the window retry after it closes.
 pub(crate) struct VfsHistoryMutationGuard<'a> {
     state: &'a DaemonState,
-    reconciled: bool,
+    finalized: bool,
 }
 
 impl VfsHistoryMutationGuard<'_> {
-    /// Mark the mutation window as reconciled against the committed-tree cache.
-    /// Dropping an unfinished guard invalidates conservatively so a partial
-    /// mutation followed by an error can never leave a same-head snapshot stale.
+    /// Mark the mutation window fully reconciled, persisted, and announced.
+    /// Dropping an unfinished guard invalidates and marks the graph dirty so an
+    /// error or async cancellation after an in-memory mutation cannot leave
+    /// same-head cache or persistence state stale.
     pub(crate) fn finish(mut self) {
-        self.reconciled = true;
+        self.finalized = true;
     }
 }
 
 impl Drop for VfsHistoryMutationGuard<'_> {
     fn drop(&mut self) {
-        if !self.reconciled {
+        let recovering = !self.finalized;
+        if recovering {
             self.state.bump_committed_history_version();
+            // `bump_version` marks the graph dirty for the daemon's persistence
+            // loop. Drop cannot return a save error, so immediate success paths
+            // still save explicitly; this is the cancellation/error backstop.
+            self.state.bump_version();
         }
         self.state.vfs_history_epoch.fetch_add(1, Ordering::SeqCst);
         self.state
             .vfs_history_mutations_inflight
             .fetch_sub(1, Ordering::SeqCst);
+        if recovering {
+            // Announce only after closing the mutation window, so a subscriber
+            // reacting immediately can build the recovered snapshot instead of
+            // receiving a transient in-flight 503.
+            self.state.emit_event(DaemonEvent::GraphRootChanged {
+                old_root_hash: None,
+                new_root_hash: "history-mutation-recovery".to_string(),
+            });
+        }
     }
 }
 
@@ -357,9 +384,10 @@ pub struct DaemonState {
     /// Materialized committed VFS view keyed by exact active branch head plus
     /// scoped committed-history generation.
     pub(crate) vfs_tree_cache: std::sync::RwLock<Option<Arc<VfsTreeSnapshot>>>,
-    /// Single-flight coordinator for cold VFS materialization. Waiters recheck the cache after
-    /// acquiring this lock, so one exact head/version is replayed at most once.
-    pub(crate) vfs_tree_build_lock: tokio::sync::Mutex<()>,
+    /// Daemon-owned single flight for cold VFS materialization. The task lives
+    /// independently of any request future, so disconnects and timeouts cannot
+    /// fan out detached blocking replays.
+    pub(crate) vfs_tree_build_flight: tokio::sync::Mutex<Option<VfsTreeBuildFlight>>,
     #[cfg(test)]
     pub(crate) vfs_tree_build_count: AtomicU64,
     #[cfg(test)]
@@ -737,7 +765,7 @@ impl DaemonState {
             vfs_history_epoch: AtomicU64::new(0),
             vfs_history_mutations_inflight: AtomicU64::new(0),
             vfs_tree_cache: std::sync::RwLock::new(None),
-            vfs_tree_build_lock: tokio::sync::Mutex::new(()),
+            vfs_tree_build_flight: tokio::sync::Mutex::new(None),
             #[cfg(test)]
             vfs_tree_build_count: AtomicU64::new(0),
             #[cfg(test)]
@@ -886,7 +914,7 @@ impl DaemonState {
             vfs_history_epoch: AtomicU64::new(0),
             vfs_history_mutations_inflight: AtomicU64::new(0),
             vfs_tree_cache: std::sync::RwLock::new(None),
-            vfs_tree_build_lock: tokio::sync::Mutex::new(()),
+            vfs_tree_build_flight: tokio::sync::Mutex::new(None),
             #[cfg(test)]
             vfs_tree_build_count: AtomicU64::new(0),
             #[cfg(test)]
@@ -1428,7 +1456,7 @@ impl DaemonState {
         self.vfs_history_epoch.fetch_add(1, Ordering::SeqCst);
         VfsHistoryMutationGuard {
             state: self,
-            reconciled: false,
+            finalized: false,
         }
     }
 
@@ -2191,7 +2219,7 @@ mod tests {
             vfs_history_epoch: AtomicU64::new(0),
             vfs_history_mutations_inflight: AtomicU64::new(0),
             vfs_tree_cache: std::sync::RwLock::new(None),
-            vfs_tree_build_lock: tokio::sync::Mutex::new(()),
+            vfs_tree_build_flight: tokio::sync::Mutex::new(None),
             #[cfg(test)]
             vfs_tree_build_count: AtomicU64::new(0),
             #[cfg(test)]
