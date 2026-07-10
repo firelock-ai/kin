@@ -13,7 +13,7 @@ pub mod types;
 pub mod vector;
 
 pub use embed::CodeEmbedder;
-pub use engine::{EmbeddingStatus, InMemoryGraph, ResolvedRetrievalItem};
+pub use engine::{EmbeddingStatus, InMemoryGraph, PersistenceEpoch, ResolvedRetrievalItem};
 pub use error::{KinDbError, Result};
 pub use kin_search::TEXT_INDEX_FORMAT_VERSION;
 pub use retrieval::{unified_retrieve, RetrievalCandidate, RetrievalQuery};

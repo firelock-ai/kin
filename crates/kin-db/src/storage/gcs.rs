@@ -94,6 +94,14 @@ impl GcsBackend {
         }
     }
 
+    fn deltas_prefix(&self, repo_id: &str) -> ObjectPath {
+        if self.prefix.is_empty() {
+            ObjectPath::from(format!("{repo_id}/deltas/"))
+        } else {
+            ObjectPath::from(format!("{}/{repo_id}/deltas/", self.prefix))
+        }
+    }
+
     fn numeric_version(version: Option<&str>, authority: &str) -> Result<Generation, KinDbError> {
         let version = version.ok_or_else(|| {
             KinDbError::StorageError(format!(
@@ -195,6 +203,54 @@ impl GcsBackend {
             has_full_authority,
         )))
     }
+
+    fn list_delta_objects(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<(Generation, ObjectMeta)>, KinDbError> {
+        let prefix = self.deltas_prefix(repo_id);
+        let list_result = self
+            .block_on(self.store.list_with_delimiter(Some(&prefix)))
+            .map_err(|error| {
+                KinDbError::StorageError(format!("GCS list deltas failed: {error}"))
+            })?;
+
+        let mut deltas = Vec::new();
+        for meta in list_result.objects {
+            let filename = meta.location.filename().ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "GCS delta authority {} has no filename",
+                    meta.location
+                ))
+            })?;
+            let stem = filename.strip_suffix(".kndd").ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "GCS delta authority {} has an unexpected object name",
+                    meta.location
+                ))
+            })?;
+            let generation = stem.parse::<Generation>().map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "GCS delta authority {} has an invalid generation: {error}",
+                    meta.location
+                ))
+            })?;
+            if generation == GENERATION_INIT || filename != format!("{generation:020}.kndd") {
+                return Err(KinDbError::StorageError(format!(
+                    "GCS delta authority {} has a reserved or noncanonical generation",
+                    meta.location
+                )));
+            }
+            deltas.push((generation, meta));
+        }
+        deltas.sort_by_key(|(generation, _)| *generation);
+        if deltas.windows(2).any(|window| window[0].0 == window[1].0) {
+            return Err(KinDbError::StorageError(format!(
+                "GCS repo {repo_id} has duplicate delta generations"
+            )));
+        }
+        Ok(deltas)
+    }
 }
 
 impl StorageBackend for GcsBackend {
@@ -215,18 +271,20 @@ impl StorageBackend for GcsBackend {
 
     fn load_recovery_state(&self, repo_id: &str) -> Result<SnapshotRecoveryState, KinDbError> {
         // GCS incremental writes are disabled until snapshot+journal authority
-        // has one conditional commit point. A snapshot written by this backend
-        // carries a full-authority envelope, so leftover legacy journals after
-        // its commit are stale and ignored. Raw legacy snapshots with journals
-        // fail closed because no base/head binding exists.
-        let Some((authority, has_full_authority)) = self.load_snapshot_object(repo_id)? else {
-            return Ok((None, Vec::new()));
-        };
-        if !has_full_authority && !self.load_deltas_since(repo_id, GENERATION_INIT)?.is_empty() {
+        // has one conditional commit point. Any visible journal is therefore
+        // unbound legacy state or a post-migration write from an old binary.
+        // Silently deleting or ignoring it would acknowledge graph state that
+        // is absent from the full-snapshot authority.
+        let deltas = self.list_delta_objects(repo_id)?;
+        if !deltas.is_empty() {
             return Err(KinDbError::StorageError(format!(
-                "legacy GCS repo {repo_id} has journals but no full-snapshot authority envelope; refusing unbound replay"
+                "GCS repo {repo_id} has {} unbound or mixed-version delta objects; drain legacy writers and reconcile them before retrying",
+                deltas.len()
             )));
         }
+        let Some((authority, _has_full_authority)) = self.load_snapshot_object(repo_id)? else {
+            return Ok((None, Vec::new()));
+        };
         Ok((Some(authority), Vec::new()))
     }
 
@@ -237,6 +295,13 @@ impl StorageBackend for GcsBackend {
         expected_gen: Generation,
     ) -> Result<Generation, KinDbError> {
         let _snapshot = crate::storage::format::GraphSnapshot::from_bytes(data)?;
+        let deltas = self.list_delta_objects(repo_id)?;
+        if !deltas.is_empty() {
+            return Err(KinDbError::StorageError(format!(
+                "refusing GCS full-snapshot commit for repo {repo_id}: {} legacy or mixed-version delta objects remain",
+                deltas.len()
+            )));
+        }
         let path = self.snapshot_path(repo_id);
         let payload = PutPayload::from(Self::encode_full_snapshot_authority(data)?);
 
@@ -276,6 +341,12 @@ impl StorageBackend for GcsBackend {
                 "GCS save result for {path} did not advance generation: expected above {expected_gen}, found {generation}"
             )));
         }
+        // Do not perform another fallible read after the conditional put. At
+        // this point authority has committed and callers must receive its new
+        // generation so their CAS cursor cannot remain on the pre-commit value.
+        // `load_recovery_state` and `clear_deltas` both list journals and fail
+        // closed if a legacy writer raced this commit; Kin's retryable
+        // post-commit finalizer exercises that fence immediately.
         Ok(generation)
     }
 
@@ -295,60 +366,33 @@ impl StorageBackend for GcsBackend {
         repo_id: &str,
         since_gen: Generation,
     ) -> Result<Vec<(Vec<u8>, Generation)>, KinDbError> {
-        let prefix = ObjectPath::from(format!("{}/{repo_id}/deltas/", self.prefix));
-
-        let list_result = self
-            .block_on(self.store.list_with_delimiter(Some(&prefix)))
-            .map_err(|e| KinDbError::StorageError(format!("GCS list deltas failed: {e}")))?;
-
-        let mut deltas: Vec<(Generation, ObjectPath)> = Vec::new();
-        for meta in list_result.objects {
-            let filename = meta.location.filename().unwrap_or_default();
-            if let Some(stem) = filename.strip_suffix(".kndd") {
-                if let Ok(gen) = stem.parse::<Generation>() {
-                    if gen > since_gen {
-                        deltas.push((gen, meta.location));
-                    }
-                }
-            }
-        }
-        deltas.sort_by_key(|(gen, _)| *gen);
-
+        let deltas = self.list_delta_objects(repo_id)?;
         let mut result = Vec::with_capacity(deltas.len());
-        for (gen, path) in deltas {
+        for (generation, meta) in deltas {
+            if generation <= since_gen {
+                continue;
+            }
+            let path = meta.location;
             let get_result = self.block_on(self.store.get(&path)).map_err(|e| {
                 KinDbError::StorageError(format!("GCS delta read failed for {path}: {e}"))
             })?;
             let bytes = self.block_on(get_result.bytes()).map_err(|e| {
                 KinDbError::StorageError(format!("GCS delta bytes failed for {path}: {e}"))
             })?;
-            result.push((bytes.to_vec(), gen));
+            result.push((bytes.to_vec(), generation));
         }
 
         Ok(result)
     }
 
     fn clear_deltas(&self, repo_id: &str) -> Result<(), KinDbError> {
-        let prefix = ObjectPath::from(format!("{}/{repo_id}/deltas/", self.prefix));
-
-        let list_result = self
-            .block_on(self.store.list_with_delimiter(Some(&prefix)))
-            .map_err(|e| {
-                KinDbError::StorageError(format!("GCS list deltas for clear failed: {e}"))
-            })?;
-
-        for meta in list_result.objects {
-            match self.block_on(self.store.delete(&meta.location)) {
-                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
-                Err(e) => {
-                    return Err(KinDbError::StorageError(format!(
-                        "GCS delta delete failed for {}: {e}",
-                        meta.location
-                    )));
-                }
-            }
+        let deltas = self.list_delta_objects(repo_id)?;
+        if !deltas.is_empty() {
+            return Err(KinDbError::StorageError(format!(
+                "refusing to delete {} unbound GCS delta objects for repo {repo_id}; reconcile mixed-version writes explicitly",
+                deltas.len()
+            )));
         }
-
         Ok(())
     }
 
@@ -440,7 +484,184 @@ impl GcsBackend {
 mod tests {
     use super::*;
     use crate::storage::format::GraphSnapshot;
+    use async_trait::async_trait;
+    use futures_util::stream::BoxStream;
+    use futures_util::StreamExt;
     use object_store::memory::InMemory;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions,
+        PutResult, Result as ObjectStoreResult,
+    };
+    use std::collections::HashMap;
+    use std::fmt;
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct VersionState {
+        next_generation: Generation,
+        versions: HashMap<String, Generation>,
+    }
+
+    /// Deterministic GCS-compatible fixture: InMemory payload behavior plus
+    /// numeric object versions and atomic UpdateVersion preconditions.
+    struct VersionedMemoryStore {
+        inner: InMemory,
+        state: Arc<tokio::sync::Mutex<VersionState>>,
+    }
+
+    impl VersionedMemoryStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemory::new(),
+                state: Arc::new(tokio::sync::Mutex::new(VersionState {
+                    next_generation: 100,
+                    versions: HashMap::new(),
+                })),
+            }
+        }
+
+        fn precondition_error(path: &ObjectPath, message: String) -> object_store::Error {
+            object_store::Error::Precondition {
+                path: path.to_string(),
+                source: Box::new(std::io::Error::other(message)),
+            }
+        }
+
+        fn apply_version(meta: &mut ObjectMeta, state: &VersionState) {
+            meta.version = state
+                .versions
+                .get(meta.location.as_ref())
+                .map(ToString::to_string);
+        }
+    }
+
+    impl fmt::Debug for VersionedMemoryStore {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("VersionedMemoryStore")
+        }
+    }
+
+    impl fmt::Display for VersionedMemoryStore {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("VersionedMemoryStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for VersionedMemoryStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            let mut state = self.state.lock().await;
+            if let PutMode::Update(update) = &opts.mode {
+                let expected = update.version.as_deref().ok_or_else(|| {
+                    Self::precondition_error(location, "numeric version is required".to_string())
+                })?;
+                let current = state.versions.get(location.as_ref()).ok_or_else(|| {
+                    Self::precondition_error(location, "object has no numeric version".to_string())
+                })?;
+                if expected != current.to_string() {
+                    return Err(Self::precondition_error(
+                        location,
+                        format!("version {current} does not match {expected}"),
+                    ));
+                }
+            }
+
+            let mut result = self.inner.put_opts(location, payload, opts).await?;
+            let generation = state.next_generation;
+            state.next_generation += 1;
+            state.versions.insert(location.to_string(), generation);
+            result.version = Some(generation.to_string());
+            Ok(result)
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            let mut result = self.inner.get_opts(location, options).await?;
+            let state = self.state.lock().await;
+            Self::apply_version(&mut result.meta, &state);
+            Ok(result)
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, ObjectStoreResult<ObjectPath>>,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectPath>> {
+            let state = Arc::clone(&self.state);
+            self.inner
+                .delete_stream(locations)
+                .then(move |result| {
+                    let state = Arc::clone(&state);
+                    async move {
+                        if let Ok(location) = &result {
+                            state.lock().await.versions.remove(location.as_ref());
+                        }
+                        result
+                    }
+                })
+                .boxed()
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            let state = Arc::clone(&self.state);
+            self.inner
+                .list(prefix)
+                .then(move |result| {
+                    let state = Arc::clone(&state);
+                    async move {
+                        let mut meta = result?;
+                        let state = state.lock().await;
+                        Self::apply_version(&mut meta, &state);
+                        Ok(meta)
+                    }
+                })
+                .boxed()
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> ObjectStoreResult<ListResult> {
+            let mut result = self.inner.list_with_delimiter(prefix).await?;
+            let state = self.state.lock().await;
+            for meta in &mut result.objects {
+                Self::apply_version(meta, &state);
+            }
+            Ok(result)
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
+            let mut state = self.state.lock().await;
+            self.inner.copy_opts(from, to, options).await?;
+            let generation = state.next_generation;
+            state.next_generation += 1;
+            state.versions.insert(to.to_string(), generation);
+            Ok(())
+        }
+    }
 
     fn test_backend() -> GcsBackend {
         GcsBackend::from_store(Box::new(InMemory::new()), "test")
@@ -522,11 +743,102 @@ mod tests {
             .block_on(backend.store.put(&legacy_path, PutPayload::from(delta)))
             .unwrap();
         assert_eq!(backend.load_deltas_since(repo_id, 0).unwrap().len(), 1);
-        let (authority, recovery_deltas) = backend.load_recovery_state(repo_id).unwrap();
-        assert!(authority.is_none());
-        assert!(
-            recovery_deltas.is_empty(),
-            "unbound legacy GCS journals must never be inferred as authority"
+        let recovery_error = backend
+            .load_recovery_state(repo_id)
+            .expect_err("unbound legacy GCS journals must fail closed");
+        assert!(recovery_error.to_string().contains("mixed-version delta"));
+        let cleanup_error = backend
+            .clear_deltas(repo_id)
+            .expect_err("automatic cleanup must not erase unbound journal state");
+        assert!(cleanup_error.to_string().contains("refusing to delete"));
+        assert_eq!(backend.load_deltas_since(repo_id, 0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn gcs_versioned_fixture_reopens_exact_full_authority_and_rejects_stale_writer() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "fixture");
+        let stale = GcsBackend::from_store(Box::new(Arc::clone(&store)), "fixture");
+        let repo_id = "restart-repo";
+
+        let mut base = GraphSnapshot::empty();
+        base.file_hashes.insert("base.rs".to_string(), [1; 32]);
+        let gen1 = backend
+            .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let stale_gen = stale.load_snapshot(repo_id).unwrap().unwrap().1;
+        assert_eq!(stale_gen, gen1);
+
+        let mut current = base.clone();
+        current
+            .file_hashes
+            .insert("current.rs".to_string(), [2; 32]);
+        let gen2 = backend
+            .save_snapshot(repo_id, &current.to_bytes().unwrap(), gen1)
+            .unwrap();
+        let stale_error = stale
+            .save_snapshot(repo_id, &base.to_bytes().unwrap(), stale_gen)
+            .expect_err("stale GCS writer must lose conditional update");
+        assert!(stale_error.to_string().contains("generation mismatch"));
+
+        let reopened = GcsBackend::from_store(Box::new(Arc::clone(&store)), "fixture");
+        let recovered = crate::storage::backend::load_recovered_snapshot(&reopened, repo_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.generation, gen2);
+        assert_eq!(recovered.snapshot.file_hashes, current.file_hashes);
+
+        let mut after_reopen = recovered.snapshot;
+        after_reopen
+            .file_hashes
+            .insert("after-reopen.rs".to_string(), [3; 32]);
+        let gen3 = reopened
+            .save_snapshot(repo_id, &after_reopen.to_bytes().unwrap(), gen2)
+            .unwrap();
+        let final_backend = GcsBackend::from_store(Box::new(store), "fixture");
+        let final_recovery =
+            crate::storage::backend::load_recovered_snapshot(&final_backend, repo_id)
+                .unwrap()
+                .unwrap();
+        assert_eq!(final_recovery.generation, gen3);
+        assert_eq!(
+            final_recovery.snapshot.file_hashes,
+            after_reopen.file_hashes
+        );
+    }
+
+    #[test]
+    fn gcs_versioned_fixture_fails_closed_on_post_authority_legacy_journal() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "fixture");
+        let repo_id = "mixed-version";
+        let bytes = GraphSnapshot::empty().to_bytes().unwrap();
+        let generation = backend
+            .save_snapshot(repo_id, &bytes, GENERATION_INIT)
+            .unwrap();
+        let delta_path = ObjectPath::from(format!(
+            "fixture/{repo_id}/deltas/{:020}.kndd",
+            generation + 1
+        ));
+        let delta = crate::storage::delta::GraphSnapshotDelta::empty(generation)
+            .to_bytes()
+            .unwrap();
+        backend
+            .block_on(store.put(&delta_path, PutPayload::from(delta)))
+            .unwrap();
+
+        let recovery_error = crate::storage::backend::load_recovered_snapshot(&backend, repo_id)
+            .expect_err("post-authority legacy journal must fail closed");
+        assert!(recovery_error.to_string().contains("mixed-version delta"));
+        backend
+            .clear_deltas(repo_id)
+            .expect_err("mixed-version journal must be preserved for reconciliation");
+        assert_eq!(
+            backend
+                .load_deltas_since(repo_id, generation)
+                .unwrap()
+                .len(),
+            1
         );
     }
 
@@ -587,27 +899,47 @@ mod tests {
     #[test]
     #[ignore = "requires real GCS + ADC credentials"]
     fn gcs_real_conditional_update_roundtrip() {
-        let Ok(bucket) = std::env::var("KINDB_GCS_CAS_BUCKET") else {
-            eprintln!("KINDB_GCS_CAS_BUCKET not set; skipping");
-            return;
-        };
-        let prefix = format!("v2-cas-check/{}", std::process::id());
-        let backend = GcsBackend::new(&bucket, prefix).unwrap();
+        let bucket = std::env::var("KINDB_GCS_CAS_BUCKET").expect(
+            "KINDB_GCS_CAS_BUCKET must name the credentialed proof bucket; an explicit ignored-test run must never pass by skipping",
+        );
+        let prefix = format!("v3-recovery-check/{}", uuid::Uuid::new_v4());
+        let backend = GcsBackend::new(&bucket, prefix.clone()).unwrap();
+        let stale = GcsBackend::new(&bucket, prefix.clone()).unwrap();
         let repo = "cas-test-repo";
 
-        let bytes = GraphSnapshot::empty().to_bytes().unwrap();
+        let mut base = GraphSnapshot::empty();
+        base.file_hashes.insert("base.rs".to_string(), [1; 32]);
+        let bytes = base.to_bytes().unwrap();
         let gen1 = backend
             .save_snapshot(repo, &bytes, GENERATION_INIT)
             .expect("first save (Create) should succeed");
-        let (_loaded, gen_loaded) = backend.load_snapshot(repo).unwrap().unwrap();
-        // The previously-failing conditional Update against real GCS:
+        let stale_gen = stale.load_snapshot(repo).unwrap().unwrap().1;
+        assert_eq!(stale_gen, gen1);
+
+        let mut current = base.clone();
+        current
+            .file_hashes
+            .insert("current.rs".to_string(), [2; 32]);
         let gen2 = backend
-            .save_snapshot(repo, &bytes, gen_loaded)
+            .save_snapshot(repo, &current.to_bytes().unwrap(), gen1)
             .expect("second save (conditional Update) must succeed against real GCS");
-        let gen3 = backend
-            .save_snapshot(repo, &bytes, gen2)
-            .expect("third save (conditional Update) must also succeed");
-        eprintln!("gens: create={gen1} loaded={gen_loaded} update1={gen2} update2={gen3}");
-        assert!(gen2 > GENERATION_INIT && gen3 > GENERATION_INIT);
+        stale
+            .save_snapshot(repo, &bytes, stale_gen)
+            .expect_err("stale real-GCS writer must fail its generation precondition");
+
+        let reopened = GcsBackend::new(&bucket, prefix).unwrap();
+        let recovered = crate::storage::backend::load_recovered_snapshot(&reopened, repo)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.generation, gen2);
+        assert_eq!(recovered.snapshot.file_hashes, current.file_hashes);
+
+        eprintln!(
+            "gens: create={gen1} update={gen2} recovered={}",
+            recovered.generation
+        );
+        reopened
+            .block_on(reopened.store.delete(&reopened.snapshot_path(repo)))
+            .expect("proof object cleanup should succeed");
     }
 }

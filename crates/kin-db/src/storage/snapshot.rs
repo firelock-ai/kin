@@ -8,7 +8,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::engine::InMemoryGraph;
+use crate::engine::{InMemoryGraph, PersistenceEpoch};
 use crate::error::KinDbError;
 use crate::storage::backend::Generation;
 use crate::storage::delta::{apply_graph_delta, GraphSnapshotDelta};
@@ -35,6 +35,35 @@ pub struct SnapshotManager {
     _lock_file: Option<File>,
     /// Whether this manager was opened in read-only mode.
     read_only: bool,
+}
+
+struct PersistenceAttempt<'a> {
+    graph: &'a InMemoryGraph,
+    epoch: Option<PersistenceEpoch>,
+}
+
+impl<'a> PersistenceAttempt<'a> {
+    fn new(graph: &'a InMemoryGraph, epoch: PersistenceEpoch) -> Self {
+        Self {
+            graph,
+            epoch: Some(epoch),
+        }
+    }
+
+    fn complete(mut self) {
+        if let Some(epoch) = self.epoch.take() {
+            let completed = self.graph.complete_persistence(epoch);
+            debug_assert!(completed, "persistence epoch must still be in flight");
+        }
+    }
+}
+
+impl Drop for PersistenceAttempt<'_> {
+    fn drop(&mut self) {
+        if let Some(epoch) = self.epoch.take() {
+            self.graph.fail_persistence(epoch);
+        }
+    }
 }
 
 /// Derive the text index directory as a sibling of the snapshot file.
@@ -1453,8 +1482,9 @@ impl SnapshotManager {
 
         let t0 = std::time::Instant::now();
         let precomputed_hash = precomputed_hash.or_else(|| graph.snapshot_root_hash_hint());
-        let (bytes, graph_root_hash) =
-            graph.serialize_snapshot_borrowed_with_hash(precomputed_hash)?;
+        let (bytes, graph_root_hash, persistence_epoch) =
+            graph.begin_snapshot_persistence(precomputed_hash)?;
+        let persistence_attempt = PersistenceAttempt::new(graph, persistence_epoch);
         let t_ser = t0.elapsed();
 
         let t1 = std::time::Instant::now();
@@ -1489,8 +1519,7 @@ impl SnapshotManager {
         }
 
         clear_local_deltas(&path)?;
-        graph.clear_pending_delta();
-        graph.clear_full_snapshot_required();
+        persistence_attempt.complete();
 
         Ok(graph_root_hash)
     }
@@ -1513,18 +1542,24 @@ impl SnapshotManager {
             return Ok(Some(base_generation.saturating_add(1)));
         }
 
-        let Some(delta) = graph.pending_delta_snapshot(base_generation) else {
+        let Some((delta, persistence_epoch)) = graph.begin_delta_persistence(base_generation)
+        else {
             graph.flush_text_index()?;
             return Ok(None);
         };
+        let persistence_attempt = PersistenceAttempt::new(graph, persistence_epoch);
         if delta.is_empty() {
             graph.flush_text_index()?;
+            persistence_attempt.complete();
             return Ok(None);
         }
 
-        let generation = write_local_delta(&path, &delta, base_generation)?;
-        graph.clear_pending_delta();
+        // Derived-index failure must happen before the durable delta commit;
+        // after write_local_delta succeeds there are no remaining fallible
+        // steps before the generation is returned to the caller.
         graph.flush_text_index()?;
+        let generation = write_local_delta(&path, &delta, base_generation)?;
+        persistence_attempt.complete();
         Ok(Some(generation))
     }
 

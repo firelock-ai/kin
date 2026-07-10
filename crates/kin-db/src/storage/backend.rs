@@ -602,6 +602,13 @@ impl LocalFileBackend {
                 record.snapshot_file
             )));
         }
+        let legacy_generation = self.read_legacy_generation(repo_id)?;
+        if legacy_generation > record.head_generation {
+            return Err(KinDbError::StorageError(format!(
+                "legacy local writer advanced repo {repo_id} to generation {legacy_generation} beyond atomic authority head {}; drain pre-authority writers before retrying",
+                record.head_generation
+            )));
+        }
         Ok(Some(record))
     }
 
@@ -1250,6 +1257,32 @@ mod tests {
             .to_string()
             .contains("no persisted snapshot-base authority"));
         assert!(!backend.authority_path(repo_id).exists());
+    }
+
+    #[test]
+    fn local_atomic_authority_rejects_post_migration_legacy_writer() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "mixed-version-writer";
+        let base = GraphSnapshot::empty();
+        let gen1 = backend
+            .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+
+        // Model a pre-authority binary committing through graph.kndb.gen after
+        // the new authority record already exists. Its old path reports success
+        // without advancing authority.json.
+        let legacy_delta = crate::storage::delta::GraphSnapshotDelta::empty(gen1);
+        LocalFileBackend::atomic_write(
+            &backend.delta_path(repo_id, gen1 + 1),
+            &legacy_delta.to_bytes().unwrap(),
+        )
+        .unwrap();
+        backend.write_generation(repo_id, gen1 + 1).unwrap();
+
+        let error = load_recovered_snapshot(&backend, repo_id)
+            .expect_err("mixed-version writer divergence must fail closed");
+        assert!(error.to_string().contains("legacy local writer advanced"));
     }
 
     #[test]

@@ -15,7 +15,7 @@
 //! overlays(repo_id TEXT, session_id TEXT, data BLOB, PK(repo_id, session_id))
 //! ```
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
@@ -39,6 +39,8 @@ pub struct SqliteBackend {
     /// Retained for diagnostics / display; the connection owns the actual file.
     #[allow(dead_code)]
     db_path: PathBuf,
+    #[cfg(test)]
+    clear_deltas_after_authority_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl SqliteBackend {
@@ -73,6 +75,8 @@ impl SqliteBackend {
         Ok(Self {
             conn: Mutex::new(conn),
             db_path,
+            #[cfg(test)]
+            clear_deltas_after_authority_hook: Mutex::new(None),
         })
     }
 
@@ -87,6 +91,8 @@ impl SqliteBackend {
         Ok(Self {
             conn: Mutex::new(conn),
             db_path: PathBuf::from(":memory:"),
+            #[cfg(test)]
+            clear_deltas_after_authority_hook: Mutex::new(None),
         })
     }
 
@@ -330,13 +336,15 @@ impl StorageBackend for SqliteBackend {
     ) -> Result<Generation, KinDbError> {
         let _snapshot = crate::storage::format::GraphSnapshot::from_bytes(data)?;
         let expected_sql_generation = Self::encode_generation(expected_gen, "expected snapshot")?;
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
 
         // Use an immediate transaction to hold the write lock for the
         // duration of the read-check-write cycle (CAS).
-        let tx = conn.unchecked_transaction().map_err(|e| {
-            KinDbError::StorageError(format!("SQLite begin transaction failed: {e}"))
-        })?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| {
+                KinDbError::StorageError(format!("SQLite begin transaction failed: {e}"))
+            })?;
 
         let current_gen: Option<(i64, Option<i64>)> = tx
             .query_row(
@@ -422,10 +430,12 @@ impl StorageBackend for SqliteBackend {
             )));
         }
         let base_sql_generation = Self::encode_generation(base_gen, "delta base")?;
-        let conn = self.conn.lock();
-        let tx = conn.unchecked_transaction().map_err(|e| {
-            KinDbError::StorageError(format!("SQLite begin transaction failed: {e}"))
-        })?;
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| {
+                KinDbError::StorageError(format!("SQLite begin transaction failed: {e}"))
+            })?;
 
         // Read current generation for CAS
         let current_gen: Option<(i64, Option<i64>)> = tx
@@ -512,21 +522,42 @@ impl StorageBackend for SqliteBackend {
     }
 
     fn clear_deltas(&self, repo_id: &str) -> Result<(), KinDbError> {
-        let conn = self.conn.lock();
-        if let Some(authority) = Self::load_authority_from_connection(&conn, repo_id)? {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "SQLite begin delta-cleanup transaction failed: {error}"
+                ))
+            })?;
+        if let Some(authority) = Self::load_authority_from_connection(&tx, repo_id)? {
             if authority.snapshot_generation != authority.head_generation {
                 return Err(KinDbError::StorageError(format!(
                     "refusing to clear authoritative SQLite deltas for repo {repo_id}: snapshot generation {}, head {}",
                     authority.snapshot_generation, authority.head_generation
                 )));
             }
-        }
-        conn.execute("DELETE FROM deltas WHERE repo_id = ?1", params![repo_id])
+            #[cfg(test)]
+            if let Some(hook) = self.clear_deltas_after_authority_hook.lock().take() {
+                hook();
+            }
+            let cutoff =
+                Self::encode_generation(authority.snapshot_generation, "delta cleanup cutoff")?;
+            tx.execute(
+                "DELETE FROM deltas WHERE repo_id = ?1 AND generation <= ?2",
+                params![repo_id, cutoff],
+            )
             .map_err(|e| {
                 KinDbError::StorageError(format!(
                     "SQLite clear_deltas failed for repo {repo_id}: {e}"
                 ))
             })?;
+        }
+        tx.commit().map_err(|error| {
+            KinDbError::StorageError(format!(
+                "SQLite delta-cleanup commit failed for repo {repo_id}: {error}"
+            ))
+        })?;
         Ok(())
     }
 
@@ -1013,5 +1044,82 @@ mod tests {
         assert!(recovered.snapshot.file_hashes.contains_key("base.rs"));
         assert!(recovered.snapshot.file_hashes.contains_key("first.rs"));
         assert!(recovered.snapshot.file_hashes.contains_key("second.rs"));
+    }
+
+    #[test]
+    fn sqlite_cutoff_cleanup_cannot_delete_concurrent_writer_delta() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("cleanup-race.db");
+        let repo_id = "cleanup-race";
+        let cleaner = Arc::new(SqliteBackend::new(&db_path).unwrap());
+        let writer = Arc::new(SqliteBackend::new(&db_path).unwrap());
+        let base = GraphSnapshot::empty();
+        let gen1 = cleaner
+            .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let mut promoted = base.clone();
+        promoted
+            .file_hashes
+            .insert("promoted.rs".to_string(), [4; 32]);
+        let first = crate::storage::delta::compute_graph_delta(&base, &promoted, gen1);
+        let gen2 = cleaner
+            .save_delta(repo_id, &first.to_bytes().unwrap(), gen1)
+            .unwrap();
+        let gen3 = cleaner
+            .save_snapshot(repo_id, &promoted.to_bytes().unwrap(), gen2)
+            .unwrap();
+
+        let (checked_tx, checked_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        *cleaner.clear_deltas_after_authority_hook.lock() = Some(Box::new(move || {
+            checked_tx.send(()).unwrap();
+            continue_rx.recv().unwrap();
+        }));
+
+        let cleaner_thread = {
+            let cleaner = Arc::clone(&cleaner);
+            std::thread::spawn(move || cleaner.clear_deltas(repo_id))
+        };
+        checked_rx.recv().unwrap();
+
+        let mut with_concurrent = promoted.clone();
+        with_concurrent
+            .file_hashes
+            .insert("concurrent.rs".to_string(), [5; 32]);
+        let concurrent =
+            crate::storage::delta::compute_graph_delta(&promoted, &with_concurrent, gen3);
+        let (writer_started_tx, writer_started_rx) = mpsc::channel();
+        let (writer_done_tx, writer_done_rx) = mpsc::channel();
+        let writer_thread = {
+            let writer = Arc::clone(&writer);
+            let bytes = concurrent.to_bytes().unwrap();
+            std::thread::spawn(move || {
+                writer_started_tx.send(()).unwrap();
+                let result = writer.save_delta(repo_id, &bytes, gen3);
+                writer_done_tx.send(()).unwrap();
+                result
+            })
+        };
+        writer_started_rx.recv().unwrap();
+        assert!(
+            writer_done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "concurrent writer must wait behind the cleanup transaction"
+        );
+
+        continue_tx.send(()).unwrap();
+        cleaner_thread.join().unwrap().unwrap();
+        let gen4 = writer_thread.join().unwrap().unwrap();
+        assert_eq!(gen4, gen3 + 1);
+
+        let recovered = crate::storage::backend::load_recovered_snapshot(writer.as_ref(), repo_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.generation, gen4);
+        assert!(recovered.snapshot.file_hashes.contains_key("concurrent.rs"));
     }
 }
