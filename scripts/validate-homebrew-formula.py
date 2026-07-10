@@ -92,6 +92,26 @@ def expected_url(artifact: str) -> str:
     )
 
 
+def question_follows_predicate_identifier(line: str, index: int) -> bool:
+    """Return whether ``line[index]`` terminates a Ruby predicate identifier.
+
+    A single preceding alphanumeric is insufficient: Ruby parses no-space
+    ternaries after numeric, instance, class, and global variables (for example
+    ``1?2:3`` and ``@flag?2:3``). Predicate method names instead end in an
+    identifier whose first character is alphabetic or ``_`` and whose token is
+    not introduced by a variable sigil. Qualified calls such as ``File.exist?``
+    and identifiers containing digits such as ``ready1?`` remain supported.
+    """
+
+    start = index
+    while start > 0 and (line[start - 1].isalnum() or line[start - 1] == "_"):
+        start -= 1
+    identifier = line[start:index]
+    if not identifier or not (identifier[0].isalpha() or identifier[0] == "_"):
+        return False
+    return start == 0 or line[start - 1] not in {"@", "$"}
+
+
 def scan_ruby_line(line: str) -> RubyLineScan:
     """Scan one generated-formula line with the Ruby tokens relevant here.
 
@@ -133,8 +153,8 @@ def scan_ruby_line(line: str) -> RubyLineScan:
         if character in {'"', "'"}:
             quote = character
             retained.append(" ")
-        elif character == "?" and (
-            index == 0 or not (line[index - 1].isalnum() or line[index - 1] == "_")
+        elif character == "?" and not question_follows_predicate_identifier(
+            line, index
         ):
             has_unsupported_question_syntax = True
             retained.append(character)

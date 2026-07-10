@@ -611,6 +611,29 @@ def test_escaped_character_literals_cannot_hide_comment_boundaries() -> None:
         )
 
 
+def test_numeric_and_variable_ternaries_cannot_bypass_question_guard() -> None:
+    for condition in ("1", "1_000", "0xff", "@ivar", "@@cvar", "$gvar"):
+        formula = current_real_formula_shape().replace(
+            '    bin.install "kin"',
+            f'    value = {condition}?2:3\n    bin.install "kin"',
+            1,
+        )
+
+        assert_ruby_syntax_valid(formula)
+        assert_validator_rejects(
+            formula, "Ruby character literals and ternary expressions"
+        )
+
+
+def test_predicate_identifier_with_digit_remains_supported() -> None:
+    formula = current_real_formula_shape().replace("File.exist?", "File.ready1?", 1)
+    assert_ruby_syntax_valid(formula)
+
+    result = run_validator(formula)
+
+    assert result.returncode == 0, result.stdout.decode() + result.stderr.decode()
+
+
 def test_percent_characters_inside_strings_and_comments_remain_data() -> None:
     formula = current_real_formula_shape().replace(
         '    bin.install "kin"',
@@ -867,6 +890,8 @@ def main() -> None:
         test_hash_character_literal_cannot_hide_percent_scope_escape,
         test_hash_character_literal_cannot_escape_install_scope_without_percent,
         test_escaped_character_literals_cannot_hide_comment_boundaries,
+        test_numeric_and_variable_ternaries_cannot_bypass_question_guard,
+        test_predicate_identifier_with_digit_remains_supported,
         test_percent_characters_inside_strings_and_comments_remain_data,
         test_unparsed_ruby_regex_cannot_supply_inactive_version,
         test_multiline_ruby_regex_inside_install_body_is_rejected,
