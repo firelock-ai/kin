@@ -363,15 +363,24 @@ pub(crate) fn select_history_oids_from_head(
         GitError::Git("history walk did not contain the requested head commit".to_string())
     })?;
 
+    // Unlimited import already contains the entire reachable ancestry, so it
+    // needs no frontier expansion (and no second object lookup per commit).
+    // Keep a deterministic child-first order for co-change consumers; semantic
+    // history imposes parent-first emission in the following phase.
+    if max_commits == 0 {
+        let mut all: Vec<_> = commit_times
+            .into_iter()
+            .map(|(oid, commit_time)| (Reverse(commit_time), oid))
+            .collect();
+        all.sort_unstable();
+        return Ok(all.into_iter().map(|(_, oid)| oid).collect());
+    }
+
     let mut frontier = BTreeSet::from([(Reverse(head_time), head_id)]);
-    let mut selected = Vec::with_capacity(if max_commits == 0 {
-        commit_times.len()
-    } else {
-        max_commits.min(commit_times.len())
-    });
+    let mut selected = Vec::with_capacity(max_commits.min(commit_times.len()));
     let mut selected_set = HashSet::new();
 
-    while max_commits == 0 || selected.len() < max_commits {
+    while selected.len() < max_commits {
         let Some(candidate) = frontier.iter().next().copied() else {
             break;
         };
