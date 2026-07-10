@@ -279,12 +279,153 @@ pub(crate) struct VfsTreeSnapshot {
 pub(crate) type VfsTreeBuildResult =
     std::result::Result<Arc<VfsTreeSnapshot>, (axum::http::StatusCode, String)>;
 
+/// Cooperative cancellation shared by one request and every blocking-pool job
+/// it launches. Request drop and daemon shutdown both signal the same token.
+pub(crate) struct BlockingWorkCancellation {
+    flag: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl BlockingWorkCancellation {
+    pub(crate) fn new() -> Self {
+        Self {
+            flag: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+        self.notify.notify_waiters();
+        // Retain one permit for the check/register race in `cancelled()`.
+        self.notify.notify_one();
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn flag(&self) -> &AtomicBool {
+        &self.flag
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        self.notify.notified().await;
+    }
+}
+
+/// Registry of blocking-pool work that may outlive the initiating HTTP
+/// future. A task keeps its registration until the synchronous body returns,
+/// so a disconnected request cannot turn it into invisible background work.
+pub(crate) struct DaemonBlockingTasks {
+    next_id: AtomicU64,
+    active: Mutex<HashMap<u64, Arc<BlockingWorkCancellation>>>,
+    idle: tokio::sync::Notify,
+    shutting_down: AtomicBool,
+}
+
+impl Default for DaemonBlockingTasks {
+    fn default() -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+            active: Mutex::new(HashMap::new()),
+            idle: tokio::sync::Notify::new(),
+            shutting_down: AtomicBool::new(false),
+        }
+    }
+}
+
+pub(crate) struct BlockingTaskRegistration {
+    id: u64,
+    tasks: Arc<DaemonBlockingTasks>,
+}
+
+impl DaemonBlockingTasks {
+    pub(crate) fn register(
+        self: &Arc<Self>,
+        cancellation: Arc<BlockingWorkCancellation>,
+    ) -> BlockingTaskRegistration {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active.insert(id, Arc::clone(&cancellation));
+        if self.shutting_down.load(Ordering::Acquire) {
+            cancellation.cancel();
+        }
+        drop(active);
+        BlockingTaskRegistration {
+            id,
+            tasks: Arc::clone(self),
+        }
+    }
+
+    pub(crate) fn cancel_all(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for cancellation in active.values() {
+            cancellation.cancel();
+        }
+    }
+
+    pub(crate) async fn cancel_and_drain(&self, timeout: Duration) -> bool {
+        self.cancel_all();
+        tokio::time::timeout(timeout, async {
+            loop {
+                let notified = self.idle.notified();
+                if self
+                    .active
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty()
+                {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    pub(crate) fn active_count(&self) -> usize {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+impl Drop for BlockingTaskRegistration {
+    fn drop(&mut self) {
+        let mut active = self
+            .tasks
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let became_empty = active.remove(&self.id).is_some() && active.is_empty();
+        drop(active);
+        if became_empty {
+            self.tasks.idle.notify_waiters();
+            self.tasks.idle.notify_one();
+        }
+    }
+}
+
 /// One daemon-owned VFS materialization flight. The receiver is retained in
 /// state so dropping/cancelling the request that started the build cannot cancel
 /// the build or let a second request launch a duplicate O(history) replay.
 #[derive(Clone)]
 pub(crate) struct VfsTreeBuildFlight {
     pub token: Arc<()>,
+    pub cancellation: Arc<BlockingWorkCancellation>,
     pub receiver: tokio::sync::watch::Receiver<Option<VfsTreeBuildResult>>,
 }
 
@@ -292,6 +433,13 @@ pub(crate) struct VfsTreeBuildFlight {
 #[derive(Debug, Clone)]
 pub(crate) struct VfsTreeBuildTestHook {
     pub materialized: Arc<std::sync::Barrier>,
+    pub resume: Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct ReviewMutationTestHook {
+    pub mutated: Arc<std::sync::Barrier>,
     pub resume: Arc<std::sync::Barrier>,
 }
 
@@ -408,6 +556,8 @@ pub struct DaemonState {
     pub(crate) vfs_history_walk_count: AtomicU64,
     #[cfg(test)]
     pub(crate) vfs_tree_build_test_hook: std::sync::Mutex<Option<VfsTreeBuildTestHook>>,
+    #[cfg(test)]
+    pub(crate) review_mutation_test_hook: std::sync::Mutex<Option<ReviewMutationTestHook>>,
     /// Broadcast channel for SSE invalidation events.
     /// Subscribers (VFS daemon, spine, KinLab) receive real-time notifications.
     pub event_tx: tokio::sync::broadcast::Sender<DaemonEvent>,
@@ -544,6 +694,8 @@ pub struct DaemonState {
     /// Monotonic closure memo for the live HEAD graph. Explicit historical
     /// refs pay one completeness walk after daemon startup, then stay O(1).
     pub history_closure_cache: Arc<kin_cli::commands::ref_lookup::GitHistoryClosureCache>,
+    /// Blocking jobs that remain visible and cancellable after request drop.
+    pub(crate) blocking_tasks: Arc<DaemonBlockingTasks>,
 }
 
 /// Cached full locate entity-ranking for cursor paging. The daemon caches the
@@ -802,6 +954,8 @@ impl DaemonState {
             vfs_history_walk_count: AtomicU64::new(0),
             #[cfg(test)]
             vfs_tree_build_test_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            review_mutation_test_hook: std::sync::Mutex::new(None),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
             session_scopes: RwLock::new(HashMap::new()),
@@ -834,6 +988,7 @@ impl DaemonState {
             history_closure_cache: Arc::new(
                 kin_cli::commands::ref_lookup::GitHistoryClosureCache::default(),
             ),
+            blocking_tasks: Arc::new(DaemonBlockingTasks::default()),
         };
         // Restore in-flight MCP transactions persisted before a restart
         // so staged-but-uncommitted work is not silently dropped across a daemon
@@ -957,6 +1112,8 @@ impl DaemonState {
             vfs_history_walk_count: AtomicU64::new(0),
             #[cfg(test)]
             vfs_tree_build_test_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            review_mutation_test_hook: std::sync::Mutex::new(None),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
             session_scopes: RwLock::new(HashMap::new()),
@@ -989,6 +1146,7 @@ impl DaemonState {
             history_closure_cache: Arc::new(
                 kin_cli::commands::ref_lookup::GitHistoryClosureCache::default(),
             ),
+            blocking_tasks: Arc::new(DaemonBlockingTasks::default()),
         };
 
         // Restore in-flight MCP transactions persisted before a restart.
@@ -1492,6 +1650,7 @@ impl DaemonState {
 
     /// Open a bounded SemanticChange-history mutation window. See
     /// [`VfsHistoryMutationGuard`] for the publication contract.
+    #[cfg(test)]
     pub(crate) fn begin_vfs_history_mutation(&self) -> VfsHistoryMutationGuard<'_> {
         self.vfs_history_mutations_inflight
             .fetch_add(1, Ordering::SeqCst);
@@ -2278,6 +2437,25 @@ mod tests {
     use kin_reconcile::ReconcileOutcome;
     use serde_json::json;
 
+    #[tokio::test]
+    async fn blocking_task_registry_cancels_and_drains_active_and_late_work() {
+        let tasks = Arc::new(DaemonBlockingTasks::default());
+        let cancellation = Arc::new(BlockingWorkCancellation::new());
+        let registration = tasks.register(Arc::clone(&cancellation));
+        assert_eq!(tasks.active_count(), 1);
+
+        tasks.cancel_all();
+        assert!(cancellation.is_cancelled());
+        drop(registration);
+        assert!(tasks.cancel_and_drain(Duration::from_millis(50)).await);
+
+        let late_cancellation = Arc::new(BlockingWorkCancellation::new());
+        let late_registration = tasks.register(Arc::clone(&late_cancellation));
+        assert!(late_cancellation.is_cancelled());
+        drop(late_registration);
+        assert!(tasks.cancel_and_drain(Duration::from_millis(50)).await);
+    }
+
     fn simple_layout(file_id: &FilePathId) -> FileLayout {
         FileLayout {
             file_id: file_id.clone(),
@@ -2328,6 +2506,8 @@ mod tests {
             vfs_history_walk_count: AtomicU64::new(0),
             #[cfg(test)]
             vfs_tree_build_test_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            review_mutation_test_hook: std::sync::Mutex::new(None),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
             session_scopes: RwLock::new(HashMap::new()),
@@ -2360,6 +2540,7 @@ mod tests {
             history_closure_cache: Arc::new(
                 kin_cli::commands::ref_lookup::GitHistoryClosureCache::default(),
             ),
+            blocking_tasks: Arc::new(DaemonBlockingTasks::default()),
         }
     }
 

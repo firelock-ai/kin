@@ -3360,31 +3360,129 @@ pub fn run_with_graph_capture_at_ref(
     max_files_explicit: bool,
     snippet_opts: SnippetOptions,
 ) -> Result<LocateResult> {
-    let changes = kin_core::collect_changes_at_ref(graph, head)
-        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-    let historical = if let Some(git_oid) = reference.strip_prefix("git:") {
-        kin_core::build_graph_at_git_ref_with_repo(
+    run_with_graph_capture_at_ref_inner(
+        layout,
+        graph,
+        blob_store,
+        head,
+        reference,
+        text,
+        explain,
+        max_files,
+        max_files_explicit,
+        snippet_opts,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_graph_capture_at_ref_cancellable(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    blob_store: &kin_blobs::BlobStore,
+    head: &SemanticChangeId,
+    reference: &str,
+    text: &str,
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+    snippet_opts: SnippetOptions,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<LocateResult> {
+    run_with_graph_capture_at_ref_inner(
+        layout,
+        graph,
+        blob_store,
+        head,
+        reference,
+        text,
+        explain,
+        max_files,
+        max_files_explicit,
+        snippet_opts,
+        Some(cancelled),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_with_graph_capture_at_ref_inner(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    blob_store: &kin_blobs::BlobStore,
+    head: &SemanticChangeId,
+    reference: &str,
+    text: &str,
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+    snippet_opts: SnippetOptions,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<LocateResult> {
+    let ensure_not_cancelled = || -> Result<()> {
+        if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+            anyhow::bail!("ref-scoped locate cancelled");
+        }
+        Ok(())
+    };
+    ensure_not_cancelled()?;
+    let changes = match cancelled {
+        Some(cancelled) => kin_core::collect_changes_at_ref_cancellable(graph, head, cancelled),
+        None => kin_core::collect_changes_at_ref(graph, head),
+    }
+    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    ensure_not_cancelled()?;
+    let historical = match (reference.strip_prefix("git:"), cancelled) {
+        (Some(git_oid), Some(cancelled)) => kin_core::build_graph_at_git_ref_with_repo_cancellable(
             graph,
             blob_store,
             head,
             layout.working_dir(),
             git_oid,
             None,
-        )
-    } else {
-        kin_core::build_graph_at_ref_with_repo(
+            cancelled,
+        ),
+        (Some(git_oid), None) => kin_core::build_graph_at_git_ref_with_repo(
+            graph,
+            blob_store,
+            head,
+            layout.working_dir(),
+            git_oid,
+            None,
+        ),
+        (None, Some(cancelled)) => kin_core::build_graph_at_ref_with_repo_cancellable(
             graph,
             blob_store,
             head,
             Some(layout.working_dir()),
             None,
-        )
+            cancelled,
+        ),
+        (None, None) => kin_core::build_graph_at_ref_with_repo(
+            graph,
+            blob_store,
+            head,
+            Some(layout.working_dir()),
+            None,
+        ),
     }
     .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-    let _ = crate::commands::cochange::refresh_from_changes(&historical, &changes);
+    ensure_not_cancelled()?;
+    match cancelled {
+        Some(cancelled) => {
+            let _ = crate::commands::cochange::refresh_from_changes_cancellable(
+                &historical,
+                &changes,
+                cancelled,
+            );
+        }
+        None => {
+            let _ = crate::commands::cochange::refresh_from_changes(&historical, &changes);
+        }
+    }
+    ensure_not_cancelled()?;
     let extra_priority_files =
         discover_historical_test_artifact_priority_files(&historical, reference, text);
-    run_with_graph_capture_with_priority_files_and_vector_source(
+    let result = run_with_graph_capture_with_priority_files_and_vector_source(
         &historical,
         None,
         text,
@@ -3394,7 +3492,9 @@ pub fn run_with_graph_capture_at_ref(
         extra_priority_files,
         Some(graph),
         snippet_opts,
-    )
+    )?;
+    ensure_not_cancelled()?;
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------

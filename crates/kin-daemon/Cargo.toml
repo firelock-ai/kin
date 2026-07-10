@@ -23,6 +23,7 @@ gcs = ["kin-db/gcs"]
 firestore = ["kin-spine/firestore"]
 
 [dependencies]
+anyhow = { workspace = true }
 mimalloc = { version = "0.1", default-features = false }
 kin-model = { workspace = true }
 kin-core = { workspace = true }

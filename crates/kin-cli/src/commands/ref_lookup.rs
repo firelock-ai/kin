@@ -2,12 +2,11 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{anyhow, bail, Context, Result};
-use kin_model::{BranchName, ChangeStore, Entity, EntityFilter, GraphStore};
+use kin_model::{BranchName, ChangeStore, Entity, EntityFilter, GraphStore, SemanticChange};
 use kin_model::{Hash256, SemanticChangeId};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
-use tracing::warn;
 
 /// A reference did not resolve to a semantic change — unknown ref syntax, a
 /// ref that legitimately does not exist, or a relative-ref hop (`^N`/`~N`)
@@ -85,6 +84,7 @@ pub struct PreparedGitHydration {
     imported_change_id: SemanticChangeId,
     git_oid: String,
     imported: Vec<kin_git::ImportedChange>,
+    semantic_complete: bool,
 }
 
 /// Per-graph memo of Git-derived histories proven complete down to Kin's
@@ -98,6 +98,7 @@ pub struct PreparedGitHydration {
 #[derive(Debug, Default)]
 pub struct GitHistoryClosureCache {
     closed: RwLock<HashSet<SemanticChangeId>>,
+    semantic_complete: RwLock<HashSet<SemanticChangeId>>,
     first_check_gate: std::sync::Mutex<()>,
     #[cfg(test)]
     closure_walks: std::sync::atomic::AtomicU64,
@@ -108,6 +109,13 @@ impl GitHistoryClosureCache {
         self.closed
             .read()
             .map(|closed| closed.contains(head))
+            .unwrap_or(false)
+    }
+
+    pub fn is_known_semantic_complete(&self, head: &SemanticChangeId) -> bool {
+        self.semantic_complete
+            .read()
+            .map(|complete| complete.contains(head))
             .unwrap_or(false)
     }
 
@@ -129,6 +137,12 @@ impl GitHistoryClosureCache {
     fn closure_walk_count(&self) -> u64 {
         self.closure_walks
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn remember_semantic_complete(&self, change_ids: impl IntoIterator<Item = SemanticChangeId>) {
+        if let Ok(mut complete) = self.semantic_complete.write() {
+            complete.extend(change_ids);
+        }
     }
 }
 
@@ -250,8 +264,14 @@ fn resolve_ref_importing_git_if_needed_with_mode(
 ) -> Result<ResolvedRef> {
     let mut hydrated_change_ids = Vec::new();
     if let Some(git_oid) = reference.and_then(extract_git_ref) {
-        let imported_change_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid)?;
-        if !imported_git_history_is_closed_cached(graph, imported_change_id, closure_cache, None)? {
+        let needs_hydration = git_ref_requires_hydration_for_mode_inner(
+            graph,
+            git_oid,
+            closure_cache,
+            enrich_semantics,
+            None,
+        )?;
+        if needs_hydration {
             hydrated_change_ids = hydrate_imported_git_ref(
                 graph,
                 layout,
@@ -595,6 +615,24 @@ pub fn git_ref_requires_hydration_cached(
     git_ref_requires_hydration_inner(graph, reference, Some(closure_cache))
 }
 
+/// Mode-aware cached form. Semantic consumers must not treat an artifact-only
+/// closure as semantically hydrated.
+pub fn git_ref_requires_hydration_cached_for_mode(
+    graph: &kin_db::InMemoryGraph,
+    reference: &str,
+    closure_cache: &GitHistoryClosureCache,
+    enrich_semantics: bool,
+) -> bool {
+    git_ref_requires_hydration_for_mode_inner(
+        graph,
+        reference,
+        Some(closure_cache),
+        enrich_semantics,
+        None,
+    )
+    .unwrap_or(true)
+}
+
 /// Cancellable cached closure check for daemon blocking-pool work. Unlike the
 /// conservative boolean helper, cancellation is returned to the caller so a
 /// timed-out request cannot silently start a replacement import.
@@ -602,7 +640,24 @@ pub fn git_ref_requires_hydration_cached_cancellable(
     graph: &kin_db::InMemoryGraph,
     reference: &str,
     closure_cache: &GitHistoryClosureCache,
+    enrich_semantics: bool,
     cancelled: &AtomicBool,
+) -> Result<bool> {
+    git_ref_requires_hydration_for_mode_inner(
+        graph,
+        reference,
+        Some(closure_cache),
+        enrich_semantics,
+        Some(cancelled),
+    )
+}
+
+fn git_ref_requires_hydration_for_mode_inner(
+    graph: &kin_db::InMemoryGraph,
+    reference: &str,
+    closure_cache: Option<&GitHistoryClosureCache>,
+    enrich_semantics: bool,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<bool> {
     let Some(git_oid) = extract_git_ref(reference) else {
         return Ok(false);
@@ -612,12 +667,12 @@ pub fn git_ref_requires_hydration_cached_cancellable(
         // turning malformed 40-character input into a closure-check failure.
         return Ok(false);
     };
-    Ok(!imported_git_history_is_closed_cached(
-        graph,
-        imported_change_id,
-        Some(closure_cache),
-        Some(cancelled),
-    )?)
+    let closed =
+        imported_git_history_is_closed_cached(graph, imported_change_id, closure_cache, cancelled)?;
+    Ok(!closed
+        || (enrich_semantics
+            && closure_cache
+                .is_some_and(|cache| !cache.is_known_semantic_complete(&imported_change_id))))
 }
 
 fn git_ref_requires_hydration_inner(
@@ -805,16 +860,16 @@ fn prepare_git_hydration_inner(
                 &blob_store,
             ),
         };
-        if let Err(err) = enrichment {
+        enrichment.with_context(|| {
             if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-                return Err(err).context("Git history hydration cancelled during enrichment");
+                "Git history hydration cancelled during semantic enrichment".to_string()
+            } else {
+                format!(
+                    "semantic enrichment failed for hydrated Git history '{}'; refusing artifact-only publication for a semantic request",
+                    git_oid
+                )
             }
-            warn!(
-                error = %err,
-                git_oid = %git_oid,
-                "failed to enrich hydrated Git history with semantic deltas; continuing with artifact-only history"
-            );
-        }
+        })?;
     }
     if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
         bail!("Git history hydration cancelled");
@@ -823,7 +878,59 @@ fn prepare_git_hydration_inner(
         imported_change_id,
         git_oid: git_oid.to_string(),
         imported,
+        semantic_complete: enrich_semantics,
     })
+}
+
+fn semantic_change_definition(change: &SemanticChange) -> Result<serde_json::Value> {
+    // Timestamp and author are record metadata and are intentionally excluded
+    // from Kin's content identity. All graph/history-defining fields must match
+    // before an existing id can be treated as an idempotent publication retry.
+    serde_json::to_value((
+        &change.id,
+        &change.parents,
+        &change.message,
+        &change.entity_deltas,
+        &change.relation_deltas,
+        &change.artifact_deltas,
+        &change.projected_files,
+        &change.spec_link,
+        &change.evidence,
+        &change.risk_summary,
+        &change.authored_on,
+    ))
+    .context("serialize immutable SemanticChange definition")
+}
+
+/// Result of a cancellable hydration publication. A failure may still carry
+/// changes inserted before cooperative cancellation or a backend error. Daemon
+/// callers must durably account for those ids before returning the error.
+pub struct GitHydrationPublication {
+    pub inserted: Vec<SemanticChangeId>,
+    pub error: Option<anyhow::Error>,
+}
+
+impl GitHydrationPublication {
+    fn success(inserted: Vec<SemanticChangeId>) -> Self {
+        Self {
+            inserted,
+            error: None,
+        }
+    }
+
+    fn failure(inserted: Vec<SemanticChangeId>, error: anyhow::Error) -> Self {
+        Self {
+            inserted,
+            error: Some(error),
+        }
+    }
+
+    fn into_result(self) -> Result<Vec<SemanticChangeId>> {
+        match self.error {
+            Some(error) => Err(error),
+            None => Ok(self.inserted),
+        }
+    }
 }
 
 /// Publish a fully prepared import. Callers must serialize this with every
@@ -835,30 +942,148 @@ pub fn publish_prepared_git_hydration(
     closure_cache: Option<&GitHistoryClosureCache>,
     before_first_insert: &mut dyn FnMut(),
 ) -> Result<Vec<SemanticChangeId>> {
-    let mut inserted = Vec::new();
+    publish_prepared_git_hydration_inner(graph, prepared, closure_cache, before_first_insert, None)
+        .into_result()
+}
+
+/// Publish a prepared import with cooperative cancellation. Unlike the
+/// compatibility wrapper, this preserves the exact inserted-id frontier on
+/// failure so callers can invalidate and persist a partial mutation safely.
+pub fn publish_prepared_git_hydration_cancellable(
+    graph: &kin_db::InMemoryGraph,
+    prepared: PreparedGitHydration,
+    closure_cache: Option<&GitHistoryClosureCache>,
+    before_first_insert: &mut dyn FnMut(),
+    cancelled: &AtomicBool,
+) -> GitHydrationPublication {
+    publish_prepared_git_hydration_inner(
+        graph,
+        prepared,
+        closure_cache,
+        before_first_insert,
+        Some(cancelled),
+    )
+}
+
+fn publish_prepared_git_hydration_inner(
+    graph: &kin_db::InMemoryGraph,
+    prepared: PreparedGitHydration,
+    closure_cache: Option<&GitHistoryClosureCache>,
+    before_first_insert: &mut dyn FnMut(),
+    cancelled: Option<&AtomicBool>,
+) -> GitHydrationPublication {
+    let ensure_not_cancelled = || -> Result<()> {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            bail!("Git history publication cancelled");
+        }
+        Ok(())
+    };
+
+    if let Err(error) = ensure_not_cancelled() {
+        return GitHydrationPublication::failure(Vec::new(), error);
+    }
+
+    // Validate the entire immutable batch before the first mutation. This
+    // prevents a conflicting existing id late in the prepared history from
+    // leaving a newly inserted prefix behind.
+    let mut prepared_definitions = HashMap::new();
+    let mut missing = Vec::new();
     for imported_change in &prepared.imported {
-        if graph.get_change(&imported_change.change.id)?.is_none() {
-            if inserted.is_empty() {
-                before_first_insert();
+        if let Err(error) = ensure_not_cancelled() {
+            return GitHydrationPublication::failure(Vec::new(), error);
+        }
+        let definition = match semantic_change_definition(&imported_change.change) {
+            Ok(definition) => definition,
+            Err(error) => return GitHydrationPublication::failure(Vec::new(), error),
+        };
+        if let Some(prior) =
+            prepared_definitions.insert(imported_change.change.id, definition.clone())
+        {
+            if prior != definition {
+                return GitHydrationPublication::failure(
+                    Vec::new(),
+                    ref_error(
+                        &prepared.git_oid,
+                        format!(
+                            "prepared Git history contains conflicting immutable definitions for semantic change {}",
+                            imported_change.change.id
+                        ),
+                    ),
+                );
             }
-            graph.create_change(&imported_change.change)?;
-            inserted.push(imported_change.change.id);
+            continue;
+        }
+        match graph.get_change(&imported_change.change.id) {
+            Ok(Some(existing)) => match semantic_change_definition(&existing) {
+                Ok(existing_definition) if existing_definition == definition => {}
+                Ok(_) => {
+                    return GitHydrationPublication::failure(
+                        Vec::new(),
+                        ref_error(
+                            &prepared.git_oid,
+                            format!(
+                                "semantic change id {} already exists with a different immutable definition; refusing Git history redefinition",
+                                imported_change.change.id
+                            ),
+                        ),
+                    );
+                }
+                Err(error) => return GitHydrationPublication::failure(Vec::new(), error),
+            },
+            Ok(None) => missing.push(&imported_change.change),
+            Err(error) => {
+                return GitHydrationPublication::failure(Vec::new(), anyhow!(error.to_string()));
+            }
         }
     }
 
-    if !imported_git_history_is_closed_cached(
+    let mut inserted = Vec::new();
+    for change in missing {
+        if let Err(error) = ensure_not_cancelled() {
+            return GitHydrationPublication::failure(inserted, error);
+        }
+        if inserted.is_empty() {
+            before_first_insert();
+        }
+        if let Err(error) = graph.create_change(change) {
+            return GitHydrationPublication::failure(inserted, anyhow!(error.to_string()));
+        }
+        inserted.push(change.id);
+        if let Err(error) = ensure_not_cancelled() {
+            return GitHydrationPublication::failure(inserted, error);
+        }
+    }
+
+    let closed = match imported_git_history_is_closed_cached(
         graph,
         prepared.imported_change_id,
         closure_cache,
-        None,
-    )? {
-        return Err(ref_error(
-            &prepared.git_oid,
-            "imported Git commit history remained incomplete after hydration",
-        ));
+        cancelled,
+    ) {
+        Ok(closed) => closed,
+        Err(error) => return GitHydrationPublication::failure(inserted, error),
+    };
+    if !closed {
+        return GitHydrationPublication::failure(
+            inserted,
+            ref_error(
+                &prepared.git_oid,
+                "imported Git commit history remained incomplete after hydration",
+            ),
+        );
+    }
+    if prepared.semantic_complete {
+        if let Some(cache) = closure_cache {
+            cache.remember_semantic_complete(
+                prepared
+                    .imported
+                    .iter()
+                    .map(|imported_change| imported_change.change.id),
+            );
+        }
     }
 
-    Ok(inserted)
+    GitHydrationPublication::success(inserted)
 }
 
 fn resolve_semantic_change<G>(
@@ -959,9 +1184,133 @@ mod tests {
             &graph,
             "git:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &cache,
+            false,
             &cancelled,
         );
         assert!(result.unwrap_err().to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn artifact_hydration_does_not_satisfy_semantic_mode_cache() {
+        let graph = InMemoryGraph::new();
+        let genesis = kin_core::build_genesis_change();
+        graph.create_change(&genesis).unwrap();
+        let git_oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let head = kin_git::semantic_change_id_from_git_oid_hex(git_oid).unwrap();
+        let change = make_change(head, vec![genesis.id]);
+        let cache = GitHistoryClosureCache::default();
+        let prepared = PreparedGitHydration {
+            imported_change_id: head,
+            git_oid: git_oid.to_string(),
+            imported: vec![kin_git::ImportedChange {
+                change: change.clone(),
+                git_oid: git_oid.to_string(),
+            }],
+            semantic_complete: false,
+        };
+        let mut before_insert = || {};
+        publish_prepared_git_hydration(&graph, prepared, Some(&cache), &mut before_insert).unwrap();
+
+        assert!(!git_ref_requires_hydration_cached_for_mode(
+            &graph, git_oid, &cache, false
+        ));
+        assert!(git_ref_requires_hydration_cached_for_mode(
+            &graph, git_oid, &cache, true
+        ));
+
+        let semantic_prepared = PreparedGitHydration {
+            imported_change_id: head,
+            git_oid: git_oid.to_string(),
+            imported: vec![kin_git::ImportedChange {
+                change,
+                git_oid: git_oid.to_string(),
+            }],
+            semantic_complete: true,
+        };
+        let inserted = publish_prepared_git_hydration(
+            &graph,
+            semantic_prepared,
+            Some(&cache),
+            &mut before_insert,
+        )
+        .unwrap();
+        assert!(inserted.is_empty());
+        assert!(!git_ref_requires_hydration_cached_for_mode(
+            &graph, git_oid, &cache, true
+        ));
+    }
+
+    #[test]
+    fn hydration_redefinition_is_rejected_before_any_insertion() {
+        let graph = InMemoryGraph::new();
+        let genesis = kin_core::build_genesis_change();
+        graph.create_change(&genesis).unwrap();
+        let missing_id = change_id(0x91);
+        let conflicting_id = change_id(0x92);
+        let mut existing = make_change(conflicting_id, vec![missing_id]);
+        existing.message = "existing definition".to_string();
+        graph.create_change(&existing).unwrap();
+        let mut conflicting = existing.clone();
+        conflicting.message = "different definition".to_string();
+        let prepared = PreparedGitHydration {
+            imported_change_id: conflicting_id,
+            git_oid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            imported: vec![
+                kin_git::ImportedChange {
+                    change: make_change(missing_id, vec![genesis.id]),
+                    git_oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                },
+                kin_git::ImportedChange {
+                    change: conflicting,
+                    git_oid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                },
+            ],
+            semantic_complete: false,
+        };
+        let mut before_insert = || {};
+        let error =
+            publish_prepared_git_hydration(&graph, prepared, None, &mut before_insert).unwrap_err();
+
+        assert!(error.to_string().contains("different immutable definition"));
+        assert!(graph.get_change(&missing_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn cancellable_publication_reports_inserted_frontier() {
+        let graph = InMemoryGraph::new();
+        let genesis = kin_core::build_genesis_change();
+        graph.create_change(&genesis).unwrap();
+        let first = change_id(0xa1);
+        let second = change_id(0xa2);
+        let prepared = PreparedGitHydration {
+            imported_change_id: second,
+            git_oid: "cccccccccccccccccccccccccccccccccccccccc".to_string(),
+            imported: vec![
+                kin_git::ImportedChange {
+                    change: make_change(first, vec![genesis.id]),
+                    git_oid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                },
+                kin_git::ImportedChange {
+                    change: make_change(second, vec![first]),
+                    git_oid: "cccccccccccccccccccccccccccccccccccccccc".to_string(),
+                },
+            ],
+            semantic_complete: false,
+        };
+        let cancelled = AtomicBool::new(false);
+        let mut cancel_before_first_insert = || cancelled.store(true, Ordering::Relaxed);
+        let outcome = publish_prepared_git_hydration_cancellable(
+            &graph,
+            prepared,
+            None,
+            &mut cancel_before_first_insert,
+            &cancelled,
+        );
+
+        assert!(outcome.error.is_some());
+        assert_eq!(outcome.inserted, vec![first]);
+        assert!(graph.get_change(&first).unwrap().is_some());
+        assert!(graph.get_change(&second).unwrap().is_none());
     }
 
     fn temp_layout() -> kin_core::KinLayout {
@@ -1009,23 +1358,18 @@ mod tests {
         graph.create_change(&genesis).unwrap();
         let head_id = kin_git::semantic_change_id_from_git_oid_hex(&head_oid).unwrap();
         let parent_id = kin_git::semantic_change_id_from_git_oid_hex(&parent_oid).unwrap();
-        graph
-            .create_change(&SemanticChange {
-                id: head_id,
-                parents: vec![parent_id],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "partial imported head".to_string(),
-                entity_deltas: vec![],
-                relation_deltas: vec![],
-                artifact_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
+        let imported = kin_git::import_git_history_to_commit_with_blobs(
+            repo.path(),
+            &head_oid,
+            genesis.id,
+            None,
+        )
+        .unwrap();
+        let imported_head = imported
+            .iter()
+            .find(|imported| imported.change.id == head_id)
             .unwrap();
+        graph.create_change(&imported_head.change).unwrap();
 
         assert!(git_ref_requires_hydration(&graph, &head_oid));
         let resolved = resolve_ref_importing_git_if_needed_for_locate_with_report(
@@ -1079,7 +1423,7 @@ mod tests {
         for _ in 0..8 {
             assert!(!git_ref_requires_hydration_cached(&graph, git_oid, &cache));
             let mut unexpected_mutation = || panic!("warm resolution attempted hydration");
-            let resolved = resolve_ref_importing_git_if_needed_with_report_cached(
+            let resolved = resolve_ref_importing_git_if_needed_for_locate_with_report_cached(
                 &graph,
                 &layout,
                 Some(git_oid),

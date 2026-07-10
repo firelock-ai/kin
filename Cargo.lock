@@ -3152,6 +3152,7 @@ dependencies = [
 name = "kin-daemon"
 version = "0.2.15"
 dependencies = [
+ "anyhow",
  "async-stream",
  "axum",
  "chrono",

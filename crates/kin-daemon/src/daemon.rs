@@ -664,6 +664,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
             shutdown_state
                 .is_shutdown
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            shutdown_state.blocking_tasks.cancel_all();
         }
     });
 
@@ -1675,6 +1676,17 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
         cancel_tx,
     )
     .await;
+
+    if !state
+        .blocking_tasks
+        .cancel_and_drain(Duration::from_secs(10))
+        .await
+    {
+        warn!(
+            active = state.blocking_tasks.active_count(),
+            "tracked blocking tasks did not cooperatively stop within shutdown drain cap"
+        );
+    }
 
     // Graceful shutdown: flush in-memory state to storage backend.
     // On spot instance preemption, GKE sends SIGTERM with a 30-second grace period.

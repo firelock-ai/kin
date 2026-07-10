@@ -68,6 +68,49 @@ pub fn execute_history_request_cached(
     closure_cache: &crate::commands::ref_lookup::GitHistoryClosureCache,
     before_first_insert: &mut dyn FnMut(),
 ) -> Result<HistoryExecution> {
+    execute_history_request_cached_inner(
+        layout,
+        graph,
+        request,
+        closure_cache,
+        before_first_insert,
+        None,
+    )
+}
+
+pub fn execute_history_request_cached_cancellable(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: &HistoryRequest,
+    closure_cache: &crate::commands::ref_lookup::GitHistoryClosureCache,
+    before_first_insert: &mut dyn FnMut(),
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<HistoryExecution> {
+    execute_history_request_cached_inner(
+        layout,
+        graph,
+        request,
+        closure_cache,
+        before_first_insert,
+        Some(cancelled),
+    )
+}
+
+fn execute_history_request_cached_inner(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: &HistoryRequest,
+    closure_cache: &crate::commands::ref_lookup::GitHistoryClosureCache,
+    before_first_insert: &mut dyn FnMut(),
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<HistoryExecution> {
+    let ensure_not_cancelled = || -> Result<()> {
+        if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+            anyhow::bail!("history request cancelled");
+        }
+        Ok(())
+    };
+    ensure_not_cancelled()?;
     let resolved =
         crate::commands::ref_lookup::resolve_ref_importing_git_if_needed_with_report_cached(
             graph,
@@ -76,6 +119,7 @@ pub fn execute_history_request_cached(
             closure_cache,
             before_first_insert,
         )?;
+    ensure_not_cancelled()?;
     let head = resolved.head;
     let target = match request.reference.as_deref() {
         Some(_) => {
@@ -89,10 +133,12 @@ pub fn execute_history_request_cached(
     )];
 
     let revisions = graph.get_entity_revisions_at(&target.id, &head)?;
+    ensure_not_cancelled()?;
     if revisions.is_empty() {
         lines.push("  No history recorded".to_string());
     } else {
         for revision in &revisions {
+            ensure_not_cancelled()?;
             let change = graph.get_change(&revision.introduced_by)?;
             let message = change
                 .as_ref()
