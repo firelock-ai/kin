@@ -89,6 +89,8 @@ pub struct ReviewExecution {
     /// described the same way as a no-op: daemon owners persist the hydrated
     /// state so the import happens once per repo instead of once per process.
     pub hydrated_changes: usize,
+    /// Exact inserted history frontier for targeted daemon cache invalidation.
+    pub hydrated_change_ids: Vec<kin_model::SemanticChangeId>,
 }
 
 #[derive(Serialize)]
@@ -174,6 +176,17 @@ pub async fn execute_review_request(
     graph: &kin_db::InMemoryGraph,
     request: ReviewRequest,
 ) -> Result<ReviewExecution> {
+    let cache = crate::commands::ref_lookup::GitHistoryClosureCache::default();
+    execute_review_request_cached(layout, graph, request, &cache, &mut || {})
+}
+
+pub fn execute_review_request_cached(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: ReviewRequest,
+    closure_cache: &crate::commands::ref_lookup::GitHistoryClosureCache,
+    before_first_insert: &mut dyn FnMut(),
+) -> Result<ReviewExecution> {
     match request {
         ReviewRequest::Run {
             change,
@@ -187,6 +200,7 @@ pub async fn execute_review_request(
             )?,
             mutated: false,
             hydrated_changes: 0,
+            hydrated_change_ids: Vec::new(),
         }),
         ReviewRequest::Shadow {
             base,
@@ -196,13 +210,24 @@ pub async fn execute_review_request(
             author,
             json,
         } => {
-            let (response, hydrated_changes) = build_shadow_run_response(
-                layout, graph, base, head, title, source_url, author, json,
+            let (response, hydrated_change_ids) = build_shadow_run_response(
+                layout,
+                graph,
+                base,
+                head,
+                title,
+                source_url,
+                author,
+                json,
+                closure_cache,
+                before_first_insert,
             )?;
+            let hydrated_changes = hydrated_change_ids.len();
             Ok(ReviewExecution {
                 response,
                 mutated: false,
                 hydrated_changes,
+                hydrated_change_ids,
             })
         }
         ReviewRequest::Create {
@@ -323,19 +348,28 @@ fn build_shadow_run_response(
     source_url: Option<String>,
     author: Option<String>,
     json: bool,
-) -> Result<(ReviewResponse, usize)> {
+    closure_cache: &crate::commands::ref_lookup::GitHistoryClosureCache,
+    before_first_insert: &mut dyn FnMut(),
+) -> Result<(ReviewResponse, Vec<kin_model::SemanticChangeId>)> {
     // The everyday "your branch is behind main" case: base is not on head's
     // ancestry. That gap is provable from the Git commit-parent DAG alone —
     // no semantic hydration needed — so it is checked before either ref pays
     // for a full history import. Returns `None` whenever the fast
     // conclusion can't be drawn, in which case the normal resolve-and-hydrate
     // path below runs exactly as it always has.
-    if let Some(report) =
-        shadow_ancestry_fast_path_gap(graph, layout, &base, &head, &title, &source_url, &author)?
-    {
+    if let Some(report) = shadow_ancestry_fast_path_gap(
+        graph,
+        layout,
+        &base,
+        &head,
+        &title,
+        &source_url,
+        &author,
+        closure_cache,
+    )? {
         // The fast path never hydrates anything, so this is always a true
         // zero, not a placeholder.
-        return Ok((shadow_response_from_report(&report, json, 0)?, 0));
+        return Ok((shadow_response_from_report(&report, json, 0)?, Vec::new()));
     }
 
     // Resolve the head ref before the base ref. A review pair is almost always
@@ -343,20 +377,26 @@ fn build_shadow_run_response(
     // ancestry in a single pass; the base is then already present in the graph
     // and resolves on the fast path instead of re-walking the shared history.
     let resolved_head =
-        crate::commands::ref_lookup::resolve_ref_importing_git_if_needed_with_report(
+        crate::commands::ref_lookup::resolve_ref_importing_git_if_needed_with_report_cached(
             graph,
             layout,
             Some(head.as_str()),
+            closure_cache,
+            before_first_insert,
         )
         .with_context(|| format!("resolve shadow head ref '{}'", head))?;
     let resolved_base =
-        crate::commands::ref_lookup::resolve_ref_importing_git_if_needed_with_report(
+        crate::commands::ref_lookup::resolve_ref_importing_git_if_needed_with_report_cached(
             graph,
             layout,
             Some(base.as_str()),
+            closure_cache,
+            before_first_insert,
         )
         .with_context(|| format!("resolve shadow base ref '{}'", base))?;
-    let hydrated_changes = resolved_base.hydrated_changes + resolved_head.hydrated_changes;
+    let mut hydrated_change_ids = resolved_head.hydrated_change_ids;
+    hydrated_change_ids.extend(resolved_base.hydrated_change_ids);
+    let hydrated_changes = hydrated_change_ids.len();
 
     let request = kin_review::ShadowRequest {
         base_ref: base,
@@ -372,7 +412,7 @@ fn build_shadow_run_response(
     let report = kin_review::build_shadow_report(graph, &request)?;
     Ok((
         shadow_response_from_report(&report, json, hydrated_changes)?,
-        hydrated_changes,
+        hydrated_change_ids,
     ))
 }
 
@@ -399,6 +439,7 @@ fn shadow_ancestry_fast_path_gap(
     title: &Option<String>,
     source_url: &Option<String>,
     author: &Option<String>,
+    closure_cache: &crate::commands::ref_lookup::GitHistoryClosureCache,
 ) -> Result<Option<kin_review::ShadowGateReport>> {
     let Some(base_oid) = crate::commands::ref_lookup::extract_git_ref(base) else {
         return Ok(None);
@@ -406,8 +447,13 @@ fn shadow_ancestry_fast_path_gap(
     let Some(head_oid) = crate::commands::ref_lookup::extract_git_ref(head) else {
         return Ok(None);
     };
-    let needs_check = crate::commands::ref_lookup::git_ref_requires_hydration(graph, base)
-        || crate::commands::ref_lookup::git_ref_requires_hydration(graph, head);
+    let needs_check =
+        crate::commands::ref_lookup::git_ref_requires_hydration_cached(graph, base, closure_cache)
+            || crate::commands::ref_lookup::git_ref_requires_hydration_cached(
+                graph,
+                head,
+                closure_cache,
+            );
     if !needs_check {
         return Ok(None);
     }
@@ -789,6 +835,7 @@ fn create_review_with_graph(
         },
         mutated: true,
         hydrated_changes: 0,
+        hydrated_change_ids: Vec::new(),
     })
 }
 
@@ -849,6 +896,7 @@ fn decide_review_with_graph(
         },
         mutated: true,
         hydrated_changes: 0,
+        hydrated_change_ids: Vec::new(),
     })
 }
 
@@ -896,6 +944,7 @@ fn add_note_with_graph(
         response: ReviewResponse { text, json: None },
         mutated: true,
         hydrated_changes: 0,
+        hydrated_change_ids: Vec::new(),
     })
 }
 
@@ -957,6 +1006,7 @@ fn start_discussion_with_graph(
         response: ReviewResponse { text, json: None },
         mutated: true,
         hydrated_changes: 0,
+        hydrated_change_ids: Vec::new(),
     })
 }
 
@@ -994,6 +1044,7 @@ fn reply_discussion_with_graph(
         },
         mutated: true,
         hydrated_changes: 0,
+        hydrated_change_ids: Vec::new(),
     })
 }
 
@@ -1017,6 +1068,7 @@ fn resolve_discussion_with_graph(
         },
         mutated: true,
         hydrated_changes: 0,
+        hydrated_change_ids: Vec::new(),
     })
 }
 
@@ -1055,6 +1107,7 @@ fn assign_reviewer_with_graph(
         },
         mutated: true,
         hydrated_changes: 0,
+        hydrated_change_ids: Vec::new(),
     })
 }
 
@@ -1098,6 +1151,7 @@ fn list_reviews_with_graph(
             },
             mutated: false,
             hydrated_changes: 0,
+            hydrated_change_ids: Vec::new(),
         });
     }
 
@@ -1118,6 +1172,7 @@ fn list_reviews_with_graph(
         response: ReviewResponse { text, json: None },
         mutated: false,
         hydrated_changes: 0,
+        hydrated_change_ids: Vec::new(),
     })
 }
 
@@ -1211,6 +1266,7 @@ fn show_review_with_graph(
         response: ReviewResponse { text, json: None },
         mutated: false,
         hydrated_changes: 0,
+        hydrated_change_ids: Vec::new(),
     })
 }
 
@@ -1386,7 +1442,8 @@ mod tests {
             "branch b must not be imported before the call"
         );
 
-        let (response, hydrated_changes) = build_shadow_run_response(
+        let cache = crate::commands::ref_lookup::GitHistoryClosureCache::default();
+        let (response, hydrated_change_ids) = build_shadow_run_response(
             &layout,
             &graph,
             branch_a.clone(),
@@ -1395,11 +1452,14 @@ mod tests {
             None,
             None,
             true,
+            &cache,
+            &mut || {},
         )
         .expect("a stale base must produce a gap report, not an error");
 
         assert_eq!(
-            hydrated_changes, 0,
+            hydrated_change_ids.len(),
+            0,
             "the fast path must report no hydration was performed"
         );
 
@@ -1475,7 +1535,8 @@ mod tests {
             })
             .unwrap();
 
-        let (response, hydrated_changes) = build_shadow_run_response(
+        let cache = crate::commands::ref_lookup::GitHistoryClosureCache::default();
+        let (response, hydrated_change_ids) = build_shadow_run_response(
             &layout,
             &graph,
             format!("kin:{base_id}"),
@@ -1484,11 +1545,14 @@ mod tests {
             None,
             None,
             true,
+            &cache,
+            &mut || {},
         )
         .unwrap();
 
         assert_eq!(
-            hydrated_changes, 0,
+            hydrated_change_ids.len(),
+            0,
             "already-resolved refs must report zero hydrated changes"
         );
         let json: serde_json::Value =

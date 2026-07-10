@@ -204,6 +204,10 @@ pub struct TemporalScope {
     pub head: kin_model::SemanticChangeId,
     /// Cached reconstructed historical graph
     pub cached_graph: Arc<kin_db::InMemoryGraph>,
+    /// Closure memo owned by the same graph instance. Keeping ownership paired
+    /// prevents a verified head from one temporal graph being reused for a
+    /// different graph with the same SemanticChange id.
+    pub history_closure_cache: Arc<kin_cli::commands::ref_lookup::GitHistoryClosureCache>,
     /// When the scope was created
     pub created_at: Instant,
     /// Time-to-live — scope auto-expires after this duration
@@ -514,6 +518,9 @@ pub struct DaemonState {
     /// `set_scope` blocking task), so it is a tokio mutex behind an `Arc` — not
     /// the std locks used for the synchronous critical sections above.
     pub hydration_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Monotonic closure memo for the live HEAD graph. Explicit historical
+    /// refs pay one completeness walk after daemon startup, then stay O(1).
+    pub history_closure_cache: Arc<kin_cli::commands::ref_lookup::GitHistoryClosureCache>,
 }
 
 /// Cached full locate entity-ranking for cursor paging. The daemon caches the
@@ -798,6 +805,9 @@ impl DaemonState {
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
             hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
+            history_closure_cache: Arc::new(
+                kin_cli::commands::ref_lookup::GitHistoryClosureCache::default(),
+            ),
         };
         // Restore in-flight MCP transactions persisted before a restart
         // so staged-but-uncommitted work is not silently dropped across a daemon
@@ -947,6 +957,9 @@ impl DaemonState {
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
             hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
+            history_closure_cache: Arc::new(
+                kin_cli::commands::ref_lookup::GitHistoryClosureCache::default(),
+            ),
         };
 
         // Restore in-flight MCP transactions persisted before a restart.
@@ -1536,6 +1549,9 @@ impl DaemonState {
                 ref_string,
                 head,
                 cached_graph,
+                history_closure_cache: Arc::new(
+                    kin_cli::commands::ref_lookup::GitHistoryClosureCache::default(),
+                ),
                 created_at: Instant::now(),
                 ttl: DEFAULT_SCOPE_TTL,
             },
@@ -1612,6 +1628,34 @@ impl DaemonState {
             Some(sid) => self.graph_for_session(sid).await,
             None => Arc::clone(&self.graph),
         }
+    }
+
+    /// Resolve a request graph and its matching Git-history closure memo under
+    /// the same scope read lock. This pairing is important: a scope expiry or
+    /// replacement must never pair one graph with another graph's monotonic
+    /// completeness claims.
+    pub async fn graph_and_history_cache_for_request(
+        &self,
+        session_id: Option<&kin_model::SessionId>,
+    ) -> (
+        Arc<kin_db::InMemoryGraph>,
+        Arc<kin_cli::commands::ref_lookup::GitHistoryClosureCache>,
+    ) {
+        if let Some(session_id) = session_id {
+            let scopes = self.session_scopes.read().await;
+            if let Some(scope) = scopes.get(session_id) {
+                if !scope.is_expired() {
+                    return (
+                        Arc::clone(&scope.cached_graph),
+                        Arc::clone(&scope.history_closure_cache),
+                    );
+                }
+            }
+        }
+        (
+            Arc::clone(&self.graph),
+            Arc::clone(&self.history_closure_cache),
+        )
     }
 
     /// Emit an SSE event to all subscribers. Non-blocking — if no subscribers, the event is dropped.
@@ -2252,6 +2296,9 @@ mod tests {
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
             hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
+            history_closure_cache: Arc::new(
+                kin_cli::commands::ref_lookup::GitHistoryClosureCache::default(),
+            ),
         }
     }
 
@@ -3081,6 +3128,9 @@ mod tests {
                     ref_string: "git:abc123".to_string(),
                     head,
                     cached_graph: Arc::clone(&scoped_graph),
+                    history_closure_cache: Arc::new(
+                        kin_cli::commands::ref_lookup::GitHistoryClosureCache::default(),
+                    ),
                     // Already expired: created in the past with a zero TTL.
                     created_at: Instant::now() - Duration::from_secs(60),
                     ttl: Duration::from_secs(0),
@@ -3111,6 +3161,9 @@ mod tests {
                     ref_string: "git:abc123".to_string(),
                     head,
                     cached_graph: Arc::clone(&scoped_graph),
+                    history_closure_cache: Arc::new(
+                        kin_cli::commands::ref_lookup::GitHistoryClosureCache::default(),
+                    ),
                     created_at: Instant::now() - Duration::from_millis(80),
                     ttl: Duration::from_millis(100),
                 },

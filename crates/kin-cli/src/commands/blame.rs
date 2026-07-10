@@ -20,6 +20,7 @@ pub struct BlameResponse {
 pub struct BlameExecution {
     pub response: BlameResponse,
     pub hydrated_git_history: bool,
+    pub hydrated_change_ids: Vec<kin_model::SemanticChangeId>,
 }
 
 /// `kin blame <entity>` — Show who/when each version of an entity was committed.
@@ -54,11 +55,25 @@ pub fn execute_blame_request(
     graph: &kin_db::InMemoryGraph,
     request: &BlameRequest,
 ) -> Result<BlameExecution> {
-    let resolved = crate::commands::ref_lookup::resolve_ref_importing_git_if_needed_with_report(
-        graph,
-        layout,
-        request.reference.as_deref(),
-    )?;
+    let cache = crate::commands::ref_lookup::GitHistoryClosureCache::default();
+    execute_blame_request_cached(layout, graph, request, &cache, &mut || {})
+}
+
+pub fn execute_blame_request_cached(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: &BlameRequest,
+    closure_cache: &crate::commands::ref_lookup::GitHistoryClosureCache,
+    before_first_insert: &mut dyn FnMut(),
+) -> Result<BlameExecution> {
+    let resolved =
+        crate::commands::ref_lookup::resolve_ref_importing_git_if_needed_with_report_cached(
+            graph,
+            layout,
+            request.reference.as_deref(),
+            closure_cache,
+            before_first_insert,
+        )?;
     let head = resolved.head;
     let target = match request.reference.as_deref() {
         Some(_) => {
@@ -80,6 +95,7 @@ pub fn execute_blame_request(
         return Ok(BlameExecution {
             response: BlameResponse { lines },
             hydrated_git_history: resolved.hydrated_git_history,
+            hydrated_change_ids: resolved.hydrated_change_ids,
         });
     }
 
@@ -114,5 +130,6 @@ pub fn execute_blame_request(
     Ok(BlameExecution {
         response: BlameResponse { lines },
         hydrated_git_history: resolved.hydrated_git_history,
+        hydrated_change_ids: resolved.hydrated_change_ids,
     })
 }

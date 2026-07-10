@@ -1450,9 +1450,11 @@ async fn set_scope(
     // (roughly 2x peak memory → OOM). Already-imported refs skip the gate and
     // stay on the fast path. Acquired here (async) and moved into the blocking
     // task so it is held for the whole import.
-    let needs_hydration = kin_cli::commands::ref_lookup::git_ref_requires_hydration(
+    let history_closure_cache = Arc::clone(&state.history_closure_cache);
+    let needs_hydration = kin_cli::commands::ref_lookup::git_ref_requires_hydration_cached(
         state.graph.as_ref(),
         &ref_string,
+        history_closure_cache.as_ref(),
     );
     let hydration_gate = if needs_hydration {
         Some(Arc::clone(&state.hydration_gate).lock_owned().await)
@@ -1462,8 +1464,7 @@ async fn set_scope(
     let scope_task = tokio::task::spawn_blocking(
         move || -> std::result::Result<_, (StatusCode, String)> {
             let _hydration_gate = hydration_gate;
-            let vfs_history_mutation =
-                needs_hydration.then(|| state_clone.begin_vfs_history_mutation());
+            let mut vfs_history_mutation = None;
             // Resolve the ref to a SemanticChangeId using the LOCATE resolve mode
             // (enrich_semantics=false). Scope-for-retrieval only needs the
             // base_commit's tree state; the full per-commit semantic-delta enrichment
@@ -1472,15 +1473,26 @@ async fn set_scope(
             // session-scope locate path never reads those deltas (it ranks the scoped
             // entity set with HEAD vectors via `vector_source`). The /locate ref path
             // already uses this lighter mode.
-            let resolved =
-            kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate_with_report(
-                state_clone.graph.as_ref(),
-                &state_clone.layout,
-                Some(&ref_string),
-            )
-            .map_err(|err| (StatusCode::BAD_REQUEST, format!("{:#}", err)))?;
+            let resolved = {
+                let mut before_first_insert = || {
+                    if vfs_history_mutation.is_none() {
+                        vfs_history_mutation = Some(state_clone.begin_vfs_history_mutation());
+                    }
+                };
+                kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate_with_report_cached(
+                    state_clone.graph.as_ref(),
+                    &state_clone.layout,
+                    Some(&ref_string),
+                    history_closure_cache.as_ref(),
+                    &mut before_first_insert,
+                )
+                .map_err(|err| (StatusCode::BAD_REQUEST, format!("{:#}", err)))?
+            };
             if resolved.hydrated_git_history {
-                invalidate_vfs_after_bulk_hydration(&state_clone)?;
+                invalidate_vfs_for_inserted_changes(
+                    &state_clone,
+                    resolved.hydrated_change_ids.iter().copied(),
+                )?;
                 state_clone.bump_version();
                 state_clone.save_snapshot().map_err(internal_error)?;
                 state_clone.mark_clean();
@@ -1489,7 +1501,7 @@ async fn set_scope(
                     new_root_hash: "scope-hydration".to_string(),
                 });
             }
-            if let Some(mutation) = vfs_history_mutation {
+            if let Some(mutation) = vfs_history_mutation.take() {
                 mutation.finish();
             }
             let head = resolved.head;
@@ -3108,25 +3120,37 @@ async fn locate(
         // Locating at an unimported Git ref lazily imports its full ancestry;
         // serialize that against every other daemon hydration. Already-imported
         // refs skip the gate and stay on the fast path.
-        let needs_hydration = kin_cli::commands::ref_lookup::git_ref_requires_hydration(
+        let needs_hydration = kin_cli::commands::ref_lookup::git_ref_requires_hydration_cached(
             state.graph.as_ref(),
             reference,
+            state.history_closure_cache.as_ref(),
         );
         let _hydration_gate = if needs_hydration {
             Some(state.hydration_gate.lock().await)
         } else {
             None
         };
-        let vfs_history_mutation = needs_hydration
-            .then(|| state.begin_vfs_history_mutation());
-        let resolved = kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate_with_report(
-            state.graph.as_ref(),
-            &state.layout,
-            Some(reference),
-        )
-        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+        let mut vfs_history_mutation = None;
+        let resolved = {
+            let mut before_first_insert = || {
+                if vfs_history_mutation.is_none() {
+                    vfs_history_mutation = Some(state.begin_vfs_history_mutation());
+                }
+            };
+            kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate_with_report_cached(
+                state.graph.as_ref(),
+                &state.layout,
+                Some(reference),
+                state.history_closure_cache.as_ref(),
+                &mut before_first_insert,
+            )
+            .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?
+        };
         if resolved.hydrated_git_history {
-            invalidate_vfs_after_bulk_hydration(&state)?;
+            invalidate_vfs_for_inserted_changes(
+                &state,
+                resolved.hydrated_change_ids.iter().copied(),
+            )?;
             state.bump_version();
             state.save_snapshot().map_err(internal_error)?;
             state.mark_clean();
@@ -3135,7 +3159,7 @@ async fn locate(
                 new_root_hash: "locate-hydration".to_string(),
             });
         }
-        if let Some(mutation) = vfs_history_mutation {
+        if let Some(mutation) = vfs_history_mutation.take() {
             mutation.finish();
         }
         let head = resolved.head;
@@ -3406,20 +3430,33 @@ async fn review(
             | kin_cli::commands::review::ReviewRequest::Resolve { .. }
             | kin_cli::commands::review::ReviewRequest::Assign { .. }
     );
-    let graph = if mutates {
-        Arc::clone(&state.graph)
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let (graph, history_closure_cache) = if mutates {
+        (
+            Arc::clone(&state.graph),
+            Arc::clone(&state.history_closure_cache),
+        )
     } else {
-        let session_id = extract_session_id_from_headers(&headers)?;
-        resolve_session_graph(&state, session_id.as_ref()).await
+        state
+            .graph_and_history_cache_for_request(session_id.as_ref())
+            .await
     };
+    let mutates_live_graph = Arc::ptr_eq(&graph, &state.graph);
     // A shadow review over an unimported Git ref lazily imports its full
     // ancestry; serialize that against every other daemon hydration so two deep
     // imports never run at once. Already-imported (or non-Git) refs skip the
     // gate and stay on the fast path.
     let needs_hydration = match &req {
         kin_cli::commands::review::ReviewRequest::Shadow { base, head, .. } => {
-            kin_cli::commands::ref_lookup::git_ref_requires_hydration(graph.as_ref(), base)
-                || kin_cli::commands::ref_lookup::git_ref_requires_hydration(graph.as_ref(), head)
+            kin_cli::commands::ref_lookup::git_ref_requires_hydration_cached(
+                graph.as_ref(),
+                base,
+                history_closure_cache.as_ref(),
+            ) || kin_cli::commands::ref_lookup::git_ref_requires_hydration_cached(
+                graph.as_ref(),
+                head,
+                history_closure_cache.as_ref(),
+            )
         }
         _ => false,
     };
@@ -3428,33 +3465,44 @@ async fn review(
     } else {
         None
     };
-    let vfs_history_mutation = needs_hydration.then(|| state.begin_vfs_history_mutation());
-    let execution =
-        kin_cli::commands::review::execute_review_request(&state.layout, graph.as_ref(), req)
-            .await
-            .map_err(|err| {
-                // A ref the resolver cannot make sense of is the caller's
-                // input, not a server fault — e.g. a shadow request naming a
-                // ref that doesn't exist or uses syntax the resolver doesn't
-                // understand — so it is reported as a client error with the
-                // full "why" chain instead of falling into the generic
-                // internal-error path.
-                if kin_cli::commands::ref_lookup::is_ref_resolution_error(&err) {
-                    (StatusCode::BAD_REQUEST, format!("{err:#}"))
-                } else {
-                    internal_error(err)
-                }
-            })?;
-    if execution.hydrated_changes > 0 {
+    let mut vfs_history_mutation = None;
+    let execution = {
+        let mut before_first_insert = || {
+            if mutates_live_graph && vfs_history_mutation.is_none() {
+                vfs_history_mutation = Some(state.begin_vfs_history_mutation());
+            }
+        };
+        kin_cli::commands::review::execute_review_request_cached(
+            &state.layout,
+            graph.as_ref(),
+            req,
+            history_closure_cache.as_ref(),
+            &mut before_first_insert,
+        )
+        .map_err(|err| {
+            // A ref the resolver cannot make sense of is the caller's
+            // input, not a server fault — e.g. a shadow request naming a
+            // ref that doesn't exist or uses syntax the resolver doesn't
+            // understand — so it is reported as a client error with the
+            // full "why" chain instead of falling into the generic
+            // internal-error path.
+            if kin_cli::commands::ref_lookup::is_ref_resolution_error(&err) {
+                (StatusCode::BAD_REQUEST, format!("{err:#}"))
+            } else {
+                internal_error(err)
+            }
+        })?
+    };
+    if execution.hydrated_changes > 0 && mutates_live_graph {
         tracing::info!(
             hydrated_changes = execution.hydrated_changes,
             review_mutations = 0u64,
             "shadow review hydrated historical changes into the graph"
         );
-        invalidate_vfs_after_bulk_hydration(&state)?;
+        invalidate_vfs_for_inserted_changes(&state, execution.hydrated_change_ids.iter().copied())?;
         state.bump_version();
     }
-    if execution.hydrated_changes > 0 {
+    if execution.hydrated_changes > 0 && mutates_live_graph {
         state.save_snapshot().map_err(internal_error)?;
         state.mark_clean();
         // A live SSE subscriber (e.g. the VFS daemon) should hear about this
@@ -3467,7 +3515,7 @@ async fn review(
             new_root_hash: "review-hydration".to_string(),
         });
     }
-    if let Some(mutation) = vfs_history_mutation {
+    if let Some(mutation) = vfs_history_mutation.take() {
         mutation.finish();
     }
     if execution.mutated {
@@ -3689,24 +3737,43 @@ async fn blame(
     }
 
     let session_id = extract_session_id_from_headers(&headers)?;
-    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let (graph, history_closure_cache) = state
+        .graph_and_history_cache_for_request(session_id.as_ref())
+        .await;
+    let mutates_live_graph = Arc::ptr_eq(&graph, &state.graph);
     // Blaming at an unimported Git ref lazily imports its full ancestry;
     // serialize that against every other daemon hydration. Already-imported (or
     // absent) refs skip the gate and stay on the fast path.
     let needs_hydration = req.reference.as_deref().is_some_and(|reference| {
-        kin_cli::commands::ref_lookup::git_ref_requires_hydration(graph.as_ref(), reference)
+        kin_cli::commands::ref_lookup::git_ref_requires_hydration_cached(
+            graph.as_ref(),
+            reference,
+            history_closure_cache.as_ref(),
+        )
     });
     let _hydration_gate = if needs_hydration {
         Some(state.hydration_gate.lock().await)
     } else {
         None
     };
-    let vfs_history_mutation = needs_hydration.then(|| state.begin_vfs_history_mutation());
-    let execution =
-        kin_cli::commands::blame::execute_blame_request(&state.layout, graph.as_ref(), &req)
-            .map_err(internal_error)?;
-    if execution.hydrated_git_history {
-        invalidate_vfs_after_bulk_hydration(&state)?;
+    let mut vfs_history_mutation = None;
+    let execution = {
+        let mut before_first_insert = || {
+            if mutates_live_graph && vfs_history_mutation.is_none() {
+                vfs_history_mutation = Some(state.begin_vfs_history_mutation());
+            }
+        };
+        kin_cli::commands::blame::execute_blame_request_cached(
+            &state.layout,
+            graph.as_ref(),
+            &req,
+            history_closure_cache.as_ref(),
+            &mut before_first_insert,
+        )
+        .map_err(internal_error)?
+    };
+    if execution.hydrated_git_history && mutates_live_graph {
+        invalidate_vfs_for_inserted_changes(&state, execution.hydrated_change_ids.iter().copied())?;
         state.bump_version();
         state.save_snapshot().map_err(internal_error)?;
         state.mark_clean();
@@ -3715,7 +3782,7 @@ async fn blame(
             new_root_hash: "blame-hydration".to_string(),
         });
     }
-    if let Some(mutation) = vfs_history_mutation {
+    if let Some(mutation) = vfs_history_mutation.take() {
         mutation.finish();
     }
     Ok(Json(execution.response))
@@ -3738,24 +3805,43 @@ async fn history(
     }
 
     let session_id = extract_session_id_from_headers(&headers)?;
-    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let (graph, history_closure_cache) = state
+        .graph_and_history_cache_for_request(session_id.as_ref())
+        .await;
+    let mutates_live_graph = Arc::ptr_eq(&graph, &state.graph);
     // History at an unimported Git ref lazily imports its full ancestry;
     // serialize that against every other daemon hydration. Already-imported (or
     // absent) refs skip the gate and stay on the fast path.
     let needs_hydration = req.reference.as_deref().is_some_and(|reference| {
-        kin_cli::commands::ref_lookup::git_ref_requires_hydration(graph.as_ref(), reference)
+        kin_cli::commands::ref_lookup::git_ref_requires_hydration_cached(
+            graph.as_ref(),
+            reference,
+            history_closure_cache.as_ref(),
+        )
     });
     let _hydration_gate = if needs_hydration {
         Some(state.hydration_gate.lock().await)
     } else {
         None
     };
-    let vfs_history_mutation = needs_hydration.then(|| state.begin_vfs_history_mutation());
-    let execution =
-        kin_cli::commands::history::execute_history_request(&state.layout, graph.as_ref(), &req)
-            .map_err(internal_error)?;
-    if execution.hydrated_git_history {
-        invalidate_vfs_after_bulk_hydration(&state)?;
+    let mut vfs_history_mutation = None;
+    let execution = {
+        let mut before_first_insert = || {
+            if mutates_live_graph && vfs_history_mutation.is_none() {
+                vfs_history_mutation = Some(state.begin_vfs_history_mutation());
+            }
+        };
+        kin_cli::commands::history::execute_history_request_cached(
+            &state.layout,
+            graph.as_ref(),
+            &req,
+            history_closure_cache.as_ref(),
+            &mut before_first_insert,
+        )
+        .map_err(internal_error)?
+    };
+    if execution.hydrated_git_history && mutates_live_graph {
+        invalidate_vfs_for_inserted_changes(&state, execution.hydrated_change_ids.iter().copied())?;
         state.bump_version();
         state.save_snapshot().map_err(internal_error)?;
         state.mark_clean();
@@ -3764,7 +3850,7 @@ async fn history(
             new_root_hash: "history-hydration".to_string(),
         });
     }
-    if let Some(mutation) = vfs_history_mutation {
+    if let Some(mutation) = vfs_history_mutation.take() {
         mutation.finish();
     }
     Ok(Json(execution.response))
@@ -6323,33 +6409,6 @@ fn invalidate_vfs_for_inserted_changes(
         state.bump_committed_history_version();
     }
     Ok(affects_active)
-}
-
-/// Reconcile one completed bulk hydration against the cached active frontier.
-/// This is one O(active-history) pass per hydration, not one pass per inserted
-/// commit. It avoids evicting the active snapshot when a non-active ref grows.
-fn invalidate_vfs_after_bulk_hydration(state: &DaemonState) -> Result<bool, (StatusCode, String)> {
-    let cached = read_recover(&state.vfs_tree_cache).as_ref().cloned();
-    let Some(cached) = cached else {
-        return Ok(false);
-    };
-    let Some(head) = cached.key.head else {
-        return Ok(false);
-    };
-    let epoch_before = state
-        .vfs_history_epoch
-        .load(std::sync::atomic::Ordering::SeqCst);
-    let walked = walk_vfs_history(state, head)?;
-    let epoch_after = state
-        .vfs_history_epoch
-        .load(std::sync::atomic::Ordering::SeqCst);
-    let changed = epoch_before != epoch_after
-        || *cached.reachable_change_ids != walked.reachable_change_ids
-        || *cached.missing_parent_ids != walked.missing_parent_ids;
-    if changed {
-        state.bump_committed_history_version();
-    }
-    Ok(changed)
 }
 
 fn stable_vfs_history_epoch(state: &DaemonState) -> Result<u64, (StatusCode, String)> {
@@ -9216,6 +9275,73 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_git_ref_before_first_insert_leaves_vfs_and_durability_clean() {
+        std::env::set_var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", "true");
+        let state = test_state();
+        let genesis = kin_core::build_genesis_change();
+        state.graph.create_change(&genesis).unwrap();
+        let branch_name = BranchName::new("main");
+        state
+            .graph
+            .create_branch(&Branch {
+                name: branch_name.clone(),
+                head: genesis.id,
+            })
+            .unwrap();
+        kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let before = current_vfs_snapshot(&state).await.unwrap();
+        let history_version_before = state
+            .committed_history_version
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let vfs_version_before = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+        let mut events = state.event_tx.subscribe();
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/locate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "text": "fixture",
+                            "explain": false,
+                            "max_files": 10,
+                            "max_files_explicit": true,
+                            "reference": "git:ffffffffffffffffffffffffffffffffffffffff",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let after = current_vfs_snapshot(&state).await.unwrap();
+        assert!(Arc::ptr_eq(&before, &after));
+        assert_eq!(
+            state
+                .committed_history_version
+                .load(std::sync::atomic::Ordering::SeqCst),
+            history_version_before
+        );
+        assert_eq!(
+            state.vfs_version.load(std::sync::atomic::Ordering::SeqCst),
+            vfs_version_before
+        );
+        assert!(!state.is_dirty());
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        std::env::remove_var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
+    }
+
+    #[tokio::test]
     async fn mcp_tools_call_semantic_search_uses_live_graph() {
         let state = test_state();
         let entity = test_entity("handler", "src/lib.py");
@@ -10472,6 +10598,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_history_failure_does_not_invalidate_live_vfs() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let genesis = kin_core::build_genesis_change();
+        state.graph.create_change(&genesis).unwrap();
+        let branch_name = BranchName::new("main");
+        state
+            .graph
+            .create_branch(&Branch {
+                name: branch_name.clone(),
+                head: genesis.id,
+            })
+            .unwrap();
+        kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
+
+        let session_id = kin_model::SessionId::new();
+        state
+            .set_session_scope(
+                &session_id,
+                "git:ffffffffffffffffffffffffffffffffffffffff".to_string(),
+                genesis.id,
+                Arc::new(kin_db::InMemoryGraph::new()),
+            )
+            .await;
+
+        let before = current_vfs_snapshot(&state).await.unwrap();
+        let history_version_before = state
+            .committed_history_version
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let vfs_version_before = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+        let mut events = state.event_tx.subscribe();
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/history")
+                    .header("content-type", "application/json")
+                    .header("X-Kin-Session", session_id.to_string())
+                    .body(Body::from(
+                        serde_json::json!({
+                            "entity": "missing",
+                            "reference": "git:ffffffffffffffffffffffffffffffffffffffff",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(response.status().is_server_error());
+        let after = current_vfs_snapshot(&state).await.unwrap();
+        assert!(Arc::ptr_eq(&before, &after));
+        assert_eq!(
+            state
+                .committed_history_version
+                .load(std::sync::atomic::Ordering::SeqCst),
+            history_version_before
+        );
+        assert_eq!(
+            state.vfs_version.load(std::sync::atomic::Ordering::SeqCst),
+            vfs_version_before
+        );
+        assert!(!state.is_dirty());
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
     async fn verify_run_endpoint_persists_daemon_graph_state() {
         let state = test_state();
         state
@@ -11246,7 +11444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bulk_hydration_reconciles_active_reachability_once() {
+    async fn bulk_hydration_uses_inserted_frontier_without_history_replay() {
         use std::sync::atomic::Ordering;
 
         const INSERTED: usize = 64;
@@ -11296,6 +11494,7 @@ mod tests {
         let walks_before = state.vfs_history_walk_count.load(Ordering::SeqCst);
         {
             let mutation = state.begin_vfs_history_mutation();
+            let mut inserted = Vec::with_capacity(INSERTED);
             for index in 0..INSERTED {
                 let id = SemanticChangeId::from_hash(Hash256::from_bytes(
                     [0x20u8.wrapping_add(index as u8); 32],
@@ -11325,12 +11524,13 @@ mod tests {
                         authored_on: Some(branch_name.clone()),
                     })
                     .unwrap();
+                inserted.push(id);
             }
-            assert!(invalidate_vfs_after_bulk_hydration(&state).unwrap());
+            assert!(invalidate_vfs_for_inserted_changes(&state, inserted).unwrap());
             assert_eq!(
                 state.vfs_history_walk_count.load(Ordering::SeqCst) - walks_before,
-                1,
-                "one bulk hydration must perform one active-history reconciliation, not one per insert"
+                0,
+                "bulk hydration must invalidate from inserted ids without replaying active history"
             );
             mutation.finish();
         }

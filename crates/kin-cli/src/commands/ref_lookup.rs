@@ -4,6 +4,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use kin_model::{BranchName, ChangeStore, Entity, EntityFilter, GraphStore};
 use kin_model::{Hash256, SemanticChangeId};
+use std::collections::HashSet;
+use std::sync::RwLock;
 use tracing::warn;
 
 /// A reference did not resolve to a semantic change — unknown ref syntax, a
@@ -54,7 +56,7 @@ pub(crate) fn parse_change_id(input: &str) -> Result<SemanticChangeId> {
     ))
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ResolvedRef {
     pub head: SemanticChangeId,
     /// Whether resolving this ref lazily imported Git ancestry into the graph.
@@ -66,6 +68,47 @@ pub struct ResolvedRef {
     /// from `hydrated_git_history`: a caller reporting on hydration should
     /// show this count rather than collapse it to a boolean.
     pub hydrated_changes: usize,
+    /// Exact SemanticChange ids inserted by hydration. Daemon cache owners use
+    /// this frontier to invalidate only a materialized VFS view that was
+    /// actually affected, without replaying the whole active history again.
+    pub hydrated_change_ids: Vec<SemanticChangeId>,
+}
+
+/// Per-graph memo of Git-derived histories proven complete down to Kin's
+/// canonical genesis.
+///
+/// Completion is monotonic for a live Kin graph: history hydration and commits
+/// add SemanticChanges but never remove already-published ancestry. Keeping the
+/// memo next to the graph owner therefore turns repeated explicit-ref checks
+/// from O(history) walks into O(1) membership lookups without weakening the
+/// partial-history repair check on the first request.
+#[derive(Debug, Default)]
+pub struct GitHistoryClosureCache {
+    closed: RwLock<HashSet<SemanticChangeId>>,
+    first_check_gate: std::sync::Mutex<()>,
+    #[cfg(test)]
+    closure_walks: std::sync::atomic::AtomicU64,
+}
+
+impl GitHistoryClosureCache {
+    fn contains(&self, head: &SemanticChangeId) -> bool {
+        self.closed
+            .read()
+            .map(|closed| closed.contains(head))
+            .unwrap_or(false)
+    }
+
+    fn remember(&self, closed_history: HashSet<SemanticChangeId>) {
+        if let Ok(mut closed) = self.closed.write() {
+            closed.extend(closed_history);
+        }
+    }
+
+    #[cfg(test)]
+    fn closure_walk_count(&self) -> u64 {
+        self.closure_walks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 pub fn resolve_ref<G>(
@@ -95,7 +138,15 @@ pub fn resolve_ref_importing_git_if_needed(
     layout: &kin_core::KinLayout,
     reference: Option<&str>,
 ) -> Result<SemanticChangeId> {
-    Ok(resolve_ref_importing_git_if_needed_with_mode(graph, layout, reference, true)?.head)
+    Ok(resolve_ref_importing_git_if_needed_with_mode(
+        graph,
+        layout,
+        reference,
+        true,
+        None,
+        &mut || {},
+    )?
+    .head)
 }
 
 pub fn resolve_ref_importing_git_if_needed_for_locate(
@@ -103,7 +154,15 @@ pub fn resolve_ref_importing_git_if_needed_for_locate(
     layout: &kin_core::KinLayout,
     reference: Option<&str>,
 ) -> Result<SemanticChangeId> {
-    Ok(resolve_ref_importing_git_if_needed_with_mode(graph, layout, reference, false)?.head)
+    Ok(resolve_ref_importing_git_if_needed_with_mode(
+        graph,
+        layout,
+        reference,
+        false,
+        None,
+        &mut || {},
+    )?
+    .head)
 }
 
 pub fn resolve_ref_importing_git_if_needed_with_report(
@@ -111,7 +170,7 @@ pub fn resolve_ref_importing_git_if_needed_with_report(
     layout: &kin_core::KinLayout,
     reference: Option<&str>,
 ) -> Result<ResolvedRef> {
-    resolve_ref_importing_git_if_needed_with_mode(graph, layout, reference, true)
+    resolve_ref_importing_git_if_needed_with_mode(graph, layout, reference, true, None, &mut || {})
 }
 
 pub fn resolve_ref_importing_git_if_needed_for_locate_with_report(
@@ -119,7 +178,45 @@ pub fn resolve_ref_importing_git_if_needed_for_locate_with_report(
     layout: &kin_core::KinLayout,
     reference: Option<&str>,
 ) -> Result<ResolvedRef> {
-    resolve_ref_importing_git_if_needed_with_mode(graph, layout, reference, false)
+    resolve_ref_importing_git_if_needed_with_mode(graph, layout, reference, false, None, &mut || {})
+}
+
+/// Resolve a ref with a graph-owned closure memo and a callback invoked exactly
+/// before the first SemanticChange insertion. The callback lets daemon callers
+/// open mutation publication guards lazily: an invalid/missing Git oid that
+/// fails before insertion does not dirty or invalidate an unchanged graph.
+pub fn resolve_ref_importing_git_if_needed_with_report_cached(
+    graph: &kin_db::InMemoryGraph,
+    layout: &kin_core::KinLayout,
+    reference: Option<&str>,
+    closure_cache: &GitHistoryClosureCache,
+    before_first_insert: &mut dyn FnMut(),
+) -> Result<ResolvedRef> {
+    resolve_ref_importing_git_if_needed_with_mode(
+        graph,
+        layout,
+        reference,
+        true,
+        Some(closure_cache),
+        before_first_insert,
+    )
+}
+
+pub fn resolve_ref_importing_git_if_needed_for_locate_with_report_cached(
+    graph: &kin_db::InMemoryGraph,
+    layout: &kin_core::KinLayout,
+    reference: Option<&str>,
+    closure_cache: &GitHistoryClosureCache,
+    before_first_insert: &mut dyn FnMut(),
+) -> Result<ResolvedRef> {
+    resolve_ref_importing_git_if_needed_with_mode(
+        graph,
+        layout,
+        reference,
+        false,
+        Some(closure_cache),
+        before_first_insert,
+    )
 }
 
 fn resolve_ref_importing_git_if_needed_with_mode(
@@ -127,19 +224,30 @@ fn resolve_ref_importing_git_if_needed_with_mode(
     layout: &kin_core::KinLayout,
     reference: Option<&str>,
     enrich_semantics: bool,
+    closure_cache: Option<&GitHistoryClosureCache>,
+    before_first_insert: &mut dyn FnMut(),
 ) -> Result<ResolvedRef> {
-    let mut hydrated_changes = 0usize;
+    let mut hydrated_change_ids = Vec::new();
     if let Some(git_oid) = reference.and_then(extract_git_ref) {
         let imported_change_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid)?;
-        if !imported_git_history_is_closed(graph, imported_change_id)? {
-            hydrated_changes = hydrate_imported_git_ref(graph, layout, git_oid, enrich_semantics)?;
+        if !imported_git_history_is_closed_cached(graph, imported_change_id, closure_cache)? {
+            hydrated_change_ids = hydrate_imported_git_ref(
+                graph,
+                layout,
+                git_oid,
+                enrich_semantics,
+                closure_cache,
+                before_first_insert,
+            )?;
         }
     }
     let head = resolve_ref(graph, layout, reference)?;
+    let hydrated_changes = hydrated_change_ids.len();
     Ok(ResolvedRef {
         head,
         hydrated_git_history: hydrated_changes > 0,
         hydrated_changes,
+        hydrated_change_ids,
     })
 }
 
@@ -452,6 +560,25 @@ pub fn extract_git_ref(reference: &str) -> Option<&str> {
 /// an unresolved presence check reports `true` so a real import is never left
 /// unserialized.
 pub fn git_ref_requires_hydration(graph: &kin_db::InMemoryGraph, reference: &str) -> bool {
+    git_ref_requires_hydration_inner(graph, reference, None)
+}
+
+/// Cached form used by long-lived daemon graph owners. A complete history is
+/// walked at most once for that graph/cache pair; subsequent warm checks are a
+/// constant-time lookup.
+pub fn git_ref_requires_hydration_cached(
+    graph: &kin_db::InMemoryGraph,
+    reference: &str,
+    closure_cache: &GitHistoryClosureCache,
+) -> bool {
+    git_ref_requires_hydration_inner(graph, reference, Some(closure_cache))
+}
+
+fn git_ref_requires_hydration_inner(
+    graph: &kin_db::InMemoryGraph,
+    reference: &str,
+    closure_cache: Option<&GitHistoryClosureCache>,
+) -> bool {
     let Some(git_oid) = extract_git_ref(reference) else {
         return false;
     };
@@ -459,7 +586,7 @@ pub fn git_ref_requires_hydration(graph: &kin_db::InMemoryGraph, reference: &str
         return false;
     };
     !matches!(
-        imported_git_history_is_closed(graph, imported_change_id),
+        imported_git_history_is_closed_cached(graph, imported_change_id, closure_cache),
         Ok(true)
     )
 }
@@ -469,16 +596,48 @@ pub fn git_ref_requires_hydration(graph: &kin_db::InMemoryGraph, reference: &str
 /// an interrupted/older hydration can leave `H` stored while an ancestor `M`
 /// is absent, and resolving `H` must repair that closure rather than silently
 /// accepting the partial graph.
-fn imported_git_history_is_closed(
+fn imported_git_history_is_closed_cached(
     graph: &kin_db::InMemoryGraph,
     head: SemanticChangeId,
+    closure_cache: Option<&GitHistoryClosureCache>,
 ) -> Result<bool> {
+    if closure_cache.is_some_and(|cache| cache.contains(&head)) {
+        return Ok(true);
+    }
+
+    // Only the first unknown-head check holds this gate. Re-check after
+    // acquisition so concurrent first requests do not all replay the same
+    // deep history before one of them publishes the monotonic memo.
+    let _first_check = closure_cache.map(|cache| {
+        cache
+            .first_check_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
+    if closure_cache.is_some_and(|cache| cache.contains(&head)) {
+        return Ok(true);
+    }
+
+    #[cfg(test)]
+    if let Some(cache) = closure_cache {
+        cache
+            .closure_walks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     let genesis_id = kin_core::build_genesis_change().id;
     let mut stack = vec![head];
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = HashSet::new();
     let mut reached_genesis = false;
 
     while let Some(change_id) = stack.pop() {
+        if closure_cache.is_some_and(|cache| cache.contains(&change_id)) {
+            // A previously verified ancestor already proves the remainder of
+            // this path reaches canonical genesis. Only the new descendant
+            // prefix needs to be inspected and memoized.
+            reached_genesis = true;
+            continue;
+        }
         if change_id == genesis_id {
             reached_genesis = true;
             continue;
@@ -495,20 +654,25 @@ fn imported_git_history_is_closed(
         stack.extend(change.parents);
     }
 
+    if reached_genesis {
+        visited.insert(genesis_id);
+        if let Some(cache) = closure_cache {
+            cache.remember(visited);
+        }
+    }
     Ok(reached_genesis)
 }
 
-/// Lazily import the Git ancestry of `git_oid` into `graph`, returning the
-/// count of changes actually inserted (0 when the ref was already present and
-/// no import ran). Callers report this count directly rather than collapsing
-/// it to a boolean, so a cold multi-thousand-change import is never described
-/// the same way as a no-op.
+/// Lazily import the Git ancestry of `git_oid` into `graph`, returning the exact
+/// ids inserted (empty when the ref was already present and no import ran).
 fn hydrate_imported_git_ref(
     graph: &kin_db::InMemoryGraph,
     layout: &kin_core::KinLayout,
     git_oid: &str,
     enrich_semantics: bool,
-) -> Result<usize> {
+    closure_cache: Option<&GitHistoryClosureCache>,
+    before_first_insert: &mut dyn FnMut(),
+) -> Result<Vec<SemanticChangeId>> {
     let imported_change_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid)?;
 
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
@@ -535,15 +699,18 @@ fn hydrate_imported_git_ref(
         }
     }
 
-    let mut inserted = 0usize;
+    let mut inserted = Vec::new();
     for imported_change in &imported {
         if graph.get_change(&imported_change.change.id)?.is_none() {
+            if inserted.is_empty() {
+                before_first_insert();
+            }
             graph.create_change(&imported_change.change)?;
-            inserted += 1;
+            inserted.push(imported_change.change.id);
         }
     }
 
-    if !imported_git_history_is_closed(graph, imported_change_id)? {
+    if !imported_git_history_is_closed_cached(graph, imported_change_id, closure_cache)? {
         return Err(ref_error(
             git_oid,
             "imported Git commit history remained incomplete after hydration",
@@ -725,6 +892,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parent, parent_id);
+    }
+
+    #[test]
+    fn cached_closed_git_history_walks_once_across_warm_resolutions() {
+        let graph = InMemoryGraph::new();
+        let genesis = kin_core::build_genesis_change();
+        graph.create_change(&genesis).unwrap();
+
+        let mut parent = genesis.id;
+        for index in 0..1_024_u64 {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&index.to_le_bytes());
+            bytes[8] = 0x5a;
+            let id = SemanticChangeId::from_hash(Hash256::from_bytes(bytes));
+            graph.create_change(&make_change(id, vec![parent])).unwrap();
+            parent = id;
+        }
+
+        let git_oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let head = kin_git::semantic_change_id_from_git_oid_hex(git_oid).unwrap();
+        graph
+            .create_change(&make_change(head, vec![parent]))
+            .unwrap();
+        let cache = GitHistoryClosureCache::default();
+
+        assert!(!git_ref_requires_hydration_cached(&graph, git_oid, &cache));
+        assert_eq!(cache.closure_walk_count(), 1);
+
+        let layout = temp_layout();
+        for _ in 0..8 {
+            assert!(!git_ref_requires_hydration_cached(&graph, git_oid, &cache));
+            let mut unexpected_mutation = || panic!("warm resolution attempted hydration");
+            let resolved = resolve_ref_importing_git_if_needed_with_report_cached(
+                &graph,
+                &layout,
+                Some(git_oid),
+                &cache,
+                &mut unexpected_mutation,
+            )
+            .unwrap();
+            assert_eq!(resolved.head, head);
+            assert!(resolved.hydrated_change_ids.is_empty());
+        }
+
+        assert_eq!(
+            cache.closure_walk_count(),
+            1,
+            "warm cached resolutions must not replay Git history"
+        );
     }
 
     #[test]
