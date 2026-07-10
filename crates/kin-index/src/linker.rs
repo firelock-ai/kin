@@ -2,10 +2,12 @@
 // Copyright 2026 Firelock, LLC
 
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use sha2::{Digest, Sha256};
@@ -1236,7 +1238,8 @@ fn sorted_fanout_targets(targets: HashSet<EntityId>) -> Vec<EntityId> {
 /// and whether a trailing C variadic (`...`) or parameter pack lets it accept
 /// unboundedly many. A call of `n` positional arguments is arity-compatible
 /// with the callee iff `min <= n && (variadic || n <= max)`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArityBounds {
     min: usize,
     max: usize,
@@ -2880,6 +2883,71 @@ pub struct IncrementalLinker {
     pub class_bases_by_file: HashMap<String, Vec<(String, Vec<String>)>>,
 }
 
+/// Serialization contract for [`IncrementalLinker`] inside history-hydration
+/// checkpoints.
+///
+/// This is intentionally a separate, versioned shape rather than serde on the
+/// runtime hash maps. Map and set iteration order is process-randomized, while
+/// checkpoint bytes must be reproducible. Every unordered container is stored
+/// as a sorted vector; order-sensitive candidate vectors retain their runtime
+/// order. There are deliberately no serde defaults. Adding a runtime linker
+/// field therefore requires changing both exhaustive conversions below and
+/// bumping [`INCREMENTAL_LINKER_CHECKPOINT_VERSION`], or the build fails.
+type ClassBasesByFileCheckpointV1 = Vec<(String, Vec<(String, Vec<String>)>)>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IncrementalLinkerCheckpointV1 {
+    entity_by_file_name: Vec<(String, Vec<(String, EntityId)>)>,
+    entity_by_name: Vec<(String, Vec<(String, EntityId)>)>,
+    entity_by_bare_name: Vec<(String, Vec<(String, EntityId)>)>,
+    entity_kind_by_id: Vec<(EntityId, EntityKind)>,
+    entity_arity_by_id: Vec<(EntityId, ArityBounds)>,
+    known_files: Vec<String>,
+    entities_by_file: Vec<(String, Vec<(EntityId, Visibility)>)>,
+    include_targets_by_file: Vec<(String, Vec<String>)>,
+    class_bases_by_file: ClassBasesByFileCheckpointV1,
+}
+
+/// Bump whenever [`IncrementalLinkerCheckpointV1`] or linker semantics change.
+pub const INCREMENTAL_LINKER_CHECKPOINT_VERSION: u32 = 1;
+
+/// Build-time kin-index identity included in the composite hydration
+/// checkpoint version key.
+pub const KIN_INDEX_CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn checkpoint_hash_map<K, V>(
+    entries: Vec<(K, V)>,
+    field: &'static str,
+) -> Result<HashMap<K, V>, String>
+where
+    K: Eq + Hash,
+{
+    let mut map = HashMap::with_capacity(entries.len());
+    for (key, value) in entries {
+        if map.insert(key, value).is_some() {
+            return Err(format!(
+                "incremental-linker checkpoint contains duplicate key in {field}"
+            ));
+        }
+    }
+    Ok(map)
+}
+
+fn checkpoint_hash_set<T>(values: Vec<T>, field: &'static str) -> Result<HashSet<T>, String>
+where
+    T: Eq + Hash,
+{
+    let expected = values.len();
+    let set: HashSet<T> = values.into_iter().collect();
+    if set.len() != expected {
+        return Err(format!(
+            "incremental-linker checkpoint contains duplicate value in {field}"
+        ));
+    }
+    Ok(set)
+}
+
 impl IncrementalLinker {
     pub fn new() -> Self {
         Self {
@@ -2893,6 +2961,132 @@ impl IncrementalLinker {
             include_targets_by_file: HashMap::new(),
             class_bases_by_file: HashMap::new(),
         }
+    }
+
+    /// Convert the live linker to its canonical checkpoint representation.
+    pub fn to_checkpoint_v1(&self) -> IncrementalLinkerCheckpointV1 {
+        let Self {
+            entity_by_file_name,
+            entity_by_name,
+            entity_by_bare_name,
+            entity_kind_by_id,
+            entity_arity_by_id,
+            known_files,
+            entities_by_file,
+            include_targets_by_file,
+            class_bases_by_file,
+        } = self;
+
+        let mut entity_by_file_name: Vec<_> = entity_by_file_name
+            .iter()
+            .map(|(file, entities)| {
+                let mut entities: Vec<_> = entities
+                    .iter()
+                    .map(|(name, id)| (name.clone(), *id))
+                    .collect();
+                entities.sort_by(|a, b| a.0.cmp(&b.0));
+                (file.clone(), entities)
+            })
+            .collect();
+        entity_by_file_name.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut entity_by_name: Vec<_> = entity_by_name
+            .iter()
+            .map(|(name, candidates)| (name.clone(), candidates.clone()))
+            .collect();
+        entity_by_name.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut entity_by_bare_name: Vec<_> = entity_by_bare_name
+            .iter()
+            .map(|(name, candidates)| (name.clone(), candidates.clone()))
+            .collect();
+        entity_by_bare_name.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut entity_kind_by_id: Vec<_> = entity_kind_by_id
+            .iter()
+            .map(|(id, kind)| (*id, *kind))
+            .collect();
+        entity_kind_by_id.sort_by_key(|(id, _)| *id);
+
+        let mut entity_arity_by_id: Vec<_> = entity_arity_by_id
+            .iter()
+            .map(|(id, bounds)| (*id, *bounds))
+            .collect();
+        entity_arity_by_id.sort_by_key(|(id, _)| *id);
+
+        let mut known_files: Vec<_> = known_files.iter().cloned().collect();
+        known_files.sort();
+
+        let mut entities_by_file: Vec<_> = entities_by_file
+            .iter()
+            .map(|(file, entities)| (file.clone(), entities.clone()))
+            .collect();
+        entities_by_file.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut include_targets_by_file: Vec<_> = include_targets_by_file
+            .iter()
+            .map(|(file, targets)| (file.clone(), targets.clone()))
+            .collect();
+        include_targets_by_file.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut class_bases_by_file: Vec<_> = class_bases_by_file
+            .iter()
+            .map(|(file, bases)| (file.clone(), bases.clone()))
+            .collect();
+        class_bases_by_file.sort_by(|a, b| a.0.cmp(&b.0));
+
+        IncrementalLinkerCheckpointV1 {
+            entity_by_file_name,
+            entity_by_name,
+            entity_by_bare_name,
+            entity_kind_by_id,
+            entity_arity_by_id,
+            known_files,
+            entities_by_file,
+            include_targets_by_file,
+            class_bases_by_file,
+        }
+    }
+
+    /// Restore a linker checkpoint, refusing duplicate keys or set members.
+    pub fn from_checkpoint_v1(checkpoint: IncrementalLinkerCheckpointV1) -> Result<Self, String> {
+        let IncrementalLinkerCheckpointV1 {
+            entity_by_file_name,
+            entity_by_name,
+            entity_by_bare_name,
+            entity_kind_by_id,
+            entity_arity_by_id,
+            known_files,
+            entities_by_file,
+            include_targets_by_file,
+            class_bases_by_file,
+        } = checkpoint;
+
+        let entity_by_file_name = checkpoint_hash_map(
+            entity_by_file_name
+                .into_iter()
+                .map(|(file, entities)| {
+                    checkpoint_hash_map(entities, "entity_by_file_name.inner")
+                        .map(|entities| (file, entities))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            "entity_by_file_name",
+        )?;
+
+        Ok(Self {
+            entity_by_file_name,
+            entity_by_name: checkpoint_hash_map(entity_by_name, "entity_by_name")?,
+            entity_by_bare_name: checkpoint_hash_map(entity_by_bare_name, "entity_by_bare_name")?,
+            entity_kind_by_id: checkpoint_hash_map(entity_kind_by_id, "entity_kind_by_id")?,
+            entity_arity_by_id: checkpoint_hash_map(entity_arity_by_id, "entity_arity_by_id")?,
+            known_files: checkpoint_hash_set(known_files, "known_files")?,
+            entities_by_file: checkpoint_hash_map(entities_by_file, "entities_by_file")?,
+            include_targets_by_file: checkpoint_hash_map(
+                include_targets_by_file,
+                "include_targets_by_file",
+            )?,
+            class_bases_by_file: checkpoint_hash_map(class_bases_by_file, "class_bases_by_file")?,
+        })
     }
 
     /// Remove a file and all its associated entities from the indexes.
@@ -3641,6 +3835,64 @@ mod tests {
         ArtifactId, EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm,
         GraphNodeId, Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
     };
+
+    #[test]
+    fn incremental_linker_checkpoint_is_canonical_round_trippable_and_fail_loud() {
+        let alpha = EntityId::from_content("src/a.rs", "alpha", "function", 1);
+        let beta = EntityId::from_content("src/b.rs", "beta", "function", 1);
+
+        let build = |reverse: bool| {
+            let mut linker = IncrementalLinker::new();
+            let entries = if reverse {
+                vec![("src/b.rs", "beta", beta), ("src/a.rs", "alpha", alpha)]
+            } else {
+                vec![("src/a.rs", "alpha", alpha), ("src/b.rs", "beta", beta)]
+            };
+            for (file, name, id) in entries {
+                linker
+                    .entity_by_file_name
+                    .insert(file.to_string(), HashMap::from([(name.to_string(), id)]));
+                linker
+                    .entity_by_name
+                    .insert(name.to_string(), vec![(file.to_string(), id)]);
+                linker.entity_kind_by_id.insert(id, EntityKind::Function);
+                linker.known_files.insert(file.to_string());
+                linker
+                    .entities_by_file
+                    .insert(file.to_string(), vec![(id, Visibility::Public)]);
+                linker
+                    .include_targets_by_file
+                    .insert(file.to_string(), vec![format!("include/{name}.h")]);
+                linker.class_bases_by_file.insert(
+                    file.to_string(),
+                    vec![(format!("{name}Class"), vec!["Base".to_string()])],
+                );
+            }
+            linker
+        };
+
+        let canonical = serde_json::to_vec(&build(false).to_checkpoint_v1()).unwrap();
+        let reverse_insertion = serde_json::to_vec(&build(true).to_checkpoint_v1()).unwrap();
+        assert_eq!(
+            canonical, reverse_insertion,
+            "unordered map/set insertion must not change checkpoint bytes"
+        );
+
+        let checkpoint: IncrementalLinkerCheckpointV1 = serde_json::from_slice(&canonical).unwrap();
+        let restored = IncrementalLinker::from_checkpoint_v1(checkpoint).unwrap();
+        assert_eq!(
+            canonical,
+            serde_json::to_vec(&restored.to_checkpoint_v1()).unwrap(),
+            "round-trip must preserve the canonical linker state"
+        );
+
+        let mut missing_field: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+        missing_field.as_object_mut().unwrap().remove("known_files");
+        assert!(
+            serde_json::from_value::<IncrementalLinkerCheckpointV1>(missing_field).is_err(),
+            "missing newly-required linker state must fail loudly; no serde defaults"
+        );
+    }
 
     fn test_fingerprint() -> SemanticFingerprint {
         let zero = Hash256::from_bytes([0u8; 32]);

@@ -3269,6 +3269,8 @@ dependencies = [
  "notify",
  "pretty_assertions",
  "rayon",
+ "serde",
+ "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
@@ -3418,6 +3420,7 @@ version = "0.2.15"
 dependencies = [
  "kin-model",
  "pretty_assertions",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
