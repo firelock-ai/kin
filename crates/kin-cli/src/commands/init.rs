@@ -514,6 +514,19 @@ fn deterministic_change_payload_matches(
     }
 }
 
+fn stable_change_payload_without_parents_matches(
+    left: &SemanticChange,
+    right: &SemanticChange,
+) -> bool {
+    fn payload(change: &SemanticChange) -> Option<serde_json::Value> {
+        let mut value = serde_json::to_value(change).ok()?;
+        value.as_object_mut()?.remove("parents");
+        Some(value)
+    }
+
+    matches!((payload(left), payload(right)), (Some(left), Some(right)) if left == right)
+}
+
 /// Publish a deterministic init/import change exactly once.
 ///
 /// kin-db 0.2.31's `create_change` is an insertion primitive, not an upsert:
@@ -546,20 +559,20 @@ fn validate_repaired_change_history(
 ) -> Result<()> {
     let Some(root) = changes.get(&boundary_root) else {
         return Err(anyhow!(
-            "REFUSED legacy history repair: canonical genesis {} is absent",
+            "REFUSED legacy Git-import repair: canonical genesis {} is absent",
             boundary_root
         ));
     };
     if !root.parents.is_empty() {
         return Err(anyhow!(
-            "REFUSED legacy history repair: canonical genesis {} has parents",
+            "REFUSED legacy Git-import repair: canonical genesis {} has parents",
             boundary_root
         ));
     }
     for branch in branches.values() {
         if !changes.contains_key(&branch.head) {
             return Err(anyhow!(
-                "REFUSED legacy history repair: branch {} has missing head {}",
+                "REFUSED legacy Git-import repair: branch {} has missing head {}",
                 branch.name,
                 branch.head
             ));
@@ -568,14 +581,22 @@ fn validate_repaired_change_history(
     for change in changes.values() {
         if change.id != boundary_root && change.parents.is_empty() {
             return Err(anyhow!(
-                "REFUSED legacy history repair: non-genesis change {} has no parent",
+                "REFUSED legacy Git-import repair: non-genesis change {} has no parent",
                 change.id
             ));
         }
+        let mut unique_parents = HashSet::with_capacity(change.parents.len());
         for parent in &change.parents {
+            if !unique_parents.insert(*parent) {
+                return Err(anyhow!(
+                    "REFUSED legacy Git-import repair: change {} repeats parent {}",
+                    change.id,
+                    parent
+                ));
+            }
             if !changes.contains_key(parent) {
                 return Err(anyhow!(
-                    "REFUSED legacy history repair: change {} has missing parent {}",
+                    "REFUSED legacy Git-import repair: change {} has missing parent {}",
                     change.id,
                     parent
                 ));
@@ -600,7 +621,7 @@ fn validate_repaired_change_history(
                 2 => continue,
                 1 => {
                     return Err(anyhow!(
-                        "REFUSED legacy history repair: parent DAG contains a cycle at {}",
+                        "REFUSED legacy Git-import repair: parent DAG contains a cycle at {}",
                         change_id
                     ));
                 }
@@ -616,66 +637,107 @@ fn validate_repaired_change_history(
     Ok(())
 }
 
-fn has_reachable_self_parent(graph: &kin_db::InMemoryGraph) -> Result<bool> {
-    let mut stack: Vec<_> = graph
-        .list_branches()?
-        .into_iter()
-        .map(|branch| branch.head)
-        .collect();
+fn legacy_boundary_parent_shape(
+    canonical_parents: &[SemanticChangeId],
+    boundary_root: SemanticChangeId,
+    legacy_target: SemanticChangeId,
+) -> Option<Vec<SemanticChangeId>> {
+    let mut replaced = false;
+    let mut output = Vec::with_capacity(canonical_parents.len());
+    for parent in canonical_parents.iter().copied() {
+        let parent = if parent == boundary_root {
+            replaced = true;
+            legacy_target
+        } else {
+            parent
+        };
+        if !output.contains(&parent) {
+            output.push(parent);
+        }
+    }
+    replaced.then_some(output)
+}
+
+fn candidate_parent_path_reaches(
+    changes: &HashMap<SemanticChangeId, SemanticChange>,
+    candidate_ids: &HashSet<SemanticChangeId>,
+    start: SemanticChangeId,
+    target: SemanticChangeId,
+) -> bool {
+    let mut stack = vec![start];
     let mut visited = HashSet::new();
     while let Some(change_id) = stack.pop() {
+        if change_id == target {
+            return true;
+        }
         if !visited.insert(change_id) {
             continue;
         }
-        let Some(change) = graph.get_change(&change_id)? else {
+        let Some(change) = changes.get(&change_id) else {
             continue;
         };
-        if change.parents.contains(&change.id) {
-            return Ok(true);
-        }
-        stack.extend(change.parents);
+        stack.extend(
+            change
+                .parents
+                .iter()
+                .copied()
+                .filter(|parent| candidate_ids.contains(parent)),
+        );
     }
-    Ok(false)
+    false
 }
 
-/// Repair snapshots produced by the legacy warm-init boundary bug.
-///
-/// Those snapshots could overwrite an imported Git root with a self-parent.
-/// Re-inserting the corrected record is insufficient on kin-db 0.2.31 because
-/// it leaves the old self edge in `change_children` and duplicates revision
-/// generations. Rebuild both derived indexes from the corrected change map and
-/// atomically swap the manager's graph before any new init mutation occurs.
-fn repair_legacy_self_parented_history(
-    manager: &kin_db::SnapshotManager,
-    layout: &kin_core::KinLayout,
-    boundary_root: SemanticChangeId,
-) -> Result<usize> {
-    let graph = manager.graph();
-    if !has_reachable_self_parent(graph.as_ref())? {
-        return Ok(0);
-    }
-
-    let mut snapshot = graph.to_snapshot();
-    let mut repaired = 0usize;
-    for change in snapshot.changes.values_mut() {
-        if !change.parents.contains(&change.id) {
+fn candidate_reverse_index_needs_rebuild(
+    snapshot: &kin_db::GraphSnapshot,
+    candidate_ids: &HashSet<SemanticChangeId>,
+) -> bool {
+    for candidate_id in candidate_ids {
+        let Some(change) = snapshot.changes.get(candidate_id) else {
             continue;
+        };
+        let occurrences = snapshot
+            .change_children
+            .values()
+            .map(|children| {
+                children
+                    .iter()
+                    .filter(|child| *child == candidate_id)
+                    .count()
+            })
+            .sum::<usize>();
+        if occurrences != change.parents.len() {
+            return true;
         }
-        let mut normalized = Vec::with_capacity(change.parents.len());
-        for parent in change.parents.iter().copied() {
-            let parent = if parent == change.id {
-                boundary_root
-            } else {
-                parent
-            };
-            if !normalized.contains(&parent) {
-                normalized.push(parent);
+        for parent in &change.parents {
+            let count = snapshot
+                .change_children
+                .get(parent)
+                .into_iter()
+                .flatten()
+                .filter(|child| **child == *candidate_id)
+                .count();
+            if count != 1 {
+                return true;
             }
         }
-        change.parents = normalized;
-        repaired += 1;
     }
+    false
+}
 
+fn candidate_revision_index_needs_rebuild(
+    snapshot: &kin_db::GraphSnapshot,
+    candidate_ids: &HashSet<SemanticChangeId>,
+) -> bool {
+    snapshot.entity_revisions.values().any(|revisions| {
+        let mut seen = HashSet::new();
+        revisions
+            .iter()
+            .filter(|revision| candidate_ids.contains(&revision.introduced_by))
+            .any(|revision| !seen.insert(revision.revision_id))
+    })
+}
+
+fn rebuild_history_derived_indexes(snapshot: &mut kin_db::GraphSnapshot) {
     let mut change_children = HashMap::<SemanticChangeId, Vec<SemanticChangeId>>::new();
     for change in snapshot.changes.values() {
         for parent in &change.parents {
@@ -688,12 +750,110 @@ fn repair_legacy_self_parented_history(
     }
     snapshot.change_children = change_children;
 
+    // Empty means "derive from canonical change truth" on graph restore. This
+    // removes revision generations appended by repeated deterministic imports.
+    snapshot.entity_revisions.clear();
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LegacyImportRepairOutcome {
+    corrected_changes: usize,
+    rebuilt_derived_indexes: bool,
+}
+
+/// Repair only the two provable legacy Git-import defects.
+///
+/// Old warm init passed the current imported head as the import boundary. The
+/// resulting persisted cycle is recognizable only after a fresh canonical Git
+/// import: every stored field matches, exactly one boundary substitution maps
+/// canonical genesis to one imported descendant, and that descendant's stored
+/// parent path closes the cycle. Separately, boundary-correct releases still
+/// reinserted deterministic imported ids and could duplicate reverse edges and
+/// revision generations. Both cases rebuild the derived indexes from immutable
+/// change truth. Any unrelated self-edge/cycle remains after the narrowly
+/// proven substitution and is refused by full-DAG validation.
+fn repair_legacy_git_import_history(
+    manager: &kin_db::SnapshotManager,
+    layout: &kin_core::KinLayout,
+    boundary_root: SemanticChangeId,
+    canonical_imported: &[kin_git::ImportedChange],
+) -> Result<LegacyImportRepairOutcome> {
+    if canonical_imported.is_empty() {
+        return Ok(LegacyImportRepairOutcome::default());
+    }
+    let graph = manager.graph();
+    let mut snapshot = graph.to_snapshot();
+    let candidate_ids: HashSet<_> = canonical_imported
+        .iter()
+        .map(|entry| entry.change.id)
+        .collect();
+    let mut mismatches = Vec::<(SemanticChangeId, SemanticChangeId)>::new();
+    let mut unrecognized_payload_or_parent = false;
+    for canonical in canonical_imported {
+        let Some(existing) = snapshot.changes.get(&canonical.change.id) else {
+            continue;
+        };
+        if !stable_change_payload_without_parents_matches(existing, &canonical.change) {
+            unrecognized_payload_or_parent = true;
+            continue;
+        }
+        if existing.parents == canonical.change.parents {
+            continue;
+        }
+        let matching_targets: Vec<_> = candidate_ids
+            .iter()
+            .copied()
+            .filter(|target| {
+                legacy_boundary_parent_shape(&canonical.change.parents, boundary_root, *target)
+                    .as_ref()
+                    == Some(&existing.parents)
+            })
+            .collect();
+        if matching_targets.len() == 1 {
+            mismatches.push((canonical.change.id, matching_targets[0]));
+        } else {
+            unrecognized_payload_or_parent = true;
+        }
+    }
+
+    let legacy_target = mismatches.first().map(|(_, target)| *target);
+    let legacy_shape_proven = !mismatches.is_empty()
+        && !unrecognized_payload_or_parent
+        && mismatches
+            .iter()
+            .all(|(_, target)| Some(*target) == legacy_target)
+        && mismatches.iter().all(|(boundary_change, target)| {
+            candidate_parent_path_reaches(
+                &snapshot.changes,
+                &candidate_ids,
+                *target,
+                *boundary_change,
+            )
+        });
+
+    let mut corrected_changes = 0usize;
+    if legacy_shape_proven {
+        let mismatch_ids: HashSet<_> = mismatches.iter().map(|(id, _)| *id).collect();
+        for canonical in canonical_imported {
+            if mismatch_ids.contains(&canonical.change.id) {
+                snapshot
+                    .changes
+                    .insert(canonical.change.id, canonical.change.clone());
+                corrected_changes += 1;
+            }
+        }
+    }
+
     validate_repaired_change_history(&snapshot.changes, &snapshot.branches, boundary_root)?;
 
-    // Empty means "derive from canonical change truth" on graph restore. This
-    // removes revision generations appended by repeated insertion of the same
-    // deterministic change id without attempting an error-prone in-place edit.
-    snapshot.entity_revisions.clear();
+    let rebuild_derived_indexes = corrected_changes > 0
+        || candidate_reverse_index_needs_rebuild(&snapshot, &candidate_ids)
+        || candidate_revision_index_needs_rebuild(&snapshot, &candidate_ids);
+    if !rebuild_derived_indexes {
+        return Ok(LegacyImportRepairOutcome::default());
+    }
+
+    rebuild_history_derived_indexes(&mut snapshot);
     let repaired_graph =
         kin_db::InMemoryGraph::from_snapshot_with_text_index(snapshot, layout.text_index_dir());
     manager.swap(repaired_graph);
@@ -702,8 +862,11 @@ fn repair_legacy_self_parented_history(
     // repaired graph only in memory, causing the same recovery on every open.
     manager
         .save()
-        .context("persist repaired legacy semantic history")?;
-    Ok(repaired)
+        .context("persist repaired legacy Git-import history")?;
+    Ok(LegacyImportRepairOutcome {
+        corrected_changes,
+        rebuilt_derived_indexes: true,
+    })
 }
 
 pub async fn run(
@@ -766,14 +929,9 @@ pub async fn run(
             .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
         // For a warm cache hit, the genesis change isn't created anew.
         // We look up the current head of the default branch to use as the parent
-        // for the new auto-parse change.
-        let repaired = repair_legacy_self_parented_history(&snap, &layout, history_boundary_root)?;
-        if repaired > 0 {
-            warn!(
-                repaired_changes = repaired,
-                "repaired legacy self-parented Git history and rebuilt derived revision indexes"
-            );
-        }
+        // for the new auto-parse change. Legacy Git-boundary recovery waits for
+        // the fresh canonical import below so it never guesses ancestry from a
+        // malformed stored graph alone.
         let config = kin_core::KinConfig::load(&layout.config_path())?;
         let parent_id = snap
             .graph()
@@ -896,7 +1054,7 @@ pub async fn run(
     };
 
     if !all_files.is_empty() {
-        let graph = snap.graph();
+        let mut graph = snap.graph();
         // Build a semantic change for the initial parse.
         // Include artifact_deltas for every file so that the VFS tree
         // (built from the change DAG) knows which files exist.
@@ -1052,6 +1210,23 @@ pub async fn run(
                                 "enrich imported Git history with semantic deltas ({git_history})"
                             )
                         })?;
+
+                        let repair = repair_legacy_git_import_history(
+                            &snap,
+                            &layout,
+                            history_boundary_root,
+                            &imported,
+                        )?;
+                        if repair.rebuilt_derived_indexes {
+                            warn!(
+                                corrected_changes = repair.corrected_changes,
+                                "repaired proven legacy Git-import history and rebuilt derived indexes"
+                            );
+                            // `SnapshotManager::swap` is RCU-style. Refresh the
+                            // caller's Arc so exact-once collision checks target
+                            // the repaired graph rather than the retired view.
+                            graph = snap.graph();
+                        }
 
                         let mut last_id = None;
                         for ic in &imported {
@@ -8413,6 +8588,74 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         assert!(!tracked_graph_paths(graph.as_ref()).contains(".kin/snapshot/manifest.json"));
     }
 
+    fn assert_history_derived_indexes_are_unique(snapshot: &kin_db::GraphSnapshot) {
+        for children in snapshot.change_children.values() {
+            let unique: HashSet<_> = children.iter().copied().collect();
+            assert_eq!(
+                unique.len(),
+                children.len(),
+                "duplicate parent-to-child reverse edge survived upgrade"
+            );
+        }
+        for revisions in snapshot.entity_revisions.values() {
+            let unique: HashSet<_> = revisions
+                .iter()
+                .map(|revision| revision.revision_id)
+                .collect();
+            assert_eq!(
+                unique.len(),
+                revisions.len(),
+                "duplicate entity revision generation survived upgrade"
+            );
+        }
+    }
+
+    fn seed_release_old_warm_import(
+        repo_dir: &Path,
+        layout: &kin_core::KinLayout,
+    ) -> Vec<SemanticChangeId> {
+        let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+        let graph = snap.graph();
+        let branch = kin_core::read_current_branch(layout).unwrap();
+        let legacy_boundary = graph.get_branch(&branch).unwrap().unwrap().head;
+        let blob_store = kin_blobs::BlobStore::new(layout.objects_dir()).unwrap();
+        let options = git_history_import_options("recent").unwrap();
+        let mut legacy = kin_git::import_git_history_with_blobs(
+            repo_dir,
+            legacy_boundary,
+            &options,
+            Some(&blob_store),
+        )
+        .unwrap();
+        kin_git::anchor_imported_history_at_base_link(
+            repo_dir,
+            &mut legacy,
+            legacy_boundary,
+            Some(&blob_store),
+        )
+        .unwrap();
+
+        // This is the exact old publication defect: warm init supplied the
+        // current imported head as its boundary, then reinserted every
+        // deterministic Git id. Reuse the already-persisted semantic deltas;
+        // the old replay also treated that wrong boundary as external, so the
+        // only authoritative record difference is the generated parent edge.
+        for imported in &legacy {
+            let mut old_release_record = graph
+                .get_change(&imported.change.id)
+                .unwrap()
+                .expect("fresh init must already contain every imported Git id");
+            old_release_record.parents = imported.change.parents.clone();
+            graph.create_change(&old_release_record).unwrap();
+        }
+        let ids: Vec<_> = legacy.iter().map(|entry| entry.change.id).collect();
+        graph
+            .update_branch_head(&branch, ids.last().unwrap())
+            .unwrap();
+        snap.save().unwrap();
+        ids
+    }
+
     #[tokio::test]
     #[serial]
     async fn consecutive_default_git_history_inits_keep_canonical_boundary_root() {
@@ -8634,6 +8877,255 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 "repair retained duplicate revision generations"
             );
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn release_old_two_commit_cycle_upgrades_to_canonical_git_history() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        if !init_git_repo_for_test(repo_dir.path())
+            || !commit_git_file_for_test(
+                repo_dir.path(),
+                "src/lib.rs",
+                "pub fn answer() -> u32 { 1 }\n",
+                "first",
+            )
+            || !commit_git_file_for_test(
+                repo_dir.path(),
+                "src/lib.rs",
+                "pub fn answer(value: u32) -> u32 { value }\n",
+                "second",
+            )
+        {
+            return;
+        }
+        let home_dir = tempfile::tempdir().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home_dir.path());
+        let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
+        let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
+
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "recent".to_string(),
+        )
+        .await
+        .unwrap();
+        let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
+        let legacy_ids = seed_release_old_warm_import(repo_dir.path(), &layout);
+        assert!(legacy_ids.len() >= 2);
+        {
+            let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+            let graph = snap.graph();
+            assert_eq!(
+                graph.get_change(&legacy_ids[0]).unwrap().unwrap().parents,
+                vec![*legacy_ids.last().unwrap()],
+                "fixture did not reproduce the old head-as-boundary edge"
+            );
+            assert!(candidate_parent_path_reaches(
+                &graph.to_snapshot().changes,
+                &legacy_ids.iter().copied().collect(),
+                *legacy_ids.last().unwrap(),
+                legacy_ids[0],
+            ));
+        }
+
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "recent".to_string(),
+        )
+        .await
+        .expect("new init must upgrade the exact old multi-commit cycle");
+
+        let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+        let persisted = snap.graph().to_snapshot();
+        assert_eq!(
+            persisted.changes[&legacy_ids[0]].parents,
+            vec![kin_core::build_genesis_change().id]
+        );
+        for pair in legacy_ids.windows(2) {
+            assert_eq!(persisted.changes[&pair[1]].parents[0], pair[0]);
+        }
+        assert_history_derived_indexes_are_unique(&persisted);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn canonical_import_with_duplicate_derived_indexes_is_rebuilt_on_upgrade() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        if !init_git_repo_for_test(repo_dir.path())
+            || !commit_git_file_for_test(
+                repo_dir.path(),
+                "src/lib.rs",
+                "pub fn answer() -> u32 { 1 }\n",
+                "first",
+            )
+            || !commit_git_file_for_test(
+                repo_dir.path(),
+                "src/lib.rs",
+                "pub fn answer(value: u32) -> u32 { value }\n",
+                "second",
+            )
+        {
+            return;
+        }
+        let home_dir = tempfile::tempdir().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home_dir.path());
+        let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
+        let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
+
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "recent".to_string(),
+        )
+        .await
+        .unwrap();
+        let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
+        let candidate_ids = {
+            let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+            let graph = snap.graph();
+            let branch = kin_core::read_current_branch(&layout).unwrap();
+            let head = graph.get_branch(&branch).unwrap().unwrap().head;
+            let changes = graph
+                .get_changes_since(&kin_core::build_genesis_change().id, &head)
+                .unwrap();
+            let ids: Vec<_> = changes
+                .iter()
+                .filter(|change| change.message != "kin init: auto-parse")
+                .map(|change| change.id)
+                .collect();
+            for _ in 0..2 {
+                for id in &ids {
+                    graph
+                        .create_change(&graph.get_change(id).unwrap().unwrap())
+                        .unwrap();
+                }
+            }
+            snap.save().unwrap();
+            ids
+        };
+        let candidate_set: HashSet<_> = candidate_ids.iter().copied().collect();
+        {
+            let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+            let persisted = snap.graph().to_snapshot();
+            assert!(candidate_reverse_index_needs_rebuild(
+                &persisted,
+                &candidate_set
+            ));
+            assert!(candidate_revision_index_needs_rebuild(
+                &persisted,
+                &candidate_set
+            ));
+            assert!(candidate_ids.iter().all(|id| {
+                persisted.changes[id]
+                    .parents
+                    .iter()
+                    .all(|parent| *parent != *id)
+            }));
+        }
+
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "recent".to_string(),
+        )
+        .await
+        .expect("canonical parents with duplicate derived indexes must upgrade");
+        let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+        let persisted = snap.graph().to_snapshot();
+        assert!(!candidate_reverse_index_needs_rebuild(
+            &persisted,
+            &candidate_set
+        ));
+        assert!(!candidate_revision_index_needs_rebuild(
+            &persisted,
+            &candidate_set
+        ));
+        assert_history_derived_indexes_are_unique(&persisted);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn unrelated_self_edge_is_refused_not_reparented_as_git_history() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        if !init_git_repo_for_test(repo_dir.path())
+            || !commit_git_file_for_test(
+                repo_dir.path(),
+                "src/lib.rs",
+                "pub fn answer() -> u32 { 42 }\n",
+                "initial",
+            )
+        {
+            return;
+        }
+        let home_dir = tempfile::tempdir().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home_dir.path());
+        let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
+        let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "recent".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
+        let unrelated_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xd7; 32]));
+        {
+            let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+            let graph = snap.graph();
+            let mut unrelated = kin_core::build_genesis_change();
+            unrelated.id = unrelated_id;
+            unrelated.parents = vec![unrelated_id];
+            unrelated.message = "unrelated corrupt native change".to_string();
+            graph.create_change(&unrelated).unwrap();
+            snap.save().unwrap();
+        }
+
+        let error = run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "recent".to_string(),
+        )
+        .await
+        .expect_err("unrelated self-edge must fail loud");
+        assert!(
+            error
+                .to_string()
+                .contains("legacy Git-import repair: parent DAG contains a cycle"),
+            "unexpected refusal: {error:#}"
+        );
+        let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+        assert_eq!(
+            snap.graph()
+                .get_change(&unrelated_id)
+                .unwrap()
+                .unwrap()
+                .parents,
+            vec![unrelated_id],
+            "refusal must not guess a canonical parent for unrelated corruption"
+        );
     }
 
     #[tokio::test]

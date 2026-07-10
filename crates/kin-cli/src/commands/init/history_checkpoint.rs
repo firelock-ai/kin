@@ -898,17 +898,40 @@ fn write_new_or_identical(
     }
 }
 
-/// Create every missing directory component with durable namespace metadata.
-///
-/// `create_dir_all` can install several nested entries while leaving every
-/// ancestor except the leaf unsynchronized. On Unix that is not enough for the
-/// checkpoint publication contract: after sudden power loss an fsynced object
-/// may survive while one of the directories leading to it does not. Creating
-/// one component at a time and syncing both the new directory and its parent
-/// makes each link in the path durable before an object or manifest is linked
-/// below it.
+/// Unix directory identity used to invalidate the process-local durability
+/// cache if a path is deleted and recreated between checkpoint sessions.
 #[cfg(unix)]
-fn create_dir_all_durable(path: &Path) -> Result<()> {
+type DurableDirectoryIdentity = (u64, u64);
+
+#[cfg(unix)]
+static DURABLE_DIRECTORY_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<PathBuf, DurableDirectoryIdentity>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(unix)]
+fn directory_identity(path: &Path) -> Result<DurableDirectoryIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("stat checkpoint directory {}", path.display()))?;
+    if !metadata.is_dir() {
+        return Err(anyhow!(
+            "checkpoint directory destination {} is not a directory",
+            path.display()
+        ));
+    }
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(unix)]
+fn create_dir_all_durable_with_sync<F>(
+    path: &Path,
+    cache: &std::sync::Mutex<HashMap<PathBuf, DurableDirectoryIdentity>>,
+    mut sync: F,
+) -> Result<()>
+where
+    F: FnMut(&Path) -> Result<()>,
+{
     let absolute;
     let path = if path.is_absolute() {
         path
@@ -919,7 +942,15 @@ fn create_dir_all_durable(path: &Path) -> Result<()> {
         absolute.as_path()
     };
     if path.is_dir() {
-        return Ok(());
+        let identity = directory_identity(path)?;
+        if cache
+            .lock()
+            .map_err(|_| anyhow!("checkpoint durable-directory cache is poisoned"))?
+            .get(path)
+            .is_some_and(|cached| *cached == identity)
+        {
+            return Ok(());
+        }
     }
 
     let mut missing = Vec::new();
@@ -942,10 +973,7 @@ fn create_dir_all_durable(path: &Path) -> Result<()> {
 
     for directory in missing.into_iter().rev() {
         match fs::create_dir(&directory) {
-            Ok(()) => {
-                sync_directory(&directory)?;
-                sync_parent_directory(&directory)?;
-            }
+            Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 if !directory.is_dir() {
                     return Err(error).with_context(|| {
@@ -955,8 +983,6 @@ fn create_dir_all_durable(path: &Path) -> Result<()> {
                         )
                     });
                 }
-                sync_directory(&directory)?;
-                sync_parent_directory(&directory)?;
             }
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -965,7 +991,57 @@ fn create_dir_all_durable(path: &Path) -> Result<()> {
             }
         }
     }
+
+    // Sync the leaf and every ancestor through the nearest identity-cached
+    // durable directory. The cached ancestor itself must be synced again: its
+    // namespace is what persists the first newly-created child. Cache entries
+    // are published only after the complete chain succeeds, so a failed fsync
+    // leaves no false success marker. A retry therefore re-syncs already-
+    // existing leaf/ancestors instead of returning early after create_dir.
+    let mut sync_chain = Vec::<(PathBuf, DurableDirectoryIdentity)>::new();
+    let mut cursor = path.to_path_buf();
+    loop {
+        let identity = directory_identity(&cursor)?;
+        let cached = cache
+            .lock()
+            .map_err(|_| anyhow!("checkpoint durable-directory cache is poisoned"))?
+            .get(&cursor)
+            .is_some_and(|cached| *cached == identity);
+        sync_chain.push((cursor.clone(), identity));
+        if cached {
+            break;
+        }
+        let Some(parent) = cursor.parent() else {
+            break;
+        };
+        if parent == cursor {
+            break;
+        }
+        cursor = parent.to_path_buf();
+    }
+    for (directory, _) in &sync_chain {
+        sync(directory)?;
+    }
+    let mut cached = cache
+        .lock()
+        .map_err(|_| anyhow!("checkpoint durable-directory cache is poisoned"))?;
+    for (directory, identity) in sync_chain {
+        cached.insert(directory, identity);
+    }
     Ok(())
+}
+
+/// Create every missing directory component with durable namespace metadata.
+///
+/// `create_dir_all` can install several nested entries while leaving every
+/// ancestor except the leaf unsynchronized. On Unix, the complete leaf-to-
+/// durable-ancestor chain is synced before publication proceeds. Successful
+/// identities are cached to keep steady-state object reuse O(1), while a
+/// failed sync deliberately leaves the path uncached so retry revalidates it.
+#[cfg(unix)]
+fn create_dir_all_durable(path: &Path) -> Result<()> {
+    let cache = DURABLE_DIRECTORY_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    create_dir_all_durable_with_sync(path, cache, sync_directory)
 }
 
 #[cfg(not(unix))]
@@ -2141,6 +2217,55 @@ mod tests {
         // The idempotent path must not require recreating or replacing any
         // already-durable directory entry.
         create_dir_all_durable(&nested).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_directory_retry_resyncs_existing_chain_after_sync_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir
+            .path()
+            .join("checkpoints")
+            .join("history-hydration")
+            .join("objects");
+        let fail_at = nested.parent().unwrap().to_path_buf();
+        let cache = std::sync::Mutex::new(HashMap::new());
+        let mut injected = false;
+
+        let error = create_dir_all_durable_with_sync(&nested, &cache, |directory| {
+            if directory == fail_at && !injected {
+                injected = true;
+                return Err(anyhow!("injected directory sync failure"));
+            }
+            Ok(())
+        })
+        .expect_err("the first durability pass must surface the injected failure");
+        assert!(error
+            .to_string()
+            .contains("injected directory sync failure"));
+        assert!(
+            nested.is_dir(),
+            "creation completes before the sync barrier"
+        );
+        assert!(
+            cache.lock().unwrap().is_empty(),
+            "a partial sync must not publish any durable identity"
+        );
+
+        let mut retried = Vec::new();
+        create_dir_all_durable_with_sync(&nested, &cache, |directory| {
+            retried.push(directory.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert!(retried.contains(&nested), "retry skipped the existing leaf");
+        assert!(
+            retried.contains(&fail_at),
+            "retry skipped the existing ancestor whose first sync failed"
+        );
+        let cached = cache.lock().unwrap();
+        assert!(cached.contains_key(&nested));
+        assert!(cached.contains_key(&fail_at));
     }
 
     #[test]
