@@ -1572,6 +1572,7 @@ enum ParsedFileResult {
     EntitySource {
         rel_path: String,
         hash: [u8; 32],
+        parse_completeness: ParseCompleteness,
         entities: Vec<Entity>,
         discovered_tests: Vec<DiscoveredTest>,
         relations: Vec<kin_parser::ExtractedRelation>,
@@ -1614,6 +1615,7 @@ struct DiscoveredTest {
 #[serde(deny_unknown_fields)]
 struct ImportedSemanticFileState {
     file_path: String,
+    parse_completeness: ParseCompleteness,
     entities: Vec<Entity>,
     relations: Vec<kin_parser::ExtractedRelation>,
     imports: Vec<kin_parser::FileImport>,
@@ -1623,6 +1625,7 @@ impl ImportedSemanticFileState {
     fn to_link_data(&self) -> kin_index::FileParseData {
         kin_index::FileParseData {
             file_path: self.file_path.clone(),
+            parse_completeness: self.parse_completeness.clone(),
             entities: self.entities.clone(),
             relations: self.relations.clone(),
             imports: self.imports.clone(),
@@ -1843,6 +1846,7 @@ fn take_imported_parent_baseline(
 /// re-keys entity ids per commit. Shared via `Arc` so a blob recurring across
 /// commits reuses one allocation instead of re-parsing.
 struct CachedParse {
+    parse_completeness: ParseCompleteness,
     entities: Vec<Entity>,
     extracted_relations: Vec<kin_parser::ExtractedRelation>,
     imports: Vec<kin_parser::FileImport>,
@@ -2242,6 +2246,11 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
                             .index_file_content_with_tests(&job.file_id, content, job.blob_hash)
                             .map(|indexed| {
                                 Arc::new(CachedParse {
+                                    parse_completeness: indexed
+                                        .indexed_file
+                                        .file_layout
+                                        .parse_completeness
+                                        .clone(),
                                     entities: indexed.indexed_file.entities,
                                     extracted_relations: indexed.indexed_file.extracted_relations,
                                     imports: indexed.indexed_file.imports,
@@ -2353,6 +2362,7 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
                         file_path.clone(),
                         ImportedSemanticFileState {
                             file_path: file_path.clone(),
+                            parse_completeness: parsed.parse_completeness.clone(),
                             entities: stabilized_entities,
                             relations: parsed.extracted_relations.clone(),
                             imports: parsed.imports.clone(),
@@ -3134,17 +3144,20 @@ fn index_files_with_stable_entity_ids(
                                 extracted_tests,
                             );
 
+                            let parse_completeness =
+                                ParseCompleteness::from_parse_state(&parse_state);
                             let layout = build_layout(
                                 &file_id,
                                 &file_entities,
                                 source.len(),
                                 &[],
-                                ParseCompleteness::from_parse_state(&parse_state),
+                                parse_completeness.clone(),
                             );
 
                             ParsedFileResult::EntitySource {
                                 rel_path: file.rel_path.clone(),
                                 hash: file.hash,
+                                parse_completeness,
                                 entities: file_entities,
                                 discovered_tests,
                                 relations: extracted_relations,
@@ -3258,6 +3271,7 @@ fn index_files_with_stable_entity_ids(
             ParsedFileResult::EntitySource {
                 rel_path,
                 hash,
+                parse_completeness,
                 entities,
                 discovered_tests: file_tests,
                 relations,
@@ -3281,6 +3295,7 @@ fn index_files_with_stable_entity_ids(
                 discovered_tests.extend(file_tests.clone());
                 file_parse_data.push(kin_index::FileParseData {
                     file_path: rel_path.clone(),
+                    parse_completeness: parse_completeness.clone(),
                     entities: entities.clone(),
                     relations: relations.clone(),
                     imports: imports.clone(),
@@ -5398,6 +5413,7 @@ mod tests {
         let blob = kin_blobs::Hash256::from_bytes([0x42; 32]);
         let mut memo: HashMap<(kin_blobs::Hash256, u32), Arc<CachedParse>> = HashMap::new();
         let payload = Arc::new(CachedParse {
+            parse_completeness: ParseCompleteness::Full,
             entities: Vec::new(),
             extracted_relations: Vec::new(),
             imports: Vec::new(),
@@ -5429,6 +5445,22 @@ mod tests {
             !memo.contains_key(&(other_blob, kin_parser::PARSER_SEMANTICS_VERSION)),
             "a different blob must not collide with the cached entry"
         );
+    }
+
+    #[test]
+    fn historical_link_data_preserves_parse_completeness() {
+        let expected = ParseCompleteness::Partial(
+            "one recovered error range in historical source".to_string(),
+        );
+        let state = ImportedSemanticFileState {
+            file_path: "src/history.py".to_string(),
+            parse_completeness: expected.clone(),
+            entities: Vec::new(),
+            relations: Vec::new(),
+            imports: Vec::new(),
+        };
+
+        assert_eq!(state.to_link_data().parse_completeness, expected);
     }
 
     #[test]

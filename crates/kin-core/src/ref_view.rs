@@ -1163,6 +1163,7 @@ fn rebuild_entity_source_file_layouts(
             parsed_relations.extend(indexed.indexed_file.relations.iter().cloned());
             parsed_files.push(FileParseData {
                 file_path: indexed.indexed_file.file_id.0.clone(),
+                parse_completeness: indexed.indexed_file.file_layout.parse_completeness.clone(),
                 entities: indexed.indexed_file.entities.clone(),
                 relations: indexed.indexed_file.extracted_relations.clone(),
                 imports: indexed.indexed_file.imports.clone(),
@@ -1260,6 +1261,10 @@ fn enrich_sparse_historical_source_file(
         .iter()
         .any(|entity| !lifecycle.is_alive_at_ref(entity));
     if any_stale {
+        let parse_completeness = ParseCompleteness::Partial(
+            "historical ref view layout reparsed without binding because persisted entities were not alive at ref"
+                .to_string(),
+        );
         let file_layout = build_entity_file_layout(
             &indexed_file.file_id,
             &indexed_file.entities,
@@ -1271,16 +1276,14 @@ fn enrich_sparse_historical_source_file(
                     SourceRegion::EntityRef { byte_range, .. }
                     | SourceRegion::Trivia { byte_range } => byte_range.end,
                 }),
-            ParseCompleteness::Partial(
-                "historical ref view layout reparsed without binding because persisted entities were not alive at ref"
-                    .to_string(),
-            ),
+            parse_completeness.clone(),
         );
         return Some(HistoricalSourceFileEnrichment {
             entities: indexed_file.entities.clone(),
             file_layout,
             parse_data: FileParseData {
                 file_path: indexed_file.file_id.0,
+                parse_completeness,
                 entities: indexed_file.entities,
                 relations: indexed_file.extracted_relations,
                 imports: indexed_file.imports,
@@ -1291,6 +1294,9 @@ fn enrich_sparse_historical_source_file(
     let stabilized_entities =
         stabilize_parsed_entities(persisted_entities, indexed_file.entities, lifecycle);
     let merged_entities = merge_historical_file_entities(persisted_entities, stabilized_entities);
+    let parse_completeness = ParseCompleteness::Partial(
+        "historical ref view layout enriched from parsed blob and persisted entity IDs".to_string(),
+    );
     let file_layout = build_entity_file_layout(
         &indexed_file.file_id,
         &merged_entities,
@@ -1302,10 +1308,7 @@ fn enrich_sparse_historical_source_file(
                 SourceRegion::EntityRef { byte_range, .. }
                 | SourceRegion::Trivia { byte_range } => byte_range.end,
             }),
-        ParseCompleteness::Partial(
-            "historical ref view layout enriched from parsed blob and persisted entity IDs"
-                .to_string(),
-        ),
+        parse_completeness.clone(),
     );
 
     Some(HistoricalSourceFileEnrichment {
@@ -1313,6 +1316,7 @@ fn enrich_sparse_historical_source_file(
         file_layout,
         parse_data: FileParseData {
             file_path: indexed_file.file_id.0,
+            parse_completeness,
             entities: merged_entities,
             relations: indexed_file.extracted_relations,
             imports: indexed_file.imports,

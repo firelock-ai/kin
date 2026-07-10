@@ -154,17 +154,14 @@ fn python_collector_only_rename(old: &str, new: &str) -> bool {
 }
 
 /// True when `old` and `new` are identical once the two explicit spellings of
-/// the `NoneType` singleton — `type(None)` and `types.NoneType` — are folded to
-/// one form. Python 3.10+ guarantees `type(None) is types.NoneType`, so a
-/// declaration that swaps one spelling for the other (a default value, or a
-/// non-`def` module-level declaration whose text carries the reference) changes
-/// no runtime contract. Only that exact spelling is folded, so any other type
-/// difference still counts and is never masked. Bare `NoneType` is not folded —
+/// the `NoneType` singleton — the builtin expression `type(None)` and
+/// `types.NoneType` — are folded to one form. Python 3.10+ guarantees
+/// `type(None) is types.NoneType`, so a declaration that swaps those expression
+/// spellings changes no runtime contract. The fold is token-aware: quoted text,
+/// larger identifiers such as `mytype`, and attribute calls such as
+/// `obj.type(None)` are never rewritten. Bare `NoneType` is not folded because
 /// its meaning depends on a `from types import` binding absent from the text.
 fn python_none_type_spelling_neutral(old: &str, new: &str) -> bool {
-    fn fold(signature: &str) -> String {
-        signature.replace("type(None)", "types.NoneType")
-    }
     let old_has_def = find_python_def_keyword(old).is_some();
     let new_has_def = find_python_def_keyword(new).is_some();
     if old_has_def || new_has_def {
@@ -179,7 +176,72 @@ fn python_none_type_spelling_neutral(old: &str, new: &str) -> bool {
             return false;
         }
     }
-    fold(old) == fold(new)
+    match (
+        fold_python_none_type_expressions(old),
+        fold_python_none_type_expressions(new),
+    ) {
+        (Some(old), Some(new)) => old == new,
+        _ => false,
+    }
+}
+
+/// Canonicalize standalone builtin `type(None)` expressions without rewriting
+/// source substrings that merely contain those bytes. This lightweight lexical
+/// pass is deliberately narrower than general Python normalization: it skips
+/// complete string literals byte-for-byte, rejects comments/interpolated or
+/// malformed strings, requires identifier token boundaries, and refuses a
+/// `type` token selected through attribute access. Whitespace between the four
+/// expression tokens is formatting and may differ.
+fn fold_python_none_type_expressions(signature: &str) -> Option<String> {
+    fn skip_ascii_whitespace(bytes: &[u8], mut i: usize) -> usize {
+        while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        i
+    }
+
+    let bytes = signature.as_bytes();
+    let mut folded = String::with_capacity(signature.len());
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if matches!(bytes[i], b'\'' | b'"') {
+            let end = python_quote_end(bytes, i)?;
+            folded.push_str(&signature[i..end]);
+            i = end;
+            continue;
+        }
+        if bytes[i] == b'#' {
+            return None;
+        }
+
+        if python_keyword_at(bytes, i, b"type") {
+            let previous_non_space = bytes[..i]
+                .iter()
+                .rfind(|byte| !byte.is_ascii_whitespace())
+                .copied();
+            if previous_non_space != Some(b'.') {
+                let open = skip_ascii_whitespace(bytes, i + "type".len());
+                if bytes.get(open) == Some(&b'(') {
+                    let none = skip_ascii_whitespace(bytes, open + 1);
+                    if python_keyword_at(bytes, none, b"None") {
+                        let close = skip_ascii_whitespace(bytes, none + "None".len());
+                        if bytes.get(close) == Some(&b')') {
+                            folded.push_str("types.NoneType");
+                            i = close + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        let ch = signature[i..].chars().next()?;
+        folded.push(ch);
+        i += ch.len_utf8();
+    }
+
+    Some(folded)
 }
 
 /// The runtime declaration mode, callable name, and normalized parameter list
@@ -2405,6 +2467,10 @@ mod tests {
             "def f(x=types.NoneType)"
         ));
         assert!(signature_runtime_neutral(
+            "def f(x=type ( None ))",
+            "def f(x=types.NoneType)"
+        ));
+        assert!(signature_runtime_neutral(
             "PROTECTED = (bool, int, type(None), bytes)",
             "PROTECTED = (bool, int, types.NoneType, bytes)"
         ));
@@ -2426,6 +2492,18 @@ mod tests {
         assert!(!signature_runtime_neutral(
             "PROTECTED = (bool, int, type(None), bytes)",
             "PROTECTED = (bool, int, NoneType, bytes)"
+        ));
+        assert!(!signature_runtime_neutral(
+            r#"def f(x="type(None)")"#,
+            r#"def f(x="types.NoneType")"#
+        ));
+        assert!(!signature_runtime_neutral(
+            "def f(x=mytype(None))",
+            "def f(x=mytypes.NoneType)"
+        ));
+        assert!(!signature_runtime_neutral(
+            "def f(x=obj.type(None))",
+            "def f(x=obj.types.NoneType)"
         ));
     }
 

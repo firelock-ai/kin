@@ -22,25 +22,24 @@
 //! re-blocked the positional-safe rename with no test to catch it.
 
 use kin_db::{EntityStore, InMemoryGraph};
-use kin_index::{link_cross_file, FileParseData, CALL_SHAPE_EVIDENCE_AGGREGATION_V1};
+use kin_index::{
+    link_cross_file, FileParseData, CALL_SHAPE_EVIDENCE_AGGREGATION_V1,
+    CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1,
+};
 use kin_model::review::{RiskLevel, RiskSummary};
-use kin_model::{Entity, FilePathId, GraphNodeId, ParseState, RelationKind};
+use kin_model::{Entity, FilePathId, GraphNodeId, ParseCompleteness, RelationKind};
 use kin_parser::{LanguageAdapter, PythonAdapter};
 use kin_review::{
     analyze_impact, collect_inline_comments, derive_shadow_policy, EntityChange, EntityChangeKind,
     InlineCommentKind, Review, SemanticDiff, ShadowGateVerdict,
 };
 
-fn parse_python_bytes(file_path: &str, bytes: &[u8]) -> FileParseData {
+fn parse_python_bytes_allow_incomplete(file_path: &str, bytes: &[u8]) -> FileParseData {
     let adapter = PythonAdapter;
     let file_id = FilePathId::new(file_path);
     let tree = adapter.parse(bytes).expect("parse");
     let output = adapter.extract(&tree, bytes, &file_id).expect("extract");
-    assert!(
-        matches!(output.parse_state, ParseState::Valid),
-        "call-shape fixture must exercise a valid Python parse: {:?}",
-        output.parse_state
-    );
+    let parse_completeness = ParseCompleteness::from_parse_state(&output.parse_state);
     let entities: Vec<Entity> = output
         .entities
         .into_iter()
@@ -48,10 +47,21 @@ fn parse_python_bytes(file_path: &str, bytes: &[u8]) -> FileParseData {
         .collect();
     FileParseData {
         file_path: file_path.to_string(),
+        parse_completeness,
         entities,
         relations: output.relations,
         imports: output.imports,
     }
+}
+
+fn parse_python_bytes(file_path: &str, bytes: &[u8]) -> FileParseData {
+    let parsed = parse_python_bytes_allow_incomplete(file_path, bytes);
+    assert!(
+        matches!(&parsed.parse_completeness, ParseCompleteness::Full),
+        "call-shape fixture must exercise a valid Python parse: {:?}",
+        parsed.parse_completeness
+    );
+    parsed
 }
 
 fn parse_python(file_path: &str, source: &str) -> FileParseData {
@@ -78,7 +88,12 @@ fn link_into_graph_bytes(
     source: &[u8],
 ) -> (Vec<FileParseData>, Vec<kin_model::Relation>, InMemoryGraph) {
     let files = vec![parse_python_bytes("mod.py", source)];
+    link_parsed_files_into_graph(files)
+}
 
+fn link_parsed_files_into_graph(
+    files: Vec<FileParseData>,
+) -> (Vec<FileParseData>, Vec<kin_model::Relation>, InMemoryGraph) {
     // Real linker: resolves calls and persists each Calls edge's argument shape.
     let relations = link_cross_file(&files);
 
@@ -93,6 +108,27 @@ fn link_into_graph_bytes(
         graph.upsert_relation(rel).expect("upsert relation");
     }
     (files, relations, graph)
+}
+
+fn shadow_verdict(graph: &InMemoryGraph, diff: SemanticDiff) -> ShadowGateVerdict {
+    let report = analyze_impact(graph, &diff).expect("analyze impact");
+    let inline_comments = collect_inline_comments(&diff, &report);
+    let review = Review {
+        base: None,
+        head: None,
+        diff,
+        impact: report,
+        risk: RiskSummary {
+            overall_risk: RiskLevel::Low,
+            breaking_changes: vec![],
+            test_coverage_gaps: vec![],
+            contract_violations: vec![],
+            work_risks: vec![],
+            notes: vec![],
+        },
+        inline_comments,
+    };
+    derive_shadow_policy(&review, &[], &[]).verdict
 }
 
 /// The rename diff for `target`: same entity id, signature `old_sig` -> `new_sig`.
@@ -146,28 +182,7 @@ fn link_and_shadow_analysis(
 ) {
     let (files, relations, graph) = link_into_graph(source);
     let diff = rename_diff(&files, old_sig, new_sig);
-    let report = analyze_impact(&graph, &diff).expect("analyze impact");
-    let inline_comments = collect_inline_comments(&diff, &report);
-    let review = Review {
-        base: None,
-        head: None,
-        diff,
-        impact: report,
-        risk: RiskSummary {
-            overall_risk: RiskLevel::Low,
-            breaking_changes: vec![],
-            test_coverage_gaps: vec![],
-            contract_violations: vec![],
-            work_risks: vec![],
-            notes: vec![],
-        },
-        inline_comments,
-    };
-    (
-        derive_shadow_policy(&review, &[], &[]).verdict,
-        files,
-        relations,
-    )
+    (shadow_verdict(&graph, diff), files, relations)
 }
 
 fn link_and_shadow_verdict(source: &str, old_sig: &str, new_sig: &str) -> ShadowGateVerdict {
@@ -227,28 +242,7 @@ fn link_and_shadow_verdict_from_source_bytes(
         }],
         ..Default::default()
     };
-    let report = analyze_impact(&graph, &diff).expect("analyze impact");
-    let inline_comments = collect_inline_comments(&diff, &report);
-    let review = Review {
-        base: None,
-        head: None,
-        diff,
-        impact: report,
-        risk: RiskSummary {
-            overall_risk: RiskLevel::Low,
-            breaking_changes: vec![],
-            test_coverage_gaps: vec![],
-            contract_violations: vec![],
-            work_risks: vec![],
-            notes: vec![],
-        },
-        inline_comments,
-    };
-    (
-        derive_shadow_policy(&review, &[], &[]).verdict,
-        old_signature,
-        new_signature,
-    )
+    (shadow_verdict(&graph, diff), old_signature, new_signature)
 }
 
 const POSITIONAL_CALLERS: &str = "\
@@ -394,6 +388,48 @@ def caller_one():
 def caller_two():
     return target(2, "explicit")
 "#;
+
+const PARSED_NONE_TYPE_STRING_DEFAULT_OLD: &str = r#"def target(value="type(None)"):
+    return value
+
+
+def caller():
+    return target("explicit")
+"#;
+
+const PARSED_NONE_TYPE_STRING_DEFAULT_NEW: &str = r#"def target(value="types.NoneType"):
+    return value
+
+
+def caller():
+    return target("explicit")
+"#;
+
+const PARSED_LARGER_IDENTIFIER_DEFAULT_OLD: &str = r#"def target(value=mytype(None)):
+    return value
+
+
+def caller():
+    return target("explicit")
+"#;
+
+const PARSED_LARGER_IDENTIFIER_DEFAULT_NEW: &str = r#"def target(value=mytypes.NoneType):
+    return value
+
+
+def caller():
+    return target("explicit")
+"#;
+
+const INCOMPLETE_CALLER_WITH_UNTRUSTWORTHY_COVERAGE: &str = "\
+def target(ext, args):
+    return ext, args
+
+
+def caller():
+    target(1, 2)
+    return target(3, args=4
+";
 
 const PARSED_SYNC_RENAME: &str = "\
 def target(ext, args):
@@ -778,6 +814,96 @@ fn e2e_parsed_sources_preserve_and_block_changed_string_default() {
         verdict,
         ShadowGateVerdict::WouldBlock,
         "a parsed rename plus semantic string-default change must stay blocking"
+    );
+}
+
+#[test]
+fn e2e_parsed_none_type_text_and_larger_identifier_defaults_stay_blocking() {
+    for (label, old_source, new_source, old_fragment, new_fragment) in [
+        (
+            "quoted text",
+            PARSED_NONE_TYPE_STRING_DEFAULT_OLD,
+            PARSED_NONE_TYPE_STRING_DEFAULT_NEW,
+            r#"value="type(None)""#,
+            r#"value="types.NoneType""#,
+        ),
+        (
+            "larger identifier",
+            PARSED_LARGER_IDENTIFIER_DEFAULT_OLD,
+            PARSED_LARGER_IDENTIFIER_DEFAULT_NEW,
+            "value=mytype(None)",
+            "value=mytypes.NoneType",
+        ),
+    ] {
+        let (verdict, old_signature, new_signature) =
+            link_and_shadow_verdict_from_sources(old_source, new_source);
+        assert!(
+            old_signature.contains(old_fragment),
+            "old {label} default must come from parsed source: {old_signature}"
+        );
+        assert!(
+            new_signature.contains(new_fragment),
+            "new {label} default must come from parsed source: {new_signature}"
+        );
+        assert_eq!(
+            verdict,
+            ShadowGateVerdict::WouldBlock,
+            "NoneType spelling normalization must not rewrite {label}"
+        );
+    }
+}
+
+#[test]
+fn e2e_incomplete_parse_with_omitted_call_cannot_neutralize_rename() {
+    let parsed = parse_python_bytes_allow_incomplete(
+        "mod.py",
+        INCOMPLETE_CALLER_WITH_UNTRUSTWORTHY_COVERAGE.as_bytes(),
+    );
+    assert!(
+        matches!(
+            &parsed.parse_completeness,
+            ParseCompleteness::Partial(_) | ParseCompleteness::Failed(_)
+        ),
+        "fixture must exercise tree-sitter recovery: {:?}",
+        parsed.parse_completeness
+    );
+    let extracted_target_calls = parsed
+        .relations
+        .iter()
+        .filter(|relation| relation.kind == RelationKind::Calls && relation.dst_name == "target")
+        .count();
+    assert_eq!(
+        extracted_target_calls, 1,
+        "the recovered parse must omit the malformed keyword call"
+    );
+
+    let (files, relations, graph) = link_parsed_files_into_graph(vec![parsed]);
+    let target = find_entity(&files, "target");
+    let inbound = relations
+        .iter()
+        .find(|relation| {
+            relation.kind == RelationKind::Calls && relation.dst == GraphNodeId::Entity(target.id)
+        })
+        .expect("the recovered positional call still links");
+    assert!(inbound.evidence.iter().all(|evidence| {
+        evidence.parser_rule.as_deref() == Some(CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1)
+            && evidence.call_shape.is_none()
+    }));
+
+    let diff = rename_diff(&files, "def target(ext, args)", "def target(ext, lines)");
+    let impact = analyze_impact(&graph, &diff).expect("analyze incomplete-parse impact");
+    assert!(
+        !impact
+            .entity_impact(&target.id)
+            .expect("target impact")
+            .call_shapes
+            .all_consumers_shaped_calls,
+        "explicit incomplete-parse evidence must remain unknown"
+    );
+    assert_eq!(
+        shadow_verdict(&graph, diff),
+        ShadowGateVerdict::WouldBlock,
+        "an omitted call from recovered syntax cannot be neutralized by the surviving positional call"
     );
 }
 

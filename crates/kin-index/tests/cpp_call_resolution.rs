@@ -30,6 +30,7 @@ fn parse_cpp(file_path: &str, source: &str) -> FileParseData {
         .collect();
     FileParseData {
         file_path: file_path.to_string(),
+        parse_completeness: kin_model::ParseCompleteness::Full,
         entities,
         relations: output.relations,
         imports: output.imports,

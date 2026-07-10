@@ -30,8 +30,8 @@ pub use linker::{
     extract_projection_source_markers, link_cross_file, link_cross_file_against_entities,
     link_cross_file_incremental, CrossFileLinker, FileParseData, IncrementalLinker,
     IncrementalLinkerCheckpointV1, LinkingOutcome, UnresolvedRelation,
-    CALL_SHAPE_EVIDENCE_AGGREGATION_V1, INCREMENTAL_LINKER_CHECKPOINT_VERSION,
-    KIN_INDEX_CRATE_VERSION,
+    CALL_SHAPE_EVIDENCE_AGGREGATION_V1, CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1,
+    INCREMENTAL_LINKER_CHECKPOINT_VERSION, KIN_INDEX_CRATE_VERSION,
 };
 pub use overlay::{apply_file_removal, apply_to_graph, ApplyResult};
 pub use pipeline::{

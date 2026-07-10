@@ -257,6 +257,8 @@ fn parse_and_index(
             Ok(p) => p,
             Err(_) => continue,
         };
+        let parse_completeness =
+            kin_model::ParseCompleteness::from_parse_state(&parse_output.parse_state);
 
         let extracted_relations = parse_output.relations;
         let file_imports = parse_output.imports;
@@ -279,6 +281,7 @@ fn parse_and_index(
 
         file_parse_data.push(kin_index::linker::FileParseDataWithTests {
             file_path: rel_path,
+            parse_completeness,
             entities: file_entities,
             relations: extracted_relations,
             imports: file_imports,

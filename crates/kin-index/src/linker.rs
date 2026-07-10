@@ -13,8 +13,8 @@ use tracing::debug;
 use sha2::{Digest, Sha256};
 
 use kin_model::{
-    ArtifactId, Entity, EntityId, EntityKind, GraphNodeId, LanguageId, Relation, RelationEvidence,
-    RelationId, RelationKind, RelationOrigin, Visibility,
+    ArtifactId, Entity, EntityId, EntityKind, GraphNodeId, LanguageId, ParseCompleteness, Relation,
+    RelationEvidence, RelationId, RelationKind, RelationOrigin, Visibility,
 };
 use kin_parser::{CallArgShape, ExtractedRelation, FileImport};
 
@@ -29,6 +29,12 @@ use kin_parser::{CallArgShape, ExtractedRelation, FileImport};
 /// be neutralized. `parser_rule` is defaultable in storage, making an older
 /// record's absent marker a conservative, backward-compatible `unknown`.
 pub const CALL_SHAPE_EVIDENCE_AGGREGATION_V1: &str = "call_shape_aggregation_v1";
+
+/// Persisted fail-closed marker for call evidence recovered from a parse that
+/// was not fully valid. A recovered tree can omit call sites, so even a shaped
+/// occurrence cannot certify that every call on the logical edge was observed.
+/// Review treats this explicit unshaped record as unknown/blocking evidence.
+pub const CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1: &str = "call_shape_incomplete_parse_v1";
 
 /// Result of resolving a single unresolved relation.
 #[derive(Debug)]
@@ -63,6 +69,9 @@ pub struct UnresolvedRelation {
 pub struct FileParseData {
     /// Relative file path (e.g., "src/app/api/chat/route.ts").
     pub file_path: String,
+    /// Completeness of the parse that produced `relations`. Only `Full` input
+    /// may certify call-shape aggregation as complete.
+    pub parse_completeness: ParseCompleteness,
     /// Entities with IDs already assigned.
     pub entities: Vec<Entity>,
     /// Unresolved name-based relations from this file.
@@ -79,6 +88,7 @@ pub struct FileParseData {
 #[derive(Debug, Clone)]
 pub struct FileParseDataWithTests {
     pub file_path: String,
+    pub parse_completeness: ParseCompleteness,
     pub entities: Vec<Entity>,
     pub relations: Vec<ExtractedRelation>,
     pub imports: Vec<FileImport>,
@@ -89,6 +99,7 @@ impl FileParseDataWithTests {
     pub fn into_linkable(self) -> FileParseData {
         FileParseData {
             file_path: self.file_path,
+            parse_completeness: self.parse_completeness,
             entities: self.entities,
             relations: self.relations,
             imports: self.imports,
@@ -128,6 +139,7 @@ pub fn link_cross_file_with_tests(files: &[FileParseDataWithTests]) -> Vec<Relat
         .iter()
         .map(|file| FileParseData {
             file_path: file.file_path.clone(),
+            parse_completeness: file.parse_completeness.clone(),
             entities: file.entities.clone(),
             relations: file.relations.clone(),
             imports: file.imports.clone(),
@@ -411,6 +423,9 @@ fn build_link_context<'a>(
 fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation> {
     let mut resolved = Vec::new();
     let mut relation_indices = HashMap::new();
+    let make_relation = |rel: &ExtractedRelation, src, dst, confidence| {
+        make_relation(rel, src, dst, confidence, &file.parse_completeness)
+    };
     // Lazily resolved once per file: only ambiguous name buckets need them.
     let mut caller_import_targets: Option<HashSet<String>> = None;
     let mut caller_include_closure: Option<HashMap<String, usize>> = None;
@@ -2325,6 +2340,7 @@ fn make_relation(
     src: EntityId,
     dst: EntityId,
     confidence: f32,
+    parse_completeness: &ParseCompleteness,
 ) -> Relation {
     let kind = rel.kind;
     let origin = if confidence >= 1.0 {
@@ -2345,14 +2361,30 @@ fn make_relation(
         origin,
         created_in: None,
         import_source: None,
-        evidence: call_shape_evidence(rel.call_shape.as_ref()),
+        evidence: call_shape_evidence(rel.kind, rel.call_shape.as_ref(), parse_completeness),
     }
 }
 
 /// Convert a parser-side [`CallArgShape`] into stored relation evidence carrying
-/// the graph-model shape mirror. Empty when the call site recorded no shape, so
-/// non-call and shape-blind edges stay evidence-free as before.
-pub(crate) fn call_shape_evidence(shape: Option<&CallArgShape>) -> Vec<RelationEvidence> {
+/// the graph-model shape mirror. Fully parsed shaped calls receive the complete
+/// aggregation certificate; recovered calls receive an explicit unshaped
+/// marker because the parse may have omitted sibling occurrences. Non-call and
+/// fully parsed shape-blind edges stay evidence-free as before.
+pub(crate) fn call_shape_evidence(
+    kind: RelationKind,
+    shape: Option<&CallArgShape>,
+    parse_completeness: &ParseCompleteness,
+) -> Vec<RelationEvidence> {
+    if kind != RelationKind::Calls {
+        return Vec::new();
+    }
+    if !matches!(parse_completeness, ParseCompleteness::Full) {
+        return vec![RelationEvidence {
+            parser_rule: Some(CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1.to_string()),
+            call_shape: None,
+            ..RelationEvidence::default()
+        }];
+    }
     match shape {
         Some(shape) => vec![RelationEvidence {
             parser_rule: Some(CALL_SHAPE_EVIDENCE_AGGREGATION_V1.to_string()),
@@ -3463,6 +3495,9 @@ fn resolve_one_file_incremental(
 ) -> Vec<Relation> {
     let mut resolved = Vec::new();
     let mut relation_indices = HashMap::new();
+    let make_relation = |rel: &ExtractedRelation, src, dst, confidence| {
+        make_relation(rel, src, dst, confidence, &file.parse_completeness)
+    };
     // Lazily resolved once per file: only ambiguous name buckets need them.
     let mut caller_import_targets: Option<HashSet<String>> = None;
     let mut caller_include_closure: Option<HashMap<String, usize>> = None;
@@ -4201,6 +4236,7 @@ mod tests {
 
         let files = vec![FileParseData {
             file_path: "src/a.ts".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![e1.clone(), e2.clone()],
             relations: vec![ExtractedRelation {
                 call_shape: None,
@@ -4245,6 +4281,7 @@ mod tests {
 
         let build = |mut shapes: Vec<Option<CallArgShape>>| FileParseData {
             file_path: "src/a.py".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![caller.clone(), target.clone()],
             relations: shapes
                 .drain(..)
@@ -4318,6 +4355,7 @@ mod tests {
         let target = make_entity("target", "src/a.py");
         let build = |shapes: Vec<Option<CallArgShape>>| FileParseData {
             file_path: "src/a.py".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![caller.clone(), target.clone()],
             relations: shapes
                 .into_iter()
@@ -4357,6 +4395,48 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_parse_call_evidence_is_explicit_and_never_certified() {
+        let caller = make_entity("caller", "src/a.py");
+        let target = make_entity("target", "src/a.py");
+        let files = vec![FileParseData {
+            file_path: "src/a.py".to_string(),
+            parse_completeness: ParseCompleteness::Partial(
+                "tree-sitter recovered from one error range".to_string(),
+            ),
+            entities: vec![caller.clone(), target.clone()],
+            relations: vec![ExtractedRelation {
+                call_shape: Some(CallArgShape {
+                    positional: 2,
+                    ..CallArgShape::default()
+                }),
+                kind: RelationKind::Calls,
+                src_name: "caller".to_string(),
+                dst_name: "target".to_string(),
+                import_source: None,
+            }],
+            imports: vec![],
+        }];
+        let evidence = |relations: &[Relation]| {
+            find_calls_edge(relations, &caller, &target)
+                .expect("recovered call edge")
+                .evidence
+                .clone()
+        };
+
+        let batch = evidence(&link_cross_file(&files));
+        let mut linker = IncrementalLinker::new();
+        linker.add_file("src/a.py", &[caller.clone(), target.clone()]);
+        let incremental = evidence(&link_cross_file_incremental(&files, &linker));
+        assert_eq!(batch, incremental);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(
+            batch[0].parser_rule.as_deref(),
+            Some(CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1)
+        );
+        assert!(batch[0].call_shape.is_none());
+    }
+
+    #[test]
     fn repeated_call_metadata_keeps_strongest_resolution_independent_of_source_order() {
         let caller = rust_fn("caller", "src/caller.rs");
         let target = make_method_entity("Widget::make", "src/model.rs");
@@ -4371,12 +4451,14 @@ mod tests {
             vec![
                 FileParseData {
                     file_path: "src/caller.rs".to_string(),
+                    parse_completeness: kin_model::ParseCompleteness::Full,
                     entities: vec![caller.clone()],
                     relations,
                     imports: vec![],
                 },
                 FileParseData {
                     file_path: "src/model.rs".to_string(),
+                    parse_completeness: kin_model::ParseCompleteness::Full,
                     entities: vec![target.clone()],
                     relations: vec![],
                     imports: vec![],
@@ -4433,6 +4515,7 @@ mod tests {
         let files = vec![
             FileParseData {
                 file_path: "src/routes/api.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
                     call_shape: None,
@@ -4452,6 +4535,7 @@ mod tests {
             },
             FileParseData {
                 file_path: "src/utils/tools.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![callee.clone()],
                 relations: vec![],
                 imports: vec![],
@@ -4490,6 +4574,7 @@ mod tests {
 
         let reparsed = vec![FileParseData {
             file_path: "src/routes/api.ts".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
                 call_shape: None,
@@ -4543,6 +4628,7 @@ mod tests {
 
         let reparsed = vec![FileParseData {
             file_path: "src/app.ts".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
                 call_shape: None,
@@ -4595,6 +4681,7 @@ mod tests {
             // Same-file resolution.
             FileParseData {
                 file_path: "src/a.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![
                     make_entity("funcA", "src/a.ts"),
                     make_entity("helperA", "src/a.ts"),
@@ -4605,12 +4692,14 @@ mod tests {
             // Import-based cross-file resolution + artifact import edge.
             FileParseData {
                 file_path: "src/b.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![make_entity("handler", "src/b.ts")],
                 relations: vec![calls("handler", "executeTool")],
                 imports: vec![import("./utils/tools", "executeTool")],
             },
             FileParseData {
                 file_path: "src/utils/tools.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![make_entity("executeTool", "src/utils/tools.ts")],
                 relations: vec![],
                 imports: vec![],
@@ -4618,18 +4707,21 @@ mod tests {
             // Ambiguous global name fallback across two files.
             FileParseData {
                 file_path: "src/c.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![make_entity("runner", "src/c.ts")],
                 relations: vec![calls("runner", "shared")],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "src/d/shared.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![make_entity("shared", "src/d/shared.ts")],
                 relations: vec![],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "src/z/shared.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![make_entity("shared", "src/z/shared.ts")],
                 relations: vec![],
                 imports: vec![],
@@ -4642,6 +4734,7 @@ mod tests {
             let path = format!("src/pad/m{i}.ts");
             files.push(FileParseData {
                 file_path: path.clone(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![make_entity("a", &path), make_entity("b", &path)],
                 relations: vec![calls("a", "b"), calls("b", "missing")],
                 imports: vec![],
@@ -4670,6 +4763,7 @@ mod tests {
     fn build_include_graph_parallel_matches_serial() {
         let header = |path: &str| FileParseData {
             file_path: path.to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![],
             relations: vec![],
             imports: vec![],
@@ -4691,6 +4785,7 @@ mod tests {
         for i in 0..24 {
             files.push(FileParseData {
                 file_path: format!("src/app{i}.cpp"),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![],
                 relations: vec![],
                 imports: vec![
@@ -4729,12 +4824,14 @@ mod tests {
         let mut files = vec![
             FileParseData {
                 file_path: "src/a.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![make_entity("handler", "src/a.ts")],
                 relations: vec![],
                 imports: vec![import("./b/util", "util")],
             },
             FileParseData {
                 file_path: "src/b/util.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![make_entity("util", "src/b/util.ts")],
                 relations: vec![],
                 imports: vec![],
@@ -4747,12 +4844,14 @@ mod tests {
             let dep = format!("src/pad/dep{i}.ts");
             files.push(FileParseData {
                 file_path: path.clone(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![make_entity("m", &path)],
                 relations: vec![],
                 imports: vec![import(&format!("./dep{i}"), "d")],
             });
             files.push(FileParseData {
                 file_path: dep.clone(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![make_entity("d", &dep)],
                 relations: vec![],
                 imports: vec![],
@@ -4794,6 +4893,7 @@ mod tests {
         let files = vec![
             FileParseData {
                 file_path: "src/app.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
                     call_shape: None,
@@ -4806,6 +4906,7 @@ mod tests {
             },
             FileParseData {
                 file_path: "src/lib/helper.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![target.clone()],
                 relations: vec![],
                 imports: vec![],
@@ -4827,6 +4928,7 @@ mod tests {
         let files = vec![
             FileParseData {
                 file_path: "src/app.cpp".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
                     call_shape: None,
@@ -4846,6 +4948,7 @@ mod tests {
             },
             FileParseData {
                 file_path: "include/json/macros.hpp".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![macro_def.clone()],
                 relations: vec![],
                 imports: vec![],
@@ -4881,6 +4984,7 @@ mod tests {
         let files = vec![
             FileParseData {
                 file_path: "src/app.cpp".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller],
                 relations: vec![ExtractedRelation {
                     call_shape: None,
@@ -4893,6 +4997,7 @@ mod tests {
             },
             FileParseData {
                 file_path: "include/json/macros.hpp".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![macro_def],
                 relations: vec![],
                 imports: vec![],
@@ -4998,6 +5103,7 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "src/parse.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
                     call_shape: None,
@@ -5017,6 +5123,7 @@ void f();
             },
             FileParseData {
                 file_path: "src/util.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![callee.clone()],
                 relations: vec![],
                 imports: vec![],
@@ -5042,6 +5149,7 @@ void f();
 
         let files = vec![FileParseData {
             file_path: "src/a.ts".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![e1.clone(), e2.clone()],
             relations: vec![
                 ExtractedRelation {
@@ -5072,6 +5180,7 @@ void f();
 
         let files = vec![FileParseData {
             file_path: "src/a.ts".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![e1],
             relations: vec![ExtractedRelation {
                 call_shape: None,
@@ -5098,6 +5207,7 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "src/wiring.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
                     call_shape: None,
@@ -5110,6 +5220,7 @@ void f();
             },
             FileParseData {
                 file_path: "src/reconciler.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![callee.clone()],
                 relations: vec![],
                 imports: vec![],
@@ -5139,6 +5250,7 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "src/caller.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
                     call_shape: None,
@@ -5151,12 +5263,14 @@ void f();
             },
             FileParseData {
                 file_path: "src/foo.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![foo_new.clone()],
                 relations: vec![],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "src/bar.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![bar_new.clone()],
                 relations: vec![],
                 imports: vec![],
@@ -5195,6 +5309,7 @@ void f();
 
         let files = vec![FileParseData {
             file_path: "src/wiring.rs".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
                 call_shape: None,
@@ -5256,6 +5371,7 @@ void f();
             linker.add_file(&path, &[a.clone(), b.clone()]);
             files.push(FileParseData {
                 file_path: path,
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![a, b],
                 relations: vec![
                     ExtractedRelation {
@@ -5333,6 +5449,7 @@ void f();
 
         let files = vec![FileParseData {
             file_path: "src/caller.rs".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
                 call_shape: None,
@@ -5471,6 +5588,7 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "src/api.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
                     call_shape: None,
@@ -5490,6 +5608,7 @@ void f();
             },
             FileParseData {
                 file_path: "src/utils.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![callee.clone()],
                 relations: vec![],
                 imports: vec![],
@@ -5529,6 +5648,7 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "src/routes/api.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![importer.clone()],
                 relations: vec![],
                 imports: vec![FileImport {
@@ -5542,6 +5662,7 @@ void f();
             },
             FileParseData {
                 file_path: "src/utils/tools.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![target.clone()],
                 relations: vec![],
                 imports: vec![],
@@ -5573,6 +5694,7 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "src/main.cpp".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![_importer.clone()],
                 relations: vec![],
                 imports: vec![FileImport {
@@ -5586,6 +5708,7 @@ void f();
             },
             FileParseData {
                 file_path: "include/nlohmann/detail/input/binary_reader.hpp".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![_target.clone()],
                 relations: vec![],
                 imports: vec![],
@@ -5620,6 +5743,7 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "src/routes/api.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
                     call_shape: None,
@@ -5639,6 +5763,7 @@ void f();
             },
             FileParseData {
                 file_path: "src/utils/tools.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![callee.clone()],
                 relations: vec![],
                 imports: vec![],
@@ -5663,6 +5788,7 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "src/api.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![importer.clone()],
                 relations: vec![],
                 imports: vec![FileImport {
@@ -5676,6 +5802,7 @@ void f();
             },
             FileParseData {
                 file_path: "src/util.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![target.clone()],
                 relations: vec![],
                 imports: vec![],
@@ -5713,6 +5840,7 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "a.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![e1.clone()],
                 relations: vec![ExtractedRelation {
                     call_shape: None,
@@ -5725,6 +5853,7 @@ void f();
             },
             FileParseData {
                 file_path: "b.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![e2.clone()],
                 relations: vec![],
                 imports: vec![],
@@ -5749,6 +5878,7 @@ void f();
 
         let files = vec![FileParseData {
             file_path: "src/app.rs".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
                 call_shape: None,
@@ -5785,6 +5915,7 @@ void f();
 
         let files = vec![FileParseData {
             file_path: "src/app.rs".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
                 call_shape: None,
@@ -5812,6 +5943,7 @@ void f();
 
         let build = |entities: Vec<Entity>| FileParseData {
             file_path: "src/app.rs".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities,
             relations: vec![
                 ExtractedRelation {
@@ -5860,6 +5992,7 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "src/routes/api.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![handler.clone()],
                 relations: vec![ExtractedRelation {
                     call_shape: None,
@@ -5879,6 +6012,7 @@ void f();
             },
             FileParseData {
                 file_path: "src/utils/tools.ts".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![surviving],
                 relations: vec![],
                 imports: vec![],
@@ -5946,12 +6080,14 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "src/caller.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone()],
                 relations: vec![calls_relation("caller", "crate::work::run")],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "src/work.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![target.clone()],
                 relations: vec![],
                 imports: vec![],
@@ -5974,12 +6110,14 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "kin-review/src/review.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone()],
                 relations: vec![calls_relation("review_from_diff", "impact::analyze_impact")],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "kin-review/src/impact.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![target.clone()],
                 relations: vec![],
                 imports: vec![],
@@ -6002,12 +6140,14 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "src/caller.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone()],
                 relations: vec![calls_relation("caller", "crate::model::Widget::make")],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "src/model.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![method.clone()],
                 relations: vec![],
                 imports: vec![],
@@ -6030,12 +6170,14 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "src/caller.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone()],
                 relations: vec![calls_relation("caller", "alias::Widget::make")],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "vendor/src/model.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![method.clone()],
                 relations: vec![],
                 imports: vec![],
@@ -6059,12 +6201,14 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "src/caller.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone()],
                 relations: vec![calls_relation("caller", "Widget::make")],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "src/model.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![method.clone()],
                 relations: vec![],
                 imports: vec![],
@@ -6092,24 +6236,28 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "src/caller.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone()],
                 relations: vec![calls_relation("caller", "crate::somewhere::run")],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "src/a.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![run_a.clone()],
                 relations: vec![],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "src/b.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![run_b.clone()],
                 relations: vec![],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "src/c.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![run_c.clone()],
                 relations: vec![],
                 imports: vec![],
@@ -6136,6 +6284,7 @@ void f();
 
         let files = vec![FileParseData {
             file_path: "src/caller.rs".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![caller.clone()],
             relations: vec![calls_relation("caller", "crate::gone::vanished")],
             imports: vec![],
@@ -6160,12 +6309,14 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "kin-review/src/impact.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![target.clone()],
                 relations: vec![],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "kin-review/src/review.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller_review.clone()],
                 // same-crate module-qualified, twice (deduped to one edge)
                 relations: vec![
@@ -6176,6 +6327,7 @@ void f();
             },
             FileParseData {
                 file_path: "kin-mcp/src/handlers/review.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller_mcp.clone()],
                 // cross-crate crate-qualified
                 relations: vec![calls_relation(
@@ -6215,6 +6367,7 @@ void f();
 
         let files = vec![FileParseData {
             file_path: "src/caller.rs".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![caller.clone()],
             relations: vec![calls_relation("caller", "crate::work::run")],
             imports: vec![],
@@ -6237,6 +6390,7 @@ void f();
 
         let files = vec![FileParseData {
             file_path: "src/caller.rs".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![caller.clone()],
             relations: vec![calls_relation("caller", "crate::model::Widget::make")],
             imports: vec![],
@@ -6267,6 +6421,7 @@ void f();
 
         let files = vec![FileParseData {
             file_path: "src/caller.rs".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![caller.clone()],
             relations: vec![calls_relation("caller", "crate::somewhere::run")],
             imports: vec![],
@@ -6294,6 +6449,7 @@ void f();
             let caller = rust_fn("caller", "src/caller.rs");
             let mut files = vec![FileParseData {
                 file_path: "src/caller.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller],
                 relations: vec![calls_relation("caller", "crate::somewhere::run")],
                 imports: vec![],
@@ -6302,6 +6458,7 @@ void f();
                 let path = format!("src/t{i}.rs");
                 files.push(FileParseData {
                     file_path: path.clone(),
+                    parse_completeness: kin_model::ParseCompleteness::Full,
                     entities: vec![rust_fn("run", &path)],
                     relations: vec![],
                     imports: vec![],
@@ -6333,6 +6490,7 @@ void f();
             let caller = make_entity("build", "src/caller.rs");
             let mut files = vec![FileParseData {
                 file_path: "src/caller.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller],
                 relations: vec![calls_relation("build", "make")],
                 imports: vec![],
@@ -6341,6 +6499,7 @@ void f();
                 let path = format!("src/impl{i}.rs");
                 files.push(FileParseData {
                     file_path: path.clone(),
+                    parse_completeness: kin_model::ParseCompleteness::Full,
                     entities: vec![make_entity(&format!("Impl{i}::make"), &path)],
                     relations: vec![],
                     imports: vec![],
@@ -6377,12 +6536,14 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "src/caller.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone(), prototype.clone()],
                 relations: vec![calls_relation("run_caller", "compute")],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "src/impl.rs".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![definition.clone()],
                 relations: vec![],
                 imports: vec![],
@@ -6412,6 +6573,7 @@ void f();
 
         let files = vec![FileParseData {
             file_path: "src/caller.rs".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![caller.clone(), prototype.clone()],
             relations: vec![calls_relation("run_caller", "compute")],
             imports: vec![],
@@ -6440,24 +6602,28 @@ void f();
             vec![
                 FileParseData {
                     file_path: "src/caller.rs".to_string(),
+                    parse_completeness: kin_model::ParseCompleteness::Full,
                     entities: vec![caller.clone()],
                     relations: vec![calls_relation("caller", "crate::somewhere::run")],
                     imports: vec![],
                 },
                 FileParseData {
                     file_path: "src/a.rs".to_string(),
+                    parse_completeness: kin_model::ParseCompleteness::Full,
                     entities: vec![run_a.clone()],
                     relations: vec![],
                     imports: vec![],
                 },
                 FileParseData {
                     file_path: "src/b.rs".to_string(),
+                    parse_completeness: kin_model::ParseCompleteness::Full,
                     entities: vec![run_b.clone()],
                     relations: vec![],
                     imports: vec![],
                 },
                 FileParseData {
                     file_path: "src/c.rs".to_string(),
+                    parse_completeness: kin_model::ParseCompleteness::Full,
                     entities: vec![run_c.clone()],
                     relations: vec![],
                     imports: vec![],
@@ -6507,24 +6673,28 @@ void f();
             vec![
                 FileParseData {
                     file_path: "src/caller.rs".to_string(),
+                    parse_completeness: kin_model::ParseCompleteness::Full,
                     entities: vec![rust_fn("caller", "src/caller.rs")],
                     relations: vec![calls_relation("caller", "crate::somewhere::run")],
                     imports: vec![],
                 },
                 FileParseData {
                     file_path: "src/a.rs".to_string(),
+                    parse_completeness: kin_model::ParseCompleteness::Full,
                     entities: vec![rust_fn("run", "src/a.rs")],
                     relations: vec![],
                     imports: vec![],
                 },
                 FileParseData {
                     file_path: "src/b.rs".to_string(),
+                    parse_completeness: kin_model::ParseCompleteness::Full,
                     entities: vec![rust_fn("run", "src/b.rs")],
                     relations: vec![],
                     imports: vec![],
                 },
                 FileParseData {
                     file_path: "src/c.rs".to_string(),
+                    parse_completeness: kin_model::ParseCompleteness::Full,
                     entities: vec![rust_fn("run", "src/c.rs")],
                     relations: vec![],
                     imports: vec![],
@@ -6534,18 +6704,21 @@ void f();
             vec![
                 FileParseData {
                     file_path: "src/caller.rs".to_string(),
+                    parse_completeness: kin_model::ParseCompleteness::Full,
                     entities: vec![make_entity("build", "src/caller.rs")],
                     relations: vec![calls_relation("build", "new")],
                     imports: vec![],
                 },
                 FileParseData {
                     file_path: "src/foo.rs".to_string(),
+                    parse_completeness: kin_model::ParseCompleteness::Full,
                     entities: vec![make_entity("Foo::new", "src/foo.rs")],
                     relations: vec![],
                     imports: vec![],
                 },
                 FileParseData {
                     file_path: "src/bar.rs".to_string(),
+                    parse_completeness: kin_model::ParseCompleteness::Full,
                     entities: vec![make_entity("Bar::new", "src/bar.rs")],
                     relations: vec![],
                     imports: vec![],
@@ -6555,6 +6728,7 @@ void f();
             vec![
                 FileParseData {
                     file_path: "src/caller.rs".to_string(),
+                    parse_completeness: kin_model::ParseCompleteness::Full,
                     entities: vec![
                         rust_fn("run_caller", "src/caller.rs"),
                         rust_fn("compute", "src/caller.rs"),
@@ -6564,6 +6738,7 @@ void f();
                 },
                 FileParseData {
                     file_path: "src/impl.rs".to_string(),
+                    parse_completeness: kin_model::ParseCompleteness::Full,
                     entities: vec![rust_fn("compute", "src/impl.rs")],
                     relations: vec![],
                     imports: vec![],
@@ -6642,18 +6817,21 @@ void f();
             // Decoy package first: bucket order would pick it without the pin.
             FileParseData {
                 file_path: "pkg/cmd/project/create/create.go".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![decoy.clone()],
                 relations: vec![],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "pkg/cmd/pr/create/create.go".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![target.clone()],
                 relations: vec![],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "pkg/cmd/pr/pr.go".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone()],
                 relations: vec![pinned_calls_relation(
                     "NewCmdPR",
@@ -6686,18 +6864,21 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "pkg/cmd/label/create.go".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![decoy.clone()],
                 relations: vec![],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "pkg/cmd/pr/create/create.go".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![target.clone()],
                 relations: vec![],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "pkg/cmd/pr/create/create_test.go".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone()],
                 relations: vec![calls_relation("TestCreateRun", "createRun")],
                 imports: vec![],
@@ -6721,12 +6902,14 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "internal/run/run.go".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![local_decoy.clone()],
                 relations: vec![],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "cmd/gh/main.go".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone()],
                 relations: vec![pinned_calls_relation(
                     "main",
@@ -6764,18 +6947,21 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "src/x/parse.go".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![first.clone()],
                 relations: vec![],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "src/y/parse.go".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![second.clone()],
                 relations: vec![],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "src/z/drive.go".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone()],
                 relations: vec![calls_relation("drive", "parse")],
                 imports: vec![],
@@ -6805,6 +6991,7 @@ void f();
 
         let files = vec![FileParseData {
             file_path: "pkg/cmd/pr/pr.go".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![caller.clone()],
             relations: vec![pinned_calls_relation(
                 "NewCmdPR",
@@ -6837,6 +7024,7 @@ void f();
 
         let files = vec![FileParseData {
             file_path: "pkg/cmd/pr/create/create_test.go".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![caller.clone()],
             relations: vec![calls_relation("TestCreateRun", "createRun")],
             imports: vec![],
@@ -6864,18 +7052,21 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "single_include/catch.hpp".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![bundled.clone()],
                 relations: vec![],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "include/internal/catch_tostring.h".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![header.clone()],
                 relations: vec![],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "include/internal/catch_tostring.cpp".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone()],
                 relations: vec![calls_relation("writeValue", "toString")],
                 imports: vec![],
@@ -6916,24 +7107,28 @@ void f();
             // closure signal.
             FileParseData {
                 file_path: "single_include/catch2/catch.hpp".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![bundled.clone()],
                 relations: vec![],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "include/internal/catch_tostring.h".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![target.clone()],
                 relations: vec![],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "include/catch.hpp".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![],
                 relations: vec![],
                 imports: vec![include_import("internal/catch_tostring.h")],
             },
             FileParseData {
                 file_path: "projects/SelfTest/ToStringTests.cpp".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone()],
                 relations: vec![calls_relation("TestToString", "convert")],
                 imports: vec![include_import("catch.hpp")],
@@ -6963,18 +7158,21 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "single_include/catch2/catch.hpp".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![bundled.clone(), bundled_extra_a, bundled_extra_b],
                 relations: vec![],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "include/internal/catch_session.h".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![target.clone()],
                 relations: vec![],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "projects/SelfTest/MainTests.cpp".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone()],
                 relations: vec![calls_relation("runMain", "Session")],
                 imports: vec![
@@ -7005,24 +7203,28 @@ void f();
         let files = vec![
             FileParseData {
                 file_path: "alpha/format.hpp".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![first.clone()],
                 relations: vec![],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "beta/format.hpp".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![second.clone()],
                 relations: vec![],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "src/other.hpp".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![],
                 relations: vec![],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "src/render.cpp".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone()],
                 relations: vec![calls_relation("render", "format")],
                 imports: vec![include_import("src/other.hpp")],
@@ -7064,6 +7266,7 @@ void f();
         // recorded into persistent state.
         linker.record_file_includes(&[FileParseData {
             file_path: "include/catch.hpp".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![],
             relations: vec![],
             imports: vec![include_import("internal/catch_tostring.h")],
@@ -7072,6 +7275,7 @@ void f();
         // Later step: only the caller is (re)parsed.
         let files = vec![FileParseData {
             file_path: "projects/SelfTest/ToStringTests.cpp".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![caller.clone()],
             relations: vec![calls_relation("TestToString", "convert")],
             imports: vec![include_import("catch.hpp")],
@@ -7110,6 +7314,7 @@ void f();
 
         let files = vec![FileParseData {
             file_path: "projects/SelfTest/MainTests.cpp".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![caller.clone()],
             relations: vec![calls_relation("runMain", "Session")],
             imports: vec![
@@ -7150,6 +7355,7 @@ void f();
         );
         linker.record_file_includes(&[FileParseData {
             file_path: "include/catch.hpp".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![],
             relations: vec![],
             imports: vec![include_import("internal/catch_tostring.h")],
@@ -7157,6 +7363,7 @@ void f();
 
         let caller_step = vec![FileParseData {
             file_path: "projects/SelfTest/ToStringTests.cpp".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![caller.clone()],
             relations: vec![calls_relation("TestToString", "convert")],
             imports: vec![include_import("catch.hpp")],
@@ -7171,6 +7378,7 @@ void f();
         // Later step: the umbrella is reparsed without the include.
         linker.record_file_includes(&[FileParseData {
             file_path: "include/catch.hpp".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![],
             relations: vec![],
             imports: vec![],
@@ -7196,12 +7404,14 @@ void f();
         let mut files = vec![
             FileParseData {
                 file_path: "aux/probe.hpp".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![decoy.clone()],
                 relations: vec![],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "src/drive.cpp".to_string(),
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities: vec![caller.clone()],
                 relations: vec![calls_relation("drive", "probe")],
                 imports: vec![include_import("chain/h00.hpp")],
@@ -7223,6 +7433,7 @@ void f();
             };
             files.push(FileParseData {
                 file_path,
+                parse_completeness: kin_model::ParseCompleteness::Full,
                 entities,
                 relations: vec![],
                 imports,

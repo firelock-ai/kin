@@ -514,11 +514,13 @@ fn persist_semantic_index<G: GraphStore>(
     for indexed in indexed_files {
         let entity_count = indexed.indexed_file.entities.len();
         let relation_count = indexed.indexed_file.relations.len();
+        let parse_completeness = indexed.indexed_file.file_layout.parse_completeness.clone();
         all_entities.extend(indexed.indexed_file.entities.iter().cloned());
         all_relations.extend(indexed.indexed_file.relations);
 
         file_parse_data.push(kin_index::linker::FileParseDataWithTests {
             file_path: indexed.indexed_file.file_id.0.clone(),
+            parse_completeness,
             entities: indexed.indexed_file.entities,
             relations: indexed.indexed_file.extracted_relations,
             imports: indexed.indexed_file.imports,

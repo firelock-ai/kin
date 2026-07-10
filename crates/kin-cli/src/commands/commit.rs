@@ -208,6 +208,8 @@ async fn run_local_commit_pipeline_for_tests(
                         continue;
                     }
                 };
+                let parse_completeness =
+                    kin_model::ParseCompleteness::from_parse_state(&parse_output.parse_state);
 
                 // Collect relations and imports for cross-file linking
                 let extracted_relations = parse_output.relations;
@@ -271,6 +273,7 @@ async fn run_local_commit_pipeline_for_tests(
                 // Collect file parse data for cross-file linking
                 file_parse_data.push(kin_index::linker::FileParseDataWithTests {
                     file_path: rel_path,
+                    parse_completeness,
                     entities: file_entities,
                     relations: extracted_relations,
                     imports: file_imports,

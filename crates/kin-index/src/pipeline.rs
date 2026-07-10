@@ -159,14 +159,10 @@ impl IndexPipeline {
             kin_parser::attach_go_command_effect_contract_metadata(&tree, source, &mut entities);
         }
 
-        let (relations, unresolved_relations) = resolve_relations(&extracted_relations, &entities);
-        let file_layout = build_layout(
-            file_id,
-            &entities,
-            source.len(),
-            &[],
-            ParseCompleteness::from_parse_state(&parse_state),
-        );
+        let parse_completeness = ParseCompleteness::from_parse_state(&parse_state);
+        let (relations, unresolved_relations) =
+            resolve_relations(&extracted_relations, &entities, &parse_completeness);
+        let file_layout = build_layout(file_id, &entities, source.len(), &[], parse_completeness);
 
         debug!(
             path = %file_id,
@@ -300,14 +296,10 @@ impl IndexPipeline {
         }
 
         // Resolve extracted relations to model relations using entity name mapping
-        let (relations, unresolved_relations) = resolve_relations(&extracted_relations, &entities);
-        let file_layout = build_layout(
-            file_id,
-            &entities,
-            source.len(),
-            &[],
-            ParseCompleteness::from_parse_state(&parse_state),
-        );
+        let parse_completeness = ParseCompleteness::from_parse_state(&parse_state);
+        let (relations, unresolved_relations) =
+            resolve_relations(&extracted_relations, &entities, &parse_completeness);
+        let file_layout = build_layout(file_id, &entities, source.len(), &[], parse_completeness);
 
         debug!(
             path = %path.display(),
@@ -763,6 +755,7 @@ pub fn classify_file_role(path: &str) -> EntityRole {
 fn resolve_relations(
     extracted: &[kin_parser::ExtractedRelation],
     entities: &[Entity],
+    parse_completeness: &ParseCompleteness,
 ) -> (Vec<Relation>, Vec<UnresolvedRelation>) {
     let mut resolved = Vec::new();
     let mut relation_indices = HashMap::new();
@@ -791,7 +784,11 @@ fn resolve_relations(
                         origin: RelationOrigin::Parsed,
                         created_in: None,
                         import_source: rel.import_source.clone(),
-                        evidence: crate::linker::call_shape_evidence(rel.call_shape.as_ref()),
+                        evidence: crate::linker::call_shape_evidence(
+                            rel.kind,
+                            rel.call_shape.as_ref(),
+                            parse_completeness,
+                        ),
                     },
                 );
             }
@@ -918,6 +915,47 @@ mod tests {
                 .as_ref()
                 .is_some_and(|shape| shape.keywords == ["args"])
         }));
+    }
+
+    #[test]
+    fn incomplete_python_parse_marks_same_file_call_shape_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(dir.path().join("blobs")).unwrap();
+        let pipeline = IndexPipeline::new();
+        let py_file = dir.path().join("test.py");
+        std::fs::write(
+            &py_file,
+            b"def target(ext, args):\n    return ext, args\n\n\ndef caller():\n    target(1, 2)\n    return target(3, args=4\n",
+        )
+        .unwrap();
+
+        let indexed = pipeline.index_file(&py_file, &blob_store).unwrap();
+        assert!(matches!(indexed.parse_state, ParseState::Incomplete { .. }));
+        let caller = indexed
+            .entities
+            .iter()
+            .find(|entity| entity.name == "caller")
+            .expect("caller entity");
+        let target = indexed
+            .entities
+            .iter()
+            .find(|entity| entity.name == "target")
+            .expect("target entity");
+        let edge = indexed
+            .relations
+            .iter()
+            .find(|relation| {
+                relation.kind == kin_model::RelationKind::Calls
+                    && relation.src == kin_model::GraphNodeId::Entity(caller.id)
+                    && relation.dst == kin_model::GraphNodeId::Entity(target.id)
+            })
+            .expect("surviving positional call edge");
+        assert_eq!(edge.evidence.len(), 1);
+        assert_eq!(
+            edge.evidence[0].parser_rule.as_deref(),
+            Some(crate::linker::CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1)
+        );
+        assert!(edge.evidence[0].call_shape.is_none());
     }
 
     #[test]

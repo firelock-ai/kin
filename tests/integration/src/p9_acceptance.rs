@@ -25,12 +25,14 @@ fn ts_import_creates_relation() {
     let files = vec![
         FileParseData {
             file_path: "src/utils.ts".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![helper.clone()],
             relations: vec![],
             imports: vec![],
         },
         FileParseData {
             file_path: "src/api/route.ts".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![post.clone()],
             relations: vec![ExtractedRelation {
                 call_shape: None,
@@ -77,12 +79,14 @@ fn ts_call_creates_cross_file_relation() {
     let files = vec![
         FileParseData {
             file_path: "src/lib/tools.ts".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![execute_tool.clone()],
             relations: vec![],
             imports: vec![],
         },
         FileParseData {
             file_path: "src/api/chat/route.ts".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![post.clone()],
             relations: vec![ExtractedRelation {
                 call_shape: None,
@@ -131,6 +135,7 @@ fn same_file_relation_resolves() {
 
     let files = vec![FileParseData {
         file_path: "src/animals.ts".to_string(),
+        parse_completeness: kin_model::ParseCompleteness::Full,
         entities: vec![dog.clone(), bark.clone()],
         relations: vec![ExtractedRelation {
             call_shape: None,
@@ -166,6 +171,7 @@ fn unresolved_call_skipped_gracefully() {
 
     let files = vec![FileParseData {
         file_path: "src/api.ts".to_string(),
+        parse_completeness: kin_model::ParseCompleteness::Full,
         entities: vec![handler.clone()],
         relations: vec![ExtractedRelation {
             call_shape: None,
@@ -302,12 +308,14 @@ fn renamed_import_resolves() {
     let files = vec![
         FileParseData {
             file_path: "src/utils.ts".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![foo.clone()],
             relations: vec![],
             imports: vec![],
         },
         FileParseData {
             file_path: "src/api.ts".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![handler.clone()],
             relations: vec![ExtractedRelation {
                 call_shape: None,
@@ -362,6 +370,7 @@ fn multiple_files_cross_link() {
     let files = vec![
         FileParseData {
             file_path: "src/routes.ts".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![entity_a.clone()],
             relations: vec![ExtractedRelation {
                 call_shape: None,
@@ -381,6 +390,7 @@ fn multiple_files_cross_link() {
         },
         FileParseData {
             file_path: "src/services/order.ts".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![entity_b.clone()],
             relations: vec![ExtractedRelation {
                 call_shape: None,
@@ -400,6 +410,7 @@ fn multiple_files_cross_link() {
         },
         FileParseData {
             file_path: "src/db/repository.ts".to_string(),
+            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![entity_c.clone()],
             relations: vec![],
             imports: vec![],
