@@ -1456,6 +1456,28 @@ impl Default for VectorReconcileState {
     }
 }
 
+/// Throttle bookkeeping for the in-run vector-sidecar flush.
+///
+/// During a bulk embed the embedding queue stays non-empty for the whole run,
+/// so `SnapshotManager::flush_embed_progress` must still land the derived
+/// `.kvec` sidecar periodically — otherwise persisted coverage freezes at a
+/// batch boundary while compute keeps advancing, and a persisted-progress
+/// watchdog reaps the run as stalled. Writing the sidecar on every batch is the
+/// other extreme: it re-serializes the whole growing index (O(index) per
+/// batch), which is what motivated deferring it to the drain in the first
+/// place. This state bounds both, checkpointing on a wall-clock interval OR a
+/// batch count, whichever fires first, so persisted tracks compute at a cost
+/// amortized across the run.
+///
+/// `last_flush` is `None` before the first in-run write so the very first
+/// incremental flush lands progress immediately; each fire resets both fields.
+#[cfg(feature = "vector")]
+#[derive(Default)]
+struct VectorSidecarFlushThrottle {
+    last_flush: Option<std::time::Instant>,
+    batches_since_flush: usize,
+}
+
 /// A drained, text-formatted embedding batch ready for inference.
 ///
 /// Splitting the embed pipeline at this boundary lets a caller hold the graph
@@ -1549,6 +1571,11 @@ pub struct InMemoryGraph {
     /// (re)build, entity removal) that still demand a full index↔truth scan.
     #[cfg(feature = "vector")]
     vector_reconcile: parking_lot::Mutex<VectorReconcileState>,
+    /// Throttle bookkeeping for the in-run vector-sidecar flush. See
+    /// [`VectorSidecarFlushThrottle`] and
+    /// [`InMemoryGraph::should_flush_vector_sidecar_now`].
+    #[cfg(feature = "vector")]
+    vector_sidecar_flush_throttle: parking_lot::Mutex<VectorSidecarFlushThrottle>,
     /// Per-stage wall-clock + call-count timing for the embed hot path (drain,
     /// prep, forward, persist, prune). The staged embed methods record into this;
     /// a completed embed run logs its delta at `info` and operator tooling can
@@ -1662,6 +1689,10 @@ impl InMemoryGraph {
             artifact_embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
             #[cfg(feature = "vector")]
             vector_reconcile: parking_lot::Mutex::new(VectorReconcileState::default()),
+            #[cfg(feature = "vector")]
+            vector_sidecar_flush_throttle: parking_lot::Mutex::new(
+                VectorSidecarFlushThrottle::default(),
+            ),
             #[cfg(feature = "vector")]
             embed_stage_timings: crate::embed::EmbedStageTimings::default(),
             #[cfg(test)]
@@ -2071,6 +2102,10 @@ impl InMemoryGraph {
             #[cfg(feature = "vector")]
             vector_reconcile: parking_lot::Mutex::new(VectorReconcileState::default()),
             #[cfg(feature = "vector")]
+            vector_sidecar_flush_throttle: parking_lot::Mutex::new(
+                VectorSidecarFlushThrottle::default(),
+            ),
+            #[cfg(feature = "vector")]
             embed_stage_timings: crate::embed::EmbedStageTimings::default(),
             #[cfg(test)]
             merkle_flush_count: std::sync::atomic::AtomicUsize::new(0),
@@ -2295,6 +2330,10 @@ impl InMemoryGraph {
             artifact_embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
             #[cfg(feature = "vector")]
             vector_reconcile: parking_lot::Mutex::new(VectorReconcileState::default()),
+            #[cfg(feature = "vector")]
+            vector_sidecar_flush_throttle: parking_lot::Mutex::new(
+                VectorSidecarFlushThrottle::default(),
+            ),
             #[cfg(feature = "vector")]
             embed_stage_timings: crate::embed::EmbedStageTimings::default(),
             #[cfg(test)]
@@ -3761,6 +3800,84 @@ impl InMemoryGraph {
     #[cfg(not(feature = "vector"))]
     pub fn pending_artifact_embeddings(&self) -> usize {
         0
+    }
+
+    /// Wall-clock interval between in-run vector-sidecar checkpoints. Matches the
+    /// daemon's periodic-flush cadence and keeps a persisted-progress stall
+    /// watchdog satisfied with a wide margin (typical stall windows are minutes).
+    #[cfg(feature = "vector")]
+    const VECTOR_SIDECAR_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Batch-count backstop between in-run vector-sidecar checkpoints. On
+    /// hardware fast enough to embed more than this many batches within the time
+    /// interval, checkpoint after this many incremental flushes instead of
+    /// waiting the full interval — so persisted coverage never lags compute by
+    /// more than this many batches of work, and a crash re-derives at most that
+    /// much. Sized so the amortized per-run sidecar write cost stays O(index)
+    /// overall rather than the O(index²) of a per-batch write: at the capped
+    /// 64-entity batch this is ≤ 4096 vectors of new work between the full-index
+    /// serializes that `save_vector_index_for_graph` performs.
+    #[cfg(feature = "vector")]
+    const VECTOR_SIDECAR_FLUSH_BATCHES: usize = 64;
+
+    /// Decide whether an in-run vector-sidecar checkpoint is due, given the last
+    /// checkpoint time, the batches seen since, and the current instant. Pure so
+    /// the interval/backstop policy is unit-testable without wall-clock flakiness.
+    ///
+    /// The first checkpoint of a run (`last_flush == None`) is always due, so
+    /// progress lands from the first batch; afterwards a checkpoint is due once
+    /// either the time interval or the batch backstop is crossed.
+    #[cfg(feature = "vector")]
+    fn vector_sidecar_flush_due(
+        last_flush: Option<std::time::Instant>,
+        batches_since_flush: usize,
+        now: std::time::Instant,
+        interval: std::time::Duration,
+        batch_backstop: usize,
+    ) -> bool {
+        match last_flush {
+            None => true,
+            Some(last) => {
+                now.saturating_duration_since(last) >= interval
+                    || batches_since_flush >= batch_backstop
+            }
+        }
+    }
+
+    /// Record one incremental in-run flush and report whether the derived vector
+    /// sidecar should be checkpointed to disk now (see
+    /// [`VectorSidecarFlushThrottle`]). Called by
+    /// `SnapshotManager::flush_embed_progress` on every batch while the embed
+    /// queue is still draining; the sidecar is a full O(index) serialize, so it
+    /// is written on a throttle rather than every batch. Resets the throttle when
+    /// it fires so the next window starts from this checkpoint.
+    #[cfg(feature = "vector")]
+    pub(crate) fn should_flush_vector_sidecar_now(&self) -> bool {
+        let now = std::time::Instant::now();
+        let mut throttle = self.vector_sidecar_flush_throttle.lock();
+        throttle.batches_since_flush += 1;
+        let due = Self::vector_sidecar_flush_due(
+            throttle.last_flush,
+            throttle.batches_since_flush,
+            now,
+            Self::VECTOR_SIDECAR_FLUSH_INTERVAL,
+            Self::VECTOR_SIDECAR_FLUSH_BATCHES,
+        );
+        if due {
+            throttle.last_flush = Some(now);
+            throttle.batches_since_flush = 0;
+        }
+        due
+    }
+
+    /// Reset the in-run sidecar-flush throttle. Called when the embed queue
+    /// drains (the sidecar is written unconditionally at completion) so the next
+    /// run's first batch checkpoints immediately.
+    #[cfg(feature = "vector")]
+    pub(crate) fn reset_vector_sidecar_flush_throttle(&self) {
+        let mut throttle = self.vector_sidecar_flush_throttle.lock();
+        throttle.last_flush = None;
+        throttle.batches_since_flush = 0;
     }
 
     /// Manually queue entity IDs for embedding (e.g., after bulk import).
@@ -8496,6 +8613,80 @@ impl RetrievalKeyFileResolver for InMemoryGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The in-run vector-sidecar flush policy: the first checkpoint of a run is
+    /// always due; afterwards a checkpoint is due once EITHER the time interval
+    /// OR the batch backstop is crossed, whichever comes first. Pure, so both
+    /// arms are exercised deterministically with synthetic instants.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn vector_sidecar_flush_due_honors_interval_and_batch_backstop() {
+        use std::time::{Duration, Instant};
+        let base = Instant::now();
+        let interval = Duration::from_secs(30);
+        let backstop = 64usize;
+
+        // First checkpoint of a run is always due, whatever the counters say.
+        assert!(InMemoryGraph::vector_sidecar_flush_due(
+            None, 0, base, interval, backstop
+        ));
+        assert!(InMemoryGraph::vector_sidecar_flush_due(
+            None, 1, base, interval, backstop
+        ));
+
+        // Within both bounds → not due.
+        let last = Some(base);
+        assert!(!InMemoryGraph::vector_sidecar_flush_due(
+            last,
+            1,
+            base + Duration::from_secs(5),
+            interval,
+            backstop
+        ));
+        assert!(!InMemoryGraph::vector_sidecar_flush_due(
+            last,
+            backstop - 1,
+            base + Duration::from_secs(29),
+            interval,
+            backstop
+        ));
+
+        // Time interval reached → due even with only one batch since.
+        assert!(InMemoryGraph::vector_sidecar_flush_due(
+            last,
+            1,
+            base + Duration::from_secs(30),
+            interval,
+            backstop
+        ));
+
+        // Batch backstop reached → due even well within the time interval.
+        assert!(InMemoryGraph::vector_sidecar_flush_due(
+            last,
+            backstop,
+            base + Duration::from_secs(1),
+            interval,
+            backstop
+        ));
+    }
+
+    /// The stateful throttle: the first in-run flush lands the sidecar, immediate
+    /// follow-ups within the window are throttled, and a drain-time reset re-arms
+    /// the next run's first flush.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn should_flush_vector_sidecar_lands_first_then_throttles_until_reset() {
+        let graph = InMemoryGraph::new();
+        // First in-run flush lands immediately (persisted tracks compute from the
+        // first batch).
+        assert!(graph.should_flush_vector_sidecar_now());
+        // Immediate follow-ups are throttled (< interval and < batch backstop).
+        assert!(!graph.should_flush_vector_sidecar_now());
+        assert!(!graph.should_flush_vector_sidecar_now());
+        // A drain-time reset re-arms the first flush of the next run.
+        graph.reset_vector_sidecar_flush_throttle();
+        assert!(graph.should_flush_vector_sidecar_now());
+    }
 
     #[test]
     #[cfg(all(feature = "embeddings", feature = "vector"))]
