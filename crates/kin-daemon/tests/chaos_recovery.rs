@@ -179,6 +179,7 @@ async fn create_branch(repo_root: &Path, port: u16, name: &str) {
     let url = format!("http://127.0.0.1:{port}/graph/branches");
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut backoff = Duration::from_millis(50);
+    let genesis = kin_core::build_genesis_change().id.to_string();
 
     loop {
         // Re-read on every attempt rather than once before the loop: this
@@ -192,7 +193,10 @@ async fn create_branch(repo_root: &Path, port: u16, name: &str) {
             .filter(|token| !token.is_empty());
         let mut request = client.post(&url).json(&serde_json::json!({
             "name": name,
-            "head": "0000000000000000000000000000000000000000000000000000000000000001"
+            // Branch endpoints now fail closed on missing/rootless history.
+            // Use the canonical initialized head instead of the old arbitrary
+            // sentinel so this chaos test dirties valid graph state.
+            "head": &genesis,
         }));
         if let Some(token) = token {
             request = request.bearer_auth(token);
