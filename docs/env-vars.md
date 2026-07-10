@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (401 total, 299 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (403 total, 301 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -362,6 +362,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_POST_TEST_PENALTY` | float>=0 | 0.35 | correctness | locate tuning knob: post test penalty |
 | `KIN_LOCATE_POST_TEST_QUERY_PENALTY` | float>=0 | 1.0 | correctness | locate tuning knob: post test query penalty |
 | `KIN_LOCATE_PRECOMP_READMIT_PCT` | float>=0 | 0.3 | correctness | locate tuning knob: precomp readmit pct |
+| `KIN_LOCATE_PRESERVE_QUERY_IDENTIFIERS` | bool | false | correctness | locate tuning knob: preserve query identifiers |
 | `KIN_LOCATE_PRIORITY_COMMON_FRAC` | float>=0 | 0.02 | correctness | locate tuning knob: priority common frac |
 | `KIN_LOCATE_PRIORITY_CONTRIB_PATH_PENALTY` | float>=0 | 0.65 | correctness | locate tuning knob: priority contrib path penalty |
 | `KIN_LOCATE_PRIORITY_FRAMEWORK_NOISE_PENALTY` | float>=0 | 0.6 | correctness | locate tuning knob: priority framework noise penalty |
@@ -380,6 +381,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_PRIVATE_ACCESS_TEST_TERM_BONUS` | float>=0 | 18.0 | correctness | locate tuning knob: private access test term bonus |
 | `KIN_LOCATE_PROFILE` | enum | *(unset)* | correctness | locate capability profile; unset auto-detects from cores/RAM |
 | `KIN_LOCATE_PUBLIC_API_IMPL_PENALTY` | float>=0 | 0.3 | correctness | locate tuning knob: public api impl penalty |
+| `KIN_LOCATE_QUERY_IDENTIFIER_LIMIT` | usize | 10 | correctness | locate tuning knob: query identifier limit |
 | `KIN_LOCATE_QUERY_PRIORITY_RETAIN_LIMIT` | usize | 3 | correctness | locate tuning knob: query priority retain limit |
 | `KIN_LOCATE_QUERY_TEST_ARTIFACT_LIMIT` | usize | 3 | correctness | locate tuning knob: query test artifact limit |
 | `KIN_LOCATE_RERANK_BLEND` | bool | context-dependent | correctness | locate tuning knob: rerank blend |
