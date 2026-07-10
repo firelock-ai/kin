@@ -3040,6 +3040,9 @@ dependencies = [
 [[package]]
 name = "kin-buildinfo"
 version = "0.2.15"
+dependencies = [
+ "sha2 0.11.0",
+]
 
 [[package]]
 name = "kin-cli"
@@ -3057,6 +3060,7 @@ dependencies = [
  "directories 5.0.1",
  "ed25519-dalek",
  "flate2",
+ "fs2",
  "hex",
  "keyring",
  "kin-blobs",

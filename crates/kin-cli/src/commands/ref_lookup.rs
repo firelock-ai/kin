@@ -780,6 +780,56 @@ mod tests {
     }
 
     #[test]
+    fn lazy_git_ref_dangling_parent_refuses_before_store_or_graph_write() {
+        let repo = tempfile::tempdir().unwrap();
+        if git_ok(repo.path(), &["init", "-q"]).is_none() {
+            return;
+        }
+        assert!(git_ok(repo.path(), &["config", "user.email", "test@kin.dev"]).is_some());
+        assert!(git_ok(repo.path(), &["config", "user.name", "Kin Test"]).is_some());
+        std::fs::write(
+            repo.path().join("main.py"),
+            "def answer():\n    return 42\n",
+        )
+        .unwrap();
+        assert!(git_ok(repo.path(), &["add", "main.py"]).is_some());
+        assert!(git_ok(repo.path(), &["commit", "-q", "-m", "initial"]).is_some());
+        let git_oid = git_ok(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        let imported_id = kin_git::semantic_change_id_from_git_oid_hex(&git_oid).unwrap();
+        let layout = kin_core::init(repo.path()).unwrap().layout;
+        let graph = InMemoryGraph::new();
+        let dangling = SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0xee; 32]));
+
+        let error = hydrate_imported_git_ref_with(
+            &graph,
+            &layout,
+            &git_oid,
+            |imported, blob_store, kin_root| {
+                imported[0].change.parents = vec![dangling];
+                crate::commands::init::enrich_imported_changes_with_semantics_test_checkpoint(
+                    imported,
+                    blob_store,
+                    kin_root,
+                    "lazy-ref-clean-sha",
+                )
+                .map(|_| ())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("dangling parent")),
+            "lazy ref lost dangling-parent cause: {error:#}"
+        );
+        assert!(graph.get_change(&imported_id).unwrap().is_none());
+        assert!(
+            !layout.root().join("checkpoints/history-hydration").exists(),
+            "lazy parent preflight must precede checkpoint-store creation"
+        );
+    }
+
+    #[test]
     fn resolve_ref_accepts_imported_git_commit_sha() {
         let graph = InMemoryGraph::new();
         let layout = temp_layout();

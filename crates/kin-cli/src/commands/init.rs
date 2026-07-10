@@ -1277,6 +1277,41 @@ fn first_parent_topological_order(first_parent_index: &[Option<usize>]) -> Vec<u
     order
 }
 
+fn validate_imported_parent_closure(
+    imported: &[kin_git::ImportedChange],
+    genesis_id: SemanticChangeId,
+) -> Result<()> {
+    let mut imported_ids = HashSet::with_capacity(imported.len());
+    for imported_change in imported {
+        if !imported_ids.insert(imported_change.change.id) {
+            return Err(anyhow!(
+                "historical hydration invariant violated: duplicate imported change {}",
+                imported_change.change.id
+            ));
+        }
+    }
+    for imported_change in imported {
+        if imported_change.change.parents.is_empty() {
+            return Err(anyhow!(
+                "historical hydration invariant violated: imported change {} has no parent; Git roots must reference canonical genesis {}",
+                imported_change.change.id,
+                genesis_id
+            ));
+        }
+        for parent in &imported_change.change.parents {
+            if *parent != genesis_id && !imported_ids.contains(parent) {
+                return Err(anyhow!(
+                    "historical hydration invariant violated: imported change {} has dangling parent {} (expected imported history or canonical genesis {})",
+                    imported_change.change.id,
+                    parent,
+                    genesis_id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn take_imported_parent_baseline(
     snapshots: &mut HashMap<SemanticChangeId, ImportedCommitSemanticState>,
     parent_id: SemanticChangeId,
@@ -1343,6 +1378,18 @@ pub(crate) fn enrich_imported_changes_with_semantics(
     blob_store: &kin_blobs::BlobStore,
 ) -> Result<()> {
     enrich_imported_changes_with_semantics_inner(imported, blob_store, true).map(|_| ())
+}
+
+#[cfg(test)]
+fn enrich_imported_changes_with_semantics_and_genesis(
+    imported: &mut [kin_git::ImportedChange],
+    blob_store: &kin_blobs::BlobStore,
+    genesis_id: SemanticChangeId,
+) -> Result<()> {
+    enrich_imported_changes_with_semantics_with_checkpoints_and_genesis(
+        imported, blob_store, true, None, genesis_id,
+    )
+    .map(|_| ())
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1433,6 +1480,22 @@ fn enrich_imported_changes_with_semantics_with_checkpoints(
     parse_memo_enabled: bool,
     checkpoint_config: Option<HydrationCheckpointConfig>,
 ) -> Result<HydrationReplayStats> {
+    enrich_imported_changes_with_semantics_with_checkpoints_and_genesis(
+        imported,
+        blob_store,
+        parse_memo_enabled,
+        checkpoint_config,
+        kin_core::build_genesis_change().id,
+    )
+}
+
+fn enrich_imported_changes_with_semantics_with_checkpoints_and_genesis(
+    imported: &mut [kin_git::ImportedChange],
+    blob_store: &kin_blobs::BlobStore,
+    parse_memo_enabled: bool,
+    checkpoint_config: Option<HydrationCheckpointConfig>,
+    genesis_id: SemanticChangeId,
+) -> Result<HydrationReplayStats> {
     // Profiling timers (accumulated across every commit in the pass).
     let mut total_blob_read_time = std::time::Duration::ZERO;
     let mut total_parsing_time = std::time::Duration::ZERO;
@@ -1449,6 +1512,12 @@ fn enrich_imported_changes_with_semantics_with_checkpoints(
     let total_commits = imported.len();
     let start_time = std::time::Instant::now();
 
+    // kin-git closes every truncation-horizon edge onto the import's genesis.
+    // Validate that contract before acquiring the checkpoint-store lock, reading
+    // blobs, or mutating deltas so corruption can never be mistaken for a root
+    // baseline or leave a partial side effect.
+    validate_imported_parent_closure(imported, genesis_id)?;
+
     // Resolve each imported commit's FIRST git parent to an in-set slice index.
     // kin-git derives a commit's artifact deltas by diffing its tree against its
     // first parent's tree, so the first parent's semantic state is the correct
@@ -1464,11 +1533,13 @@ fn enrich_imported_changes_with_semantics_with_checkpoints(
     let first_parent_index: Vec<Option<usize>> = imported
         .iter()
         .map(|imported_change| {
-            imported_change
-                .change
-                .parents
-                .first()
-                .and_then(|parent| index_by_change_id.get(parent).copied())
+            imported_change.change.parents.first().and_then(|parent| {
+                (*parent != genesis_id).then(|| {
+                    *index_by_change_id
+                        .get(parent)
+                        .expect("validated imported first parent must be present")
+                })
+            })
         })
         .collect();
 
@@ -4674,7 +4745,7 @@ mod tests {
         let mut imported = vec![
             imported_change(
                 [0x11; 32],
-                [0x10; 32],
+                [0; 32],
                 "imported root",
                 vec![artifact_delta(
                     "src/lib.py",
@@ -4796,7 +4867,7 @@ mod tests {
             vec![
                 imported_change(
                     [0x31; 32],
-                    [0x30; 32],
+                    [0; 32],
                     "add module",
                     vec![artifact_delta(
                         "src/mod.py",
@@ -4927,7 +4998,7 @@ mod tests {
             vec![
                 imported_change(
                     [0x41; 32],
-                    [0x40; 32],
+                    [0; 32],
                     "seed the tree",
                     vec![
                         artifact_delta(
@@ -5170,7 +5241,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let mut imported = vec![
             imported_change(
                 [0x21; 32],
-                [0x20; 32],
+                [0; 32],
                 "imported root",
                 vec![artifact_delta(
                     "command/pr_checkout.go",
@@ -5230,7 +5301,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let mut imported = vec![
             imported_change(
                 [0x21; 32],
-                [0x20; 32],
+                [0; 32],
                 "imported root",
                 vec![
                     artifact_delta(
@@ -5313,7 +5384,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let mut imported = vec![
             imported_change(
                 [0x31; 32],
-                [0x30; 32],
+                [0; 32],
                 "imported root",
                 vec![
                     artifact_delta(
@@ -5370,7 +5441,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let mut imported = vec![
             imported_change(
                 [0x41; 32],
-                [0x40; 32],
+                [0; 32],
                 "imported root",
                 vec![artifact_delta(
                     "src/lib.py",
@@ -5428,7 +5499,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let mut imported = vec![
             imported_change(
                 [0x51; 32],
-                [0x50; 32],
+                [0; 32],
                 "root: add f",
                 vec![artifact_delta(
                     "src/lib.py",
@@ -5669,7 +5740,8 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         )
         .unwrap()
         .expect("a truncated window must yield a base-link change");
-        enrich_imported_changes_with_semantics(&mut anchored, &blob_store).unwrap();
+        enrich_imported_changes_with_semantics_and_genesis(&mut anchored, &blob_store, genesis_id)
+            .unwrap();
 
         // The base-link root change itself must carry the inbound handler→foo
         // edge, resolved against the FULL base universe.
@@ -5721,7 +5793,8 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             Some(&blob_store),
         )
         .unwrap();
-        enrich_imported_changes_with_semantics(&mut control, &blob_store).unwrap();
+        enrich_imported_changes_with_semantics_and_genesis(&mut control, &blob_store, genesis_id)
+            .unwrap();
         let control_head = control.last().unwrap().change.id;
         assert!(
             !replayed_edge_present(&control, control_head, "handler", "foo"),
@@ -5815,7 +5888,8 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         )
         .unwrap()
         .expect("a truncated window must yield a base-link change");
-        enrich_imported_changes_with_semantics(&mut anchored, &blob_store).unwrap();
+        enrich_imported_changes_with_semantics_and_genesis(&mut anchored, &blob_store, genesis_id)
+            .unwrap();
 
         // The base-link carries the bare-name receiver-method edge...
         assert!(
@@ -5843,7 +5917,8 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             Some(&blob_store),
         )
         .unwrap();
-        enrich_imported_changes_with_semantics(&mut control, &blob_store).unwrap();
+        enrich_imported_changes_with_semantics_and_genesis(&mut control, &blob_store, genesis_id)
+            .unwrap();
         let control_head = control.last().unwrap().change.id;
         assert!(
             !replayed_edge_present(&control, control_head, "run", "Widget::work"),
@@ -5935,7 +6010,12 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 Some(&blob_store),
             )
             .unwrap();
-            enrich_imported_changes_with_semantics(&mut imported, &blob_store).unwrap();
+            enrich_imported_changes_with_semantics_and_genesis(
+                &mut imported,
+                &blob_store,
+                genesis_id,
+            )
+            .unwrap();
             imported.into_iter().map(|ic| ic.change).collect()
         };
 
@@ -6093,9 +6173,11 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         kin_git::ImportedChange {
             change: SemanticChange {
                 id: SemanticChangeId::from_hash(Hash256::from_bytes(id_bytes)),
-                parents: vec![SemanticChangeId::from_hash(Hash256::from_bytes(
-                    parent_bytes,
-                ))],
+                parents: vec![if parent_bytes == [0; 32] {
+                    kin_core::build_genesis_change().id
+                } else {
+                    SemanticChangeId::from_hash(Hash256::from_bytes(parent_bytes))
+                }],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: message.to_string(),
@@ -6128,7 +6210,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         vec![
             imported_change(
                 [0x71; 32],
-                [0x70; 32],
+                [0; 32],
                 history_checkpoint::BASE_LINK_MESSAGE,
                 vec![artifact_delta(
                     "util.py",
@@ -6171,6 +6253,40 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 )],
             ),
         ]
+    }
+
+    fn linear_checkpoint_fixture(
+        blob_store: &kin_blobs::BlobStore,
+        count: usize,
+    ) -> Vec<kin_git::ImportedChange> {
+        assert!((1..=200).contains(&count));
+        let source = blob_store
+            .write(b"def checkpoint_scale_fixture():\n    return 1\n")
+            .unwrap();
+        (1..=count)
+            .map(|position| {
+                let deltas = if position == 1 {
+                    vec![artifact_delta(
+                        "scale.py",
+                        kin_model::ArtifactDeltaKind::Added,
+                        None,
+                        Some(Hash256::from_bytes(source.0)),
+                    )]
+                } else {
+                    Vec::new()
+                };
+                imported_change(
+                    [position as u8; 32],
+                    if position == 1 {
+                        [0; 32]
+                    } else {
+                        [(position - 1) as u8; 32]
+                    },
+                    &format!("scale commit {position}"),
+                    deltas,
+                )
+            })
+            .collect()
     }
 
     fn assert_same_hydration_deltas(
@@ -6222,6 +6338,126 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 )
             })
             .collect()
+    }
+
+    const CHECKPOINT_WORKER_ROOT: &str = "KIN_TEST_CHECKPOINT_WORKER_ROOT";
+    const CHECKPOINT_WORKER_BLOBS: &str = "KIN_TEST_CHECKPOINT_WORKER_BLOBS";
+    const CHECKPOINT_WORKER_VARIANT: &str = "KIN_TEST_CHECKPOINT_WORKER_VARIANT";
+
+    fn checkpoint_worker_command(
+        root: &Path,
+        blobs: &Path,
+        variant: &str,
+    ) -> std::process::Command {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "commands::init::tests::checkpoint_subprocess_worker",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHECKPOINT_WORKER_ROOT, root)
+            .env(CHECKPOINT_WORKER_BLOBS, blobs)
+            .env(CHECKPOINT_WORKER_VARIANT, variant);
+        command
+    }
+
+    fn assert_checkpoint_worker(output: std::process::Output) {
+        assert!(
+            output.status.success(),
+            "checkpoint subprocess failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn checkpoint_subprocess_worker() {
+        let Ok(root) = std::env::var(CHECKPOINT_WORKER_ROOT) else {
+            return;
+        };
+        let blobs = PathBuf::from(std::env::var(CHECKPOINT_WORKER_BLOBS).unwrap());
+        let variant = std::env::var(CHECKPOINT_WORKER_VARIANT).unwrap();
+        let blob_store = kin_blobs::BlobStore::new(blobs).unwrap();
+        let mut history = checkpoint_fixture(&blob_store);
+        if variant == "linear" {
+            history.truncate(2);
+        } else {
+            assert_eq!(variant, "branched");
+        }
+        let config = HydrationCheckpointConfig::clean_for_test(
+            Path::new(&root),
+            "subprocess-clean-sha",
+            1,
+            16 * 1024 * 1024,
+        );
+        enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut history,
+            &blob_store,
+            true,
+            Some(config),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn checkpoint_bytes_are_identical_across_real_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_a = dir.path().join("kin-a");
+        let root_b = dir.path().join("kin-b");
+        assert_checkpoint_worker(
+            checkpoint_worker_command(&root_a, &dir.path().join("blobs-a"), "branched")
+                .output()
+                .unwrap(),
+        );
+        assert_checkpoint_worker(
+            checkpoint_worker_command(&root_b, &dir.path().join("blobs-b"), "branched")
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(
+            checkpoint_file_map(&root_a),
+            checkpoint_file_map(&root_b),
+            "separate OS processes emitted different canonical checkpoint bytes"
+        );
+    }
+
+    #[test]
+    fn concurrent_processes_publish_without_dangling_checkpoint_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("shared-kin");
+        let linear = checkpoint_worker_command(&root, &dir.path().join("linear-blobs"), "linear")
+            .spawn()
+            .unwrap();
+        let branched =
+            checkpoint_worker_command(&root, &dir.path().join("branched-blobs"), "branched")
+                .spawn()
+                .unwrap();
+        assert_checkpoint_worker(linear.wait_with_output().unwrap());
+        assert_checkpoint_worker(branched.wait_with_output().unwrap());
+
+        let config = HydrationCheckpointConfig::clean_for_test(
+            &root,
+            "subprocess-clean-sha",
+            1,
+            16 * 1024 * 1024,
+        );
+        history_checkpoint::validate_store_for_test(&config).unwrap();
+
+        // A fresh consumer can also restore and complete from the concurrently
+        // published store, establishing that manifests are operational rather
+        // than merely parseable.
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("verify-blobs")).unwrap();
+        let mut history = checkpoint_fixture(&blob_store);
+        let stats = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut history,
+            &blob_store,
+            true,
+            Some(config),
+        )
+        .unwrap();
+        assert!(stats.resumed_from > 0);
     }
 
     #[test]
@@ -6319,6 +6555,44 @@ func prCheckout(cmd *cobra.Command, args []string) error {
     }
 
     #[test]
+    fn checkpoint_falls_back_when_new_side_branch_needs_an_older_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let root = dir.path().join("kin");
+        let config =
+            HydrationCheckpointConfig::clean_for_test(&root, "clean-sha", 1, 16 * 1024 * 1024);
+
+        // First history is linear A -> B. Its final B checkpoint retains B, not
+        // A, because no future branch is known yet.
+        let mut linear = checkpoint_fixture(&blob_store);
+        linear.truncate(2);
+        let seeded = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut linear,
+            &blob_store,
+            true,
+            Some(config.clone()),
+        )
+        .unwrap();
+        assert_eq!(seeded.resumed_from, 0);
+
+        // The complete fixture preserves exact prefix A,B but adds C from A.
+        // B's valid frontier is now inapplicable; A is the newest applicable
+        // checkpoint and must be selected instead of refusing the store.
+        let mut oracle = checkpoint_fixture(&blob_store);
+        enrich_imported_changes_with_semantics_inner(&mut oracle, &blob_store, true).unwrap();
+        let mut branched = checkpoint_fixture(&blob_store);
+        let resumed = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut branched,
+            &blob_store,
+            true,
+            Some(config),
+        )
+        .unwrap();
+        assert_eq!(resumed.resumed_from, 1);
+        assert_same_hydration_deltas(&oracle, &branched);
+    }
+
+    #[test]
     fn checkpoint_build_identity_is_strict_and_dirty_or_unknown_builds_do_full_replay() {
         let dir = tempfile::tempdir().unwrap();
         let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
@@ -6356,13 +6630,33 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         assert!(error
             .to_string()
             .contains("clean build/version key mismatch"));
+        let dependency_b = HydrationCheckpointConfig::clean_for_test(
+            &clean_root,
+            "clean-sha-a",
+            1,
+            16 * 1024 * 1024,
+        )
+        .with_dependency_provenance_for_test("different-lock-provenance");
+        let dependency_error = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut checkpoint_fixture(&blob_store),
+            &blob_store,
+            true,
+            Some(dependency_b),
+        )
+        .unwrap_err();
+        assert!(dependency_error
+            .to_string()
+            .contains("clean build/version key mismatch"));
+        let seeded_files = checkpoint_file_map(&clean_root);
 
         for (name, reason) in [
             ("dirty", "dirty build is ambiguous"),
             ("unknown", "unknown build SHA"),
         ] {
-            let root = dir.path().join(name);
-            let config = HydrationCheckpointConfig::disabled_for_test(&root, reason);
+            let config = HydrationCheckpointConfig::disabled_for_test(
+                &clean_root,
+                &format!("{name}: {reason}"),
+            );
             let mut replayed = checkpoint_fixture(&blob_store);
             let stats = enrich_imported_changes_with_semantics_with_checkpoints(
                 &mut replayed,
@@ -6373,7 +6667,11 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             .unwrap();
             assert_eq!(stats.resumed_from, 0);
             assert_eq!(stats.checkpoint_io.serialized_units, 0);
-            assert!(!root.join("checkpoints/history-hydration").exists());
+            assert_eq!(
+                checkpoint_file_map(&clean_root),
+                seeded_files,
+                "{name} build must neither reuse nor mutate a seeded store"
+            );
             assert_same_hydration_deltas(&oracle, &replayed);
         }
     }
@@ -6429,6 +6727,11 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let mut oracle = checkpoint_fixture(&blob_store);
         enrich_imported_changes_with_semantics_inner(&mut oracle, &blob_store, true).unwrap();
         let root = dir.path().join("capped");
+        let stale_temp = root
+            .join("checkpoints/history-hydration/objects/segments")
+            .join(".orphan.json.tmp.999999");
+        fs::create_dir_all(stale_temp.parent().unwrap()).unwrap();
+        fs::write(&stale_temp, vec![0x55; 8 * 1024]).unwrap();
         let config = HydrationCheckpointConfig::clean_for_test(&root, "clean-sha", 1, 1);
         let mut replayed = checkpoint_fixture(&blob_store);
         let stats = enrich_imported_changes_with_semantics_with_checkpoints(
@@ -6440,6 +6743,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         .unwrap();
         assert!(stats.checkpoint_io.retained_bytes <= 1);
         assert_eq!(stats.checkpoint_io.serialized_units, 4);
+        assert!(!stale_temp.exists(), "stale crash temp was not reaped");
         let retained: u64 = recursive_checkpoint_files(&root)
             .iter()
             .map(|path| fs::metadata(path).unwrap().len())
@@ -6511,6 +6815,45 @@ func prCheckout(cmd *cobra.Command, args []string) error {
     }
 
     #[test]
+    fn checkpoint_retained_byte_reconciliation_is_linear_not_per_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let run = |count: usize, name: &str| {
+            let root = dir.path().join(name);
+            let config = HydrationCheckpointConfig::clean_for_test(
+                &root,
+                "scale-clean-sha",
+                1,
+                64 * 1024 * 1024,
+            );
+            let mut history = linear_checkpoint_fixture(&blob_store, count);
+            enrich_imported_changes_with_semantics_with_checkpoints(
+                &mut history,
+                &blob_store,
+                true,
+                Some(config),
+            )
+            .unwrap()
+            .checkpoint_io
+        };
+
+        let small = run(8, "small");
+        let large = run(16, "large");
+        assert_eq!(small.retention_full_scans, 2);
+        assert_eq!(large.retention_full_scans, 2);
+        assert!(
+            large.retention_entries_scanned
+                <= small
+                    .retention_entries_scanned
+                    .saturating_mul(3)
+                    .saturating_add(32),
+            "retention reconciliation grew superlinearly: small={} large={}",
+            small.retention_entries_scanned,
+            large.retention_entries_scanned
+        );
+    }
+
+    #[test]
     fn missing_first_parent_snapshot_is_an_invariant_error() {
         let parent = SemanticChangeId::from_hash(Hash256::from_bytes([0x44; 32]));
         let mut snapshots = HashMap::new();
@@ -6522,6 +6865,35 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 .to_string()
                 .contains("missing retained first-parent state"));
         }
+    }
+
+    #[test]
+    fn dangling_imported_parent_refuses_before_checkpoint_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let root = dir.path().join("kin");
+        let config =
+            HydrationCheckpointConfig::clean_for_test(&root, "clean-sha", 1, 16 * 1024 * 1024);
+        let mut imported = checkpoint_fixture(&blob_store);
+        let dangling = SemanticChangeId::from_hash(Hash256::from_bytes([0xee; 32]));
+        imported[0].change.parents = vec![dangling];
+
+        let error = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut imported,
+            &blob_store,
+            true,
+            Some(config),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("dangling parent"), "{error:#}");
+        assert!(imported
+            .iter()
+            .all(|entry| entry.change.entity_deltas.is_empty()
+                && entry.change.relation_deltas.is_empty()));
+        assert!(
+            !root.join("checkpoints/history-hydration").exists(),
+            "parent preflight must run before lock/store creation"
+        );
     }
 
     fn entity_by_name(graph: &kin_db::InMemoryGraph, file: &str, name: &str) -> Entity {

@@ -13,27 +13,31 @@
 
 use super::{insert_relation_indexes, ImportedCommitSemanticState, ImportedSemanticFileState};
 use anyhow::{anyhow, Context, Result};
+use fs2::FileExt;
 use kin_model::SemanticChangeId;
 use kin_model::{ArtifactId, EntityDelta, EntityId, Relation, RelationDelta, RelationId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-const MANIFEST_SCHEMA: &str = "kin.history-hydration.manifest.v2";
-const SEGMENT_SCHEMA: &str = "kin.history-hydration.delta-segment.v2";
-const PARSER_FRONTIER_SCHEMA: &str = "kin.history-hydration.parser-frontier.v2";
-const LINKER_FRONTIER_SCHEMA: &str = "kin.history-hydration.linker-frontier.v2";
-const FORMAT_VERSION: u32 = 2;
+const MANIFEST_SCHEMA: &str = "kin.history-hydration.manifest.v3";
+const SEGMENT_SCHEMA: &str = "kin.history-hydration.delta-segment.v3";
+const PARSER_FRONTIER_SCHEMA: &str = "kin.history-hydration.parser-frontier.v3";
+const LINKER_FRONTIER_SCHEMA: &str = "kin.history-hydration.linker-frontier.v3";
+const FORMAT_VERSION: u32 = 3;
 /// Bump for a replay semantic change even when the artifact shapes are stable.
-const HYDRATION_SEMANTICS_VERSION: u32 = 2;
+const HYDRATION_SEMANTICS_VERSION: u32 = 3;
 const DEFAULT_INTERVAL: usize = 2_000;
 const DEFAULT_MANIFESTS_PER_HISTORY: usize = 6;
 const DEFAULT_HISTORY_LIMIT: usize = 2;
 const DEFAULT_BYTE_CAP: u64 = 2 * 1024 * 1024 * 1024;
+const STORE_LOCK_FILE: &str = ".store.lock";
+static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
 pub(super) const BASE_LINK_MESSAGE: &str = "kin import: base-link (window base universe)";
 
@@ -41,6 +45,7 @@ pub(super) const BASE_LINK_MESSAGE: &str = "kin import: base-link (window base u
 #[serde(deny_unknown_fields)]
 struct CheckpointVersionKeyV2 {
     clean_git_sha: String,
+    dependency_provenance: String,
     graph_snapshot_version: u32,
     parser_semantics_version: u32,
     hydration_semantics_version: u32,
@@ -50,9 +55,13 @@ struct CheckpointVersionKeyV2 {
 }
 
 impl CheckpointVersionKeyV2 {
-    fn for_clean_sha(clean_git_sha: impl Into<String>) -> Self {
+    fn for_clean_source(
+        clean_git_sha: impl Into<String>,
+        dependency_provenance: impl Into<String>,
+    ) -> Self {
         Self {
             clean_git_sha: clean_git_sha.into(),
+            dependency_provenance: dependency_provenance.into(),
             graph_snapshot_version: kin_db::GraphSnapshot::CURRENT_VERSION,
             parser_semantics_version: kin_parser::PARSER_SEMANTICS_VERSION,
             hydration_semantics_version: HYDRATION_SEMANTICS_VERSION,
@@ -82,7 +91,12 @@ pub(super) struct HydrationCheckpointConfig {
 impl HydrationCheckpointConfig {
     pub(super) fn production(kin_root: &Path) -> Self {
         let build = kin_buildinfo::get();
-        let build_policy = checkpoint_build_policy(build.sha, build.dirty);
+        let build_policy = checkpoint_build_policy(
+            build.sha,
+            build.dirty,
+            build.source_known,
+            build.dependency_provenance,
+        );
         Self {
             kin_root: kin_root.to_path_buf(),
             interval: DEFAULT_INTERVAL,
@@ -106,8 +120,9 @@ impl HydrationCheckpointConfig {
             manifests_per_history: DEFAULT_MANIFESTS_PER_HISTORY,
             history_limit: DEFAULT_HISTORY_LIMIT,
             byte_cap,
-            build_policy: CheckpointBuildPolicy::Enabled(CheckpointVersionKeyV2::for_clean_sha(
+            build_policy: CheckpointBuildPolicy::Enabled(CheckpointVersionKeyV2::for_clean_source(
                 clean_git_sha,
+                "test-cargo-lock-provenance",
             )),
         }
     }
@@ -134,9 +149,31 @@ impl HydrationCheckpointConfig {
         self.history_limit = history_limit.max(1);
         self
     }
+
+    #[cfg(test)]
+    pub(super) fn with_dependency_provenance_for_test(mut self, provenance: &str) -> Self {
+        if let CheckpointBuildPolicy::Enabled(version) = &mut self.build_policy {
+            version.dependency_provenance = provenance.to_string();
+        }
+        self
+    }
 }
 
-fn checkpoint_build_policy(embedded_sha: &str, embedded_dirty: bool) -> CheckpointBuildPolicy {
+fn checkpoint_build_policy(
+    embedded_sha: &str,
+    embedded_dirty: bool,
+    source_known: bool,
+    dependency_provenance: &str,
+) -> CheckpointBuildPolicy {
+    if !source_known
+        || dependency_provenance.trim().is_empty()
+        || dependency_provenance == "unknown"
+    {
+        return CheckpointBuildPolicy::Disabled(
+            "checkpoint reuse/write disabled: kin build source or dependency provenance is unknown; performing a full semantic replay"
+                .to_string(),
+        );
+    }
     if embedded_dirty {
         return CheckpointBuildPolicy::Disabled(format!(
             "checkpoint reuse/write disabled: kin build {embedded_sha} is dirty; performing a full semantic replay"
@@ -148,7 +185,10 @@ fn checkpoint_build_policy(embedded_sha: &str, embedded_dirty: bool) -> Checkpoi
                 .to_string(),
         );
     }
-    CheckpointBuildPolicy::Enabled(CheckpointVersionKeyV2::for_clean_sha(embedded_sha))
+    CheckpointBuildPolicy::Enabled(CheckpointVersionKeyV2::for_clean_source(
+        embedded_sha,
+        dependency_provenance,
+    ))
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -162,6 +202,11 @@ pub(super) struct CheckpointIoStats {
     pub(super) read_bytes: u64,
     pub(super) max_serialized_unit_bytes: u64,
     pub(super) retained_bytes: u64,
+    /// Entries visited by full retained-byte reconciliation scans. A healthy
+    /// session performs one at open and one at finalization, never one per
+    /// periodic boundary.
+    pub(super) retention_entries_scanned: usize,
+    pub(super) retention_full_scans: usize,
 }
 
 impl CheckpointIoStats {
@@ -623,6 +668,67 @@ fn histories_dir(config: &HydrationCheckpointConfig) -> PathBuf {
     checkpoint_root(config).join("histories")
 }
 
+/// Exclusive repository-scoped ownership of the checkpoint object store.
+///
+/// The daemon's hydration gate only serializes callers inside one process. A
+/// file lock is required because object publication and reachability GC form a
+/// single transaction: without it, one process can collect another process's
+/// pre-manifest frontier objects. The guard intentionally lives for the whole
+/// hydration session, so the immutable segment tail selected at prepare time
+/// cannot be pruned before its next boundary is published.
+struct CheckpointStoreLock {
+    file: File,
+}
+
+impl CheckpointStoreLock {
+    fn acquire(config: &HydrationCheckpointConfig) -> Result<Self> {
+        let root = checkpoint_root(config);
+        fs::create_dir_all(&root)
+            .with_context(|| format!("create checkpoint root {}", root.display()))?;
+        let lock_path = root.join(STORE_LOCK_FILE);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("open checkpoint lock {}", lock_path.display()))?;
+        file.lock_exclusive()
+            .with_context(|| format!("lock checkpoint store {}", root.display()))?;
+        cleanup_stale_checkpoint_temps(&root)?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for CheckpointStoreLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+fn cleanup_stale_checkpoint_temps(root: &Path) -> Result<()> {
+    fn walk(dir: &Path) -> Result<()> {
+        if !dir.exists() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                walk(&path)?;
+            } else if entry.file_type()?.is_file()
+                && entry.file_name().to_string_lossy().contains(".tmp.")
+            {
+                fs::remove_file(&path)
+                    .with_context(|| format!("remove stale checkpoint temp {}", path.display()))?;
+                sync_parent_directory(&path)?;
+            }
+        }
+        Ok(())
+    }
+    walk(root)
+}
+
 fn manifest_dir(config: &HydrationCheckpointConfig, history_digest: &str) -> PathBuf {
     histories_dir(config).join(history_digest).join("manifests")
 }
@@ -662,10 +768,8 @@ fn write_new_or_identical(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("artifact");
-    let temp = path.with_file_name(format!(".{file_name}.tmp.{}", std::process::id()));
-    if temp.exists() {
-        fs::remove_file(&temp)?;
-    }
+    let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+    let temp = path.with_file_name(format!(".{file_name}.tmp.{}.{}", std::process::id(), nonce));
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -706,6 +810,7 @@ fn write_new_or_identical(
     }
 }
 
+#[cfg(unix)]
 fn sync_parent_directory(path: &Path) -> Result<()> {
     let parent = path
         .parent()
@@ -713,6 +818,14 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
     fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
         .with_context(|| format!("sync checkpoint directory {}", parent.display()))
+}
+
+// Opening a directory as `std::fs::File` is not portable to Windows. File and
+// hard-link publication are still atomic there; skip the Unix directory-fsync
+// durability enhancement rather than making every checkpoint write fail.
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn write_content_addressed(
@@ -749,6 +862,40 @@ fn read_manifest(path: &Path, stats: &mut CheckpointIoStats) -> Result<ManifestP
     let bytes = fs::read(path)?;
     stats.record_read(bytes.len());
     decode_envelope(MANIFEST_SCHEMA, path, &bytes)
+}
+
+fn validate_published_boundary(
+    config: &HydrationCheckpointConfig,
+    manifest_path: &Path,
+    manifest_bytes: &[u8],
+    segment_digest: &str,
+    parser_frontier_digest: &str,
+    linker_frontier_digest: &str,
+    stats: &mut CheckpointIoStats,
+) -> Result<()> {
+    let installed_manifest = fs::read(manifest_path)
+        .with_context(|| format!("read published manifest {}", manifest_path.display()))?;
+    stats.record_read(installed_manifest.len());
+    if installed_manifest != manifest_bytes {
+        return Err(anyhow!(
+            "REFUSED hydration checkpoint {}: published manifest bytes changed before validation",
+            manifest_path.display()
+        ));
+    }
+
+    let (segment_path, segment_bytes) =
+        read_content_addressed(&segment_dir(config), segment_digest, stats)?;
+    let segment: DeltaSegmentPayloadV2 =
+        decode_envelope(SEGMENT_SCHEMA, &segment_path, &segment_bytes)?;
+    if let Some(previous) = segment.previous_segment_digest {
+        // Validate the immediate predecessor as well. The session-wide store
+        // lock guarantees earlier links in the already-validated chain cannot
+        // disappear while this process is active.
+        let _ = read_content_addressed(&segment_dir(config), &previous, stats)?;
+    }
+    let _ = read_content_addressed(&parser_frontier_dir(config), parser_frontier_digest, stats)?;
+    let _ = read_content_addressed(&linker_frontier_dir(config), linker_frontier_digest, stats)?;
+    Ok(())
 }
 
 fn list_files(dir: &Path, suffix: &str) -> Result<Vec<PathBuf>> {
@@ -809,11 +956,15 @@ fn validate_version(
 pub(super) struct HydrationCheckpointSession {
     config: HydrationCheckpointConfig,
     version_key: Option<CheckpointVersionKeyV2>,
+    // Kept alive for the full session; see CheckpointStoreLock's safety
+    // contract. Disabled/unknown builds never acquire it or touch the store.
+    _store_lock: Option<CheckpointStoreLock>,
     prefix_digests: Vec<String>,
     history_digest: String,
     last_boundary: usize,
     delta_tail_digest: Option<String>,
     io_stats: CheckpointIoStats,
+    retained_bytes: u64,
     disabled_after_cap: bool,
 }
 
@@ -837,14 +988,28 @@ impl HydrationCheckpointSession {
                 None
             }
         };
+        let store_lock = if version_key.is_some() {
+            Some(CheckpointStoreLock::acquire(&config)?)
+        } else {
+            None
+        };
+        let mut io_stats = CheckpointIoStats::default();
+        let retained_bytes = if store_lock.is_some() {
+            retained_bytes(&config, &mut io_stats)?
+        } else {
+            0
+        };
+        io_stats.retained_bytes = retained_bytes;
         let mut session = Self {
             config,
             version_key,
+            _store_lock: store_lock,
             prefix_digests,
             history_digest,
             last_boundary: 0,
             delta_tail_digest: None,
-            io_stats: CheckpointIoStats::default(),
+            io_stats,
+            retained_bytes,
             disabled_after_cap: false,
         };
         let resume = if session.version_key.is_some() {
@@ -886,7 +1051,7 @@ impl HydrationCheckpointSession {
             .version_key
             .as_ref()
             .expect("enabled session has version");
-        let mut nearest: Option<(PathBuf, ManifestPayloadV2)> = None;
+        let mut candidates = Vec::<(PathBuf, ManifestPayloadV2)>::new();
         for path in all_manifest_paths(&self.config)? {
             let manifest = read_manifest(&path, &mut self.io_stats)?;
             if manifest.format_version != FORMAT_VERSION {
@@ -909,58 +1074,60 @@ impl HydrationCheckpointSession {
                 ));
             }
             validate_version(&manifest.version_key, version, &path)?;
-
-            if let Some((existing_path, existing)) = &nearest {
-                if existing.processed_count == manifest.processed_count
-                    && (existing.delta_tail_digest != manifest.delta_tail_digest
-                        || existing.parser_frontier_digest != manifest.parser_frontier_digest
-                        || existing.linker_frontier_digest != manifest.linker_frontier_digest)
-                {
-                    return Err(anyhow!(
-                        "REFUSED hydration checkpoints {} and {}: same prefix boundary points to different artifacts",
-                        existing_path.display(),
-                        path.display()
-                    ));
-                }
-            }
-            if nearest
-                .as_ref()
-                .map(|(_, existing)| manifest.processed_count > existing.processed_count)
-                .unwrap_or(true)
-            {
-                nearest = Some((path, manifest));
-            }
+            // Two different complete histories may share this exact prefix but
+            // retain different live branch ancestors at the boundary. Their
+            // frontier object digests are therefore allowed to differ; candidate
+            // applicability below selects the one suitable for the current DAG.
+            // A deterministic destination within one history is still protected
+            // by write_new_or_identical.
+            candidates.push((path, manifest));
         }
-        let Some((manifest_path, manifest)) = nearest else {
-            return Ok(None);
-        };
+        candidates.sort_by(|left, right| {
+            right
+                .1
+                .processed_count
+                .cmp(&left.1.processed_count)
+                .then_with(|| left.0.cmp(&right.0))
+        });
 
-        self.restore_segments(&manifest, &manifest_path, imported, order)?;
-        let remaining_children = remaining_children_after_prefix(
-            initial_remaining_children,
-            first_parent_index,
-            order,
-            manifest.processed_count,
-        )?;
-        let expected_frontier: HashSet<_> = order[..manifest.processed_count]
-            .iter()
-            .copied()
-            .filter(|index| remaining_children[*index] > 0)
-            .map(|index| imported[index].change.id)
-            .collect();
-        let frontier = self.restore_frontier(&manifest, &expected_frontier)?;
-        self.delta_tail_digest = Some(manifest.delta_tail_digest.clone());
-        eprintln!(
-            "  Hydration Checkpoint: resumed {}/{} commits from {}",
-            manifest.processed_count,
-            imported.len(),
-            manifest_path.display()
-        );
-        Ok(Some(HydrationResumeState {
-            processed_count: manifest.processed_count,
-            remaining_children,
-            frontier,
-        }))
+        for (manifest_path, manifest) in candidates {
+            let remaining_children = remaining_children_after_prefix(
+                initial_remaining_children,
+                first_parent_index,
+                order,
+                manifest.processed_count,
+            )?;
+            let expected_frontier: HashSet<_> = order[..manifest.processed_count]
+                .iter()
+                .copied()
+                .filter(|index| remaining_children[*index] > 0)
+                .map(|index| imported[index].change.id)
+                .collect();
+            // A valid checkpoint produced before a new side branch existed may
+            // not retain the older ancestor that branch now needs. That makes
+            // this boundary inapplicable, not corrupt: try the next older exact
+            // prefix. Digest/schema/version/index failures still return Err.
+            let Some(frontier) = self.restore_frontier(&manifest, &expected_frontier)? else {
+                continue;
+            };
+            // Mutate imported deltas only after the candidate is known to be
+            // applicable, so an older fallback never observes a partially
+            // restored newer prefix.
+            self.restore_segments(&manifest, &manifest_path, imported, order)?;
+            self.delta_tail_digest = Some(manifest.delta_tail_digest.clone());
+            eprintln!(
+                "  Hydration Checkpoint: resumed {}/{} commits from {}",
+                manifest.processed_count,
+                imported.len(),
+                manifest_path.display()
+            );
+            return Ok(Some(HydrationResumeState {
+                processed_count: manifest.processed_count,
+                remaining_children,
+                frontier,
+            }));
+        }
+        Ok(None)
     }
 
     fn restore_segments(
@@ -1031,7 +1198,7 @@ impl HydrationCheckpointSession {
         &mut self,
         manifest: &ManifestPayloadV2,
         expected_frontier: &HashSet<SemanticChangeId>,
-    ) -> Result<HashMap<SemanticChangeId, ImportedCommitSemanticState>> {
+    ) -> Result<Option<HashMap<SemanticChangeId, ImportedCommitSemanticState>>> {
         let version = self
             .version_key
             .as_ref()
@@ -1094,13 +1261,15 @@ impl HydrationCheckpointSession {
             || linker_ids.len() != linker_frontier.states.len()
             || parser_ids != linker_ids
             || !parser_ids.contains(&manifest.boundary_change_id)
-            || !expected_frontier.is_subset(&parser_ids)
         {
             return Err(anyhow!(
                 "REFUSED hydration checkpoint frontiers {} and {}: incomplete, duplicate, or mismatched parser/linker states",
                 parser_path.display(),
                 linker_path.display()
             ));
+        }
+        if !expected_frontier.is_subset(&parser_ids) {
+            return Ok(None);
         }
 
         let mut linkers: HashMap<_, _> = linker_frontier
@@ -1124,7 +1293,7 @@ impl HydrationCheckpointSession {
                 .with_context(|| format!("restore frontier state {}", entry.change_id))?;
             restored.insert(entry.change_id, state);
         }
-        Ok(restored)
+        Ok(Some(restored))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1159,6 +1328,7 @@ impl HydrationCheckpointSession {
                 self.config.interval
             ));
         }
+        let written_bytes_before = self.io_stats.written_bytes;
 
         let completed = order[self.last_boundary..processed_count]
             .iter()
@@ -1259,8 +1429,8 @@ impl HydrationCheckpointSession {
             boundary_change_id,
             boundary,
             delta_tail_digest: segment_digest.clone(),
-            parser_frontier_digest,
-            linker_frontier_digest,
+            parser_frontier_digest: parser_frontier_digest.clone(),
+            linker_frontier_digest: linker_frontier_digest.clone(),
         };
         let manifest_bytes = encode_envelope(MANIFEST_SCHEMA, &manifest)?;
         self.io_stats.record_serialized(manifest_bytes.len());
@@ -1272,13 +1442,20 @@ impl HydrationCheckpointSession {
         );
         write_new_or_identical(&manifest_path, &manifest_bytes, &mut self.io_stats)?;
 
+        self.retained_bytes = self.retained_bytes.saturating_add(
+            self.io_stats
+                .written_bytes
+                .saturating_sub(written_bytes_before),
+        );
+
         self.last_boundary = processed_count;
-        self.delta_tail_digest = Some(segment_digest);
+        self.delta_tail_digest = Some(segment_digest.clone());
         let retention = enforce_retention(
             &self.config,
             &self.history_digest,
             processed_count == imported.len(),
             &mut self.io_stats,
+            &mut self.retained_bytes,
         )?;
         self.io_stats.retained_bytes = retention.total_bytes;
         if !retention.current_history_retained {
@@ -1288,6 +1465,15 @@ impl HydrationCheckpointSession {
                 self.config.byte_cap
             );
         } else {
+            validate_published_boundary(
+                &self.config,
+                &manifest_path,
+                &manifest_bytes,
+                &segment_digest,
+                &parser_frontier_digest,
+                &linker_frontier_digest,
+                &mut self.io_stats,
+            )?;
             eprintln!(
                 "  Hydration Checkpoint: boundary {}/{} retained={} bytes cap={} segment={}B parser_frontier={}B linker_frontier={}B max_unit={}B",
                 processed_count,
@@ -1352,6 +1538,7 @@ fn evenly_spaced_manifest_positions(
 fn prune_manifests_per_history(
     config: &HydrationCheckpointConfig,
     stats: &mut CheckpointIoStats,
+    retained_total: &mut u64,
 ) -> Result<()> {
     for history in list_directories(&histories_dir(config))? {
         let mut manifests = Vec::new();
@@ -1362,7 +1549,7 @@ fn prune_manifests_per_history(
         let keep = evenly_spaced_manifest_positions(&manifests, config.manifests_per_history);
         for (idx, (path, _)) in manifests.into_iter().enumerate() {
             if !keep.contains(&idx) {
-                fs::remove_file(path)?;
+                remove_file_counted(&path, retained_total)?;
             }
         }
     }
@@ -1373,6 +1560,7 @@ fn prune_history_identities(
     config: &HydrationCheckpointConfig,
     current_history_digest: &str,
     stats: &mut CheckpointIoStats,
+    retained_total: &mut u64,
 ) -> Result<bool> {
     let histories = list_directories(&histories_dir(config))?;
     if histories.len() <= config.history_limit {
@@ -1401,7 +1589,7 @@ fn prune_history_identities(
     });
     let mut removed = false;
     for (path, _, _) in ranked.into_iter().skip(config.history_limit) {
-        fs::remove_dir_all(path)?;
+        remove_dir_all_counted(&path, retained_total)?;
         removed = true;
     }
     Ok(removed)
@@ -1451,6 +1639,7 @@ fn referenced_segments(
 fn garbage_collect_frontiers(
     config: &HydrationCheckpointConfig,
     stats: &mut CheckpointIoStats,
+    retained_total: &mut u64,
 ) -> Result<()> {
     let (parser_frontiers, linker_frontiers) = referenced_frontiers(config, stats)?;
     for path in list_files(&parser_frontier_dir(config), ".json")? {
@@ -1459,7 +1648,7 @@ fn garbage_collect_frontiers(
             .and_then(|name| name.to_str())
             .unwrap_or_default();
         if !parser_frontiers.contains(digest) {
-            fs::remove_file(path)?;
+            remove_file_counted(&path, retained_total)?;
         }
     }
     for path in list_files(&linker_frontier_dir(config), ".json")? {
@@ -1468,7 +1657,7 @@ fn garbage_collect_frontiers(
             .and_then(|name| name.to_str())
             .unwrap_or_default();
         if !linker_frontiers.contains(digest) {
-            fs::remove_file(path)?;
+            remove_file_counted(&path, retained_total)?;
         }
     }
     Ok(())
@@ -1482,6 +1671,7 @@ fn garbage_collect_frontiers(
 fn garbage_collect_segments(
     config: &HydrationCheckpointConfig,
     stats: &mut CheckpointIoStats,
+    retained_total: &mut u64,
 ) -> Result<()> {
     let segments = referenced_segments(config, stats)?;
     for path in list_files(&segment_dir(config), ".json")? {
@@ -1490,29 +1680,68 @@ fn garbage_collect_segments(
             .and_then(|name| name.to_str())
             .unwrap_or_default();
         if !segments.contains(digest) {
-            fs::remove_file(path)?;
+            remove_file_counted(&path, retained_total)?;
         }
     }
     Ok(())
 }
 
-fn retained_bytes(config: &HydrationCheckpointConfig) -> Result<u64> {
-    fn sum_files(dir: &Path) -> Result<u64> {
+fn retained_bytes(
+    config: &HydrationCheckpointConfig,
+    stats: &mut CheckpointIoStats,
+) -> Result<u64> {
+    fn sum_files(dir: &Path, visited: &mut usize) -> Result<u64> {
         if !dir.exists() {
             return Ok(0);
         }
         let mut total = 0u64;
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
+            *visited = visited.saturating_add(1);
             if entry.file_type()?.is_dir() {
-                total = total.saturating_add(sum_files(&entry.path())?);
+                total = total.saturating_add(sum_files(&entry.path(), visited)?);
             } else if entry.file_type()?.is_file() {
                 total = total.saturating_add(entry.metadata()?.len());
             }
         }
         Ok(total)
     }
-    sum_files(&checkpoint_root(config))
+    stats.retention_full_scans = stats.retention_full_scans.saturating_add(1);
+    let mut visited = 0usize;
+    let total = sum_files(&checkpoint_root(config), &mut visited)?;
+    stats.retention_entries_scanned = stats.retention_entries_scanned.saturating_add(visited);
+    Ok(total)
+}
+
+fn path_file_bytes(path: &Path) -> Result<u64> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let metadata = fs::metadata(path)?;
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    let mut total = 0u64;
+    for entry in fs::read_dir(path)? {
+        total = total.saturating_add(path_file_bytes(&entry?.path())?);
+    }
+    Ok(total)
+}
+
+fn remove_file_counted(path: &Path, retained_total: &mut u64) -> Result<()> {
+    let bytes = fs::metadata(path)?.len();
+    fs::remove_file(path)?;
+    sync_parent_directory(path)?;
+    *retained_total = retained_total.saturating_sub(bytes);
+    Ok(())
+}
+
+fn remove_dir_all_counted(path: &Path, retained_total: &mut u64) -> Result<()> {
+    let bytes = path_file_bytes(path)?;
+    fs::remove_dir_all(path)?;
+    sync_parent_directory(path)?;
+    *retained_total = retained_total.saturating_sub(bytes);
+    Ok(())
 }
 
 fn enforce_retention(
@@ -1520,22 +1749,25 @@ fn enforce_retention(
     current_history_digest: &str,
     final_boundary: bool,
     stats: &mut CheckpointIoStats,
+    retained_total: &mut u64,
 ) -> Result<RetentionOutcome> {
-    prune_manifests_per_history(config, stats)?;
-    let removed_history = prune_history_identities(config, current_history_digest, stats)?;
-    garbage_collect_frontiers(config, stats)?;
+    prune_manifests_per_history(config, stats, retained_total)?;
+    let removed_history =
+        prune_history_identities(config, current_history_digest, stats, retained_total)?;
+    garbage_collect_frontiers(config, stats, retained_total)?;
     if final_boundary || removed_history {
-        garbage_collect_segments(config, stats)?;
+        garbage_collect_segments(config, stats, retained_total)?;
     }
-    let mut total = retained_bytes(config)?;
 
-    if total > config.byte_cap {
+    // Reconcile incremental accounting only at finalization or when the cap
+    // forces GC. Periodic boundaries stay O(1) in accumulated segment count.
+    let reconcile_after_gc = final_boundary || *retained_total > config.byte_cap;
+    if *retained_total > config.byte_cap {
         // An interrupted prior write may have left an unreferenced segment.
         // Collect those before discarding any still-usable history.
-        garbage_collect_segments(config, stats)?;
-        total = retained_bytes(config)?;
+        garbage_collect_segments(config, stats, retained_total)?;
     }
-    if total > config.byte_cap {
+    if *retained_total > config.byte_cap {
         let mut histories = list_directories(&histories_dir(config))?;
         histories.sort_by(|a, b| {
             let a_current = a.file_name().and_then(|n| n.to_str()) == Some(current_history_digest);
@@ -1543,20 +1775,75 @@ fn enforce_retention(
             a_current.cmp(&b_current).then_with(|| a.cmp(b))
         });
         for history in histories {
-            if total <= config.byte_cap {
+            if *retained_total <= config.byte_cap {
                 break;
             }
-            fs::remove_dir_all(&history)?;
-            garbage_collect_frontiers(config, stats)?;
-            garbage_collect_segments(config, stats)?;
-            total = retained_bytes(config)?;
+            remove_dir_all_counted(&history, retained_total)?;
+            garbage_collect_frontiers(config, stats, retained_total)?;
+            garbage_collect_segments(config, stats, retained_total)?;
+        }
+    }
+    if reconcile_after_gc {
+        let observed = retained_bytes(config, stats)?;
+        if observed != *retained_total {
+            return Err(anyhow!(
+                "REFUSED hydration checkpoint retention accounting drift after GC: tracked {} bytes, observed {} bytes",
+                *retained_total,
+                observed
+            ));
+        }
+        if observed > config.byte_cap {
+            return Err(anyhow!(
+                "REFUSED hydration checkpoint retention cap: retained {} bytes exceeds cap {}",
+                observed,
+                config.byte_cap
+            ));
         }
     }
     let current_retained = manifest_dir(config, current_history_digest).exists();
     Ok(RetentionOutcome {
-        total_bytes: total,
+        total_bytes: *retained_total,
         current_history_retained: current_retained,
     })
+}
+
+#[cfg(test)]
+pub(super) fn validate_store_for_test(config: &HydrationCheckpointConfig) -> Result<()> {
+    let _lock = CheckpointStoreLock::acquire(config)?;
+    let version = match &config.build_policy {
+        CheckpointBuildPolicy::Enabled(version) => version,
+        CheckpointBuildPolicy::Disabled(reason) => {
+            return Err(anyhow!("test checkpoint store is disabled: {reason}"));
+        }
+    };
+    let mut stats = CheckpointIoStats::default();
+    for path in all_manifest_paths(config)? {
+        let manifest = read_manifest(&path, &mut stats)?;
+        validate_version(&manifest.version_key, version, &path)?;
+        let (parser_path, parser_bytes) = read_content_addressed(
+            &parser_frontier_dir(config),
+            &manifest.parser_frontier_digest,
+            &mut stats,
+        )?;
+        let _: ParserFrontierPayloadV2 =
+            decode_envelope(PARSER_FRONTIER_SCHEMA, &parser_path, &parser_bytes)?;
+        let (linker_path, linker_bytes) = read_content_addressed(
+            &linker_frontier_dir(config),
+            &manifest.linker_frontier_digest,
+            &mut stats,
+        )?;
+        let _: LinkerFrontierPayloadV2 =
+            decode_envelope(LINKER_FRONTIER_SCHEMA, &linker_path, &linker_bytes)?;
+    }
+    let _ = referenced_segments(config, &mut stats)?;
+    let total = retained_bytes(config, &mut stats)?;
+    if total > config.byte_cap {
+        return Err(anyhow!(
+            "checkpoint test store retained {total} bytes above cap {}",
+            config.byte_cap
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1565,7 +1852,7 @@ mod tests {
 
     #[test]
     fn evenly_spaced_retention_keeps_base_latest_and_interior_quantiles() {
-        let version = CheckpointVersionKeyV2::for_clean_sha("abc123");
+        let version = CheckpointVersionKeyV2::for_clean_source("abc123", "lock-sha");
         let manifests: Vec<_> = (1..=10)
             .map(|position| {
                 (
@@ -1624,15 +1911,23 @@ mod tests {
     #[test]
     fn checkpoint_build_policy_refuses_dirty_or_unknown_source_identity() {
         assert!(matches!(
-            checkpoint_build_policy("abc123def456", false),
+            checkpoint_build_policy("abc123def456", false, true, "lock-sha"),
             CheckpointBuildPolicy::Enabled(_)
         ));
         assert!(matches!(
-            checkpoint_build_policy("abc123def456", true),
+            checkpoint_build_policy("abc123def456", true, true, "lock-sha"),
             CheckpointBuildPolicy::Disabled(_)
         ));
         assert!(matches!(
-            checkpoint_build_policy("unknown", false),
+            checkpoint_build_policy("unknown", false, true, "lock-sha"),
+            CheckpointBuildPolicy::Disabled(_)
+        ));
+        assert!(matches!(
+            checkpoint_build_policy("abc123def456", false, false, "lock-sha"),
+            CheckpointBuildPolicy::Disabled(_)
+        ));
+        assert!(matches!(
+            checkpoint_build_policy("abc123def456", false, true, "unknown"),
             CheckpointBuildPolicy::Disabled(_)
         ));
     }

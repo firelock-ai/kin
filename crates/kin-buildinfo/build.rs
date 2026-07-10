@@ -2,8 +2,11 @@
 // Copyright 2026 Firelock, LLC
 
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use sha2::{Digest, Sha256};
 
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -45,13 +48,24 @@ fn main() {
         }
     }
 
-    let sha = git(&root, &["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    let sha = git(&root, &["rev-parse", "HEAD"]);
     let branch = git(&root, &["branch", "--show-current"])
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "detached".into());
-    let dirty = git(&root, &["status", "--porcelain"])
+    // A clean status is valid empty output, so use the variant that preserves
+    // empty stdout. Any execution/status/UTF-8 failure is an unknown source
+    // identity and must fail closed for persisted semantic caches.
+    let status = git_allow_empty(&root, &["status", "--porcelain"]);
+    let dependency_provenance = dependency_provenance(&root);
+    let source_known = sha.is_some() && status.is_some() && dependency_provenance.is_some();
+    let sha = sha.unwrap_or_else(|| "unknown".into());
+    // Keep the legacy boolean conservative for every existing build-mismatch
+    // consumer. `KIN_BUILD_SOURCE_KNOWN` carries the non-lossy tri-state.
+    let dirty = status
+        .as_ref()
         .map(|value| !value.is_empty())
-        .unwrap_or(false);
+        .unwrap_or(true);
+    let dependency_provenance = dependency_provenance.unwrap_or_else(|| "unknown".to_string());
     let built_at = Command::new("date")
         .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
         .output()
@@ -70,12 +84,18 @@ fn main() {
 
     println!("cargo:rustc-env=KIN_BUILD_GIT_SHA={sha}");
     println!("cargo:rustc-env=KIN_BUILD_DIRTY={dirty}");
+    println!("cargo:rustc-env=KIN_BUILD_SOURCE_KNOWN={source_known}");
+    println!("cargo:rustc-env=KIN_BUILD_DEPENDENCY_PROVENANCE={dependency_provenance}");
     println!("cargo:rustc-env=KIN_BUILD_BRANCH={branch}");
     println!("cargo:rustc-env=KIN_BUILD_TIME={built_at}");
     println!("cargo:rustc-env=KIN_BUILD_VERSION={version}");
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Option<String> {
+    git_allow_empty(cwd, args).filter(|value| !value.is_empty())
+}
+
+fn git_allow_empty(cwd: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .args(args)
         .current_dir(cwd)
@@ -84,6 +104,23 @@ fn git(cwd: &Path, args: &[&str]) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!value.is_empty()).then_some(value)
+    let value = String::from_utf8(output.stdout).ok()?;
+    Some(value.trim().to_string())
+}
+
+fn dependency_provenance(root: &Path) -> Option<String> {
+    let lock_path = root.join("Cargo.lock");
+    println!("cargo:rerun-if-changed={}", lock_path.display());
+    let bytes = fs::read(lock_path).ok()?;
+    Some(hex_sha256(&bytes))
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut output, "{byte:02x}").expect("write to String cannot fail");
+    }
+    output
 }
