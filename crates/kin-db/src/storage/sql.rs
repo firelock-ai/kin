@@ -274,10 +274,16 @@ impl StorageBackend for SqliteBackend {
         since_gen: Generation,
     ) -> Result<Vec<(Vec<u8>, Generation)>, KinDbError> {
         let conn = self.conn.lock();
+        let since_sql_generation = match i64::try_from(since_gen) {
+            Ok(generation) => generation,
+            // No valid SQLite generation can exceed i64::MAX, but the query
+            // must still surface corrupt negative authorities below.
+            Err(_) => i64::MAX,
+        };
         let mut stmt = conn
             .prepare(
                 "SELECT data, generation FROM deltas \
-                 WHERE repo_id = ?1 AND generation > ?2 \
+                 WHERE repo_id = ?1 AND (generation < 0 OR generation > ?2) \
                  ORDER BY generation ASC",
             )
             .map_err(|e| {
@@ -285,10 +291,10 @@ impl StorageBackend for SqliteBackend {
             })?;
 
         let rows = stmt
-            .query_map(params![repo_id, since_gen as i64], |row| {
+            .query_map(params![repo_id, since_sql_generation], |row| {
                 let data: Vec<u8> = row.get(0)?;
                 let gen: i64 = row.get(1)?;
-                Ok((data, gen as Generation))
+                Ok((data, gen))
             })
             .map_err(|e| {
                 KinDbError::StorageError(format!(
@@ -298,9 +304,15 @@ impl StorageBackend for SqliteBackend {
 
         let mut result = Vec::new();
         for row in rows {
-            result.push(row.map_err(|e| {
+            let (data, generation) = row.map_err(|e| {
                 KinDbError::StorageError(format!("SQLite load_deltas_since row failed: {e}"))
-            })?);
+            })?;
+            let generation = Generation::try_from(generation).map_err(|_| {
+                KinDbError::StorageError(format!(
+                    "SQLite delta contains negative generation {generation}"
+                ))
+            })?;
+            result.push((data, generation));
         }
 
         Ok(result)
@@ -444,6 +456,28 @@ mod tests {
             .save_snapshot("test-repo", &bytes, gen1)
             .unwrap_err();
         assert!(err.to_string().contains("generation mismatch"));
+    }
+
+    #[test]
+    fn sqlite_negative_delta_generation_fails_closed_before_filtering() {
+        let backend = test_backend();
+        let repo_id = "negative-delta";
+        backend
+            .conn
+            .lock()
+            .execute(
+                "INSERT INTO deltas (repo_id, generation, data) VALUES (?1, ?2, ?3)",
+                params![repo_id, -1_i64, b"corrupt"],
+            )
+            .unwrap();
+
+        for since_generation in [GENERATION_INIT, Generation::MAX] {
+            let error = StorageBackend::load_deltas_since(&backend, repo_id, since_generation)
+                .expect_err("negative persisted delta generation must not be hidden by the query");
+            assert!(error
+                .to_string()
+                .contains("SQLite delta contains negative generation -1"));
+        }
     }
 
     #[test]
