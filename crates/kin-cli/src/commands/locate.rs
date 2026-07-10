@@ -15003,9 +15003,10 @@ pub fn apply_entity_page(
 
 /// Reciprocal-rank-fusion constant `k` (`KIN_LOCATE_RRF_K`, default 60). Larger
 /// `k` flattens the rank-position weighting; the standard literature value is 60.
-/// Floored at 1 so the denominator can never collapse.
+/// Floored at 1 so the denominator can never collapse. Shares the same knob the
+/// internal signal-fusion RRF reads, so both fusions stay on one constant.
 pub fn locate_rrf_k() -> f64 {
-    locate_env_usize("KIN_LOCATE_RRF_K", 60).max(1) as f64
+    locate_env_f32("KIN_LOCATE_RRF_K", 60.0).max(1.0) as f64
 }
 
 /// Reciprocal Rank Fusion over several already-ranked item lists. Each item
