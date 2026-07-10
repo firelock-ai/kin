@@ -25,6 +25,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+mod history_checkpoint;
+
+use history_checkpoint::{
+    CheckpointIoStats, HydrationCheckpointBoundary, HydrationCheckpointConfig,
+    HydrationCheckpointSession,
+};
+
 /// Discovery cap for `kin init`. When more than this many indexable files are
 /// found, init refuses to grind unless the caller explicitly opts in (`--force`)
 /// or raises the limit via `KIN_INIT_MAX_FILES`.
@@ -466,6 +473,443 @@ fn print_fresh_native_next_steps(layout: &kin_core::KinLayout, agent_doc_changed
     println!("  Git escape hatch: kin git export --output <path>");
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeterministicChangeProvenance {
+    /// `kin init: auto-parse` regenerates these machine-local fields on retry.
+    Regenerated,
+    /// Imported Git provenance is part of the immutable source record.
+    Stable,
+}
+
+/// Whether two records with the same deterministic change id carry the same
+/// authoritative payload. Only the auto-parse retry path may ignore its
+/// regenerated wall-clock provenance. Imported Git author/timestamp fields are
+/// stable source truth and a same-id mismatch must be refused.
+fn deterministic_change_payload_matches(
+    left: &SemanticChange,
+    right: &SemanticChange,
+    provenance: DeterministicChangeProvenance,
+) -> bool {
+    fn graph_payload(change: &SemanticChange) -> Option<serde_json::Value> {
+        let mut value = serde_json::to_value(change).ok()?;
+        let object = value.as_object_mut()?;
+        object.remove("timestamp");
+        object.remove("author");
+        Some(value)
+    }
+
+    fn normalized_auto_parse_entities(change: &SemanticChange) -> Option<Vec<serde_json::Value>> {
+        if change.message != "kin init: auto-parse" {
+            return None;
+        }
+        let mut entities = change
+            .entity_deltas
+            .iter()
+            .map(|delta| match delta {
+                EntityDelta::Added(entity) => Some(entity),
+                EntityDelta::Modified { .. } | EntityDelta::Removed(_) => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        entities.sort_by_key(|entity| entity.id);
+        if entities.windows(2).any(|pair| pair[0].id == pair[1].id) {
+            return None;
+        }
+        entities
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .ok()
+    }
+
+    fn auto_parse_payload_without_entities(change: &SemanticChange) -> Option<serde_json::Value> {
+        let mut value = graph_payload(change)?;
+        *value.as_object_mut()?.get_mut("entity_deltas")? = serde_json::Value::Array(Vec::new());
+        Some(value)
+    }
+
+    match provenance {
+        DeterministicChangeProvenance::Regenerated => {
+            match (graph_payload(left), graph_payload(right)) {
+                (Some(left_payload), Some(right_payload)) => {
+                    left_payload == right_payload
+                        || matches!(
+                            (
+                                auto_parse_payload_without_entities(left),
+                                auto_parse_payload_without_entities(right),
+                                normalized_auto_parse_entities(left),
+                                normalized_auto_parse_entities(right),
+                            ),
+                            (Some(left_rest), Some(right_rest), Some(left_entities), Some(right_entities))
+                                if left_rest == right_rest && left_entities == right_entities
+                        )
+                }
+                _ => false,
+            }
+        }
+        DeterministicChangeProvenance::Stable => {
+            match (serde_json::to_value(left), serde_json::to_value(right)) {
+                (Ok(left), Ok(right)) => left == right,
+                _ => false,
+            }
+        }
+    }
+}
+
+fn stable_change_payload_without_parents_matches(
+    left: &SemanticChange,
+    right: &SemanticChange,
+) -> bool {
+    fn payload(change: &SemanticChange) -> Option<serde_json::Value> {
+        let mut value = serde_json::to_value(change).ok()?;
+        value.as_object_mut()?.remove("parents");
+        Some(value)
+    }
+
+    matches!((payload(left), payload(right)), (Some(left), Some(right)) if left == right)
+}
+
+/// Publish a deterministic init/import change exactly once.
+///
+/// kin-db 0.2.31's `create_change` is an insertion primitive, not an upsert:
+/// calling it again appends the id to every parent's reverse-child vector and
+/// replays entity revisions before overwriting the change map entry. Guarding
+/// here keeps repeated warm init idempotent while refusing a same-id collision
+/// whose graph-defining payload changed.
+fn create_deterministic_change_once(
+    graph: &kin_db::InMemoryGraph,
+    change: &SemanticChange,
+    provenance: DeterministicChangeProvenance,
+) -> Result<bool> {
+    if let Some(existing) = graph.get_change(&change.id)? {
+        if deterministic_change_payload_matches(&existing, change, provenance) {
+            return Ok(false);
+        }
+        return Err(anyhow!(
+            "REFUSED deterministic init change {}: existing graph payload differs",
+            change.id
+        ));
+    }
+    graph.create_change(change)?;
+    Ok(true)
+}
+
+fn validate_repaired_change_history(
+    changes: &HashMap<SemanticChangeId, SemanticChange>,
+    branches: &HashMap<kin_model::BranchName, kin_model::Branch>,
+    boundary_root: SemanticChangeId,
+) -> Result<()> {
+    let Some(root) = changes.get(&boundary_root) else {
+        return Err(anyhow!(
+            "REFUSED legacy Git-import repair: canonical genesis {} is absent",
+            boundary_root
+        ));
+    };
+    if !root.parents.is_empty() {
+        return Err(anyhow!(
+            "REFUSED legacy Git-import repair: canonical genesis {} has parents",
+            boundary_root
+        ));
+    }
+    for branch in branches.values() {
+        if !changes.contains_key(&branch.head) {
+            return Err(anyhow!(
+                "REFUSED legacy Git-import repair: branch {} has missing head {}",
+                branch.name,
+                branch.head
+            ));
+        }
+    }
+    for change in changes.values() {
+        if change.id != boundary_root && change.parents.is_empty() {
+            return Err(anyhow!(
+                "REFUSED legacy Git-import repair: non-genesis change {} has no parent",
+                change.id
+            ));
+        }
+        let mut unique_parents = HashSet::with_capacity(change.parents.len());
+        for parent in &change.parents {
+            if !unique_parents.insert(*parent) {
+                return Err(anyhow!(
+                    "REFUSED legacy Git-import repair: change {} repeats parent {}",
+                    change.id,
+                    parent
+                ));
+            }
+            if !changes.contains_key(parent) {
+                return Err(anyhow!(
+                    "REFUSED legacy Git-import repair: change {} has missing parent {}",
+                    change.id,
+                    parent
+                ));
+            }
+        }
+    }
+
+    // Validate every parent edge after normalizing the known legacy self-edge.
+    // Refuse broader corruption rather than silently inventing ancestry for it.
+    let mut color = HashMap::<SemanticChangeId, u8>::with_capacity(changes.len());
+    for start in changes.keys().copied() {
+        if color.get(&start) == Some(&2) {
+            continue;
+        }
+        let mut stack = vec![(start, false)];
+        while let Some((change_id, exiting)) = stack.pop() {
+            if exiting {
+                color.insert(change_id, 2);
+                continue;
+            }
+            match color.get(&change_id).copied().unwrap_or(0) {
+                2 => continue,
+                1 => {
+                    return Err(anyhow!(
+                        "REFUSED legacy Git-import repair: parent DAG contains a cycle at {}",
+                        change_id
+                    ));
+                }
+                _ => {}
+            }
+            color.insert(change_id, 1);
+            stack.push((change_id, true));
+            for parent in changes[&change_id].parents.iter().rev().copied() {
+                stack.push((parent, false));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn legacy_boundary_parent_shape(
+    canonical_parents: &[SemanticChangeId],
+    boundary_root: SemanticChangeId,
+    legacy_target: SemanticChangeId,
+) -> Option<Vec<SemanticChangeId>> {
+    let mut replaced = false;
+    let mut output = Vec::with_capacity(canonical_parents.len());
+    for parent in canonical_parents.iter().copied() {
+        let parent = if parent == boundary_root {
+            replaced = true;
+            legacy_target
+        } else {
+            parent
+        };
+        if !output.contains(&parent) {
+            output.push(parent);
+        }
+    }
+    replaced.then_some(output)
+}
+
+fn candidate_parent_path_reaches(
+    changes: &HashMap<SemanticChangeId, SemanticChange>,
+    candidate_ids: &HashSet<SemanticChangeId>,
+    start: SemanticChangeId,
+    target: SemanticChangeId,
+) -> bool {
+    let mut stack = vec![start];
+    let mut visited = HashSet::new();
+    while let Some(change_id) = stack.pop() {
+        if change_id == target {
+            return true;
+        }
+        if !visited.insert(change_id) {
+            continue;
+        }
+        let Some(change) = changes.get(&change_id) else {
+            continue;
+        };
+        stack.extend(
+            change
+                .parents
+                .iter()
+                .copied()
+                .filter(|parent| candidate_ids.contains(parent)),
+        );
+    }
+    false
+}
+
+fn candidate_reverse_index_needs_rebuild(
+    snapshot: &kin_db::GraphSnapshot,
+    candidate_ids: &HashSet<SemanticChangeId>,
+) -> bool {
+    for candidate_id in candidate_ids {
+        let Some(change) = snapshot.changes.get(candidate_id) else {
+            continue;
+        };
+        let occurrences = snapshot
+            .change_children
+            .values()
+            .map(|children| {
+                children
+                    .iter()
+                    .filter(|child| *child == candidate_id)
+                    .count()
+            })
+            .sum::<usize>();
+        if occurrences != change.parents.len() {
+            return true;
+        }
+        for parent in &change.parents {
+            let count = snapshot
+                .change_children
+                .get(parent)
+                .into_iter()
+                .flatten()
+                .filter(|child| **child == *candidate_id)
+                .count();
+            if count != 1 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn candidate_revision_index_needs_rebuild(
+    snapshot: &kin_db::GraphSnapshot,
+    candidate_ids: &HashSet<SemanticChangeId>,
+) -> bool {
+    snapshot.entity_revisions.values().any(|revisions| {
+        let mut seen = HashSet::new();
+        revisions
+            .iter()
+            .filter(|revision| candidate_ids.contains(&revision.introduced_by))
+            .any(|revision| !seen.insert(revision.revision_id))
+    })
+}
+
+fn rebuild_history_derived_indexes(snapshot: &mut kin_db::GraphSnapshot) {
+    let mut change_children = HashMap::<SemanticChangeId, Vec<SemanticChangeId>>::new();
+    for change in snapshot.changes.values() {
+        for parent in &change.parents {
+            change_children.entry(*parent).or_default().push(change.id);
+        }
+    }
+    for children in change_children.values_mut() {
+        children.sort_by_key(ToString::to_string);
+        children.dedup();
+    }
+    snapshot.change_children = change_children;
+
+    // Empty means "derive from canonical change truth" on graph restore. This
+    // removes revision generations appended by repeated deterministic imports.
+    snapshot.entity_revisions.clear();
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LegacyImportRepairOutcome {
+    corrected_changes: usize,
+    rebuilt_derived_indexes: bool,
+}
+
+/// Repair only the two provable legacy Git-import defects.
+///
+/// Old warm init passed the current imported head as the import boundary. The
+/// resulting persisted cycle is recognizable only after a fresh canonical Git
+/// import: every stored field matches, exactly one boundary substitution maps
+/// canonical genesis to one imported descendant, and that descendant's stored
+/// parent path closes the cycle. Separately, boundary-correct releases still
+/// reinserted deterministic imported ids and could duplicate reverse edges and
+/// revision generations. Both cases rebuild the derived indexes from immutable
+/// change truth. Any unrelated self-edge/cycle remains after the narrowly
+/// proven substitution and is refused by full-DAG validation.
+fn repair_legacy_git_import_history(
+    manager: &kin_db::SnapshotManager,
+    layout: &kin_core::KinLayout,
+    boundary_root: SemanticChangeId,
+    canonical_imported: &[kin_git::ImportedChange],
+) -> Result<LegacyImportRepairOutcome> {
+    if canonical_imported.is_empty() {
+        return Ok(LegacyImportRepairOutcome::default());
+    }
+    let graph = manager.graph();
+    let mut snapshot = graph.to_snapshot();
+    let candidate_ids: HashSet<_> = canonical_imported
+        .iter()
+        .map(|entry| entry.change.id)
+        .collect();
+    let mut mismatches = Vec::<(SemanticChangeId, SemanticChangeId)>::new();
+    let mut unrecognized_payload_or_parent = false;
+    for canonical in canonical_imported {
+        let Some(existing) = snapshot.changes.get(&canonical.change.id) else {
+            continue;
+        };
+        if !stable_change_payload_without_parents_matches(existing, &canonical.change) {
+            unrecognized_payload_or_parent = true;
+            continue;
+        }
+        if existing.parents == canonical.change.parents {
+            continue;
+        }
+        let matching_targets: Vec<_> = candidate_ids
+            .iter()
+            .copied()
+            .filter(|target| {
+                legacy_boundary_parent_shape(&canonical.change.parents, boundary_root, *target)
+                    .as_ref()
+                    == Some(&existing.parents)
+            })
+            .collect();
+        if matching_targets.len() == 1 {
+            mismatches.push((canonical.change.id, matching_targets[0]));
+        } else {
+            unrecognized_payload_or_parent = true;
+        }
+    }
+
+    let legacy_target = mismatches.first().map(|(_, target)| *target);
+    let legacy_shape_proven = !mismatches.is_empty()
+        && !unrecognized_payload_or_parent
+        && mismatches
+            .iter()
+            .all(|(_, target)| Some(*target) == legacy_target)
+        && mismatches.iter().all(|(boundary_change, target)| {
+            candidate_parent_path_reaches(
+                &snapshot.changes,
+                &candidate_ids,
+                *target,
+                *boundary_change,
+            )
+        });
+
+    let mut corrected_changes = 0usize;
+    if legacy_shape_proven {
+        let mismatch_ids: HashSet<_> = mismatches.iter().map(|(id, _)| *id).collect();
+        for canonical in canonical_imported {
+            if mismatch_ids.contains(&canonical.change.id) {
+                snapshot
+                    .changes
+                    .insert(canonical.change.id, canonical.change.clone());
+                corrected_changes += 1;
+            }
+        }
+    }
+
+    validate_repaired_change_history(&snapshot.changes, &snapshot.branches, boundary_root)?;
+
+    let rebuild_derived_indexes = corrected_changes > 0
+        || candidate_reverse_index_needs_rebuild(&snapshot, &candidate_ids)
+        || candidate_revision_index_needs_rebuild(&snapshot, &candidate_ids);
+    if !rebuild_derived_indexes {
+        return Ok(LegacyImportRepairOutcome::default());
+    }
+
+    rebuild_history_derived_indexes(&mut snapshot);
+    let repaired_graph =
+        kin_db::InMemoryGraph::from_snapshot_with_text_index(snapshot, layout.text_index_dir());
+    manager.swap(repaired_graph);
+    // Persist immediately. A warm repository with no indexable working-tree
+    // files otherwise takes the early no-change path and would leave the
+    // repaired graph only in memory, causing the same recovery on every open.
+    manager
+        .save()
+        .context("persist repaired legacy Git-import history")?;
+    Ok(LegacyImportRepairOutcome {
+        corrected_changes,
+        rebuilt_derived_indexes: true,
+    })
+}
+
 pub async fn run(
     path: Option<String>,
     json: bool,
@@ -511,7 +955,14 @@ pub async fn run(
     phase!("snapshot_repo");
 
     let is_warm = kin_dir.exists();
-    let (layout, snap, blob_store, genesis_id) = if is_warm {
+    // Git history hydration has one repository-invariant, non-colliding
+    // boundary root: Kin's canonical genesis. It must never be replaced with
+    // the current branch head on a warm init. The branch head is only the
+    // parent of this init's auto-parse change; using it as the imported Git
+    // root can either leave an out-of-window dangling parent or close a cycle
+    // when that head is itself one of the imported Git changes.
+    let history_boundary_root = kin_core::build_genesis_change().id;
+    let (layout, snap, blob_store, auto_parse_parent_id) = if is_warm {
         let layout = kin_core::KinLayout::discover(&dir)
             .ok_or_else(|| anyhow::anyhow!("layout not found in existing .kin"))?;
         let snap = crate::backend::open_kindb_snapshot(&layout)?;
@@ -519,7 +970,9 @@ pub async fn run(
             .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
         // For a warm cache hit, the genesis change isn't created anew.
         // We look up the current head of the default branch to use as the parent
-        // for the new auto-parse change.
+        // for the new auto-parse change. Legacy Git-boundary recovery waits for
+        // the fresh canonical import below so it never guesses ancestry from a
+        // malformed stored graph alone.
         let config = kin_core::KinConfig::load(&layout.config_path())?;
         let parent_id = snap
             .graph()
@@ -635,20 +1088,14 @@ pub async fn run(
         println!("  Snapshot saved ({} files)", snapshot_file_count);
     }
 
-    let mut embed_status = kin_db::EmbeddingStatus {
-        pending: 0,
-        indexed: 0,
-        total: 0,
-    };
-
+    let mut graph = snap.graph();
+    let branch_name = kin_core::read_current_branch(&layout)?;
     if !all_files.is_empty() {
-        let graph = snap.graph();
         // Build a semantic change for the initial parse.
         // Include artifact_deltas for every file so that the VFS tree
         // (built from the change DAG) knows which files exist.
-        let branch_name = kin_core::read_current_branch(&layout)?;
         let change_id = compute_init_change_id(
-            &genesis_id,
+            &auto_parse_parent_id,
             &compute_artifact_fingerprint(
                 indexable_files
                     .iter()
@@ -678,7 +1125,11 @@ pub async fn run(
                 new_hash: Some(kin_model::Hash256::from_bytes(f.hash)),
             })
             .collect();
-        let all_entities = graph.list_all_entities()?;
+        let mut all_entities = graph.list_all_entities()?;
+        // `list_all_entities` is backed by a hash map. Canonicalize its order
+        // before it becomes a deterministic init change payload so a repeated
+        // warm init cannot look different solely because hash iteration moved.
+        all_entities.sort_by_key(|entity| entity.id);
         // Gather relation deltas while only borrowing the entity list, then
         // consume the list itself into the entity deltas. Building the Added
         // entity deltas by value (instead of `.iter().cloned()`) avoids holding
@@ -703,7 +1154,7 @@ pub async fn run(
 
         let change = SemanticChange {
             id: change_id,
-            parents: vec![genesis_id],
+            parents: vec![auto_parse_parent_id],
             timestamp: Timestamp::now(),
             author: AuthorId::new(whoami()),
             message: "kin init: auto-parse".to_string(),
@@ -716,168 +1167,199 @@ pub async fn run(
             risk_summary: None,
             authored_on: Some(branch_name.clone()),
         };
-        graph.create_change(&change)?;
+        create_deterministic_change_once(
+            graph.as_ref(),
+            &change,
+            DeterministicChangeProvenance::Regenerated,
+        )?;
         graph.update_branch_head(&branch_name, &change_id)?;
 
         phase!("change_dag+blob_backfill");
+    }
 
-        if is_git_repo {
-            if let Some(import_opts) = git_history_import_options(&git_history) {
-                match crate::commands::cochange::refresh_from_git_history_with_limit(
-                    graph.as_ref(),
-                    &dir,
-                    import_opts.max_commits,
-                ) {
-                    Ok(count) if count > 0 => {
-                        if !json {
-                            println!("  Mined {} co-change relation(s) from Git history.", count);
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        warn!(
-                            error = %err,
-                            mode = %git_history,
-                            "failed to mine co-change relations from git history"
-                        );
+    // Git history is independent of whether the current checkout contains a
+    // source file. In particular, a repository whose HEAD deletes its final
+    // file still has authoritative committed history to import or repair.
+    if is_git_repo {
+        if let Some(import_opts) = git_history_import_options(&git_history) {
+            match crate::commands::cochange::refresh_from_git_history_with_limit(
+                graph.as_ref(),
+                &dir,
+                import_opts.max_commits,
+            ) {
+                Ok(count) if count > 0 => {
+                    if !json {
+                        println!("  Mined {} co-change relation(s) from Git history.", count);
                     }
                 }
+                Ok(_) => {}
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        mode = %git_history,
+                        "failed to mine co-change relations from git history"
+                    );
+                }
+            }
 
-                match kin_git::import_git_history_with_blobs(
-                    &dir,
-                    genesis_id,
-                    &import_opts,
-                    Some(&blob_store),
-                ) {
-                    Ok(mut imported) if !imported.is_empty() => {
-                        // Anchor the (possibly truncated) history at a full base
-                        // universe so ref-scoped blast at historical refs sees
-                        // committed inbound edges across files untouched inside
-                        // the window. Must run BEFORE enrichment: the base-link
-                        // change is then parsed, linked, and used as each
-                        // windowed commit's semantic baseline by the same pass.
-                        match kin_git::anchor_imported_history_at_base_link(
-                            &dir,
-                            &mut imported,
-                            genesis_id,
-                            Some(&blob_store),
-                        ) {
-                            Ok(Some(base_id)) => {
-                                debug!(base_link = %base_id, "anchored imported history at base-link change");
-                            }
-                            Ok(None) => {}
-                            Err(err) => {
-                                warn!(
-                                    error = %err,
-                                    mode = %git_history,
-                                    "failed to anchor imported Git history at a base-link change; continuing without base-universe anchoring"
-                                );
-                            }
+            match kin_git::import_git_history_with_blobs(
+                &dir,
+                history_boundary_root,
+                &import_opts,
+                Some(&blob_store),
+            ) {
+                Ok(mut imported) if !imported.is_empty() => {
+                    // Anchor the (possibly truncated) history at a full base
+                    // universe so ref-scoped blast at historical refs sees
+                    // committed inbound edges across files untouched inside
+                    // the window. Must run BEFORE enrichment: the base-link
+                    // change is then parsed, linked, and used as each
+                    // windowed commit's semantic baseline by the same pass.
+                    match kin_git::anchor_imported_history_at_base_link(
+                        &dir,
+                        &mut imported,
+                        history_boundary_root,
+                        Some(&blob_store),
+                    ) {
+                        Ok(Some(base_id)) => {
+                            debug!(base_link = %base_id, "anchored imported history at base-link change");
                         }
-
-                        if let Err(err) =
-                            enrich_imported_changes_with_semantics(&mut imported, &blob_store)
-                        {
+                        Ok(None) => {}
+                        Err(err) => {
                             warn!(
                                 error = %err,
                                 mode = %git_history,
-                                "failed to enrich imported Git history with semantic deltas; continuing with artifact-only history"
-                            );
-                        }
-
-                        let mut last_id = None;
-                        for ic in &imported {
-                            graph.create_change(&ic.change)?;
-                            last_id = Some(ic.change.id);
-                        }
-                        if let Some(head) = last_id {
-                            graph.update_branch_head(&branch_name, &head)?;
-                        }
-                        if !json {
-                            let mode_label = match git_history.as_str() {
-                                "recent" => "recent",
-                                "full" => "full",
-                                _ => git_history.as_str(),
-                            };
-                            println!(
-                                "  Imported {} {mode_label} Git commit(s) as semantic history.",
-                                imported.len()
+                                "failed to anchor imported Git history at a base-link change; continuing without base-universe anchoring"
                             );
                         }
                     }
-                    Ok(_) => {}
-                    Err(err) => {
-                        if git_history == "full" {
-                            return Err(anyhow!(
-                                "failed to import full Git history during init: {}",
-                                err
-                            ));
-                        }
+
+                    // Historical semantic truth is an authority path. A
+                    // checkpoint with a stale version key or invalid digest
+                    // must stop init rather than silently degrade the graph
+                    // to artifact-only history.
+                    enrich_imported_changes_with_semantics_checkpointed(
+                        &mut imported,
+                        &blob_store,
+                        layout.root(),
+                        history_boundary_root,
+                    )
+                    .with_context(|| {
+                        format!("enrich imported Git history with semantic deltas ({git_history})")
+                    })?;
+
+                    let repair = repair_legacy_git_import_history(
+                        &snap,
+                        &layout,
+                        history_boundary_root,
+                        &imported,
+                    )?;
+                    if repair.rebuilt_derived_indexes {
                         warn!(
-                            error = %err,
-                            mode = %git_history,
-                            "failed to import Git history during init (non-fatal)"
+                            corrected_changes = repair.corrected_changes,
+                            "repaired proven legacy Git-import history and rebuilt derived indexes"
                         );
+                        // `SnapshotManager::swap` is RCU-style. Refresh the
+                        // caller's Arc so exact-once collision checks target
+                        // the repaired graph rather than the retired view.
+                        graph = snap.graph();
                     }
-                }
-            }
-        }
 
-        embed_status = graph.embedding_status();
-
-        phase!("cochange_mining");
-
-        let saved_root_hash = snap.save()?;
-        phase!("snapshot_save");
-
-        // Build and save the read-only index for fast CLI queries.
-        let read_index = kin_db::ReadIndex::from_graph(&graph)?;
-        let idx_path = layout.kindb_snapshot_path().with_extension("kidx");
-        read_index.save(&idx_path)?;
-
-        phase!("read_index_save");
-
-        // Optional LSP enrichment: discover servers, enrich entities with type-resolved relations.
-        if !no_lsp {
-            let discovered = kin_lsp::discovery::discover_servers();
-            if !discovered.is_empty() && !json {
-                println!("  Discovering LSP servers for enrichment...");
-                for server in &discovered {
-                    println!("    {} ({})", server.language, server.command);
-                }
-                println!("  LSP enrichment available — run `kin embed` after init completes.");
-                // Full LSP enrichment (starting servers, querying call hierarchy) runs
-                // in the daemon background. For kin init, we just report availability.
-                // Synchronous enrichment would add 30-60s to init time.
-            }
-
-            // Trigger LSP cold sweep only through an already-routed daemon.
-            let daemon_url = if let Some(daemon_url) = std::env::var("KIN_DAEMON_URL")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-            {
-                Some(daemon_url)
-            } else {
-                crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await
-            };
-            if let Some(daemon_url) = daemon_url {
-                if let Ok(resp) = reqwest::Client::new()
-                    .post(format!("{}/v1/lsp/sweep", daemon_url.trim_end_matches('/')))
-                    .timeout(std::time::Duration::from_secs(2))
-                    .send()
-                    .await
-                {
-                    if resp.status().is_success() && !json {
+                    let mut last_id = None;
+                    for ic in &imported {
+                        create_deterministic_change_once(
+                            graph.as_ref(),
+                            &ic.change,
+                            DeterministicChangeProvenance::Stable,
+                        )?;
+                        last_id = Some(ic.change.id);
+                    }
+                    if let Some(head) = last_id {
+                        graph.update_branch_head(&branch_name, &head)?;
+                    }
+                    if !json {
+                        let mode_label = match git_history.as_str() {
+                            "recent" => "recent",
+                            "full" => "full",
+                            _ => git_history.as_str(),
+                        };
                         println!(
-                            "  LSP cold sweep triggered — enriching all entities in background"
+                            "  Imported {} {mode_label} Git commit(s) as semantic history.",
+                            imported.len()
                         );
                     }
                 }
+                Ok(_) => {}
+                Err(err) => {
+                    if git_history == "full" {
+                        return Err(anyhow!(
+                            "failed to import full Git history during init: {}",
+                            err
+                        ));
+                    }
+                    warn!(
+                        error = %err,
+                        mode = %git_history,
+                        "failed to import Git history during init (non-fatal)"
+                    );
+                }
             }
         }
+    }
 
-        if !json {
-            println!(
+    let embed_status = graph.embedding_status();
+
+    phase!("cochange_mining");
+
+    let saved_root_hash = snap.save()?;
+    phase!("snapshot_save");
+
+    // Build and save the read-only index for fast CLI queries.
+    let read_index = kin_db::ReadIndex::from_graph(&graph)?;
+    let idx_path = layout.kindb_snapshot_path().with_extension("kidx");
+    read_index.save(&idx_path)?;
+
+    phase!("read_index_save");
+
+    // Optional LSP enrichment: discover servers, enrich entities with type-resolved relations.
+    if !all_files.is_empty() && !no_lsp {
+        let discovered = kin_lsp::discovery::discover_servers();
+        if !discovered.is_empty() && !json {
+            println!("  Discovering LSP servers for enrichment...");
+            for server in &discovered {
+                println!("    {} ({})", server.language, server.command);
+            }
+            println!("  LSP enrichment available — run `kin embed` after init completes.");
+            // Full LSP enrichment (starting servers, querying call hierarchy) runs
+            // in the daemon background. For kin init, we just report availability.
+            // Synchronous enrichment would add 30-60s to init time.
+        }
+
+        // Trigger LSP cold sweep only through an already-routed daemon.
+        let daemon_url = if let Some(daemon_url) = std::env::var("KIN_DAEMON_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        {
+            Some(daemon_url)
+        } else {
+            crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await
+        };
+        if let Some(daemon_url) = daemon_url {
+            if let Ok(resp) = reqwest::Client::new()
+                .post(format!("{}/v1/lsp/sweep", daemon_url.trim_end_matches('/')))
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await
+            {
+                if resp.status().is_success() && !json {
+                    println!("  LSP cold sweep triggered — enriching all entities in background");
+                }
+            }
+        }
+    }
+
+    if !all_files.is_empty() && !json {
+        println!(
                 "  Initialized with {} entities from {} files ({} relations) [{} embeddings indexed, {} queued]",
                 init_summary.total_entity_count,
                 init_summary.total_files,
@@ -885,119 +1367,109 @@ pub async fn run(
                 embed_status.indexed,
                 embed_status.pending
             );
-            if embed_status.pending > 0 {
-                println!("  Run `kin embed` to build semantic vector search.");
-            }
+        if embed_status.pending > 0 {
+            println!("  Run `kin embed` to build semantic vector search.");
         }
-        if verbose {
-            // Role classification summary
-            let all_entities = graph.list_all_entities()?;
-            let mut role_counts: std::collections::HashMap<kin_model::EntityRole, usize> =
-                std::collections::HashMap::new();
-            for entity in &all_entities {
-                *role_counts.entry(entity.role).or_insert(0) += 1;
-            }
-            let roles = [
-                (kin_model::EntityRole::Source, "source"),
-                (kin_model::EntityRole::Test, "test"),
-                (kin_model::EntityRole::External, "external"),
-                (kin_model::EntityRole::Docs, "docs"),
-                (kin_model::EntityRole::Generated, "generated"),
-                (kin_model::EntityRole::Vendored, "vendored"),
-            ];
-            let parts: Vec<String> = roles
-                .iter()
-                .filter_map(|(role, label)| role_counts.get(role).map(|c| format!("{label}: {c}")))
-                .collect();
-            eprintln!("  Roles: {}", parts.join(", "));
-
-            // File classification summary
-            let mut class_counts: std::collections::HashMap<&str, usize> =
-                std::collections::HashMap::new();
-            for file in &indexable_files {
-                let label = match &file.classification {
-                    kin_index::FileClassification::EntitySource => "entity_source",
-                    kin_index::FileClassification::ShallowSyntax { .. } => "shallow_syntax",
-                    kin_index::FileClassification::StructuredArtifact(_) => "structured_artifact",
-                    kin_index::FileClassification::OpaqueArtifact { .. } => "opaque_artifact",
-                };
-                *class_counts.entry(label).or_insert(0) += 1;
-            }
-            let class_parts: Vec<String> = class_counts
-                .iter()
-                .map(|(label, count)| format!("{label}: {count}"))
-                .collect();
-            eprintln!("  File classifications: {}", class_parts.join(", "));
-
-            // Entity kind summary
-            let mut kind_counts: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
-            for entity in &all_entities {
-                *kind_counts.entry(format!("{:?}", entity.kind)).or_insert(0) += 1;
-            }
-            let mut kind_pairs: Vec<_> = kind_counts.iter().collect();
-            kind_pairs.sort_by(|a, b| b.1.cmp(a.1));
-            let kind_parts: Vec<String> = kind_pairs
-                .iter()
-                .take(8)
-                .map(|(kind, count)| format!("{kind}: {count}"))
-                .collect();
-            eprintln!("  Entity kinds: {}", kind_parts.join(", "));
-
-            // Doc summary coverage
-            let with_docs = all_entities
-                .iter()
-                .filter(|e| e.doc_summary.is_some())
-                .count();
-            eprintln!(
-                "  Doc summaries: {}/{} entities ({:.0}%)",
-                with_docs,
-                all_entities.len(),
-                if all_entities.is_empty() {
-                    0.0
-                } else {
-                    (with_docs as f64 / all_entities.len() as f64) * 100.0
-                }
-            );
+    }
+    if !all_files.is_empty() && verbose {
+        // Role classification summary
+        let all_entities = graph.list_all_entities()?;
+        let mut role_counts: std::collections::HashMap<kin_model::EntityRole, usize> =
+            std::collections::HashMap::new();
+        for entity in &all_entities {
+            *role_counts.entry(entity.role).or_insert(0) += 1;
         }
-        if init_summary.warm_cache_hit {
-            info!(
-                changed_files = init_summary.warm_changed_files,
-                reparsed_files = init_summary.warm_reparsed_files,
-                indexed_files = init_summary.total_files,
-                "warm init cache reused prior semantic snapshot"
-            );
-        }
+        let roles = [
+            (kin_model::EntityRole::Source, "source"),
+            (kin_model::EntityRole::Test, "test"),
+            (kin_model::EntityRole::External, "external"),
+            (kin_model::EntityRole::Docs, "docs"),
+            (kin_model::EntityRole::Generated, "generated"),
+            (kin_model::EntityRole::Vendored, "vendored"),
+        ];
+        let parts: Vec<String> = roles
+            .iter()
+            .filter_map(|(role, label)| role_counts.get(role).map(|c| format!("{label}: {c}")))
+            .collect();
+        eprintln!("  Roles: {}", parts.join(", "));
 
+        // File classification summary
+        let mut class_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for file in &indexable_files {
+            let label = match &file.classification {
+                kin_index::FileClassification::EntitySource => "entity_source",
+                kin_index::FileClassification::ShallowSyntax { .. } => "shallow_syntax",
+                kin_index::FileClassification::StructuredArtifact(_) => "structured_artifact",
+                kin_index::FileClassification::OpaqueArtifact { .. } => "opaque_artifact",
+            };
+            *class_counts.entry(label).or_insert(0) += 1;
+        }
+        let class_parts: Vec<String> = class_counts
+            .iter()
+            .map(|(label, count)| format!("{label}: {count}"))
+            .collect();
+        eprintln!("  File classifications: {}", class_parts.join(", "));
+
+        // Entity kind summary
+        let mut kind_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for entity in &all_entities {
+            *kind_counts.entry(format!("{:?}", entity.kind)).or_insert(0) += 1;
+        }
+        let mut kind_pairs: Vec<_> = kind_counts.iter().collect();
+        kind_pairs.sort_by(|a, b| b.1.cmp(a.1));
+        let kind_parts: Vec<String> = kind_pairs
+            .iter()
+            .take(8)
+            .map(|(kind, count)| format!("{kind}: {count}"))
+            .collect();
+        eprintln!("  Entity kinds: {}", kind_parts.join(", "));
+
+        // Doc summary coverage
+        let with_docs = all_entities
+            .iter()
+            .filter(|e| e.doc_summary.is_some())
+            .count();
+        eprintln!(
+            "  Doc summaries: {}/{} entities ({:.0}%)",
+            with_docs,
+            all_entities.len(),
+            if all_entities.is_empty() {
+                0.0
+            } else {
+                (with_docs as f64 / all_entities.len() as f64) * 100.0
+            }
+        );
+    }
+    if init_summary.warm_cache_hit {
+        info!(
+            changed_files = init_summary.warm_changed_files,
+            reparsed_files = init_summary.warm_reparsed_files,
+            indexed_files = init_summary.total_files,
+            "warm init cache reused prior semantic snapshot"
+        );
+    }
+
+    if !all_files.is_empty() {
         if let Err(err) = refresh_init_cache(&dir, graph.as_ref(), saved_root_hash) {
             warn!(error = %err, "failed to refresh warm init cache");
         }
+    }
 
-        // Register in the global ~/.kin/registry.toml with entity count
-        if let Ok(mut registry) = kin_core::registry::KinRegistry::load() {
-            let repo_id = dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-            registry.upsert(
-                repo_id,
-                dir.canonicalize().unwrap_or(dir),
-                init_summary.total_entity_count,
-            );
-            let _ = registry.save();
-        }
-    } else {
-        // No source files — register with zero entities
-        if let Ok(mut registry) = kin_core::registry::KinRegistry::load() {
-            let repo_id = dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-            registry.upsert(repo_id, dir.canonicalize().unwrap_or(dir), 0);
-            let _ = registry.save();
-        }
+    // Register in the global ~/.kin/registry.toml with the current-tree count.
+    if let Ok(mut registry) = kin_core::registry::KinRegistry::load() {
+        let repo_id = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        registry.upsert(
+            repo_id,
+            dir.canonicalize().unwrap_or(dir),
+            init_summary.total_entity_count,
+        );
+        let _ = registry.save();
     }
 
     if json {
@@ -1008,7 +1480,7 @@ pub async fn run(
                 repo_root: layout.root().display().to_string(),
                 kindb_snapshot_path: layout.kindb_snapshot_path().display().to_string(),
                 objects_dir: layout.objects_dir().display().to_string(),
-                genesis_change: genesis_id.to_string(),
+                genesis_change: history_boundary_root.to_string(),
                 indexed_embeddings: embed_status.indexed,
                 pending_embeddings: embed_status.pending,
                 summary: init_summary,
@@ -1138,7 +1610,8 @@ struct DiscoveredTest {
     target_entity_ids: Vec<EntityId>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ImportedSemanticFileState {
     file_path: String,
     entities: Vec<Entity>,
@@ -1226,9 +1699,9 @@ impl Clone for ImportedCommitSemanticState {
 /// so "process a commit after its first parent" is a forest constraint; Kahn's
 /// algorithm seeded and drained in ascending index order yields a stable order
 /// in which every commit follows its first parent, staying as close as possible
-/// to the input order. Any commit left unvisited by an (impossible for git)
-/// cycle is appended in index order so no commit is silently dropped.
-fn first_parent_topological_order(first_parent_index: &[Option<usize>]) -> Vec<usize> {
+/// to the input order. An (impossible for Git) cycle is rejected instead of
+/// manufacturing an order that would replay a child before its baseline.
+fn first_parent_topological_order(first_parent_index: &[Option<usize>]) -> Result<Vec<usize>> {
     let n = first_parent_index.len();
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut indegree = vec![0usize; n];
@@ -1242,12 +1715,7 @@ fn first_parent_topological_order(first_parent_index: &[Option<usize>]) -> Vec<u
     let mut queue: std::collections::VecDeque<usize> =
         (0..n).filter(|&i| indegree[i] == 0).collect();
     let mut order = Vec::with_capacity(n);
-    let mut seen = vec![false; n];
     while let Some(i) = queue.pop_front() {
-        if seen[i] {
-            continue;
-        }
-        seen[i] = true;
         order.push(i);
         for &child in &children[i] {
             indegree[child] -= 1;
@@ -1256,12 +1724,116 @@ fn first_parent_topological_order(first_parent_index: &[Option<usize>]) -> Vec<u
             }
         }
     }
-    for (i, visited) in seen.iter().enumerate() {
-        if !visited {
-            order.push(i);
+    if order.len() != n {
+        return Err(anyhow!(
+            "historical hydration invariant violated: imported first-parent graph contains a cycle"
+        ));
+    }
+    Ok(order)
+}
+
+fn validate_imported_parent_closure(
+    imported: &[kin_git::ImportedChange],
+    boundary_root: SemanticChangeId,
+) -> Result<()> {
+    let mut imported_ids = HashSet::with_capacity(imported.len());
+    for imported_change in imported {
+        if imported_change.change.id == boundary_root {
+            return Err(anyhow!(
+                "historical hydration invariant violated: imported change collides with boundary root {}",
+                boundary_root
+            ));
+        }
+        if !imported_ids.insert(imported_change.change.id) {
+            return Err(anyhow!(
+                "historical hydration invariant violated: duplicate imported change {}",
+                imported_change.change.id
+            ));
         }
     }
-    order
+    for imported_change in imported {
+        if imported_change.change.parents.is_empty() {
+            return Err(anyhow!(
+                "historical hydration invariant violated: imported change {} has no parent; Git roots must reference canonical genesis {}",
+                imported_change.change.id,
+                boundary_root
+            ));
+        }
+        for parent in &imported_change.change.parents {
+            if *parent != boundary_root && !imported_ids.contains(parent) {
+                return Err(anyhow!(
+                    "historical hydration invariant violated: imported change {} has dangling parent {} (expected imported history or canonical genesis {})",
+                    imported_change.change.id,
+                    parent,
+                    boundary_root
+                ));
+            }
+        }
+    }
+
+    // Validate the complete parent DAG, not only the first-parent forest used
+    // as the semantic replay baseline. A merge can name canonical genesis as
+    // its first parent while a secondary-parent path closes a cycle. Closure
+    // validation alone accepts that shape, and first-parent ordering cannot see
+    // it. Reject every such cycle here, before checkpoint prepare can acquire
+    // the store lock or create directories.
+    let parents_by_id: HashMap<_, _> = imported
+        .iter()
+        .map(|entry| (entry.change.id, entry.change.parents.as_slice()))
+        .collect();
+    let mut color = HashMap::<SemanticChangeId, u8>::with_capacity(imported.len());
+    for start in imported_ids.iter().copied() {
+        if color.get(&start) == Some(&2) {
+            continue;
+        }
+        let mut stack = vec![(start, false)];
+        while let Some((change_id, exiting)) = stack.pop() {
+            if exiting {
+                color.insert(change_id, 2);
+                continue;
+            }
+            match color.get(&change_id).copied().unwrap_or(0) {
+                2 => continue,
+                1 => {
+                    return Err(anyhow!(
+                        "historical hydration invariant violated: imported parent DAG contains a cycle at {}",
+                        change_id
+                    ));
+                }
+                _ => {}
+            }
+            color.insert(change_id, 1);
+            stack.push((change_id, true));
+            for parent in parents_by_id[&change_id].iter().rev().copied() {
+                if parent != boundary_root {
+                    stack.push((parent, false));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn take_imported_parent_baseline(
+    snapshots: &mut HashMap<SemanticChangeId, ImportedCommitSemanticState>,
+    parent_id: SemanticChangeId,
+    is_last_child: bool,
+) -> Result<ImportedCommitSemanticState> {
+    if is_last_child {
+        snapshots.remove(&parent_id).ok_or_else(|| {
+            anyhow!(
+                "historical hydration invariant violated: missing retained first-parent state {} for its last child",
+                parent_id
+            )
+        })
+    } else {
+        snapshots.get(&parent_id).cloned().ok_or_else(|| {
+            anyhow!(
+                "historical hydration invariant violated: missing retained first-parent state {} while later children remain",
+                parent_id
+            )
+        })
+    }
 }
 
 /// Pre-reconciliation parse payload memoized per `(blob_hash,
@@ -1302,6 +1874,7 @@ struct ImportedParseJob {
     served_deltas: Vec<usize>,
 }
 
+#[cfg(test)]
 pub(crate) fn enrich_imported_changes_with_semantics(
     imported: &mut [kin_git::ImportedChange],
     blob_store: &kin_blobs::BlobStore,
@@ -1309,14 +1882,127 @@ pub(crate) fn enrich_imported_changes_with_semantics(
     enrich_imported_changes_with_semantics_inner(imported, blob_store, true).map(|_| ())
 }
 
+#[cfg(test)]
+fn enrich_imported_changes_with_semantics_and_genesis(
+    imported: &mut [kin_git::ImportedChange],
+    blob_store: &kin_blobs::BlobStore,
+    genesis_id: SemanticChangeId,
+) -> Result<()> {
+    enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
+        imported, blob_store, true, None, genesis_id,
+    )
+    .map(|_| ())
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct HydrationReplayStats {
+    parse_memo_hits: usize,
+    parse_memo_misses: usize,
+    resumed_from: usize,
+    checkpoint_io: CheckpointIoStats,
+}
+
+#[cfg(test)]
+impl HydrationReplayStats {
+    pub(crate) fn resumed_from(&self) -> usize {
+        self.resumed_from
+    }
+}
+
+pub(crate) fn enrich_imported_changes_with_semantics_checkpointed(
+    imported: &mut [kin_git::ImportedChange],
+    blob_store: &kin_blobs::BlobStore,
+    kin_root: &Path,
+    boundary_root: SemanticChangeId,
+) -> Result<HydrationReplayStats> {
+    let config = HydrationCheckpointConfig::production(kin_root);
+    let stats = enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
+        imported,
+        blob_store,
+        true,
+        Some(config),
+        boundary_root,
+    )?;
+    debug!(
+        resumed_from = stats.resumed_from,
+        parse_memo_hits = stats.parse_memo_hits,
+        parse_memo_misses = stats.parse_memo_misses,
+        total_commits = imported.len(),
+        checkpoint_serialized_units = stats.checkpoint_io.serialized_units,
+        checkpoint_written_bytes = stats.checkpoint_io.written_bytes,
+        checkpoint_max_unit_bytes = stats.checkpoint_io.max_serialized_unit_bytes,
+        checkpoint_retained_bytes = stats.checkpoint_io.retained_bytes,
+        "historical semantic hydration checkpoint outcome"
+    );
+    Ok(stats)
+}
+
+/// Test-only seam for exercising the exact production hydration wrapper from
+/// lazy-ref callers while supplying a deterministic clean build identity.
+/// Production never accepts an identity from the request or environment.
+#[cfg(test)]
+pub(crate) fn enrich_imported_changes_with_semantics_test_checkpoint(
+    imported: &mut [kin_git::ImportedChange],
+    blob_store: &kin_blobs::BlobStore,
+    kin_root: &Path,
+    clean_git_sha: &str,
+    boundary_root: SemanticChangeId,
+) -> Result<HydrationReplayStats> {
+    enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
+        imported,
+        blob_store,
+        true,
+        Some(HydrationCheckpointConfig::clean_for_test(
+            kin_root,
+            clean_git_sha,
+            1,
+            16 * 1024 * 1024,
+        )),
+        boundary_root,
+    )
+}
+
 /// Replay body shared by production (`parse_memo_enabled = true`) and the
 /// memo-off serial oracle used in tests. Returns `(parse_memo_hits,
 /// parse_memo_misses)` observed over the pass.
+#[cfg(test)]
 fn enrich_imported_changes_with_semantics_inner(
     imported: &mut [kin_git::ImportedChange],
     blob_store: &kin_blobs::BlobStore,
     parse_memo_enabled: bool,
 ) -> Result<(usize, usize)> {
+    let stats = enrich_imported_changes_with_semantics_with_checkpoints(
+        imported,
+        blob_store,
+        parse_memo_enabled,
+        None,
+    )?;
+    Ok((stats.parse_memo_hits, stats.parse_memo_misses))
+}
+
+#[cfg(test)]
+fn enrich_imported_changes_with_semantics_with_checkpoints(
+    imported: &mut [kin_git::ImportedChange],
+    blob_store: &kin_blobs::BlobStore,
+    parse_memo_enabled: bool,
+    checkpoint_config: Option<HydrationCheckpointConfig>,
+) -> Result<HydrationReplayStats> {
+    enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
+        imported,
+        blob_store,
+        parse_memo_enabled,
+        checkpoint_config,
+        kin_core::build_genesis_change().id,
+    )
+}
+
+fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
+    imported: &mut [kin_git::ImportedChange],
+    blob_store: &kin_blobs::BlobStore,
+    parse_memo_enabled: bool,
+    checkpoint_config: Option<HydrationCheckpointConfig>,
+    boundary_root: SemanticChangeId,
+) -> Result<HydrationReplayStats> {
     // Profiling timers (accumulated across every commit in the pass).
     let mut total_blob_read_time = std::time::Duration::ZERO;
     let mut total_parsing_time = std::time::Duration::ZERO;
@@ -1333,6 +2019,12 @@ fn enrich_imported_changes_with_semantics_inner(
     let total_commits = imported.len();
     let start_time = std::time::Instant::now();
 
+    // kin-git closes every truncation-horizon edge onto the import's genesis.
+    // Validate that contract before acquiring the checkpoint-store lock, reading
+    // blobs, or mutating deltas so corruption can never be mistaken for a root
+    // baseline or leave a partial side effect.
+    validate_imported_parent_closure(imported, boundary_root)?;
+
     // Resolve each imported commit's FIRST git parent to an in-set slice index.
     // kin-git derives a commit's artifact deltas by diffing its tree against its
     // first parent's tree, so the first parent's semantic state is the correct
@@ -1348,11 +2040,13 @@ fn enrich_imported_changes_with_semantics_inner(
     let first_parent_index: Vec<Option<usize>> = imported
         .iter()
         .map(|imported_change| {
-            imported_change
-                .change
-                .parents
-                .first()
-                .and_then(|parent| index_by_change_id.get(parent).copied())
+            imported_change.change.parents.first().and_then(|parent| {
+                (*parent != boundary_root).then(|| {
+                    *index_by_change_id
+                        .get(parent)
+                        .expect("validated imported first parent must be present")
+                })
+            })
         })
         .collect();
 
@@ -1363,11 +2057,34 @@ fn enrich_imported_changes_with_semantics_inner(
     for parent in first_parent_index.iter().flatten() {
         remaining_children[*parent] += 1;
     }
+    let initial_remaining_children = remaining_children.clone();
 
-    let order = first_parent_topological_order(&first_parent_index);
+    // Reject cycles before checkpoint prepare acquires the repository-scoped
+    // store lock or creates any store paths. Git cannot contain a commit
+    // cycle, so accepting one here would only turn corrupt input into a later
+    // missing-snapshot failure with partial hydration side effects.
+    let order = first_parent_topological_order(&first_parent_index)?;
     let mut snapshots = HashMap::<SemanticChangeId, ImportedCommitSemanticState>::new();
+    let mut resumed_from = 0usize;
+    let mut checkpoint_session = if let Some(config) = checkpoint_config {
+        let (session, resume) = HydrationCheckpointSession::prepare(
+            config,
+            imported,
+            &order,
+            &first_parent_index,
+            &initial_remaining_children,
+        )?;
+        if let Some(resume) = resume {
+            resumed_from = resume.processed_count;
+            remaining_children = resume.remaining_children;
+            snapshots = resume.frontier;
+        }
+        Some(session)
+    } else {
+        None
+    };
 
-    for (processed, &i) in order.iter().enumerate() {
+    for (processed, &i) in order.iter().enumerate().skip(resumed_from) {
         if total_commits > 0 {
             let percent = ((processed + 1) * 100) / total_commits;
             let short_oid: String = imported[i].git_oid.chars().take(7).collect();
@@ -1389,13 +2106,20 @@ fn enrich_imported_changes_with_semantics_inner(
         // per-commit body below already uses.
         let baseline = match first_parent_index[i] {
             Some(parent_idx) => {
-                remaining_children[parent_idx] -= 1;
+                remaining_children[parent_idx] = remaining_children[parent_idx]
+                    .checked_sub(1)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "historical hydration invariant violated: first-parent child count underflow at {}",
+                            imported[parent_idx].change.id
+                        )
+                    })?;
                 let parent_id = imported[parent_idx].change.id;
-                if remaining_children[parent_idx] == 0 {
-                    snapshots.remove(&parent_id).unwrap_or_default()
-                } else {
-                    snapshots.get(&parent_id).cloned().unwrap_or_default()
-                }
+                take_imported_parent_baseline(
+                    &mut snapshots,
+                    parent_id,
+                    remaining_children[parent_idx] == 0,
+                )?
             }
             None => ImportedCommitSemanticState::default(),
         };
@@ -1748,21 +2472,65 @@ fn enrich_imported_changes_with_semantics_inner(
         imported[i].change.entity_deltas = entity_deltas;
         imported[i].change.relation_deltas = relation_deltas;
 
-        // Retain this commit's resulting state only while a later child will
-        // fork from it; leaves are dropped immediately.
+        let processed_count = processed + 1;
+        let checkpoint_boundary = checkpoint_session.as_ref().and_then(|session| {
+            if !session.enabled() {
+                return None;
+            }
+            let is_base_link = imported[i].change.message == history_checkpoint::BASE_LINK_MESSAGE;
+            let is_final = processed_count == total_commits;
+            let is_periodic = processed_count % session.interval() == 0;
+            if is_base_link {
+                Some(HydrationCheckpointBoundary::BaseLink)
+            } else if is_final {
+                Some(HydrationCheckpointBoundary::Final)
+            } else if is_periodic {
+                Some(HydrationCheckpointBoundary::Periodic)
+            } else {
+                None
+            }
+        });
+
+        let resulting_state = ImportedCommitSemanticState {
+            files: current_files,
+            relations: current_relations,
+            relations_by_src,
+            relations_by_src_artifact,
+            relations_by_dst,
+            linker: incremental_linker,
+        };
+
+        // Retain this commit's resulting state while a later child will fork
+        // from it. A checkpoint boundary additionally retains its own state
+        // even when it is currently a leaf, allowing a longer or shorter
+        // exact-prefix history to resume from that nearest ancestor later.
+        let mut detached_boundary_state = None;
         if remaining_children[i] > 0 {
-            snapshots.insert(
-                imported[i].change.id,
-                ImportedCommitSemanticState {
-                    files: current_files,
-                    relations: current_relations,
-                    relations_by_src,
-                    relations_by_src_artifact,
-                    relations_by_dst,
-                    linker: incremental_linker,
-                },
-            );
+            snapshots.insert(imported[i].change.id, resulting_state);
+        } else if checkpoint_boundary.is_some() {
+            detached_boundary_state = Some(resulting_state);
+        } else {
+            drop(resulting_state);
         }
+
+        if let (Some(session), Some(boundary)) = (checkpoint_session.as_mut(), checkpoint_boundary)
+        {
+            session.persist_boundary(
+                imported,
+                &order,
+                processed_count,
+                boundary,
+                &snapshots,
+                detached_boundary_state.as_ref(),
+            )?;
+        }
+    }
+
+    // Finalize even when `resumed_from == total_commits` and the replay loop
+    // executed zero times. Cache cap enforcement and orphan reachability GC
+    // are store invariants, not side effects of replaying a new boundary.
+    if let Some(session) = checkpoint_session.as_mut() {
+        session.finalize()?;
     }
 
     if total_commits > 0 {
@@ -1770,6 +2538,8 @@ fn enrich_imported_changes_with_semantics_inner(
         let total_time_sec = start_time.elapsed().as_secs_f64();
         eprintln!("  Hydration Profiling Summary:");
         eprintln!("    Total Commits: {}", total_commits);
+        eprintln!("    Resumed From: {}", resumed_from);
+        eprintln!("    Replayed Commits: {}", total_commits - resumed_from);
         eprintln!("    Total Time: {:.1}s", total_time_sec);
         eprintln!(
             "    - Blob Read: {:.1}s ({:.1}%)",
@@ -1802,6 +2572,7 @@ fn enrich_imported_changes_with_semantics_inner(
                 "{}",
                 hydrate_stage_timings_json(
                     total_commits,
+                    resumed_from,
                     total_time_sec,
                     total_blob_read_time.as_secs_f64(),
                     total_parsing_time.as_secs_f64(),
@@ -1814,7 +2585,16 @@ fn enrich_imported_changes_with_semantics_inner(
         }
     }
 
-    Ok((parse_memo_hits, parse_memo_misses))
+    let checkpoint_io = checkpoint_session
+        .as_ref()
+        .map(HydrationCheckpointSession::io_stats)
+        .unwrap_or_default();
+    Ok(HydrationReplayStats {
+        parse_memo_hits,
+        parse_memo_misses,
+        resumed_from,
+        checkpoint_io,
+    })
 }
 
 /// One machine-readable record of the history-hydration replay profile, emitted
@@ -1823,11 +2603,15 @@ fn enrich_imported_changes_with_semantics_inner(
 /// so the line reads in the same order as the human summary printed above it.
 #[derive(Serialize)]
 struct HydrateStageTimings {
-    /// Commits replayed in the pass.
+    /// Total commits in the requested history.
     total_commits: usize,
+    /// Prefix restored from a persisted semantic checkpoint.
+    resumed_from_commits: usize,
+    /// Commits actually replayed during this pass.
+    replayed_commits: usize,
     /// Wall-clock seconds for the whole pass.
     total_s: f64,
-    /// Replay throughput (`total_commits` / `total_s`).
+    /// Replay throughput (`replayed_commits` / `total_s`).
     commits_per_s: f64,
     /// Seconds spent reading blobs.
     blob_read_s: f64,
@@ -1874,6 +2658,7 @@ fn hydrate_stage_timings_enabled() -> bool {
 #[allow(clippy::too_many_arguments)]
 fn hydrate_stage_timings_json(
     total_commits: usize,
+    resumed_from_commits: usize,
     total_s: f64,
     blob_read_s: f64,
     parsing_s: f64,
@@ -1882,11 +2667,12 @@ fn hydrate_stage_timings_json(
     parse_memo_hits: usize,
     parse_memo_misses: usize,
 ) -> String {
+    let replayed_commits = total_commits.saturating_sub(resumed_from_commits);
     // Guard the divide so a zero wall never yields NaN/Infinity (serde renders
     // those as `null`, which would break the "always a parseable number"
     // contract). A real pass always has a positive wall.
     let commits_per_s = if total_s > 0.0 {
-        total_commits as f64 / total_s
+        replayed_commits as f64 / total_s
     } else {
         0.0
     };
@@ -1894,6 +2680,8 @@ fn hydrate_stage_timings_json(
     let line = HydrateStageTimingsLine {
         kin_hydrate_stage_timings: HydrateStageTimings {
             total_commits,
+            resumed_from_commits,
+            replayed_commits,
             total_s,
             commits_per_s,
             blob_read_s,
@@ -4224,11 +5012,78 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_change_retry_only_relaxes_regenerated_provenance() {
+        let mut original = kin_core::build_genesis_change();
+        original.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x81; 32]));
+        original.parents = vec![kin_core::build_genesis_change().id];
+        original.message = "kin init: auto-parse".to_string();
+        original.entity_deltas = vec![
+            EntityDelta::Added(test_entity("first", "src/lib.rs")),
+            EntityDelta::Added(test_entity("second", "src/lib.rs")),
+        ];
+        let mut retried = original.clone();
+        retried.author = AuthorId::new("different-local-user");
+        retried.timestamp = Timestamp::now();
+        retried.entity_deltas.reverse();
+
+        assert!(deterministic_change_payload_matches(
+            &original,
+            &retried,
+            DeterministicChangeProvenance::Regenerated,
+        ));
+        assert!(!deterministic_change_payload_matches(
+            &original,
+            &retried,
+            DeterministicChangeProvenance::Stable,
+        ));
+
+        let mut changed_entity = retried.clone();
+        match &mut changed_entity.entity_deltas[0] {
+            EntityDelta::Added(entity) => entity.signature.push_str(" -> changed"),
+            _ => unreachable!(),
+        }
+        assert!(!deterministic_change_payload_matches(
+            &original,
+            &changed_entity,
+            DeterministicChangeProvenance::Regenerated,
+        ));
+
+        retried.message = "changed semantic payload".to_string();
+        assert!(!deterministic_change_payload_matches(
+            &original,
+            &retried,
+            DeterministicChangeProvenance::Regenerated,
+        ));
+    }
+
+    #[test]
+    fn repaired_history_validation_refuses_non_self_cycles() {
+        let root = kin_core::build_genesis_change();
+        let root_id = root.id;
+        let first_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x82; 32]));
+        let second_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x83; 32]));
+        let mut first = root.clone();
+        first.id = first_id;
+        first.parents = vec![second_id];
+        let mut second = root.clone();
+        second.id = second_id;
+        second.parents = vec![first_id];
+        let changes = [(root_id, root), (first_id, first), (second_id, second)]
+            .into_iter()
+            .collect();
+
+        let error = validate_repaired_change_history(&changes, &HashMap::new(), root_id)
+            .expect_err("repair must not normalize broader parent-DAG corruption");
+        assert!(error.to_string().contains("parent DAG contains a cycle"));
+    }
+
+    #[test]
     fn hydrate_stage_timings_json_is_parseable_with_explicit_residue() {
         // Representative pass: the four buckets leave a non-trivial residue, and
         // most parses were served from the memo.
-        let line =
-            hydrate_stage_timings_json(32865, 1933.4, 42.5, 261.9, 954.7, 641.2, 30000, 2865);
+        let line = hydrate_stage_timings_json(
+            32865, 32000, 1933.4, 42.5, 261.9, 954.7, 641.2, 30000, 2865,
+        );
 
         let value: serde_json::Value =
             serde_json::from_str(&line).expect("emitted line must be parseable JSON");
@@ -4238,6 +5093,8 @@ mod tests {
 
         // Count is an integer; every timing is a real (finite) float, never null.
         assert_eq!(obj["total_commits"].as_u64(), Some(32865));
+        assert_eq!(obj["resumed_from_commits"].as_u64(), Some(32000));
+        assert_eq!(obj["replayed_commits"].as_u64(), Some(865));
         for key in [
             "total_s",
             "commits_per_s",
@@ -4273,13 +5130,15 @@ mod tests {
             "other_s must be the explicit unattributed residue"
         );
 
-        // Throughput is commits / wall.
-        assert!((obj["commits_per_s"].as_f64().unwrap() - 32865.0 / 1933.4).abs() < 1e-9);
+        // Throughput counts only work done in this process, never the restored prefix.
+        assert!((obj["commits_per_s"].as_f64().unwrap() - 865.0 / 1933.4).abs() < 1e-9);
 
         // Keys are emitted in the documented order, not alphabetized.
         let order = [
             "kin_hydrate_stage_timings",
             "total_commits",
+            "resumed_from_commits",
+            "replayed_commits",
             "total_s",
             "commits_per_s",
             "blob_read_s",
@@ -4304,7 +5163,7 @@ mod tests {
     fn hydrate_stage_timings_json_guards_zero_wall() {
         // A zero wall must not emit NaN/Infinity (serde renders those as null);
         // commits_per_s falls back to 0.0 and stays a parseable number.
-        let line = hydrate_stage_timings_json(10, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0);
+        let line = hydrate_stage_timings_json(10, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0);
         let value: serde_json::Value =
             serde_json::from_str(&line).expect("emitted line must be parseable JSON");
         let obj = &value["kin_hydrate_stage_timings"];
@@ -4470,7 +5329,7 @@ mod tests {
         let mut imported = vec![
             imported_change(
                 [0x11; 32],
-                [0x10; 32],
+                [0; 32],
                 "imported root",
                 vec![artifact_delta(
                     "src/lib.py",
@@ -4592,7 +5451,7 @@ mod tests {
             vec![
                 imported_change(
                     [0x31; 32],
-                    [0x30; 32],
+                    [0; 32],
                     "add module",
                     vec![artifact_delta(
                         "src/mod.py",
@@ -4723,7 +5582,7 @@ mod tests {
             vec![
                 imported_change(
                     [0x41; 32],
-                    [0x40; 32],
+                    [0; 32],
                     "seed the tree",
                     vec![
                         artifact_delta(
@@ -4966,7 +5825,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let mut imported = vec![
             imported_change(
                 [0x21; 32],
-                [0x20; 32],
+                [0; 32],
                 "imported root",
                 vec![artifact_delta(
                     "command/pr_checkout.go",
@@ -5026,7 +5885,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let mut imported = vec![
             imported_change(
                 [0x21; 32],
-                [0x20; 32],
+                [0; 32],
                 "imported root",
                 vec![
                     artifact_delta(
@@ -5109,7 +5968,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let mut imported = vec![
             imported_change(
                 [0x31; 32],
-                [0x30; 32],
+                [0; 32],
                 "imported root",
                 vec![
                     artifact_delta(
@@ -5166,7 +6025,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let mut imported = vec![
             imported_change(
                 [0x41; 32],
-                [0x40; 32],
+                [0; 32],
                 "imported root",
                 vec![artifact_delta(
                     "src/lib.py",
@@ -5224,7 +6083,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let mut imported = vec![
             imported_change(
                 [0x51; 32],
-                [0x50; 32],
+                [0; 32],
                 "root: add f",
                 vec![artifact_delta(
                     "src/lib.py",
@@ -5326,6 +6185,30 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 .output();
         }
         true
+    }
+
+    fn commit_git_file_for_test(dir: &Path, path: &str, content: &str, message: &str) -> bool {
+        let file = dir.join(path);
+        if let Some(parent) = file.parent() {
+            if fs::create_dir_all(parent).is_err() {
+                return false;
+            }
+        }
+        if fs::write(&file, content).is_err() {
+            return false;
+        }
+        Command::new("git")
+            .args(["add", path])
+            .current_dir(dir)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+            && Command::new("git")
+                .args(["commit", "-q", "-m", message])
+                .current_dir(dir)
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
     }
 
     /// Replay the DAG reachable from `head` and report whether a LIVE relation
@@ -5465,7 +6348,8 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         )
         .unwrap()
         .expect("a truncated window must yield a base-link change");
-        enrich_imported_changes_with_semantics(&mut anchored, &blob_store).unwrap();
+        enrich_imported_changes_with_semantics_and_genesis(&mut anchored, &blob_store, genesis_id)
+            .unwrap();
 
         // The base-link root change itself must carry the inbound handler→foo
         // edge, resolved against the FULL base universe.
@@ -5517,7 +6401,8 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             Some(&blob_store),
         )
         .unwrap();
-        enrich_imported_changes_with_semantics(&mut control, &blob_store).unwrap();
+        enrich_imported_changes_with_semantics_and_genesis(&mut control, &blob_store, genesis_id)
+            .unwrap();
         let control_head = control.last().unwrap().change.id;
         assert!(
             !replayed_edge_present(&control, control_head, "handler", "foo"),
@@ -5611,7 +6496,8 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         )
         .unwrap()
         .expect("a truncated window must yield a base-link change");
-        enrich_imported_changes_with_semantics(&mut anchored, &blob_store).unwrap();
+        enrich_imported_changes_with_semantics_and_genesis(&mut anchored, &blob_store, genesis_id)
+            .unwrap();
 
         // The base-link carries the bare-name receiver-method edge...
         assert!(
@@ -5639,7 +6525,8 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             Some(&blob_store),
         )
         .unwrap();
-        enrich_imported_changes_with_semantics(&mut control, &blob_store).unwrap();
+        enrich_imported_changes_with_semantics_and_genesis(&mut control, &blob_store, genesis_id)
+            .unwrap();
         let control_head = control.last().unwrap().change.id;
         assert!(
             !replayed_edge_present(&control, control_head, "run", "Widget::work"),
@@ -5731,7 +6618,12 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 Some(&blob_store),
             )
             .unwrap();
-            enrich_imported_changes_with_semantics(&mut imported, &blob_store).unwrap();
+            enrich_imported_changes_with_semantics_and_genesis(
+                &mut imported,
+                &blob_store,
+                genesis_id,
+            )
+            .unwrap();
             imported.into_iter().map(|ic| ic.change).collect()
         };
 
@@ -5889,9 +6781,11 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         kin_git::ImportedChange {
             change: SemanticChange {
                 id: SemanticChangeId::from_hash(Hash256::from_bytes(id_bytes)),
-                parents: vec![SemanticChangeId::from_hash(Hash256::from_bytes(
-                    parent_bytes,
-                ))],
+                parents: vec![if parent_bytes == [0; 32] {
+                    kin_core::build_genesis_change().id
+                } else {
+                    SemanticChangeId::from_hash(Hash256::from_bytes(parent_bytes))
+                }],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: message.to_string(),
@@ -5906,6 +6800,986 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             },
             git_oid: hex::encode(id_bytes),
         }
+    }
+
+    fn checkpoint_fixture(blob_store: &kin_blobs::BlobStore) -> Vec<kin_git::ImportedChange> {
+        let util_v1 = blob_store
+            .write(b"def helper(value):\n    return value\n")
+            .unwrap();
+        let app_v1 = blob_store
+            .write(b"from util import helper\n\ndef run():\n    return helper(1)\n")
+            .unwrap();
+        let util_v2 = blob_store
+            .write(b"def helper(value):\n    return value + 1\n")
+            .unwrap();
+        let sibling_v1 = blob_store
+            .write(b"def sibling():\n    return 'branch'\n")
+            .unwrap();
+        vec![
+            imported_change(
+                [0x71; 32],
+                [0; 32],
+                history_checkpoint::BASE_LINK_MESSAGE,
+                vec![artifact_delta(
+                    "util.py",
+                    kin_model::ArtifactDeltaKind::Added,
+                    None,
+                    Some(Hash256::from_bytes(util_v1.0)),
+                )],
+            ),
+            imported_change(
+                [0x72; 32],
+                [0x71; 32],
+                "add caller",
+                vec![artifact_delta(
+                    "app.py",
+                    kin_model::ArtifactDeltaKind::Added,
+                    None,
+                    Some(Hash256::from_bytes(app_v1.0)),
+                )],
+            ),
+            imported_change(
+                [0x73; 32],
+                [0x71; 32],
+                "add sibling branch",
+                vec![artifact_delta(
+                    "sibling.py",
+                    kin_model::ArtifactDeltaKind::Added,
+                    None,
+                    Some(Hash256::from_bytes(sibling_v1.0)),
+                )],
+            ),
+            imported_change(
+                [0x74; 32],
+                [0x72; 32],
+                "change helper",
+                vec![artifact_delta(
+                    "util.py",
+                    kin_model::ArtifactDeltaKind::Modified,
+                    Some(Hash256::from_bytes(util_v1.0)),
+                    Some(Hash256::from_bytes(util_v2.0)),
+                )],
+            ),
+        ]
+    }
+
+    fn linear_checkpoint_fixture(
+        blob_store: &kin_blobs::BlobStore,
+        count: usize,
+    ) -> Vec<kin_git::ImportedChange> {
+        assert!((1..=200).contains(&count));
+        let source = blob_store
+            .write(b"def checkpoint_scale_fixture():\n    return 1\n")
+            .unwrap();
+        (1..=count)
+            .map(|position| {
+                let deltas = if position == 1 {
+                    vec![artifact_delta(
+                        "scale.py",
+                        kin_model::ArtifactDeltaKind::Added,
+                        None,
+                        Some(Hash256::from_bytes(source.0)),
+                    )]
+                } else {
+                    Vec::new()
+                };
+                imported_change(
+                    [position as u8; 32],
+                    if position == 1 {
+                        [0; 32]
+                    } else {
+                        [(position - 1) as u8; 32]
+                    },
+                    &format!("scale commit {position}"),
+                    deltas,
+                )
+            })
+            .collect()
+    }
+
+    fn assert_same_hydration_deltas(
+        expected: &[kin_git::ImportedChange],
+        actual: &[kin_git::ImportedChange],
+    ) {
+        assert_eq!(expected.len(), actual.len());
+        for (position, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+            assert_eq!(
+                canonical_json(&expected.change.entity_deltas),
+                canonical_json(&actual.change.entity_deltas),
+                "entity deltas diverged at commit {position}"
+            );
+            assert_eq!(
+                canonical_json(&expected.change.relation_deltas),
+                canonical_json(&actual.change.relation_deltas),
+                "relation deltas diverged at commit {position}"
+            );
+        }
+    }
+
+    fn recursive_checkpoint_files(root: &Path) -> Vec<PathBuf> {
+        fn walk(dir: &Path, output: &mut Vec<PathBuf>) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, output);
+                } else if path.is_file() {
+                    output.push(path);
+                }
+            }
+        }
+        let mut output = Vec::new();
+        walk(root, &mut output);
+        output.sort();
+        output
+    }
+
+    fn checkpoint_path_has_component(path: &Path, expected: &str) -> bool {
+        path.components()
+            .any(|component| component.as_os_str() == expected)
+    }
+
+    fn checkpoint_path_has_file_suffix(path: &Path, suffix: &str) -> bool {
+        path.file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with(suffix))
+    }
+
+    fn checkpoint_file_map(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        recursive_checkpoint_files(root)
+            .into_iter()
+            .map(|path| {
+                (
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(path).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    const CHECKPOINT_WORKER_ROOT: &str = "KIN_TEST_CHECKPOINT_WORKER_ROOT";
+    const CHECKPOINT_WORKER_BLOBS: &str = "KIN_TEST_CHECKPOINT_WORKER_BLOBS";
+    const CHECKPOINT_WORKER_VARIANT: &str = "KIN_TEST_CHECKPOINT_WORKER_VARIANT";
+    const CHECKPOINT_WORKER_LOCK_ATTEMPT: &str = "KIN_TEST_CHECKPOINT_LOCK_ATTEMPT";
+    const CHECKPOINT_WORKER_LOCK_ACQUIRED: &str = "KIN_TEST_CHECKPOINT_LOCK_ACQUIRED";
+    const CHECKPOINT_WORKER_LOCK_RELEASE: &str = "KIN_TEST_CHECKPOINT_LOCK_RELEASE";
+
+    fn checkpoint_worker_command(
+        root: &Path,
+        blobs: &Path,
+        variant: &str,
+    ) -> std::process::Command {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "commands::init::tests::checkpoint_subprocess_worker",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHECKPOINT_WORKER_ROOT, root)
+            .env(CHECKPOINT_WORKER_BLOBS, blobs)
+            .env(CHECKPOINT_WORKER_VARIANT, variant);
+        command
+    }
+
+    fn assert_checkpoint_worker(output: std::process::Output) {
+        assert!(
+            output.status.success(),
+            "checkpoint subprocess failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn wait_for_test_path(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for test handshake {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn checkpoint_subprocess_worker() {
+        let Ok(root) = std::env::var(CHECKPOINT_WORKER_ROOT) else {
+            return;
+        };
+        let blobs = PathBuf::from(std::env::var(CHECKPOINT_WORKER_BLOBS).unwrap());
+        let variant = std::env::var(CHECKPOINT_WORKER_VARIANT).unwrap();
+        let blob_store = kin_blobs::BlobStore::new(blobs).unwrap();
+        let mut history = checkpoint_fixture(&blob_store);
+        if variant == "linear" {
+            history.truncate(2);
+        } else if variant == "crash-orphan" {
+            history[0].change.message = "orphan-only crash boundary".to_string();
+        } else {
+            assert_eq!(variant, "branched");
+        }
+        let mut config = HydrationCheckpointConfig::clean_for_test(
+            Path::new(&root),
+            "subprocess-clean-sha",
+            1,
+            16 * 1024 * 1024,
+        );
+        if let (Ok(attempt), Ok(acquired)) = (
+            std::env::var(CHECKPOINT_WORKER_LOCK_ATTEMPT),
+            std::env::var(CHECKPOINT_WORKER_LOCK_ACQUIRED),
+        ) {
+            let release = std::env::var(CHECKPOINT_WORKER_LOCK_RELEASE)
+                .ok()
+                .map(PathBuf::from);
+            config = config.with_lock_test_hook(
+                PathBuf::from(attempt),
+                PathBuf::from(acquired),
+                release,
+            );
+        }
+        if variant == "crash-orphan" {
+            config = config.with_crash_after_objects_before_manifest();
+        }
+        enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut history,
+            &blob_store,
+            true,
+            Some(config),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn checkpoint_bytes_are_identical_across_real_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_a = dir.path().join("kin-a");
+        let root_b = dir.path().join("kin-b");
+        assert_checkpoint_worker(
+            checkpoint_worker_command(&root_a, &dir.path().join("blobs-a"), "branched")
+                .output()
+                .unwrap(),
+        );
+        assert_checkpoint_worker(
+            checkpoint_worker_command(&root_b, &dir.path().join("blobs-b"), "branched")
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(
+            checkpoint_file_map(&root_a),
+            checkpoint_file_map(&root_b),
+            "separate OS processes emitted different canonical checkpoint bytes"
+        );
+    }
+
+    #[test]
+    fn concurrent_processes_publish_without_dangling_checkpoint_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("shared-kin");
+        let holder_attempt = dir.path().join("holder-attempt");
+        let holder_acquired = dir.path().join("holder-acquired");
+        let holder_release = dir.path().join("holder-release");
+        let waiter_attempt = dir.path().join("waiter-attempt");
+        let waiter_acquired = dir.path().join("waiter-acquired");
+
+        let mut holder_command =
+            checkpoint_worker_command(&root, &dir.path().join("linear-blobs"), "linear");
+        holder_command
+            .env(CHECKPOINT_WORKER_LOCK_ATTEMPT, &holder_attempt)
+            .env(CHECKPOINT_WORKER_LOCK_ACQUIRED, &holder_acquired)
+            .env(CHECKPOINT_WORKER_LOCK_RELEASE, &holder_release);
+        let linear = holder_command.spawn().unwrap();
+        wait_for_test_path(&holder_acquired);
+
+        let mut waiter_command =
+            checkpoint_worker_command(&root, &dir.path().join("branched-blobs"), "branched");
+        waiter_command
+            .env(CHECKPOINT_WORKER_LOCK_ATTEMPT, &waiter_attempt)
+            .env(CHECKPOINT_WORKER_LOCK_ACQUIRED, &waiter_acquired);
+        let branched = waiter_command.spawn().unwrap();
+        wait_for_test_path(&waiter_attempt);
+        assert!(
+            !waiter_acquired.exists(),
+            "second process acquired the store while the first process held it"
+        );
+
+        fs::write(&holder_release, b"release\n").unwrap();
+        assert_checkpoint_worker(linear.wait_with_output().unwrap());
+        assert_checkpoint_worker(branched.wait_with_output().unwrap());
+        assert!(
+            waiter_acquired.exists(),
+            "waiting process never acquired the store after deterministic release"
+        );
+
+        let config = HydrationCheckpointConfig::clean_for_test(
+            &root,
+            "subprocess-clean-sha",
+            1,
+            16 * 1024 * 1024,
+        );
+        history_checkpoint::validate_store_for_test(&config).unwrap();
+
+        // A fresh consumer can also restore and complete from the concurrently
+        // published store, establishing that manifests are operational rather
+        // than merely parseable.
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("verify-blobs")).unwrap();
+        let mut history = checkpoint_fixture(&blob_store);
+        let stats = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut history,
+            &blob_store,
+            true,
+            Some(config),
+        )
+        .unwrap();
+        assert!(stats.resumed_from > 0);
+    }
+
+    #[test]
+    fn installed_objects_without_manifest_are_recovered_after_real_process_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("crash-kin");
+        let crashed =
+            checkpoint_worker_command(&root, &dir.path().join("crash-blobs"), "crash-orphan")
+                .output()
+                .unwrap();
+        assert!(
+            !crashed.status.success(),
+            "crash worker unexpectedly published a complete checkpoint"
+        );
+
+        let orphan_objects: Vec<_> = recursive_checkpoint_files(&root)
+            .into_iter()
+            .filter(|path| checkpoint_path_has_component(path, "objects"))
+            .collect();
+        assert!(
+            orphan_objects.len() >= 3,
+            "crash did not leave the installed segment and frontier objects"
+        );
+        assert!(
+            recursive_checkpoint_files(&root)
+                .iter()
+                .all(|path| !checkpoint_path_has_file_suffix(path, ".manifest.json")),
+            "crash injection occurred after manifest publication"
+        );
+
+        assert_checkpoint_worker(
+            checkpoint_worker_command(&root, &dir.path().join("recovery-blobs"), "branched")
+                .output()
+                .unwrap(),
+        );
+        for orphan in orphan_objects {
+            assert!(
+                !orphan.exists(),
+                "prepare maintenance retained unreachable crash object {}",
+                orphan.display()
+            );
+        }
+        let config = HydrationCheckpointConfig::clean_for_test(
+            &root,
+            "subprocess-clean-sha",
+            1,
+            16 * 1024 * 1024,
+        );
+        history_checkpoint::validate_store_for_test(&config).unwrap();
+    }
+
+    #[test]
+    fn segmented_checkpoint_resume_is_canonical_prefix_reusable_and_bit_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let mut oracle = checkpoint_fixture(&blob_store);
+        enrich_imported_changes_with_semantics_inner(&mut oracle, &blob_store, true).unwrap();
+
+        let root_a = dir.path().join("kin-a");
+        let config_a =
+            HydrationCheckpointConfig::clean_for_test(&root_a, "clean-sha-a", 1, 16 * 1024 * 1024);
+        let mut first = checkpoint_fixture(&blob_store);
+        let first_stats = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut first,
+            &blob_store,
+            true,
+            Some(config_a.clone()),
+        )
+        .unwrap();
+        assert_eq!(first_stats.resumed_from, 0);
+        assert_eq!(first_stats.checkpoint_io.serialized_units, 16);
+        assert_eq!(first_stats.checkpoint_io.written_units, 16);
+        assert!(first_stats.checkpoint_io.max_serialized_unit_bytes > 0);
+        assert_same_hydration_deltas(&oracle, &first);
+
+        let root_b = dir.path().join("kin-b");
+        let config_b =
+            HydrationCheckpointConfig::clean_for_test(&root_b, "clean-sha-a", 1, 16 * 1024 * 1024);
+        let mut independent = checkpoint_fixture(&blob_store);
+        enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut independent,
+            &blob_store,
+            true,
+            Some(config_b),
+        )
+        .unwrap();
+        assert_eq!(
+            checkpoint_file_map(&root_a),
+            checkpoint_file_map(&root_b),
+            "independent clean runs must emit byte-identical object graphs"
+        );
+        let canonical_checkpoint_map = checkpoint_file_map(&root_a);
+
+        let segment_files: Vec<_> = recursive_checkpoint_files(&root_a)
+            .into_iter()
+            .filter(|path| checkpoint_path_has_component(path, "segments"))
+            .collect();
+        assert_eq!(segment_files.len(), 4, "one immutable segment per boundary");
+
+        let mut historical_ref = checkpoint_fixture(&blob_store);
+        historical_ref.truncate(3);
+        let historical_stats = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut historical_ref,
+            &blob_store,
+            true,
+            Some(config_a.clone()),
+        )
+        .unwrap();
+        assert_eq!(historical_stats.resumed_from, 3);
+        assert_eq!(historical_stats.checkpoint_io.serialized_units, 0);
+        assert_same_hydration_deltas(&oracle[..3], &historical_ref);
+
+        let mut manifests: Vec<_> = recursive_checkpoint_files(&root_a)
+            .into_iter()
+            .filter(|path| checkpoint_path_has_file_suffix(path, ".manifest.json"))
+            .collect();
+        manifests.sort();
+        fs::remove_file(&manifests[2]).unwrap();
+        fs::remove_file(&manifests[3]).unwrap();
+        let mut resumed = checkpoint_fixture(&blob_store);
+        let resumed_stats = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut resumed,
+            &blob_store,
+            true,
+            Some(config_a),
+        )
+        .unwrap();
+        assert_eq!(resumed_stats.resumed_from, 2);
+        assert_eq!(
+            resumed_stats.checkpoint_io.serialized_units, 8,
+            "two suffix boundaries serialize exactly segment+parser-frontier+linker-frontier+manifest each"
+        );
+        assert_eq!(
+            resumed_stats.checkpoint_io.reused_units, 0,
+            "prepare GC must remove every object made unreachable by the deleted manifests"
+        );
+        assert_eq!(
+            resumed_stats.checkpoint_io.written_units, 8,
+            "both replayed boundaries must rebuild segment, frontiers, and manifest after startup reachability GC"
+        );
+        assert_eq!(
+            checkpoint_file_map(&root_a),
+            canonical_checkpoint_map,
+            "resumed reconstruction must restore the exact canonical object graph"
+        );
+        assert_same_hydration_deltas(&oracle, &resumed);
+    }
+
+    #[test]
+    fn checkpoint_falls_back_when_new_side_branch_needs_an_older_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let root = dir.path().join("kin");
+        let config =
+            HydrationCheckpointConfig::clean_for_test(&root, "clean-sha", 1, 16 * 1024 * 1024);
+
+        // First history is linear A -> B. Its final B checkpoint retains B, not
+        // A, because no future branch is known yet.
+        let mut linear = checkpoint_fixture(&blob_store);
+        linear.truncate(2);
+        let seeded = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut linear,
+            &blob_store,
+            true,
+            Some(config.clone()),
+        )
+        .unwrap();
+        assert_eq!(seeded.resumed_from, 0);
+
+        // The complete fixture preserves exact prefix A,B but adds C from A.
+        // B's valid frontier is now inapplicable; A is the newest applicable
+        // checkpoint and must be selected instead of refusing the store.
+        let mut oracle = checkpoint_fixture(&blob_store);
+        enrich_imported_changes_with_semantics_inner(&mut oracle, &blob_store, true).unwrap();
+        let mut branched = checkpoint_fixture(&blob_store);
+        let resumed = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut branched,
+            &blob_store,
+            true,
+            Some(config),
+        )
+        .unwrap();
+        assert_eq!(resumed.resumed_from, 1);
+        assert_same_hydration_deltas(&oracle, &branched);
+    }
+
+    #[test]
+    fn checkpoint_build_identity_is_strict_and_dirty_or_unknown_builds_do_full_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let mut oracle = checkpoint_fixture(&blob_store);
+        enrich_imported_changes_with_semantics_inner(&mut oracle, &blob_store, true).unwrap();
+
+        let clean_root = dir.path().join("clean");
+        let clean_a = HydrationCheckpointConfig::clean_for_test(
+            &clean_root,
+            "clean-sha-a",
+            1,
+            16 * 1024 * 1024,
+        );
+        let mut seeded = checkpoint_fixture(&blob_store);
+        enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut seeded,
+            &blob_store,
+            true,
+            Some(clean_a),
+        )
+        .unwrap();
+        let clean_b = HydrationCheckpointConfig::clean_for_test(
+            &clean_root,
+            "clean-sha-b",
+            1,
+            16 * 1024 * 1024,
+        );
+        let error = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut checkpoint_fixture(&blob_store),
+            &blob_store,
+            true,
+            Some(clean_b),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("clean build/version key mismatch"));
+        let dependency_b = HydrationCheckpointConfig::clean_for_test(
+            &clean_root,
+            "clean-sha-a",
+            1,
+            16 * 1024 * 1024,
+        )
+        .with_dependency_provenance_for_test("different-lock-provenance");
+        let dependency_error = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut checkpoint_fixture(&blob_store),
+            &blob_store,
+            true,
+            Some(dependency_b),
+        )
+        .unwrap_err();
+        assert!(dependency_error
+            .to_string()
+            .contains("clean build/version key mismatch"));
+        let seeded_files = checkpoint_file_map(&clean_root);
+
+        for (name, reason) in [
+            ("dirty", "dirty build is ambiguous"),
+            ("unknown", "unknown build SHA"),
+        ] {
+            let config = HydrationCheckpointConfig::disabled_for_test(
+                &clean_root,
+                &format!("{name}: {reason}"),
+            );
+            let mut replayed = checkpoint_fixture(&blob_store);
+            let stats = enrich_imported_changes_with_semantics_with_checkpoints(
+                &mut replayed,
+                &blob_store,
+                true,
+                Some(config),
+            )
+            .unwrap();
+            assert_eq!(stats.resumed_from, 0);
+            assert_eq!(stats.checkpoint_io.serialized_units, 0);
+            assert_eq!(
+                checkpoint_file_map(&clean_root),
+                seeded_files,
+                "{name} build must neither reuse nor mutate a seeded store"
+            );
+            assert_same_hydration_deltas(&oracle, &replayed);
+        }
+    }
+
+    #[test]
+    fn checkpoint_segment_frontier_and_manifest_corruption_all_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        for component in [
+            "segments",
+            "parser-frontiers",
+            "linker-frontiers",
+            "manifest",
+        ] {
+            let root = dir.path().join(format!("corrupt-{component}"));
+            let config =
+                HydrationCheckpointConfig::clean_for_test(&root, "clean-sha", 1, 16 * 1024 * 1024);
+            let mut seeded = checkpoint_fixture(&blob_store);
+            enrich_imported_changes_with_semantics_with_checkpoints(
+                &mut seeded,
+                &blob_store,
+                true,
+                Some(config.clone()),
+            )
+            .unwrap();
+            let targets: Vec<_> = recursive_checkpoint_files(&root)
+                .into_iter()
+                .filter(|path| {
+                    if component == "manifest" {
+                        checkpoint_path_has_file_suffix(path, ".manifest.json")
+                    } else {
+                        checkpoint_path_has_component(path, component)
+                    }
+                })
+                .collect();
+            assert!(!targets.is_empty(), "missing {component} fixture artifact");
+            for path in targets {
+                fs::write(path, b"corrupt").unwrap();
+            }
+            let error = enrich_imported_changes_with_semantics_with_checkpoints(
+                &mut checkpoint_fixture(&blob_store),
+                &blob_store,
+                true,
+                Some(config),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("REFUSED hydration checkpoint"),
+                "{} corruption was not refused: {error:#}",
+                component
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_byte_cap_is_enforced_without_changing_semantic_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let mut oracle = checkpoint_fixture(&blob_store);
+        enrich_imported_changes_with_semantics_inner(&mut oracle, &blob_store, true).unwrap();
+        let root = dir.path().join("capped");
+        let stale_temp = root
+            .join("checkpoints/history-hydration/objects/segments")
+            .join(".orphan.json.tmp.999999");
+        fs::create_dir_all(stale_temp.parent().unwrap()).unwrap();
+        fs::write(&stale_temp, vec![0x55; 8 * 1024]).unwrap();
+        let config = HydrationCheckpointConfig::clean_for_test(&root, "clean-sha", 1, 1);
+        let mut replayed = checkpoint_fixture(&blob_store);
+        let stats = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut replayed,
+            &blob_store,
+            true,
+            Some(config),
+        )
+        .unwrap();
+        assert!(stats.checkpoint_io.retained_bytes <= 1);
+        assert_eq!(stats.checkpoint_io.serialized_units, 4);
+        assert!(!stale_temp.exists(), "stale crash temp was not reaped");
+        let retained: u64 = recursive_checkpoint_files(&root)
+            .iter()
+            .map(|path| fs::metadata(path).unwrap().len())
+            .sum();
+        assert!(retained <= 1);
+        assert_same_hydration_deltas(&oracle, &replayed);
+    }
+
+    #[test]
+    fn lowered_byte_cap_and_orphan_gc_apply_on_exact_full_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let root = dir.path().join("cap-resume");
+        let high_cap =
+            HydrationCheckpointConfig::clean_for_test(&root, "clean-sha", 1, 16 * 1024 * 1024);
+        let mut seeded = checkpoint_fixture(&blob_store);
+        let seed_stats = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut seeded,
+            &blob_store,
+            true,
+            Some(high_cap),
+        )
+        .unwrap();
+        let low_cap = seed_stats.checkpoint_io.retained_bytes;
+        assert!(low_cap > 0);
+
+        // Model an object that was installed after the high-cap run but never
+        // made reachable from a manifest. The lower cap is exactly the known
+        // good store size, so a zero-replay resume must collect this object in
+        // prepare rather than returning early above the new policy limit.
+        let orphan = root
+            .join("checkpoints/history-hydration/objects/segments")
+            .join(format!("{}.json", "f".repeat(64)));
+        fs::write(&orphan, vec![0x55; 8 * 1024]).unwrap();
+
+        let low_config = HydrationCheckpointConfig::clean_for_test(&root, "clean-sha", 1, low_cap);
+        let mut resumed = checkpoint_fixture(&blob_store);
+        let resume_stats = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut resumed,
+            &blob_store,
+            true,
+            Some(low_config.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            resume_stats.resumed_from,
+            resumed.len(),
+            "exact final checkpoint should still take the zero-replay path"
+        );
+        assert!(!orphan.exists(), "unreachable object survived prepare GC");
+        assert!(resume_stats.checkpoint_io.retained_bytes <= low_cap);
+        history_checkpoint::validate_store_for_test(&low_config).unwrap();
+        assert_same_hydration_deltas(&seeded, &resumed);
+    }
+
+    #[test]
+    fn checkpoint_retention_keeps_base_latest_and_even_interior_with_deterministic_gc() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let root = dir.path().join("retained");
+        let config =
+            HydrationCheckpointConfig::clean_for_test(&root, "clean-sha", 1, 16 * 1024 * 1024)
+                .with_retention_for_test(3, 2);
+        let mut hydrated = checkpoint_fixture(&blob_store);
+        enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut hydrated,
+            &blob_store,
+            true,
+            Some(config),
+        )
+        .unwrap();
+
+        let files = recursive_checkpoint_files(&root);
+        let manifests: Vec<_> = files
+            .iter()
+            .filter(|path| checkpoint_path_has_file_suffix(path, ".manifest.json"))
+            .collect();
+        let manifest_positions: Vec<_> = manifests
+            .iter()
+            .map(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .split('-')
+                    .next()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(manifest_positions, vec![1, 2, 4]);
+        assert_eq!(
+            files
+                .iter()
+                .filter(|path| checkpoint_path_has_component(path, "parser-frontiers"))
+                .count(),
+            3,
+            "unreferenced parser frontier was not collected"
+        );
+        assert_eq!(
+            files
+                .iter()
+                .filter(|path| checkpoint_path_has_component(path, "linker-frontiers"))
+                .count(),
+            3,
+            "unreferenced linker frontier was not collected"
+        );
+        assert_eq!(
+            files
+                .iter()
+                .filter(|path| checkpoint_path_has_component(path, "segments"))
+                .count(),
+            4,
+            "latest immutable delta chain must retain every bounded segment to genesis"
+        );
+    }
+
+    #[test]
+    fn checkpoint_retained_byte_reconciliation_is_linear_not_per_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let run = |count: usize, name: &str| {
+            let root = dir.path().join(name);
+            let config = HydrationCheckpointConfig::clean_for_test(
+                &root,
+                "scale-clean-sha",
+                1,
+                64 * 1024 * 1024,
+            );
+            let mut history = linear_checkpoint_fixture(&blob_store, count);
+            enrich_imported_changes_with_semantics_with_checkpoints(
+                &mut history,
+                &blob_store,
+                true,
+                Some(config),
+            )
+            .unwrap()
+            .checkpoint_io
+        };
+
+        let small = run(8, "small");
+        let large = run(16, "large");
+        assert_eq!(small.retention_full_scans, 2);
+        assert_eq!(large.retention_full_scans, 2);
+        assert!(
+            large.retention_entries_scanned
+                <= small
+                    .retention_entries_scanned
+                    .saturating_mul(3)
+                    .saturating_add(32),
+            "retention reconciliation grew superlinearly: small={} large={}",
+            small.retention_entries_scanned,
+            large.retention_entries_scanned
+        );
+    }
+
+    #[test]
+    fn missing_first_parent_snapshot_is_an_invariant_error() {
+        let parent = SemanticChangeId::from_hash(Hash256::from_bytes([0x44; 32]));
+        let mut snapshots = HashMap::new();
+        for is_last_child in [false, true] {
+            let error = take_imported_parent_baseline(&mut snapshots, parent, is_last_child)
+                .err()
+                .expect("missing parent snapshot must fail");
+            assert!(error
+                .to_string()
+                .contains("missing retained first-parent state"));
+        }
+    }
+
+    #[test]
+    fn dangling_imported_parent_refuses_before_checkpoint_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let root = dir.path().join("kin");
+        let config =
+            HydrationCheckpointConfig::clean_for_test(&root, "clean-sha", 1, 16 * 1024 * 1024);
+        let mut imported = checkpoint_fixture(&blob_store);
+        let dangling = SemanticChangeId::from_hash(Hash256::from_bytes([0xee; 32]));
+        imported[0].change.parents = vec![dangling];
+
+        let error = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut imported,
+            &blob_store,
+            true,
+            Some(config),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("dangling parent"), "{error:#}");
+        assert!(imported
+            .iter()
+            .all(|entry| entry.change.entity_deltas.is_empty()
+                && entry.change.relation_deltas.is_empty()));
+        assert!(
+            !root.join("checkpoints/history-hydration").exists(),
+            "parent preflight must run before lock/store creation"
+        );
+    }
+
+    #[test]
+    fn cyclic_imported_first_parent_refuses_before_checkpoint_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let root = dir.path().join("kin");
+        let config =
+            HydrationCheckpointConfig::clean_for_test(&root, "clean-sha", 1, 16 * 1024 * 1024);
+        let mut imported = checkpoint_fixture(&blob_store);
+        let first = imported[0].change.id;
+        let second = imported[1].change.id;
+        imported[0].change.parents = vec![second];
+        imported[1].change.parents = vec![first];
+
+        let error = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut imported,
+            &blob_store,
+            true,
+            Some(config),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("imported parent DAG contains a cycle"),
+            "unexpected cycle refusal: {error:#}"
+        );
+        assert!(imported
+            .iter()
+            .all(|entry| entry.change.entity_deltas.is_empty()
+                && entry.change.relation_deltas.is_empty()));
+        assert!(
+            !root.join("checkpoints/history-hydration").exists(),
+            "cycle preflight must run before lock/store creation"
+        );
+    }
+
+    #[test]
+    fn cyclic_imported_secondary_parent_refuses_before_checkpoint_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let root = dir.path().join("kin");
+        let config =
+            HydrationCheckpointConfig::clean_for_test(&root, "clean-sha", 1, 16 * 1024 * 1024);
+        let mut imported = checkpoint_fixture(&blob_store);
+        let boundary_root = kin_core::build_genesis_change().id;
+        let first = imported[0].change.id;
+        let second = imported[1].change.id;
+
+        // Both first-parent paths reach canonical genesis, but the secondary
+        // edges form first -> second -> first. First-parent-only validation
+        // used to accept this corrupt merge shape and acquire the store lock.
+        imported[0].change.parents = vec![boundary_root, second];
+        imported[1].change.parents = vec![boundary_root, first];
+
+        let error = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut imported,
+            &blob_store,
+            true,
+            Some(config),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("imported parent DAG contains a cycle"),
+            "unexpected secondary-parent cycle refusal: {error:#}"
+        );
+        assert!(imported
+            .iter()
+            .all(|entry| entry.change.entity_deltas.is_empty()
+                && entry.change.relation_deltas.is_empty()));
+        assert!(
+            !root.join("checkpoints/history-hydration").exists(),
+            "secondary-parent preflight must run before lock/store creation"
+        );
+    }
+
+    #[test]
+    fn imported_change_cannot_collide_with_boundary_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let root = dir.path().join("kin");
+        let config =
+            HydrationCheckpointConfig::clean_for_test(&root, "clean-sha", 1, 16 * 1024 * 1024);
+        let boundary_root = kin_core::build_genesis_change().id;
+        let mut imported = checkpoint_fixture(&blob_store);
+        imported[0].change.id = boundary_root;
+
+        let error = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut imported,
+            &blob_store,
+            true,
+            Some(config),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("collides with boundary root"),
+            "unexpected root-collision refusal: {error:#}"
+        );
+        assert!(
+            !root.join("checkpoints/history-hydration").exists(),
+            "root-collision preflight must run before lock/store creation"
+        );
     }
 
     fn entity_by_name(graph: &kin_db::InMemoryGraph, file: &str, name: &str) -> Entity {
@@ -6753,6 +8627,775 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         assert_repo_owned_graph_truth(graph.as_ref(), &expected_paths);
         assert_makefile_is_text_searchable(graph.as_ref());
         assert!(!tracked_graph_paths(graph.as_ref()).contains(".kin/snapshot/manifest.json"));
+    }
+
+    fn assert_history_derived_indexes_are_unique(snapshot: &kin_db::GraphSnapshot) {
+        for children in snapshot.change_children.values() {
+            let unique: HashSet<_> = children.iter().copied().collect();
+            assert_eq!(
+                unique.len(),
+                children.len(),
+                "duplicate parent-to-child reverse edge survived upgrade"
+            );
+        }
+        for revisions in snapshot.entity_revisions.values() {
+            let unique: HashSet<_> = revisions
+                .iter()
+                .map(|revision| revision.revision_id)
+                .collect();
+            assert_eq!(
+                unique.len(),
+                revisions.len(),
+                "duplicate entity revision generation survived upgrade"
+            );
+        }
+    }
+
+    fn seed_release_old_warm_import(
+        repo_dir: &Path,
+        layout: &kin_core::KinLayout,
+    ) -> Vec<SemanticChangeId> {
+        let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+        let graph = snap.graph();
+        let branch = kin_core::read_current_branch(layout).unwrap();
+        let legacy_boundary = graph.get_branch(&branch).unwrap().unwrap().head;
+        let blob_store = kin_blobs::BlobStore::new(layout.objects_dir()).unwrap();
+        let options = git_history_import_options("recent").unwrap();
+        let mut legacy = kin_git::import_git_history_with_blobs(
+            repo_dir,
+            legacy_boundary,
+            &options,
+            Some(&blob_store),
+        )
+        .unwrap();
+        kin_git::anchor_imported_history_at_base_link(
+            repo_dir,
+            &mut legacy,
+            legacy_boundary,
+            Some(&blob_store),
+        )
+        .unwrap();
+
+        // This is the exact old publication defect: warm init supplied the
+        // current imported head as its boundary, then reinserted every
+        // deterministic Git id. Reuse the already-persisted semantic deltas;
+        // the old replay also treated that wrong boundary as external, so the
+        // only authoritative record difference is the generated parent edge.
+        for imported in &legacy {
+            let mut old_release_record = graph
+                .get_change(&imported.change.id)
+                .unwrap()
+                .expect("fresh init must already contain every imported Git id");
+            old_release_record.parents = imported.change.parents.clone();
+            graph.create_change(&old_release_record).unwrap();
+        }
+        let ids: Vec<_> = legacy.iter().map(|entry| entry.change.id).collect();
+        graph
+            .update_branch_head(&branch, ids.last().unwrap())
+            .unwrap();
+        snap.save().unwrap();
+        ids
+    }
+
+    fn rewrite_warm_auto_parse_to_legacy_entity_order(layout: &kin_core::KinLayout) {
+        let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+        let graph = snap.graph();
+        let branch = kin_core::read_current_branch(layout).unwrap();
+        let imported_head = graph.get_branch(&branch).unwrap().unwrap().head;
+        let mut snapshot = graph.to_snapshot();
+        let candidates = snapshot
+            .changes
+            .values_mut()
+            .filter(|change| {
+                change.message == "kin init: auto-parse" && change.parents == vec![imported_head]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "fixture needs exactly one warm auto-parse record parented by the imported head"
+        );
+        let change = candidates.into_iter().next().unwrap();
+        assert!(
+            change.entity_deltas.len() >= 2
+                && change
+                    .entity_deltas
+                    .iter()
+                    .all(|delta| matches!(delta, EntityDelta::Added(_))),
+            "fixture needs a multi-entity Added-only auto-parse payload"
+        );
+        let canonical_ids = change
+            .entity_deltas
+            .iter()
+            .map(|delta| match delta {
+                EntityDelta::Added(entity) => entity.id,
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        change.entity_deltas.reverse();
+        let legacy_ids = change
+            .entity_deltas
+            .iter()
+            .map(|delta| match delta {
+                EntityDelta::Added(entity) => entity.id,
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(
+            legacy_ids, canonical_ids,
+            "fixture must persist the old hash-map entity ordering"
+        );
+
+        drop(graph);
+        let legacy_graph =
+            kin_db::InMemoryGraph::from_snapshot_with_text_index(snapshot, layout.text_index_dir());
+        snap.swap(legacy_graph);
+        snap.save().unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn consecutive_default_git_history_inits_keep_canonical_boundary_root() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        if !init_git_repo_for_test(repo_dir.path())
+            || !commit_git_file_for_test(
+                repo_dir.path(),
+                "src/lib.rs",
+                "pub fn answer() -> u32 { 42 }\n",
+                "initial",
+            )
+        {
+            return;
+        }
+        let git_oid = read_git_head(repo_dir.path()).unwrap();
+        let git_change = kin_git::semantic_change_id_from_git_oid_hex(&git_oid).unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home_dir.path());
+        let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
+        let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
+
+        let mut second_change_children = None;
+        let mut second_entity_revisions = None;
+        let mut second_changes = None;
+        for pass in 0..3 {
+            run(
+                Some(repo_dir.path().display().to_string()),
+                false,
+                true,
+                false,
+                true,
+                "recent".to_string(),
+            )
+            .await
+            .unwrap();
+
+            if pass >= 1 {
+                let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
+                let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+                let persisted = snap.graph().to_snapshot();
+                for children in persisted.change_children.values() {
+                    let unique: HashSet<_> = children.iter().copied().collect();
+                    assert_eq!(
+                        unique.len(),
+                        children.len(),
+                        "repeated init duplicated a parent-to-child reverse edge"
+                    );
+                }
+                for revisions in persisted.entity_revisions.values() {
+                    let unique: HashSet<_> = revisions
+                        .iter()
+                        .map(|revision| revision.revision_id)
+                        .collect();
+                    assert_eq!(
+                        unique.len(),
+                        revisions.len(),
+                        "repeated init duplicated an entity revision generation"
+                    );
+                }
+                if pass == 1 {
+                    second_change_children = Some(persisted.change_children);
+                    second_entity_revisions = Some(persisted.entity_revisions);
+                    second_changes = Some(
+                        persisted
+                            .changes
+                            .iter()
+                            .map(|(id, change)| {
+                                (id.to_string(), serde_json::to_value(change).unwrap())
+                            })
+                            .collect::<BTreeMap<_, _>>(),
+                    );
+                } else {
+                    assert_eq!(
+                        second_change_children.as_ref().unwrap(),
+                        &persisted.change_children,
+                        "third init changed reverse DAG indexes"
+                    );
+                    assert_eq!(
+                        second_entity_revisions.as_ref().unwrap(),
+                        &persisted.entity_revisions,
+                        "third init replayed revision generations"
+                    );
+                    assert_eq!(
+                        second_changes.as_ref().unwrap(),
+                        &persisted
+                            .changes
+                            .iter()
+                            .map(|(id, change)| {
+                                (id.to_string(), serde_json::to_value(change).unwrap())
+                            })
+                            .collect::<BTreeMap<_, _>>(),
+                        "third init rewrote a deterministic change record"
+                    );
+                }
+            }
+        }
+
+        let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
+        let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+        let graph = snap.graph();
+        let imported = graph.get_change(&git_change).unwrap().unwrap();
+        assert_eq!(
+            imported.parents,
+            vec![kin_core::build_genesis_change().id],
+            "true Git root must stay attached to canonical Kin genesis"
+        );
+        let persisted = graph.to_snapshot();
+        assert_eq!(
+            persisted
+                .change_children
+                .get(&kin_core::build_genesis_change().id)
+                .into_iter()
+                .flatten()
+                .filter(|child| **child == git_change)
+                .count(),
+            1,
+            "canonical genesis must name the imported root exactly once"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn warm_init_repairs_legacy_self_parent_without_stale_reverse_edges() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        if !init_git_repo_for_test(repo_dir.path())
+            || !commit_git_file_for_test(
+                repo_dir.path(),
+                "src/lib.rs",
+                "pub fn answer() -> u32 { 42 }\n",
+                "initial",
+            )
+        {
+            return;
+        }
+        let git_oid = read_git_head(repo_dir.path()).unwrap();
+        let git_change = kin_git::semantic_change_id_from_git_oid_hex(&git_oid).unwrap();
+        let canonical_root = kin_core::build_genesis_change().id;
+        let home_dir = tempfile::tempdir().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home_dir.path());
+        let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
+        let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
+
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "recent".to_string(),
+        )
+        .await
+        .unwrap();
+
+        // Reproduce the pre-fix warm-init corruption under kin-db 0.2.31:
+        // overwriting the deterministic Git change with a self-parent appends
+        // both a stale reverse edge and duplicate revision generations.
+        let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
+        {
+            let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+            let graph = snap.graph();
+            let mut malformed = graph.get_change(&git_change).unwrap().unwrap();
+            malformed.parents = vec![git_change];
+            graph.create_change(&malformed).unwrap();
+            let branch = kin_core::read_current_branch(&layout).unwrap();
+            graph.update_branch_head(&branch, &git_change).unwrap();
+            snap.save().unwrap();
+        }
+
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "recent".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+        let persisted = snap.graph().to_snapshot();
+        assert_eq!(
+            persisted.changes[&git_change].parents,
+            vec![canonical_root],
+            "legacy self-parent was not repaired to canonical genesis"
+        );
+        assert!(
+            !persisted
+                .change_children
+                .get(&git_change)
+                .into_iter()
+                .flatten()
+                .any(|child| *child == git_change),
+            "repair left the legacy self edge in the reverse index"
+        );
+        assert_eq!(
+            persisted
+                .change_children
+                .get(&canonical_root)
+                .into_iter()
+                .flatten()
+                .filter(|child| **child == git_change)
+                .count(),
+            1,
+            "repair did not rebuild exactly one canonical reverse edge"
+        );
+        for children in persisted.change_children.values() {
+            let unique: HashSet<_> = children.iter().copied().collect();
+            assert_eq!(unique.len(), children.len());
+        }
+        for revisions in persisted.entity_revisions.values() {
+            let unique: HashSet<_> = revisions
+                .iter()
+                .map(|revision| revision.revision_id)
+                .collect();
+            assert_eq!(
+                unique.len(),
+                revisions.len(),
+                "repair retained duplicate revision generations"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn release_old_two_commit_cycle_upgrades_to_canonical_git_history() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        if !init_git_repo_for_test(repo_dir.path())
+            || !commit_git_file_for_test(
+                repo_dir.path(),
+                "src/lib.rs",
+                "pub fn answer() -> u32 { 1 }\npub fn helper() -> u32 { 2 }\n",
+                "first",
+            )
+            || !commit_git_file_for_test(
+                repo_dir.path(),
+                "src/lib.rs",
+                "pub fn answer(value: u32) -> u32 { value }\npub fn helper() -> u32 { 2 }\n",
+                "second",
+            )
+        {
+            return;
+        }
+        let home_dir = tempfile::tempdir().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home_dir.path());
+        let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
+        let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
+
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "recent".to_string(),
+        )
+        .await
+        .unwrap();
+        let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
+
+        // v0.2.15 generated this warm deterministic record from hash-map
+        // iteration order. The current build sorts by entity id. Preserve the
+        // old ordering in an otherwise byte-equivalent multi-entity payload so
+        // this run reaches, and then repairs, the old Git boundary cycle.
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "recent".to_string(),
+        )
+        .await
+        .unwrap();
+        rewrite_warm_auto_parse_to_legacy_entity_order(&layout);
+        let legacy_ids = seed_release_old_warm_import(repo_dir.path(), &layout);
+        assert!(legacy_ids.len() >= 2);
+        {
+            let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+            let graph = snap.graph();
+            assert_eq!(
+                graph.get_change(&legacy_ids[0]).unwrap().unwrap().parents,
+                vec![*legacy_ids.last().unwrap()],
+                "fixture did not reproduce the old head-as-boundary edge"
+            );
+            assert!(candidate_parent_path_reaches(
+                &graph.to_snapshot().changes,
+                &legacy_ids.iter().copied().collect(),
+                *legacy_ids.last().unwrap(),
+                legacy_ids[0],
+            ));
+        }
+
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "recent".to_string(),
+        )
+        .await
+        .expect("new init must upgrade the exact old multi-commit cycle");
+
+        let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+        let persisted = snap.graph().to_snapshot();
+        assert_eq!(
+            persisted.changes[&legacy_ids[0]].parents,
+            vec![kin_core::build_genesis_change().id]
+        );
+        for pair in legacy_ids.windows(2) {
+            assert_eq!(persisted.changes[&pair[1]].parents[0], pair[0]);
+        }
+        assert_history_derived_indexes_are_unique(&persisted);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn empty_head_still_upgrades_legacy_git_history_to_canonical_log() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        if !init_git_repo_for_test(repo_dir.path())
+            || !commit_git_file_for_test(
+                repo_dir.path(),
+                "src/lib.rs",
+                "pub fn transient() -> u32 { 1 }\n",
+                "add source",
+            )
+        {
+            return;
+        }
+        fs::remove_file(repo_dir.path().join("src/lib.rs")).unwrap();
+        fs::remove_dir(repo_dir.path().join("src")).unwrap();
+        if !Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo_dir.path())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+            || !Command::new("git")
+                .args(["commit", "-q", "-m", "delete final source"])
+                .current_dir(repo_dir.path())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        {
+            return;
+        }
+        assert!(
+            fs::read_dir(repo_dir.path())
+                .unwrap()
+                .all(|entry| entry.unwrap().file_name() == ".git"),
+            "fixture HEAD must contain no working-tree files"
+        );
+
+        let home_dir = tempfile::tempdir().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home_dir.path());
+        let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
+        let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "recent".to_string(),
+        )
+        .await
+        .expect("an empty HEAD must still import committed Git history");
+
+        let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
+        let legacy_ids = seed_release_old_warm_import(repo_dir.path(), &layout);
+        assert_eq!(legacy_ids.len(), 2);
+        {
+            let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+            assert_eq!(
+                snap.graph()
+                    .get_change(&legacy_ids[0])
+                    .unwrap()
+                    .unwrap()
+                    .parents,
+                vec![legacy_ids[1]],
+                "fixture did not install the old head-as-boundary cycle"
+            );
+        }
+
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "recent".to_string(),
+        )
+        .await
+        .expect("empty HEAD must not bypass legacy history repair");
+
+        let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+        let graph = snap.graph();
+        let persisted = graph.to_snapshot();
+        assert_eq!(
+            persisted.changes[&legacy_ids[0]].parents,
+            vec![kin_core::build_genesis_change().id]
+        );
+        assert_eq!(
+            persisted.changes[&legacy_ids[1]].parents,
+            vec![legacy_ids[0]]
+        );
+        let branch = kin_core::read_current_branch(&layout).unwrap();
+        assert_eq!(
+            graph.get_branch(&branch).unwrap().unwrap().head,
+            legacy_ids[1]
+        );
+        let log = graph
+            .get_changes_since(&kin_core::build_genesis_change().id, &legacy_ids[1])
+            .expect("canonical history log must be traversable from genesis");
+        assert!(legacy_ids
+            .iter()
+            .all(|id| log.iter().any(|change| change.id == *id)));
+        assert_history_derived_indexes_are_unique(&persisted);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn canonical_import_with_duplicate_derived_indexes_is_rebuilt_on_upgrade() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        if !init_git_repo_for_test(repo_dir.path())
+            || !commit_git_file_for_test(
+                repo_dir.path(),
+                "src/lib.rs",
+                "pub fn answer() -> u32 { 1 }\n",
+                "first",
+            )
+            || !commit_git_file_for_test(
+                repo_dir.path(),
+                "src/lib.rs",
+                "pub fn answer(value: u32) -> u32 { value }\n",
+                "second",
+            )
+        {
+            return;
+        }
+        let home_dir = tempfile::tempdir().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home_dir.path());
+        let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
+        let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
+
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "recent".to_string(),
+        )
+        .await
+        .unwrap();
+        let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
+        let candidate_ids = {
+            let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+            let graph = snap.graph();
+            let branch = kin_core::read_current_branch(&layout).unwrap();
+            let head = graph.get_branch(&branch).unwrap().unwrap().head;
+            let changes = graph
+                .get_changes_since(&kin_core::build_genesis_change().id, &head)
+                .unwrap();
+            let ids: Vec<_> = changes
+                .iter()
+                .filter(|change| change.message != "kin init: auto-parse")
+                .map(|change| change.id)
+                .collect();
+            for _ in 0..2 {
+                for id in &ids {
+                    graph
+                        .create_change(&graph.get_change(id).unwrap().unwrap())
+                        .unwrap();
+                }
+            }
+            snap.save().unwrap();
+            ids
+        };
+        let candidate_set: HashSet<_> = candidate_ids.iter().copied().collect();
+        {
+            let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+            let persisted = snap.graph().to_snapshot();
+            assert!(candidate_reverse_index_needs_rebuild(
+                &persisted,
+                &candidate_set
+            ));
+            assert!(candidate_revision_index_needs_rebuild(
+                &persisted,
+                &candidate_set
+            ));
+            assert!(candidate_ids.iter().all(|id| {
+                persisted.changes[id]
+                    .parents
+                    .iter()
+                    .all(|parent| *parent != *id)
+            }));
+        }
+
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "recent".to_string(),
+        )
+        .await
+        .expect("canonical parents with duplicate derived indexes must upgrade");
+        let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+        let persisted = snap.graph().to_snapshot();
+        assert!(!candidate_reverse_index_needs_rebuild(
+            &persisted,
+            &candidate_set
+        ));
+        assert!(!candidate_revision_index_needs_rebuild(
+            &persisted,
+            &candidate_set
+        ));
+        assert_history_derived_indexes_are_unique(&persisted);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn unrelated_self_edge_is_refused_not_reparented_as_git_history() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        if !init_git_repo_for_test(repo_dir.path())
+            || !commit_git_file_for_test(
+                repo_dir.path(),
+                "src/lib.rs",
+                "pub fn answer() -> u32 { 42 }\n",
+                "initial",
+            )
+        {
+            return;
+        }
+        let home_dir = tempfile::tempdir().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home_dir.path());
+        let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
+        let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "recent".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
+        let unrelated_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xd7; 32]));
+        {
+            let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+            let graph = snap.graph();
+            let mut unrelated = kin_core::build_genesis_change();
+            unrelated.id = unrelated_id;
+            unrelated.parents = vec![unrelated_id];
+            unrelated.message = "unrelated corrupt native change".to_string();
+            graph.create_change(&unrelated).unwrap();
+            snap.save().unwrap();
+        }
+
+        let error = run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "recent".to_string(),
+        )
+        .await
+        .expect_err("unrelated self-edge must fail loud");
+        assert!(
+            error
+                .to_string()
+                .contains("legacy Git-import repair: parent DAG contains a cycle"),
+            "unexpected refusal: {error:#}"
+        );
+        let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+        assert_eq!(
+            snap.graph()
+                .get_change(&unrelated_id)
+                .unwrap()
+                .unwrap()
+                .parents,
+            vec![unrelated_id],
+            "refusal must not guess a canonical parent for unrelated corruption"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn git_history_off_then_recent_uses_canonical_boundary_root() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        if !init_git_repo_for_test(repo_dir.path())
+            || !commit_git_file_for_test(
+                repo_dir.path(),
+                "src/lib.rs",
+                "pub fn answer() -> u32 { 42 }\n",
+                "initial",
+            )
+        {
+            return;
+        }
+        let git_oid = read_git_head(repo_dir.path()).unwrap();
+        let git_change = kin_git::semantic_change_id_from_git_oid_hex(&git_oid).unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home_dir.path());
+        let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
+        let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
+
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "off".to_string(),
+        )
+        .await
+        .unwrap();
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "recent".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
+        let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+        let imported = snap.graph().get_change(&git_change).unwrap().unwrap();
+        assert_eq!(
+            imported.parents,
+            vec![kin_core::build_genesis_change().id],
+            "warm import must not use the prior auto-parse head as its root"
+        );
     }
 
     #[tokio::test]

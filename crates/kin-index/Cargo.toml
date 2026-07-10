@@ -17,6 +17,7 @@ tree-sitter = { workspace = true }
 kin-db = { workspace = true }
 notify = { workspace = true }
 rayon = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
@@ -27,3 +28,4 @@ tokio = { workspace = true }
 kin-spine = { workspace = true }
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
+serde_json = { workspace = true }
