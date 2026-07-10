@@ -127,14 +127,12 @@ fn link_cross_file_calls_after_indexing() {
     let files: Vec<FileParseData> = vec![
         FileParseData {
             file_path: utils_idx.file_id.0.clone(),
-            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: utils_idx.entities.clone(),
             relations: vec![],
             imports: vec![],
         },
         FileParseData {
             file_path: main_idx.file_id.0.clone(),
-            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: main_idx.entities.clone(),
             relations: main_idx
                 .unresolved_relations
@@ -309,7 +307,6 @@ export function divide(a: number, b: number): number {
         .iter()
         .map(|idx| FileParseData {
             file_path: idx.file_id.0.clone(),
-            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: idx.entities.clone(),
             relations: idx
                 .unresolved_relations

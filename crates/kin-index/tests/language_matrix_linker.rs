@@ -123,7 +123,6 @@ fn parse_with(adapter: &dyn LanguageAdapter, path: &str, src: &str) -> FileParse
         .collect();
     FileParseData {
         file_path: path.to_string(),
-        parse_completeness: kin_model::ParseCompleteness::Full,
         entities,
         relations: output.relations,
         imports: output.imports,
@@ -220,21 +219,18 @@ fn same_name_free_functions_resolve_to_single_target() {
     let files = vec![
         FileParseData {
             file_path: "c.rs".to_string(),
-            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![caller.clone()],
             relations: vec![calls_relation("run", "shared")],
             imports: vec![],
         },
         FileParseData {
             file_path: "a.rs".to_string(),
-            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![func("shared", "a.rs")],
             relations: vec![],
             imports: vec![],
         },
         FileParseData {
             file_path: "b.rs".to_string(),
-            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![func("shared", "b.rs")],
             relations: vec![],
             imports: vec![],
@@ -255,7 +251,6 @@ fn receiver_fanout_call_count(n: usize) -> usize {
     let caller = method("build", "caller.rs");
     let mut files = vec![FileParseData {
         file_path: "caller.rs".to_string(),
-        parse_completeness: kin_model::ParseCompleteness::Full,
         entities: vec![caller],
         relations: vec![calls_relation("build", "make")],
         imports: vec![],
@@ -264,7 +259,6 @@ fn receiver_fanout_call_count(n: usize) -> usize {
         let path = format!("impl{i}.rs");
         files.push(FileParseData {
             file_path: path.clone(),
-            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![method(&format!("Impl{i}::make"), &path)],
             relations: vec![],
             imports: vec![],
@@ -309,14 +303,12 @@ fn simple_name_resolves_but_dotted_receiver_name_does_not() {
     let simple = vec![
         FileParseData {
             file_path: "caller.rs".to_string(),
-            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![func("run", "caller.rs")],
             relations: vec![calls_relation("run", "execute")],
             imports: vec![],
         },
         FileParseData {
             file_path: "target.rs".to_string(),
-            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![target.clone()],
             relations: vec![],
             imports: vec![],
@@ -331,14 +323,12 @@ fn simple_name_resolves_but_dotted_receiver_name_does_not() {
     let dotted = vec![
         FileParseData {
             file_path: "caller.rs".to_string(),
-            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![func("run", "caller.rs")],
             relations: vec![calls_relation("run", "obj.execute")],
             imports: vec![],
         },
         FileParseData {
             file_path: "target.rs".to_string(),
-            parse_completeness: kin_model::ParseCompleteness::Full,
             entities: vec![target],
             relations: vec![],
             imports: vec![],

@@ -214,6 +214,14 @@ fn fold_python_none_type_expressions(signature: &str) -> Option<String> {
         if bytes[i] == b'#' {
             return None;
         }
+        // Outside a string, Python only permits `\` as an explicit physical
+        // line continuation. Signature extraction can collapse the newline and
+        // leave the slash adjacent to an attribute selector (`obj.\ type`), so
+        // this lightweight lexer cannot safely decide whether `type` is the
+        // builtin. Fail closed instead of normalizing through the selector.
+        if bytes[i] == b'\\' {
+            return None;
+        }
 
         if python_keyword_at(bytes, i, b"type") {
             let previous_non_space = bytes[..i]
@@ -2504,6 +2512,10 @@ mod tests {
         assert!(!signature_runtime_neutral(
             "def f(x=obj.type(None))",
             "def f(x=obj.types.NoneType)"
+        ));
+        assert!(!signature_runtime_neutral(
+            "def f(x=obj.\\ type(None))",
+            "def f(x=obj.\\ types.NoneType)"
         ));
     }
 

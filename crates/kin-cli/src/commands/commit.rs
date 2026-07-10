@@ -17,8 +17,8 @@ use anyhow::Result;
 use kin_index::{FileClassification, FileClassifier};
 #[cfg(test)]
 use kin_model::{
-    relation::GraphNodeId, ArtifactDelta, ArtifactDeltaKind, AuthorId, EntityDelta, FilePathId,
-    Hash256, RelationDelta, SemanticChange, ShallowTrackedFile, Timestamp,
+    relation::GraphNodeId, ArtifactDelta, ArtifactDeltaKind, ArtifactId, AuthorId, EntityDelta,
+    FilePathId, Hash256, RelationDelta, SemanticChange, ShallowTrackedFile, Timestamp,
 };
 
 pub async fn run(message: String, quiet: bool) -> Result<()> {
@@ -106,6 +106,7 @@ async fn run_local_commit_pipeline_for_tests(
 
     let mut total_files = 0usize;
     let mut file_parse_data: Vec<kin_index::linker::FileParseDataWithTests> = Vec::new();
+    let mut parse_completeness_by_file = kin_index::FileParseCompletenessMap::new();
     // Track which files were successfully parsed for entity reconciliation
     let mut parsed_file_entity_names: HashMap<String, HashSet<String>> = HashMap::new();
 
@@ -210,6 +211,7 @@ async fn run_local_commit_pipeline_for_tests(
                 };
                 let parse_completeness =
                     kin_model::ParseCompleteness::from_parse_state(&parse_output.parse_state);
+                parse_completeness_by_file.insert(rel_path.clone(), parse_completeness.clone());
 
                 // Collect relations and imports for cross-file linking
                 let extracted_relations = parse_output.relations;
@@ -266,6 +268,14 @@ async fn run_local_commit_pipeline_for_tests(
                     }
                 }
 
+                graph.upsert_file_layout(&kin_projection::build_layout(
+                    &file_id,
+                    &file_entities,
+                    source.len(),
+                    &[],
+                    parse_completeness,
+                ))?;
+
                 // Record which entity names were parsed for this file
                 total_entity_count += file_entities.len();
                 parsed_file_entity_names.insert(rel_path.clone(), parsed_names);
@@ -273,7 +283,6 @@ async fn run_local_commit_pipeline_for_tests(
                 // Collect file parse data for cross-file linking
                 file_parse_data.push(kin_index::linker::FileParseDataWithTests {
                     file_path: rel_path,
-                    parse_completeness,
                     entities: file_entities,
                     relations: extracted_relations,
                     imports: file_imports,
@@ -425,11 +434,25 @@ async fn run_local_commit_pipeline_for_tests(
                 graph.remove_outgoing_relations(&entity.id)?;
             }
         }
+
+        let file_id = FilePathId::new(&file_data.file_path);
+        let artifact_id = graph
+            .artifact_id_for_path(&file_id)
+            .unwrap_or_else(|| ArtifactId::seed_from_path(&file_data.file_path));
+        let artifact_node = GraphNodeId::Artifact(artifact_id);
+        for rel in graph.get_all_relations_for_node(&artifact_node)? {
+            if rel.src == artifact_node {
+                old_relation_ids.insert(rel.id);
+            }
+        }
     }
 
     // --- Phase: link --- (progress printed by the linker itself)
     let link_start = Instant::now();
-    let linked_relations = kin_index::linker::link_cross_file_with_tests(&file_parse_data);
+    let linked_relations = kin_index::linker::link_cross_file_with_tests_and_completeness(
+        &file_parse_data,
+        &parse_completeness_by_file,
+    );
     let mut relation_deltas = Vec::new();
     let mut new_relation_ids: HashSet<kin_model::RelationId> = HashSet::new();
 
@@ -442,6 +465,7 @@ async fn run_local_commit_pipeline_for_tests(
     // Emit Removed deltas for relations that existed before but weren't re-created
     for old_id in &old_relation_ids {
         if !new_relation_ids.contains(old_id) {
+            graph.remove_relation(old_id)?;
             relation_deltas.push(RelationDelta::Removed(*old_id));
         }
     }

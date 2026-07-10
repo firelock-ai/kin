@@ -1520,13 +1520,15 @@ fn parse_and_index(
     let pi_timer = std::time::Instant::now();
     let (total_entity_count, _total_files, file_parse_data, discovered_tests, projection_relations) =
         index_files(graph, blob_store, indexable_files)?;
+    let parse_completeness_by_file = link_parse_completeness_from_layouts(graph, &file_parse_data)?;
     eprintln!(
         "  [init-timer] {:>30}: {:.2}s",
         "index_files (parse+upsert)",
         pi_timer.elapsed().as_secs_f64()
     );
     // Cross-file relation linking (progress printed by the linker itself)
-    let mut linked_relations = kin_index::link_cross_file(&file_parse_data);
+    let mut linked_relations =
+        kin_index::link_cross_file_with_completeness(&file_parse_data, &parse_completeness_by_file);
     linked_relations.extend(projection_relations);
     eprintln!(
         "  [init-timer] {:>30}: {:.2}s",
@@ -1572,7 +1574,6 @@ enum ParsedFileResult {
     EntitySource {
         rel_path: String,
         hash: [u8; 32],
-        parse_completeness: ParseCompleteness,
         entities: Vec<Entity>,
         discovered_tests: Vec<DiscoveredTest>,
         relations: Vec<kin_parser::ExtractedRelation>,
@@ -1615,17 +1616,23 @@ struct DiscoveredTest {
 #[serde(deny_unknown_fields)]
 struct ImportedSemanticFileState {
     file_path: String,
+    #[serde(default = "legacy_imported_parse_completeness")]
     parse_completeness: ParseCompleteness,
     entities: Vec<Entity>,
     relations: Vec<kin_parser::ExtractedRelation>,
     imports: Vec<kin_parser::FileImport>,
 }
 
+fn legacy_imported_parse_completeness() -> ParseCompleteness {
+    ParseCompleteness::Failed(
+        "historical import checkpoint predates parse-coverage tracking".to_string(),
+    )
+}
+
 impl ImportedSemanticFileState {
     fn to_link_data(&self) -> kin_index::FileParseData {
         kin_index::FileParseData {
             file_path: self.file_path.clone(),
-            parse_completeness: self.parse_completeness.clone(),
             entities: self.entities.clone(),
             relations: self.relations.clone(),
             imports: self.imports.clone(),
@@ -2394,6 +2401,11 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
             .filter_map(|path| current_files.get(path))
             .map(ImportedSemanticFileState::to_link_data)
             .collect::<Vec<_>>();
+        let changed_parse_completeness = impacted_files
+            .iter()
+            .filter_map(|path| current_files.get(path))
+            .map(|file| (file.file_path.clone(), file.parse_completeness.clone()))
+            .collect::<kin_index::FileParseCompletenessMap>();
 
         let mut old_relations = HashMap::<RelationId, Relation>::new();
         for relation_id in &old_relation_ids {
@@ -2414,9 +2426,11 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
             incremental_linker.record_file_includes(&changed_parse_data);
             incremental_linker.record_class_bases(&changed_parse_data);
             let mut new_relations_by_id = HashMap::<RelationId, Relation>::new();
-            for relation in
-                kin_index::link_cross_file_incremental(&changed_parse_data, &incremental_linker)
-            {
+            for relation in kin_index::link_cross_file_incremental_with_completeness(
+                &changed_parse_data,
+                &incremental_linker,
+                &changed_parse_completeness,
+            ) {
                 new_relations_by_id.insert(relation.id, relation);
             }
             total_linking_time += link_start_time.elapsed();
@@ -2898,6 +2912,7 @@ fn imported_relations_equivalent(old: &Relation, new: &Relation) -> bool {
         && old.dst == new.dst
         && old.origin == new.origin
         && old.import_source == new.import_source
+        && old.evidence == new.evidence
         && (old.confidence - new.confidence).abs() < f32::EPSILON
 }
 
@@ -3039,6 +3054,24 @@ fn index_files(
     index_files_with_stable_entity_ids(graph, blob_store, files, &HashMap::new())
 }
 
+fn link_parse_completeness_from_layouts(
+    graph: &kin_db::InMemoryGraph,
+    files: &[kin_index::FileParseData],
+) -> Result<kin_index::FileParseCompletenessMap> {
+    let mut completeness = kin_index::FileParseCompletenessMap::new();
+    for file in files {
+        let file_id = FilePathId::new(&file.file_path);
+        let state = graph
+            .get_file_layout(&file_id)?
+            .map(|layout| layout.parse_completeness)
+            .unwrap_or_else(|| {
+                ParseCompleteness::Failed("indexed source file has no persisted layout".to_string())
+            });
+        completeness.insert(file.file_path.clone(), state);
+    }
+    Ok(completeness)
+}
+
 fn index_files_with_stable_entity_ids(
     graph: &kin_db::InMemoryGraph,
     blob_store: &kin_blobs::BlobStore,
@@ -3157,7 +3190,6 @@ fn index_files_with_stable_entity_ids(
                             ParsedFileResult::EntitySource {
                                 rel_path: file.rel_path.clone(),
                                 hash: file.hash,
-                                parse_completeness,
                                 entities: file_entities,
                                 discovered_tests,
                                 relations: extracted_relations,
@@ -3271,7 +3303,6 @@ fn index_files_with_stable_entity_ids(
             ParsedFileResult::EntitySource {
                 rel_path,
                 hash,
-                parse_completeness,
                 entities,
                 discovered_tests: file_tests,
                 relations,
@@ -3295,7 +3326,6 @@ fn index_files_with_stable_entity_ids(
                 discovered_tests.extend(file_tests.clone());
                 file_parse_data.push(kin_index::FileParseData {
                     file_path: rel_path.clone(),
-                    parse_completeness: parse_completeness.clone(),
                     entities: entities.clone(),
                     relations: relations.clone(),
                     imports: imports.clone(),
@@ -3853,6 +3883,7 @@ fn apply_warm_cache_delta(
         &selected_files,
         &old_entities_by_file,
     )?;
+    let parse_completeness_by_file = link_parse_completeness_from_layouts(graph, &file_parse_data)?;
     dphase!("index_files (reparse)");
 
     remove_stale_reparsed_entities(graph, &old_entities_by_file, &file_parse_data)?;
@@ -3882,8 +3913,11 @@ fn apply_warm_cache_delta(
         incremental_linker.known_files.len()
     );
 
-    let mut linked_relations =
-        kin_index::link_cross_file_incremental(&file_parse_data, &incremental_linker);
+    let mut linked_relations = kin_index::link_cross_file_incremental_with_completeness(
+        &file_parse_data,
+        &incremental_linker,
+        &parse_completeness_by_file,
+    );
     linked_relations.extend(projection_relations);
     let new_relation_ids: HashSet<RelationId> = linked_relations
         .iter()
@@ -5448,7 +5482,7 @@ mod tests {
     }
 
     #[test]
-    fn historical_link_data_preserves_parse_completeness() {
+    fn historical_state_preserves_parse_completeness_separately_from_public_link_data() {
         let expected = ParseCompleteness::Partial(
             "one recovered error range in historical source".to_string(),
         );
@@ -5460,7 +5494,48 @@ mod tests {
             imports: Vec::new(),
         };
 
-        assert_eq!(state.to_link_data().parse_completeness, expected);
+        assert_eq!(state.parse_completeness, expected);
+        let link_data = state.to_link_data();
+        assert_eq!(link_data.file_path, "src/history.py");
+        let completeness = kin_index::FileParseCompletenessMap::from([(
+            state.file_path.clone(),
+            state.parse_completeness.clone(),
+        )]);
+        let mut linker = kin_index::IncrementalLinker::new();
+        linker.add_file(&state.file_path, &state.entities);
+        let relations = kin_index::link_cross_file_incremental_with_completeness(
+            &[link_data],
+            &linker,
+            &completeness,
+        );
+        assert!(relations
+            .iter()
+            .any(|relation| relation.evidence.iter().any(|evidence| {
+                evidence.parser_rule.as_deref()
+                    == Some(kin_index::CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1)
+                    && evidence.source_path.as_deref() == Some("src/history.py")
+            })));
+    }
+
+    #[test]
+    fn historical_relation_equivalence_detects_call_evidence_changes() {
+        let caller = EntityId::from_content("src/caller.py", "caller", "function", 1);
+        let target = EntityId::from_content("src/defs.py", "target", "function", 1);
+        let mut positional = test_relation(RelationKind::Calls, caller, target);
+        positional.evidence = vec![kin_model::RelationEvidence {
+            parser_rule: Some(kin_index::CALL_SHAPE_EVIDENCE_AGGREGATION_V1.to_string()),
+            call_shape: Some(kin_model::CallArgShape::new(1, Vec::new(), false, false)),
+            ..kin_model::RelationEvidence::default()
+        }];
+        let mut keyword = positional.clone();
+        keyword.evidence[0].call_shape = Some(kin_model::CallArgShape::new(
+            0,
+            vec!["value".to_string()],
+            false,
+            false,
+        ));
+
+        assert!(!imported_relations_equivalent(&positional, &keyword));
     }
 
     #[test]

@@ -217,6 +217,7 @@ fn parse_and_index(
     let mut total_entity_count = 0usize;
     let mut total_files = 0usize;
     let mut file_parse_data: Vec<kin_index::linker::FileParseDataWithTests> = Vec::new();
+    let mut parse_completeness_by_file = kin_index::FileParseCompletenessMap::new();
 
     for file_path in all_files {
         let rel_path = file_path
@@ -259,6 +260,7 @@ fn parse_and_index(
         };
         let parse_completeness =
             kin_model::ParseCompleteness::from_parse_state(&parse_output.parse_state);
+        parse_completeness_by_file.insert(rel_path.clone(), parse_completeness.clone());
 
         let extracted_relations = parse_output.relations;
         let file_imports = parse_output.imports;
@@ -277,11 +279,18 @@ fn parse_and_index(
             file_entities.push(entity);
         }
 
+        graph.upsert_file_layout(&kin_projection::build_layout(
+            &file_id,
+            &file_entities,
+            source.len(),
+            &[],
+            parse_completeness,
+        ))?;
+
         total_entity_count += file_entities.len();
 
         file_parse_data.push(kin_index::linker::FileParseDataWithTests {
             file_path: rel_path,
-            parse_completeness,
             entities: file_entities,
             relations: extracted_relations,
             imports: file_imports,
@@ -289,7 +298,10 @@ fn parse_and_index(
         });
     }
 
-    let linked_relations = kin_index::linker::link_cross_file_with_tests(&file_parse_data);
+    let linked_relations = kin_index::linker::link_cross_file_with_tests_and_completeness(
+        &file_parse_data,
+        &parse_completeness_by_file,
+    );
     for rel in &linked_relations {
         graph.upsert_relation(rel)?;
     }

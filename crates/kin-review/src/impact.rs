@@ -39,6 +39,14 @@ fn entity_identity_key(entity: &Entity) -> (String, String, String) {
 /// by construction, so a ref-scoped implementation cannot be misused to
 /// mutate graph state.
 pub trait ImpactGraph {
+    /// Whether graph-owned parser coverage proves every entity-bearing source
+    /// file was parsed fully. The default is fail-closed so implementations of
+    /// the older public trait remain source-compatible without certifying new
+    /// rename-neutralization behavior accidentally.
+    fn call_shape_parse_coverage_complete(&self) -> Result<bool, ReviewError> {
+        Ok(false)
+    }
+
     fn get_entity(&self, id: &EntityId) -> Result<Option<Entity>, ReviewError>;
     fn get_relations(
         &self,
@@ -71,6 +79,66 @@ pub trait ImpactGraph {
 pub struct LiveGraph<'a, G>(pub &'a G);
 
 impl<G: GraphStore> ImpactGraph for LiveGraph<'_, G> {
+    fn call_shape_parse_coverage_complete(&self) -> Result<bool, ReviewError> {
+        let layouts = self.0.list_file_layouts().map_err(ReviewError::graph)?;
+        let entities = self.0.list_all_entities().map_err(ReviewError::graph)?;
+        let mut source_files = BTreeSet::new();
+
+        for layout in layouts {
+            if !matches!(
+                layout.parse_completeness,
+                kin_model::ParseCompleteness::Full
+            ) {
+                return Ok(false);
+            }
+            source_files.insert(layout.file_id.0);
+        }
+        for entity in entities {
+            if let Some(file) = entity.file_origin {
+                source_files.insert(file.0);
+            } else if let Some(span) = entity.span {
+                source_files.insert(span.file.0);
+            }
+        }
+
+        for file in source_files {
+            let file_id = kin_model::FilePathId::new(&file);
+            let Some(artifact_id) = self.0.artifact_id_for_path(&file_id) else {
+                return Ok(false);
+            };
+            let artifact = GraphNodeId::Artifact(artifact_id);
+            let neighborhood = self
+                .0
+                .traverse(&artifact, &[RelationKind::DependsOn], 1)
+                .map_err(ReviewError::graph)?;
+            let mut full = false;
+            for relation in neighborhood
+                .relations
+                .iter()
+                .filter(|relation| relation.src == artifact)
+            {
+                for evidence in &relation.evidence {
+                    match evidence.parser_rule.as_deref() {
+                        Some(kin_index::CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1) => {
+                            return Ok(false)
+                        }
+                        Some(kin_index::CALL_SHAPE_PARSE_COVERAGE_FULL_V1)
+                            if evidence.source_path.as_deref() == Some(file.as_str()) =>
+                        {
+                            full = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if !full {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
     fn get_entity(&self, id: &EntityId) -> Result<Option<Entity>, ReviewError> {
         self.0.get_entity(id).map_err(ReviewError::graph)
     }
@@ -326,6 +394,7 @@ pub fn analyze_impact_at<I: ImpactGraph>(
     let mut seen_tests = HashSet::new();
 
     let mut entity_impacts: Vec<EntityImpact> = Vec::new();
+    let call_shape_parse_coverage_complete = graph.call_shape_parse_coverage_complete()?;
 
     for &entity_id in &changed_ids {
         // Per-entity inbound attribution accumulated alongside the global
@@ -352,7 +421,7 @@ pub fn analyze_impact_at<I: ImpactGraph>(
         // accumulate a distinct union only; iteration order never reaches output.
         let mut ent_caller_keyword_names: BTreeSet<String> = BTreeSet::new();
         let mut ent_any_var_keyword_caller = false;
-        let mut ent_all_consumers_shaped_calls = true;
+        let mut ent_all_consumers_shaped_calls = call_shape_parse_coverage_complete;
 
         // Find relations pointing TO this entity (callers, dependents, etc.).
         // `get_relations` serves outgoing edges only, so the inbound harvest
@@ -824,6 +893,10 @@ mod tests {
     }
 
     impl ImpactGraph for MockImpactGraph {
+        fn call_shape_parse_coverage_complete(&self) -> Result<bool, ReviewError> {
+            Ok(true)
+        }
+
         fn get_entity(&self, id: &EntityId) -> Result<Option<Entity>, ReviewError> {
             Ok(self.entities.get(id).cloned())
         }

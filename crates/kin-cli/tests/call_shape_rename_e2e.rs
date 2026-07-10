@@ -23,18 +23,23 @@
 
 use kin_db::{EntityStore, InMemoryGraph};
 use kin_index::{
-    link_cross_file, FileParseData, CALL_SHAPE_EVIDENCE_AGGREGATION_V1,
-    CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1,
+    link_cross_file, link_cross_file_with_completeness, FileParseCompletenessMap, FileParseData,
+    CALL_SHAPE_EVIDENCE_AGGREGATION_V1, CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1,
 };
 use kin_model::review::{RiskLevel, RiskSummary};
-use kin_model::{Entity, FilePathId, GraphNodeId, ParseCompleteness, RelationKind};
+use kin_model::{
+    Entity, FileLayout, FilePathId, GraphNodeId, ImportSection, ParseCompleteness, RelationKind,
+};
 use kin_parser::{LanguageAdapter, PythonAdapter};
 use kin_review::{
     analyze_impact, collect_inline_comments, derive_shadow_policy, EntityChange, EntityChangeKind,
     InlineCommentKind, Review, SemanticDiff, ShadowGateVerdict,
 };
 
-fn parse_python_bytes_allow_incomplete(file_path: &str, bytes: &[u8]) -> FileParseData {
+fn parse_python_bytes_allow_incomplete(
+    file_path: &str,
+    bytes: &[u8],
+) -> (FileParseData, ParseCompleteness) {
     let adapter = PythonAdapter;
     let file_id = FilePathId::new(file_path);
     let tree = adapter.parse(bytes).expect("parse");
@@ -45,21 +50,23 @@ fn parse_python_bytes_allow_incomplete(file_path: &str, bytes: &[u8]) -> FilePar
         .into_iter()
         .map(|e| e.into_entity_with_source(adapter.language_id(), &file_id, Some(bytes)))
         .collect();
-    FileParseData {
-        file_path: file_path.to_string(),
+    (
+        FileParseData {
+            file_path: file_path.to_string(),
+            entities,
+            relations: output.relations,
+            imports: output.imports,
+        },
         parse_completeness,
-        entities,
-        relations: output.relations,
-        imports: output.imports,
-    }
+    )
 }
 
 fn parse_python_bytes(file_path: &str, bytes: &[u8]) -> FileParseData {
-    let parsed = parse_python_bytes_allow_incomplete(file_path, bytes);
+    let (parsed, parse_completeness) = parse_python_bytes_allow_incomplete(file_path, bytes);
     assert!(
-        matches!(&parsed.parse_completeness, ParseCompleteness::Full),
+        matches!(&parse_completeness, ParseCompleteness::Full),
         "call-shape fixture must exercise a valid Python parse: {:?}",
-        parsed.parse_completeness
+        parse_completeness
     );
     parsed
 }
@@ -94,12 +101,36 @@ fn link_into_graph_bytes(
 fn link_parsed_files_into_graph(
     files: Vec<FileParseData>,
 ) -> (Vec<FileParseData>, Vec<kin_model::Relation>, InMemoryGraph) {
+    let completeness = files
+        .iter()
+        .map(|file| (file.file_path.clone(), ParseCompleteness::Full))
+        .collect();
+    link_parsed_files_into_graph_with_completeness(files, completeness)
+}
+
+fn link_parsed_files_into_graph_with_completeness(
+    files: Vec<FileParseData>,
+    completeness: FileParseCompletenessMap,
+) -> (Vec<FileParseData>, Vec<kin_model::Relation>, InMemoryGraph) {
     // Real linker: resolves calls and persists each Calls edge's argument shape.
-    let relations = link_cross_file(&files);
+    let relations = link_cross_file_with_completeness(&files, &completeness);
 
     // Persist entities and edges into a real graph store, exactly as ingest does.
     let graph = InMemoryGraph::new();
     for file in &files {
+        graph
+            .upsert_file_layout(&FileLayout {
+                file_id: FilePathId::new(&file.file_path),
+                parse_completeness: completeness.get(&file.file_path).cloned().unwrap_or_else(
+                    || ParseCompleteness::Failed("missing test parse coverage".to_string()),
+                ),
+                imports: ImportSection {
+                    byte_range: 0..0,
+                    items: Vec::new(),
+                },
+                regions: Vec::new(),
+            })
+            .expect("upsert file layout");
         for entity in &file.entities {
             graph.upsert_entity(entity).expect("upsert entity");
         }
@@ -421,13 +452,36 @@ def caller():
     return target("explicit")
 "#;
 
-const INCOMPLETE_CALLER_WITH_UNTRUSTWORTHY_COVERAGE: &str = "\
-def target(ext, args):
-    return ext, args
+const PARSED_LINE_CONTINUED_ATTRIBUTE_DEFAULT_OLD: &str = r#"def target(value=obj.\
+ type(None)):
+    return value
 
 
 def caller():
-    target(1, 2)
+    return target("explicit")
+"#;
+
+const PARSED_LINE_CONTINUED_ATTRIBUTE_DEFAULT_NEW: &str = r#"def target(value=obj.\
+ types.NoneType):
+    return value
+
+
+def caller():
+    return target("explicit")
+"#;
+
+const INCOMPLETE_TARGET_DEFINITION: &str = "\
+def target(ext, args):
+    return ext, args
+";
+
+const COMPLETE_POSITIONAL_CALLER: &str = "\
+def caller():
+    return target(1, 2)
+";
+
+const INCOMPLETE_ONLY_KEYWORD_CALLER: &str = "\
+def broken():
     return target(3, args=4
 ";
 
@@ -854,41 +908,71 @@ fn e2e_parsed_none_type_text_and_larger_identifier_defaults_stay_blocking() {
 }
 
 #[test]
-fn e2e_incomplete_parse_with_omitted_call_cannot_neutralize_rename() {
-    let parsed = parse_python_bytes_allow_incomplete(
-        "mod.py",
-        INCOMPLETE_CALLER_WITH_UNTRUSTWORTHY_COVERAGE.as_bytes(),
+fn e2e_line_continued_attribute_none_type_change_stays_blocking() {
+    let (verdict, old_signature, new_signature) = link_and_shadow_verdict_from_sources(
+        PARSED_LINE_CONTINUED_ATTRIBUTE_DEFAULT_OLD,
+        PARSED_LINE_CONTINUED_ATTRIBUTE_DEFAULT_NEW,
     );
     assert!(
+        old_signature.contains('\\') && new_signature.contains('\\'),
+        "production signatures must retain the explicit continuation: {old_signature:?} -> {new_signature:?}"
+    );
+    assert_eq!(
+        verdict,
+        ShadowGateVerdict::WouldBlock,
+        "NoneType normalization must not cross an explicit continuation after attribute access"
+    );
+}
+
+#[test]
+fn e2e_fully_omitted_call_in_incomplete_file_cannot_neutralize_rename() {
+    let target = parse_python("defs.py", INCOMPLETE_TARGET_DEFINITION);
+    let positional = parse_python("good.py", COMPLETE_POSITIONAL_CALLER);
+    let (incomplete, incomplete_state) =
+        parse_python_bytes_allow_incomplete("bad.py", INCOMPLETE_ONLY_KEYWORD_CALLER.as_bytes());
+    assert!(
         matches!(
-            &parsed.parse_completeness,
+            &incomplete_state,
             ParseCompleteness::Partial(_) | ParseCompleteness::Failed(_)
         ),
         "fixture must exercise tree-sitter recovery: {:?}",
-        parsed.parse_completeness
+        incomplete_state
     );
-    let extracted_target_calls = parsed
+    let extracted_target_calls = incomplete
         .relations
         .iter()
         .filter(|relation| relation.kind == RelationKind::Calls && relation.dst_name == "target")
         .count();
     assert_eq!(
-        extracted_target_calls, 1,
-        "the recovered parse must omit the malformed keyword call"
+        extracted_target_calls, 0,
+        "the recovered parse must fully omit its only malformed keyword call"
     );
 
-    let (files, relations, graph) = link_parsed_files_into_graph(vec![parsed]);
+    let files = vec![target, positional, incomplete];
+    let completeness = FileParseCompletenessMap::from([
+        ("defs.py".to_string(), ParseCompleteness::Full),
+        ("good.py".to_string(), ParseCompleteness::Full),
+        ("bad.py".to_string(), incomplete_state),
+    ]);
+    let (files, relations, graph) =
+        link_parsed_files_into_graph_with_completeness(files, completeness);
     let target = find_entity(&files, "target");
     let inbound = relations
         .iter()
         .find(|relation| {
             relation.kind == RelationKind::Calls && relation.dst == GraphNodeId::Entity(target.id)
         })
-        .expect("the recovered positional call still links");
+        .expect("the complete positional caller still links");
     assert!(inbound.evidence.iter().all(|evidence| {
-        evidence.parser_rule.as_deref() == Some(CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1)
-            && evidence.call_shape.is_none()
+        evidence.parser_rule.as_deref() == Some(CALL_SHAPE_EVIDENCE_AGGREGATION_V1)
+            && evidence.call_shape.is_some()
     }));
+    assert!(relations
+        .iter()
+        .any(|relation| relation.evidence.iter().any(|evidence| {
+            evidence.parser_rule.as_deref() == Some(CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1)
+                && evidence.source_path.as_deref() == Some("bad.py")
+        })));
 
     let diff = rename_diff(&files, "def target(ext, args)", "def target(ext, lines)");
     let impact = analyze_impact(&graph, &diff).expect("analyze incomplete-parse impact");
@@ -898,7 +982,7 @@ fn e2e_incomplete_parse_with_omitted_call_cannot_neutralize_rename() {
             .expect("target impact")
             .call_shapes
             .all_consumers_shaped_calls,
-        "explicit incomplete-parse evidence must remain unknown"
+        "file-level incomplete-parse evidence must remain unknown even when no call edge survived"
     );
     assert_eq!(
         shadow_verdict(&graph, diff),
