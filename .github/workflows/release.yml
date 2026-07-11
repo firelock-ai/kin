@@ -1072,14 +1072,21 @@ jobs:
 
       - name: Aggregate per-artifact checksums
         run: |
+          set -euo pipefail
           # Forward-compat: combine the per-artifact "*.sha256" files into a
           # single checksums-sha256.txt. Installers verify against the
           # per-artifact files, so this is published as a convenience only.
+          # PowerShell writes the Windows sidecar with CRLF; make the aggregate
+          # byte-canonical on the Linux publisher without changing any record.
           : > checksums-sha256.txt
           for f in *.tar.gz.sha256 *.zip.sha256; do
             [ -e "$f" ] || continue
-            cat "$f" >> checksums-sha256.txt
+            tr -d '\r' < "$f" >> checksums-sha256.txt
           done
+          if LC_ALL=C grep -q $'\r' checksums-sha256.txt; then
+            echo "::error::aggregate checksum file still contains carriage returns" >&2
+            exit 1
+          fi
 
       - name: Verify complete release asset inventory
         run: |

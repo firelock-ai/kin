@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Post-release verification now waits for complete npm integrity metadata, and
+  cross-platform checksum aggregation normalizes Windows CRLF sidecars to LF.
+
 ## [0.2.16] - 2026-07-11
 
 Graph authority is more durable across long imports and daemon restarts, while
