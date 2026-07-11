@@ -35,6 +35,7 @@ def main() -> None:
             )
 
     release = RELEASE.read_text(encoding="utf-8")
+    ci_workflow = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
     installer_callback = INSTALLER_CALLBACK.read_text(encoding="utf-8")
     docker_workflow = (WORKFLOWS / "docker.yml").read_text(encoding="utf-8")
     if "workflow_dispatch:" in release:
@@ -213,6 +214,51 @@ def main() -> None:
         "EXPECTED_SOURCE_DIGEST: ${{ needs.build_daemon_image.outputs.digest }}",
         "release daemon image promotion",
     )
+
+    build_start = release.index("  build:")
+    build_end = release.index("\n  notarize_linux:", build_start)
+    build_job = release[build_start:build_end]
+    windows_bytes = build_job.index("      - name: Preserve tracked bytes on Windows")
+    checkout = build_job.index("      - name: Checkout\n")
+    vfs_checkout = build_job.index("      - name: Checkout kin-vfs")
+    lock_assertion = build_job.index(
+        "      - name: Verify canonical release input bytes"
+    )
+    first_compile = build_job.index("      - name: Build kin-cli + kin-daemon (native)")
+    if not windows_bytes < checkout < vfs_checkout < lock_assertion < first_compile:
+        raise AssertionError(
+            "release build must disable Windows conversion before checkout and verify "
+            "both tracked lockfiles before compilation"
+        )
+    for policy in (
+        "if: runner.os == 'Windows'",
+        "git config --global core.autocrlf false",
+        '["cat-file", "blob", "HEAD:Cargo.lock"]',
+        '[["Kin", process.cwd()], ["kin-vfs", path.join(process.cwd(), "kin-vfs")]]',
+        "if (!working.equals(tracked))",
+        "refusing platform-specific release provenance",
+    ):
+        require(build_job, policy, "cross-platform release lockfile authority")
+
+    windows_start = ci_workflow.index("  windows-installer:")
+    windows_end = ci_workflow.index("\n  check:", windows_start)
+    windows_job = ci_workflow[windows_start:windows_end]
+    ci_windows_bytes = windows_job.index(
+        "      - name: Preserve tracked bytes on Windows"
+    )
+    ci_checkout = windows_job.index("      - uses: actions/checkout@v7")
+    if ci_windows_bytes >= ci_checkout:
+        raise AssertionError(
+            "Windows CI must disable line-ending conversion before checkout"
+        )
+    for policy in (
+        "git config --global core.autocrlf false",
+        '["cat-file", "blob", "HEAD:Cargo.lock"]',
+        "if (!workingLock.equals(trackedLock))",
+        "meta.dependency_provenance !== expectedLock",
+        "does not match tracked Git bytes",
+    ):
+        require(windows_job, policy, "Windows exact lockfile provenance regression")
 
     for obsolete in (
         ROOT / "scripts" / "promote-npm-release.sh",
@@ -408,7 +454,8 @@ def main() -> None:
 
     print(
         "release workflow authority is tag-only, protected, pinned, GCP-free, "
-        "and npm automatic through short-lived OIDC with post-public proof"
+        "cross-platform byte-canonical, and npm automatic through short-lived "
+        "OIDC with post-public proof"
     )
 
 

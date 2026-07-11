@@ -43,8 +43,8 @@ release path fails closed on artifact provenance.
   the first batch.
 - Release automation now binds Windows checksums to exact archives, gates GitHub Latest
   on anonymous install proof and automatically published, provenance-verified npm
-  packages, validates the public Homebrew formula outcome, and attests the immutable
-  daemon image.
+  packages, preserves tracked lockfile bytes across operating systems, validates the
+  public Homebrew formula outcome, and attests the immutable daemon image.
 
 ## [0.2.15] - 2026-07-08
 
