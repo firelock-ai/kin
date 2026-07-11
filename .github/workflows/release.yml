@@ -116,8 +116,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write
-      attestations: write
     outputs:
       digest: ${{ steps.publish.outputs.digest }}
       commit: ${{ steps.source.outputs.commit }}
@@ -243,35 +241,110 @@ jobs:
             echo "- no mutable latest tag was written"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # Attestation is intentionally separate from the image build. It may only
+  # inspect the immutable commit tag emitted above, and cannot rebuild or move
+  # it. This keeps OIDC/attestation authority out of the build job while still
+  # blocking every public release surface if exact OCI provenance is absent.
+  attest_daemon_image:
+    name: Attest immutable daemon image
+    needs: [config, build_daemon_image]
+    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Resolve peeled release commit
+        id: source
+        shell: bash
+        env:
+          EXPECTED_COMMIT: ${{ needs.build_daemon_image.outputs.commit }}
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
+          test "$commit" = "$(git rev-parse HEAD)"
+          if [ "$commit" != "$EXPECTED_COMMIT" ]; then
+            echo "::error::release tag peels to $commit, image job resolved to $EXPECTED_COMMIT"
+            exit 1
+          fi
+          if ! printf '%s\n' "$commit" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::release tag did not resolve to a full commit id"
+            exit 1
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Resolve exact immutable daemon digest
+        id: subject
+        shell: bash
+        env:
+          COMMIT: ${{ steps.source.outputs.commit }}
+          EXPECTED_DIGEST: ${{ needs.build_daemon_image.outputs.digest }}
+          IMAGE: ghcr.io/firelock-ai/kin
+        run: |
+          set -euo pipefail
+          reference="${IMAGE}:${COMMIT}"
+          digest="$(docker buildx imagetools inspect \
+            "$reference" --format '{{.Manifest.Digest}}')"
+          if ! printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::could not resolve an immutable manifest digest for $reference"
+            exit 1
+          fi
+          if [ "$digest" != "$EXPECTED_DIGEST" ]; then
+            echo "::error::$reference moved from release-built $EXPECTED_DIGEST to $digest"
+            exit 1
+          fi
+          bash scripts/verify-container-build-info.sh \
+            "${IMAGE}@${digest}" "$COMMIT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
       - name: Attest immutable daemon image
-        # Store SLSA provenance next to the exact digest in GHCR so staging and
-        # production admission can verify the protected tag workflow identity.
+        # With no predicate inputs actions/attest emits SLSA provenance. Store
+        # the bundle next to the exact digest in GHCR for downstream admission.
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
         with:
           subject-name: ghcr.io/firelock-ai/kin
-          subject-digest: ${{ steps.publish.outputs.digest }}
+          subject-digest: ${{ steps.subject.outputs.digest }}
           push-to-registry: true
-          # Keep authority minimal: the registry attestation is required, but
-          # the optional linked-artifact storage record is not.
+          # The OCI bundle is required; the optional linked-artifact storage
+          # record (and its broader artifact-metadata permission) is not.
           create-storage-record: false
 
       - name: Verify immutable daemon image attestation
         env:
           GH_TOKEN: ${{ github.token }}
-          DIGEST: ${{ steps.publish.outputs.digest }}
+          DIGEST: ${{ steps.subject.outputs.digest }}
           COMMIT: ${{ steps.source.outputs.commit }}
         run: |
           set -euo pipefail
-          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}"
           verified=false
           for attempt in 1 2 3 4 5; do
             if gh attestation verify \
               "oci://ghcr.io/firelock-ai/kin@${DIGEST}" \
               --repo "$GITHUB_REPOSITORY" \
+              --bundle-from-oci \
               --predicate-type https://slsa.dev/provenance/v1 \
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
               --signer-digest "$COMMIT" \
-              --cert-identity "$identity" \
+              --source-digest "$COMMIT" \
               --source-ref "$GITHUB_REF" \
               --deny-self-hosted-runners; then
               verified=true
@@ -923,7 +996,7 @@ jobs:
 
   publish:
     name: Publish Release
-    needs: [build, notarize_linux]
+    needs: [build, notarize_linux, attest_daemon_image]
     # notarize_linux is skipped on the default (macOS notarytool) path; publish
     # must still run then, but must NOT run if notarization actually failed or
     # was cancelled. `always() && !failure() && !cancelled()` lets a skipped
@@ -1656,7 +1729,7 @@ jobs:
   # No main-push workflow, GCP identity, or mutable latest tag participates.
   version_tag_image:
     name: Version-tag ghcr image
-    needs: [publish, install_proof, build_daemon_image]
+    needs: [publish, install_proof, build_daemon_image, attest_daemon_image]
     # Mirror publish's always() guard so a skipped notarize_linux does not
     # transitively skip this job, and only tag real version-tag pushes so
     # `:<version>` never points at an unreleased build.
