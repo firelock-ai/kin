@@ -46,11 +46,10 @@ and Windows x86_64), verifies the GitHub attestation plus exact tag/commit/lock
 provenance, and exercises a fresh repository, graph search/locate, MCP
 initialize/list/call, and all supported agent configuration writers. The four
 Unix legs additionally build embeddings and prove semantic search/locate at
-complete coverage. Both npm packages are then staged under their final channel
-through npm Trusted Publishing. An authenticated maintainer inspects the staged
-tarballs and approves both packages with 2FA; anonymous exact-byte, provenance,
-and install proof runs after approval. GitHub Latest is promoted only after
-every gate passes.
+complete coverage. Both npm packages are then published under their final
+channel through protected npm Trusted Publishing with short-lived OIDC.
+Anonymous exact-byte, provenance, and install proof runs after publication.
+GitHub Latest is promoted only after both packages pass every gate.
 
 The daemon container is a separate attested subject. The protected tag workflow
 builds one exact commit-tagged image in GHCR, verifies its embedded source and
@@ -259,23 +258,18 @@ spctl --assess --type execute --verbose ./kin
   separate authorship/provenance check can run `gh attestation verify`.
 - **npm and Homebrew distribution** are downstream of the GitHub release. Both
   public npm packages trust only `firelock-ai/kin`'s `release.yml` in the
-  protected `release` environment, and that OIDC identity may only run
-  `npm stage publish`. It stages each version under its final channel without a
-  long-lived token. The maintainer should wait for both stage jobs to succeed,
-  then use an authenticated npm account to download both staged tarballs (for
-  example, with `npm stage download`) and compare their contents plus the
-  workflow-emitted SRI and SHA-1 values before approving either package with
-  2FA. The release workflow's OIDC identity deliberately cannot download or
-  inspect pending stages, so this pre-approval inspection is a human-enforced
-  gate. npm cannot make the two approvals atomic, so one package can still
-  become public before the other. Never cut or approve a newer release while an
-  older staged version remains pending. If the workflow fails or times out,
-  finish that same release immediately or reject every remaining staged version
-  before starting another release.
-- **npm's automated exact-byte proof is post-publication.** Approval makes the
-  npm version and final channel public before anonymous CI can fetch and verify
-  exact bytes, provenance, and clean install/provision behavior. A failure at
-  that point leaves an immutable public npm version requiring incident response;
-  it is not pre-public proof. GitHub Latest and the Homebrew tap remain blocked
-  until both npm versions and channels are visible and all post-public checks
-  pass.
+  protected `release` environment, and that identity may run `npm publish`
+  only through short-lived OIDC. Traditional npm tokens remain disabled. Each
+  publish helper packs the reviewed tag tree, records the expected SRI and
+  SHA-1, rechecks the destination channel immediately before mutation, and
+  publishes with npm provenance. Reruns never overwrite a version: they accept
+  an existing version only after anonymous verification proves its exact bytes,
+  final channel, workflow identity, tag, and commit.
+- **npm's exact-byte proof is necessarily post-publication.** npm versions are
+  immutable, so anonymous CI can fetch and verify registry bytes, provenance,
+  and clean install/provision behavior only after each publish. The two package
+  writes are not atomic; a transient failure can expose one before the other.
+  An idempotent rerun verifies the first and completes the second. Any proof
+  failure leaves GitHub Latest and the Homebrew tap blocked and requires
+  incident response for that same release rather than a rollback or manual tag
+  mutation.

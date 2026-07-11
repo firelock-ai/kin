@@ -2,6 +2,15 @@
 // Copyright 2026 Firelock, LLC
 
 import assert from 'node:assert/strict';
+import { execFileSync, spawnSync } from 'node:child_process';
+import {
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import test from 'node:test';
 
 import {
@@ -43,6 +52,28 @@ test('maps release channels and prevents rollback', () => {
   assert.doesNotThrow(() => assertNotRollback('1.2.3', '1.2.3'));
   assert.doesNotThrow(() => assertNotRollback('1.2.4', '1.2.3'));
   assert.throws(() => assertNotRollback('1.2.2', '1.2.3', 'npm latest'), /refusing to roll/);
+});
+
+test('CLI enforces channel and rollback policy through a symlinked path', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'kin-release-order-'));
+  const linkedEntry = join(directory, 'release-order.mjs');
+  try {
+    symlinkSync(fileURLToPath(new URL('./release-order.mjs', import.meta.url)), linkedEntry);
+    const channel = execFileSync(process.execPath, [linkedEntry, 'channel', '1.2.3'], {
+      encoding: 'utf8',
+    });
+    assert.equal(channel.trim(), 'latest');
+
+    const rollback = spawnSync(
+      process.execPath,
+      [linkedEntry, 'assert-not-rollback', '1.2.2', '1.2.3', 'npm latest'],
+      { encoding: 'utf8' },
+    );
+    assert.notEqual(rollback.status, 0);
+    assert.match(rollback.stderr, /refusing to roll it back/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('reads npm channel authority from successful package metadata', async () => {
