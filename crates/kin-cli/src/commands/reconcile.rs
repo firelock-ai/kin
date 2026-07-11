@@ -1052,13 +1052,19 @@ mod tests {
         fs::write(session_dir.join("src/lib.rs"), updated).unwrap();
         record_base_from_source(&layout, &session_dir);
 
-        // Block the snapshot's atomic-write tmp path so the persist fails. The
-        // tmp name is the full snapshot path with `.tmp` APPENDED (graph.kndb ->
-        // graph.kndb.tmp), not the extension replaced — `with_extension` would
-        // yield `graph.tmp`, which no longer collides with the real tmp path
-        // since distinct per-file tmp suffixes were introduced, so the write
-        // would silently succeed and this failure-injection would be a no-op.
-        let mut blocked_tmp_name = crate::backend::kindb_snapshot_path(&layout).into_os_string();
+        // Block the next immutable snapshot base's atomic-write tmp path. The
+        // canonical graph.kndb file is now only a compatibility projection, so
+        // blocking its tmp would happen after committed authority and would no
+        // longer make persistence fail.
+        let snapshot_path = crate::backend::kindb_snapshot_path(&layout);
+        let generation = kin_db::SnapshotManager::open_read_only(&snapshot_path)
+            .unwrap()
+            .generation();
+        let mut versions_name = snapshot_path.into_os_string();
+        versions_name.push(".snapshots");
+        let versioned_path =
+            std::path::PathBuf::from(versions_name).join(format!("{:020}.kndb", generation + 1));
+        let mut blocked_tmp_name = versioned_path.into_os_string();
         blocked_tmp_name.push(".tmp");
         let blocked_tmp_path = std::path::PathBuf::from(blocked_tmp_name);
         fs::create_dir_all(&blocked_tmp_path).unwrap();
