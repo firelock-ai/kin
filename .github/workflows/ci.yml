@@ -76,12 +76,14 @@ jobs:
       - name: Test release ordering and npm provenance policy
         run: |
           python3 ./scripts/test-release-workflow-authority.py
-          python3 ./scripts/test-promote-npm-release.py
+          python3 ./scripts/test-npm-staged-release.py
           node --test \
             ./scripts/release-order.test.mjs \
             ./scripts/verify-npm-attestation.test.mjs
           node --check ./scripts/release-order.mjs
           node --check ./scripts/verify-npm-attestation.mjs
+          bash -n ./scripts/stage-npm-release.sh
+          bash -n ./scripts/wait-npm-approval.sh
           bash -n ./scripts/verify-npm-release.sh
 
   windows-installer:

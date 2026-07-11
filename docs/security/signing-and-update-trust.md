@@ -205,8 +205,14 @@ spctl --assess --type execute --verbose ./kin
   this repository, the release workflow, the source tag, and the source commit.
   The installer itself performs the checksum verification; users who want the
   separate authorship/provenance check can run `gh attestation verify`.
-- **npm and Homebrew distribution** are downstream of the GitHub release. The
-  initial npm candidate publish uses OIDC Trusted Publishing. A scoped
-  `NPM_TOKEN` is still required for npm dist-tag restoration and promotion,
-  operations npm's trusted-publishing flow does not authorize. The Homebrew tap
-  consumes the published archives and their checksums.
+- **npm and Homebrew distribution** are downstream of the GitHub release. Both
+  public npm packages trust only `firelock-ai/kin`'s `release.yml` in the
+  protected `release` environment, and that OIDC identity may only run
+  `npm stage publish`. It stages each version under its final channel without a
+  long-lived token. The maintainer should wait for both stage jobs to succeed,
+  then approve both packages separately with 2FA; npm cannot make those two
+  approvals atomic, so one package can still become public before the other.
+  GitHub Latest remains blocked until both versions and channels are anonymously
+  visible, their exact bytes and provenance verify, and clean
+  install/provision smoke passes for both packages. The Homebrew tap consumes
+  the published archives and checksums only after that gate.

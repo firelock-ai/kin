@@ -57,21 +57,107 @@ def main() -> None:
         "EXPECTED_SOURCE_DIGEST: ${{ needs.build_daemon_image.outputs.digest }}",
         "release daemon image promotion",
     )
-    require(
-        release,
-        'exec bash scripts/promote-npm-release.sh "${GITHUB_REF_NAME#v}"',
-        "two-package npm promotion",
-    )
-    promoter = (ROOT / "scripts" / "promote-npm-release.sh").read_text(
-        encoding="utf-8"
-    )
-    for compensation_policy in (
-        "rollback_promotions()",
-        "trap 'rollback_promotions $?' ERR",
-        "npm promotion failed; restoring every channel changed by this run",
-        "abort_promotion",
+
+    for obsolete in (
+        ROOT / "scripts" / "promote-npm-release.sh",
+        ROOT / "scripts" / "test-promote-npm-release.py",
     ):
-        require(promoter, compensation_policy, "two-package npm promotion")
+        if obsolete.exists():
+            raise AssertionError(
+                f"obsolete token-based npm promoter still exists: {obsolete}"
+            )
+
+    for job, next_job, package_dir in (
+        ("stage_npm_compatibility", "stage_npm_canonical", "./packages/kin-mcp"),
+        ("stage_npm_canonical", "wait_for_npm_approval", "./packages/kin"),
+    ):
+        start = release.index(f"  {job}:")
+        end = release.index(f"\n  {next_job}:", start + 3)
+        stage_job = release[start:end]
+        for policy in (
+            "needs: [publish, install_proof]",
+            "environment: release",
+            "id-token: write",
+            "npm@11.15.0",
+            "scripts/stage-npm-release.sh",
+            package_dir,
+        ):
+            require(stage_job, policy, f"{job} trusted staging")
+
+    for policy in (
+        "needs: [stage_npm_canonical, stage_npm_compatibility, version_tag_image]",
+        'bash scripts/wait-npm-approval.sh "${GITHUB_REF_NAME#v}"',
+        "needs: wait_for_npm_approval",
+        "scripts/verify-npm-release.sh",
+        "needs: verify_npm_approved",
+        '"${PACKAGE}@${VERSION}"',
+        "needs: [publish, install_proof, version_tag_image, smoke_npm_approved]",
+        "GitHub Latest remains blocked",
+        "Wait until BOTH npm stage jobs succeed, then approve BOTH packages",
+    ):
+        require(release, policy, "two-package staged npm release gate")
+
+    stager = (ROOT / "scripts" / "stage-npm-release.sh").read_text(encoding="utf-8")
+    waiter = (ROOT / "scripts" / "wait-npm-approval.sh").read_text(encoding="utf-8")
+    for policy in (
+        'npm stage publish "$tarball" --access public --tag "$channel"',
+        "--provenance",
+        "exact bytes and provenance verified before skipping staging",
+        "OIDC identity cannot inspect staged packages",
+        "human 2FA approval is required",
+    ):
+        require(stager, policy, "OIDC npm staging helper")
+    for policy in (
+        'packages=("@kinlab/kin" "@kinlab/kin-mcp")',
+        "Partial npm approval detected",
+        "already newer",
+        "Timed out waiting for both npm approvals",
+        "GitHub Latest was not promoted",
+    ):
+        require(waiter, policy, "anonymous npm approval waiter")
+
+    verifier = (ROOT / "scripts" / "verify-npm-release.sh").read_text(encoding="utf-8")
+    for helper_name, helper in (
+        ("OIDC npm staging helper", stager),
+        ("anonymous npm approval waiter", waiter),
+        ("anonymous npm provenance verifier", verifier),
+    ):
+        require(
+            helper,
+            "env -u NODE_AUTH_TOKEN -u NPM_TOKEN",
+            f"{helper_name} credential scrubbing",
+        )
+
+    public_npm_path = "\n".join((release, stager, waiter, verifier))
+    if re.search(r"(?<!stage )npm publish(?:\s|$)", public_npm_path):
+        raise AssertionError("public npm release path must remain stage-only")
+    if re.search(
+        r"npm stage (?:list|view|approve|reject|download)(?:\s|$)",
+        public_npm_path,
+    ):
+        raise AssertionError(
+            "OIDC release jobs must not invoke unsupported npm stage reads/writes"
+        )
+
+    for live_contract in (
+        "Both public npm packages trust only firelock-ai/kin + release.yml + environment",
+        "allow only `npm stage publish`, and disallow traditional tokens",
+        "stage_npm_canonical",
+        "stage_npm_compatibility",
+    ):
+        require(release, live_contract, "live stage-only npm trust contract")
+
+    for forbidden in (
+        "secrets.NPM_TOKEN",
+        "release-candidate-",
+        "npm dist-tag",
+        "promote_npm",
+        "promote-npm-release.sh",
+    ):
+        if forbidden in release or forbidden in stager or forbidden in waiter:
+            raise AssertionError(
+                f"staged npm release path contains retired authority: {forbidden}"
+            )
     for forbidden in (
         "workflow_dispatch",
         "branches: [main]",
@@ -143,7 +229,10 @@ def main() -> None:
                 f"{workflow.name} exposes branch-selectable dispatch with a release-capable secret"
             )
 
-    print("release workflow authority is tag-only, protected, pinned, and GCP-free")
+    print(
+        "release workflow authority is tag-only, protected, pinned, GCP-free, "
+        "and npm stage-only until human approval"
+    )
 
 
 if __name__ == "__main__":

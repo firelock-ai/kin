@@ -15,6 +15,9 @@ permissions:
 # tags" limits v* creation/update/deletion to the release captain, while the
 # protected `release` environment admits only v* tags and requires approval.
 # Every credential-bearing or public-write job below must keep that environment.
+# Both public npm packages trust only firelock-ai/kin + release.yml + environment
+# `release`, allow only `npm stage publish`, and disallow traditional tokens.
+# Keep the two stage jobs on that exact identity; approval remains human + 2FA.
 
 # Serialize every release channel. GitHub may replace an older pending run, so
 # every mutation also performs its own SemVer rollback check immediately before
@@ -1138,7 +1141,7 @@ jobs:
       - name: Attest final release archives and provenance
         if: ${{ steps.release_state.outputs.existing_final != 'true' }}
         # Fail closed: without a repository attestation, no public prerelease is
-        # created and no npm candidate can be provisioned from these archives.
+        # created and no npm package can be staged from these archives.
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
         with:
           subject-path: |
@@ -1157,8 +1160,8 @@ jobs:
           generate_release_notes: true
           # Every tag starts non-latest so anonymous installation can exercise
           # the public assets without exposing an unproven stable release as
-          # /releases/latest. Stable tags are promoted only after install_proof
-          # plus anonymous npm candidate provisioning and npm latest promotion.
+          # /releases/latest. Stable tags are promoted only after install_proof,
+          # both human npm approvals, provenance verification, and clean smoke.
           prerelease: true
           make_latest: false
           fail_on_unmatched_files: true
@@ -1194,8 +1197,8 @@ jobs:
       contents: read
       attestations: read
 
-  publish_npm:
-    name: Publish npm Wrapper Candidate
+  stage_npm_compatibility:
+    name: Stage npm Compatibility Wrapper (@kinlab/kin-mcp)
     needs: [publish, install_proof]
     # publish uses always() to survive a skipped notarize_linux (the default
     # macOS-notarytool path); mirror that guard here or GitHub transitively skips
@@ -1203,14 +1206,11 @@ jobs:
     if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     environment: release
-    # New versions use npm Trusted Publishing (OIDC). The token secret is used
-    # only to restore the provisional tag on an idempotent rerun; npm dist-tag
-    # mutation is not supported by Trusted Publishing.
     permissions:
       contents: read
       id-token: write
     steps:
-      - name: Checkout
+      - name: Checkout release source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
@@ -1220,92 +1220,45 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false
 
-      - name: Upgrade npm for OIDC trusted publishing (needs >= 11.5.1)
-        run: npm install -g npm@11.12.1
-
-      - name: Verify npm package version matches tag
+      - name: Install staged-publishing npm CLI
         run: |
-          PACKAGE_VERSION=$(node -p "require('./packages/kin-mcp/package.json').version")
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          test "$PACKAGE_VERSION" = "$TAG_VERSION"
+          env -u NODE_AUTH_TOKEN -u NPM_TOKEN npm install --global npm@11.15.0
+          test "$(npm --version)" = "11.15.0"
 
-      - name: Publish npm candidate (Trusted Publishing via OIDC)
-        id: npm_pub
+      - name: Stage final-channel package with Trusted Publishing
+        id: npm_stage
         shell: bash
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          set -euo pipefail
-          PKG=$(node -p "require('./packages/kin-mcp/package.json').name")
-          VER=$(node -p "require('./packages/kin-mcp/package.json').version")
-          EXPECTED_COMMIT="$(git rev-parse HEAD)"
-          CANDIDATE_TAG="release-candidate-$(printf '%s' "$VER" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
-          {
-            echo "pkg=$PKG"
-            echo "ver=$VER"
-            echo "candidate_tag=$CANDIDATE_TAG"
-          } >> "$GITHUB_OUTPUT"
-          pack_dir="$RUNNER_TEMP/npm-pack-kin-mcp"
-          mkdir -p "$pack_dir"
-          pack_json="$(env -u NODE_AUTH_TOKEN -u NPM_TOKEN \
-            npm pack ./packages/kin-mcp --json --pack-destination "$pack_dir")"
-          tarball="$(printf '%s\n' "$pack_json" | node -e '
-            let input=""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => {
-              const records=JSON.parse(input); if (records.length !== 1 || !records[0].filename) process.exit(2);
-              process.stdout.write(records[0].filename);
-            });
-          ')"
-          tarball="$pack_dir/$tarball"
+          exec bash scripts/stage-npm-release.sh \
+            ./packages/kin-mcp "$GITHUB_REF" "$(git rev-parse HEAD)"
 
-          if env -u NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG=/dev/null npm view "${PKG}@${VER}" version >/dev/null 2>&1; then
-            env -u NPM_TOKEN bash scripts/verify-npm-release.sh \
-              "$PKG" "$VER" ./packages/kin-mcp "$GITHUB_REF" "$EXPECTED_COMMIT"
-            current_candidate="$(env -u NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG=/dev/null \
-              npm view "${PKG}@${CANDIDATE_TAG}" version 2>/dev/null || true)"
-            if [ "$current_candidate" != "$VER" ]; then
-              if [ -z "${NPM_TOKEN:-}" ]; then
-                echo "::error::NPM_TOKEN is required to restore $CANDIDATE_TAG on an idempotent rerun"
-                exit 1
-              fi
-              env NODE_AUTH_TOKEN="$NPM_TOKEN" npm dist-tag add "${PKG}@${VER}" "$CANDIDATE_TAG"
-            fi
-            echo "${PKG}@${VER} already existed; identity verified and provisional tag restored."
-            echo "published=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          env -u NODE_AUTH_TOKEN -u NPM_TOKEN \
-            npm publish "$tarball" --access public --tag "$CANDIDATE_TAG"
-          env -u NPM_TOKEN bash scripts/verify-npm-release.sh \
-            "$PKG" "$VER" ./packages/kin-mcp "$GITHUB_REF" "$EXPECTED_COMMIT"
-          echo "published=true" >> "$GITHUB_OUTPUT"
-
-      - name: Notify Discord (npm candidate)
-        if: steps.npm_pub.outputs.published == 'true' && env.DISCORD_WEBHOOK_URL != ''
+      - name: Notify Discord (npm approval required)
+        if: steps.npm_stage.outputs.staged == 'true' && env.DISCORD_WEBHOOK_URL != ''
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          PKG: ${{ steps.npm_pub.outputs.pkg }}
-          VER: ${{ steps.npm_pub.outputs.ver }}
-          CANDIDATE_TAG: ${{ steps.npm_pub.outputs.candidate_tag }}
+          PKG: ${{ steps.npm_stage.outputs.package }}
+          VER: ${{ steps.npm_stage.outputs.version }}
+          CHANNEL: ${{ steps.npm_stage.outputs.channel }}
         run: |
-          jq -nc --arg c "📦 \`${PKG}@${VER}\` published to **npm** under provisional tag \`${CANDIDATE_TAG}\`." '{content:$c}' \
+          jq -nc --arg c "📦 \`${PKG}@${VER}\` is staged for npm channel \`${CHANNEL}\`. Wait until BOTH npm stage jobs succeed, then approve BOTH packages in npm's Staged Packages UI with 2FA. GitHub Latest remains blocked until both are approved and proven." '{content:$c}' \
             | curl -fsS -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
 
-  publish_npm_canonical:
-    name: Publish npm Canonical Candidate (@kinlab/kin)
+  stage_npm_canonical:
+    name: Stage npm Canonical Package (@kinlab/kin)
     needs: [publish, install_proof]
-    # Both candidate jobs run in parallel, but both are mandatory inputs to the
-    # anonymous smoke and promotion gates below.
+    # Both stage jobs are mandatory. npm approvals remain separate human writes,
+    # so a partial approval can make one package public while GitHub Latest stays
+    # blocked waiting for the other package.
     if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     environment: release
-    # Trusted Publishing is the publication credential. NPM_TOKEN is limited to
-    # dist-tag restoration/promotion because OIDC does not authorize dist-tag.
     permissions:
       contents: read
       id-token: write
     steps:
-      - name: Checkout
+      - name: Checkout release source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
@@ -1315,83 +1268,111 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false
 
-      - name: Upgrade npm for OIDC trusted publishing (needs >= 11.5.1)
-        run: npm install -g npm@11.12.1
-
-      - name: Verify npm package version matches tag
+      - name: Install staged-publishing npm CLI
         run: |
-          PACKAGE_VERSION=$(node -p "require('./packages/kin/package.json').version")
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          test "$PACKAGE_VERSION" = "$TAG_VERSION"
+          env -u NODE_AUTH_TOKEN -u NPM_TOKEN npm install --global npm@11.15.0
+          test "$(npm --version)" = "11.15.0"
 
       - name: Run launcher tests
         run: npm test --prefix ./packages/kin
 
-      - name: Publish npm candidate (Trusted Publishing via OIDC)
-        id: npm_pub_kin
+      - name: Stage final-channel package with Trusted Publishing
+        id: npm_stage
         shell: bash
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          set -euo pipefail
-          PKG=$(node -p "require('./packages/kin/package.json').name")
-          VER=$(node -p "require('./packages/kin/package.json').version")
-          EXPECTED_COMMIT="$(git rev-parse HEAD)"
-          CANDIDATE_TAG="release-candidate-$(printf '%s' "$VER" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
-          {
-            echo "pkg=$PKG"
-            echo "ver=$VER"
-            echo "candidate_tag=$CANDIDATE_TAG"
-          } >> "$GITHUB_OUTPUT"
-          pack_dir="$RUNNER_TEMP/npm-pack-kin"
-          mkdir -p "$pack_dir"
-          pack_json="$(env -u NODE_AUTH_TOKEN -u NPM_TOKEN \
-            npm pack ./packages/kin --json --pack-destination "$pack_dir")"
-          tarball="$(printf '%s\n' "$pack_json" | node -e '
-            let input=""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => {
-              const records=JSON.parse(input); if (records.length !== 1 || !records[0].filename) process.exit(2);
-              process.stdout.write(records[0].filename);
-            });
-          ')"
-          tarball="$pack_dir/$tarball"
+          exec bash scripts/stage-npm-release.sh \
+            ./packages/kin "$GITHUB_REF" "$(git rev-parse HEAD)"
 
-          if env -u NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG=/dev/null npm view "${PKG}@${VER}" version >/dev/null 2>&1; then
-            env -u NPM_TOKEN bash scripts/verify-npm-release.sh \
-              "$PKG" "$VER" ./packages/kin "$GITHUB_REF" "$EXPECTED_COMMIT"
-            current_candidate="$(env -u NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG=/dev/null \
-              npm view "${PKG}@${CANDIDATE_TAG}" version 2>/dev/null || true)"
-            if [ "$current_candidate" != "$VER" ]; then
-              if [ -z "${NPM_TOKEN:-}" ]; then
-                echo "::error::NPM_TOKEN is required to restore $CANDIDATE_TAG on an idempotent rerun"
-                exit 1
-              fi
-              env NODE_AUTH_TOKEN="$NPM_TOKEN" npm dist-tag add "${PKG}@${VER}" "$CANDIDATE_TAG"
-            fi
-            echo "${PKG}@${VER} already existed; identity verified and provisional tag restored."
-            echo "published=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          env -u NODE_AUTH_TOKEN -u NPM_TOKEN \
-            npm publish "$tarball" --access public --tag "$CANDIDATE_TAG"
-          env -u NPM_TOKEN bash scripts/verify-npm-release.sh \
-            "$PKG" "$VER" ./packages/kin "$GITHUB_REF" "$EXPECTED_COMMIT"
-          echo "published=true" >> "$GITHUB_OUTPUT"
-
-      - name: Notify Discord (npm candidate)
-        if: steps.npm_pub_kin.outputs.published == 'true' && env.DISCORD_WEBHOOK_URL != ''
+      - name: Notify Discord (npm approval required)
+        if: steps.npm_stage.outputs.staged == 'true' && env.DISCORD_WEBHOOK_URL != ''
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          PKG: ${{ steps.npm_pub_kin.outputs.pkg }}
-          VER: ${{ steps.npm_pub_kin.outputs.ver }}
-          CANDIDATE_TAG: ${{ steps.npm_pub_kin.outputs.candidate_tag }}
+          PKG: ${{ steps.npm_stage.outputs.package }}
+          VER: ${{ steps.npm_stage.outputs.version }}
+          CHANNEL: ${{ steps.npm_stage.outputs.channel }}
         run: |
-          jq -nc --arg c "📦 \`${PKG}@${VER}\` published to **npm** under provisional tag \`${CANDIDATE_TAG}\` (canonical Kin install surface)." '{content:$c}' \
+          jq -nc --arg c "📦 \`${PKG}@${VER}\` is staged for npm channel \`${CHANNEL}\`. Wait until BOTH npm stage jobs succeed, then approve BOTH packages in npm's Staged Packages UI with 2FA. GitHub Latest remains blocked until both are approved and proven." '{content:$c}' \
             | curl -fsS -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
 
-  smoke_npm_candidates:
-    name: Anonymous npm Candidate Smoke (${{ matrix.package }})
-    needs: [publish_npm, publish_npm_canonical]
+  wait_for_npm_approval:
+    name: Wait for Both Human npm Approvals
+    needs: [stage_npm_canonical, stage_npm_compatibility, version_tag_image]
+    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout release policy
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install staged-publishing npm CLI
+        run: |
+          env -u NODE_AUTH_TOKEN -u NPM_TOKEN npm install --global npm@11.15.0
+          test "$(npm --version)" = "11.15.0"
+
+      - name: Wait for both versions and final channels
+        env:
+          NPM_APPROVAL_ATTEMPTS: 90
+          NPM_APPROVAL_DELAY_SECONDS: 20
+        run: bash scripts/wait-npm-approval.sh "${GITHUB_REF_NAME#v}"
+
+  verify_npm_approved:
+    name: Verify Approved npm Provenance (${{ matrix.package }})
+    needs: wait_for_npm_approval
+    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: "@kinlab/kin"
+            package_dir: ./packages/kin
+          - package: "@kinlab/kin-mcp"
+            package_dir: ./packages/kin-mcp
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install pinned npm CLI
+        run: |
+          env -u NODE_AUTH_TOKEN -u NPM_TOKEN npm install --global npm@11.15.0
+          test "$(npm --version)" = "11.15.0"
+
+      - name: Verify exact public bytes and OIDC provenance
+        env:
+          PACKAGE: ${{ matrix.package }}
+          PACKAGE_DIR: ${{ matrix.package_dir }}
+        run: |
+          bash scripts/verify-npm-release.sh \
+            "$PACKAGE" "${GITHUB_REF_NAME#v}" "$PACKAGE_DIR" \
+            "$GITHUB_REF" "$(git rev-parse HEAD)"
+
+  smoke_npm_approved:
+    name: Anonymous Approved npm Smoke (${{ matrix.package }})
+    needs: verify_npm_approved
     if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     permissions:
@@ -1411,8 +1392,10 @@ jobs:
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.0.0
         with:
           node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
 
-      - name: Install and provision candidate without credentials
+      - name: Install exact approved version and provision without credentials
         shell: bash
         env:
           PACKAGE: ${{ matrix.package }}
@@ -1421,32 +1404,17 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
-          CANDIDATE_TAG="release-candidate-$(printf '%s' "$VERSION" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
           tmp="$(mktemp -d)"
           trap 'rm -rf "$tmp"' EXIT
           mkdir -p "$tmp/home"
           : > "$tmp/empty-npmrc"
 
-          resolved=""
-          for attempt in $(seq 1 18); do
-            resolved="$(env -u NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG="$tmp/empty-npmrc" \
-              npm view "${PACKAGE}@${CANDIDATE_TAG}" version 2>/dev/null || true)"
-            if [ "$resolved" = "$VERSION" ]; then
-              break
-            fi
-            if [ "$attempt" -eq 18 ]; then
-              echo "::error::anonymous npm lookup did not resolve ${PACKAGE}@${CANDIDATE_TAG} to $VERSION"
-              exit 1
-            fi
-            sleep 10
-          done
-
-          env -u NODE_AUTH_TOKEN \
+          env -u NODE_AUTH_TOKEN -u NPM_TOKEN \
             HOME="$tmp/home" \
             NPM_CONFIG_CACHE="$tmp/npm-cache" \
             NPM_CONFIG_USERCONFIG="$tmp/empty-npmrc" \
             npm install --global --prefix "$tmp/prefix" --no-audit --no-fund \
-            "${PACKAGE}@${CANDIDATE_TAG}"
+            "${PACKAGE}@${VERSION}"
           launcher="$tmp/prefix/bin/$BINARY"
           test -x "$launcher"
 
@@ -1469,39 +1437,9 @@ jobs:
             "$daemon_bin" --version
           fi
 
-  promote_npm:
-    name: Promote Proven npm Packages
-    needs: [publish_npm, publish_npm_canonical, smoke_npm_candidates, version_tag_image]
-    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
-    runs-on: ubuntu-latest
-    environment: release
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout release policy
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-
-      - name: Install Node
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.0.0
-        with:
-          node-version: 24
-          registry-url: https://registry.npmjs.org
-
-      - name: Upgrade npm
-        run: npm install -g npm@11.12.1
-
-      - name: Promote both proven package versions
-        shell: bash
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          exec bash scripts/promote-npm-release.sh "${GITHUB_REF_NAME#v}"
-
   finalize_release:
     name: Promote Proven Release
-    needs: [publish, install_proof, version_tag_image, promote_npm]
+    needs: [publish, install_proof, version_tag_image, smoke_npm_approved]
     if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     environment: release
@@ -1520,6 +1458,14 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
+          channel="$(node scripts/release-order.mjs channel "$version")"
+          for package in @kinlab/kin @kinlab/kin-mcp; do
+            npm_version="$(node scripts/release-order.mjs npm-channel "$package" "$channel")"
+            if [ "$npm_version" != "$version" ]; then
+              echo "::error::npm ${package}@${channel} moved to ${npm_version}; GitHub Latest remains blocked"
+              exit 1
+            fi
+          done
           current_tag="$(node scripts/release-order.mjs github-latest "$GITHUB_REPOSITORY")"
           current_version="${current_tag#v}"
           node scripts/release-order.mjs assert-not-rollback \

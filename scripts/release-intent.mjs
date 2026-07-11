@@ -11,7 +11,7 @@ const run = promisify(execFile);
 // depends on is already in sync, BEFORE a tag is cut:
 //
 //   - every npm package version (packages/kin-mcp and the canonical
-//     packages/kin) equals the workspace version — release.yml's npm publish
+//     packages/kin) equals the workspace version — release.yml's npm staging
 //     jobs hard-assert this, so a mismatch would otherwise only surface AFTER
 //     the tag is already pushed;
 //   - a CHANGELOG section exists for the version (required for a stable
@@ -171,7 +171,7 @@ async function main() {
     const v = JSON.parse(npmText).version;
     npmVersions.push({ manifest, version: v });
     if (v !== version) {
-      failures.push(`npm manifest ${manifest} is ${v}, workspace is ${version} — they must match (the npm publish jobs assert it)`);
+      failures.push(`npm manifest ${manifest} is ${v}, workspace is ${version} — they must match (the npm staging jobs assert it)`);
     }
   }
   const npmVersion = npmVersions.map((n) => `${n.manifest.split('/').slice(-2, -1)[0] ?? n.manifest}@${n.version ?? '<missing>'}`).join(', ');
