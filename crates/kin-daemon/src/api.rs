@@ -1286,11 +1286,12 @@ fn acknowledge_ref_hydration(
                 "historical ref hydration changed the durable graph"
             );
             state.bump_version();
-            state.queue_persistence_event(DaemonEvent::GraphRootChanged {
-                old_root_hash: None,
-                new_root_hash: event_label.to_string(),
-            });
-            state.save_snapshot().map_err(internal_error)?;
+            state
+                .save_snapshot_with_event(DaemonEvent::GraphRootChanged {
+                    old_root_hash: None,
+                    new_root_hash: event_label.to_string(),
+                })
+                .map_err(internal_error)?;
             state.mark_clean();
         }
         RequestGraphAuthority::SessionScope => {
@@ -11010,6 +11011,97 @@ mod tests {
             .save_snapshot()
             .expect("a later no-op save must remain healthy");
         state.mark_clean();
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hydration_event_waits_for_own_persistence_generation() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let git_head = setup_daemon_hydration_fixture(&state);
+        let imported_change = kin_git::semantic_change_id_from_git_oid_hex(&git_head).unwrap();
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let mut events = state.event_tx.subscribe();
+
+        let (lock_held_tx, lock_held_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let state_for_older_save = Arc::clone(&state);
+        let older_save = tokio::task::spawn_blocking(move || {
+            let _persist_guard = state_for_older_save
+                .persist_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            lock_held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        lock_held_rx.recv().unwrap();
+
+        let request_state = Arc::clone(&state);
+        let request_head = git_head.clone();
+        let request = tokio::spawn(async move {
+            router(request_state)
+                .oneshot(
+                    Request::post("/history")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "entity": "entity_that_does_not_exist",
+                                "reference": request_head,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+
+        for _ in 0..100 {
+            if state.graph.get_change(&imported_change).unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            state.graph.get_change(&imported_change).unwrap().is_some(),
+            "hydration must reach the save boundary while the older generation holds the lock"
+        );
+        assert!(
+            !state.persistence_event_is_queued_for_test(),
+            "the hydration event must not be visible to an older finalizer"
+        );
+        state.emit_pending_persistence_event_for_test();
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        release_tx.send(()).unwrap();
+        older_save.await.unwrap();
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation_before + 1
+        );
+        match events
+            .try_recv()
+            .expect("hydration generation finalization must emit the queued event")
+        {
+            DaemonEvent::GraphRootChanged { new_root_hash, .. } => {
+                assert_eq!(new_root_hash, "history-hydration")
+            }
+            other => panic!("hydration generation emitted the wrong event: {other:?}"),
+        }
         assert!(matches!(
             events.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)

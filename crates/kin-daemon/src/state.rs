@@ -1690,7 +1690,7 @@ impl DaemonState {
     /// derived artifacts have finalized. One pending event is sufficient to
     /// make subscribers refresh to the latest graph, so concurrent mutations
     /// coalesce instead of producing stale intermediate notifications.
-    pub(crate) fn queue_persistence_event(&self, event: DaemonEvent) {
+    fn queue_persistence_event(&self, event: DaemonEvent) {
         let mut pending = self
             .pending_persistence_event
             .lock()
@@ -1716,6 +1716,19 @@ impl DaemonState {
         self.finalization_fail_once.store(true, Ordering::SeqCst);
     }
 
+    #[cfg(test)]
+    pub(crate) fn persistence_event_is_queued_for_test(&self) -> bool {
+        self.pending_persistence_event
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn emit_pending_persistence_event_for_test(&self) {
+        self.emit_pending_persistence_event();
+    }
+
     /// Save the current graph via the storage backend (CAS write).
     ///
     /// Returns the new generation on success. Fails if another writer
@@ -1725,14 +1738,22 @@ impl DaemonState {
     /// `.kin/kindb/head-generation` so CLI and MCP processes can detect
     /// when their loaded snapshot is stale (P2-2.7).
     pub fn save_snapshot(&self) -> Result<()> {
-        self.save_snapshot_impl(false)
+        self.save_snapshot_impl(false, None)
+    }
+
+    /// Save graph authority and publish `event` only after the generation that
+    /// contains the caller's mutation has finalized. Queueing happens while
+    /// holding `persist_lock`, so an older in-flight generation cannot consume
+    /// this event before the caller's batch is detached and committed.
+    pub(crate) fn save_snapshot_with_event(&self, event: DaemonEvent) -> Result<()> {
+        self.save_snapshot_impl(false, Some(event))
     }
 
     pub fn save_snapshot_full(&self) -> Result<()> {
-        self.save_snapshot_impl(true)
+        self.save_snapshot_impl(true, None)
     }
 
-    fn save_snapshot_impl(&self, force_full: bool) -> Result<()> {
+    fn save_snapshot_impl(&self, force_full: bool, event: Option<DaemonEvent>) -> Result<()> {
         // Serialize the whole kndb + generation-marker + kidx write sequence
         // against any other save (persist loop, idle flush, embed worker).
         // Without this, two concurrent saves race on the shared tmp paths and
@@ -1742,6 +1763,10 @@ impl DaemonState {
             .persist_lock
             .lock()
             .map_err(|_| DaemonError::Io(std::io::Error::other("persist lock poisoned")))?;
+
+        if let Some(event) = event {
+            self.queue_persistence_event(event);
+        }
 
         let repo_id = self.cached_repo_id.as_str();
         let expected_gen = self.snapshot_generation.load(Ordering::SeqCst);
