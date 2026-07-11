@@ -98,7 +98,7 @@ pub struct HealthResponse {
     /// until restart. A true value drives `status: "attention"`.
     #[serde(default)]
     pub embed_worker_failed: bool,
-    /// Monotonic snapshot generation marker (`.kin/kindb/generation`), bumped
+    /// Monotonic authority-head marker (`.kin/kindb/head-generation`), bumped
     /// when the daemon commits a newer graph snapshot. A freshness token that
     /// lets clients and the MCP envelope express `graph_as_of` and detect stale
     /// reads. Additive; `0` before the first snapshot is committed.
@@ -9033,11 +9033,11 @@ mod tests {
     #[tokio::test]
     async fn health_surfaces_graph_generation_marker() {
         // /health must read and surface the persisted snapshot generation marker
-        // (.kin/kindb/generation) so the MCP envelope can express graph_as_of.
+        // (.kin/kindb/head-generation) so the MCP envelope can express graph_as_of.
         let state = test_state();
         let kindb = state.layout.root().join("kindb");
         std::fs::create_dir_all(&kindb).unwrap();
-        std::fs::write(kindb.join("generation"), "7").unwrap();
+        std::fs::write(kindb.join("head-generation"), "7").unwrap();
 
         let app = router(state);
         let response = app

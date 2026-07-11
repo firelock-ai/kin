@@ -1607,7 +1607,7 @@ impl DaemonState {
     /// committed since our last load (generation mismatch).
     ///
     /// After a successful save, writes the new generation number to
-    /// `.kin/kindb/generation` so CLI and MCP processes can detect
+    /// `.kin/kindb/head-generation` so CLI and MCP processes can detect
     /// when their loaded snapshot is stale (P2-2.7).
     pub fn save_snapshot(&self) -> Result<()> {
         self.save_snapshot_impl(false)
@@ -1919,7 +1919,13 @@ impl DaemonState {
         Ok((staged_path, authority_graph.entity_count() as u64))
     }
 
-    /// Write the generation number to `.kin/kindb/generation`.
+    /// Write the durable authority head to `.kin/kindb/head-generation`.
+    ///
+    /// KinDB owns `.kin/kindb/generation` as the generation of its legacy
+    /// `graph.kndb` compatibility projection. A delta commit advances graph
+    /// authority without advancing that projection, so using the legacy path
+    /// as the daemon freshness marker makes the next authority read look like
+    /// a mixed-version legacy writer and correctly fail closed.
     ///
     /// CLI and MCP processes read this file before queries and compare it
     /// to their loaded generation. If different, they know the daemon has
@@ -1927,7 +1933,7 @@ impl DaemonState {
     fn write_generation_marker(&self, generation: u64) -> Result<()> {
         use std::io::Write;
 
-        let gen_path = self.layout.root().join("kindb").join("generation");
+        let gen_path = self.layout.kindb_head_generation_path();
         let tmp_path = gen_path.with_extension(format!("tmp-{}", std::process::id()));
         let parent = gen_path.parent().ok_or_else(|| {
             DaemonError::Io(std::io::Error::other(
@@ -1951,13 +1957,14 @@ impl DaemonState {
         Ok(())
     }
 
-    /// Read the current snapshot generation from `.kin/kindb/generation`.
+    /// Read the current durable authority head from
+    /// `.kin/kindb/head-generation`.
     ///
     /// Returns 0 if the file doesn't exist. CLI and MCP can call this
     /// before queries to check if the daemon has committed a newer snapshot
     /// than what they have loaded in memory.
     pub fn read_generation_marker(layout: &KinLayout) -> u64 {
-        let gen_path = layout.root().join("kindb").join("generation");
+        let gen_path = layout.kindb_head_generation_path();
         std::fs::read_to_string(&gen_path)
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
@@ -3458,7 +3465,7 @@ mod tests {
         state.save_snapshot().unwrap();
         drop(state);
 
-        let marker = layout.root().join("kindb").join("generation");
+        let marker = layout.kindb_head_generation_path();
         std::fs::write(&marker, "0").unwrap();
         let idx_path = layout.kindb_snapshot_path().with_extension("kidx");
         std::fs::remove_file(&idx_path).unwrap();
@@ -3954,9 +3961,12 @@ mod tests {
     fn sequential_saves_leave_consistent_kndb_kidx_pair() {
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
-        let kndb_path = init.layout.kindb_snapshot_path();
+        let layout = init.layout;
+        let kndb_path = layout.kindb_snapshot_path();
         let kidx_path = kndb_path.with_extension("kidx");
-        let state = test_state(init.layout, repo_dir.path());
+        let legacy_projection_generation = layout.kindb_dir().join("generation");
+        std::fs::write(&legacy_projection_generation, "0").unwrap();
+        let state = test_state(layout.clone(), repo_dir.path());
         state
             .graph
             .upsert_entity(&test_entity("paired_fn", "src/lib.rs"))
@@ -3966,7 +3976,26 @@ mod tests {
         // each leave both halves of the on-disk pair present and reloadable —
         // no torn kndb without its kidx, and no kidx without its kndb.
         state.save_snapshot().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&legacy_projection_generation)
+                .unwrap()
+                .trim(),
+            "0"
+        );
         state.save_snapshot().unwrap();
+
+        assert_eq!(
+            DaemonState::read_generation_marker(&layout),
+            2,
+            "the daemon freshness marker must follow the durable authority head"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&legacy_projection_generation)
+                .unwrap()
+                .trim(),
+            "0",
+            "a delta must not mislabel the legacy full-snapshot projection as current"
+        );
 
         assert!(kndb_path.exists(), "graph.kndb must exist after save");
         assert!(kidx_path.exists(), "graph.kidx must exist after save");
