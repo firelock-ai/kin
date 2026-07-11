@@ -470,7 +470,8 @@ Historical note: this snapshot predates the public GitHub prerelease series and 
 - Daemon mode for background file watching (`kin-daemon`)
 - 19-crate workspace architecture
 
-[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.1...HEAD
+[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.16...HEAD
+[0.2.16]: https://github.com/firelock-ai/kin/compare/v0.2.15...v0.2.16
 [0.2.1]: https://github.com/firelock-ai/kin/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/firelock-ai/kin/compare/v0.1.0-alpha.25...v0.2.0
 [0.1.0-alpha.25]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0-alpha.25
