@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.16] - 2026-07-11
+
+Graph authority is more durable across long imports and daemon restarts, while
+agent-facing retrieval and review surfaces explain their evidence more clearly and the
+release path fails closed on artifact provenance.
+
+### Added
+
+- History hydration checkpoints let interrupted imports resume from deterministic,
+  graph-owned progress instead of replaying completed work.
+- `semantic_locate` now reports per-hit `match_evidence` on both the default cosine
+  path and the opt-in fused path; fused multi-query fan-out and reciprocal-rank fusion
+  are available without changing the honest default.
+- Shadow review keeps rename-neutral downstream risk proportionate, excludes
+  derived-copy consumers, and stamps range depth plus a non-demoting deep-history
+  evidence ceiling when a deep range yields no blast radius.
+
+### Changed
+
+- Graph-derived VFS snapshot materialization is cached with single-flight fills, so
+  concurrent readers reuse the same authoritative projection work.
+- `history` and `blame` route lazy hydration through the owning graph authority:
+  HEAD-owned growth is persisted and broadcast only when changes were inserted, while
+  session-scoped growth stays private.
+- Pin `kin-db` 0.2.35 for the storage and snapshot-lock lifecycle used by restart-safe
+  daemon authority.
+
+### Fixed
+
+- Daemon reopen now replays the authoritative storage delta chain and restores the exact
+  generation; completed HEAD hydration survives restart without replay, and its
+  invalidation event is emitted once its persistence generation finalizes.
+- Reconcile bursts retain their full bounded backlog instead of discarding events past
+  the first batch.
+- Release automation now binds Windows checksums to exact archives, gates GitHub Latest
+  on anonymous install proof and approved, proven npm packages, validates the public
+  Homebrew formula outcome, and attests the immutable daemon image.
+
 ## [0.2.15] - 2026-07-08
 
 Sharper shadow review: behavior-equivalence fingerprinting, call-site argument shapes,
