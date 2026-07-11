@@ -100,6 +100,144 @@ jobs:
               "$version" "$current_version" "GitHub Latest"
           fi
 
+  # Publish the daemon image from the same externally-authorized tag workflow
+  # as every other release surface. Main pushes and manual dispatches never get
+  # package-write authority. The commit tag is an immutable staging identity;
+  # version_tag_image promotes that exact digest only after public install proof.
+  build_daemon_image:
+    name: Build immutable daemon image
+    needs: config
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+      commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Resolve release commit
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
+          test "$commit" = "$(git rev-parse HEAD)"
+          if ! printf '%s\n' "$commit" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::release tag did not resolve to a full commit id"
+            exit 1
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Publish or verify immutable commit image
+        id: publish
+        shell: bash
+        env:
+          COMMIT: ${{ steps.source.outputs.commit }}
+          IMAGE: ghcr.io/firelock-ai/kin
+        run: |
+          set -euo pipefail
+          source_image="${IMAGE}:${COMMIT}"
+
+          inspect_digest() {
+            local reference="$1"
+            local output
+            for attempt in 1 2 3 4 5; do
+              if output="$(docker buildx imagetools inspect "$reference" \
+                --format '{{.Manifest.Digest}}' 2>&1)"; then
+                printf '%s\n' "$output"
+                return 0
+              fi
+              if [ "$output" = "ERROR: ${reference}: not found" ]; then
+                return 44
+              fi
+              if [ "$attempt" -eq 5 ]; then
+                printf '%s\n' "$output" >&2
+                echo "::error::could not establish immutable state for $reference" >&2
+                return 1
+              fi
+              sleep $(( attempt * 2 ))
+            done
+          }
+
+          if digest="$(inspect_digest "$source_image")"; then
+            # A rerun never overwrites the commit identity. Verify the exact
+            # existing digest carries this checkout's source and lock metadata.
+            bash scripts/verify-container-build-info.sh \
+              "${IMAGE}@${digest}" "$COMMIT"
+            action="Verified existing"
+          else
+            inspect_status=$?
+            if [ "$inspect_status" -ne 44 ]; then
+              exit "$inspect_status"
+            fi
+
+            docker buildx build \
+              --file Dockerfile \
+              --load \
+              --platform linux/amd64 \
+              --provenance=false \
+              --build-arg "KIN_BUILD_GIT_SHA=${COMMIT}" \
+              --build-arg KIN_BUILD_DIRTY=false \
+              --build-arg "KIN_BUILD_BRANCH=${GITHUB_REF_NAME}" \
+              --cache-from type=gha \
+              --cache-to type=gha,mode=max \
+              --tag "$source_image" \
+              .
+            bash scripts/verify-container-build-info.sh "$source_image" "$COMMIT"
+
+            # Release concurrency serializes writers. Recheck immediately before
+            # the first write so a surprising pre-existing tag fails closed.
+            if existing="$(inspect_digest "$source_image")"; then
+              echo "::error::$source_image appeared concurrently at $existing; refusing to overwrite it"
+              exit 1
+            else
+              inspect_status=$?
+              if [ "$inspect_status" -ne 44 ]; then
+                exit "$inspect_status"
+              fi
+            fi
+
+            docker push "$source_image"
+            digest="$(inspect_digest "$source_image")"
+            bash scripts/verify-container-build-info.sh \
+              "${IMAGE}@${digest}" "$COMMIT"
+            action="Published"
+          fi
+
+          case "$digest" in
+            sha256:*) ;;
+            *)
+              echo "::error::could not resolve an immutable digest for $source_image"
+              exit 1
+              ;;
+          esac
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          {
+            echo "${action} immutable release image:"
+            echo ""
+            echo "- source: \`${source_image}\`"
+            echo "- digest: \`${digest}\`"
+            echo "- no mutable latest tag was written"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   build:
     name: Build (${{ matrix.artifact }})
     needs: config
@@ -1369,12 +1507,61 @@ jobs:
           CANDIDATE_TAG="release-candidate-$(printf '%s' "$VERSION" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
           FINAL_TAG="$(node scripts/release-order.mjs channel "$VERSION")"
           packages=("@kinlab/kin" "@kinlab/kin-mcp")
+          declare -A originals=()
+          promoted=()
+
+          rollback_promotions() {
+            local status="$1"
+            local rollback_failed=0
+            local package original resolved
+            trap - ERR INT TERM
+            set +e
+            if [ "$status" -eq 0 ]; then status=1; fi
+
+            echo "::warning::npm promotion failed; restoring every channel changed by this run"
+            for (( index=${#promoted[@]}-1; index>=0; index-- )); do
+              package="${promoted[$index]}"
+              original="${originals[$package]}"
+              if [ "$original" = "<none>" ]; then
+                env NODE_AUTH_TOKEN="$NPM_TOKEN" \
+                  npm dist-tag rm "$package" "$FINAL_TAG" >/dev/null 2>&1 || true
+              else
+                env NODE_AUTH_TOKEN="$NPM_TOKEN" \
+                  npm dist-tag add "${package}@${original}" "$FINAL_TAG" \
+                  >/dev/null 2>&1 || true
+              fi
+
+              resolved=""
+              for attempt in $(seq 1 18); do
+                resolved="$(node scripts/release-order.mjs \
+                  npm-channel "$package" "$FINAL_TAG" 2>/dev/null || true)"
+                if [ "$resolved" = "$original" ]; then
+                  break
+                fi
+                sleep 10
+              done
+              if [ "$resolved" != "$original" ]; then
+                echo "::error::ROLLBACK REQUIRED: ${package}@${FINAL_TAG} is ${resolved:-<unknown>}, expected ${original}"
+                rollback_failed=1
+              else
+                echo "Restored ${package}@${FINAL_TAG} to ${original}"
+              fi
+            done
+            if [ "$rollback_failed" -ne 0 ]; then
+              exit 1
+            fi
+            exit "$status"
+          }
+          trap 'rollback_promotions $?' ERR
+          trap 'rollback_promotions 130' INT
+          trap 'rollback_promotions 143' TERM
 
           # Preflight every package before mutating either channel. This keeps a
           # stale tag rerun from advancing one package and then discovering the
           # other package already has a newer public channel.
           for package in "${packages[@]}"; do
             current="$(node scripts/release-order.mjs npm-channel "$package" "$FINAL_TAG")"
+            originals["$package"]="$current"
             node scripts/release-order.mjs assert-not-rollback \
               "$VERSION" "$current" "npm ${package} ${FINAL_TAG}"
             candidate="$(env -u NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG=/dev/null \
@@ -1385,19 +1572,31 @@ jobs:
             fi
           done
 
+          # The two compatibility surfaces are one release channel. Refuse to
+          # build on an already-split starting state; compensation below restores
+          # both to these identical preflight values if either write/proof fails.
+          first_package="${packages[0]}"
+          second_package="${packages[1]}"
+          if [ "${originals[$first_package]}" != "${originals[$second_package]}" ]; then
+            echo "::error::npm ${FINAL_TAG} is already split: ${first_package}=${originals[$first_package]}, ${second_package}=${originals[$second_package]}"
+            exit 1
+          fi
+
           for package in "${packages[@]}"; do
             # Re-read immediately before each write. Repository concurrency
             # serializes Kin releases; this second check also catches an
             # external/manual npm channel move during the run.
             current="$(node scripts/release-order.mjs npm-channel "$package" "$FINAL_TAG")"
-            node scripts/release-order.mjs assert-not-rollback \
-              "$VERSION" "$current" "npm ${package} ${FINAL_TAG}"
+            if [ "$current" != "${originals[$package]}" ]; then
+              echo "::error::npm ${package} ${FINAL_TAG} moved from ${originals[$package]} to $current during promotion"
+              exit 1
+            fi
             if [ "$current" != "$VERSION" ]; then
+              # Record intent before the write so a command that mutates and
+              # then loses its response is still included in compensation.
+              promoted+=("$package")
               env NODE_AUTH_TOKEN="$NPM_TOKEN" npm dist-tag add "${package}@${VERSION}" "$FINAL_TAG"
             fi
-          done
-
-          for package in "${packages[@]}"; do
             resolved=""
             for attempt in $(seq 1 18); do
               resolved="$(env -u NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG=/dev/null \
@@ -1413,8 +1612,15 @@ jobs:
             done
           done
 
+          # Both public channels now resolve anonymously to the same version.
+          # Candidate-tag cleanup is non-authoritative and must not trigger a
+          # rollback after the two-channel promotion has committed.
+          trap - ERR INT TERM
           for package in "${packages[@]}"; do
-            env NODE_AUTH_TOKEN="$NPM_TOKEN" npm dist-tag rm "$package" "$CANDIDATE_TAG"
+            if ! env NODE_AUTH_TOKEN="$NPM_TOKEN" \
+              npm dist-tag rm "$package" "$CANDIDATE_TAG"; then
+              echo "::warning::could not remove provisional ${package}@${CANDIDATE_TAG}; final ${FINAL_TAG} remains verified"
+            fi
           done
 
   finalize_release:
@@ -1576,18 +1782,12 @@ jobs:
         run: |
           bash scripts/verify-homebrew-formula.sh "$GITHUB_REF_NAME"
 
-  # Version-tag the public daemon image so operators can pin a release
-  # (`docker pull ghcr.io/firelock-ai/kin:0.2.7`). daemon-image.yml already pushed
-  # `ghcr.io/firelock-ai/kin:<commit-sha>` + `:latest` on the main push that this
-  # release was cut from; here we add `:<version>` and `:v<version>` as extra tags
-  # pointing at that same image — a registry-side manifest copy, no rebuild — so
-  # the version tags resolve to the exact image built for the release commit. Kept
-  # out of daemon-image.yml on purpose: rebuilding on the tag would produce a
-  # second, differently-built image, and "on a version tag" logic belongs with the
-  # other release surfaces here.
+  # Promote the immutable commit image built by this release workflow so
+  # operators can pin a version (`docker pull ghcr.io/firelock-ai/kin:0.2.7`).
+  # No main-push workflow, GCP identity, or mutable latest tag participates.
   version_tag_image:
     name: Version-tag ghcr image
-    needs: [publish, install_proof]
+    needs: [publish, install_proof, build_daemon_image]
     # Mirror publish's always() guard so a skipped notarize_linux does not
     # transitively skip this job, and only tag real version-tag pushes so
     # `:<version>` never points at an unreleased build.
@@ -1618,33 +1818,20 @@ jobs:
       - name: Version-tag the release commit's daemon image (no rebuild)
         env:
           IMAGE: ghcr.io/firelock-ai/kin
+          EXPECTED_COMMIT: ${{ needs.build_daemon_image.outputs.commit }}
+          EXPECTED_SOURCE_DIGEST: ${{ needs.build_daemon_image.outputs.digest }}
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
 
-          # daemon-image.yml tags every push to main as `${IMAGE}:<commit-sha>`
-          # (github.sha on a branch push is the head commit) plus `:latest`. The
-          # release tag was cut on that same commit, so peel the tag to its commit
-          # and retag THAT image. Peel with git rather than trusting github.sha,
-          # whose value for an annotated tag is the tag object, not the commit the
-          # daemon image was keyed on.
+          # Peel with git rather than trusting github.sha, whose value for an
+          # annotated tag is the tag object rather than the target commit.
           COMMIT="$(git rev-parse HEAD)"
+          if [ "$COMMIT" != "$EXPECTED_COMMIT" ]; then
+            echo "::error::release checkout resolved to $COMMIT, image job resolved to $EXPECTED_COMMIT"
+            exit 1
+          fi
           SRC="${IMAGE}:${COMMIT}"
-
-          # daemon-image.yml (push:main) and this release run were kicked off by the
-          # same bump commit, so the commit image is normally already present by the
-          # time Publish Release finishes. Poll rather than assume: a hand-pushed tag
-          # or a slow/failed daemon-image build then fails loud instead of silently
-          # tagging nothing.
-          deadline=$(( SECONDS + 1800 ))
-          until docker buildx imagetools inspect "$SRC" >/dev/null 2>&1; do
-            if [ "$SECONDS" -ge "$deadline" ]; then
-              echo "::error::$SRC was not found after 30m — daemon-image.yml did not publish an image for this commit (did it run and succeed?). Refusing to version-tag via a rebuild."
-              exit 1
-            fi
-            echo "Waiting for $SRC (published by daemon-image.yml on the main push)…"
-            sleep 20
-          done
 
           source_digest="$(docker buildx imagetools inspect "$SRC" --format '{{.Manifest.Digest}}')"
           case "$source_digest" in
@@ -1654,6 +1841,10 @@ jobs:
               exit 1
               ;;
           esac
+          if [ "$source_digest" != "$EXPECTED_SOURCE_DIGEST" ]; then
+            echo "::error::$SRC moved from release-built $EXPECTED_SOURCE_DIGEST to $source_digest"
+            exit 1
+          fi
 
           # Version tags are immutable release identities. A rerun may observe
           # an already-correct tag, but it must never overwrite a mismatched
