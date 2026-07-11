@@ -134,10 +134,7 @@ fi
 
 FAKE_RELEASE_ORDER = r"""#!/usr/bin/env node
 import fs from 'node:fs';
-
-const statePath = process.env.FAKE_NPM_STATE;
-const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
-const [command, ...args] = process.argv.slice(2);
+import { pathToFileURL } from 'node:url';
 
 const compare = (left, right) => {
   const a = left.split('.').map(Number);
@@ -148,27 +145,39 @@ const compare = (left, right) => {
   return 0;
 };
 
-if (command === 'channel') {
-  console.log('latest');
-} else if (command === 'npm-channel') {
-  const [packageName, channel] = args;
-  state.channel_reads = (state.channel_reads ?? 0) + 1;
-  fs.writeFileSync(statePath, JSON.stringify(state));
-  if (state.scenario === 'fail_post_publish_channel_read' && state.channel_reads >= 2) {
-    console.error('simulated npm registry outage after publish acceptance');
-    process.exit(1);
+const main = (argv) => {
+  const statePath = process.env.FAKE_NPM_STATE;
+  const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  const [command, ...args] = argv;
+
+  if (command === 'channel') {
+    console.log('latest');
+  } else if (command === 'npm-channel') {
+    const [packageName, channel] = args;
+    state.channel_reads = (state.channel_reads ?? 0) + 1;
+    fs.writeFileSync(statePath, JSON.stringify(state));
+    if (state.scenario === 'fail_post_publish_channel_read' && state.channel_reads >= 2) {
+      console.error('simulated npm registry outage after publish acceptance');
+      process.exit(1);
+    }
+    console.log(state.tags?.[packageName]?.[channel] ?? '<none>');
+  } else if (command === 'assert-not-rollback') {
+    const [candidate, current, label = 'release channel'] = args;
+    state.rollback_checks = (state.rollback_checks ?? 0) + 1;
+    fs.writeFileSync(statePath, JSON.stringify(state));
+    if (current !== '<none>' && compare(candidate, current) < 0) {
+      console.error(`${label} is already ${current}; refusing to roll it back to ${candidate}`);
+      process.exit(1);
+    }
+    console.log(`${label} may advance from ${current} to ${candidate}`);
+  } else {
+    console.error(`unsupported fake release-order command: ${command}`);
+    process.exit(98);
   }
-  console.log(state.tags?.[packageName]?.[channel] ?? '<none>');
-} else if (command === 'assert-not-rollback') {
-  const [candidate, current, label = 'release channel'] = args;
-  if (current !== '<none>' && compare(candidate, current) < 0) {
-    console.error(`${label} is already ${current}; refusing to roll it back to ${candidate}`);
-    process.exit(1);
-  }
-  console.log(`${label} may advance from ${current} to ${candidate}`);
-} else {
-  console.error(`unsupported fake release-order command: ${command}`);
-  process.exit(98);
+};
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main(process.argv.slice(2));
 }
 """
 
@@ -214,7 +223,7 @@ def harness() -> tuple[tempfile.TemporaryDirectory[str], Path, dict[str, str]]:
             "FAKE_NPM_STATE": str(tmp / "state.json"),
             "FAKE_VERIFY_LOG": str(tmp / "verify.json"),
             "NPM_RELEASE_VERIFY_SCRIPT": str(bin_dir / "verify"),
-            "NPM_RELEASE_ORDER_SCRIPT": str(bin_dir / "release-order.mjs"),
+            "NPM_RELEASE_ORDER_SCRIPT": str((bin_dir / "release-order.mjs").resolve()),
             "GITHUB_OUTPUT": str(tmp / "github-output"),
             "NODE_AUTH_TOKEN": "must-not-reach-npm",
             "NPM_TOKEN": "must-not-reach-npm",
@@ -352,6 +361,68 @@ bash "$1" "$3" "$4" "$5"
     print("PASS: bad existing package blocks absent sibling before either publish job")
 
 
+def test_symlinked_checkout_runs_channel_and_rollback_preflight() -> None:
+    owner, package_dir, env = harness()
+    tmp = Path(owner.name)
+    repo = tmp / "physical-repo"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    write_executable(scripts / PUBLISHER.name, PUBLISHER.read_text(encoding="utf-8"))
+    write_executable(scripts / "release-order.mjs", FAKE_RELEASE_ORDER)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "scripts"], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Kin Release Test",
+            "-c",
+            "user.email=release-test@kin.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-qm",
+            "test fixture",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    logical_repo = tmp / "logical-repo"
+    logical_repo.symlink_to(repo, target_is_directory=True)
+    state_path = tmp / "state.json"
+    state_path.write_text(json.dumps(base_state()), encoding="utf-8")
+    env.pop("NPM_RELEASE_ORDER_SCRIPT")
+    commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+    ).strip()
+    result = subprocess.run(
+        [
+            "bash",
+            str(logical_repo / "scripts" / PUBLISHER.name),
+            "--preflight",
+            str(package_dir),
+            REF,
+            commit,
+        ],
+        cwd=logical_repo,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    snapshot = json.loads(state_path.read_text())
+    owner.cleanup()
+    assert result.returncode == 0, result.stderr
+    assert snapshot.get("channel_reads") == 1
+    assert snapshot.get("rollback_checks") == 1
+    assert "latest=0.2.15" in result.stdout
+    assert "no registry mutation performed" in result.stdout
+    assert not any(command[:1] == ["publish"] for command in snapshot["commands"])
+    print("PASS: symlinked checkout executes channel and rollback preflight")
+
+
 def test_new_publish() -> None:
     result, snapshot = run_publish(base_state())
     assert result.returncode == 0, result.stderr
@@ -457,6 +528,7 @@ def main() -> None:
     test_existing_preflight_requires_exact_public_proof()
     test_targeted_view_outage_is_not_treated_as_absence()
     test_bad_existing_package_blocks_absent_sibling_before_any_publish()
+    test_symlinked_checkout_runs_channel_and_rollback_preflight()
     test_new_publish()
     test_public_rerun_verifies_before_skip()
     test_rejected_publish_fails_without_public_version()

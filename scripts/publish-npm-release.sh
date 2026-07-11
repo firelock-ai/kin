@@ -22,8 +22,8 @@ fi
 package_dir="$1"
 expected_ref="$2"
 expected_commit="$3"
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-root="$(cd -- "$script_dir/.." && pwd)"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+root="$(cd -- "$script_dir/.." && pwd -P)"
 verify_script="${NPM_RELEASE_VERIFY_SCRIPT:-$script_dir/verify-npm-release.sh}"
 release_order_script="${NPM_RELEASE_ORDER_SCRIPT:-$script_dir/release-order.mjs}"
 
