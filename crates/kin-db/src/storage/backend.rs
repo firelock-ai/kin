@@ -377,6 +377,8 @@ pub struct LocalFileBackend {
     fail_delta_cleanup: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_legacy_rebuild_cleanup: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    recovery_after_authority_hook: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
 }
 
 const LOCAL_AUTHORITY_VERSION: u32 = 2;
@@ -426,6 +428,8 @@ impl LocalFileBackend {
             fail_delta_cleanup: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_legacy_rebuild_cleanup: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            recovery_after_authority_hook: parking_lot::Mutex::new(None),
         }
     }
 
@@ -755,6 +759,32 @@ impl LocalFileBackend {
             if digest != identity.sha256 {
                 return Err(KinDbError::StorageError(format!(
                     "acknowledged delta digest mismatch for repo {repo_id} generation {}: expected {}, found {digest}; a mixed-version writer replaced committed journal bytes",
+                    identity.generation, identity.sha256
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_loaded_acknowledged_deltas(
+        repo_id: &str,
+        record: &LocalAuthorityRecord,
+        deltas: &[(Vec<u8>, Generation)],
+    ) -> Result<(), KinDbError> {
+        for identity in &record.acknowledged_deltas {
+            let Some((bytes, _)) = deltas
+                .iter()
+                .find(|(_, generation)| *generation == identity.generation)
+            else {
+                return Err(KinDbError::StorageError(format!(
+                    "repo {repo_id} delta chain ended before acknowledged generation {}",
+                    identity.generation
+                )));
+            };
+            let digest = Self::snapshot_digest(bytes);
+            if digest != identity.sha256 {
+                return Err(KinDbError::StorageError(format!(
+                    "acknowledged delta digest mismatch for repo {repo_id} generation {} while loading recovery bytes: expected {}, found {digest}; a mixed-version writer replaced committed journal bytes",
                     identity.generation, identity.sha256
                 )));
             }
@@ -1173,6 +1203,11 @@ impl LocalFileBackend {
         self.fail_legacy_rebuild_cleanup
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
+
+    #[cfg(test)]
+    fn set_recovery_after_authority_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.recovery_after_authority_hook.lock() = Some(Box::new(hook));
+    }
 }
 
 impl StorageBackend for LocalFileBackend {
@@ -1197,10 +1232,31 @@ impl StorageBackend for LocalFileBackend {
     fn load_recovery_state(&self, repo_id: &str) -> Result<SnapshotRecoveryState, KinDbError> {
         let _lock = self.acquire_lock(repo_id)?;
         let authority = self.load_authority_unlocked(repo_id)?;
+        let authority_record = self.read_authority_record_raw_unlocked(repo_id)?;
+        match (authority.as_ref(), authority_record.as_ref()) {
+            (Some(authority), Some(record))
+                if authority.snapshot_generation == record.snapshot_generation
+                    && authority.head_generation == record.head_generation
+                    && Self::snapshot_digest(&authority.snapshot_bytes)
+                        == record.snapshot_sha256 => {}
+            (None, None) => {}
+            _ => {
+                return Err(KinDbError::StorageError(format!(
+                    "repo {repo_id} snapshot authority changed while loading recovery state"
+                )));
+            }
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.recovery_after_authority_hook.lock().take() {
+            hook();
+        }
         let since = authority
             .as_ref()
             .map_or(GENERATION_INIT, |authority| authority.snapshot_generation);
         let deltas = self.load_deltas_since_unlocked(repo_id, since)?;
+        if let Some(record) = authority_record.as_ref() {
+            Self::validate_loaded_acknowledged_deltas(repo_id, record, &deltas)?;
+        }
         Ok((authority, deltas))
     }
 
@@ -2101,6 +2157,40 @@ mod tests {
         assert!(error
             .to_string()
             .contains("acknowledged delta digest mismatch"));
+    }
+
+    #[test]
+    fn local_recovery_validates_the_exact_delta_bytes_it_returns() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "mixed-version-recovery-read-race";
+        let base = GraphSnapshot::empty();
+        let gen1 = backend
+            .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let mut current = base.clone();
+        current
+            .file_hashes
+            .insert("committed.rs".to_string(), [7; 32]);
+        let committed = crate::storage::delta::compute_graph_delta(&base, &current, gen1);
+        let gen2 = backend
+            .save_delta(repo_id, &committed.to_bytes().unwrap(), gen1)
+            .unwrap();
+
+        let delta_path = backend.delta_path(repo_id, gen2);
+        let replacement = crate::storage::delta::GraphSnapshotDelta::empty(gen1)
+            .to_bytes()
+            .unwrap();
+        backend.set_recovery_after_authority_hook(move || {
+            LocalFileBackend::atomic_write(&delta_path, &replacement).unwrap();
+        });
+
+        let error = load_recovered_snapshot(&backend, repo_id)
+            .expect_err("recovery must hash the same bytes it is about to return and replay");
+        assert!(
+            error.to_string().contains("while loading recovery bytes"),
+            "unexpected recovery race error: {error}"
+        );
     }
 
     #[test]
