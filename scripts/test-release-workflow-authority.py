@@ -95,7 +95,14 @@ def main() -> None:
 
     for workflow in sorted(WORKFLOWS.glob("*.yml")):
         content = workflow.read_text(encoding="utf-8")
-        if "branches: [main]" in content:
+        main_branch = re.search(
+            r"(?m)^\s+branches:\s*\[\s*['\"]?main['\"]?\s*\]\s*$",
+            content,
+        ) or re.search(
+            r"(?m)^\s+branches:\s*$\n(?:\s+-.*\n)*?\s+-\s*['\"]?main['\"]?\s*$",
+            content,
+        )
+        if main_branch:
             writes = re.findall(
                 r"(?m)^\s+(contents|packages|id-token):\s*write\s*$", content
             )
@@ -109,6 +116,29 @@ def main() -> None:
                 raise AssertionError(
                     f"{workflow.name} still consumes infra-only {forbidden_secret}"
                 )
+
+        if "workflow_dispatch:" in content and re.search(
+            r"secrets\.(?:KIN_[A-Z0-9_]*TOKEN|NPM_TOKEN|WIF_PROVIDER|WIF_SERVICE_ACCOUNT)",
+            content,
+        ):
+            raise AssertionError(
+                f"{workflow.name} exposes branch-selectable dispatch with a release-capable secret"
+            )
+
+    dependency_wave = (WORKFLOWS / "kin-dependency-wave.yml").read_text(
+        encoding="utf-8"
+    )
+    dependency_pin = "d06908b534ad5a70bb0f39a1b2b8d6228acf70a4"
+    require(
+        dependency_wave,
+        f"cargo-dependency-wave.yml@{dependency_pin}",
+        "dependency-wave reusable workflow",
+    )
+    require(
+        dependency_wave,
+        f"kin-actions-ref: {dependency_pin}",
+        "dependency-wave helper checkout",
+    )
 
     print("release workflow authority is tag-only, protected, pinned, and GCP-free")
 
