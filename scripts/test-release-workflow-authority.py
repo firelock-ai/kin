@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = ROOT / ".github" / "workflows"
 RELEASE = WORKFLOWS / "release.yml"
+INSTALLER_CALLBACK = WORKFLOWS / "publish-release-installers.yml"
 
 
 def require(content: str, needle: str, context: str) -> None:
@@ -34,6 +35,7 @@ def main() -> None:
             )
 
     release = RELEASE.read_text(encoding="utf-8")
+    installer_callback = INSTALLER_CALLBACK.read_text(encoding="utf-8")
     docker_workflow = (WORKFLOWS / "docker.yml").read_text(encoding="utf-8")
     if "workflow_dispatch:" in release:
         raise AssertionError(
@@ -42,6 +44,82 @@ def main() -> None:
     require(release, 'tags:\n      - "v*.*.*"', "release trigger")
     require(release, "  build_daemon_image:", "release daemon image job")
     require(release, "  attest_daemon_image:", "release daemon attestation job")
+
+    for policy in (
+        'workflows: ["Release"]',
+        "types: [completed]",
+        "actions: read",
+        "contents: read",
+        "vars.INSTALLER_DISPATCH_READY == 'true'",
+        "github.event.workflow_run.status == 'completed'",
+        "github.event.workflow_run.conclusion == 'success'",
+        "github.event.workflow_run.event == 'push'",
+        "startsWith(github.event.workflow_run.head_branch, 'v')",
+        "!contains(github.event.workflow_run.head_branch, '-')",
+        "environment: installer-dispatch",
+        "timeout-minutes: 15",
+        "SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}",
+        "KIN_TAG: ${{ github.event.workflow_run.head_branch }}",
+        "KIN_SHA: ${{ github.event.workflow_run.head_sha }}",
+        'gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"',
+        '[ "$(jq -r .status <<< "$run")" = completed ]',
+        '[ "$(jq -r .conclusion <<< "$run")" = success ]',
+        '[ "$(jq -r .path <<< "$run")" = .github/workflows/release.yml ]',
+        '[ "$peeled" = "$KIN_SHA" ]',
+        'gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${KIN_TAG}"',
+        'gh api "repos/${GITHUB_REPOSITORY}/releases/latest"',
+        "ref: ${{ env.KIN_SHA }}",
+        "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
+        "secrets.KIN_INSTALLER_APP_ID",
+        "secrets.KIN_INSTALLER_APP_PRIVATE_KEY",
+        "repositories: kin-infra",
+        "permission-actions: read",
+        "permission-contents: write",
+        'event_type:"publish-install"',
+        "schema_version:1",
+        "release_workflow_run_id:$run_id",
+        "install_sha256:$install_sha256",
+        "install_ps1_sha256:$install_ps1_sha256",
+        "Publish installers ${KIN_TAG} from Kin run ${SOURCE_RUN_ID}",
+        "actions/workflows/publish-install.yml/runs?event=repository_dispatch",
+        "the workflow may still be disabled",
+        'python3 scripts/verify_installer_parity.py "$KIN_TAG" --expected-sha "$KIN_SHA"',
+    ):
+        require(installer_callback, policy, "completed-release installer callback")
+
+    callback_admission_start = installer_callback.index("    if: >-")
+    callback_admission_end = installer_callback.index(
+        "    runs-on:", callback_admission_start
+    )
+    callback_admission = installer_callback[
+        callback_admission_start:callback_admission_end
+    ]
+    require(
+        callback_admission,
+        "!contains(github.event.workflow_run.head_branch, '-')",
+        "stable-only installer callback admission",
+    )
+
+    for forbidden in (
+        "workflow_dispatch:",
+        "push:",
+        "pull_request:",
+        "gcloud",
+        "WIF_INSTALLER_PROVIDER",
+        "WIF_INSTALLER_SERVICE_ACCOUNT",
+    ):
+        if forbidden in installer_callback:
+            raise AssertionError(
+                f"completed-release installer callback contains forbidden authority: {forbidden}"
+            )
+    for permission in ("contents", "id-token", "packages", "attestations"):
+        if re.search(
+            rf"(?m)^\s+{re.escape(permission)}:\s*write\s*$", installer_callback
+        ):
+            raise AssertionError(
+                "completed-release installer callback grants its workflow token "
+                f"forbidden {permission}:write authority"
+            )
 
     for policy in (
         "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",

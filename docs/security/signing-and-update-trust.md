@@ -63,6 +63,45 @@ without rebuilding and never writes an implicit `latest` image.
 Hosted infrastructure may copy the exact manifest into its private registry,
 but that operation is a separately attested promotion, not a second build.
 
+The public convenience installers are also a post-release promotion, not
+mutable `main` content. After the complete tag-only Release workflow succeeds,
+[`publish-release-installers.yml`](../../.github/workflows/publish-release-installers.yml)
+revalidates the completed run, exact tag and peeled commit, published Latest
+release, and both installer hashes. It then uses a short-lived GitHub App token
+scoped only to `firelock-ai/kin-infra` to request the protected atomic
+publisher. The callback has no cloud credential. The downstream publisher
+stages immutable objects, generation-CAS activates `/install`, `/install.ps1`,
+and `/current.json`, proves all three public bytes, and restores the previous
+generations if proof fails.
+
+The callback runs in the `installer-dispatch` GitHub environment, admitted only
+from protected `main`. That environment holds `KIN_INSTALLER_APP_ID` and
+`KIN_INSTALLER_APP_PRIVATE_KEY`; the GitHub App must be installed only on
+`firelock-ai/kin-infra` with repository Contents write permission, which is the
+minimum permission required to create a repository dispatch, plus Actions read
+permission so the callback can wait for and verify the exact downstream run.
+The downstream `installer` environment and its dedicated WIF identity remain a
+separate approval and authorization boundary. Missing environments, secrets, a
+disabled downstream workflow, or a non-successful Release run fail closed and
+leave the currently served installer generations unchanged.
+
+The repository variable `INSTALLER_DISPATCH_READY` must equal `true` before the
+callback job is admitted. Leave it unset until the environment, GitHub App,
+downstream workflow, bucket versioning, and public readback path are all
+verified; this prevents a merged workflow from creating or using an unprotected
+environment during bootstrap.
+
+Public OSS readiness requires exact live byte parity, not merely a safe or
+functioning installer. Run
+`python3 scripts/verify_installer_parity.py <release-tag>` and require success
+before an announcement or public-launch claim. The gate compares both served
+scripts with the exact peeled release commit and requires `/current.json` to
+bind the same tag, commit, hashes, and GCS generations. Even wording-only drift
+in `install.ps1` fails this gate. For the first migration to the atomic
+publisher, leave `INSTALLER_DISPATCH_READY` unset, publish the exact release via
+the protected break-glass workflow, prove parity, and only then set the variable
+to `true` for future completed-release callbacks.
+
 ## Three Independent Integrity Layers
 
 Kin's release trust rests on three layers that are verified independently:
