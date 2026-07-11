@@ -68,23 +68,20 @@ jobs:
       - name: Test @kinlab/kin (canonical launcher)
         run: npm test --prefix ./packages/kin && npm run lint --prefix ./packages/kin
 
-      # test:unit, not test: full `node --test` discovery pulls in the first-run
-      # smoke, which requires a built kin binary a fresh CI runner does not have.
       - name: Test @kinlab/kin-mcp (compatibility wrapper)
-        run: npm run test:unit --prefix ./packages/kin-mcp && npm run lint --prefix ./packages/kin-mcp
+        run: npm test --prefix ./packages/kin-mcp && npm run lint --prefix ./packages/kin-mcp
 
       - name: Test release ordering and npm provenance policy
         run: |
           python3 ./scripts/test-release-workflow-authority.py
           python3 ./scripts/test_installer_parity.py
-          python3 ./scripts/test-npm-staged-release.py
+          python3 ./scripts/test-npm-automatic-release.py
           node --test \
             ./scripts/release-order.test.mjs \
             ./scripts/verify-npm-attestation.test.mjs
           node --check ./scripts/release-order.mjs
           node --check ./scripts/verify-npm-attestation.mjs
-          bash -n ./scripts/stage-npm-release.sh
-          bash -n ./scripts/wait-npm-approval.sh
+          bash -n ./scripts/publish-npm-release.sh
           bash -n ./scripts/verify-npm-release.sh
 
   windows-installer:
