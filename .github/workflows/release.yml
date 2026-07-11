@@ -1343,6 +1343,9 @@ jobs:
           env -u NODE_AUTH_TOKEN -u NPM_TOKEN npm install --global npm@11.15.0
           test "$(npm --version)" = "11.15.0"
 
+      - name: Run compatibility wrapper tests
+        run: npm test --prefix ./packages/kin-mcp
+
       - name: Stage final-channel package with Trusted Publishing
         id: npm_stage
         shell: bash
