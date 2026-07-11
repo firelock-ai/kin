@@ -2372,32 +2372,53 @@ impl InMemoryGraph {
     }
 
     fn rebuild_text_index_with_root_hash(&self, root_hash: [u8; 32]) {
-        let _span = tracing::info_span!("kindb.graph.rebuild_text_index_with_root_hash").entered();
-        let Some(ref ti) = self.text_index else {
-            return;
-        };
+        if let Err(error) = self.try_rebuild_text_index_from_graph(self, root_hash) {
+            tracing::warn!(error = %error, "failed to rebuild text index");
+        }
+    }
 
-        let docs: Vec<(RetrievalKey, Vec<(String, f32)>)> = {
-            let ent = self.entities.read();
-            let _span = tracing::info_span!(
-                "kindb.graph.rebuild_text_index.collect",
-                entities = ent.entities.len(),
-                shallow_files = ent.shallow_files.len(),
-                structured_artifacts = ent.structured_artifacts.len(),
-                opaque_artifacts = ent.opaque_artifacts.len()
-            )
-            .entered();
-            let entity_docs = ent.entities.values().map(|entity| {
-                let extra = collect_text_index_extra_fields(&ent, &entity.id);
-                let fields = if extra.is_empty() {
-                    crate::search::entity_fields(entity)
-                } else {
-                    crate::search::entity_fields_with_extra(entity, &extra)
-                };
-                (RetrievalKey::Entity(entity.id), fields)
-            });
-            let artifact_docs = collect_artifact_text_index_docs(&ent);
-            entity_docs.chain(artifact_docs).collect()
+    fn try_rebuild_text_index_from_graph(
+        &self,
+        source: &InMemoryGraph,
+        root_hash: [u8; 32],
+    ) -> Result<(), KinDbError> {
+        let _span = tracing::info_span!("kindb.graph.rebuild_text_index_with_root_hash").entered();
+        let docs = {
+            let ent = source.entities.read();
+            Self::collect_text_index_docs(&ent)
+        };
+        self.try_rebuild_text_index_from_docs(docs, root_hash)
+    }
+
+    fn collect_text_index_docs(ent: &EntityData) -> Vec<(RetrievalKey, Vec<(String, f32)>)> {
+        let _span = tracing::info_span!(
+            "kindb.graph.rebuild_text_index.collect",
+            entities = ent.entities.len(),
+            shallow_files = ent.shallow_files.len(),
+            structured_artifacts = ent.structured_artifacts.len(),
+            opaque_artifacts = ent.opaque_artifacts.len()
+        )
+        .entered();
+        let entity_docs = ent.entities.values().map(|entity| {
+            let extra = collect_text_index_extra_fields(ent, &entity.id);
+            let fields = if extra.is_empty() {
+                crate::search::entity_fields(entity)
+            } else {
+                crate::search::entity_fields_with_extra(entity, &extra)
+            };
+            (RetrievalKey::Entity(entity.id), fields)
+        });
+        let artifact_docs = collect_artifact_text_index_docs(ent);
+        entity_docs.chain(artifact_docs).collect()
+    }
+
+    fn try_rebuild_text_index_from_docs(
+        &self,
+        docs: Vec<(RetrievalKey, Vec<(String, f32)>)>,
+        root_hash: [u8; 32],
+    ) -> Result<(), KinDbError> {
+        let Some(ref ti) = self.text_index else {
+            return Ok(());
         };
 
         {
@@ -2406,17 +2427,18 @@ impl InMemoryGraph {
                 docs = docs.len()
             )
             .entered();
-            let _ = ti.rebuild_all_owned(docs);
+            ti.rebuild_all_owned(docs)?;
         }
 
         {
             let _span = tracing::info_span!("kindb.graph.rebuild_text_index.commit").entered();
             ti.set_graph_root_hash(root_hash);
-            let _ = ti.commit();
+            ti.commit()?;
         }
         self.text_dirty.store(false, Ordering::Release);
         self.text_full_rebuild_required
             .store(false, Ordering::Release);
+        Ok(())
     }
 
     #[inline]
@@ -2543,6 +2565,60 @@ impl InMemoryGraph {
         let removed = pending.in_flight_persistence.remove(&epoch.0);
         self.full_snapshot_required.store(true, Ordering::Release);
         removed
+    }
+
+    /// Persist derived sidecars only while the live graph is still exactly the
+    /// state captured by `epoch` and `expected_root_hash`.
+    ///
+    /// All graph read guards and the pending-delta fence are held through the
+    /// text rebuild and `persist_additional`. This uses the already-held entity
+    /// guard to materialize text documents, avoiding both a recursive read lock
+    /// and a second full `GraphSnapshot` allocation for large repositories.
+    pub(crate) fn persist_derived_sidecars_for_epoch<T>(
+        &self,
+        epoch: PersistenceEpoch,
+        expected_root_hash: [u8; 32],
+        persist_additional: impl FnOnce() -> Result<T, KinDbError>,
+    ) -> Result<bool, KinDbError> {
+        let ent = self.entities.read();
+        let _chg = self.changes.read();
+        let _wrk = self.work.read();
+        let _rev = self.reviews.read();
+        let _ver = self.verification.read();
+        let _prv = self.provenance.read();
+        let _ses = self.sessions.read();
+        let pending = self.pending_delta.lock();
+        self.flush_merkle(&ent);
+        let current_root_hash = self.merkle.read().root_hash();
+        let exact = current_root_hash == expected_root_hash
+            && pending.in_flight_persistence.contains(&epoch.0)
+            && pending.delta.is_empty()
+            && !self.full_snapshot_required.load(Ordering::Acquire);
+        if !exact {
+            return Ok(false);
+        }
+        let docs = Self::collect_text_index_docs(&ent);
+        self.try_rebuild_text_index_from_docs(docs, expected_root_hash)?;
+        persist_additional()?;
+        Ok(true)
+    }
+
+    /// Commit any staged live text for current-process query coherence while
+    /// stamping the persisted index as deliberately non-authoritative. A cold
+    /// reopen will rebuild it from graph truth rather than accept a mixed epoch.
+    pub(crate) fn invalidate_persisted_text_index(&self) -> Result<(), KinDbError> {
+        if self.text_full_rebuild_required.load(Ordering::Acquire) {
+            // The successful rebuild clears this flag. Preserve it on error so
+            // a retry cannot stamp a still-stale live index as invalid-but-
+            // coherent without first applying relation-derived text changes.
+            return self.try_rebuild_text_index_from_graph(self, [0u8; 32]);
+        }
+        if let Some(ref ti) = self.text_index {
+            ti.set_graph_root_hash([0u8; 32]);
+            ti.commit()?;
+        }
+        self.text_dirty.store(false, Ordering::Release);
+        Ok(())
     }
 
     pub fn full_snapshot_required(&self) -> bool {

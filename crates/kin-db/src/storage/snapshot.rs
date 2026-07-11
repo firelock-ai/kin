@@ -6,11 +6,12 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::engine::{InMemoryGraph, PersistenceEpoch};
 use crate::error::KinDbError;
-use crate::storage::backend::Generation;
+use crate::storage::backend::{Generation, GENERATION_INIT};
 use crate::storage::delta::{apply_graph_delta, GraphSnapshotDelta};
 use crate::storage::format::CompactionStats;
 use crate::storage::merkle::compute_graph_root_hash;
@@ -35,6 +36,8 @@ pub struct SnapshotManager {
     _lock_file: Option<File>,
     /// Whether this manager was opened in read-only mode.
     read_only: bool,
+    /// Last generation acknowledged by the atomic local snapshot authority.
+    generation: AtomicU64,
 }
 
 struct PersistenceAttempt<'a> {
@@ -86,6 +89,158 @@ fn local_delta_dir_for(snapshot_path: &Path) -> PathBuf {
     append_suffix(snapshot_path, ".deltas")
 }
 
+const LOCAL_SNAPSHOT_AUTHORITY_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LocalSnapshotAuthority {
+    version: u32,
+    snapshot_generation: Generation,
+    head_generation: Generation,
+    snapshot_file: String,
+    snapshot_root_hash: String,
+}
+
+fn local_authority_path(snapshot_path: &Path) -> PathBuf {
+    append_suffix(snapshot_path, ".authority.json")
+}
+
+fn local_snapshot_versions_dir(snapshot_path: &Path) -> PathBuf {
+    append_suffix(snapshot_path, ".snapshots")
+}
+
+fn local_snapshot_file_name(generation: Generation) -> String {
+    format!("{generation:020}.kndb")
+}
+
+fn local_versioned_snapshot_path(snapshot_path: &Path, generation: Generation) -> PathBuf {
+    local_snapshot_versions_dir(snapshot_path).join(local_snapshot_file_name(generation))
+}
+
+fn legacy_generation_hint(snapshot_path: &Path) -> Result<Generation, KinDbError> {
+    let Some(parent) = snapshot_path.parent() else {
+        return Ok(GENERATION_INIT);
+    };
+    let marker = parent.join("generation");
+    if !marker.exists() {
+        return Ok(GENERATION_INIT);
+    }
+    let value = std::fs::read_to_string(&marker).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to read legacy generation hint {}: {error}",
+            marker.display()
+        ))
+    })?;
+    value.trim().parse::<Generation>().map_err(|error| {
+        KinDbError::StorageError(format!(
+            "invalid legacy generation hint in {}: {error}",
+            marker.display()
+        ))
+    })
+}
+
+fn read_local_authority_manifest(
+    snapshot_path: &Path,
+) -> Result<Option<LocalSnapshotAuthority>, KinDbError> {
+    let path = local_authority_path(snapshot_path);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to read local snapshot authority {}: {error}",
+            path.display()
+        ))
+    })?;
+    let authority: LocalSnapshotAuthority = serde_json::from_slice(&bytes).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "invalid local snapshot authority {}: {error}",
+            path.display()
+        ))
+    })?;
+    if authority.version != LOCAL_SNAPSHOT_AUTHORITY_VERSION {
+        return Err(KinDbError::StorageError(format!(
+            "unsupported local snapshot authority version {} in {}",
+            authority.version,
+            path.display()
+        )));
+    }
+    if authority.snapshot_generation > authority.head_generation {
+        return Err(KinDbError::StorageError(format!(
+            "local snapshot authority base {} exceeds head {}",
+            authority.snapshot_generation, authority.head_generation
+        )));
+    }
+    let expected_file = local_snapshot_file_name(authority.snapshot_generation);
+    if authority.snapshot_file != expected_file {
+        return Err(KinDbError::StorageError(format!(
+            "local snapshot authority references noncanonical snapshot file {}",
+            authority.snapshot_file
+        )));
+    }
+    let versioned_path = local_snapshot_versions_dir(snapshot_path).join(&authority.snapshot_file);
+    if !versioned_path.is_file() {
+        return Err(KinDbError::StorageError(format!(
+            "local snapshot authority references missing snapshot {}",
+            versioned_path.display()
+        )));
+    }
+    if authority.snapshot_root_hash.len() != 64
+        || hex::decode(&authority.snapshot_root_hash).is_err()
+    {
+        return Err(KinDbError::StorageError(format!(
+            "local snapshot authority has an invalid graph root for {}",
+            versioned_path.display()
+        )));
+    }
+    Ok(Some(authority))
+}
+
+fn local_authority_root_hash(authority: &LocalSnapshotAuthority) -> Result<[u8; 32], KinDbError> {
+    let bytes = hex::decode(&authority.snapshot_root_hash).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "invalid local snapshot authority graph root: {error}"
+        ))
+    })?;
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        KinDbError::StorageError(format!(
+            "invalid local snapshot authority graph root length {}; expected 32 bytes",
+            bytes.len()
+        ))
+    })
+}
+
+fn write_local_authority(
+    snapshot_path: &Path,
+    authority: &LocalSnapshotAuthority,
+) -> Result<(), KinDbError> {
+    let bytes = serde_json::to_vec(authority).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to encode local snapshot authority: {error}"
+        ))
+    })?;
+    let path = local_authority_path(snapshot_path);
+    match mmap::atomic_write_bytes_no_magic(&path, &bytes) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // The atomic primitive can report a recovery-marker cleanup error
+            // after its rename and parent-directory fsync have already
+            // committed the new authority. Detect that irreversible state so
+            // callers advance their cursor instead of retrying from a stale
+            // generation and colliding with their own successful commit.
+            if std::fs::read(&path).ok().as_deref() == Some(bytes.as_slice()) {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "local snapshot authority committed with deferred temp-marker cleanup"
+                );
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
 fn local_delta_path(snapshot_path: &Path, generation: u64) -> PathBuf {
     local_delta_dir_for(snapshot_path).join(format!("{generation:020}.kndd"))
 }
@@ -119,9 +274,22 @@ fn local_delta_files(snapshot_path: &Path) -> Result<Vec<(u64, PathBuf)>, KinDbE
         if path.extension().and_then(|ext| ext.to_str()) != Some("kndd") {
             continue;
         }
-        if let Some(generation) = local_delta_generation(&path) {
-            files.push((generation, path));
+        let generation = local_delta_generation(&path).ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "local delta authority {} has an invalid generation",
+                path.display()
+            ))
+        })?;
+        let canonical_name = format!("{generation:020}.kndd");
+        if generation == GENERATION_INIT
+            || path.file_name().and_then(|name| name.to_str()) != Some(canonical_name.as_str())
+        {
+            return Err(KinDbError::StorageError(format!(
+                "local delta authority {} has a reserved or noncanonical generation",
+                path.display()
+            )));
         }
+        files.push((generation, path));
     }
     files.sort_by_key(|(generation, _)| *generation);
     Ok(files)
@@ -131,17 +299,100 @@ fn local_delta_count(snapshot_path: &Path) -> Result<usize, KinDbError> {
     Ok(local_delta_files(snapshot_path)?.len())
 }
 
+fn validate_authoritative_base_snapshot(
+    snapshot_path: &Path,
+    authority: &LocalSnapshotAuthority,
+    snapshot: &crate::storage::GraphSnapshot,
+    persisted_root_hash: Option<[u8; 32]>,
+) -> Result<[u8; 32], KinDbError> {
+    let expected_root_hash = local_authority_root_hash(authority)?;
+    if persisted_root_hash != Some(expected_root_hash) {
+        return Err(KinDbError::StorageError(format!(
+            "authoritative local snapshot {} root trailer does not match authority {}",
+            snapshot_path.display(),
+            authority.snapshot_root_hash
+        )));
+    }
+    // With no journal, graph construction immediately below builds the Merkle
+    // cache and performs the same content-vs-root verification. A journal
+    // clears the base root after replay, so validate the base explicitly before
+    // applying any deltas in that case.
+    if authority.snapshot_generation < authority.head_generation {
+        let actual_root_hash = compute_graph_root_hash(snapshot);
+        if actual_root_hash != expected_root_hash {
+            return Err(KinDbError::StorageError(format!(
+                "authoritative local snapshot {} graph root mismatch: authority {}, actual {}",
+                snapshot_path.display(),
+                authority.snapshot_root_hash,
+                hex::encode(actual_root_hash)
+            )));
+        }
+    }
+    Ok(expected_root_hash)
+}
+
 fn apply_local_deltas(
     snapshot_path: &Path,
     mut snapshot: crate::storage::GraphSnapshot,
     persisted_root_hash: Option<[u8; 32]>,
-) -> Result<(crate::storage::GraphSnapshot, Option<[u8; 32]>, usize), KinDbError> {
+    authority: Option<&LocalSnapshotAuthority>,
+) -> Result<
+    (
+        crate::storage::GraphSnapshot,
+        Option<[u8; 32]>,
+        usize,
+        Generation,
+    ),
+    KinDbError,
+> {
     let files = local_delta_files(snapshot_path)?;
-    if files.is_empty() {
-        return Ok((snapshot, persisted_root_hash, 0));
+    let Some(authority) = authority else {
+        if !files.is_empty() {
+            return Err(KinDbError::StorageError(format!(
+                "local snapshot {} has {} deltas but no atomic snapshot-base authority",
+                snapshot_path.display(),
+                files.len()
+            )));
+        }
+        return Ok((
+            snapshot,
+            persisted_root_hash,
+            0,
+            legacy_generation_hint(snapshot_path)?,
+        ));
+    };
+
+    let mut expected_generation =
+        authority
+            .snapshot_generation
+            .checked_add(1)
+            .ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "local snapshot generation exhausted at {}",
+                    authority.snapshot_generation
+                ))
+            })?;
+    let mut recovered_generation = authority.snapshot_generation;
+    let mut applied = 0usize;
+
+    if authority.snapshot_generation == authority.head_generation {
+        return Ok((snapshot, persisted_root_hash, 0, authority.head_generation));
     }
 
-    for (_, path) in &files {
+    for (generation, path) in &files {
+        if *generation <= authority.snapshot_generation {
+            continue;
+        }
+        if *generation > authority.head_generation {
+            // A delta written before an authority-commit crash is not durable
+            // authority. A retry may overwrite this exact generation.
+            continue;
+        }
+        if *generation != expected_generation {
+            return Err(KinDbError::StorageError(format!(
+                "local delta chain is incomplete: expected generation {expected_generation}, found {generation}"
+            )));
+        }
         let bytes = std::fs::read(path).map_err(|err| {
             KinDbError::StorageError(format!(
                 "failed to read local delta {}: {err}",
@@ -149,16 +400,90 @@ fn apply_local_deltas(
             ))
         })?;
         let delta = GraphSnapshotDelta::from_bytes(&bytes)?;
+        let expected_base = generation - 1;
+        if delta.base_generation != expected_base {
+            return Err(KinDbError::StorageError(format!(
+                "local delta generation {generation} declares base {}, expected {expected_base}",
+                delta.base_generation
+            )));
+        }
         apply_graph_delta(&mut snapshot, &delta);
+        applied += 1;
+        recovered_generation = *generation;
+        if *generation < authority.head_generation {
+            expected_generation = generation.checked_add(1).ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "local delta generation exhausted at {generation}"
+                ))
+            })?;
+        }
     }
-    Ok((snapshot, None, files.len()))
+    if recovered_generation != authority.head_generation {
+        return Err(KinDbError::StorageError(format!(
+            "local delta chain ended at generation {recovered_generation}, acknowledged head is {}",
+            authority.head_generation
+        )));
+    }
+    Ok((snapshot, None, applied, authority.head_generation))
 }
 
 fn write_local_delta(
     snapshot_path: &Path,
     delta: &GraphSnapshotDelta,
-    fallback_generation: u64,
+    base_generation: u64,
 ) -> Result<u64, KinDbError> {
+    let mut authority = match read_local_authority_manifest(snapshot_path)? {
+        Some(authority) => authority,
+        None => {
+            let files = local_delta_files(snapshot_path)?;
+            if !files.is_empty() {
+                return Err(KinDbError::StorageError(format!(
+                    "local snapshot {} has an unbound journal; refusing delta persistence",
+                    snapshot_path.display()
+                )));
+            }
+            let snapshot_bytes = std::fs::read(snapshot_path).map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to read legacy local snapshot {}: {error}",
+                    snapshot_path.display()
+                ))
+            })?;
+            let snapshot = crate::storage::GraphSnapshot::from_bytes(&snapshot_bytes)?;
+            let snapshot_root_hash = compute_graph_root_hash(&snapshot);
+            let authoritative_snapshot_bytes =
+                snapshot.to_bytes_with_persisted_root_hash(snapshot_root_hash)?;
+            let versioned_path = local_versioned_snapshot_path(snapshot_path, base_generation);
+            std::fs::create_dir_all(local_snapshot_versions_dir(snapshot_path)).map_err(
+                |error| {
+                    KinDbError::StorageError(format!(
+                        "failed to create local snapshot versions directory: {error}"
+                    ))
+                },
+            )?;
+            mmap::atomic_write_bytes(&versioned_path, &authoritative_snapshot_bytes)?;
+            let authority = LocalSnapshotAuthority {
+                version: LOCAL_SNAPSHOT_AUTHORITY_VERSION,
+                snapshot_generation: base_generation,
+                head_generation: base_generation,
+                snapshot_file: local_snapshot_file_name(base_generation),
+                snapshot_root_hash: hex::encode(snapshot_root_hash),
+            };
+            write_local_authority(snapshot_path, &authority)?;
+            authority
+        }
+    };
+    if authority.head_generation != base_generation {
+        return Err(KinDbError::StorageError(format!(
+            "local delta base generation mismatch: expected {base_generation}, found {}",
+            authority.head_generation
+        )));
+    }
+    if delta.base_generation != base_generation {
+        return Err(KinDbError::StorageError(format!(
+            "local delta payload declares base {}, expected {base_generation}",
+            delta.base_generation
+        )));
+    }
     let dir = local_delta_dir_for(snapshot_path);
     std::fs::create_dir_all(&dir).map_err(|err| {
         KinDbError::StorageError(format!(
@@ -166,13 +491,16 @@ fn write_local_delta(
             dir.display()
         ))
     })?;
-    let next_generation = local_delta_files(snapshot_path)?
-        .last()
-        .map(|(generation, _)| generation.saturating_add(1))
-        .unwrap_or_else(|| fallback_generation.saturating_add(1));
+    let next_generation = base_generation.checked_add(1).ok_or_else(|| {
+        KinDbError::StorageError(format!(
+            "local delta generation exhausted at {base_generation}"
+        ))
+    })?;
     let path = local_delta_path(snapshot_path, next_generation);
     let bytes = delta.to_bytes()?;
     mmap::atomic_write_bytes_no_magic(&path, &bytes)?;
+    authority.head_generation = next_generation;
+    write_local_authority(snapshot_path, &authority)?;
     Ok(next_generation)
 }
 
@@ -185,6 +513,56 @@ fn clear_local_deltas(snapshot_path: &Path) -> Result<(), KinDbError> {
         std::fs::remove_file(&path).map_err(|err| {
             KinDbError::StorageError(format!(
                 "failed to remove local delta {}: {err}",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn clear_superseded_local_snapshots(
+    snapshot_path: &Path,
+    keep_generation: Generation,
+) -> Result<(), KinDbError> {
+    let dir = local_snapshot_versions_dir(snapshot_path);
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(&dir).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to read local snapshot versions directory {}: {error}",
+            dir.display()
+        ))
+    })? {
+        let entry = entry.map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to read local snapshot entry in {}: {error}",
+                dir.display()
+            ))
+        })?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(generation) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.parse::<Generation>().ok())
+        else {
+            continue;
+        };
+        if path.extension().and_then(|ext| ext.to_str()) != Some("kndb")
+            || name != local_snapshot_file_name(generation)
+            || generation >= keep_generation
+        {
+            // A greater generation can be an in-flight static writer that has
+            // installed its immutable base but not yet moved authority. Never
+            // reap it from cleanup keyed to the older committed generation.
+            continue;
+        }
+        std::fs::remove_file(&path).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to remove superseded local snapshot {}: {error}",
                 path.display()
             ))
         })?;
@@ -544,6 +922,45 @@ pub struct EmbedFlushOutcome {
 }
 
 impl SnapshotManager {
+    /// Return whether `path` has an atomic local snapshot authority sidecar.
+    ///
+    /// The canonical `graph.kndb` file is only a compatibility projection and
+    /// may legitimately be absent after a crash that follows the authority
+    /// commit. Callers deciding whether a repository has persisted graph truth
+    /// must therefore consider this sidecar too; [`SnapshotManager::open`]
+    /// performs the full validation before serving it.
+    pub fn local_authority_exists(path: impl Into<PathBuf>) -> bool {
+        let path = normalize_snapshot_path(path.into());
+        local_authority_path(&path).exists()
+    }
+
+    fn cleanup_superseded_versions_under_exclusive_lock(path: &Path) {
+        let result = read_local_authority_manifest(path).and_then(|authority| {
+            let Some(authority) = authority else {
+                return Ok(());
+            };
+            clear_superseded_local_snapshots(path, authority.snapshot_generation)
+        });
+        if let Err(error) = result {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "deferred superseded local snapshot cleanup"
+            );
+        }
+    }
+
+    fn cleanup_superseded_versions_if_lock_available(path: &Path) {
+        let Ok(_lock_file) = Self::acquire_lock(path, false) else {
+            // A SnapshotManager caller may already hold this exact lock, or a
+            // real reader/writer may still be active. The owning manager/open
+            // path performs the same cleanup; otherwise a later save/reopen
+            // retries it. Never trade availability for deleting old bases.
+            return;
+        };
+        Self::cleanup_superseded_versions_under_exclusive_lock(path);
+    }
+
     /// Acquire an OS-level file lock adjacent to the snapshot path.
     /// Returns the lock file handle on success.
     fn acquire_lock(path: &Path, read_only: bool) -> Result<File, KinDbError> {
@@ -741,6 +1158,60 @@ impl SnapshotManager {
         // next load, not destroyed here.
 
         Ok(())
+    }
+
+    #[cfg(feature = "vector")]
+    fn invalidate_vector_index_metadata(path: &Path) -> Result<(), KinDbError> {
+        let metadata_path = vector_index_metadata_path_for(path);
+        let Some(mut metadata) = read_vector_index_metadata(&metadata_path)? else {
+            return Ok(());
+        };
+        metadata.graph_root_hash = hex::encode([0u8; 32]);
+        write_vector_index_metadata(&metadata_path, &metadata)
+    }
+
+    #[cfg(not(feature = "vector"))]
+    fn invalidate_vector_index_metadata(_path: &Path) -> Result<(), KinDbError> {
+        Ok(())
+    }
+
+    /// Prepare sidecars before committing a detached full-snapshot authority.
+    /// A valid root stamp is written only while `epoch` still fences the exact
+    /// captured graph. If a later mutation exists, the sidecar is preserved but
+    /// deliberately invalidated so reopen rebuilds from authority.
+    pub fn persist_snapshot_sidecars_for_epoch(
+        path: &Path,
+        graph: &InMemoryGraph,
+        graph_root_hash: [u8; 32],
+        epoch: PersistenceEpoch,
+    ) -> Result<(), KinDbError> {
+        let exact = graph.persist_derived_sidecars_for_epoch(epoch, graph_root_hash, || {
+            #[cfg(feature = "vector")]
+            {
+                Self::save_vector_index_bundle(path, graph, graph_root_hash, None)
+            }
+            #[cfg(not(feature = "vector"))]
+            {
+                Ok(())
+            }
+        })?;
+        if !exact {
+            graph.invalidate_persisted_text_index()?;
+            Self::invalidate_vector_index_metadata(path)?;
+        }
+        Ok(())
+    }
+
+    /// Invalidate local derived-sidecar root stamps before committing a graph
+    /// delta whose exact index batch is not available. This is intentionally
+    /// fallible before authority commit; a failure forces a full retry.
+    pub fn invalidate_derived_sidecars(
+        path: impl Into<PathBuf>,
+        graph: &InMemoryGraph,
+    ) -> Result<(), KinDbError> {
+        let path = normalize_snapshot_path(path.into());
+        graph.invalidate_persisted_text_index()?;
+        Self::invalidate_vector_index_metadata(&path)
     }
 
     /// Load the persisted vector-index sidecar for `path` into `graph` only if
@@ -963,6 +1434,7 @@ impl SnapshotManager {
             current: RwLock::new(Arc::new(graph)),
             _lock_file: None,
             read_only: false,
+            generation: AtomicU64::new(GENERATION_INIT),
         }
     }
 
@@ -1101,8 +1573,8 @@ impl SnapshotManager {
             ))
         })?;
 
-        let (snapshot, persisted_root_hash, _) =
-            apply_local_deltas(path, snapshot, persisted_root_hash)?;
+        let (snapshot, persisted_root_hash, _, _) =
+            apply_local_deltas(path, snapshot, persisted_root_hash, None)?;
 
         Ok(Self::graph_from_snapshot(
             snapshot,
@@ -1118,7 +1590,7 @@ impl SnapshotManager {
         text_index_path: Option<&PathBuf>,
         read_only: bool,
         skip_text_index: bool,
-    ) -> Result<InMemoryGraph, KinDbError> {
+    ) -> Result<(InMemoryGraph, Generation), KinDbError> {
         let _span = tracing::info_span!(
             "kindb.snapshot.open_graph",
             path = %path.display(),
@@ -1127,14 +1599,45 @@ impl SnapshotManager {
             skip_text_index = skip_text_index
         )
         .entered();
-        let (graph, graph_root_hash) = if path.exists() {
+        let authority = read_local_authority_manifest(path)?;
+        let authoritative = authority.is_some();
+        let generation = authority
+            .as_ref()
+            .map(|authority| authority.head_generation)
+            .unwrap_or(if path.exists() {
+                legacy_generation_hint(path)?
+            } else {
+                GENERATION_INIT
+            });
+        let read_path = authority
+            .as_ref()
+            .map(|authority| {
+                local_snapshot_versions_dir(path).join(authority.snapshot_file.as_str())
+            })
+            .unwrap_or_else(|| path.to_path_buf());
+
+        let (graph, graph_root_hash) = if read_path.exists() {
             match {
                 let _span = tracing::info_span!("kindb.snapshot.open_mmap").entered();
-                mmap::MmapReader::open_with_persisted_root_hash(path)
+                mmap::MmapReader::open_with_persisted_root_hash(&read_path)
             } {
                 Ok(snapshot) => {
-                    let (snapshot, persisted_root_hash, delta_count) =
-                        apply_local_deltas(path, snapshot.0, snapshot.1)?;
+                    if let Some(authority) = authority.as_ref() {
+                        validate_authoritative_base_snapshot(
+                            &read_path,
+                            authority,
+                            &snapshot.0,
+                            snapshot.1,
+                        )?;
+                    }
+                    let (snapshot, persisted_root_hash, delta_count, recovered_generation) =
+                        apply_local_deltas(path, snapshot.0, snapshot.1, authority.as_ref())?;
+                    if recovered_generation != generation {
+                        return Err(KinDbError::StorageError(format!(
+                            "local recovery generation changed while opening {}: expected {generation}, found {recovered_generation}",
+                            path.display()
+                        )));
+                    }
                     if delta_count > 0 {
                         tracing::info!(
                             path = %path.display(),
@@ -1156,9 +1659,17 @@ impl SnapshotManager {
                     match Self::graph_truth_corruption(&graph, persisted_root_hash) {
                         None => Ok((graph, graph_root_hash)),
                         Some((committed_root, actual_root)) => {
+                            if authoritative {
+                                return Err(KinDbError::StorageError(format!(
+                                    "authoritative local snapshot {} failed graph-root verification: committed {}, actual {}",
+                                    read_path.display(),
+                                    Self::root_hash_tag(committed_root),
+                                    Self::root_hash_tag(actual_root)
+                                )));
+                            }
                             drop(graph);
                             Self::quarantine_and_heal_graph_truth(
-                                path,
+                                &read_path,
                                 committed_root,
                                 actual_root,
                                 text_index_path,
@@ -1168,8 +1679,12 @@ impl SnapshotManager {
                         }
                     }
                 }
+                Err(err) if authoritative => Err(KinDbError::StorageError(format!(
+                    "failed to open authoritative local snapshot {}: {err}",
+                    read_path.display()
+                ))),
                 Err(err) => Self::recover_graph_from_tmp(
-                    path,
+                    &read_path,
                     Some(&err),
                     text_index_path,
                     read_only,
@@ -1177,10 +1692,16 @@ impl SnapshotManager {
                 ),
             }
         } else {
-            let tmp_path = mmap::recovery_tmp_path(path);
+            if authoritative {
+                return Err(KinDbError::StorageError(format!(
+                    "authoritative local snapshot {} is missing",
+                    read_path.display()
+                )));
+            }
+            let tmp_path = mmap::recovery_tmp_path(&read_path);
             if tmp_path.exists() {
                 Self::recover_graph_from_tmp(
-                    path,
+                    &read_path,
                     None,
                     text_index_path,
                     read_only,
@@ -1238,28 +1759,80 @@ impl SnapshotManager {
             Self::load_vector_index_if_valid(path, &graph, graph_root_hash, !read_only, None)?;
         }
 
-        Ok(graph)
+        if authoritative && !read_only {
+            let recovery_tmp = mmap::recovery_tmp_path(path);
+            let recovery_marker = mmap::recovery_marker_path(path);
+            if !path.exists() || recovery_tmp.exists() || recovery_marker.exists() {
+                if let Err(error) = std::fs::read(&read_path)
+                    .map_err(|error| {
+                        KinDbError::StorageError(format!(
+                            "failed to read authoritative snapshot projection source {}: {error}",
+                            read_path.display()
+                        ))
+                    })
+                    .and_then(|bytes| mmap::atomic_write_bytes(path, &bytes))
+                {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "failed to heal canonical snapshot compatibility projection"
+                    );
+                }
+            }
+        }
+
+        Ok((graph, generation))
     }
 
     fn open_graph_for_locate(
         path: &Path,
         text_index_path: Option<&PathBuf>,
-    ) -> Result<InMemoryGraph, KinDbError> {
+    ) -> Result<(InMemoryGraph, Generation), KinDbError> {
         let _span = tracing::info_span!(
             "kindb.snapshot.open_graph_for_locate",
             path = %path.display(),
             persistent_text_index = text_index_path.is_some()
         )
         .entered();
-        if path.exists() && local_delta_count(path)? > 0 {
+        let authority = read_local_authority_manifest(path)?;
+        if (path.exists() || authority.is_some()) && local_delta_count(path)? > 0 {
             tracing::info!(
                 path = %path.display(),
                 "bypassing locate cache because local snapshot deltas are pending"
             );
             return Self::open_graph(path, text_index_path, true, false);
         }
-        let (graph, graph_root_hash) = if path.exists() {
-            let hinted_root_hash = mmap::MmapReader::read_persisted_root_hash_unverified(path)?;
+        let generation = authority
+            .as_ref()
+            .map(|authority| authority.head_generation)
+            .unwrap_or(if path.exists() {
+                legacy_generation_hint(path)?
+            } else {
+                GENERATION_INIT
+            });
+        let read_path = authority
+            .as_ref()
+            .map(|authority| {
+                local_snapshot_versions_dir(path).join(authority.snapshot_file.as_str())
+            })
+            .unwrap_or_else(|| path.to_path_buf());
+        let authority_root_hash = authority
+            .as_ref()
+            .map(local_authority_root_hash)
+            .transpose()?;
+        let authoritative = authority.is_some();
+        let (graph, graph_root_hash) = if read_path.exists() {
+            let hinted_root_hash =
+                mmap::MmapReader::read_persisted_root_hash_unverified(&read_path)?;
+            if let Some(expected_root_hash) = authority_root_hash {
+                if hinted_root_hash != Some(expected_root_hash) {
+                    return Err(KinDbError::StorageError(format!(
+                        "authoritative local locate snapshot {} root trailer does not match authority {}",
+                        read_path.display(),
+                        hex::encode(expected_root_hash)
+                    )));
+                }
+            }
             if let Some(root_hash) = hinted_root_hash {
                 if let Some(snapshot) = Self::load_locate_cache(path, root_hash)? {
                     let _span = tracing::info_span!("kindb.snapshot.use_locate_cache").entered();
@@ -1278,14 +1851,23 @@ impl SnapshotManager {
                             None,
                         )?;
                     }
-                    return Ok(graph);
+                    return Ok((graph, generation));
                 }
             }
             match {
                 let _span = tracing::info_span!("kindb.snapshot.open_locate_mmap").entered();
-                mmap::MmapReader::open_for_locate_with_persisted_root_hash(path)
+                mmap::MmapReader::open_for_locate_with_persisted_root_hash(&read_path)
             } {
                 Ok((snapshot, persisted_root_hash)) => {
+                    if let Some(expected_root_hash) = authority_root_hash {
+                        if persisted_root_hash != Some(expected_root_hash) {
+                            return Err(KinDbError::StorageError(format!(
+                                "authoritative local locate snapshot {} root does not match authority {}",
+                                read_path.display(),
+                                hex::encode(expected_root_hash)
+                            )));
+                        }
+                    }
                     let cache_root_hash = persisted_root_hash.or(hinted_root_hash).or_else(|| {
                         let snapshot_for_hash: crate::storage::GraphSnapshot =
                             snapshot.clone().into();
@@ -1302,9 +1884,17 @@ impl SnapshotManager {
                         cache_root_hash,
                     ))
                 }
-                Err(err) => {
-                    Self::recover_graph_from_tmp(path, Some(&err), text_index_path, true, false)
-                }
+                Err(err) if authoritative => Err(KinDbError::StorageError(format!(
+                    "failed to open authoritative local locate snapshot {}: {err}",
+                    read_path.display()
+                ))),
+                Err(err) => Self::recover_graph_from_tmp(
+                    &read_path,
+                    Some(&err),
+                    text_index_path,
+                    true,
+                    false,
+                ),
             }
         } else {
             match text_index_path {
@@ -1318,7 +1908,7 @@ impl SnapshotManager {
             Self::load_vector_index_if_valid(path, &graph, graph_root_hash, false, None)?;
         }
 
-        Ok(graph)
+        Ok((graph, generation))
     }
 
     /// Open an existing snapshot from disk, or create a new empty graph if
@@ -1333,7 +1923,8 @@ impl SnapshotManager {
         let path = normalize_snapshot_path(path.into());
         let lock_file = Self::acquire_lock(&path, false)?;
         let ti_path = text_index_dir_for(&path);
-        let graph = Self::open_graph(&path, ti_path.as_ref(), false, false)?;
+        let (graph, generation) = Self::open_graph(&path, ti_path.as_ref(), false, false)?;
+        Self::cleanup_superseded_versions_under_exclusive_lock(&path);
 
         Ok(Self {
             path,
@@ -1341,6 +1932,7 @@ impl SnapshotManager {
             current: RwLock::new(Arc::new(graph)),
             _lock_file: Some(lock_file),
             read_only: false,
+            generation: AtomicU64::new(generation),
         })
     }
 
@@ -1353,7 +1945,8 @@ impl SnapshotManager {
     pub fn open_without_text_index(path: impl Into<PathBuf>) -> Result<Self, KinDbError> {
         let path = normalize_snapshot_path(path.into());
         let lock_file = Self::acquire_lock(&path, false)?;
-        let graph = Self::open_graph(&path, None, false, true)?;
+        let (graph, generation) = Self::open_graph(&path, None, false, true)?;
+        Self::cleanup_superseded_versions_under_exclusive_lock(&path);
 
         Ok(Self {
             path,
@@ -1361,6 +1954,7 @@ impl SnapshotManager {
             current: RwLock::new(Arc::new(graph)),
             _lock_file: Some(lock_file),
             read_only: false,
+            generation: AtomicU64::new(generation),
         })
     }
 
@@ -1370,7 +1964,7 @@ impl SnapshotManager {
         let path = normalize_snapshot_path(path.into());
         let lock_file = Self::acquire_lock(&path, true)?;
         let ti_path = text_index_dir_for(&path);
-        let graph = Self::open_graph(&path, ti_path.as_ref(), true, false)?;
+        let (graph, generation) = Self::open_graph(&path, ti_path.as_ref(), true, false)?;
 
         Ok(Self {
             path,
@@ -1378,6 +1972,7 @@ impl SnapshotManager {
             current: RwLock::new(Arc::new(graph)),
             _lock_file: Some(lock_file),
             read_only: true,
+            generation: AtomicU64::new(generation),
         })
     }
 
@@ -1391,7 +1986,7 @@ impl SnapshotManager {
         let path = normalize_snapshot_path(path.into());
         let lock_file = Self::acquire_lock(&path, true)?;
         let ti_path = text_index_dir_for(&path);
-        let graph = Self::open_graph_for_locate(&path, ti_path.as_ref())?;
+        let (graph, generation) = Self::open_graph_for_locate(&path, ti_path.as_ref())?;
 
         Ok(Self {
             path,
@@ -1399,6 +1994,7 @@ impl SnapshotManager {
             current: RwLock::new(Arc::new(graph)),
             _lock_file: Some(lock_file),
             read_only: true,
+            generation: AtomicU64::new(generation),
         })
     }
 
@@ -1417,6 +2013,7 @@ impl SnapshotManager {
             current: RwLock::new(Arc::new(graph)),
             _lock_file: None,
             read_only: true,
+            generation: AtomicU64::new(GENERATION_INIT),
         }
     }
 
@@ -1431,6 +2028,11 @@ impl SnapshotManager {
         &self.path
     }
 
+    /// Last generation acknowledged by the local base/head authority.
+    pub fn generation(&self) -> Generation {
+        self.generation.load(Ordering::Acquire)
+    }
+
     /// Save the current graph state to disk atomically (full snapshot).
     /// Returns the Merkle root hash computed during save.
     pub fn save(&self) -> Result<crate::storage::merkle::MerkleHash, KinDbError> {
@@ -1441,7 +2043,13 @@ impl SnapshotManager {
             )));
         }
         let graph = self.graph();
-        Self::save_graph_with_hash(&self.path, graph.as_ref(), None)
+        let (root_hash, generation) =
+            Self::save_graph_with_hash_and_generation(&self.path, graph.as_ref(), None)?;
+        self.generation.store(generation, Ordering::Release);
+        if self._lock_file.is_some() {
+            Self::cleanup_superseded_versions_under_exclusive_lock(&self.path);
+        }
+        Ok(root_hash)
     }
 
     /// Persist an arbitrary live graph to disk using snapshot semantics.
@@ -1456,6 +2064,16 @@ impl SnapshotManager {
         Self::save_graph_with_hash(path, graph, None)
     }
 
+    /// Persist a full snapshot and return both its root and acknowledged local
+    /// generation. Callers that publish a generation marker must use this
+    /// result rather than guessing from process-local state.
+    pub fn save_graph_with_generation(
+        path: impl Into<PathBuf>,
+        graph: &InMemoryGraph,
+    ) -> Result<(crate::storage::merkle::MerkleHash, Generation), KinDbError> {
+        Self::save_graph_with_hash_and_generation(path, graph, None)
+    }
+
     /// Like [`save_graph`] but accepts a pre-computed Merkle root hash.
     /// When provided, the expensive root-hash traversal is skipped.
     pub fn save_graph_with_hash(
@@ -1463,6 +2081,15 @@ impl SnapshotManager {
         graph: &InMemoryGraph,
         precomputed_hash: Option<crate::storage::merkle::MerkleHash>,
     ) -> Result<crate::storage::merkle::MerkleHash, KinDbError> {
+        Self::save_graph_with_hash_and_generation(path, graph, precomputed_hash)
+            .map(|(root_hash, _)| root_hash)
+    }
+
+    fn save_graph_with_hash_and_generation(
+        path: impl Into<PathBuf>,
+        graph: &InMemoryGraph,
+        precomputed_hash: Option<crate::storage::merkle::MerkleHash>,
+    ) -> Result<(crate::storage::merkle::MerkleHash, Generation), KinDbError> {
         let path = normalize_snapshot_path(path.into());
         let _span = tracing::info_span!(
             "kindb.snapshot.save_graph_with_hash",
@@ -1480,6 +2107,29 @@ impl SnapshotManager {
             })?;
         }
 
+        let current_generation = match read_local_authority_manifest(&path)? {
+            Some(authority) => authority.head_generation,
+            None => {
+                let deltas = local_delta_files(&path)?;
+                if !deltas.is_empty() {
+                    return Err(KinDbError::StorageError(format!(
+                        "local snapshot {} has an unbound journal; refusing full promotion",
+                        path.display()
+                    )));
+                }
+                if path.exists() {
+                    legacy_generation_hint(&path)?
+                } else {
+                    GENERATION_INIT
+                }
+            }
+        };
+        let new_generation = current_generation.checked_add(1).ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "local snapshot generation exhausted at {current_generation}"
+            ))
+        })?;
+
         let t0 = std::time::Instant::now();
         let precomputed_hash = precomputed_hash.or_else(|| graph.snapshot_root_hash_hint());
         let (bytes, graph_root_hash, persistence_epoch) =
@@ -1488,20 +2138,28 @@ impl SnapshotManager {
         let t_ser = t0.elapsed();
 
         let t1 = std::time::Instant::now();
+        let versioned_path = local_versioned_snapshot_path(&path, new_generation);
+        std::fs::create_dir_all(local_snapshot_versions_dir(&path)).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to create local snapshot versions directory: {error}"
+            ))
+        })?;
         {
             let _span = tracing::info_span!("kindb.snapshot.save_graph.atomic_write").entered();
-            mmap::atomic_write_bytes(&path, &bytes)?;
+            mmap::atomic_write_bytes(&versioned_path, &bytes)?;
         }
         let t_write = t1.elapsed();
-
-        // Drop the serialized bytes before text-index work.
-        drop(bytes);
 
         let t2 = std::time::Instant::now();
         {
             let _span =
                 tracing::info_span!("kindb.snapshot.save_graph.persist_text_index").entered();
-            graph.persist_text_index_with_root_hash(graph_root_hash)?;
+            Self::persist_snapshot_sidecars_for_epoch(
+                &path,
+                graph,
+                graph_root_hash,
+                persistence_epoch,
+            )?;
         }
         let t_text = t2.elapsed();
 
@@ -1513,15 +2171,39 @@ impl SnapshotManager {
             t0.elapsed().as_secs_f64(),
         );
 
-        #[cfg(feature = "vector")]
-        {
-            Self::save_vector_index_bundle(&path, graph, graph_root_hash, None)?;
-        }
-
-        clear_local_deltas(&path)?;
+        let authority = LocalSnapshotAuthority {
+            version: LOCAL_SNAPSHOT_AUTHORITY_VERSION,
+            snapshot_generation: new_generation,
+            head_generation: new_generation,
+            snapshot_file: local_snapshot_file_name(new_generation),
+            snapshot_root_hash: hex::encode(graph_root_hash),
+        };
+        write_local_authority(&path, &authority)?;
         persistence_attempt.complete();
 
-        Ok(graph_root_hash)
+        // Compatibility projection and stale-journal cleanup are downstream of
+        // the atomic authority commit. They must never make a committed save
+        // look failed or leave the caller on the old generation.
+        if let Err(error) = mmap::atomic_write_bytes(&path, &bytes) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to refresh canonical snapshot projection after authority commit"
+            );
+        }
+        if let Err(error) = clear_local_deltas(&path) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "snapshot authority committed; deferred stale local delta cleanup"
+            );
+        }
+        // Static save callers (notably the daemon) do not retain a
+        // SnapshotManager lock. Reclaim older immutable bases when it is safe
+        // to acquire one so repeated full saves cannot grow disk use without
+        // bound. A contended lock simply defers cleanup.
+        Self::cleanup_superseded_versions_if_lock_available(&path);
+        Ok((graph_root_hash, new_generation))
     }
 
     /// Append the graph's mutation-time delta to the local journal.
@@ -1537,9 +2219,12 @@ impl SnapshotManager {
         base_generation: Generation,
     ) -> Result<Option<Generation>, KinDbError> {
         let path = normalize_snapshot_path(path.into());
-        if graph.full_snapshot_required() || !path.exists() {
-            Self::save_graph_with_hash(path.clone(), graph, None)?;
-            return Ok(Some(base_generation.saturating_add(1)));
+        if graph.full_snapshot_required()
+            || (!path.exists() && read_local_authority_manifest(&path)?.is_none())
+        {
+            let (_, generation) =
+                Self::save_graph_with_hash_and_generation(path.clone(), graph, None)?;
+            return Ok(Some(generation));
         }
 
         let Some((delta, persistence_epoch)) = graph.begin_delta_persistence(base_generation)
@@ -1549,6 +2234,9 @@ impl SnapshotManager {
         };
         let persistence_attempt = PersistenceAttempt::new(graph, persistence_epoch);
         if delta.is_empty() {
+            // No graph authority changes, so existing sidecar provenance stays
+            // valid. Flush any staged live text without invalidating a vector
+            // index that still describes the same committed graph root.
             graph.flush_text_index()?;
             persistence_attempt.complete();
             return Ok(None);
@@ -1557,7 +2245,7 @@ impl SnapshotManager {
         // Derived-index failure must happen before the durable delta commit;
         // after write_local_delta succeeds there are no remaining fallible
         // steps before the generation is returned to the caller.
-        graph.flush_text_index()?;
+        Self::invalidate_derived_sidecars(&path, graph)?;
         let generation = write_local_delta(&path, &delta, base_generation)?;
         persistence_attempt.complete();
         Ok(Some(generation))
@@ -1633,7 +2321,8 @@ impl SnapshotManager {
         // Capture the branch `save_graph_delta` will take *before* calling it —
         // the full save clears `full_snapshot_required`, so reading it after
         // would always observe the incremental case and double-write the kvec.
-        let full_snapshot = graph.full_snapshot_required() || !path.exists();
+        let full_snapshot = graph.full_snapshot_required()
+            || (!path.exists() && read_local_authority_manifest(&path)?.is_none());
         let generation = Self::save_graph_delta(&path, graph, base_generation)?;
         if !full_snapshot {
             // The graph delta (the authority) is already on disk. The derived
@@ -1724,14 +2413,15 @@ impl SnapshotManager {
                 })?;
             }
 
-            // Write to disk first while we still have a reference to the snapshot.
-            // Then consume the snapshot to build the in-memory graph (no clone).
-            // This avoids doubling memory for graphs with >500K entities.
-            mmap::atomic_write(&self.path, &snapshot)?;
             let compacted_graph = match self.text_index_path.as_ref() {
                 Some(p) => InMemoryGraph::from_snapshot_with_text_index(snapshot, p.clone()),
                 None => InMemoryGraph::from_snapshot(snapshot),
             };
+            let (_, generation) = Self::save_graph_with_generation(&self.path, &compacted_graph)?;
+            self.generation.store(generation, Ordering::Release);
+            if self._lock_file.is_some() {
+                Self::cleanup_superseded_versions_under_exclusive_lock(&self.path);
+            }
             self.swap(compacted_graph);
         }
 
@@ -1851,6 +2541,386 @@ mod tests {
             local_delta_count(&path).unwrap(),
             0,
             "full save should compact local delta journal"
+        );
+    }
+
+    fn write_three_generation_local_journal(path: &Path) {
+        let mgr = SnapshotManager::new(path);
+        let graph = mgr.graph();
+        graph
+            .upsert_entity(&test_entity("base_generation"))
+            .unwrap();
+        mgr.save().unwrap();
+
+        graph
+            .upsert_entity(&test_entity("second_generation"))
+            .unwrap();
+        assert_eq!(
+            SnapshotManager::save_graph_delta(path, graph.as_ref(), 1).unwrap(),
+            Some(2)
+        );
+
+        graph
+            .upsert_entity(&test_entity("third_generation"))
+            .unwrap();
+        assert_eq!(
+            SnapshotManager::save_graph_delta(path, graph.as_ref(), 2).unwrap(),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn local_delta_open_rejects_missing_prefix_and_acknowledged_head() {
+        let missing_prefix = TempDir::new().unwrap();
+        let prefix_path = missing_prefix.path().join("graph.kndb");
+        write_three_generation_local_journal(&prefix_path);
+        std::fs::remove_file(local_delta_path(&prefix_path, 2)).unwrap();
+
+        let error = match SnapshotManager::open_without_text_index(&prefix_path) {
+            Ok(_) => panic!("an acknowledged journal with a missing prefix must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("expected generation 2, found 3"),
+            "unexpected missing-prefix error: {error}"
+        );
+
+        let missing_head = TempDir::new().unwrap();
+        let head_path = missing_head.path().join("graph.kndb");
+        write_three_generation_local_journal(&head_path);
+        std::fs::remove_file(local_delta_path(&head_path, 3)).unwrap();
+
+        let error = match SnapshotManager::open_without_text_index(&head_path) {
+            Ok(_) => panic!("a missing acknowledged journal head must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("chain ended at generation 2, acknowledged head is 3"),
+            "unexpected missing-head error: {error}"
+        );
+    }
+
+    #[test]
+    fn committed_full_save_ignores_stale_journal_when_cleanup_crashes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let mgr = SnapshotManager::new(&path);
+        let graph = mgr.graph();
+        let actor = Actor {
+            actor_id: ActorId::new(),
+            kind: ActorKind::Assistant,
+            display_name: "cleanup-test".into(),
+            external_refs: Vec::new(),
+        };
+        graph.create_actor(&actor).unwrap();
+        mgr.save().unwrap();
+
+        let event = AuditEvent {
+            event_id: AuditEventId::new(),
+            actor_id: actor.actor_id,
+            action: "single-event".into(),
+            target_scope: None,
+            timestamp: Timestamp::now(),
+            details: None,
+        };
+        // Use a wire-compatible Vec delta directly. Current graph mutations
+        // conservatively request a full save for this domain, but older/local
+        // journals can contain it and replaying it twice is non-idempotent.
+        let mut delta = GraphSnapshotDelta::empty(1);
+        delta.audit_events.added.push(event);
+        assert_eq!(write_local_delta(&path, &delta, 1).unwrap(), 2);
+
+        // A directory with a canonical stale-journal name makes remove_file
+        // fail deterministically after the new authority is committed. Both it
+        // and the real generation-2 delta must then be harmless on restart.
+        std::fs::create_dir(local_delta_path(&path, 1)).unwrap();
+        let recovered = SnapshotManager::open_without_text_index(&path).unwrap();
+        let recovered_graph = recovered.graph();
+        drop(recovered);
+        let (_, generation) =
+            SnapshotManager::save_graph_with_generation(&path, recovered_graph.as_ref()).unwrap();
+        assert_eq!(generation, 3);
+        assert_eq!(
+            local_delta_count(&path).unwrap(),
+            2,
+            "failed cleanup fixture and stale delta should remain on disk"
+        );
+
+        let reopened = SnapshotManager::open_without_text_index(&path).unwrap();
+        assert_eq!(reopened.generation(), 3);
+        assert_eq!(
+            reopened.graph().query_audit_events(None, 10).unwrap().len(),
+            1,
+            "stale generation-2 Vec additions must not replay over the compacted base"
+        );
+    }
+
+    #[test]
+    fn local_generation_recovers_across_save_restart_save_cycles() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let base = test_entity("restart_base");
+        let second = test_entity("restart_second");
+        let third = test_entity("restart_third");
+
+        let mgr = SnapshotManager::new(&path);
+        mgr.graph().upsert_entity(&base).unwrap();
+        mgr.save().unwrap();
+        assert_eq!(mgr.generation(), 1);
+        drop(mgr);
+
+        let first_restart = SnapshotManager::open(&path).unwrap();
+        assert_eq!(first_restart.generation(), 1);
+        first_restart.graph().upsert_entity(&second).unwrap();
+        assert_eq!(
+            SnapshotManager::save_graph_delta(
+                &path,
+                first_restart.graph().as_ref(),
+                first_restart.generation(),
+            )
+            .unwrap(),
+            Some(2)
+        );
+        drop(first_restart);
+
+        let second_restart = SnapshotManager::open(&path).unwrap();
+        assert_eq!(second_restart.generation(), 2);
+        second_restart.graph().upsert_entity(&third).unwrap();
+        assert_eq!(
+            SnapshotManager::save_graph_delta(
+                &path,
+                second_restart.graph().as_ref(),
+                second_restart.generation(),
+            )
+            .unwrap(),
+            Some(3)
+        );
+        drop(second_restart);
+
+        let reopened = SnapshotManager::open(&path).unwrap();
+        assert_eq!(reopened.generation(), 3);
+        let names: std::collections::HashSet<_> = reopened
+            .graph()
+            .list_all_entities()
+            .unwrap()
+            .into_iter()
+            .map(|entity| entity.name)
+            .collect();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains("restart_base"));
+        assert!(names.contains("restart_second"));
+        assert!(names.contains("restart_third"));
+    }
+
+    #[test]
+    fn legacy_snapshot_without_root_trailer_migrates_before_delta() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let legacy_graph = InMemoryGraph::new();
+        legacy_graph
+            .upsert_entity(&test_entity("legacy_base"))
+            .unwrap();
+        // `to_bytes` deliberately omits the persisted Merkle trailer used by
+        // the new authority format, matching pre-authority local snapshots.
+        std::fs::write(&path, legacy_graph.to_snapshot().to_bytes().unwrap()).unwrap();
+
+        let mgr = SnapshotManager::open_without_text_index(&path).unwrap();
+        assert_eq!(mgr.generation(), GENERATION_INIT);
+        mgr.graph()
+            .upsert_entity(&test_entity("post_migration_delta"))
+            .unwrap();
+        assert_eq!(
+            SnapshotManager::save_graph_delta(&path, mgr.graph().as_ref(), mgr.generation(),)
+                .unwrap(),
+            Some(1)
+        );
+        drop(mgr);
+
+        let reopened = SnapshotManager::open_without_text_index(&path).unwrap();
+        assert_eq!(reopened.generation(), 1);
+        let names: std::collections::HashSet<_> = reopened
+            .graph()
+            .list_all_entities()
+            .unwrap()
+            .into_iter()
+            .map(|entity| entity.name)
+            .collect();
+        assert!(names.contains("legacy_base"));
+        assert!(names.contains("post_migration_delta"));
+    }
+
+    #[test]
+    fn static_full_save_reclaims_only_older_versioned_bases() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let graph = InMemoryGraph::new();
+        graph.upsert_entity(&test_entity("generation_one")).unwrap();
+        assert_eq!(
+            SnapshotManager::save_graph_with_generation(&path, &graph)
+                .unwrap()
+                .1,
+            1
+        );
+
+        // Model an in-flight writer that installed a future immutable base but
+        // has not moved authority yet. Cleanup for generation 2 must preserve
+        // it while reclaiming the genuinely superseded generation 1 base.
+        let future_path = local_versioned_snapshot_path(&path, 3);
+        std::fs::copy(local_versioned_snapshot_path(&path, 1), &future_path).unwrap();
+        graph.upsert_entity(&test_entity("generation_two")).unwrap();
+        assert_eq!(
+            SnapshotManager::save_graph_with_generation(&path, &graph)
+                .unwrap()
+                .1,
+            2
+        );
+        assert!(!local_versioned_snapshot_path(&path, 1).exists());
+        assert!(local_versioned_snapshot_path(&path, 2).exists());
+        assert!(future_path.exists());
+    }
+
+    #[test]
+    fn manager_full_save_reclaims_older_base_while_holding_exclusive_lock() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let seed = InMemoryGraph::new();
+        seed.upsert_entity(&test_entity("generation_one")).unwrap();
+        SnapshotManager::save_graph_with_generation(&path, &seed).unwrap();
+        assert!(local_versioned_snapshot_path(&path, 1).exists());
+
+        // `open` holds the database flock for this manager's lifetime. The
+        // static save primitive's best-effort cleanup therefore cannot take a
+        // nested lock; `SnapshotManager::save` must still reclaim the older
+        // base under the lock it already owns.
+        let mgr = SnapshotManager::open(&path).unwrap();
+        mgr.graph()
+            .upsert_entity(&test_entity("generation_two"))
+            .unwrap();
+        mgr.save().unwrap();
+
+        assert_eq!(mgr.generation(), 2);
+        assert!(!local_versioned_snapshot_path(&path, 1).exists());
+        assert!(local_versioned_snapshot_path(&path, 2).exists());
+    }
+
+    #[test]
+    fn later_mutation_cannot_stamp_sidecars_with_detached_snapshot_root() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let text_index_path = text_index_dir_for(&path).unwrap();
+        let mgr = SnapshotManager::new(&path);
+        let graph = mgr.graph();
+        let mut entity = test_entity("initialepochtoken");
+        let entity_id = entity.id;
+        graph.upsert_entity(&entity).unwrap();
+        mgr.save().unwrap();
+
+        entity.name = "capturedepochtoken".into();
+        entity.signature = "fn capturedepochtoken()".into();
+        graph.upsert_entity(&entity).unwrap();
+        let (captured_bytes, captured_root, epoch) =
+            graph.begin_snapshot_persistence(None).unwrap();
+
+        // This mutation arrives after the graph bytes/root were detached but
+        // before their derived sidecars are persisted.
+        entity.name = "newerepochtoken".into();
+        entity.signature = "fn newerepochtoken()".into();
+        graph.upsert_entity(&entity).unwrap();
+
+        #[cfg(feature = "vector")]
+        {
+            write_vector_index_metadata(
+                &vector_index_metadata_path_for(&path),
+                &VectorIndexMetadata {
+                    version: VectorIndexMetadata::VERSION,
+                    graph_root_hash: hex::encode(captured_root),
+                    dimensions: 4,
+                    indexed: 1,
+                    embedding_provider: None,
+                    embedding_model_id: None,
+                    embedding_model_revision: None,
+                    embedding_pipeline_epoch: None,
+                    embedder_identity: None,
+                },
+            )
+            .unwrap();
+        }
+
+        SnapshotManager::persist_snapshot_sidecars_for_epoch(
+            &path,
+            graph.as_ref(),
+            captured_root,
+            epoch,
+        )
+        .unwrap();
+
+        let persisted_text =
+            crate::search::TextIndex::open_read_only(Some(&text_index_path)).unwrap();
+        assert_eq!(
+            persisted_text.graph_root_hash(),
+            Some([0u8; 32]),
+            "mixed-epoch live text must be marked non-authoritative"
+        );
+        drop(persisted_text);
+
+        #[cfg(feature = "vector")]
+        assert_eq!(
+            read_vector_index_metadata(&vector_index_metadata_path_for(&path))
+                .unwrap()
+                .unwrap()
+                .graph_root_hash,
+            hex::encode([0u8; 32]),
+            "mixed-epoch vector metadata must be marked non-authoritative"
+        );
+
+        // Simulate the crash window after authority commit but before the
+        // canonical compatibility projection is refreshed. The old canonical
+        // file remains generation 1; only the immutable generation-2 snapshot
+        // and atomic authority identify durable truth.
+        let generation = 2;
+        let versioned_path = local_versioned_snapshot_path(&path, generation);
+        std::fs::create_dir_all(local_snapshot_versions_dir(&path)).unwrap();
+        mmap::atomic_write_bytes(&versioned_path, &captured_bytes).unwrap();
+        write_local_authority(
+            &path,
+            &LocalSnapshotAuthority {
+                version: LOCAL_SNAPSHOT_AUTHORITY_VERSION,
+                snapshot_generation: generation,
+                head_generation: generation,
+                snapshot_file: local_snapshot_file_name(generation),
+                snapshot_root_hash: hex::encode(captured_root),
+            },
+        )
+        .unwrap();
+        assert!(graph.complete_persistence(epoch));
+        drop(mgr);
+
+        let reopened = SnapshotManager::open(&path).unwrap();
+        assert_eq!(reopened.generation(), generation);
+        assert_eq!(
+            reopened
+                .graph()
+                .get_entity(&entity_id)
+                .unwrap()
+                .unwrap()
+                .name,
+            "capturedepochtoken"
+        );
+        assert!(reopened
+            .graph()
+            .text_search("capturedepochtoken", 10)
+            .unwrap()
+            .iter()
+            .any(|(key, _)| *key == RetrievalKey::Entity(entity_id)));
+        assert!(
+            reopened
+                .graph()
+                .text_search("newerepochtoken", 10)
+                .unwrap()
+                .is_empty(),
+            "reopen must rebuild from detached authority, never newer live sidecar content"
         );
     }
 
@@ -2150,7 +3220,7 @@ mod tests {
     }
 
     #[test]
-    fn open_recovers_from_valid_tmp_when_primary_is_corrupted() {
+    fn open_heals_corrupt_compatibility_projection_from_authority() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");
         let tmp_path = mmap::recovery_tmp_path(&path);
@@ -2171,11 +3241,21 @@ mod tests {
         corrupt_bytes[mid] ^= 0xFF;
         std::fs::write(&path, corrupt_bytes).unwrap();
 
+        let authority = read_local_authority_manifest(&path).unwrap().unwrap();
+        let authoritative_path =
+            local_snapshot_versions_dir(&path).join(authority.snapshot_file.as_str());
+        let authoritative_bytes = std::fs::read(&authoritative_path).unwrap();
+
         let recovered = SnapshotManager::open(&path).unwrap();
         let recovered_graph = recovered.graph();
         let fetched = recovered_graph.get_entity(&entity_id).unwrap().unwrap();
         assert_eq!(fetched.name, "recover_corrupted_primary");
         assert!(!tmp_path.exists(), "recovery tmp should be consumed");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            authoritative_bytes,
+            "unfinished compatibility write should heal from committed authority"
+        );
     }
 
     #[test]
@@ -3556,10 +4636,13 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
         mgr.save().unwrap();
 
-        let mut bytes = std::fs::read(&path).unwrap();
+        let authority = read_local_authority_manifest(&path).unwrap().unwrap();
+        let authoritative_path =
+            local_snapshot_versions_dir(&path).join(authority.snapshot_file.as_str());
+        let mut bytes = std::fs::read(&authoritative_path).unwrap();
         let mid = bytes.len() / 2;
         bytes[mid] ^= 0xFF;
-        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(&authoritative_path, &bytes).unwrap();
 
         let err = match SnapshotManager::open(&path) {
             Ok(_) => panic!("expected corrupted snapshot to fail reopening"),
@@ -3567,7 +4650,9 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("checksum mismatch") || msg.contains("corrupted"),
+            msg.contains("digest mismatch")
+                || msg.contains("checksum mismatch")
+                || msg.contains("corrupted"),
             "expected corruption detection, got: {msg}"
         );
     }
