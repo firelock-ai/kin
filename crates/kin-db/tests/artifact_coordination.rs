@@ -10,9 +10,12 @@
 //!
 //! | Artifact | Path | Purpose |
 //! |----------|------|---------|
-//! | Main snapshot | `graph.kndb` | MessagePack-serialized GraphSnapshot |
+//! | Authority | `graph.kndb.authority.json` | Atomic committed snapshot base/head generations and graph root |
+//! | Versioned snapshot | `graph.kndb.snapshots/{gen:020}.kndb` | Immutable committed GraphSnapshot base |
+//! | Compatibility projection | `graph.kndb` | Canonical projection for legacy readers; not recovery authority |
+//! | Delta journal | `graph.kndb.deltas/{gen:020}.kndd` | Contiguous committed changes after the snapshot base |
 //! | Lock file | `graph.lock` | flock sentinel for exclusive process access |
-//! | Recovery candidate | `graph.kndb.tmp` | In-flight write; promoted to graph.kndb on success |
+//! | Recovery candidate | `graph.kndb.tmp` | In-flight compatibility projection write |
 //! | Recovery marker | `graph.kndb.tmp.meta` | SHA-256 + byte length of graph.kndb.tmp for crash validation |
 //!
 //! ## Persisted artifacts (StorageBackend/LocalFileBackend path):
@@ -34,7 +37,25 @@
 //! | Recovery marker | `*.usearch.tmp.meta` | SHA-256 for crash recovery of vector index |
 
 use kin_db::*;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = std::ffi::OsString::from(path.as_os_str());
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn authoritative_snapshot_path(snapshot_path: &Path) -> PathBuf {
+    let authority_path = append_suffix(snapshot_path, ".authority.json");
+    let authority: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&authority_path).unwrap()).unwrap();
+    let snapshot_file = authority
+        .get("snapshot_file")
+        .and_then(serde_json::Value::as_str)
+        .expect("authority must name its immutable snapshot");
+    append_suffix(snapshot_path, ".snapshots").join(snapshot_file)
+}
 
 fn test_entity(name: &str) -> Entity {
     Entity {
@@ -156,10 +177,9 @@ fn backend_artifacts_stay_consistent() {
 
     // Load and reconstruct: snapshot + delta should equal snapshot2.
     let (loaded_bytes, loaded_gen) = backend.load_snapshot("repo1").unwrap().unwrap();
-    // Note: save_delta advances the shared generation counter, so loaded_gen
-    // may be > gen1. The snapshot bytes are still from gen1's save, but the
-    // generation file reflects the latest write (including deltas).
-    assert!(loaded_gen >= gen1, "loaded gen should be >= gen1");
+    // The tuple generation must describe these exact base bytes. The
+    // acknowledged journal head is available through load_snapshot_authority.
+    assert_eq!(loaded_gen, gen1);
 
     let mut loaded_snapshot = GraphSnapshot::from_bytes(&loaded_bytes).unwrap();
     let deltas = backend.load_deltas_since("repo1", gen1).unwrap();
@@ -187,21 +207,23 @@ fn backend_artifacts_stay_consistent() {
     );
 }
 
-/// Simulate a crash mid-write by leaving a .tmp + .tmp.meta but no primary.
-/// Verify recovery produces the correct graph.
+/// A compatibility-projection write that crashes before the authority commit
+/// must not replace the last committed graph truth.
 #[test]
-fn crash_recovery_from_valid_tmp() {
+fn crash_before_authority_commit_keeps_old_snapshot_truth() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("kindb").join("graph.kndb");
 
     // Create a graph and save it normally first.
-    {
+    let original_entity_id = {
         let mgr = SnapshotManager::open(&path).unwrap();
         let graph = mgr.graph();
         let e1 = test_entity("original");
+        let e1_id = e1.id;
         graph.upsert_entity(&e1).unwrap();
         mgr.save().unwrap();
-    }
+        e1_id
+    };
 
     // Now simulate a crash: write a new snapshot to .tmp with marker,
     // but delete the primary (as if rename hadn't happened yet).
@@ -246,24 +268,25 @@ fn crash_recovery_from_valid_tmp() {
         std::fs::remove_file(&path).unwrap();
     }
 
-    // Recovery: open should detect missing primary, find valid .tmp, and recover.
+    // Recovery reads committed authority, not the uncommitted compatibility
+    // candidate, then heals the canonical projection from immutable truth.
     let recovered_mgr = SnapshotManager::open(&path).unwrap();
     let graph = recovered_mgr.graph();
 
-    // The recovered graph should contain the new entity.
-    let fetched = graph.get_entity(&new_entity_id).unwrap();
     assert!(
-        fetched.is_some(),
-        "crash-recovered graph should contain the entity written before crash"
+        graph.get_entity(&original_entity_id).unwrap().is_some(),
+        "last committed entity should survive the interrupted write"
     );
-    assert_eq!(fetched.unwrap().name, "crash_recovery");
-
-    // The primary should now exist (promoted from .tmp).
-    assert!(path.exists(), "primary snapshot should be restored");
-    let mut consumed_tmp = std::ffi::OsString::from(path.as_os_str());
-    consumed_tmp.push(".tmp");
     assert!(
-        !std::path::PathBuf::from(consumed_tmp).exists(),
+        graph.get_entity(&new_entity_id).unwrap().is_none(),
+        "uncommitted compatibility candidate must not override authority"
+    );
+
+    // The compatibility projection should be restored from authority and the
+    // stale recovery candidate consumed.
+    assert!(path.exists(), "compatibility projection should be restored");
+    assert!(
+        !append_suffix(&path, ".tmp").exists(),
         "recovery .tmp should be consumed"
     );
 }
@@ -284,12 +307,14 @@ fn corrupt_snapshot_no_recovery_fails_cleanly() {
         mgr.save().unwrap();
     }
 
-    // Corrupt it.
-    let mut bytes = std::fs::read(&path).unwrap();
+    // Corrupt the immutable snapshot named by authority. Corrupting only the
+    // compatibility projection cannot affect committed graph truth.
+    let authoritative_path = authoritative_snapshot_path(&path);
+    let mut bytes = std::fs::read(&authoritative_path).unwrap();
     for byte in bytes.iter_mut().take(20) {
         *byte ^= 0xFF;
     }
-    std::fs::write(&path, bytes).unwrap();
+    std::fs::write(&authoritative_path, bytes).unwrap();
 
     // Open should fail (corrupt primary, no recovery candidate).
     let result = SnapshotManager::open(&path);

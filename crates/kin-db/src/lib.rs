@@ -13,7 +13,7 @@ pub mod types;
 pub mod vector;
 
 pub use embed::CodeEmbedder;
-pub use engine::{EmbeddingStatus, InMemoryGraph, ResolvedRetrievalItem};
+pub use engine::{EmbeddingStatus, InMemoryGraph, PersistenceEpoch, ResolvedRetrievalItem};
 pub use error::{KinDbError, Result};
 pub use kin_search::TEXT_INDEX_FORMAT_VERSION;
 pub use retrieval::{unified_retrieve, RetrievalCandidate, RetrievalQuery};
@@ -34,7 +34,10 @@ pub use storage::{
     verify_entity, verify_subgraph, EntityVerification, MerkleHash, TamperedNode,
     VerificationReport, ZERO_HASH,
 };
-pub use storage::{Generation, LocalFileBackend, StorageBackend, GENERATION_INIT};
+pub use storage::{
+    load_recovered_snapshot, Generation, LocalFileBackend, PersistedDelta, RecoveredSnapshot,
+    SnapshotAuthority, SnapshotRecoveryState, StorageBackend, GENERATION_INIT,
+};
 pub use storage::{LoadStrategy, SystemMemInfo, TieredConfig, TieredGraph};
 pub use store::{
     ChangeStore, EntityStore, GraphStore, ProvenanceStore, SessionStore, VerificationStore,

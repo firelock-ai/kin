@@ -7,6 +7,7 @@ pub mod format;
 #[cfg(feature = "gcs")]
 pub mod gcs;
 pub mod index;
+mod local_journal;
 pub mod merkle;
 pub mod migration;
 mod mmap;
@@ -15,7 +16,10 @@ mod snapshot;
 pub mod sql;
 pub mod tiered;
 
-pub use backend::{Generation, LocalFileBackend, StorageBackend, GENERATION_INIT};
+pub use backend::{
+    load_recovered_snapshot, Generation, LocalFileBackend, PersistedDelta, RecoveredSnapshot,
+    SnapshotAuthority, SnapshotRecoveryState, StorageBackend, GENERATION_INIT,
+};
 pub use delta::{
     apply_graph_delta, compute_graph_delta, CollectionDelta, GraphSnapshotDelta, VecDelta,
 };

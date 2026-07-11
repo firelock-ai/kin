@@ -10,11 +10,29 @@
 //! - Concurrent readers + single writer produce no corruption
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use kin_db::*;
 use tempfile::TempDir;
+
+fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = std::ffi::OsString::from(path.as_os_str());
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn authoritative_snapshot_path(snapshot_path: &Path) -> PathBuf {
+    let authority_path = append_suffix(snapshot_path, ".authority.json");
+    let authority: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&authority_path).unwrap()).unwrap();
+    let snapshot_file = authority
+        .get("snapshot_file")
+        .and_then(serde_json::Value::as_str)
+        .expect("authority must name its immutable snapshot");
+    append_suffix(snapshot_path, ".snapshots").join(snapshot_file)
+}
 
 fn test_fingerprint() -> SemanticFingerprint {
     SemanticFingerprint {
@@ -275,8 +293,10 @@ fn corrupt_snapshot_detected() {
         mgr.save().unwrap();
     }
 
-    // Read the raw bytes and corrupt them.
-    let mut bytes = std::fs::read(&path).unwrap();
+    // Corrupt the immutable snapshot named by authority. The canonical path is
+    // only a compatibility projection and cannot override committed truth.
+    let authoritative_path = authoritative_snapshot_path(&path);
+    let mut bytes = std::fs::read(&authoritative_path).unwrap();
     assert!(bytes.len() > 40, "snapshot should be non-trivial");
 
     // Corrupt the middle of the file (past the header).
@@ -284,7 +304,7 @@ fn corrupt_snapshot_detected() {
     for byte in bytes[mid..mid + 10].iter_mut() {
         *byte ^= 0xFF;
     }
-    std::fs::write(&path, &bytes).unwrap();
+    std::fs::write(&authoritative_path, &bytes).unwrap();
 
     // Open should fail since the data is corrupt and no recovery candidate exists.
     let result = SnapshotManager::open(&path);

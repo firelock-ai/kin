@@ -4,7 +4,6 @@
 use memmap2::Mmap;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,6 +13,29 @@ use crate::storage::format::GraphSnapshot;
 use crate::storage::mmap;
 use crate::store::{ChangeStore, EntityStore};
 use crate::types::*;
+
+#[cfg(test)]
+std::thread_local! {
+    static AFTER_RECOVERY_BEFORE_OPEN_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_after_recovery_before_open_hook(hook: impl FnOnce() + 'static) {
+    AFTER_RECOVERY_BEFORE_OPEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_after_recovery_before_open_hook() {
+    AFTER_RECOVERY_BEFORE_OPEN_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_after_recovery_before_open_hook() {}
 
 /// System memory information used to configure tier sizes.
 #[derive(Debug, Clone, Copy)]
@@ -158,7 +180,7 @@ impl TieredGraph {
         let mem_info = SystemMemInfo::detect();
         ensure_recoverable_snapshot_file(&path)?;
 
-        if !path.exists() {
+        if !path_entry_exists(&path, "tiered snapshot")? {
             // No snapshot file — start with an empty graph
             return Ok(Self {
                 hot: Arc::new(InMemoryGraph::new()),
@@ -172,8 +194,14 @@ impl TieredGraph {
             });
         }
 
-        // Check file size to decide strategy
-        let file_size = std::fs::metadata(&path)
+        // Hold the no-follow regular-file descriptor used for both strategy
+        // selection and the mmap branch. A path swap after recovery validation
+        // can therefore only make a later safe open fail, never map a symlink
+        // target or block on a FIFO.
+        run_after_recovery_before_open_hook();
+        let file = mmap::open_regular_nofollow(&path, "tiered snapshot")?;
+        let file_size = file
+            .metadata()
             .map_err(|e| {
                 KinDbError::StorageError(format!("failed to stat {}: {e}", path.display()))
             })?
@@ -201,9 +229,6 @@ impl TieredGraph {
             })
         } else {
             // Too large — use mmap-backed strategy
-            let file = File::open(&path).map_err(|e| {
-                KinDbError::StorageError(format!("failed to open {}: {e}", path.display()))
-            })?;
             let mmap = unsafe {
                 Mmap::map(&file).map_err(|e| {
                     KinDbError::StorageError(format!("failed to mmap {}: {e}", path.display()))
@@ -746,14 +771,14 @@ fn promote_recovery_snapshot(
 }
 
 fn ensure_recoverable_snapshot_file(path: &Path) -> Result<(), KinDbError> {
-    if path.exists() {
+    if path_entry_exists(path, "tiered snapshot")? {
         match mmap::MmapReader::open(path) {
             Ok(_) => Ok(()),
             Err(err) => promote_recovery_snapshot(path, Some(&err)),
         }
     } else {
         let tmp_path = mmap::recovery_tmp_path(path);
-        if tmp_path.exists() {
+        if path_entry_exists(&tmp_path, "tiered recovery snapshot")? {
             promote_recovery_snapshot(path, None)
         } else {
             Ok(())
@@ -761,9 +786,20 @@ fn ensure_recoverable_snapshot_file(path: &Path) -> Result<(), KinDbError> {
     }
 }
 
+fn path_entry_exists(path: &Path, role: &str) -> Result<bool, KinDbError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(KinDbError::StorageError(format!(
+            "failed to inspect {role} {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
 fn load_snapshot_from_disk(path: &Path) -> Result<GraphSnapshot, KinDbError> {
     ensure_recoverable_snapshot_file(path)?;
-    if !path.exists() {
+    if !path_entry_exists(path, "tiered snapshot")? {
         return Ok(GraphSnapshot::empty());
     }
     mmap::MmapReader::open(path)
@@ -771,8 +807,8 @@ fn load_snapshot_from_disk(path: &Path) -> Result<GraphSnapshot, KinDbError> {
 
 fn mmap_snapshot_file(path: &Path) -> Result<(Mmap, GraphSnapshot), KinDbError> {
     ensure_recoverable_snapshot_file(path)?;
-    let file = File::open(path)
-        .map_err(|e| KinDbError::StorageError(format!("failed to open {}: {e}", path.display())))?;
+    run_after_recovery_before_open_hook();
+    let file = mmap::open_regular_nofollow(path, "tiered mmap snapshot")?;
     let mmap = unsafe {
         Mmap::map(&file).map_err(|e| {
             KinDbError::StorageError(format!("failed to mmap {}: {e}", path.display()))
@@ -1098,6 +1134,33 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("unproven without a valid marker"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tiered_open_rejects_symlink_swapped_after_recovery_validation() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let victim = dir.path().join("victim.kndb");
+        let bytes = GraphSnapshot::empty().to_bytes().unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(&victim, &bytes).unwrap();
+        let raced_path = path.clone();
+        set_after_recovery_before_open_hook(move || {
+            std::fs::remove_file(&raced_path).unwrap();
+            symlink(&victim, &raced_path).unwrap();
+        });
+
+        let error = match TieredGraph::open(&path, TieredConfig::default()) {
+            Ok(_) => panic!("tiered open must not follow a post-validation symlink swap"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("tiered snapshot"),
+            "unexpected post-validation symlink error: {error}"
+        );
     }
 
     #[test]

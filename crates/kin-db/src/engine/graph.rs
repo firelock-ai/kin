@@ -909,15 +909,39 @@ struct SessionData {
 #[derive(Debug)]
 struct PendingGraphDelta {
     delta: GraphSnapshotDelta,
+    next_persistence_epoch: u64,
+    in_flight_persistence: HashSet<u64>,
 }
 
 impl Default for PendingGraphDelta {
     fn default() -> Self {
         Self {
             delta: GraphSnapshotDelta::empty(0),
+            next_persistence_epoch: 1,
+            in_flight_persistence: HashSet::new(),
         }
     }
 }
+
+impl PendingGraphDelta {
+    fn begin_persistence(&mut self) -> PersistenceEpoch {
+        let mut epoch = self.next_persistence_epoch.max(1);
+        while self.in_flight_persistence.contains(&epoch) {
+            epoch = epoch.wrapping_add(1).max(1);
+        }
+        self.next_persistence_epoch = epoch.wrapping_add(1).max(1);
+        self.in_flight_persistence.insert(epoch);
+        PersistenceEpoch(epoch)
+    }
+}
+
+/// Opaque acknowledgement token for one detached persistence batch.
+///
+/// Starting persistence atomically detaches the mutations captured by that
+/// write. Mutations arriving while backend I/O is in flight accumulate in a
+/// fresh buffer and therefore cannot be cleared by the older write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PersistenceEpoch(u64);
 
 fn delta_map_upsert<K, V>(delta: &mut CollectionDelta<K, V>, key: K, value: V)
 where
@@ -2348,32 +2372,53 @@ impl InMemoryGraph {
     }
 
     fn rebuild_text_index_with_root_hash(&self, root_hash: [u8; 32]) {
-        let _span = tracing::info_span!("kindb.graph.rebuild_text_index_with_root_hash").entered();
-        let Some(ref ti) = self.text_index else {
-            return;
-        };
+        if let Err(error) = self.try_rebuild_text_index_from_graph(self, root_hash) {
+            tracing::warn!(error = %error, "failed to rebuild text index");
+        }
+    }
 
-        let docs: Vec<(RetrievalKey, Vec<(String, f32)>)> = {
-            let ent = self.entities.read();
-            let _span = tracing::info_span!(
-                "kindb.graph.rebuild_text_index.collect",
-                entities = ent.entities.len(),
-                shallow_files = ent.shallow_files.len(),
-                structured_artifacts = ent.structured_artifacts.len(),
-                opaque_artifacts = ent.opaque_artifacts.len()
-            )
-            .entered();
-            let entity_docs = ent.entities.values().map(|entity| {
-                let extra = collect_text_index_extra_fields(&ent, &entity.id);
-                let fields = if extra.is_empty() {
-                    crate::search::entity_fields(entity)
-                } else {
-                    crate::search::entity_fields_with_extra(entity, &extra)
-                };
-                (RetrievalKey::Entity(entity.id), fields)
-            });
-            let artifact_docs = collect_artifact_text_index_docs(&ent);
-            entity_docs.chain(artifact_docs).collect()
+    fn try_rebuild_text_index_from_graph(
+        &self,
+        source: &InMemoryGraph,
+        root_hash: [u8; 32],
+    ) -> Result<(), KinDbError> {
+        let _span = tracing::info_span!("kindb.graph.rebuild_text_index_with_root_hash").entered();
+        let docs = {
+            let ent = source.entities.read();
+            Self::collect_text_index_docs(&ent)
+        };
+        self.try_rebuild_text_index_from_docs(docs, root_hash)
+    }
+
+    fn collect_text_index_docs(ent: &EntityData) -> Vec<(RetrievalKey, Vec<(String, f32)>)> {
+        let _span = tracing::info_span!(
+            "kindb.graph.rebuild_text_index.collect",
+            entities = ent.entities.len(),
+            shallow_files = ent.shallow_files.len(),
+            structured_artifacts = ent.structured_artifacts.len(),
+            opaque_artifacts = ent.opaque_artifacts.len()
+        )
+        .entered();
+        let entity_docs = ent.entities.values().map(|entity| {
+            let extra = collect_text_index_extra_fields(ent, &entity.id);
+            let fields = if extra.is_empty() {
+                crate::search::entity_fields(entity)
+            } else {
+                crate::search::entity_fields_with_extra(entity, &extra)
+            };
+            (RetrievalKey::Entity(entity.id), fields)
+        });
+        let artifact_docs = collect_artifact_text_index_docs(ent);
+        entity_docs.chain(artifact_docs).collect()
+    }
+
+    fn try_rebuild_text_index_from_docs(
+        &self,
+        docs: Vec<(RetrievalKey, Vec<(String, f32)>)>,
+        root_hash: [u8; 32],
+    ) -> Result<(), KinDbError> {
+        let Some(ref ti) = self.text_index else {
+            return Ok(());
         };
 
         {
@@ -2382,17 +2427,18 @@ impl InMemoryGraph {
                 docs = docs.len()
             )
             .entered();
-            let _ = ti.rebuild_all_owned(docs);
+            ti.rebuild_all_owned(docs)?;
         }
 
         {
             let _span = tracing::info_span!("kindb.graph.rebuild_text_index.commit").entered();
             ti.set_graph_root_hash(root_hash);
-            let _ = ti.commit();
+            ti.commit()?;
         }
         self.text_dirty.store(false, Ordering::Release);
         self.text_full_rebuild_required
             .store(false, Ordering::Release);
+        Ok(())
     }
 
     #[inline]
@@ -2481,8 +2527,112 @@ impl InMemoryGraph {
         Some(delta)
     }
 
+    /// Detach the currently pending delta for one backend write.
+    ///
+    /// Mutations arriving after this call are recorded in a fresh pending
+    /// buffer. Call [`complete_persistence`](Self::complete_persistence) after
+    /// the backend has durably committed the returned delta, or
+    /// [`fail_persistence`](Self::fail_persistence) if it did not commit.
+    pub fn begin_delta_persistence(
+        &self,
+        base_generation: Generation,
+    ) -> Option<(GraphSnapshotDelta, PersistenceEpoch)> {
+        let mut pending = self.pending_delta.lock();
+        if pending.delta.is_empty() {
+            return None;
+        }
+        let mut delta = GraphSnapshotDelta::empty(base_generation);
+        std::mem::swap(&mut pending.delta, &mut delta);
+        delta.base_generation = base_generation;
+        let epoch = pending.begin_persistence();
+        Some((delta, epoch))
+    }
+
+    /// Acknowledge one detached persistence batch after its authority commit.
+    pub fn complete_persistence(&self, epoch: PersistenceEpoch) -> bool {
+        self.pending_delta
+            .lock()
+            .in_flight_persistence
+            .remove(&epoch.0)
+    }
+
+    /// Retire a failed detached persistence batch and force the next retry to
+    /// serialize the complete live graph. The live graph still contains every
+    /// mutation from the failed batch, while later mutations remain isolated in
+    /// the fresh pending buffer.
+    pub fn fail_persistence(&self, epoch: PersistenceEpoch) -> bool {
+        let mut pending = self.pending_delta.lock();
+        let removed = pending.in_flight_persistence.remove(&epoch.0);
+        self.full_snapshot_required.store(true, Ordering::Release);
+        removed
+    }
+
+    /// Persist derived sidecars only while the live graph is still exactly the
+    /// state captured by `epoch` and `expected_root_hash`.
+    ///
+    /// All graph read guards and the pending-delta fence are held through the
+    /// text rebuild and `persist_additional`. This uses the already-held entity
+    /// guard to materialize text documents, avoiding both a recursive read lock
+    /// and a second full `GraphSnapshot` allocation for large repositories.
+    pub(crate) fn persist_derived_sidecars_for_epoch<T>(
+        &self,
+        epoch: PersistenceEpoch,
+        expected_root_hash: [u8; 32],
+        persist_additional: impl FnOnce() -> Result<T, KinDbError>,
+    ) -> Result<bool, KinDbError> {
+        let ent = self.entities.read();
+        let _chg = self.changes.read();
+        let _wrk = self.work.read();
+        let _rev = self.reviews.read();
+        let _ver = self.verification.read();
+        let _prv = self.provenance.read();
+        let _ses = self.sessions.read();
+        let pending = self.pending_delta.lock();
+        self.flush_merkle(&ent);
+        let current_root_hash = self.merkle.read().root_hash();
+        let exact = current_root_hash == expected_root_hash
+            && pending.in_flight_persistence.contains(&epoch.0)
+            && pending.delta.is_empty()
+            && !self.full_snapshot_required.load(Ordering::Acquire);
+        if !exact {
+            return Ok(false);
+        }
+        let docs = Self::collect_text_index_docs(&ent);
+        self.try_rebuild_text_index_from_docs(docs, expected_root_hash)?;
+        persist_additional()?;
+        Ok(true)
+    }
+
+    /// Commit any staged live text for current-process query coherence while
+    /// stamping the persisted index as deliberately non-authoritative. A cold
+    /// reopen will rebuild it from graph truth rather than accept a mixed epoch.
+    pub(crate) fn invalidate_persisted_text_index(&self) -> Result<(), KinDbError> {
+        if self.text_full_rebuild_required.load(Ordering::Acquire) {
+            // The successful rebuild clears this flag. Preserve it on error so
+            // a retry cannot stamp a still-stale live index as invalid-but-
+            // coherent without first applying relation-derived text changes.
+            return self.try_rebuild_text_index_from_graph(self, [0u8; 32]);
+        }
+        if let Some(ref ti) = self.text_index {
+            ti.set_graph_root_hash([0u8; 32]);
+            ti.commit()?;
+        }
+        self.text_dirty.store(false, Ordering::Release);
+        Ok(())
+    }
+
     pub fn full_snapshot_required(&self) -> bool {
         self.full_snapshot_required.load(Ordering::Acquire)
+    }
+
+    /// Whether graph truth contains work that has not yet been acknowledged by
+    /// durable authority. This includes mutations waiting in the active delta,
+    /// a detached batch still in backend I/O, and a forced full-snapshot retry.
+    pub fn has_unpersisted_changes(&self) -> bool {
+        let pending = self.pending_delta.lock();
+        self.full_snapshot_required.load(Ordering::Acquire)
+            || !pending.delta.is_empty()
+            || !pending.in_flight_persistence.is_empty()
     }
 
     pub fn clear_full_snapshot_required(&self) {
@@ -2490,6 +2640,7 @@ impl InMemoryGraph {
     }
 
     fn require_full_snapshot(&self) {
+        let _pending = self.pending_delta.lock();
         self.full_snapshot_required.store(true, Ordering::Release);
     }
 
@@ -2805,9 +2956,50 @@ impl InMemoryGraph {
         &self,
         precomputed_hash: Option<crate::storage::merkle::MerkleHash>,
     ) -> Result<(Vec<u8>, crate::storage::merkle::MerkleHash), KinDbError> {
+        let (bytes, graph_root_hash, _) =
+            self.serialize_snapshot_borrowed_inner(precomputed_hash, false)?;
+        Ok((bytes, graph_root_hash))
+    }
+
+    /// Serialize one full-snapshot persistence batch and detach every pending
+    /// mutation represented by those bytes. Later mutations accumulate in a
+    /// fresh buffer while backend I/O is in flight.
+    pub fn begin_snapshot_persistence(
+        &self,
+        precomputed_hash: Option<crate::storage::merkle::MerkleHash>,
+    ) -> Result<
+        (
+            Vec<u8>,
+            crate::storage::merkle::MerkleHash,
+            PersistenceEpoch,
+        ),
+        KinDbError,
+    > {
+        let (bytes, graph_root_hash, epoch) =
+            self.serialize_snapshot_borrowed_inner(precomputed_hash, true)?;
+        Ok((
+            bytes,
+            graph_root_hash,
+            epoch.expect("persistence serialization always allocates an epoch"),
+        ))
+    }
+
+    fn serialize_snapshot_borrowed_inner(
+        &self,
+        precomputed_hash: Option<crate::storage::merkle::MerkleHash>,
+        begin_persistence: bool,
+    ) -> Result<
+        (
+            Vec<u8>,
+            crate::storage::merkle::MerkleHash,
+            Option<PersistenceEpoch>,
+        ),
+        KinDbError,
+    > {
         let _span = tracing::info_span!(
             "kindb.graph.serialize_snapshot_borrowed_with_hash",
-            precomputed_hash = precomputed_hash.is_some()
+            precomputed_hash = precomputed_hash.is_some(),
+            begin_persistence
         )
         .entered();
         use crate::storage::format::BorrowedGraphSnapshot;
@@ -2876,6 +3068,17 @@ impl InMemoryGraph {
         };
         let t_serialize = t2.elapsed();
 
+        // All graph read guards are still held, so the serialized bytes and
+        // detached mutation buffer describe one exact graph state. A writer
+        // cannot mutate graph truth until this function returns; mutations
+        // arriving afterwards land in the new pending buffer.
+        let persistence_epoch = begin_persistence.then(|| {
+            let mut pending = self.pending_delta.lock();
+            pending.delta = GraphSnapshotDelta::empty(0);
+            self.full_snapshot_required.store(false, Ordering::Release);
+            pending.begin_persistence()
+        });
+
         tracing::debug!(
             lock_ms = t_lock.as_secs_f64() * 1000.0,
             root_hash_ms = t_hash.as_secs_f64() * 1000.0,
@@ -2884,7 +3087,7 @@ impl InMemoryGraph {
             "kindb.save_timer"
         );
 
-        Ok((bytes, graph_root_hash))
+        Ok((bytes, graph_root_hash, persistence_epoch))
     }
 
     /// O(1) lookup: file path → graph-assigned ArtifactId
@@ -9851,6 +10054,86 @@ mod tests {
     }
 
     #[test]
+    fn delta_persistence_detaches_later_mutations_from_acknowledgement() {
+        let graph = InMemoryGraph::new();
+        let first = test_entity("first", "src/first.rs");
+        let second = test_entity("second", "src/second.rs");
+        assert!(!graph.has_unpersisted_changes());
+        graph.upsert_entity(&first).unwrap();
+        assert!(graph.has_unpersisted_changes());
+
+        let (persisting, epoch) = graph
+            .begin_delta_persistence(1)
+            .expect("first mutation is pending");
+        assert!(graph.has_unpersisted_changes());
+        assert!(persisting
+            .entities
+            .modified
+            .iter()
+            .any(|(id, _)| id == &first.id));
+
+        graph.upsert_entity(&second).unwrap();
+        assert!(graph.complete_persistence(epoch));
+        assert!(graph.has_unpersisted_changes());
+
+        let next = graph
+            .pending_delta_snapshot(2)
+            .expect("later mutation remains pending");
+        assert!(!next.entities.modified.iter().any(|(id, _)| id == &first.id));
+        assert!(next
+            .entities
+            .modified
+            .iter()
+            .any(|(id, _)| id == &second.id));
+    }
+
+    #[test]
+    fn full_snapshot_persistence_detaches_later_mutations() {
+        let graph = InMemoryGraph::new();
+        let first = test_entity("first", "src/first.rs");
+        let second = test_entity("second", "src/second.rs");
+        graph.upsert_entity(&first).unwrap();
+
+        let (_bytes, _root, epoch) = graph.begin_snapshot_persistence(None).unwrap();
+        graph.upsert_entity(&second).unwrap();
+        assert!(graph.complete_persistence(epoch));
+
+        let next = graph
+            .pending_delta_snapshot(2)
+            .expect("mutation after full snapshot capture remains pending");
+        assert_eq!(next.entities.modified.len(), 1);
+        assert_eq!(next.entities.modified[0].0, second.id);
+    }
+
+    #[test]
+    fn acknowledged_persistence_is_clean_when_no_later_mutation_exists() {
+        let graph = InMemoryGraph::new();
+        graph
+            .upsert_entity(&test_entity("only", "src/only.rs"))
+            .unwrap();
+        let (_delta, epoch) = graph.begin_delta_persistence(1).unwrap();
+        assert!(graph.has_unpersisted_changes());
+        assert!(graph.complete_persistence(epoch));
+        assert!(!graph.has_unpersisted_changes());
+    }
+
+    #[test]
+    fn failed_persistence_forces_full_retry_without_clearing_later_mutations() {
+        let graph = InMemoryGraph::new();
+        let first = test_entity("first", "src/first.rs");
+        let second = test_entity("second", "src/second.rs");
+        graph.upsert_entity(&first).unwrap();
+        let (_persisting, epoch) = graph.begin_delta_persistence(1).unwrap();
+        graph.upsert_entity(&second).unwrap();
+
+        assert!(graph.fail_persistence(epoch));
+        assert!(graph.full_snapshot_required());
+        let later = graph.pending_delta_snapshot(1).unwrap();
+        assert_eq!(later.entities.modified.len(), 1);
+        assert_eq!(later.entities.modified[0].0, second.id);
+    }
+
+    #[test]
     fn create_changes_remove_before_add_matches_sequential_delta_bytes() {
         let sequential = InMemoryGraph::new();
         let batched = InMemoryGraph::new();
@@ -12620,7 +12903,10 @@ mod tests {
         #[cfg(feature = "vector")]
         assert_eq!(stats.pending_embedding_count, 6);
         #[cfg(not(feature = "vector"))]
-        assert_eq!(stats.pending_embedding_count, 0);
+        assert_eq!(
+            stats.pending_embedding_count, stats.total_entities,
+            "without a vector index every entity remains an unindexed embedding gap"
+        );
         #[cfg(feature = "vector")]
         assert!((stats.embedding_coverage_percent - 33.33333333333333).abs() < 0.001);
         #[cfg(not(feature = "vector"))]
