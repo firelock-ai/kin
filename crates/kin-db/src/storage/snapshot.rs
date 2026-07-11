@@ -37,13 +37,50 @@ pub struct SnapshotManager {
     text_index_path: Option<PathBuf>,
     /// Current live graph behind an Arc for cheap sharing.
     current: RwLock<Arc<InMemoryGraph>>,
-    /// OS-level lock file handle. Held for the lifetime of this manager;
-    /// the exclusive flock is released automatically when the File is dropped.
-    _lock_file: Option<File>,
+    /// OS-level lock guard. Held for the lifetime of this manager and explicitly
+    /// unlocked before the manager's potentially large graph is dropped.
+    _lock_file: Option<SnapshotFileLock>,
     /// Whether this manager was opened in read-only mode.
     read_only: bool,
     /// Last generation acknowledged by the atomic local snapshot authority.
     generation: AtomicU64,
+}
+
+/// Owns one acquired snapshot lock and releases it explicitly on every exit path.
+///
+/// Relying only on `File` close makes unlock timing depend on descriptor lifetime
+/// and field destruction order. An explicit `LOCK_UN` keeps persistent managers
+/// and one-shot static writes on the same deterministic release contract.
+struct SnapshotFileLock {
+    file: File,
+    path: PathBuf,
+}
+
+impl SnapshotFileLock {
+    fn new(file: File, path: PathBuf) -> Self {
+        Self { file, path }
+    }
+}
+
+impl Drop for SnapshotFileLock {
+    fn drop(&mut self) {
+        if let Err(error) = <File as FileExt>::unlock(&self.file) {
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %error,
+                "failed to explicitly release snapshot lock"
+            );
+        }
+    }
+}
+
+impl Drop for SnapshotManager {
+    fn drop(&mut self) {
+        // Release process-wide authority before destroying the graph. Under
+        // saturation another thread can begin reopening as soon as the final
+        // manager owner enters Drop, while graph teardown continues locally.
+        drop(self._lock_file.take());
+    }
 }
 
 struct PersistenceAttempt<'a> {
@@ -1984,8 +2021,8 @@ impl SnapshotManager {
     }
 
     /// Acquire an OS-level file lock adjacent to the snapshot path.
-    /// Returns the lock file handle on success.
-    fn acquire_lock(path: &Path, read_only: bool) -> Result<File, KinDbError> {
+    /// Returns an explicit-unlock guard on success.
+    fn acquire_lock(path: &Path, read_only: bool) -> Result<SnapshotFileLock, KinDbError> {
         let lock_path = path.with_extension("lock");
         if let Some(parent) = lock_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -2016,14 +2053,14 @@ impl SnapshotManager {
                 ))
             })?;
         }
-        Ok(lock_file)
+        Ok(SnapshotFileLock::new(lock_file, lock_path))
     }
 
     /// Acquire the write lock for a one-shot static persistence operation.
     /// Unlike `open`, static writes wait for the current reader/writer to
     /// finish so two independent processes serialize the complete read-CAS-
     /// write interval instead of racing on the same immutable generation.
-    fn acquire_static_write_lock(path: &Path) -> Result<File, KinDbError> {
+    fn acquire_static_write_lock(path: &Path) -> Result<SnapshotFileLock, KinDbError> {
         let lock_path = path.with_extension("lock");
         if let Some(parent) = lock_path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
@@ -2045,7 +2082,7 @@ impl SnapshotManager {
                 lock_path.display()
             ))
         })?;
-        Ok(lock_file)
+        Ok(SnapshotFileLock::new(lock_file, lock_path))
     }
 
     fn graph_from_snapshot(
@@ -7432,18 +7469,59 @@ mod tests {
     }
 
     #[test]
-    fn lock_released_on_drop() {
+    fn persistent_lock_is_explicitly_released_on_manager_drop() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");
 
-        // Open and immediately drop
-        {
-            let _mgr = SnapshotManager::open(&path).unwrap();
-        }
+        let mgr = SnapshotManager::open(&path).unwrap();
+        let retained_descriptor = mgr._lock_file.as_ref().unwrap().file.try_clone().unwrap();
+        drop(mgr);
 
-        // Should succeed now that the previous manager is dropped
+        // On Unix the duplicate shares the locked open-file description. A
+        // close-only implementation leaves the lock held until the duplicate
+        // is also closed; explicit unlock makes the reopen succeed immediately.
         let _mgr2 = SnapshotManager::open(&path).unwrap();
         assert_eq!(_mgr2.graph().entity_count(), 0);
+        drop(retained_descriptor);
+    }
+
+    #[test]
+    fn static_write_lock_is_explicitly_released_on_guard_drop() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let lock = SnapshotManager::acquire_static_write_lock(&path).unwrap();
+        let retained_descriptor = lock.file.try_clone().unwrap();
+        drop(lock);
+
+        let _mgr = SnapshotManager::open(&path).unwrap();
+        drop(retained_descriptor);
+    }
+
+    #[test]
+    fn parallel_static_save_and_persistent_reopen_cycles_release_every_lock() {
+        const WORKERS: usize = 4;
+        const CYCLES: usize = 4;
+
+        let dir = TempDir::new().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(WORKERS));
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let path = dir.path().join(format!("worker-{worker}/graph.kndb"));
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    let graph = InMemoryGraph::new();
+                    barrier.wait();
+
+                    for _ in 0..CYCLES {
+                        SnapshotManager::save_graph(&path, &graph).unwrap();
+                        let manager = SnapshotManager::open(&path).unwrap();
+                        drop(manager);
+                    }
+                });
+            }
+        });
     }
 
     #[test]
