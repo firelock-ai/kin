@@ -13,12 +13,12 @@ doctest = false
 
 [features]
 default = ["vector", "embeddings", "metal"]
-vector = ["kin-db/vector"]
-embeddings = ["kin-db/embeddings"]
+vector = ["kin-db/vector", "kin-cli/vector"]
+embeddings = ["kin-db/embeddings", "kin-cli/embeddings"]
 # `metal` is a macOS GPU-acceleration *marker* feature (see kin-cli for the full rationale).
 # It intentionally does NOT pull `kin-db/metal`; the real macOS-only activation lives in the
 # `[target.'cfg(target_os = "macos")'.dependencies]` block below so Linux never compiles it.
-metal = ["embeddings"]
+metal = ["embeddings", "kin-cli/metal"]
 gcs = ["kin-db/gcs"]
 firestore = ["kin-spine/firestore"]
 

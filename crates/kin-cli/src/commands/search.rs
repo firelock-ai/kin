@@ -4,11 +4,13 @@
 use anyhow::{Context, Result};
 use kin_db::{ResolvedRetrievalItem, RetrievalKey};
 use kin_model::EntityStore;
-use kin_model::{
-    Entity, EntityFilter, EntityKind, GraphStore, LanguageId, VerificationStore, Visibility,
-};
+use kin_model::{Entity, EntityFilter, EntityKind, LanguageId};
+#[cfg(feature = "vector")]
+use kin_model::{GraphStore, VerificationStore, Visibility};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+#[cfg(feature = "vector")]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Resolve session id from KIN_SESSION_ID env var.
@@ -51,10 +53,12 @@ async fn announce_active_scope(
     Ok(scope)
 }
 
+#[cfg(feature = "vector")]
 fn embedding_status_complete(status: &kin_db::EmbeddingStatus) -> bool {
     status.total == 0 || (status.indexed == status.total && status.pending == 0)
 }
 
+#[cfg(feature = "vector")]
 fn env_flag_truthy(name: &str) -> bool {
     std::env::var(name)
         .ok()
@@ -71,6 +75,7 @@ fn env_flag_truthy(name: &str) -> bool {
 /// users get graceful degradation. Benchmarks opt into the hard gate via
 /// `KIN_REQUIRE_COMPLETE_EMBEDDINGS=1`; an explicit
 /// `KIN_BYPASS_EMBEDDING_COVERAGE_CHECK=1` forces degradation even under strict.
+#[cfg(feature = "vector")]
 fn embedding_strict_mode() -> bool {
     env_flag_truthy("KIN_REQUIRE_COMPLETE_EMBEDDINGS")
         && !env_flag_truthy("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK")
@@ -79,6 +84,7 @@ fn embedding_strict_mode() -> bool {
 /// Evaluate embedding coverage for a semantic search. Default behavior never
 /// errors and returns a coverage report; strict (benchmark) behavior bails on
 /// incomplete coverage exactly as before.
+#[cfg(feature = "vector")]
 fn evaluate_semantic_coverage(
     graph: &kin_db::InMemoryGraph,
 ) -> Result<crate::commands::locate::SemanticCoverage> {
@@ -105,6 +111,7 @@ fn evaluate_semantic_coverage(
     };
 
     Ok(crate::commands::locate::SemanticCoverage {
+        supported: true,
         indexed: status.indexed,
         total: status.total,
         pending: status.pending,
@@ -674,6 +681,7 @@ fn collect_search_results(
     Ok(results)
 }
 
+#[cfg(feature = "vector")]
 fn build_semantic_raw_hit(
     graph: &kin_db::InMemoryGraph,
     record: &SearchRecord,
@@ -707,6 +715,7 @@ fn build_semantic_raw_hit(
     })
 }
 
+#[cfg(feature = "vector")]
 fn entity_provenance_signal(graph: &impl GraphStore, entity: &Entity) -> Result<f32> {
     let mut score: f32 = match entity.visibility {
         Visibility::Public => 1.0,
@@ -734,6 +743,7 @@ fn entity_provenance_signal(graph: &impl GraphStore, entity: &Entity) -> Result<
     Ok(score.clamp(0.0, 1.0))
 }
 
+#[cfg(feature = "vector")]
 fn looks_non_production_path(path: &str) -> bool {
     let markers = [
         "/test/",
@@ -932,6 +942,7 @@ fn record_entity(record: &SearchRecord) -> Option<&Entity> {
     }
 }
 
+#[cfg(feature = "vector")]
 fn record_display_title(record: &SearchRecord) -> String {
     match record {
         SearchRecord::Entity(entity) => entity.name.clone(),

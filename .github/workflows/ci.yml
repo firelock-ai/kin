@@ -11,6 +11,9 @@ on:
   repository_dispatch:
     types: [dependency-updated]
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
@@ -70,10 +73,23 @@ jobs:
       - name: Test @kinlab/kin-mcp (compatibility wrapper)
         run: npm run test:unit --prefix ./packages/kin-mcp && npm run lint --prefix ./packages/kin-mcp
 
+      - name: Test release ordering and npm provenance policy
+        run: |
+          python3 ./scripts/test-release-workflow-authority.py
+          python3 ./scripts/test-npm-staged-release.py
+          node --test \
+            ./scripts/release-order.test.mjs \
+            ./scripts/verify-npm-attestation.test.mjs
+          node --check ./scripts/release-order.mjs
+          node --check ./scripts/verify-npm-attestation.mjs
+          bash -n ./scripts/stage-npm-release.sh
+          bash -n ./scripts/wait-npm-approval.sh
+          bash -n ./scripts/verify-npm-release.sh
+
   windows-installer:
-    name: Windows installer checksum tests
+    name: Windows installer + vector-free release build
     runs-on: windows-latest
-    timeout-minutes: 5
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -84,6 +100,62 @@ jobs:
       - name: Test exact archive checksum selection (Windows PowerShell 5.1)
         shell: powershell
         run: ./scripts/test-install-checksum.ps1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: windows-vectorless-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Assert vector-free feature graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo tree --locked --target x86_64-pc-windows-msvc \
+            -p kin-daemon --no-default-features -e features -i kin-db \
+            | tee "$RUNNER_TEMP/kin-db-feature-tree.txt"
+          if grep -Eq 'kin-db feature "(vector|embeddings|metal|accelerate)"' \
+            "$RUNNER_TEMP/kin-db-feature-tree.txt"; then
+            echo "::error::Windows vector-free build still enables a heavy kin-db feature"
+            exit 1
+          fi
+
+      - name: Build Windows release binaries without vector features
+        shell: bash
+        run: >
+          cargo build --locked --release --target x86_64-pc-windows-msvc
+          -p kin-cli -p kin-daemon --no-default-features
+
+      - name: Verify Windows build provenance and disabled features
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin_dir="target/x86_64-pc-windows-msvc/release"
+          "$bin_dir/kin.exe" --version
+          "$bin_dir/kin-daemon.exe" --version
+          "$bin_dir/kin.exe" bench-meta --json > "$RUNNER_TEMP/kin-build-meta.json"
+          EXPECTED_SHA="$(git rev-parse HEAD)" node <<'NODE'
+          const fs = require("fs");
+          const meta = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/kin-build-meta.json`, "utf8"));
+          if (meta.kin_commit !== process.env.EXPECTED_SHA || meta.kin_dirty !== false || meta.kin_source_known !== true) {
+            throw new Error("Windows release build did not prove a clean, known checkout");
+          }
+          if (!/^[0-9a-f]{64}$/.test(meta.dependency_provenance ?? "")) {
+            throw new Error("Windows release build lacks Cargo.lock provenance");
+          }
+          for (const feature of ["vector", "embeddings", "metal"]) {
+            if (meta.feature_flags.includes(feature)) {
+              throw new Error(`Windows vector-free build unexpectedly enabled ${feature}`);
+            }
+          }
+          NODE
 
   check:
     name: Check & Test

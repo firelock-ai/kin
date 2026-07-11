@@ -221,6 +221,7 @@ async fn open_snapshot_daemon_first_with_mode(
 /// Load the persisted HNSW vector index into the graph if available.
 /// Non-fatal: if the file doesn't exist or fails to load, semantic search
 /// gracefully returns empty results.
+#[cfg(feature = "vector")]
 fn load_vector_index_if_exists(snap: &kin_db::SnapshotManager, layout: &kin_core::KinLayout) {
     let _span = tracing::info_span!(
         "kindb.load_vector_index_if_exists",
@@ -242,6 +243,9 @@ fn load_vector_index_if_exists(snap: &kin_db::SnapshotManager, layout: &kin_core
         }
     }
 }
+
+#[cfg(not(feature = "vector"))]
+fn load_vector_index_if_exists(_snap: &kin_db::SnapshotManager, _layout: &kin_core::KinLayout) {}
 
 /// Fetch the graph from the daemon's `/graph/bootstrap` endpoint.
 /// Returns `None` if the daemon is unreachable or returns an error.

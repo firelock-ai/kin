@@ -70,6 +70,10 @@ pub struct CommandStatusRequest {
     pub cli_sha: Option<String>,
     #[serde(default)]
     pub cli_dirty: bool,
+    #[serde(default)]
+    pub cli_source_known: bool,
+    #[serde(default)]
+    pub cli_dependency_provenance: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,8 +91,16 @@ pub struct CommandStatusResponse {
 pub struct BuildStatus {
     pub cli_sha: String,
     pub cli_dirty: bool,
+    #[serde(default)]
+    pub cli_source_known: bool,
+    #[serde(default)]
+    pub cli_dependency_provenance: String,
     pub daemon_sha: String,
     pub daemon_dirty: bool,
+    #[serde(default)]
+    pub daemon_source_known: bool,
+    #[serde(default)]
+    pub daemon_dependency_provenance: String,
 }
 
 impl CommandStatusRequest {
@@ -98,6 +110,8 @@ impl CommandStatusRequest {
             json,
             cli_sha: Some(build.sha.to_string()),
             cli_dirty: build.dirty,
+            cli_source_known: build.source_known,
+            cli_dependency_provenance: build.dependency_provenance.to_string(),
         }
     }
 }
@@ -241,24 +255,43 @@ impl StatusSummary {
     /// index yields `complete: false` plus a `note`; we never fabricate
     /// `complete: true`.
     pub fn semantic_coverage(&self) -> crate::commands::locate::SemanticCoverage {
-        let indexed = self.embeddings_indexed;
-        let total = self.embeddings_total;
-        let pending = self.embeddings_pending;
-        let complete = total == 0 || (indexed == total && pending == 0);
-        let note = if complete {
-            None
-        } else {
-            Some(format!(
+        #[cfg(not(feature = "vector"))]
+        {
+            return crate::commands::locate::SemanticCoverage {
+                supported: false,
+                indexed: self.embeddings_indexed,
+                total: self.embeddings_total,
+                pending: self.embeddings_pending,
+                complete: false,
+                note: Some(
+                    "semantic vector ranking is unsupported in this build; lexical and graph signals remain available"
+                        .to_string(),
+                ),
+            };
+        }
+
+        #[cfg(feature = "vector")]
+        {
+            let indexed = self.embeddings_indexed;
+            let total = self.embeddings_total;
+            let pending = self.embeddings_pending;
+            let complete = total == 0 || (indexed == total && pending == 0);
+            let note = if complete {
+                None
+            } else {
+                Some(format!(
                 "semantic signal partial: {indexed}/{total} indexed, {} unindexed, {pending} pending. Run `kin embed` for full semantic ranking.",
                 total.saturating_sub(indexed)
             ))
-        };
-        crate::commands::locate::SemanticCoverage {
-            indexed,
-            total,
-            pending,
-            complete,
-            note,
+            };
+            crate::commands::locate::SemanticCoverage {
+                supported: true,
+                indexed,
+                total,
+                pending,
+                complete,
+                note,
+            }
         }
     }
 
@@ -289,6 +322,9 @@ impl StatusSummary {
                 .collect();
             lines.push(format!("  Roles: {}", parts.join(", ")));
         }
+        #[cfg(not(feature = "vector"))]
+        lines.push("Enrichment: semantic vector ranking unsupported in this build".to_string());
+        #[cfg(feature = "vector")]
         if self.embeddings_total > 0 {
             lines.push(format!(
                 "Enrichment: {}/{} embeddings indexed, {} pending",
@@ -460,6 +496,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "vector")]
     #[test]
     fn semantic_coverage_reports_complete_when_fully_indexed() {
         let coverage = summary_with_embeddings(10, 10, 0).semantic_coverage();
@@ -471,6 +508,7 @@ mod tests {
         assert!(coverage.note.is_none());
     }
 
+    #[cfg(feature = "vector")]
     #[test]
     fn semantic_coverage_reports_complete_when_nothing_to_embed() {
         // total == 0 mirrors locate::embedding_status_complete: nothing eligible.
@@ -479,6 +517,7 @@ mod tests {
         assert!(coverage.note.is_none());
     }
 
+    #[cfg(feature = "vector")]
     #[test]
     fn semantic_coverage_is_honest_about_partial_index() {
         // R5: a half-embedded graph must NOT fabricate complete:true.
@@ -494,6 +533,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "vector")]
     #[test]
     fn semantic_coverage_is_honest_when_indexed_but_still_pending() {
         // indexed == total but pending > 0 is still incomplete.
@@ -502,13 +542,30 @@ mod tests {
         assert!(coverage.note.is_some());
     }
 
+    #[cfg(not(feature = "vector"))]
+    #[test]
+    fn semantic_coverage_reports_feature_disabled_without_embed_remediation() {
+        let coverage = summary_with_embeddings(0, 10, 10).semantic_coverage();
+        assert!(!coverage.supported);
+        assert!(!coverage.complete);
+        let note = coverage
+            .note
+            .expect("unsupported coverage needs an explanation");
+        assert!(note.contains("unsupported"));
+        assert!(!note.contains("kin embed"));
+    }
+
     #[test]
     fn command_status_response_includes_cli_and_daemon_builds() {
         let build = super::BuildStatus {
             cli_sha: "bd7cd12".to_string(),
             cli_dirty: false,
+            cli_source_known: true,
+            cli_dependency_provenance: "a".repeat(64),
             daemon_sha: "a09f882".to_string(),
             daemon_dirty: true,
+            daemon_source_known: true,
+            daemon_dependency_provenance: "a".repeat(64),
         };
         let response = super::build_command_status_response(
             summary_with_embeddings(1, 1, 0),
@@ -524,6 +581,12 @@ mod tests {
         assert_eq!(json["build"]["cli_sha"], "bd7cd12");
         assert_eq!(json["build"]["daemon_sha"], "a09f882");
         assert_eq!(json["build"]["daemon_dirty"], true);
+        assert_eq!(json["build"]["cli_source_known"], true);
+        assert_eq!(json["build"]["cli_dependency_provenance"], "a".repeat(64));
+        assert_eq!(
+            json["build"]["daemon_dependency_provenance"],
+            "a".repeat(64)
+        );
     }
 
     #[tokio::test]

@@ -8,10 +8,30 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
+const SHA_OVERRIDE_ENV: &str = "KIN_BUILD_GIT_SHA_OVERRIDE";
+const DIRTY_OVERRIDE_ENV: &str = "KIN_BUILD_DIRTY_OVERRIDE";
+const BRANCH_OVERRIDE_ENV: &str = "KIN_BUILD_BRANCH_OVERRIDE";
+
+#[derive(Debug)]
+struct ExplicitBuildIdentity {
+    sha: String,
+    dirty: bool,
+    branch: String,
+}
+
 fn main() {
+    for name in [SHA_OVERRIDE_ENV, DIRTY_OVERRIDE_ENV, BRANCH_OVERRIDE_ENV] {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
+
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let root = git(&manifest_dir, &["rev-parse", "--show-toplevel"])
         .map(PathBuf::from)
+        // Docker and source archives intentionally omit `.git`; retain the
+        // workspace Cargo.lock authority by walking to the nearest ancestor
+        // that carries both workspace files instead of falling back to this
+        // crate directory (which would make dependency provenance unknown).
+        .or_else(|| find_workspace_root(&manifest_dir))
         .unwrap_or_else(|| manifest_dir.clone());
 
     if let Some(head) = git(&root, &["rev-parse", "--git-path", "HEAD"]) {
@@ -48,23 +68,36 @@ fn main() {
         }
     }
 
-    let sha = git(&root, &["rev-parse", "HEAD"]);
-    let branch = git(&root, &["branch", "--show-current"])
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "detached".into());
-    // A clean status is valid empty output, so use the variant that preserves
-    // empty stdout. Any execution/status/UTF-8 failure is an unknown source
-    // identity and must fail closed for persisted semantic caches.
-    let status = git_allow_empty(&root, &["status", "--porcelain"]);
+    // Container build contexts intentionally exclude `.git`, so release image
+    // builders must provide the source identity explicitly. Treat the three
+    // values as one atomic input: a partial or malformed identity fails the
+    // build instead of silently producing a clean-looking `unknown` binary.
+    let explicit_identity = explicit_build_identity();
+    let (sha, dirty, branch, source_identity_known) = if let Some(identity) = explicit_identity {
+        (identity.sha, identity.dirty, identity.branch, true)
+    } else {
+        let sha = git(&root, &["rev-parse", "HEAD"]);
+        let branch = git(&root, &["branch", "--show-current"])
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "detached".into());
+        // A clean status is valid empty output, so use the variant that
+        // preserves empty stdout. Any execution/status/UTF-8 failure is an
+        // unknown source identity and must fail closed for persisted caches.
+        let status = git_allow_empty(&root, &["status", "--porcelain"]);
+        let source_identity_known = sha.is_some() && status.is_some();
+        let dirty = status
+            .as_ref()
+            .map(|value| !value.is_empty())
+            .unwrap_or(true);
+        (
+            sha.unwrap_or_else(|| "unknown".into()),
+            dirty,
+            branch,
+            source_identity_known,
+        )
+    };
     let dependency_provenance = dependency_provenance(&root);
-    let source_known = sha.is_some() && status.is_some() && dependency_provenance.is_some();
-    let sha = sha.unwrap_or_else(|| "unknown".into());
-    // Keep the legacy boolean conservative for every existing build-mismatch
-    // consumer. `KIN_BUILD_SOURCE_KNOWN` carries the non-lossy tri-state.
-    let dirty = status
-        .as_ref()
-        .map(|value| !value.is_empty())
-        .unwrap_or(true);
+    let source_known = source_identity_known && dependency_provenance.is_some();
     let dependency_provenance = dependency_provenance.unwrap_or_else(|| "unknown".to_string());
     let built_at = Command::new("date")
         .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
@@ -89,6 +122,52 @@ fn main() {
     println!("cargo:rustc-env=KIN_BUILD_BRANCH={branch}");
     println!("cargo:rustc-env=KIN_BUILD_TIME={built_at}");
     println!("cargo:rustc-env=KIN_BUILD_VERSION={version}");
+}
+
+fn explicit_build_identity() -> Option<ExplicitBuildIdentity> {
+    let sha = std::env::var(SHA_OVERRIDE_ENV).ok();
+    let dirty = std::env::var(DIRTY_OVERRIDE_ENV).ok();
+    let branch = std::env::var(BRANCH_OVERRIDE_ENV).ok();
+
+    if sha.is_none() && dirty.is_none() && branch.is_none() {
+        return None;
+    }
+
+    let sha = sha.unwrap_or_else(|| panic!("{SHA_OVERRIDE_ENV} is required with build overrides"));
+    let dirty =
+        dirty.unwrap_or_else(|| panic!("{DIRTY_OVERRIDE_ENV} is required with build overrides"));
+    let branch =
+        branch.unwrap_or_else(|| panic!("{BRANCH_OVERRIDE_ENV} is required with build overrides"));
+
+    assert!(
+        sha.len() == 40
+            && sha
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{SHA_OVERRIDE_ENV} must be a full lowercase 40-hex commit id"
+    );
+    let dirty = match dirty.as_str() {
+        "true" => true,
+        "false" => false,
+        _ => panic!("{DIRTY_OVERRIDE_ENV} must be exactly true or false"),
+    };
+    assert!(
+        !branch.is_empty()
+            && branch.len() <= 255
+            && !branch.chars().any(|character| character.is_control()),
+        "{BRANCH_OVERRIDE_ENV} must be a non-empty branch/ref label without control characters"
+    );
+
+    Some(ExplicitBuildIdentity { sha, dirty, branch })
+}
+
+fn find_workspace_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|candidate| {
+            candidate.join("Cargo.toml").is_file() && candidate.join("Cargo.lock").is_file()
+        })
+        .map(Path::to_path_buf)
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Option<String> {

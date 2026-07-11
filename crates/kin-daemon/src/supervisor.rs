@@ -7,7 +7,9 @@
 //! discovery and routing for repo-scoped graph daemons, while each repo daemon
 //! remains the single writer for its repo graph.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -978,33 +980,42 @@ pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::i
 // SIGKILL if it does not exit within the grace window.
 
 /// How often the reaper sweeps the machine.
+#[cfg(unix)]
 const REAPER_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 /// Timeout for a single repo-daemon `/health` probe.
+#[cfg(unix)]
 const REAPER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Grace period between SIGTERM and SIGKILL when reaping.
+#[cfg(unix)]
 const REAPER_SIGTERM_GRACE: Duration = Duration::from_secs(5);
 /// CPU usage percent (may exceed 100 on multicore) above which a daemon counts
 /// as "pinned" for a sweep.
+#[cfg(any(unix, test))]
 const REAPER_DEFAULT_CPU_PINNED_PERCENT: f32 = 80.0;
 /// Default consecutive pinned sweeps before the CPU heuristic fires.
+#[cfg(any(unix, test))]
 const REAPER_DEFAULT_CPU_PINNED_SWEEPS: u32 = 2;
 /// Consecutive sweeps a daemon must show zero persisted progress — no growth in
 /// its repo `daemon.log` — before an unreachable or CPU-pinned daemon becomes
 /// reap-eligible. 4 sweeps × 15s = a minute of zero persisted progress while
 /// unreachable, long enough that a merely-busy daemon that missed a probe
 /// deadline is never mistaken for a wedged one.
+#[cfg(any(unix, test))]
 const REAPER_STALL_SWEEPS: u32 = 4;
 /// Default slack (in seconds) a daemon's start_time may lag the deployed binary
 /// mtime before it counts as stale — absorbs clock/filesystem timestamp jitter.
+#[cfg(any(unix, test))]
 const REDEPLOY_DEFAULT_GRACE_SECS: u64 = 2;
 /// Sentinel env var carried across the self-re-exec boundary, recording the
 /// binary mtime the supervisor already re-execed into. Breaks the re-exec loop:
 /// execve preserves the process start_time, so a supervisor that predates its
 /// rebuilt binary stays stale after re-exec; without this sentinel it would
 /// re-exec on every sweep forever.
+#[cfg(unix)]
 const SUPERVISOR_REEXECED_FOR_MTIME_ENV: &str = "KIN_SUPERVISOR_REEXECED_FOR_MTIME";
 
 /// Health classification of a discovered repo daemon.
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, PartialEq)]
 enum DaemonHealth {
     /// `/health` responded 2xx; carries observed activity.
@@ -1021,6 +1032,7 @@ enum DaemonHealth {
     Unknown,
 }
 
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DaemonActivity {
     /// In-flight requests, event subscribers, or external (non-daemon) sessions.
@@ -1029,6 +1041,7 @@ struct DaemonActivity {
     reconciling: bool,
 }
 
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReapReason {
     /// Orphaned (reparented to init) and the daemon ANSWERED its health probe
@@ -1047,6 +1060,7 @@ enum ReapReason {
 }
 
 /// Why a healthy-but-invisible daemon is being adopted into the registry.
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdoptReason {
     /// No registry entry existed for this repo root.
@@ -1057,6 +1071,7 @@ enum AdoptReason {
 }
 
 /// Why a healthy idle daemon is being rolled over to pick up a fresh build.
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RedeployReason {
     /// The on-disk binary was rebuilt after this process started (its start_time
@@ -1066,6 +1081,7 @@ enum RedeployReason {
 
 /// How a discovered daemon relates to the supervisor's registry entry (if any)
 /// for the same repo root. Computed per sweep from a registry snapshot.
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegistryRelation {
     /// No registry entry exists for this repo root.
@@ -1080,6 +1096,7 @@ enum RegistryRelation {
     LiveTwin,
 }
 
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, PartialEq)]
 enum DaemonDecision {
     Keep,
@@ -1090,6 +1107,7 @@ enum DaemonDecision {
 
 /// Which heuristics beyond the always-on safe criterion are enabled, and how the
 /// CPU heuristic is tuned. Controlled by `KIN_SUPERVISOR_REAP_*`.
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, Copy)]
 struct ReapPolicy {
     cpu_heuristic_enabled: bool,
@@ -1109,6 +1127,7 @@ struct ReapPolicy {
     redeploy_grace_secs: u64,
 }
 
+#[cfg(any(unix, test))]
 impl Default for ReapPolicy {
     fn default() -> Self {
         Self {
@@ -1124,6 +1143,7 @@ impl Default for ReapPolicy {
     }
 }
 
+#[cfg(unix)]
 impl ReapPolicy {
     fn from_env() -> Self {
         let mut policy = Self::default();
@@ -1167,6 +1187,7 @@ impl ReapPolicy {
 }
 
 /// True when `key` is set to an explicitly falsey value (`0/false/no/off`).
+#[cfg(unix)]
 fn env_flag_falsey(key: &str) -> bool {
     matches!(
         std::env::var(key).ok().as_deref().map(str::trim),
@@ -1175,6 +1196,7 @@ fn env_flag_falsey(key: &str) -> bool {
 }
 
 /// True when `key` is set to an explicitly truthy value (`1/true/yes/on`).
+#[cfg(unix)]
 fn env_flag_truthy(key: &str) -> bool {
     matches!(
         std::env::var(key).ok().as_deref().map(str::trim),
@@ -1187,6 +1209,7 @@ fn env_flag_truthy(key: &str) -> bool {
 /// started and the slack window has elapsed. The boundary is exclusive: a
 /// daemon whose mtime equals `start_time + grace_secs` is NOT stale. Returns
 /// false when the deployed mtime is unknown (cannot prove staleness).
+#[cfg(any(unix, test))]
 fn is_daemon_stale(start_time: u64, deployed_mtime: Option<u64>, grace_secs: u64) -> bool {
     deployed_mtime.is_some_and(|m| m > start_time.saturating_add(grace_secs))
 }
@@ -1199,6 +1222,7 @@ fn is_daemon_stale(start_time: u64, deployed_mtime: Option<u64>, grace_secs: u64
 /// the mtime we last re-execed into, so a match means the fresh build is already
 /// running and we must stop — otherwise the supervisor re-execs every sweep. A
 /// later rebuild bumps the mtime past the sentinel, re-arming a single re-exec.
+#[cfg(any(unix, test))]
 fn should_reexec_self(
     start_time: u64,
     self_exe_mtime: u64,
@@ -1210,6 +1234,7 @@ fn should_reexec_self(
 }
 
 /// Observed facts about one discovered repo daemon, fed to the classifier.
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone)]
 struct DaemonObservation {
     pid: u32,
@@ -1257,6 +1282,7 @@ struct DaemonObservation {
 ///   point adopting one we are about to roll over).
 /// - Adoption only ever targets a HEALTHY daemon with a non-empty repo root, and
 ///   never clobbers a live twin that owns the route (split-brain safety).
+#[cfg(any(unix, test))]
 fn classify_daemon(obs: &DaemonObservation, policy: &ReapPolicy) -> DaemonDecision {
     // Absolute guard (#4): a daemon serving clients or actively reconciling is
     // never a reap candidate, regardless of registration or orphan status. It can

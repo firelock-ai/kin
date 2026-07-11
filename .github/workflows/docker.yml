@@ -9,16 +9,19 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   build-image:
     name: Docker Image Build (no push)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       # Build-only gate: this job NEVER pushes an image. It proves the
       # multi-stage Dockerfile still builds end to end — kin-* dependencies
@@ -27,7 +30,7 @@ jobs:
       # is persisted across runs via the GitHub Actions cache backend so the
       # heavy release compile stays affordable on repeat runs.
       - name: Build image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: ./Dockerfile
@@ -36,8 +39,17 @@ jobs:
           # below can `docker run` it. Single-platform, so `load` is supported.
           load: true
           tags: kin:ci
+          build-args: |
+            KIN_BUILD_GIT_SHA=${{ github.sha }}
+            KIN_BUILD_DIRTY=false
+            KIN_BUILD_BRANCH=${{ github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Verify container build provenance
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: bash scripts/verify-container-build-info.sh kin:ci "$EXPECTED_SHA"
 
       # Container-level smoke on the freshly built image. Proves the entrypoint
       # boots the daemon in local mode with NO /workspace volume — the case that
@@ -97,10 +109,9 @@ jobs:
           gcs_prep=0
           for _ in $(seq 1 30); do
             if docker logs kin-gcs 2>&1 | grep -q "Starting kin-daemon (storage=gcs"; then gcs_prep=1; break; fi
-            if [ "$(docker inspect -f '{{.State.Running}}' kin-gcs 2>/dev/null)" != "true" ]; then
-              docker logs kin-gcs 2>&1 | grep -q "Starting kin-daemon (storage=gcs" && gcs_prep=1
-              break
-            fi
+            # The expected missing-bucket exit is fast enough to beat Docker's
+            # log-driver flush. Keep polling the bounded log authority even
+            # after the container stops instead of taking one racy final read.
             sleep 1
           done
           if [ "$gcs_prep" -ne 1 ]; then echo "::error::gcs mode did not reach daemon exec after workspace prep"; dump kin-gcs; docker rm -f kin-gcs >/dev/null 2>&1 || true; exit 1; fi

@@ -1,8 +1,9 @@
 # Windows: use WSL2
 
-Kin's first-class platforms are **Linux and macOS**. On Windows, the supported
-path is **WSL2 (Windows Subsystem for Linux 2)** running a Linux distribution.
-Install and run Kin inside WSL2 exactly as you would on native Linux.
+Kin's complete vector-enabled/projection platforms are **Linux and macOS**.
+Native Windows is a supported vector-free subset for graph, lexical, daemon,
+setup, and MCP workflows. For the complete experience, use **WSL2 (Windows
+Subsystem for Linux 2)** running a Linux distribution.
 
 ## Why WSL2 and not native Windows
 
@@ -14,8 +15,8 @@ Two parts of Kin are built around Unix runtime mechanics:
   graph-backed files as normal files" experience is Linux/macOS only.
 - **Semantic vector search** ships enabled on Linux/macOS. The native Windows
   CLI artifact (`kin-windows-x86_64.zip`) is built **vector-free**
-  (`--no-default-features`) and is intended as a limited convenience binary, not
-  the full product surface.
+  (`--no-default-features`). It is supported for the non-vector product surface,
+  but it is not the full product surface.
 
 Running under WSL2 gives you the complete, vector-enabled Kin with working
 filesystem projection and the same behavior the project tests and benchmarks
@@ -59,7 +60,7 @@ against.
    than under `/mnt/c`; cross-OS filesystem access through `/mnt/*` is
    noticeably slower and does not support the projection layer cleanly.
 
-## Native Windows binary (limited)
+## Native Windows binary (supported subset)
 
 If you only need the core CLI and cannot use WSL2, install with PowerShell:
 
@@ -70,10 +71,11 @@ irm https://get.kinlab.dev/install.ps1 | iex
 The installer prints the limitation up front, verifies the download's SHA-256
 checksum, and still requires `kin-daemon` (it aborts on a daemon-less archive).
 The native `kin-windows-x86_64.zip` it installs is **vector-free** (semantic
-search disabled) and does **not** provide the transparent filesystem projection:
+vector similarity disabled) and does **not** provide the transparent filesystem projection:
 projection relies on Unix library injection (`LD_PRELOAD` /
 `DYLD_INSERT_LIBRARIES`), which native Windows does not offer. Windows projection
 is planned via ProjFS — an optional feature started by an explicit daemon init,
 not injected by the shell hook — so on native Windows the `vfs_projection` health
-check reports **n/a** rather than ok. Treat the native binary as experimental;
-WSL2 remains the recommended path.
+check reports **unsupported** rather than healthy. The graph, lexical, daemon,
+setup, and MCP surfaces are release-tested; WSL2 remains the recommended path
+when vector similarity or transparent projection is required.
