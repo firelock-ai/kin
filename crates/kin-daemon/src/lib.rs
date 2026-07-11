@@ -15,7 +15,8 @@
 //! how complete a retrieval answer is:
 //!
 //! - **`graph_generation`** on `GET /health`: the monotonic snapshot generation
-//!   marker (`.kin/kindb/generation`), bumped on each committed snapshot. This
+//!   marker (`.kin/kindb/head-generation`), bumped on each committed authority
+//!   generation. This
 //!   is the *universal* freshness token — it applies to every retrieval payload
 //!   because the MCP envelope wraps each tool result and can lift it into
 //!   `graph_as_of`. (The kin-mcp `Envelope::with_health` lift that reads this

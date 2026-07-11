@@ -268,6 +268,40 @@ pub(crate) struct VfsTreeSnapshot {
     pub timestamps: Arc<HashMap<FilePathId, u64>>,
 }
 
+/// One detached graph mutation batch that has not yet been acknowledged by
+/// durable backend authority. Dropping the guard before `complete` forces the
+/// next save through a full snapshot, so an error cannot silently discard the
+/// batch while mutations arriving during backend I/O remain independently
+/// pending.
+struct GraphPersistenceAttempt<'a> {
+    graph: &'a kin_db::InMemoryGraph,
+    epoch: Option<kin_db::PersistenceEpoch>,
+}
+
+impl<'a> GraphPersistenceAttempt<'a> {
+    fn new(graph: &'a kin_db::InMemoryGraph, epoch: kin_db::PersistenceEpoch) -> Self {
+        Self {
+            graph,
+            epoch: Some(epoch),
+        }
+    }
+
+    fn complete(mut self) {
+        if let Some(epoch) = self.epoch.take() {
+            let completed = self.graph.complete_persistence(epoch);
+            debug_assert!(completed, "persistence epoch must still be in flight");
+        }
+    }
+}
+
+impl Drop for GraphPersistenceAttempt<'_> {
+    fn drop(&mut self) {
+        if let Some(epoch) = self.epoch.take() {
+            self.graph.fail_persistence(epoch);
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct VfsTreeBuildTestHook {
@@ -300,6 +334,12 @@ pub struct DaemonState {
     pub storage_backend: Option<Box<dyn StorageBackend>>,
     /// Generation from the last snapshot load (for CAS on save).
     pub snapshot_generation: AtomicU64,
+    /// A graph authority commit advanced, but its local generation marker and
+    /// read index have not both been durably finalized yet. A save with no new
+    /// graph mutations still retries this work.
+    post_commit_finalization_pending: AtomicBool,
+    #[cfg(test)]
+    finalization_fail_once: AtomicBool,
     /// Monotonically increasing version counter for VFS cache invalidation.
     /// Incremented on every graph mutation (reconcile, commit, overlay update).
     /// Unlike entity_count, this never decreases on deletions.
@@ -343,6 +383,10 @@ pub struct DaemonState {
     /// True when the in-memory graph has been mutated since the last save.
     /// The background persistence task checks this to decide when to flush.
     pub dirty: AtomicBool,
+    /// Monotonic acknowledgement fence for `dirty`. A mutation increments this
+    /// before a later `mark_clean` can clear the flag, so a save finishing at
+    /// the same time as a new mutation cannot erase that mutation's wakeup.
+    mutation_epoch: AtomicU64,
     /// Serializes explicit `/embed` requests with the background embedding
     /// worker so they cannot drain queues and mutate the vector index
     /// concurrently.
@@ -540,7 +584,9 @@ impl DaemonState {
     /// Look for the `.kin/kindb/graph.kndb` snapshot file in the workspace.
     fn find_kndb_path(layout: &KinLayout) -> Option<std::path::PathBuf> {
         let kndb_path = layout.kindb_snapshot_path();
-        if kndb_path.exists() {
+        if kndb_path.exists()
+            || kin_db::SnapshotManager::local_authority_exists(kndb_path.as_path())
+        {
             Some(kndb_path)
         } else {
             None
@@ -577,38 +623,40 @@ impl DaemonState {
 
         let text_index_path = layout.text_index_dir();
         let locate_only = Self::locate_only_snapshot_mode();
-        let (graph, loaded_snapshot) = if let Some(kndb_path) = Self::find_kndb_path(&layout) {
-            let snapshot_mgr = if locate_only {
-                kin_db::SnapshotManager::open_read_only_for_locate(&kndb_path)
+        let (graph, generation, loaded_snapshot) =
+            if let Some(kndb_path) = Self::find_kndb_path(&layout) {
+                let snapshot_mgr = if locate_only {
+                    kin_db::SnapshotManager::open_read_only_for_locate(&kndb_path)
+                } else {
+                    kin_db::SnapshotManager::open(&kndb_path)
+                };
+                match snapshot_mgr {
+                    Ok(snapshot_mgr) => {
+                        let g = snapshot_mgr.graph();
+                        info!(
+                            locate_only = locate_only,
+                            "Loaded graph from {}",
+                            kndb_path.display()
+                        );
+                        (g, snapshot_mgr.generation(), true)
+                    }
+                    Err(e) => {
+                        return Err(DaemonError::Io(std::io::Error::other(format!(
+                            "failed to load persisted graph snapshot from {}: {}",
+                            kndb_path.display(),
+                            e
+                        ))));
+                    }
+                }
             } else {
-                kin_db::SnapshotManager::open(&kndb_path)
+                (
+                    Arc::new(kin_db::InMemoryGraph::with_text_index(
+                        text_index_path.clone(),
+                    )),
+                    kin_db::GENERATION_INIT,
+                    false,
+                )
             };
-            match snapshot_mgr {
-                Ok(snapshot_mgr) => {
-                    let g = snapshot_mgr.graph();
-                    info!(
-                        locate_only = locate_only,
-                        "Loaded graph from {}",
-                        kndb_path.display()
-                    );
-                    (g, true)
-                }
-                Err(e) => {
-                    return Err(DaemonError::Io(std::io::Error::other(format!(
-                        "failed to load persisted graph snapshot from {}: {}",
-                        kndb_path.display(),
-                        e
-                    ))));
-                }
-            }
-        } else {
-            (
-                Arc::new(kin_db::InMemoryGraph::with_text_index(
-                    text_index_path.clone(),
-                )),
-                false,
-            )
-        };
 
         let blobs = BlobStore::new(layout.objects_dir()).map_err(DaemonError::from)?;
         // No post-open vector-index load here: `SnapshotManager::open` /
@@ -637,23 +685,6 @@ impl DaemonState {
 
         let coordinator = SessionCoordinator::new(Arc::clone(&graph));
 
-        // Register a daemon-system session so the reconcile loop's traffic
-        // checks correctly exclude daemon-owned intents from blocking itself.
-        let daemon_session_id = coordinator
-            .register_session(
-                "kin-daemon",
-                "reconcile-loop",
-                kin_model::session::SessionTransport::Cli,
-                None,
-                layout.working_dir().to_path_buf(),
-                kin_model::session::SessionCapabilities::default(),
-            )
-            .unwrap_or_else(|e| {
-                tracing::warn!("failed to register daemon session: {e}");
-                kin_model::SessionId::new()
-            });
-        reconciler.set_session_id(daemon_session_id);
-
         // Resume from the last persisted VFS version so kin-vfs clients
         // don't see a reset after daemon restart.
         let persisted_vfs_version = Self::load_persisted_vfs_version(&layout);
@@ -679,7 +710,10 @@ impl DaemonState {
             is_initialized: AtomicBool::new(loaded_snapshot),
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: None,
-            snapshot_generation: AtomicU64::new(0),
+            snapshot_generation: AtomicU64::new(generation),
+            post_commit_finalization_pending: AtomicBool::new(false),
+            #[cfg(test)]
+            finalization_fail_once: AtomicBool::new(false),
             vfs_version: AtomicU64::new(persisted_vfs_version),
             vfs_tree_cache: std::sync::RwLock::new(None),
             vfs_tree_build_lock: tokio::sync::Mutex::new(()),
@@ -694,6 +728,7 @@ impl DaemonState {
             repo_graphs: RwLock::new(HashMap::new()),
             allowed_repo_ids: None,
             dirty: AtomicBool::new(false),
+            mutation_epoch: AtomicU64::new(0),
             embedding_work: Mutex::new(()),
             persist_lock: Mutex::new(()),
             last_save: std::sync::Mutex::new(Instant::now()),
@@ -726,6 +761,24 @@ impl DaemonState {
             .repo_graphs
             .get_mut()
             .insert(state.cached_repo_id.clone(), Arc::clone(&state.graph));
+
+        // The loaded graph is the validated durable generation and the state
+        // is not externally visible yet. Heal derived artifacts directly from
+        // it; reopening would duplicate the full graph at peak startup memory.
+        // Locate-only graphs deliberately omit non-locate relations, so they
+        // may advance the freshness marker but must never replace the canonical
+        // general-purpose read index with a partial one.
+        if loaded_snapshot {
+            if locate_only {
+                state.finalize_loaded_locate_generation(generation)?;
+            } else {
+                state
+                    .post_commit_finalization_pending
+                    .store(true, Ordering::SeqCst);
+                state.finalize_loaded_generation(generation)?;
+            }
+        }
+        state.register_daemon_system_session();
         Ok(state)
     }
 
@@ -742,20 +795,21 @@ impl DaemonState {
     ) -> Result<Self> {
         let text_index_path = layout.text_index_dir();
         let (graph, generation, loaded_snapshot) =
-            match backend.load_snapshot(repo_id).map_err(DaemonError::from)? {
-                Some((bytes, gen)) => {
-                    let snapshot =
-                        kin_db::GraphSnapshot::from_bytes(&bytes).map_err(DaemonError::from)?;
+            match kin_db::load_recovered_snapshot(backend.as_ref(), repo_id)
+                .map_err(DaemonError::from)?
+            {
+                Some(recovered) => {
                     let g = kin_db::InMemoryGraph::from_snapshot_with_text_index(
-                        snapshot,
+                        recovered.snapshot,
                         text_index_path.clone(),
                     );
                     info!(
                         repo_id,
-                        generation = gen,
+                        generation = recovered.generation,
+                        deltas_replayed = recovered.deltas_applied,
                         "loaded graph from storage backend"
                     );
-                    (Arc::new(g), gen, true)
+                    (Arc::new(g), recovered.generation, true)
                 }
                 None => {
                     info!(repo_id, "no snapshot found, starting with empty graph");
@@ -790,21 +844,6 @@ impl DaemonState {
 
         let coordinator = SessionCoordinator::new(Arc::clone(&graph));
 
-        let daemon_session_id = coordinator
-            .register_session(
-                "kin-daemon",
-                "reconcile-loop",
-                kin_model::session::SessionTransport::Cli,
-                None,
-                layout.working_dir().to_path_buf(),
-                kin_model::session::SessionCapabilities::default(),
-            )
-            .unwrap_or_else(|e| {
-                tracing::warn!("failed to register daemon session: {e}");
-                kin_model::SessionId::new()
-            });
-        reconciler.set_session_id(daemon_session_id);
-
         let persisted_vfs_version = Self::load_persisted_vfs_version(&layout);
 
         // Baseline for the shutdown anti-wipe guard (entity count loaded from
@@ -824,6 +863,9 @@ impl DaemonState {
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: Some(backend),
             snapshot_generation: AtomicU64::new(generation),
+            post_commit_finalization_pending: AtomicBool::new(false),
+            #[cfg(test)]
+            finalization_fail_once: AtomicBool::new(false),
             vfs_version: AtomicU64::new(persisted_vfs_version),
             vfs_tree_cache: std::sync::RwLock::new(None),
             vfs_tree_build_lock: tokio::sync::Mutex::new(()),
@@ -838,6 +880,7 @@ impl DaemonState {
             repo_graphs: RwLock::new(HashMap::new()), // populated below
             allowed_repo_ids,
             dirty: AtomicBool::new(false),
+            mutation_epoch: AtomicU64::new(0),
             embedding_work: Mutex::new(()),
             persist_lock: Mutex::new(()),
             last_save: std::sync::Mutex::new(Instant::now()),
@@ -871,7 +914,36 @@ impl DaemonState {
         let graphs = state.repo_graphs.get_mut();
         graphs.insert(repo_id.to_string(), graph);
 
+        // The recovered graph is already the exact validated authority view
+        // and the state is not externally visible yet. Reuse it for startup
+        // artifacts instead of downloading and decoding the backend twice.
+        state
+            .post_commit_finalization_pending
+            .store(true, Ordering::SeqCst);
+        state.finalize_loaded_generation(generation)?;
+        state.register_daemon_system_session();
+
         Ok(state)
+    }
+
+    /// Register the daemon-owned reconcile session only after startup-derived
+    /// artifacts have been built from the exact loaded authority graph.
+    fn register_daemon_system_session(&mut self) {
+        let daemon_session_id = self
+            .coordinator
+            .register_session(
+                "kin-daemon",
+                "reconcile-loop",
+                kin_model::session::SessionTransport::Cli,
+                None,
+                self.layout.working_dir().to_path_buf(),
+                kin_model::session::SessionCapabilities::default(),
+            )
+            .unwrap_or_else(|error| {
+                tracing::warn!("failed to register daemon session: {error}");
+                kin_model::SessionId::new()
+            });
+        self.reconciler.get_mut().set_session_id(daemon_session_id);
     }
 
     /// Returns a reference to the spine backend, if already initialized.
@@ -1218,18 +1290,19 @@ impl DaemonState {
                 "no storage backend configured for multi-repo mode".to_string(),
             )));
         };
-        match backend.load_snapshot(repo_id).map_err(DaemonError::from)? {
-            Some((bytes, gen)) => {
-                let snapshot =
-                    kin_db::GraphSnapshot::from_bytes(&bytes).map_err(DaemonError::from)?;
+        match kin_db::load_recovered_snapshot(backend.as_ref(), repo_id)
+            .map_err(DaemonError::from)?
+        {
+            Some(recovered) => {
                 let text_index_path = self.layout.text_index_dir();
                 let graph = Arc::new(kin_db::InMemoryGraph::from_snapshot_with_text_index(
-                    snapshot,
+                    recovered.snapshot,
                     text_index_path,
                 ));
                 info!(
                     repo_id,
-                    generation = gen,
+                    generation = recovered.generation,
+                    deltas_replayed = recovered.deltas_applied,
                     "loaded repo graph from storage backend"
                 );
                 Ok(graph)
@@ -1530,7 +1603,7 @@ impl DaemonState {
     /// committed since our last load (generation mismatch).
     ///
     /// After a successful save, writes the new generation number to
-    /// `.kin/kindb/generation` so CLI and MCP processes can detect
+    /// `.kin/kindb/head-generation` so CLI and MCP processes can detect
     /// when their loaded snapshot is stale (P2-2.7).
     pub fn save_snapshot(&self) -> Result<()> {
         self.save_snapshot_impl(false)
@@ -1553,65 +1626,111 @@ impl DaemonState {
 
         let repo_id = self.cached_repo_id.as_str();
         let expected_gen = self.snapshot_generation.load(Ordering::SeqCst);
+        let mut committed = false;
 
         let new_gen = if let Some(backend) = &self.storage_backend {
-            if force_full || self.graph.full_snapshot_required() {
-                let (bytes, _) = self
+            if force_full
+                || expected_gen == kin_db::GENERATION_INIT
+                || self.graph.full_snapshot_required()
+                || !backend.supports_incremental_deltas()
+            {
+                let (bytes, graph_root_hash, persistence_epoch) = self
                     .graph
-                    .serialize_snapshot_borrowed()
+                    .begin_snapshot_persistence(None)
                     .map_err(DaemonError::from)?;
+                let persistence_attempt =
+                    GraphPersistenceAttempt::new(self.graph.as_ref(), persistence_epoch);
+                // Keep every fallible derived-index operation before the
+                // authority commit. If it fails, the RAII attempt forces a full
+                // retry and the backend generation remains unchanged.
+                kin_db::SnapshotManager::persist_snapshot_sidecars_for_epoch(
+                    self.layout.kindb_snapshot_path().as_path(),
+                    self.graph.as_ref(),
+                    graph_root_hash,
+                    persistence_epoch,
+                )
+                .map_err(DaemonError::from)?;
                 let generation = backend
                     .save_snapshot(repo_id, &bytes, expected_gen)
                     .map_err(DaemonError::from)?;
-                backend.clear_deltas(repo_id).map_err(DaemonError::from)?;
-                self.graph.clear_pending_delta();
-                self.graph.clear_full_snapshot_required();
+                // From this point on the authority commit is irreversible.
+                // Advance the CAS cursor and acknowledge only this detached
+                // batch before attempting cleanup or local finalization.
+                self.snapshot_generation.store(generation, Ordering::SeqCst);
+                persistence_attempt.complete();
+                self.post_commit_finalization_pending
+                    .store(true, Ordering::SeqCst);
+                committed = true;
+                if let Err(error) = backend.clear_deltas(repo_id) {
+                    warn!(
+                        repo_id,
+                        generation,
+                        error = %error,
+                        "snapshot committed; deferred stale delta cleanup"
+                    );
+                }
                 generation
-            } else if let Some(delta) = self.graph.pending_delta_snapshot(expected_gen) {
+            } else if let Some((delta, persistence_epoch)) =
+                self.graph.begin_delta_persistence(expected_gen)
+            {
+                let persistence_attempt =
+                    GraphPersistenceAttempt::new(self.graph.as_ref(), persistence_epoch);
                 let bytes = delta.to_bytes().map_err(DaemonError::from)?;
+                // A text-index failure must precede the durable delta commit.
+                // The index is derived and root-stamped; the authority write is
+                // the point after which this method must not lose its cursor.
+                kin_db::SnapshotManager::invalidate_derived_sidecars(
+                    self.layout.kindb_snapshot_path(),
+                    self.graph.as_ref(),
+                )
+                .map_err(DaemonError::from)?;
                 let generation = backend
                     .save_delta(repo_id, &bytes, expected_gen)
                     .map_err(DaemonError::from)?;
-                self.graph.clear_pending_delta();
-                self.graph.flush_text_index().map_err(DaemonError::from)?;
+                self.snapshot_generation.store(generation, Ordering::SeqCst);
+                persistence_attempt.complete();
+                self.post_commit_finalization_pending
+                    .store(true, Ordering::SeqCst);
+                committed = true;
                 generation
             } else {
                 self.graph.flush_text_index().map_err(DaemonError::from)?;
                 expected_gen
             }
         } else if force_full {
-            kin_db::SnapshotManager::save_graph(
-                self.layout.kindb_snapshot_path(),
-                self.graph.as_ref(),
-            )
-            .map_err(DaemonError::from)?;
-            expected_gen.saturating_add(1)
-        } else {
-            kin_db::SnapshotManager::save_graph_delta(
+            let (_, generation) = kin_db::SnapshotManager::save_graph_with_expected_generation(
                 self.layout.kindb_snapshot_path(),
                 self.graph.as_ref(),
                 expected_gen,
             )
-            .map_err(DaemonError::from)?
-            .unwrap_or(expected_gen)
+            .map_err(DaemonError::from)?;
+            committed = true;
+            generation
+        } else {
+            let generation = kin_db::SnapshotManager::save_graph_delta(
+                self.layout.kindb_snapshot_path(),
+                self.graph.as_ref(),
+                expected_gen,
+            )
+            .map_err(DaemonError::from)?;
+            committed = generation.is_some();
+            generation.unwrap_or(expected_gen)
         };
 
         self.snapshot_generation.store(new_gen, Ordering::SeqCst);
 
-        if new_gen != expected_gen || force_full {
-            // Write generation marker so CLI/MCP can detect stale snapshots.
-            self.write_generation_marker(new_gen);
-            self.save_read_index()?;
+        if committed {
+            self.post_commit_finalization_pending
+                .store(true, Ordering::SeqCst);
         }
-
-        // The on-disk snapshot now reflects the current graph; advance the
-        // anti-wipe baseline so a later shutdown is measured against what was
-        // actually persisted.
-        self.record_persisted_entity_count();
+        if self.post_commit_finalization_pending.load(Ordering::SeqCst) {
+            self.finalize_committed_generation(new_gen)?;
+        }
 
         info!(
             repo_id,
             generation = new_gen,
+            committed,
             "saved snapshot to storage backend"
         );
         Ok(())
@@ -1654,7 +1773,12 @@ impl DaemonState {
         // `base_gen`, so the cursor stays put.
         if let Some(generation) = outcome.generation {
             self.snapshot_generation.store(generation, Ordering::SeqCst);
-            self.write_generation_marker(generation);
+            self.post_commit_finalization_pending
+                .store(true, Ordering::SeqCst);
+        }
+        if self.post_commit_finalization_pending.load(Ordering::SeqCst) {
+            let generation = self.snapshot_generation.load(Ordering::SeqCst);
+            self.finalize_committed_generation(generation)?;
         }
         Ok(outcome.status.pending)
     }
@@ -1700,35 +1824,194 @@ impl DaemonState {
         )))
     }
 
-    fn save_read_index(&self) -> Result<()> {
-        let index =
-            kin_db::ReadIndex::from_graph(self.graph.as_ref()).map_err(DaemonError::from)?;
-        let idx_path = self.layout.kindb_snapshot_path().with_extension("kidx");
-        index.save(&idx_path).map_err(DaemonError::from)
+    /// Finish local artifacts for one already-committed authority generation.
+    ///
+    /// The read index is rebuilt from reopened durable authority, not the live
+    /// graph, which may already contain mutations that arrived after the
+    /// committed batch. It is staged off-path, the old canonical index is
+    /// removed, the generation marker is durably published, and only then is
+    /// the staged index promoted. Every crash point therefore leaves either the
+    /// old generation or a missing derived index, never a stale canonical index
+    /// presented as current authority.
+    fn finalize_committed_generation(&self, generation: u64) -> Result<()> {
+        #[cfg(test)]
+        if self.finalization_fail_once.swap(false, Ordering::SeqCst) {
+            return Err(DaemonError::Io(std::io::Error::other(
+                "injected post-commit finalization failure",
+            )));
+        }
+
+        let authority_graph = self.load_committed_authority_graph(generation)?;
+        self.finalize_generation_from_graph(generation, authority_graph.as_ref())
     }
 
-    /// Write the generation number to `.kin/kindb/generation`.
+    /// Finish startup artifacts from the graph that was just loaded and
+    /// validated before the state is exposed to any request or mutator.
+    /// Reopening the same authority here doubles graph memory and repeats
+    /// remote snapshot I/O on every healthy restart.
+    fn finalize_loaded_generation(&self, generation: u64) -> Result<()> {
+        self.finalize_generation_from_graph(generation, self.graph.as_ref())
+    }
+
+    /// A locate-only graph is intentionally incomplete for general-purpose
+    /// references and traces, so it cannot rebuild the canonical read index.
+    /// Remove any older index before publishing the loaded authority head;
+    /// a missing derived index is fail-safe, while an old index paired with a
+    /// new marker would advertise a mixed-generation state.
+    fn finalize_loaded_locate_generation(&self, generation: u64) -> Result<()> {
+        self.invalidate_canonical_read_index()?;
+        self.write_generation_marker(generation)
+    }
+
+    fn finalize_generation_from_graph(
+        &self,
+        generation: u64,
+        authority_graph: &kin_db::InMemoryGraph,
+    ) -> Result<()> {
+        let (staged_index, persisted_entity_count) =
+            self.stage_read_index_from_graph(generation, authority_graph)?;
+        let index_path = self.invalidate_canonical_read_index()?;
+        self.write_generation_marker(generation)?;
+        if let Err(error) = std::fs::rename(&staged_index, &index_path) {
+            return Err(DaemonError::Io(error));
+        }
+        if let Some(parent) = index_path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(DaemonError::Io)?;
+        }
+        self.persisted_entity_count
+            .store(persisted_entity_count, Ordering::SeqCst);
+        self.post_commit_finalization_pending
+            .store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn invalidate_canonical_read_index(&self) -> Result<std::path::PathBuf> {
+        let index_path = self.layout.kindb_snapshot_path().with_extension("kidx");
+        match std::fs::remove_file(&index_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(DaemonError::Io(error)),
+        }
+        if let Some(parent) = index_path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(DaemonError::Io)?;
+        }
+        Ok(index_path)
+    }
+
+    fn load_committed_authority_graph(
+        &self,
+        generation: u64,
+    ) -> Result<Arc<kin_db::InMemoryGraph>> {
+        let authority_graph = if let Some(backend) = &self.storage_backend {
+            match kin_db::load_recovered_snapshot(backend.as_ref(), &self.cached_repo_id)
+                .map_err(DaemonError::from)?
+            {
+                Some(recovered) => {
+                    if recovered.generation != generation {
+                        return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                            format!(
+                                "post-commit authority moved for repo {}: expected generation {generation}, recovered {}; reopen before finalizing derived indexes",
+                                self.cached_repo_id, recovered.generation
+                            ),
+                        )));
+                    }
+                    Arc::new(kin_db::InMemoryGraph::from_snapshot(recovered.snapshot))
+                }
+                None if generation == kin_db::GENERATION_INIT => Arc::clone(&self.graph),
+                None => {
+                    return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                        format!(
+                            "committed generation {generation} for repo {} is missing during read-index finalization",
+                            self.cached_repo_id
+                        ),
+                    )))
+                }
+            }
+        } else {
+            let snapshot =
+                kin_db::SnapshotManager::open_read_only(self.layout.kindb_snapshot_path())
+                    .map_err(DaemonError::from)?;
+            let observed_generation = snapshot.generation();
+            if observed_generation != generation {
+                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                    format!(
+                        "post-commit authority moved for repo {}: expected generation {generation}, recovered {observed_generation}; reopen before finalizing derived indexes",
+                        self.cached_repo_id
+                    ),
+                )));
+            }
+            snapshot.graph()
+        };
+        Ok(authority_graph)
+    }
+
+    fn stage_read_index_from_graph(
+        &self,
+        generation: u64,
+        authority_graph: &kin_db::InMemoryGraph,
+    ) -> Result<(std::path::PathBuf, u64)> {
+        let index = kin_db::ReadIndex::from_graph(authority_graph).map_err(DaemonError::from)?;
+        let idx_path = self.layout.kindb_snapshot_path().with_extension("kidx");
+        if let Some(parent) = idx_path.parent() {
+            std::fs::create_dir_all(parent).map_err(DaemonError::Io)?;
+        }
+        let mut staged_name = std::ffi::OsString::from(idx_path.as_os_str());
+        staged_name.push(format!(".pending-{generation}-{}", std::process::id()));
+        let staged_path = std::path::PathBuf::from(staged_name);
+        index.save(&staged_path).map_err(DaemonError::from)?;
+        Ok((staged_path, authority_graph.entity_count() as u64))
+    }
+
+    /// Write the durable authority head to `.kin/kindb/head-generation`.
+    ///
+    /// KinDB owns `.kin/kindb/generation` as the generation of its legacy
+    /// `graph.kndb` compatibility projection. A delta commit advances graph
+    /// authority without advancing that projection, so using the legacy path
+    /// as the daemon freshness marker makes the next authority read look like
+    /// a mixed-version legacy writer and correctly fail closed.
     ///
     /// CLI and MCP processes read this file before queries and compare it
     /// to their loaded generation. If different, they know the daemon has
     /// committed a newer snapshot and should reload.
-    fn write_generation_marker(&self, generation: u64) {
-        let gen_path = self.layout.root().join("kindb").join("generation");
-        let tmp_path = gen_path.with_extension("tmp");
-        if let Err(e) = std::fs::write(&tmp_path, generation.to_string())
-            .and_then(|_| std::fs::rename(&tmp_path, &gen_path))
+    fn write_generation_marker(&self, generation: u64) -> Result<()> {
+        use std::io::Write;
+
+        let gen_path = self.layout.kindb_head_generation_path();
+        let tmp_path = gen_path.with_extension(format!("tmp-{}", std::process::id()));
+        let parent = gen_path.parent().ok_or_else(|| {
+            DaemonError::Io(std::io::Error::other(
+                "generation marker path has no parent directory",
+            ))
+        })?;
+        std::fs::create_dir_all(parent).map_err(DaemonError::Io)?;
         {
-            warn!(error = %e, "failed to write generation marker");
+            let mut file = std::fs::File::create(&tmp_path).map_err(DaemonError::Io)?;
+            file.write_all(generation.to_string().as_bytes())
+                .map_err(DaemonError::Io)?;
+            file.sync_all().map_err(DaemonError::Io)?;
         }
+        if let Err(error) = std::fs::rename(&tmp_path, &gen_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(DaemonError::Io(error));
+        }
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(DaemonError::Io)?;
+        Ok(())
     }
 
-    /// Read the current snapshot generation from `.kin/kindb/generation`.
+    /// Read the current durable authority head from
+    /// `.kin/kindb/head-generation`.
     ///
     /// Returns 0 if the file doesn't exist. CLI and MCP can call this
     /// before queries to check if the daemon has committed a newer snapshot
     /// than what they have loaded in memory.
     pub fn read_generation_marker(layout: &KinLayout) -> u64 {
-        let gen_path = layout.root().join("kindb").join("generation");
+        let gen_path = layout.kindb_head_generation_path();
         std::fs::read_to_string(&gen_path)
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
@@ -1906,6 +2189,7 @@ impl DaemonState {
     /// Called after any graph mutation. The background persistence task
     /// will flush to disk when it sees this flag.
     pub fn mark_dirty(&self) {
+        self.mutation_epoch.fetch_add(1, Ordering::SeqCst);
         self.dirty.store(true, Ordering::SeqCst);
         if let Ok(mut last) = self.last_mutation.lock() {
             *last = Instant::now();
@@ -1914,7 +2198,19 @@ impl DaemonState {
 
     /// Mark the graph as clean (just saved). Records the save timestamp.
     pub fn mark_clean(&self) {
+        let observed_epoch = self.mutation_epoch.load(Ordering::SeqCst);
         self.dirty.store(false, Ordering::SeqCst);
+        // A detached backend batch, a later active delta, or a mutation epoch
+        // that changed across the clear all mean this save did not acknowledge
+        // the latest graph truth. Re-arm the persistence wakeup instead of
+        // losing the concurrent mutation.
+        if self.mutation_epoch.load(Ordering::SeqCst) != observed_epoch
+            || self.graph.has_unpersisted_changes()
+            || self.post_commit_finalization_pending.load(Ordering::SeqCst)
+        {
+            self.dirty.store(true, Ordering::SeqCst);
+            return;
+        }
         if let Ok(mut last) = self.last_save.lock() {
             *last = Instant::now();
         }
@@ -2119,6 +2415,157 @@ mod tests {
     use kin_reconcile::ReconcileOutcome;
     use serde_json::json;
 
+    struct CleanupFailOnceBackend {
+        inner: kin_db::LocalFileBackend,
+        fail_cleanup: AtomicBool,
+        delta_block: Option<DeltaSaveBlock>,
+        recovery_loads: Option<Arc<AtomicU64>>,
+    }
+
+    struct DeltaSaveBlock {
+        reached_backend: Arc<std::sync::Barrier>,
+        resume_backend: Arc<std::sync::Barrier>,
+        block_once: AtomicBool,
+    }
+
+    impl CleanupFailOnceBackend {
+        fn new(path: &std::path::Path, fail_cleanup: bool) -> Self {
+            Self {
+                inner: kin_db::LocalFileBackend::new(path),
+                fail_cleanup: AtomicBool::new(fail_cleanup),
+                delta_block: None,
+                recovery_loads: None,
+            }
+        }
+
+        fn blocking_delta(
+            path: &std::path::Path,
+            reached_backend: Arc<std::sync::Barrier>,
+            resume_backend: Arc<std::sync::Barrier>,
+        ) -> Self {
+            Self {
+                inner: kin_db::LocalFileBackend::new(path),
+                fail_cleanup: AtomicBool::new(false),
+                delta_block: Some(DeltaSaveBlock {
+                    reached_backend,
+                    resume_backend,
+                    block_once: AtomicBool::new(true),
+                }),
+                recovery_loads: None,
+            }
+        }
+
+        fn counting_load(path: &std::path::Path, recovery_loads: Arc<AtomicU64>) -> Self {
+            Self {
+                inner: kin_db::LocalFileBackend::new(path),
+                fail_cleanup: AtomicBool::new(false),
+                delta_block: None,
+                recovery_loads: Some(recovery_loads),
+            }
+        }
+    }
+
+    impl kin_db::StorageBackend for CleanupFailOnceBackend {
+        fn supports_incremental_deltas(&self) -> bool {
+            true
+        }
+
+        fn load_snapshot(
+            &self,
+            repo_id: &str,
+        ) -> std::result::Result<Option<(Vec<u8>, kin_db::Generation)>, kin_db::KinDbError>
+        {
+            self.inner.load_snapshot(repo_id)
+        }
+
+        fn load_snapshot_authority(
+            &self,
+            repo_id: &str,
+        ) -> std::result::Result<Option<kin_db::SnapshotAuthority>, kin_db::KinDbError> {
+            self.inner.load_snapshot_authority(repo_id)
+        }
+
+        fn load_recovery_state(
+            &self,
+            repo_id: &str,
+        ) -> std::result::Result<kin_db::SnapshotRecoveryState, kin_db::KinDbError> {
+            if let Some(loads) = &self.recovery_loads {
+                loads.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.load_recovery_state(repo_id)
+        }
+
+        fn save_snapshot(
+            &self,
+            repo_id: &str,
+            data: &[u8],
+            expected_gen: kin_db::Generation,
+        ) -> std::result::Result<kin_db::Generation, kin_db::KinDbError> {
+            self.inner.save_snapshot(repo_id, data, expected_gen)
+        }
+
+        fn save_delta(
+            &self,
+            repo_id: &str,
+            delta_data: &[u8],
+            base_gen: kin_db::Generation,
+        ) -> std::result::Result<kin_db::Generation, kin_db::KinDbError> {
+            if let Some(block) = &self.delta_block {
+                if block.block_once.swap(false, Ordering::SeqCst) {
+                    block.reached_backend.wait();
+                    block.resume_backend.wait();
+                }
+            }
+            self.inner.save_delta(repo_id, delta_data, base_gen)
+        }
+
+        fn load_deltas_since(
+            &self,
+            repo_id: &str,
+            since_gen: kin_db::Generation,
+        ) -> std::result::Result<Vec<(Vec<u8>, kin_db::Generation)>, kin_db::KinDbError> {
+            self.inner.load_deltas_since(repo_id, since_gen)
+        }
+
+        fn clear_deltas(&self, repo_id: &str) -> std::result::Result<(), kin_db::KinDbError> {
+            if self.fail_cleanup.swap(false, Ordering::SeqCst) {
+                return Err(kin_db::KinDbError::StorageError(
+                    "injected delta cleanup failure".to_string(),
+                ));
+            }
+            self.inner.clear_deltas(repo_id)
+        }
+
+        fn save_overlay(
+            &self,
+            repo_id: &str,
+            session_id: &str,
+            data: &[u8],
+        ) -> std::result::Result<(), kin_db::KinDbError> {
+            self.inner.save_overlay(repo_id, session_id, data)
+        }
+
+        fn load_overlay(
+            &self,
+            repo_id: &str,
+            session_id: &str,
+        ) -> std::result::Result<Option<Vec<u8>>, kin_db::KinDbError> {
+            self.inner.load_overlay(repo_id, session_id)
+        }
+
+        fn delete_overlay(
+            &self,
+            repo_id: &str,
+            session_id: &str,
+        ) -> std::result::Result<(), kin_db::KinDbError> {
+            self.inner.delete_overlay(repo_id, session_id)
+        }
+
+        fn list_repos(&self) -> std::result::Result<Vec<String>, kin_db::KinDbError> {
+            self.inner.list_repos()
+        }
+    }
+
     fn simple_layout(file_id: &FilePathId) -> FileLayout {
         FileLayout {
             file_id: file_id.clone(),
@@ -2132,6 +2579,14 @@ mod tests {
     }
 
     fn test_state(layout: KinLayout, working_dir: &std::path::Path) -> DaemonState {
+        let snapshot_generation =
+            if kin_db::SnapshotManager::local_authority_exists(layout.kindb_snapshot_path()) {
+                kin_db::SnapshotManager::open_read_only(layout.kindb_snapshot_path())
+                    .unwrap()
+                    .generation()
+            } else {
+                kin_db::GENERATION_INIT
+            };
         let graph = Arc::new(kin_db::InMemoryGraph::with_text_index(
             layout.text_index_dir(),
         ));
@@ -2156,7 +2611,10 @@ mod tests {
             is_initialized: AtomicBool::new(false),
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: None,
-            snapshot_generation: AtomicU64::new(0),
+            snapshot_generation: AtomicU64::new(snapshot_generation),
+            post_commit_finalization_pending: AtomicBool::new(false),
+            #[cfg(test)]
+            finalization_fail_once: AtomicBool::new(false),
             vfs_version: AtomicU64::new(0),
             vfs_tree_cache: std::sync::RwLock::new(None),
             vfs_tree_build_lock: tokio::sync::Mutex::new(()),
@@ -2171,6 +2629,7 @@ mod tests {
             repo_graphs: RwLock::new(HashMap::new()),
             allowed_repo_ids: None,
             dirty: AtomicBool::new(false),
+            mutation_epoch: AtomicU64::new(0),
             embedding_work: Mutex::new(()),
             persist_lock: Mutex::new(()),
             last_save: std::sync::Mutex::new(Instant::now()),
@@ -2562,7 +3021,17 @@ mod tests {
             .unwrap();
 
         // Spine must be enabled for this test regardless of ambient env.
+        // Point discovery at an explicitly empty registry: this hosted path is
+        // proving storage-only sibling ingestion and must never scan a user's
+        // real global registry (which can contain multi-gigabyte graphs).
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        kin_core::registry::KinRegistry { repos: Vec::new() }
+            .save_to(&registry_path)
+            .unwrap();
+        let prev_registry = std::env::var_os("KIN_REGISTRY_PATH");
         let prev_disable = std::env::var_os("KIN_DISABLE_SPINE");
+        std::env::set_var("KIN_REGISTRY_PATH", &registry_path);
         std::env::remove_var("KIN_DISABLE_SPINE");
 
         // ── Drive the production ingest route logic ───────────────────────
@@ -2580,6 +3049,10 @@ mod tests {
         // Restore env before asserting so a failure cannot leak the override.
         if let Some(v) = prev_disable {
             std::env::set_var("KIN_DISABLE_SPINE", v);
+        }
+        match prev_registry {
+            Some(v) => std::env::set_var("KIN_REGISTRY_PATH", v),
+            None => std::env::remove_var("KIN_REGISTRY_PATH"),
         }
 
         // The sibling was loaded purely from storage (it has no local `.kndb`).
@@ -2638,7 +3111,16 @@ mod tests {
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
         let layout = init.layout;
-        std::fs::write(layout.kindb_snapshot_path(), b"not-a-valid-kndb").unwrap();
+        let snapshot_path = layout.kindb_snapshot_path();
+        let mut authority_name = std::ffi::OsString::from(snapshot_path.as_os_str());
+        authority_name.push(".authority.json");
+        let authority: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(authority_name).unwrap()).unwrap();
+        let snapshot_file = authority["snapshot_file"].as_str().unwrap();
+        let mut versions_name = std::ffi::OsString::from(snapshot_path.as_os_str());
+        versions_name.push(".snapshots");
+        let authoritative_snapshot = std::path::PathBuf::from(versions_name).join(snapshot_file);
+        std::fs::write(authoritative_snapshot, b"not-a-valid-kndb").unwrap();
 
         let err = match DaemonState::open(layout) {
             Ok(_) => panic!("expected corrupt snapshot open to fail"),
@@ -2838,6 +3320,537 @@ mod tests {
                 .any(|b| b.name == branch_name && b.head == change_id),
             "published branch head must be visible after reload (refs non-empty)"
         );
+    }
+
+    #[test]
+    fn storage_backend_replays_sequential_deltas_after_restart() {
+        use kin_db::LocalFileBackend;
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+        let storage = tempfile::tempdir().unwrap();
+        let repo_id = "restart-repo";
+
+        let state = DaemonState::open_with_backend(
+            layout.clone(),
+            Box::new(LocalFileBackend::new(storage.path())),
+            repo_id,
+            None,
+        )
+        .unwrap();
+
+        let base = test_entity("base_entity", "src/base.rs");
+        state.graph.upsert_entity(&base).unwrap();
+        state
+            .save_snapshot()
+            .expect("generation zero must promote a full base snapshot");
+        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 1);
+
+        let first_delta_entity = test_entity("first_delta_entity", "src/first.rs");
+        state.graph.upsert_entity(&first_delta_entity).unwrap();
+        state.save_snapshot().expect("persist first delta");
+        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 2);
+
+        let second_delta_entity = test_entity("second_delta_entity", "src/second.rs");
+        state.graph.upsert_entity(&second_delta_entity).unwrap();
+        state.save_snapshot().expect("persist second delta");
+        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 3);
+        drop(state);
+
+        let reopened = DaemonState::open_with_backend(
+            layout,
+            Box::new(LocalFileBackend::new(storage.path())),
+            repo_id,
+            None,
+        )
+        .expect("base snapshot plus deltas must reopen");
+        assert_eq!(reopened.snapshot_generation.load(Ordering::SeqCst), 3);
+        let entities = reopened.graph.list_all_entities().unwrap();
+        let names: HashSet<_> = entities.iter().map(|entity| entity.name.as_str()).collect();
+        assert_eq!(entities.len(), 3);
+        assert!(names.contains("base_entity"));
+        assert!(names.contains("first_delta_entity"));
+        assert!(names.contains("second_delta_entity"));
+    }
+
+    #[test]
+    fn backend_acknowledgement_preserves_mutation_arriving_during_delta_io() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+        let storage = tempfile::tempdir().unwrap();
+        let repo_id = "concurrent-delta-ack";
+        let reached_backend = Arc::new(std::sync::Barrier::new(2));
+        let resume_backend = Arc::new(std::sync::Barrier::new(2));
+
+        let state = Arc::new(
+            DaemonState::open_with_backend(
+                layout.clone(),
+                Box::new(CleanupFailOnceBackend::blocking_delta(
+                    storage.path(),
+                    Arc::clone(&reached_backend),
+                    Arc::clone(&resume_backend),
+                )),
+                repo_id,
+                None,
+            )
+            .unwrap(),
+        );
+        state
+            .graph
+            .upsert_entity(&test_entity("base_entity", "src/base.rs"))
+            .unwrap();
+        state.mark_dirty();
+        state.save_snapshot().expect("persist full base");
+        state.mark_clean();
+        assert!(!state.is_dirty());
+
+        state
+            .graph
+            .upsert_entity(&test_entity("first_delta", "src/first.rs"))
+            .unwrap();
+        state.mark_dirty();
+        let save_state = Arc::clone(&state);
+        let save_thread = std::thread::spawn(move || save_state.save_snapshot());
+        reached_backend.wait();
+
+        // This mutation lands after the first delta was detached but before its
+        // backend authority commit. Acknowledging the first batch must not clear
+        // this second mutation.
+        state
+            .graph
+            .upsert_entity(&test_entity("during_io", "src/during.rs"))
+            .unwrap();
+        state.mark_dirty();
+        resume_backend.wait();
+        save_thread.join().unwrap().expect("persist first delta");
+        // Production callers mark clean after a successful save. The later
+        // mutation must keep the background persistence wakeup armed.
+        state.mark_clean();
+        assert!(state.is_dirty());
+        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 2);
+
+        state
+            .save_snapshot()
+            .expect("later mutation must remain pending for the next delta");
+        state.mark_clean();
+        assert!(!state.is_dirty());
+        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 3);
+        drop(state);
+
+        let reopened = DaemonState::open_with_backend(
+            layout,
+            Box::new(kin_db::LocalFileBackend::new(storage.path())),
+            repo_id,
+            None,
+        )
+        .expect("both detached batches must reopen exactly");
+        let names: HashSet<_> = reopened
+            .graph
+            .list_all_entities()
+            .unwrap()
+            .into_iter()
+            .map(|entity| entity.name)
+            .collect();
+        assert_eq!(reopened.snapshot_generation.load(Ordering::SeqCst), 3);
+        assert_eq!(names.len(), 3);
+        assert!(names.contains("base_entity"));
+        assert!(names.contains("first_delta"));
+        assert!(names.contains("during_io"));
+    }
+
+    #[test]
+    fn post_commit_finalization_retries_without_recommitting_graph() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+        let storage = tempfile::tempdir().unwrap();
+        let repo_id = "finalization-retry";
+        let state = DaemonState::open_with_backend(
+            layout.clone(),
+            Box::new(kin_db::LocalFileBackend::new(storage.path())),
+            repo_id,
+            None,
+        )
+        .unwrap();
+
+        state
+            .graph
+            .upsert_entity(&test_entity("committed", "src/committed.rs"))
+            .unwrap();
+        state.finalization_fail_once.store(true, Ordering::SeqCst);
+        let error = state
+            .save_snapshot()
+            .expect_err("injected local finalization must surface after commit");
+        assert!(error
+            .to_string()
+            .contains("injected post-commit finalization failure"));
+        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 1);
+        assert_eq!(DaemonState::read_generation_marker(&layout), 0);
+        assert!(state
+            .post_commit_finalization_pending
+            .load(Ordering::SeqCst));
+
+        let idx_path = layout.kindb_snapshot_path().with_extension("kidx");
+        assert_eq!(kin_db::ReadIndex::load(&idx_path).unwrap().entity_count, 0);
+        state
+            .save_snapshot()
+            .expect("no-op save must retry local finalization");
+        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 1);
+        assert_eq!(DaemonState::read_generation_marker(&layout), 1);
+        assert!(!state
+            .post_commit_finalization_pending
+            .load(Ordering::SeqCst));
+        assert_eq!(kin_db::ReadIndex::load(&idx_path).unwrap().entity_count, 1);
+    }
+
+    #[test]
+    fn backend_reopen_heals_stale_generation_marker_and_read_index() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+        let storage = tempfile::tempdir().unwrap();
+        let repo_id = "marker-heal";
+
+        let state = DaemonState::open_with_backend(
+            layout.clone(),
+            Box::new(kin_db::LocalFileBackend::new(storage.path())),
+            repo_id,
+            None,
+        )
+        .unwrap();
+        state
+            .graph
+            .upsert_entity(&test_entity("persisted", "src/persisted.rs"))
+            .unwrap();
+        state.save_snapshot().unwrap();
+        drop(state);
+
+        let marker = layout.kindb_head_generation_path();
+        std::fs::write(&marker, "0").unwrap();
+        let idx_path = layout.kindb_snapshot_path().with_extension("kidx");
+        std::fs::remove_file(&idx_path).unwrap();
+
+        let reopened = DaemonState::open_with_backend(
+            layout.clone(),
+            Box::new(kin_db::LocalFileBackend::new(storage.path())),
+            repo_id,
+            None,
+        )
+        .expect("reopen must heal artifacts from durable authority");
+        assert_eq!(reopened.snapshot_generation.load(Ordering::SeqCst), 1);
+        assert_eq!(DaemonState::read_generation_marker(&layout), 1);
+        assert_eq!(kin_db::ReadIndex::load(&idx_path).unwrap().entity_count, 1);
+    }
+
+    #[test]
+    fn backend_startup_reuses_the_single_recovered_graph() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+        let storage = tempfile::tempdir().unwrap();
+        let repo_id = "single-startup-load";
+
+        let seeded_graph = kin_db::InMemoryGraph::new();
+        seeded_graph
+            .upsert_entity(&test_entity("loaded_once", "src/loaded.rs"))
+            .unwrap();
+        let seed_backend = kin_db::LocalFileBackend::new(storage.path());
+        seed_backend
+            .save_snapshot(
+                repo_id,
+                &seeded_graph.to_snapshot().to_bytes().unwrap(),
+                kin_db::GENERATION_INIT,
+            )
+            .unwrap();
+
+        let recovery_loads = Arc::new(AtomicU64::new(0));
+        let state = DaemonState::open_with_backend(
+            layout.clone(),
+            Box::new(CleanupFailOnceBackend::counting_load(
+                storage.path(),
+                Arc::clone(&recovery_loads),
+            )),
+            repo_id,
+            None,
+        )
+        .expect("startup must finalize from the graph it already recovered");
+
+        assert_eq!(recovery_loads.load(Ordering::SeqCst), 1);
+        assert_eq!(state.graph.entity_count(), 1);
+        assert_eq!(DaemonState::read_generation_marker(&layout), 1);
+        assert_eq!(
+            kin_db::ReadIndex::load(&layout.kindb_snapshot_path().with_extension("kidx"))
+                .unwrap()
+                .entity_count,
+            1
+        );
+    }
+
+    #[test]
+    fn default_local_save_restart_save_recovers_authority_generation() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+
+        let first = DaemonState::open(layout.clone()).unwrap();
+        let initial_generation = first.snapshot_generation.load(Ordering::SeqCst);
+        first
+            .graph
+            .upsert_entity(&test_entity("first_local", "src/first.rs"))
+            .unwrap();
+        first.save_snapshot().unwrap();
+        assert_eq!(
+            first.snapshot_generation.load(Ordering::SeqCst),
+            initial_generation + 1
+        );
+        drop(first);
+
+        let second = DaemonState::open(layout.clone()).unwrap();
+        assert_eq!(
+            second.snapshot_generation.load(Ordering::SeqCst),
+            initial_generation + 1
+        );
+        second
+            .graph
+            .upsert_entity(&test_entity("second_local", "src/second.rs"))
+            .unwrap();
+        second.save_snapshot().unwrap();
+        assert_eq!(
+            second.snapshot_generation.load(Ordering::SeqCst),
+            initial_generation + 2
+        );
+        drop(second);
+
+        let reopened = DaemonState::open(layout.clone()).unwrap();
+        assert_eq!(
+            reopened.snapshot_generation.load(Ordering::SeqCst),
+            initial_generation + 2
+        );
+        assert_eq!(
+            DaemonState::read_generation_marker(&layout),
+            initial_generation + 2
+        );
+        let names: HashSet<_> = reopened
+            .graph
+            .list_all_entities()
+            .unwrap()
+            .into_iter()
+            .map(|entity| entity.name)
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains("first_local"));
+        assert!(names.contains("second_local"));
+    }
+
+    #[test]
+    fn default_local_force_full_rejects_stale_daemon_generation() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+        let snapshot_path = layout.kindb_snapshot_path();
+        let state = DaemonState::open(layout.clone()).unwrap();
+        let stale_generation = state.snapshot_generation.load(Ordering::SeqCst);
+
+        let external = kin_db::InMemoryGraph::new();
+        let external_entity = test_entity("external_writer", "src/external.rs");
+        external.upsert_entity(&external_entity).unwrap();
+        let (_, external_generation) =
+            kin_db::SnapshotManager::save_graph_with_expected_generation(
+                &snapshot_path,
+                &external,
+                stale_generation,
+            )
+            .unwrap();
+        assert_eq!(external_generation, stale_generation + 1);
+
+        let stale_entity = test_entity("stale_daemon", "src/stale.rs");
+        state.graph.upsert_entity(&stale_entity).unwrap();
+        let error = state
+            .save_snapshot_full()
+            .expect_err("stale full daemon writer must lose the generation CAS");
+        assert!(error.to_string().contains(&format!(
+            "expected {stale_generation}, found {external_generation}"
+        )));
+        assert_eq!(
+            state.snapshot_generation.load(Ordering::SeqCst),
+            stale_generation,
+            "failed stale save must not advance its in-memory cursor"
+        );
+        drop(state);
+
+        let reopened = DaemonState::open(layout).unwrap();
+        assert_eq!(
+            reopened.snapshot_generation.load(Ordering::SeqCst),
+            external_generation
+        );
+        assert!(reopened
+            .graph
+            .get_entity(&external_entity.id)
+            .unwrap()
+            .is_some());
+        assert!(reopened
+            .graph
+            .get_entity(&stale_entity.id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn default_local_reopen_heals_crash_between_authority_commit_and_finalization() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+        let snapshot_path = layout.kindb_snapshot_path();
+        let index_path = snapshot_path.with_extension("kidx");
+
+        let state = DaemonState::open(layout.clone()).unwrap();
+        let base_generation = state.snapshot_generation.load(Ordering::SeqCst);
+        let entity = test_entity("authority_only", "src/authority.rs");
+        state.graph.upsert_entity(&entity).unwrap();
+
+        // Commit graph authority directly, then simulate process death before
+        // DaemonState can publish either its marker or read index. Removing the
+        // canonical compatibility projection additionally proves discovery and
+        // reopen follow the atomic authority sidecar.
+        let (_, generation) = kin_db::SnapshotManager::save_graph_with_generation(
+            &snapshot_path,
+            state.graph.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(generation, base_generation + 1);
+        assert_eq!(
+            DaemonState::read_generation_marker(&layout),
+            base_generation
+        );
+        assert_eq!(
+            kin_db::ReadIndex::load(&index_path).unwrap().entity_count,
+            0
+        );
+        drop(state);
+        std::fs::remove_file(&snapshot_path).unwrap();
+
+        let reopened = DaemonState::open(layout.clone())
+            .expect("validated local authority must heal derived artifacts before serving");
+        assert_eq!(
+            reopened.snapshot_generation.load(Ordering::SeqCst),
+            base_generation + 1
+        );
+        assert_eq!(
+            DaemonState::read_generation_marker(&layout),
+            base_generation + 1
+        );
+        assert_eq!(
+            kin_db::ReadIndex::load(&index_path).unwrap().entity_count,
+            1
+        );
+        assert_eq!(
+            reopened.graph.get_entity(&entity.id).unwrap().unwrap().name,
+            "authority_only"
+        );
+    }
+
+    #[test]
+    fn default_local_finalization_rejects_newer_external_authority() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+        let snapshot_path = layout.kindb_snapshot_path();
+        let index_path = snapshot_path.with_extension("kidx");
+
+        let state = DaemonState::open(layout.clone()).unwrap();
+        state
+            .graph
+            .upsert_entity(&test_entity("daemon_generation", "src/daemon.rs"))
+            .unwrap();
+        state.save_snapshot().unwrap();
+        let daemon_generation = state.snapshot_generation.load(Ordering::SeqCst);
+        let daemon_index_count = kin_db::ReadIndex::load(&index_path).unwrap().entity_count;
+
+        let external_graph = {
+            let snapshot = kin_db::SnapshotManager::open_read_only(&snapshot_path).unwrap();
+            snapshot.graph()
+        };
+        external_graph
+            .upsert_entity(&test_entity("external_generation", "src/external.rs"))
+            .unwrap();
+        let (_, external_generation) =
+            kin_db::SnapshotManager::save_graph_with_expected_generation(
+                &snapshot_path,
+                external_graph.as_ref(),
+                daemon_generation,
+            )
+            .unwrap();
+        assert_eq!(external_generation, daemon_generation + 1);
+
+        state
+            .post_commit_finalization_pending
+            .store(true, Ordering::SeqCst);
+        let error = state
+            .finalize_committed_generation(daemon_generation)
+            .expect_err("derived artifacts must not mix two authority generations");
+        assert!(error.to_string().contains(&format!(
+            "expected generation {daemon_generation}, recovered {external_generation}"
+        )));
+        assert_eq!(
+            DaemonState::read_generation_marker(&layout),
+            daemon_generation,
+            "a failed stale finalization must not publish the newer authority under the old cursor"
+        );
+        assert_eq!(
+            kin_db::ReadIndex::load(&index_path).unwrap().entity_count,
+            daemon_index_count,
+            "a failed stale finalization must preserve the last coherent canonical index"
+        );
+        assert!(state
+            .post_commit_finalization_pending
+            .load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn committed_full_snapshot_cleanup_failure_does_not_wedge_next_cas() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+        let storage = tempfile::tempdir().unwrap();
+        let repo_id = "cleanup-retry";
+
+        let state = DaemonState::open_with_backend(
+            layout.clone(),
+            Box::new(CleanupFailOnceBackend::new(storage.path(), true)),
+            repo_id,
+            None,
+        )
+        .unwrap();
+        state
+            .graph
+            .upsert_entity(&test_entity("base_entity", "src/base.rs"))
+            .unwrap();
+        state
+            .save_snapshot()
+            .expect("committed snapshot survives cleanup failure");
+        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 1);
+
+        state
+            .graph
+            .upsert_entity(&test_entity("next_entity", "src/next.rs"))
+            .unwrap();
+        state
+            .save_snapshot()
+            .expect("next delta CAS uses committed generation, not stale cursor");
+        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 2);
+        drop(state);
+
+        let reopened = DaemonState::open_with_backend(
+            layout,
+            Box::new(CleanupFailOnceBackend::new(storage.path(), false)),
+            repo_id,
+            None,
+        )
+        .expect("snapshot plus next delta reopens after cleanup failure");
+        assert_eq!(reopened.snapshot_generation.load(Ordering::SeqCst), 2);
+        assert_eq!(reopened.graph.entity_count(), 2);
     }
 
     fn make_scoped_graph_with_entity(name: &str, file_path: &str) -> Arc<kin_db::InMemoryGraph> {
@@ -3108,12 +4121,40 @@ mod tests {
     }
 
     #[test]
+    fn locate_only_finalization_invalidates_canonical_index_before_head_marker() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+        let index_path = layout.kindb_snapshot_path().with_extension("kidx");
+        std::fs::write(&index_path, b"stale canonical index").unwrap();
+        let legacy_generation = layout.kindb_dir().join("generation");
+        std::fs::write(&legacy_generation, "0").unwrap();
+        let state = test_state(layout.clone(), repo_dir.path());
+
+        state.finalize_loaded_locate_generation(7).unwrap();
+
+        assert!(
+            !index_path.exists(),
+            "a partial locate graph must never replace or retain a canonical full read index"
+        );
+        assert_eq!(DaemonState::read_generation_marker(&layout), 7);
+        assert_eq!(
+            std::fs::read_to_string(legacy_generation).unwrap(),
+            "0",
+            "locate-only freshness must not mutate KinDB's legacy projection marker"
+        );
+    }
+
+    #[test]
     fn sequential_saves_leave_consistent_kndb_kidx_pair() {
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
-        let kndb_path = init.layout.kindb_snapshot_path();
+        let layout = init.layout;
+        let kndb_path = layout.kindb_snapshot_path();
         let kidx_path = kndb_path.with_extension("kidx");
-        let state = test_state(init.layout, repo_dir.path());
+        let legacy_projection_generation = layout.kindb_dir().join("generation");
+        std::fs::write(&legacy_projection_generation, "0").unwrap();
+        let state = test_state(layout.clone(), repo_dir.path());
         state
             .graph
             .upsert_entity(&test_entity("paired_fn", "src/lib.rs"))
@@ -3123,7 +4164,26 @@ mod tests {
         // each leave both halves of the on-disk pair present and reloadable —
         // no torn kndb without its kidx, and no kidx without its kndb.
         state.save_snapshot().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&legacy_projection_generation)
+                .unwrap()
+                .trim(),
+            "0"
+        );
         state.save_snapshot().unwrap();
+
+        assert_eq!(
+            DaemonState::read_generation_marker(&layout),
+            2,
+            "the daemon freshness marker must follow the durable authority head"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&legacy_projection_generation)
+                .unwrap()
+                .trim(),
+            "0",
+            "a delta must not mislabel the legacy full-snapshot projection as current"
+        );
 
         assert!(kndb_path.exists(), "graph.kndb must exist after save");
         assert!(kidx_path.exists(), "graph.kidx must exist after save");

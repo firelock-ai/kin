@@ -266,14 +266,14 @@ fn session_key(arguments: &HashMap<String, serde_json::Value>) -> String {
 }
 
 /// Current graph generation from the local marker the daemon maintains at
-/// `<kin_dir>/kindb/generation`. Read directly off disk (no daemon round-trip);
+/// `<kin_dir>/kindb/head-generation`. Read directly off disk (no daemon round-trip);
 /// a missing or unreadable marker reads as generation 0, which still gives a
 /// stable within-session memo, just without cross-generation invalidation.
 fn current_graph_generation() -> u64 {
     let Some(kin_dir) = discover_kin_dir() else {
         return 0;
     };
-    std::fs::read_to_string(kin_dir.join("kindb").join("generation"))
+    std::fs::read_to_string(kin_core::KinLayout::new(kin_dir).kindb_head_generation_path())
         .ok()
         .and_then(|contents| contents.trim().parse::<u64>().ok())
         .unwrap_or(0)
