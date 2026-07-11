@@ -685,23 +685,6 @@ impl DaemonState {
 
         let coordinator = SessionCoordinator::new(Arc::clone(&graph));
 
-        // Register a daemon-system session so the reconcile loop's traffic
-        // checks correctly exclude daemon-owned intents from blocking itself.
-        let daemon_session_id = coordinator
-            .register_session(
-                "kin-daemon",
-                "reconcile-loop",
-                kin_model::session::SessionTransport::Cli,
-                None,
-                layout.working_dir().to_path_buf(),
-                kin_model::session::SessionCapabilities::default(),
-            )
-            .unwrap_or_else(|e| {
-                tracing::warn!("failed to register daemon session: {e}");
-                kin_model::SessionId::new()
-            });
-        reconciler.set_session_id(daemon_session_id);
-
         // Resume from the last persisted VFS version so kin-vfs clients
         // don't see a reset after daemon restart.
         let persisted_vfs_version = Self::load_persisted_vfs_version(&layout);
@@ -779,16 +762,23 @@ impl DaemonState {
             .get_mut()
             .insert(state.cached_repo_id.clone(), Arc::clone(&state.graph));
 
-        // The local snapshot authority is the durable generation source. A
-        // crash can commit it before the compatibility marker/read index are
-        // finalized, so rebuild those derived artifacts from reopened
-        // authority before any request can observe this state.
+        // The loaded graph is the validated durable generation and the state
+        // is not externally visible yet. Heal derived artifacts directly from
+        // it; reopening would duplicate the full graph at peak startup memory.
+        // Locate-only graphs deliberately omit non-locate relations, so they
+        // may advance the freshness marker but must never replace the canonical
+        // general-purpose read index with a partial one.
         if loaded_snapshot {
-            state
-                .post_commit_finalization_pending
-                .store(true, Ordering::SeqCst);
-            state.finalize_committed_generation(generation)?;
+            if locate_only {
+                state.finalize_loaded_locate_generation(generation)?;
+            } else {
+                state
+                    .post_commit_finalization_pending
+                    .store(true, Ordering::SeqCst);
+                state.finalize_loaded_generation(generation)?;
+            }
         }
+        state.register_daemon_system_session();
         Ok(state)
     }
 
@@ -853,21 +843,6 @@ impl DaemonState {
         reconciler.set_traffic_checker(Box::new(traffic_checker));
 
         let coordinator = SessionCoordinator::new(Arc::clone(&graph));
-
-        let daemon_session_id = coordinator
-            .register_session(
-                "kin-daemon",
-                "reconcile-loop",
-                kin_model::session::SessionTransport::Cli,
-                None,
-                layout.working_dir().to_path_buf(),
-                kin_model::session::SessionCapabilities::default(),
-            )
-            .unwrap_or_else(|e| {
-                tracing::warn!("failed to register daemon session: {e}");
-                kin_model::SessionId::new()
-            });
-        reconciler.set_session_id(daemon_session_id);
 
         let persisted_vfs_version = Self::load_persisted_vfs_version(&layout);
 
@@ -939,15 +914,36 @@ impl DaemonState {
         let graphs = state.repo_graphs.get_mut();
         graphs.insert(repo_id.to_string(), graph);
 
-        // Authority may have committed immediately before a crash, leaving the
-        // local marker and read index stale. Reopening has the exact durable
-        // generation, so heal both artifacts before exposing this state.
+        // The recovered graph is already the exact validated authority view
+        // and the state is not externally visible yet. Reuse it for startup
+        // artifacts instead of downloading and decoding the backend twice.
         state
             .post_commit_finalization_pending
             .store(true, Ordering::SeqCst);
-        state.finalize_committed_generation(generation)?;
+        state.finalize_loaded_generation(generation)?;
+        state.register_daemon_system_session();
 
         Ok(state)
+    }
+
+    /// Register the daemon-owned reconcile session only after startup-derived
+    /// artifacts have been built from the exact loaded authority graph.
+    fn register_daemon_system_session(&mut self) {
+        let daemon_session_id = self
+            .coordinator
+            .register_session(
+                "kin-daemon",
+                "reconcile-loop",
+                kin_model::session::SessionTransport::Cli,
+                None,
+                self.layout.working_dir().to_path_buf(),
+                kin_model::session::SessionCapabilities::default(),
+            )
+            .unwrap_or_else(|error| {
+                tracing::warn!("failed to register daemon session: {error}");
+                kin_model::SessionId::new()
+            });
+        self.reconciler.get_mut().set_session_id(daemon_session_id);
     }
 
     /// Returns a reference to the spine backend, if already initialized.
@@ -1845,19 +1841,36 @@ impl DaemonState {
             )));
         }
 
-        let (staged_index, persisted_entity_count) = self.stage_read_index(generation)?;
-        let index_path = self.layout.kindb_snapshot_path().with_extension("kidx");
-        match std::fs::remove_file(&index_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(DaemonError::Io(error)),
-        }
-        if let Some(parent) = index_path.parent() {
-            std::fs::File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(DaemonError::Io)?;
-        }
+        let authority_graph = self.load_committed_authority_graph(generation)?;
+        self.finalize_generation_from_graph(generation, authority_graph.as_ref())
+    }
 
+    /// Finish startup artifacts from the graph that was just loaded and
+    /// validated before the state is exposed to any request or mutator.
+    /// Reopening the same authority here doubles graph memory and repeats
+    /// remote snapshot I/O on every healthy restart.
+    fn finalize_loaded_generation(&self, generation: u64) -> Result<()> {
+        self.finalize_generation_from_graph(generation, self.graph.as_ref())
+    }
+
+    /// A locate-only graph is intentionally incomplete for general-purpose
+    /// references and traces, so it cannot rebuild the canonical read index.
+    /// Remove any older index before publishing the loaded authority head;
+    /// a missing derived index is fail-safe, while an old index paired with a
+    /// new marker would advertise a mixed-generation state.
+    fn finalize_loaded_locate_generation(&self, generation: u64) -> Result<()> {
+        self.invalidate_canonical_read_index()?;
+        self.write_generation_marker(generation)
+    }
+
+    fn finalize_generation_from_graph(
+        &self,
+        generation: u64,
+        authority_graph: &kin_db::InMemoryGraph,
+    ) -> Result<()> {
+        let (staged_index, persisted_entity_count) =
+            self.stage_read_index_from_graph(generation, authority_graph)?;
+        let index_path = self.invalidate_canonical_read_index()?;
         self.write_generation_marker(generation)?;
         if let Err(error) = std::fs::rename(&staged_index, &index_path) {
             return Err(DaemonError::Io(error));
@@ -1874,7 +1887,25 @@ impl DaemonState {
         Ok(())
     }
 
-    fn stage_read_index(&self, generation: u64) -> Result<(std::path::PathBuf, u64)> {
+    fn invalidate_canonical_read_index(&self) -> Result<std::path::PathBuf> {
+        let index_path = self.layout.kindb_snapshot_path().with_extension("kidx");
+        match std::fs::remove_file(&index_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(DaemonError::Io(error)),
+        }
+        if let Some(parent) = index_path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(DaemonError::Io)?;
+        }
+        Ok(index_path)
+    }
+
+    fn load_committed_authority_graph(
+        &self,
+        generation: u64,
+    ) -> Result<Arc<kin_db::InMemoryGraph>> {
         let authority_graph = if let Some(backend) = &self.storage_backend {
             match kin_db::load_recovered_snapshot(backend.as_ref(), &self.cached_repo_id)
                 .map_err(DaemonError::from)?
@@ -1904,10 +1935,26 @@ impl DaemonState {
             let snapshot =
                 kin_db::SnapshotManager::open_read_only(self.layout.kindb_snapshot_path())
                     .map_err(DaemonError::from)?;
+            let observed_generation = snapshot.generation();
+            if observed_generation != generation {
+                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                    format!(
+                        "post-commit authority moved for repo {}: expected generation {generation}, recovered {observed_generation}; reopen before finalizing derived indexes",
+                        self.cached_repo_id
+                    ),
+                )));
+            }
             snapshot.graph()
         };
-        let index =
-            kin_db::ReadIndex::from_graph(authority_graph.as_ref()).map_err(DaemonError::from)?;
+        Ok(authority_graph)
+    }
+
+    fn stage_read_index_from_graph(
+        &self,
+        generation: u64,
+        authority_graph: &kin_db::InMemoryGraph,
+    ) -> Result<(std::path::PathBuf, u64)> {
+        let index = kin_db::ReadIndex::from_graph(authority_graph).map_err(DaemonError::from)?;
         let idx_path = self.layout.kindb_snapshot_path().with_extension("kidx");
         if let Some(parent) = idx_path.parent() {
             std::fs::create_dir_all(parent).map_err(DaemonError::Io)?;
@@ -2372,6 +2419,7 @@ mod tests {
         inner: kin_db::LocalFileBackend,
         fail_cleanup: AtomicBool,
         delta_block: Option<DeltaSaveBlock>,
+        recovery_loads: Option<Arc<AtomicU64>>,
     }
 
     struct DeltaSaveBlock {
@@ -2386,6 +2434,7 @@ mod tests {
                 inner: kin_db::LocalFileBackend::new(path),
                 fail_cleanup: AtomicBool::new(fail_cleanup),
                 delta_block: None,
+                recovery_loads: None,
             }
         }
 
@@ -2402,6 +2451,16 @@ mod tests {
                     resume_backend,
                     block_once: AtomicBool::new(true),
                 }),
+                recovery_loads: None,
+            }
+        }
+
+        fn counting_load(path: &std::path::Path, recovery_loads: Arc<AtomicU64>) -> Self {
+            Self {
+                inner: kin_db::LocalFileBackend::new(path),
+                fail_cleanup: AtomicBool::new(false),
+                delta_block: None,
+                recovery_loads: Some(recovery_loads),
             }
         }
     }
@@ -2430,6 +2489,9 @@ mod tests {
             &self,
             repo_id: &str,
         ) -> std::result::Result<kin_db::SnapshotRecoveryState, kin_db::KinDbError> {
+            if let Some(loads) = &self.recovery_loads {
+                loads.fetch_add(1, Ordering::SeqCst);
+            }
             self.inner.load_recovery_state(repo_id)
         }
 
@@ -3483,6 +3545,50 @@ mod tests {
     }
 
     #[test]
+    fn backend_startup_reuses_the_single_recovered_graph() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+        let storage = tempfile::tempdir().unwrap();
+        let repo_id = "single-startup-load";
+
+        let seeded_graph = kin_db::InMemoryGraph::new();
+        seeded_graph
+            .upsert_entity(&test_entity("loaded_once", "src/loaded.rs"))
+            .unwrap();
+        let seed_backend = kin_db::LocalFileBackend::new(storage.path());
+        seed_backend
+            .save_snapshot(
+                repo_id,
+                &seeded_graph.to_snapshot().to_bytes().unwrap(),
+                kin_db::GENERATION_INIT,
+            )
+            .unwrap();
+
+        let recovery_loads = Arc::new(AtomicU64::new(0));
+        let state = DaemonState::open_with_backend(
+            layout.clone(),
+            Box::new(CleanupFailOnceBackend::counting_load(
+                storage.path(),
+                Arc::clone(&recovery_loads),
+            )),
+            repo_id,
+            None,
+        )
+        .expect("startup must finalize from the graph it already recovered");
+
+        assert_eq!(recovery_loads.load(Ordering::SeqCst), 1);
+        assert_eq!(state.graph.entity_count(), 1);
+        assert_eq!(DaemonState::read_generation_marker(&layout), 1);
+        assert_eq!(
+            kin_db::ReadIndex::load(&layout.kindb_snapshot_path().with_extension("kidx"))
+                .unwrap()
+                .entity_count,
+            1
+        );
+    }
+
+    #[test]
     fn default_local_save_restart_save_recovers_authority_generation() {
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
@@ -3643,6 +3749,63 @@ mod tests {
             reopened.graph.get_entity(&entity.id).unwrap().unwrap().name,
             "authority_only"
         );
+    }
+
+    #[test]
+    fn default_local_finalization_rejects_newer_external_authority() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+        let snapshot_path = layout.kindb_snapshot_path();
+        let index_path = snapshot_path.with_extension("kidx");
+
+        let state = DaemonState::open(layout.clone()).unwrap();
+        state
+            .graph
+            .upsert_entity(&test_entity("daemon_generation", "src/daemon.rs"))
+            .unwrap();
+        state.save_snapshot().unwrap();
+        let daemon_generation = state.snapshot_generation.load(Ordering::SeqCst);
+        let daemon_index_count = kin_db::ReadIndex::load(&index_path).unwrap().entity_count;
+
+        let external_graph = {
+            let snapshot = kin_db::SnapshotManager::open_read_only(&snapshot_path).unwrap();
+            snapshot.graph()
+        };
+        external_graph
+            .upsert_entity(&test_entity("external_generation", "src/external.rs"))
+            .unwrap();
+        let (_, external_generation) =
+            kin_db::SnapshotManager::save_graph_with_expected_generation(
+                &snapshot_path,
+                external_graph.as_ref(),
+                daemon_generation,
+            )
+            .unwrap();
+        assert_eq!(external_generation, daemon_generation + 1);
+
+        state
+            .post_commit_finalization_pending
+            .store(true, Ordering::SeqCst);
+        let error = state
+            .finalize_committed_generation(daemon_generation)
+            .expect_err("derived artifacts must not mix two authority generations");
+        assert!(error.to_string().contains(&format!(
+            "expected generation {daemon_generation}, recovered {external_generation}"
+        )));
+        assert_eq!(
+            DaemonState::read_generation_marker(&layout),
+            daemon_generation,
+            "a failed stale finalization must not publish the newer authority under the old cursor"
+        );
+        assert_eq!(
+            kin_db::ReadIndex::load(&index_path).unwrap().entity_count,
+            daemon_index_count,
+            "a failed stale finalization must preserve the last coherent canonical index"
+        );
+        assert!(state
+            .post_commit_finalization_pending
+            .load(Ordering::SeqCst));
     }
 
     #[test]
@@ -3954,6 +4117,31 @@ mod tests {
         assert!(
             completed.load(Ordering::SeqCst),
             "save_snapshot must complete once the persist lock is released"
+        );
+    }
+
+    #[test]
+    fn locate_only_finalization_invalidates_canonical_index_before_head_marker() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+        let index_path = layout.kindb_snapshot_path().with_extension("kidx");
+        std::fs::write(&index_path, b"stale canonical index").unwrap();
+        let legacy_generation = layout.kindb_dir().join("generation");
+        std::fs::write(&legacy_generation, "0").unwrap();
+        let state = test_state(layout.clone(), repo_dir.path());
+
+        state.finalize_loaded_locate_generation(7).unwrap();
+
+        assert!(
+            !index_path.exists(),
+            "a partial locate graph must never replace or retain a canonical full read index"
+        );
+        assert_eq!(DaemonState::read_generation_marker(&layout), 7);
+        assert_eq!(
+            std::fs::read_to_string(legacy_generation).unwrap(),
+            "0",
+            "locate-only freshness must not mutate KinDB's legacy projection marker"
         );
     }
 
