@@ -1870,6 +1870,13 @@ impl DaemonState {
         if self.post_commit_finalization_pending.load(Ordering::SeqCst) {
             self.finalize_committed_generation(new_gen)?;
         }
+        // The caller's mutation may have been persisted by a concurrent save
+        // that acquired `persist_lock` after the mutation but before an
+        // event-bearing save reached this critical section. In that case this
+        // save is a no-op (`committed == false`) but the graph is already
+        // durable, so release the queued invalidation now. Committed paths have
+        // already drained it during finalization; this second take is a no-op.
+        self.emit_pending_persistence_event();
 
         info!(
             repo_id,

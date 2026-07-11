@@ -11108,6 +11108,62 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn event_bearing_noop_save_emits_after_concurrent_persistence() {
+        let state = test_state();
+        let git_head = setup_daemon_hydration_fixture(&state);
+        let prepared =
+            kin_cli::commands::ref_lookup::prepare_ref_importing_git_if_needed_with_report(
+                state.graph.as_ref(),
+                &state.layout,
+                Some(&git_head),
+            );
+        assert_eq!(prepared.hydrated_changes, 1);
+        prepared.into_result().unwrap();
+        state.bump_version();
+
+        let mut events = state.event_tx.subscribe();
+        state
+            .save_snapshot()
+            .expect("concurrent ordinary save must persist the hydrated graph");
+        state.mark_clean();
+        let persisted_generation = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        state
+            .save_snapshot_with_event(DaemonEvent::GraphRootChanged {
+                old_root_hash: None,
+                new_root_hash: "history-hydration".to_string(),
+            })
+            .expect("event-bearing no-op save must recognize already-durable authority");
+        state.mark_clean();
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            persisted_generation,
+            "the event-bearing save should not invent another generation"
+        );
+        match events
+            .try_recv()
+            .expect("already-durable hydration must release its queued event")
+        {
+            DaemonEvent::GraphRootChanged { new_root_hash, .. } => {
+                assert_eq!(new_root_hash, "history-hydration")
+            }
+            other => panic!("event-bearing no-op save emitted the wrong event: {other:?}"),
+        }
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
     #[tokio::test]
     async fn post_hydration_relative_ref_error_still_publishes_head_graph_growth() {
         let state = test_state();
