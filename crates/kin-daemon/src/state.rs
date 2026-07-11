@@ -126,6 +126,18 @@ pub enum DaemonEvent {
     },
 }
 
+/// Authority owning the graph selected for a daemon request.
+///
+/// HEAD mutations participate in the daemon's durable snapshot/version/event
+/// contract. Session-scope mutations are intentionally private and ephemeral:
+/// publishing them as a HEAD change would invalidate unrelated readers while
+/// persisting a different graph than the one that actually changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestGraphAuthority {
+    Head,
+    SessionScope,
+}
+
 /// Type of entity change for SSE events.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -338,6 +350,11 @@ pub struct DaemonState {
     /// read index have not both been durably finalized yet. A save with no new
     /// graph mutations still retries this work.
     post_commit_finalization_pending: AtomicBool,
+    /// Subscriber invalidation that must wait for durable authority and its
+    /// local generation/index artifacts to finalize. Multiple mutations before
+    /// recovery coalesce because one root invalidation refreshes subscribers to
+    /// the latest durable graph.
+    pending_persistence_event: Mutex<Option<DaemonEvent>>,
     #[cfg(test)]
     finalization_fail_once: AtomicBool,
     /// Monotonically increasing version counter for VFS cache invalidation.
@@ -712,6 +729,7 @@ impl DaemonState {
             storage_backend: None,
             snapshot_generation: AtomicU64::new(generation),
             post_commit_finalization_pending: AtomicBool::new(false),
+            pending_persistence_event: Mutex::new(None),
             #[cfg(test)]
             finalization_fail_once: AtomicBool::new(false),
             vfs_version: AtomicU64::new(persisted_vfs_version),
@@ -864,6 +882,7 @@ impl DaemonState {
             storage_backend: Some(backend),
             snapshot_generation: AtomicU64::new(generation),
             post_commit_finalization_pending: AtomicBool::new(false),
+            pending_persistence_event: Mutex::new(None),
             #[cfg(test)]
             finalization_fail_once: AtomicBool::new(false),
             vfs_version: AtomicU64::new(persisted_vfs_version),
@@ -1547,13 +1566,9 @@ impl DaemonState {
         &self,
         session_id: &kin_model::SessionId,
     ) -> Arc<kin_db::InMemoryGraph> {
-        let scopes = self.session_scopes.read().await;
-        if let Some(scope) = scopes.get(session_id) {
-            if !scope.is_expired() {
-                return Arc::clone(&scope.cached_graph);
-            }
-        }
-        Arc::clone(&self.graph)
+        self.graph_for_request_with_authority(Some(session_id))
+            .await
+            .0
     }
 
     /// Scoped graph for a WRITE (reconcile). Returns the session's private
@@ -1581,9 +1596,83 @@ impl DaemonState {
         &self,
         session_id: Option<&kin_model::SessionId>,
     ) -> Arc<kin_db::InMemoryGraph> {
-        match session_id {
-            Some(sid) => self.graph_for_session(sid).await,
-            None => Arc::clone(&self.graph),
+        self.graph_for_request_with_authority(session_id).await.0
+    }
+
+    /// Resolve both the graph and the authority that owns mutations made to it.
+    /// The pair is chosen under one scope read lock so a caller never mistakes a
+    /// scoped graph for HEAD (or vice versa) because it separately probed scope
+    /// state before resolving the graph.
+    pub(crate) async fn graph_for_request_with_authority(
+        &self,
+        session_id: Option<&kin_model::SessionId>,
+    ) -> (Arc<kin_db::InMemoryGraph>, RequestGraphAuthority) {
+        if let Some(session_id) = session_id {
+            let scopes = self.session_scopes.read().await;
+            if let Some(scope) = scopes.get(session_id) {
+                if !scope.is_expired() {
+                    return (
+                        Arc::clone(&scope.cached_graph),
+                        RequestGraphAuthority::SessionScope,
+                    );
+                }
+            }
+        }
+
+        (Arc::clone(&self.graph), RequestGraphAuthority::Head)
+    }
+
+    /// Resolve the graph authority for a request that may hydrate a Git ref.
+    ///
+    /// Ref hydration mutates the selected graph even though blame/history are
+    /// query surfaces. Treat an active temporal scope like a write lease:
+    /// prune expired entries and refresh the selected scope under the same
+    /// write lock used to clone its graph. This gives hydration a fresh scope
+    /// lease instead of starting from a nearly-expired one. Callers must still
+    /// re-resolve through this method after waiting on the global hydration
+    /// gate because the session scope may have changed while the request was
+    /// queued.
+    pub(crate) async fn graph_for_ref_hydration_with_authority(
+        &self,
+        session_id: Option<&kin_model::SessionId>,
+    ) -> (Arc<kin_db::InMemoryGraph>, RequestGraphAuthority) {
+        if let Some(session_id) = session_id {
+            let mut scopes = self.session_scopes.write().await;
+            scopes.retain(|_, scope| !scope.is_expired());
+            if let Some(scope) = scopes.get_mut(session_id) {
+                scope.created_at = Instant::now();
+                return (
+                    Arc::clone(&scope.cached_graph),
+                    RequestGraphAuthority::SessionScope,
+                );
+            }
+        }
+
+        (Arc::clone(&self.graph), RequestGraphAuthority::Head)
+    }
+
+    /// Revalidate that the authority selected before ref hydration still owns
+    /// the exact graph that was mutated. Session scopes may expire or be
+    /// replaced while synchronous history import is running; in that case the
+    /// old graph is an orphan and must not be acknowledged as current session
+    /// state. HEAD ownership is stable for the daemon lifetime.
+    pub(crate) async fn ref_hydration_authority_is_current(
+        &self,
+        session_id: Option<&kin_model::SessionId>,
+        graph: &Arc<kin_db::InMemoryGraph>,
+        authority: RequestGraphAuthority,
+    ) -> bool {
+        match authority {
+            RequestGraphAuthority::Head => Arc::ptr_eq(graph, &self.graph),
+            RequestGraphAuthority::SessionScope => {
+                let Some(session_id) = session_id else {
+                    return false;
+                };
+                let scopes = self.session_scopes.read().await;
+                scopes.get(session_id).is_some_and(|scope| {
+                    !scope.is_expired() && Arc::ptr_eq(graph, &scope.cached_graph)
+                })
+            }
         }
     }
 
@@ -1597,6 +1686,49 @@ impl DaemonState {
         }
     }
 
+    /// Delay an invalidation until the graph authority commit and its local
+    /// derived artifacts have finalized. One pending event is sufficient to
+    /// make subscribers refresh to the latest graph, so concurrent mutations
+    /// coalesce instead of producing stale intermediate notifications.
+    fn queue_persistence_event(&self, event: DaemonEvent) {
+        let mut pending = self
+            .pending_persistence_event
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending.is_none() {
+            *pending = Some(event);
+        }
+    }
+
+    fn emit_pending_persistence_event(&self) {
+        let event = self
+            .pending_persistence_event
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(event) = event {
+            self.emit_event(event);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_finalization_for_test(&self) {
+        self.finalization_fail_once.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persistence_event_is_queued_for_test(&self) -> bool {
+        self.pending_persistence_event
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn emit_pending_persistence_event_for_test(&self) {
+        self.emit_pending_persistence_event();
+    }
+
     /// Save the current graph via the storage backend (CAS write).
     ///
     /// Returns the new generation on success. Fails if another writer
@@ -1606,14 +1738,22 @@ impl DaemonState {
     /// `.kin/kindb/head-generation` so CLI and MCP processes can detect
     /// when their loaded snapshot is stale (P2-2.7).
     pub fn save_snapshot(&self) -> Result<()> {
-        self.save_snapshot_impl(false)
+        self.save_snapshot_impl(false, None)
+    }
+
+    /// Save graph authority and publish `event` only after the generation that
+    /// contains the caller's mutation has finalized. Queueing happens while
+    /// holding `persist_lock`, so an older in-flight generation cannot consume
+    /// this event before the caller's batch is detached and committed.
+    pub(crate) fn save_snapshot_with_event(&self, event: DaemonEvent) -> Result<()> {
+        self.save_snapshot_impl(false, Some(event))
     }
 
     pub fn save_snapshot_full(&self) -> Result<()> {
-        self.save_snapshot_impl(true)
+        self.save_snapshot_impl(true, None)
     }
 
-    fn save_snapshot_impl(&self, force_full: bool) -> Result<()> {
+    fn save_snapshot_impl(&self, force_full: bool, event: Option<DaemonEvent>) -> Result<()> {
         // Serialize the whole kndb + generation-marker + kidx write sequence
         // against any other save (persist loop, idle flush, embed worker).
         // Without this, two concurrent saves race on the shared tmp paths and
@@ -1623,6 +1763,10 @@ impl DaemonState {
             .persist_lock
             .lock()
             .map_err(|_| DaemonError::Io(std::io::Error::other("persist lock poisoned")))?;
+
+        if let Some(event) = event {
+            self.queue_persistence_event(event);
+        }
 
         let repo_id = self.cached_repo_id.as_str();
         let expected_gen = self.snapshot_generation.load(Ordering::SeqCst);
@@ -1726,6 +1870,13 @@ impl DaemonState {
         if self.post_commit_finalization_pending.load(Ordering::SeqCst) {
             self.finalize_committed_generation(new_gen)?;
         }
+        // The caller's mutation may have been persisted by a concurrent save
+        // that acquired `persist_lock` after the mutation but before an
+        // event-bearing save reached this critical section. In that case this
+        // save is a no-op (`committed == false`) but the graph is already
+        // durable, so release the queued invalidation now. Committed paths have
+        // already drained it during finalization; this second take is a no-op.
+        self.emit_pending_persistence_event();
 
         info!(
             repo_id,
@@ -1842,7 +1993,9 @@ impl DaemonState {
         }
 
         let authority_graph = self.load_committed_authority_graph(generation)?;
-        self.finalize_generation_from_graph(generation, authority_graph.as_ref())
+        self.finalize_generation_from_graph(generation, authority_graph.as_ref())?;
+        self.emit_pending_persistence_event();
+        Ok(())
     }
 
     /// Finish startup artifacts from the graph that was just loaded and
@@ -2613,6 +2766,7 @@ mod tests {
             storage_backend: None,
             snapshot_generation: AtomicU64::new(snapshot_generation),
             post_commit_finalization_pending: AtomicBool::new(false),
+            pending_persistence_event: Mutex::new(None),
             #[cfg(test)]
             finalization_fail_once: AtomicBool::new(false),
             vfs_version: AtomicU64::new(0),

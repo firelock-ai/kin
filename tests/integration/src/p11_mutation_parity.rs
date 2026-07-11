@@ -326,7 +326,9 @@ async fn test_session_reconcile_adds_doc_file() {
         "reconcile should copy new doc files back into the source tree"
     );
 
-    let snapshot = SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
+    let snapshot = kin_cli::backend::open_snapshot_daemon_first_read_only(&layout)
+        .await
+        .unwrap();
     let graph = snapshot.graph();
     assert_eq!(
         graph.entity_count(),
@@ -368,7 +370,9 @@ async fn test_session_reconcile_deletes_doc_file() {
         "reconcile should remove deleted doc files from the source tree",
     );
 
-    let snapshot = SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
+    let snapshot = kin_cli::backend::open_snapshot_daemon_first_read_only(&layout)
+        .await
+        .unwrap();
     let graph = snapshot.graph();
     assert_eq!(
         graph.entity_count(),
@@ -439,7 +443,9 @@ async fn test_session_reconcile_renames_source_file() {
         "new source path should be present after reconcile"
     );
 
-    let snapshot = SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
+    let snapshot = kin_cli::backend::open_snapshot_daemon_first_read_only(&layout)
+        .await
+        .unwrap();
     let graph = snapshot.graph();
     let entities = graph.list_all_entities().unwrap();
     let renamed_entities: Vec<_> = entities
@@ -511,7 +517,9 @@ async fn test_session_reconcile_rejects_broken_source_edit_without_copying_back(
         "broken source edits should stay in the session workspace, not copy back into the repo",
     );
 
-    let reopened = SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
+    let reopened = kin_cli::backend::open_snapshot_daemon_first_read_only(&layout)
+        .await
+        .unwrap();
     let reopened_graph = reopened.graph();
     let entities = reopened_graph.list_all_entities().unwrap();
     assert!(
@@ -594,7 +602,9 @@ async fn test_session_reconcile_ignores_generated_artifacts() {
         "build output should not be copied back into the source tree"
     );
 
-    let snapshot = SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
+    let snapshot = kin_cli::backend::open_snapshot_daemon_first_read_only(&layout)
+        .await
+        .unwrap();
     let graph = snapshot.graph();
     let after_entities = graph.list_all_entities().unwrap();
     let status_after = after_entities
@@ -706,7 +716,9 @@ async fn test_session_edit_test_fix_reconcile_loop() {
         "reconcile should persist the fixed source back to the repo"
     );
 
-    let snapshot = SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
+    let snapshot = kin_cli::backend::open_snapshot_daemon_first_read_only(&layout)
+        .await
+        .unwrap();
     let graph = snapshot.graph();
     let after_entities = graph.list_all_entities().unwrap();
     let status_after = after_entities
@@ -780,7 +792,9 @@ async fn test_session_round_trip() {
         "round trip should persist the edited file back into the source root",
     );
 
-    let snapshot = SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
+    let snapshot = kin_cli::backend::open_snapshot_daemon_first_read_only(&layout)
+        .await
+        .unwrap();
     let graph = snapshot.graph();
     let after_entities = graph.list_all_entities().unwrap();
     let after = after_entities

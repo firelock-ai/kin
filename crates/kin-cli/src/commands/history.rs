@@ -29,6 +29,24 @@ pub struct HistoryExecution {
     pub hydrated_changes: usize,
 }
 
+/// Ref-resolution result prepared before history rendering begins.
+///
+/// Resolving an unimported Git ref mutates the supplied graph. Daemon callers
+/// must acknowledge `hydrated_changes` (persisting HEAD-owned graphs, or
+/// retaining the mutation only in a scoped session graph) before calling
+/// [`render_prepared_history_request`], because entity lookup and rendering can
+/// still fail after hydration has succeeded.
+#[derive(Debug)]
+pub struct PreparedHistoryRequest {
+    resolution: crate::commands::ref_lookup::PreparedRefResolution,
+}
+
+impl PreparedHistoryRequest {
+    pub fn hydrated_changes(&self) -> usize {
+        self.resolution.hydrated_changes
+    }
+}
+
 pub async fn run(entity: String, reference: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
@@ -63,12 +81,34 @@ pub fn execute_history_request(
     graph: &kin_db::InMemoryGraph,
     request: &HistoryRequest,
 ) -> Result<HistoryExecution> {
-    let resolved = crate::commands::ref_lookup::resolve_ref_importing_git_if_needed_with_report(
+    let prepared = prepare_history_request(layout, graph, request)?;
+    let hydrated_changes = prepared.hydrated_changes();
+    let response = render_prepared_history_request(graph, request, prepared)?;
+    Ok(HistoryExecution {
+        response,
+        hydrated_changes,
+    })
+}
+
+pub fn prepare_history_request(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: &HistoryRequest,
+) -> Result<PreparedHistoryRequest> {
+    let resolution = crate::commands::ref_lookup::prepare_ref_importing_git_if_needed_with_report(
         graph,
         layout,
         request.reference.as_deref(),
-    )?;
-    let head = resolved.head;
+    );
+    Ok(PreparedHistoryRequest { resolution })
+}
+
+pub fn render_prepared_history_request(
+    graph: &kin_db::InMemoryGraph,
+    request: &HistoryRequest,
+    prepared: PreparedHistoryRequest,
+) -> Result<HistoryResponse> {
+    let head = prepared.resolution.into_result()?.head;
     let target = match request.reference.as_deref() {
         Some(_) => {
             crate::commands::ref_lookup::resolve_entity_query_at_ref(graph, &request.entity, &head)?
@@ -97,8 +137,5 @@ pub fn execute_history_request(
         }
     }
 
-    Ok(HistoryExecution {
-        response: HistoryResponse { lines },
-        hydrated_changes: resolved.hydrated_changes,
-    })
+    Ok(HistoryResponse { lines })
 }

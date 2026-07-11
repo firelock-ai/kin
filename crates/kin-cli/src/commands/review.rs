@@ -313,6 +313,28 @@ struct ShadowReviewResponseJson<'a> {
     review_mutations: usize,
 }
 
+enum PreparedShadowRender {
+    Precomputed {
+        report: Box<kin_review::ShadowGateReport>,
+        json: bool,
+    },
+    Resolved {
+        request: kin_review::ShadowRequest,
+        json: bool,
+    },
+}
+
+pub struct PreparedShadowRequest {
+    hydrated_changes: usize,
+    render: Result<PreparedShadowRender>,
+}
+
+impl PreparedShadowRequest {
+    pub fn hydrated_changes(&self) -> usize {
+        self.hydrated_changes
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_shadow_run_response(
     layout: &kin_core::KinLayout,
@@ -324,39 +346,93 @@ fn build_shadow_run_response(
     author: Option<String>,
     json: bool,
 ) -> Result<(ReviewResponse, usize)> {
+    let prepared =
+        prepare_shadow_request(layout, graph, base, head, title, source_url, author, json);
+    let hydrated_changes = prepared.hydrated_changes();
+    let response = render_prepared_shadow_request(graph, prepared)?;
+    Ok((response, hydrated_changes))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_shadow_request(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    base: String,
+    head: String,
+    title: Option<String>,
+    source_url: Option<String>,
+    author: Option<String>,
+    json: bool,
+) -> PreparedShadowRequest {
     // The everyday "your branch is behind main" case: base is not on head's
     // ancestry. That gap is provable from the Git commit-parent DAG alone —
     // no semantic hydration needed — so it is checked before either ref pays
     // for a full history import. Returns `None` whenever the fast
     // conclusion can't be drawn, in which case the normal resolve-and-hydrate
     // path below runs exactly as it always has.
-    if let Some(report) =
-        shadow_ancestry_fast_path_gap(graph, layout, &base, &head, &title, &source_url, &author)?
-    {
-        // The fast path never hydrates anything, so this is always a true
-        // zero, not a placeholder.
-        return Ok((shadow_response_from_report(&report, json, 0)?, 0));
+    match shadow_ancestry_fast_path_gap(graph, layout, &base, &head, &title, &source_url, &author) {
+        Ok(Some(report)) => {
+            // The fast path never hydrates anything, so this is always a true
+            // zero, not a placeholder.
+            return PreparedShadowRequest {
+                hydrated_changes: 0,
+                render: Ok(PreparedShadowRender::Precomputed {
+                    report: Box::new(report),
+                    json,
+                }),
+            };
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return PreparedShadowRequest {
+                hydrated_changes: 0,
+                render: Err(error),
+            };
+        }
     }
 
     // Resolve the head ref before the base ref. A review pair is almost always
     // ancestor..descendant, so importing the head first hydrates the full git
     // ancestry in a single pass; the base is then already present in the graph
     // and resolves on the fast path instead of re-walking the shared history.
-    let resolved_head =
-        crate::commands::ref_lookup::resolve_ref_importing_git_if_needed_with_report(
+    let prepared_head =
+        crate::commands::ref_lookup::prepare_ref_importing_git_if_needed_with_report(
             graph,
             layout,
             Some(head.as_str()),
-        )
-        .with_context(|| format!("resolve shadow head ref '{}'", head))?;
-    let resolved_base =
-        crate::commands::ref_lookup::resolve_ref_importing_git_if_needed_with_report(
+        );
+    let mut hydrated_changes = prepared_head.hydrated_changes;
+    let resolved_head = match prepared_head
+        .into_result()
+        .with_context(|| format!("resolve shadow head ref '{}'", head))
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return PreparedShadowRequest {
+                hydrated_changes,
+                render: Err(error),
+            };
+        }
+    };
+    let prepared_base =
+        crate::commands::ref_lookup::prepare_ref_importing_git_if_needed_with_report(
             graph,
             layout,
             Some(base.as_str()),
-        )
-        .with_context(|| format!("resolve shadow base ref '{}'", base))?;
-    let hydrated_changes = resolved_base.hydrated_changes + resolved_head.hydrated_changes;
+        );
+    hydrated_changes += prepared_base.hydrated_changes;
+    let resolved_base = match prepared_base
+        .into_result()
+        .with_context(|| format!("resolve shadow base ref '{}'", base))
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return PreparedShadowRequest {
+                hydrated_changes,
+                render: Err(error),
+            };
+        }
+    };
 
     let request = kin_review::ShadowRequest {
         base_ref: base,
@@ -369,11 +445,26 @@ fn build_shadow_run_response(
         actor: crate::provenance::current_actor_label(),
     };
 
-    let report = kin_review::build_shadow_report(graph, &request)?;
-    Ok((
-        shadow_response_from_report(&report, json, hydrated_changes)?,
+    PreparedShadowRequest {
         hydrated_changes,
-    ))
+        render: Ok(PreparedShadowRender::Resolved { request, json }),
+    }
+}
+
+pub fn render_prepared_shadow_request(
+    graph: &kin_db::InMemoryGraph,
+    prepared: PreparedShadowRequest,
+) -> Result<ReviewResponse> {
+    let hydrated_changes = prepared.hydrated_changes;
+    match prepared.render? {
+        PreparedShadowRender::Precomputed { report, json } => {
+            shadow_response_from_report(&report, json, hydrated_changes)
+        }
+        PreparedShadowRender::Resolved { request, json } => {
+            let report = kin_review::build_shadow_report(graph, &request)?;
+            shadow_response_from_report(&report, json, hydrated_changes)
+        }
+    }
 }
 
 /// Cheap pre-check for the shadow path's `base_not_on_head_ancestry` gap.
