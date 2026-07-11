@@ -234,7 +234,8 @@ def main() -> None:
         "npm test --prefix ./packages/kin",
         "npm test --prefix ./packages/kin-mcp",
         "for package_dir in ./packages/kin ./packages/kin-mcp",
-        'npm pack "$package_dir" --json',
+        "bash scripts/publish-npm-release.sh --preflight",
+        '"$package_dir" "$GITHUB_REF" "$(git rev-parse HEAD)"',
         "npm@11.15.0",
     ):
         require(npm_preflight, policy, "two-package npm preflight")
@@ -282,6 +283,8 @@ def main() -> None:
         "exact bytes, final channel, and provenance verified before skipping publication",
         "short-lived OIDC credential only",
         "anonymous public authority",
+        "--preflight] <package-dir>",
+        'bash "$verify_script"',
         'node "$release_order_script" npm-channel "$package" "$channel"',
         "require_exact_channel",
         "assert-not-rollback",

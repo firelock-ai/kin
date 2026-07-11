@@ -1339,30 +1339,15 @@ jobs:
           env -u NODE_AUTH_TOKEN -u NPM_TOKEN npm install --global npm@11.15.0
           test "$(npm --version)" = "11.15.0"
 
-      - name: Test and pack both public packages before either write
+      - name: Verify both package states before either write
         shell: bash
         run: |
           set -euo pipefail
           npm test --prefix ./packages/kin
           npm test --prefix ./packages/kin-mcp
-          tmp="$(mktemp -d)"
-          trap 'rm -rf "$tmp"' EXIT
-          : > "$tmp/empty-npmrc"
           for package_dir in ./packages/kin ./packages/kin-mcp; do
-            pack_json="$(env -u NODE_AUTH_TOKEN -u NPM_TOKEN \
-              NPM_CONFIG_USERCONFIG="$tmp/empty-npmrc" \
-              npm pack "$package_dir" --json --pack-destination "$tmp")"
-            printf '%s\n' "$pack_json" | node -e '
-              let input = "";
-              process.stdin.on("data", chunk => input += chunk);
-              process.stdin.on("end", () => {
-                const rows = JSON.parse(input);
-                if (rows.length !== 1 || !rows[0].integrity?.startsWith("sha512-") ||
-                    !/^[0-9a-f]{40}$/.test(rows[0].shasum ?? "")) process.exit(1);
-                console.log(rows[0].name + "@" + rows[0].version + " " +
-                  rows[0].integrity + " " + rows[0].shasum);
-              });
-            '
+            bash scripts/publish-npm-release.sh --preflight \
+              "$package_dir" "$GITHUB_REF" "$(git rev-parse HEAD)"
           done
 
   publish_npm_compatibility:

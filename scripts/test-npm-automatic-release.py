@@ -106,16 +106,23 @@ else:
 """
 
 
-FAKE_VERIFY = r"""#!/usr/bin/env python3
+FAKE_VERIFY = r"""#!/usr/bin/env bash
+set -euo pipefail
+if [ -n "${NODE_AUTH_TOKEN:-}" ] || [ -n "${NPM_TOKEN:-}" ]; then
+  echo "fake verifier detected inherited registry credentials" >&2
+  exit 96
+fi
+python3 - "$FAKE_VERIFY_LOG" "$@" <<'PY'
 import json
-import os
 import pathlib
 import sys
 
-if os.environ.get("NODE_AUTH_TOKEN") or os.environ.get("NPM_TOKEN"):
-    print("fake verifier detected inherited registry credentials", file=sys.stderr)
-    raise SystemExit(96)
-pathlib.Path(os.environ["FAKE_VERIFY_LOG"]).write_text(json.dumps(sys.argv[1:]))
+pathlib.Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:]))
+PY
+if [ "${FAKE_VERIFY_FAIL:-0}" = 1 ]; then
+  echo "simulated exact-byte or provenance failure" >&2
+  exit 1
+fi
 """
 
 
@@ -185,7 +192,9 @@ def harness() -> tuple[tempfile.TemporaryDirectory[str], Path, dict[str, str]]:
     bin_dir = tmp / "bin"
     bin_dir.mkdir()
     write_executable(bin_dir / "npm", FAKE_NPM)
-    write_executable(bin_dir / "verify", FAKE_VERIFY)
+    verify_path = bin_dir / "verify"
+    write_executable(verify_path, FAKE_VERIFY)
+    verify_path.chmod(0o644)
     write_executable(bin_dir / "release-order.mjs", FAKE_RELEASE_ORDER)
     package_dir = tmp / "package"
     package_dir.mkdir()
@@ -209,7 +218,7 @@ def harness() -> tuple[tempfile.TemporaryDirectory[str], Path, dict[str, str]]:
 
 
 def run_publish(
-    state: dict[str, object],
+    state: dict[str, object], *, preflight: bool = False, verify_fail: bool = False
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, bytes]]:
     owner, package_dir, env = harness()
     tmp = Path(owner.name)
@@ -217,8 +226,14 @@ def run_publish(
     commit = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
     ).strip()
+    if verify_fail:
+        env["FAKE_VERIFY_FAIL"] = "1"
+    command = ["bash", str(PUBLISHER)]
+    if preflight:
+        command.append("--preflight")
+    command.extend([str(package_dir), REF, commit])
     result = subprocess.run(
-        ["bash", str(PUBLISHER), str(package_dir), REF, commit],
+        command,
         cwd=ROOT,
         env=env,
         text=True,
@@ -232,6 +247,47 @@ def run_publish(
             snapshot[name] = source.read_bytes()
     owner.cleanup()
     return result, snapshot
+
+
+def test_absent_preflight_proves_channel_without_mutation() -> None:
+    result, snapshot = run_publish(base_state(), preflight=True)
+    assert result.returncode == 0, result.stderr
+    state = json.loads(snapshot["state.json"])
+    assert not any(command[:1] == ["publish"] for command in state["commands"])
+    assert "Preflight ready for absent" in result.stdout
+    assert "no registry mutation performed" in result.stdout
+    assert "verify.json" not in snapshot
+    assert "github-output" not in snapshot
+    print("PASS: absent package preflight proves channel with zero mutation authority")
+
+
+def test_existing_preflight_requires_exact_public_proof() -> None:
+    state = base_state(
+        public={PACKAGE: [VERSION], OTHER_PACKAGE: []},
+        tags={PACKAGE: {"latest": VERSION}, OTHER_PACKAGE: {"latest": OLD_VERSION}},
+    )
+    result, snapshot = run_publish(state, preflight=True)
+    assert result.returncode == 0, result.stderr
+    actual = json.loads(snapshot["state.json"])
+    assert not any(command[:1] == ["publish"] for command in actual["commands"])
+    assert "Preflight verified existing" in result.stdout
+    assert "verify.json" in snapshot
+    assert "github-output" not in snapshot
+    print("PASS: existing package preflight verifies bytes, provenance, and channel")
+
+
+def test_bad_existing_package_blocks_absent_sibling_before_any_publish() -> None:
+    state = base_state(
+        public={PACKAGE: [VERSION], OTHER_PACKAGE: []},
+        tags={PACKAGE: {"latest": VERSION}, OTHER_PACKAGE: {"latest": OLD_VERSION}},
+    )
+    result, snapshot = run_publish(state, preflight=True, verify_fail=True)
+    assert result.returncode != 0
+    actual = json.loads(snapshot["state.json"])
+    assert VERSION not in actual["public"][OTHER_PACKAGE]
+    assert not any(command[:1] == ["publish"] for command in actual["commands"])
+    assert "simulated exact-byte or provenance failure" in result.stderr
+    print("PASS: bad existing package blocks absent sibling before either publish job")
 
 
 def test_new_publish() -> None:
@@ -335,6 +391,9 @@ def test_post_publish_channel_read_failure_blocks_finalization() -> None:
 
 
 def main() -> None:
+    test_absent_preflight_proves_channel_without_mutation()
+    test_existing_preflight_requires_exact_public_proof()
+    test_bad_existing_package_blocks_absent_sibling_before_any_publish()
     test_new_publish()
     test_public_rerun_verifies_before_skip()
     test_rejected_publish_fails_without_public_version()

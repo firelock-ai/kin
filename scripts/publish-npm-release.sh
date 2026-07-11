@@ -10,8 +10,12 @@
 
 set -euo pipefail
 
-if [ "$#" -ne 3 ]; then
-  echo "usage: $0 <package-dir> <expected-ref> <expected-commit>" >&2
+mode="publish"
+if [ "$#" -eq 4 ] && [ "$1" = "--preflight" ]; then
+  mode="preflight"
+  shift
+elif [ "$#" -ne 3 ]; then
+  echo "usage: $0 [--preflight] <package-dir> <expected-ref> <expected-commit>" >&2
   exit 2
 fi
 
@@ -90,7 +94,7 @@ if ! printf '%s\n' "$shasum" | grep -Eq '^[0-9a-f]{40}$'; then
   echo "error: npm pack returned an invalid SHA-1 shasum for ${package}@${version}" >&2
   exit 1
 fi
-if [ -n "${GITHUB_OUTPUT:-}" ]; then
+if [ "$mode" = "publish" ] && [ -n "${GITHUB_OUTPUT:-}" ]; then
   {
     echo "package=$package"
     echo "version=$version"
@@ -134,11 +138,15 @@ if [ -n "$public_version" ]; then
     echo "error: npm returned unexpected public identity ${package}@${public_version}" >&2
     exit 1
   fi
-  env -u NODE_AUTH_TOKEN -u NPM_TOKEN "$verify_script" \
+  env -u NODE_AUTH_TOKEN -u NPM_TOKEN bash "$verify_script" \
     "$package" "$version" "$package_dir" "$expected_ref" "$expected_commit"
   require_exact_channel "while verifying an idempotent rerun"
-  echo "${package}@${version} is already public; exact bytes, final channel, and provenance verified before skipping publication."
-  if [ -n "${GITHUB_OUTPUT:-}" ]; then
+  if [ "$mode" = "preflight" ]; then
+    echo "Preflight verified existing ${package}@${version}: exact bytes, final channel, provenance, integrity=${integrity}, shasum=${shasum}."
+  else
+    echo "${package}@${version} is already public; exact bytes, final channel, and provenance verified before skipping publication."
+  fi
+  if [ "$mode" = "publish" ] && [ -n "${GITHUB_OUTPUT:-}" ]; then
     echo "published=false" >> "$GITHUB_OUTPUT"
   fi
   exit 0
@@ -156,6 +164,11 @@ fi
 env -u NODE_AUTH_TOKEN -u NPM_TOKEN \
   node "$release_order_script" assert-not-rollback \
     "$version" "$current" "npm ${package} ${channel}"
+
+if [ "$mode" = "preflight" ]; then
+  echo "Preflight ready for absent ${package}@${version}: ${channel}=${current}, integrity=${integrity}, shasum=${shasum}; no registry mutation performed."
+  exit 0
+fi
 
 set +e
 publish_output="$(env -u NODE_AUTH_TOKEN -u NPM_TOKEN \
@@ -187,7 +200,7 @@ if [ "$publish_status" -ne 0 ]; then
   echo "::warning::npm returned failure after accepting ${package}@${version}; recovering from anonymous public authority."
 fi
 
-env -u NODE_AUTH_TOKEN -u NPM_TOKEN "$verify_script" \
+env -u NODE_AUTH_TOKEN -u NPM_TOKEN bash "$verify_script" \
   "$package" "$version" "$package_dir" "$expected_ref" "$expected_commit"
 require_exact_channel "after publication"
 
