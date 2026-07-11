@@ -350,6 +350,11 @@ pub struct DaemonState {
     /// read index have not both been durably finalized yet. A save with no new
     /// graph mutations still retries this work.
     post_commit_finalization_pending: AtomicBool,
+    /// Subscriber invalidation that must wait for durable authority and its
+    /// local generation/index artifacts to finalize. Multiple mutations before
+    /// recovery coalesce because one root invalidation refreshes subscribers to
+    /// the latest durable graph.
+    pending_persistence_event: Mutex<Option<DaemonEvent>>,
     #[cfg(test)]
     finalization_fail_once: AtomicBool,
     /// Monotonically increasing version counter for VFS cache invalidation.
@@ -724,6 +729,7 @@ impl DaemonState {
             storage_backend: None,
             snapshot_generation: AtomicU64::new(generation),
             post_commit_finalization_pending: AtomicBool::new(false),
+            pending_persistence_event: Mutex::new(None),
             #[cfg(test)]
             finalization_fail_once: AtomicBool::new(false),
             vfs_version: AtomicU64::new(persisted_vfs_version),
@@ -876,6 +882,7 @@ impl DaemonState {
             storage_backend: Some(backend),
             snapshot_generation: AtomicU64::new(generation),
             post_commit_finalization_pending: AtomicBool::new(false),
+            pending_persistence_event: Mutex::new(None),
             #[cfg(test)]
             finalization_fail_once: AtomicBool::new(false),
             vfs_version: AtomicU64::new(persisted_vfs_version),
@@ -1679,6 +1686,36 @@ impl DaemonState {
         }
     }
 
+    /// Delay an invalidation until the graph authority commit and its local
+    /// derived artifacts have finalized. One pending event is sufficient to
+    /// make subscribers refresh to the latest graph, so concurrent mutations
+    /// coalesce instead of producing stale intermediate notifications.
+    pub(crate) fn queue_persistence_event(&self, event: DaemonEvent) {
+        let mut pending = self
+            .pending_persistence_event
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending.is_none() {
+            *pending = Some(event);
+        }
+    }
+
+    fn emit_pending_persistence_event(&self) {
+        let event = self
+            .pending_persistence_event
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(event) = event {
+            self.emit_event(event);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_finalization_for_test(&self) {
+        self.finalization_fail_once.store(true, Ordering::SeqCst);
+    }
+
     /// Save the current graph via the storage backend (CAS write).
     ///
     /// Returns the new generation on success. Fails if another writer
@@ -1924,7 +1961,9 @@ impl DaemonState {
         }
 
         let authority_graph = self.load_committed_authority_graph(generation)?;
-        self.finalize_generation_from_graph(generation, authority_graph.as_ref())
+        self.finalize_generation_from_graph(generation, authority_graph.as_ref())?;
+        self.emit_pending_persistence_event();
+        Ok(())
     }
 
     /// Finish startup artifacts from the graph that was just loaded and
@@ -2695,6 +2734,7 @@ mod tests {
             storage_backend: None,
             snapshot_generation: AtomicU64::new(snapshot_generation),
             post_commit_finalization_pending: AtomicBool::new(false),
+            pending_persistence_event: Mutex::new(None),
             #[cfg(test)]
             finalization_fail_once: AtomicBool::new(false),
             vfs_version: AtomicU64::new(0),
