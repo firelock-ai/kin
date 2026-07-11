@@ -54,9 +54,12 @@ every gate passes.
 
 The daemon container is a separate attested subject. The protected tag workflow
 builds one exact commit-tagged image in GHCR, verifies its embedded source and
-lockfile identity, attaches SLSA provenance to that immutable digest, and
-self-verifies the tag/ref/workflow identity. Later version-tag promotion reuses
-that digest without rebuilding and never writes an implicit `latest` image.
+lockfile identity, then passes that digest to a separate attestation-only job.
+That job re-resolves the commit tag, refuses digest drift, attaches SLSA
+provenance to the immutable digest in GHCR, and self-verifies the repository,
+release workflow, source tag, peeled source commit, and hosted-runner identity.
+It cannot rebuild the image. Later version-tag promotion reuses that digest
+without rebuilding and never writes an implicit `latest` image.
 Hosted infrastructure may copy the exact manifest into its private registry,
 but that operation is a separately attested promotion, not a second build.
 

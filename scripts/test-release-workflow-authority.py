@@ -41,6 +41,7 @@ def main() -> None:
         )
     require(release, 'tags:\n      - "v*.*.*"', "release trigger")
     require(release, "  build_daemon_image:", "release daemon image job")
+    require(release, "  attest_daemon_image:", "release daemon attestation job")
 
     for policy in (
         "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
@@ -51,31 +52,80 @@ def main() -> None:
         require(docker_workflow, policy, "Docker CI authority and smoke gate")
 
     image_start = release.index("  build_daemon_image:")
-    image_end = release.index("\n  build:", image_start)
+    image_end = release.index("\n  attest_daemon_image:", image_start)
     image_job = release[image_start:image_end]
     for policy in (
         "needs: config",
         "environment: release",
         "packages: write",
-        "id-token: write",
-        "attestations: write",
         "ghcr.io/firelock-ai/kin",
         "verify-container-build-info.sh",
+        "docker buildx build",
+    ):
+        require(image_job, policy, "release daemon image build job")
+
+    for forbidden in (
+        "id-token: write",
+        "attestations: write",
+        "actions/attest@",
+    ):
+        if forbidden in image_job:
+            raise AssertionError(
+                f"release daemon image build job contains attestation authority: {forbidden}"
+            )
+
+    attestation_start = release.index("  attest_daemon_image:")
+    attestation_end = release.index("\n  build:", attestation_start)
+    attestation_job = release[attestation_start:attestation_end]
+    for policy in (
+        "needs: [config, build_daemon_image]",
+        "environment: release",
+        "packages: write",
+        "id-token: write",
+        "attestations: write",
+        "EXPECTED_COMMIT: ${{ needs.build_daemon_image.outputs.commit }}",
+        "EXPECTED_DIGEST: ${{ needs.build_daemon_image.outputs.digest }}",
+        'git rev-parse "${GITHUB_REF_NAME}^{commit}"',
+        'reference="${IMAGE}:${COMMIT}"',
+        "docker buildx imagetools inspect",
+        "^sha256:[0-9a-f]{64}$",
+        'if [ "$digest" != "$EXPECTED_DIGEST" ]',
+        '"${IMAGE}@${digest}" "$COMMIT"',
         "Attest immutable daemon image",
+        "actions/attest@a1948c3f048ba23858d222213b7c278aabede763",
         "subject-name: ghcr.io/firelock-ai/kin",
-        "subject-digest: ${{ steps.publish.outputs.digest }}",
+        "subject-digest: ${{ steps.subject.outputs.digest }}",
         "push-to-registry: true",
         "create-storage-record: false",
         "Verify immutable daemon image attestation",
         '"oci://ghcr.io/firelock-ai/kin@${DIGEST}"',
+        "--bundle-from-oci",
         "--predicate-type https://slsa.dev/provenance/v1",
         '--signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"',
         '--signer-digest "$COMMIT"',
-        '--cert-identity "$identity"',
+        '--source-digest "$COMMIT"',
         '--source-ref "$GITHUB_REF"',
         "--deny-self-hosted-runners",
     ):
-        require(image_job, policy, "release daemon image job")
+        require(attestation_job, policy, "release daemon image attestation job")
+
+    if "docker buildx build" in attestation_job or re.search(
+        r"(?m)^\s*docker\s+build\s", attestation_job
+    ):
+        raise AssertionError("release daemon attestation job must not rebuild the image")
+    if image_job.count("docker buildx build") != 1:
+        raise AssertionError("release daemon path must contain exactly one image build command")
+
+    require(
+        release,
+        "needs: [build, notarize_linux, attest_daemon_image]",
+        "public release daemon attestation gate",
+    )
+    require(
+        release,
+        "needs: [publish, install_proof, build_daemon_image, attest_daemon_image]",
+        "version image daemon attestation gate",
+    )
     require(
         release,
         "EXPECTED_SOURCE_DIGEST: ${{ needs.build_daemon_image.outputs.digest }}",
@@ -199,9 +249,9 @@ def main() -> None:
         "us-central1-docker.pkg.dev",
         ":latest",
     ):
-        if forbidden in image_job:
+        if forbidden in image_job or forbidden in attestation_job:
             raise AssertionError(
-                f"release daemon image job contains forbidden authority: {forbidden}"
+                f"release daemon image path contains forbidden authority: {forbidden}"
             )
 
     unpinned: list[str] = []
