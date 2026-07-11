@@ -12,6 +12,16 @@ use std::path::{Path, PathBuf};
 use crate::error::KinDbError;
 use crate::storage::format::{GraphSnapshot, LocateGraphSnapshot};
 
+#[cfg(test)]
+std::thread_local! {
+    static PARENT_SYNC_FAILURE_COUNTDOWN: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_parent_sync_after(successful_syncs: usize) {
+    PARENT_SYNC_FAILURE_COUNTDOWN.with(|countdown| countdown.set(Some(successful_syncs)));
+}
+
 const RECOVERY_MARKER_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,7 +76,7 @@ pub(crate) fn quarantine_corrupt_snapshot(path: &Path, tag: &str) -> Result<Path
             dest.display()
         ))
     })?;
-    sync_parent_dir(path);
+    sync_parent_dir(path)?;
     Ok(dest)
 }
 
@@ -83,11 +93,49 @@ fn write_bytes_and_fsync(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
     Ok(())
 }
 
-fn sync_parent_dir(path: &Path) {
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
+fn sync_parent_dir(path: &Path) -> Result<(), KinDbError> {
+    #[cfg(test)]
+    let inject_failure = PARENT_SYNC_FAILURE_COUNTDOWN.with(|countdown| match countdown.get() {
+        Some(0) => {
+            countdown.set(None);
+            true
         }
+        Some(remaining) => {
+            countdown.set(Some(remaining - 1));
+            false
+        }
+        None => false,
+    });
+    #[cfg(not(test))]
+    let inject_failure = false;
+    if inject_failure {
+        return Err(KinDbError::StorageError(format!(
+            "injected parent-directory fsync failure for {}",
+            path.display()
+        )));
+    }
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        let dir = File::open(parent).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to open parent directory {} for fsync: {error}",
+                parent.display()
+            ))
+        })?;
+        dir.sync_all().map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to fsync parent directory {}: {error}",
+                parent.display()
+            ))
+        })
     }
 }
 
@@ -134,7 +182,7 @@ pub(crate) fn write_recovery_candidate_bytes(path: &Path, bytes: &[u8]) -> Resul
 
     write_bytes_and_fsync(&tmp_path, bytes)?;
     write_bytes_and_fsync(&marker_path, &marker_bytes)?;
-    sync_parent_dir(path);
+    sync_parent_dir(path)?;
     Ok(())
 }
 
@@ -244,7 +292,7 @@ pub(crate) fn promote_recovery_candidate_with_magic(
             path.display()
         ))
     })?;
-    sync_parent_dir(path);
+    sync_parent_dir(path)?;
 
     if let Some(expected) = expected_magic {
         verify_destination_magic(path, expected)?;
@@ -257,7 +305,7 @@ pub(crate) fn promote_recovery_candidate_with_magic(
                 marker_path.display()
             ))
         })?;
-        sync_parent_dir(path);
+        sync_parent_dir(path)?;
     }
 
     Ok(())
@@ -517,6 +565,25 @@ mod tests {
         assert!(
             err.to_string().contains("does not match expected"),
             "expected a magic-mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn atomic_write_propagates_parent_sync_failure_after_rename() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_owned();
+        std::fs::write(&path, b"old").unwrap();
+        fail_parent_sync_after(1);
+
+        let error = atomic_write_bytes_no_magic(&path, b"new")
+            .expect_err("post-rename parent fsync failure must be reported");
+        assert!(error
+            .to_string()
+            .contains("injected parent-directory fsync failure"));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"new",
+            "the error is post-rename and must not be misreported as a pre-commit failure"
         );
     }
 }

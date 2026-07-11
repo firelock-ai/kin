@@ -16,6 +16,10 @@ use crate::error::KinDbError;
 use crate::storage::backend::{Generation, GENERATION_INIT};
 use crate::storage::delta::{apply_graph_delta, GraphSnapshotDelta};
 use crate::storage::format::CompactionStats;
+use crate::storage::local_journal::{
+    delete_quarantined_delta_exact, load_quarantined_deltas, quarantine_delta_path,
+    sync_parent_directory,
+};
 use crate::storage::merkle::compute_graph_root_hash;
 use crate::storage::mmap;
 
@@ -91,7 +95,8 @@ fn local_delta_dir_for(snapshot_path: &Path) -> PathBuf {
     append_suffix(snapshot_path, ".deltas")
 }
 
-const LOCAL_SNAPSHOT_AUTHORITY_VERSION: u32 = 2;
+const LOCAL_SNAPSHOT_AUTHORITY_VERSION: u32 = 3;
+const LOCAL_SNAPSHOT_AUTHORITY_ACKNOWLEDGED_VERSION: u32 = 2;
 const LOCAL_SNAPSHOT_AUTHORITY_LEGACY_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -107,6 +112,10 @@ struct LocalSnapshotAuthority {
     head_generation: Generation,
     snapshot_file: String,
     snapshot_root_hash: String,
+    /// SHA-256 of the complete serialized snapshot, including every truth
+    /// domain and the persisted graph-root trailer.
+    #[serde(default)]
+    snapshot_sha256: String,
     /// Exact byte identities for every acknowledged journal generation.
     /// Deterministic filenames are not immutable when an older writer can
     /// still replace them after the authority head advances.
@@ -124,6 +133,10 @@ std::thread_local! {
     static LOCAL_DELTA_BEFORE_APPLY_READ_HOOK:
         std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static LOCAL_FULL_SAVE_BEFORE_DELTA_CLEANUP_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static LOCAL_CLEANUP_AFTER_QUARANTINE_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static LOCAL_FULL_SAVE_BEFORE_AUTHORITY_COMMIT_HOOK:
         std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
 }
 
@@ -162,6 +175,41 @@ fn run_local_full_save_before_delta_cleanup_hook() {
 #[cfg(not(test))]
 fn run_local_full_save_before_delta_cleanup_hook() {}
 
+#[cfg(test)]
+fn set_local_cleanup_after_quarantine_hook(hook: impl FnOnce() + 'static) {
+    LOCAL_CLEANUP_AFTER_QUARANTINE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_local_cleanup_after_quarantine_hook() {
+    LOCAL_CLEANUP_AFTER_QUARANTINE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_local_cleanup_after_quarantine_hook() {}
+
+#[cfg(test)]
+fn set_local_full_save_before_authority_commit_hook(hook: impl FnOnce() + 'static) {
+    LOCAL_FULL_SAVE_BEFORE_AUTHORITY_COMMIT_HOOK
+        .with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_local_full_save_before_authority_commit_hook() {
+    LOCAL_FULL_SAVE_BEFORE_AUTHORITY_COMMIT_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_local_full_save_before_authority_commit_hook() {}
+
 const LOCAL_LEGACY_REBUILD_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -178,6 +226,34 @@ fn local_authority_path(snapshot_path: &Path) -> PathBuf {
 
 fn local_legacy_rebuild_marker_path(snapshot_path: &Path) -> PathBuf {
     append_suffix(snapshot_path, ".legacy-journal-rebuild.json")
+}
+
+fn local_file_sha256_bytes(path: &Path) -> Result<[u8; 32], KinDbError> {
+    let mut file = File::open(path).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to open {} for digest verification: {error}",
+            path.display()
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to read {} for digest verification: {error}",
+                path.display()
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn local_file_sha256(path: &Path) -> Result<String, KinDbError> {
+    Ok(hex::encode(local_file_sha256_bytes(path)?))
 }
 
 fn read_local_legacy_rebuild_marker(
@@ -355,6 +431,7 @@ fn read_local_authority_manifest_raw(
         ))
     })?;
     if authority.version != LOCAL_SNAPSHOT_AUTHORITY_VERSION
+        && authority.version != LOCAL_SNAPSHOT_AUTHORITY_ACKNOWLEDGED_VERSION
         && authority.version != LOCAL_SNAPSHOT_AUTHORITY_LEGACY_VERSION
     {
         return Err(KinDbError::StorageError(format!(
@@ -391,18 +468,36 @@ fn read_local_authority_manifest_raw(
             versioned_path.display()
         )));
     }
+    if authority.version == LOCAL_SNAPSHOT_AUTHORITY_VERSION {
+        if authority.snapshot_sha256.len() != 64 || hex::decode(&authority.snapshot_sha256).is_err()
+        {
+            return Err(KinDbError::StorageError(format!(
+                "local snapshot authority has an invalid serialized snapshot digest for {}",
+                versioned_path.display()
+            )));
+        }
+        let actual_sha256 = local_file_sha256(&versioned_path)?;
+        if actual_sha256 != authority.snapshot_sha256 {
+            return Err(KinDbError::StorageError(format!(
+                "authoritative local snapshot digest mismatch at {}: expected {}, found {actual_sha256}",
+                versioned_path.display(), authority.snapshot_sha256
+            )));
+        }
+    }
     // Version 1 committed only base/head numbers. Preserve raw access so the
     // explicit rebuild operation can capture and reconcile its unbound
     // journal; normal reads reject journal-bearing v1 authority below.
-    if authority.version == LOCAL_SNAPSHOT_AUTHORITY_LEGACY_VERSION {
-        if !authority.retired_deltas.is_empty() {
-            return Err(KinDbError::StorageError(
-                "legacy local snapshot authority cannot bind retired delta identities".to_string(),
-            ));
-        }
-        if authority.acknowledged_deltas.is_empty() {
-            return Ok(Some(authority));
-        }
+    if authority.version < LOCAL_SNAPSHOT_AUTHORITY_VERSION && !authority.retired_deltas.is_empty()
+    {
+        return Err(KinDbError::StorageError(format!(
+            "local snapshot authority version {} cannot bind retired delta identities; version {LOCAL_SNAPSHOT_AUTHORITY_VERSION} is required",
+            authority.version
+        )));
+    }
+    if authority.version == LOCAL_SNAPSHOT_AUTHORITY_LEGACY_VERSION
+        && authority.acknowledged_deltas.is_empty()
+    {
+        return Ok(Some(authority));
     }
     let expected_delta_count = authority
         .head_generation
@@ -460,6 +555,12 @@ fn read_local_authority_manifest_raw(
                 "local snapshot authority has a retired delta at reserved generation 0".to_string(),
             ));
         }
+        if identity.generation >= authority.snapshot_generation {
+            return Err(KinDbError::StorageError(format!(
+                "local snapshot authority retired delta generation {} is not older than snapshot generation {}",
+                identity.generation, authority.snapshot_generation
+            )));
+        }
         if !bound_generations.insert(identity.generation) {
             return Err(KinDbError::StorageError(format!(
                 "local snapshot authority binds delta generation {} more than once",
@@ -476,16 +577,22 @@ fn read_local_authority_manifest_raw(
     Ok(Some(authority))
 }
 
-fn validate_local_acknowledged_deltas(
-    snapshot_path: &Path,
+fn validate_loaded_local_delta_artifacts(
     authority: &LocalSnapshotAuthority,
+    artifacts: &[(Generation, PathBuf, Vec<u8>)],
 ) -> Result<(), KinDbError> {
     for (index, identity) in authority.acknowledged_deltas.iter().enumerate() {
-        let path = local_delta_path(snapshot_path, identity.generation);
-        if !path.exists() {
+        let Some((_, path, bytes)) = artifacts
+            .iter()
+            .find(|(generation, _, _)| *generation == identity.generation)
+        else {
             if let Some(next) = authority.acknowledged_deltas[index + 1..]
                 .iter()
-                .find(|next| local_delta_path(snapshot_path, next.generation).exists())
+                .find(|next| {
+                    artifacts
+                        .iter()
+                        .any(|(generation, _, _)| *generation == next.generation)
+                })
             {
                 return Err(KinDbError::StorageError(format!(
                     "local delta chain is incomplete: expected generation {}, found {}",
@@ -497,30 +604,17 @@ fn validate_local_acknowledged_deltas(
                 identity.generation - 1,
                 authority.head_generation
             )));
-        }
-        let bytes = std::fs::read(&path).map_err(|error| {
-            KinDbError::StorageError(format!(
-                "acknowledged local delta generation {} is unavailable at {}: {error}",
-                identity.generation,
-                path.display()
-            ))
-        })?;
+        };
         let digest = hex::encode(Sha256::digest(&bytes));
         if digest != identity.sha256 {
             return Err(KinDbError::StorageError(format!(
-                "acknowledged local delta digest mismatch at generation {}: expected {}, found {digest}; a mixed-version writer replaced committed journal bytes",
-                identity.generation, identity.sha256
+                "acknowledged local delta digest mismatch at generation {} while loading replay bytes from {}: expected {}, found {digest}; a mixed-version writer replaced committed journal bytes",
+                identity.generation, path.display(), identity.sha256
             )));
         }
     }
-    Ok(())
-}
 
-fn validate_local_residual_delta_artifacts(
-    snapshot_path: &Path,
-    authority: &LocalSnapshotAuthority,
-) -> Result<(), KinDbError> {
-    for (generation, path) in local_delta_files(snapshot_path)? {
+    for (generation, path, bytes) in artifacts {
         // Non-files cannot be replayed or deleted as journal entries. Keep
         // them out of authority decisions; ordinary filesystem cleanup can
         // handle such fixtures separately.
@@ -530,21 +624,15 @@ fn validate_local_residual_delta_artifacts(
         if authority
             .acknowledged_deltas
             .iter()
-            .any(|identity| identity.generation == generation)
+            .any(|identity| identity.generation == *generation)
         {
             continue;
         }
         if let Some(identity) = authority
             .retired_deltas
             .iter()
-            .find(|identity| identity.generation == generation)
+            .find(|identity| identity.generation == *generation)
         {
-            let bytes = std::fs::read(&path).map_err(|error| {
-                KinDbError::StorageError(format!(
-                    "retired local delta generation {generation} is unavailable at {}: {error}",
-                    path.display()
-                ))
-            })?;
             let digest = hex::encode(Sha256::digest(&bytes));
             if digest != identity.sha256 {
                 return Err(KinDbError::StorageError(format!(
@@ -554,7 +642,7 @@ fn validate_local_residual_delta_artifacts(
             }
             continue;
         }
-        if generation <= authority.head_generation {
+        if *generation <= authority.head_generation {
             return Err(KinDbError::StorageError(format!(
                 "local snapshot authority head {} has an unbound residual delta at generation {generation}; recovery is fail-closed",
                 authority.head_generation
@@ -567,11 +655,59 @@ fn validate_local_residual_delta_artifacts(
     Ok(())
 }
 
+fn finalize_retired_local_quarantines(
+    snapshot_path: &Path,
+    authority: &LocalSnapshotAuthority,
+) -> Result<(), KinDbError> {
+    let quarantined = load_quarantined_deltas(&local_delta_dir_for(snapshot_path))?;
+    for artifact in &quarantined {
+        let Some(identity) = authority
+            .retired_deltas
+            .iter()
+            .find(|identity| identity.generation == artifact.generation)
+        else {
+            return Err(KinDbError::StorageError(format!(
+                "local snapshot {} has an unbound quarantined delta at generation {}; recovery is fail-closed",
+                snapshot_path.display(), artifact.generation
+            )));
+        };
+        if identity.sha256 != artifact.sha256 {
+            return Err(KinDbError::StorageError(format!(
+                "local snapshot {} quarantined delta identity mismatch at generation {}: authority binds {}, quarantine binds {}; recovery is fail-closed",
+                snapshot_path.display(), artifact.generation, identity.sha256, artifact.sha256
+            )));
+        }
+    }
+    for artifact in &quarantined {
+        delete_quarantined_delta_exact(artifact)?;
+    }
+    Ok(())
+}
+
+fn reject_unbound_staged_local_deltas(
+    snapshot_path: &Path,
+    authority: Option<&LocalSnapshotAuthority>,
+) -> Result<(), KinDbError> {
+    let head_generation = authority.map_or(GENERATION_INIT, |authority| authority.head_generation);
+    let artifacts = load_local_delta_artifacts(snapshot_path)?;
+    if let Some((generation, path, _)) = artifacts
+        .iter()
+        .find(|(generation, _, _)| *generation > head_generation)
+    {
+        return Err(KinDbError::StorageError(format!(
+            "local snapshot {} has a staged unacknowledged delta at generation {generation} above authority head {head_generation} in {}; full promotion was not committed and may be retried after the staged writer resolves",
+            snapshot_path.display(), path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn read_local_authority_manifest(
     snapshot_path: &Path,
 ) -> Result<Option<LocalSnapshotAuthority>, KinDbError> {
     let authority = read_local_authority_manifest_raw(snapshot_path)?;
     if let Some(authority) = authority.as_ref() {
+        finalize_retired_local_quarantines(snapshot_path, authority)?;
         let marker = local_legacy_rebuild_marker_path(snapshot_path);
         if marker.exists() {
             return Err(KinDbError::StorageError(format!(
@@ -581,12 +717,28 @@ fn read_local_authority_manifest(
             )));
         }
         let legacy_generation = legacy_generation_hint(snapshot_path)?;
-        if legacy_generation > authority.head_generation {
+        if legacy_generation > authority.snapshot_generation {
             return Err(KinDbError::StorageError(format!(
-                "legacy local writer advanced {} to generation {legacy_generation} beyond atomic authority head {}; drain pre-authority writers before retrying",
+                "legacy local writer advanced {} projection to generation {legacy_generation} beyond atomic authority base {}; drain pre-authority writers before retrying",
                 snapshot_path.display(),
-                authority.head_generation
+                authority.snapshot_generation
             )));
+        }
+        if legacy_generation == authority.head_generation {
+            if let Ok(projection_bytes) = std::fs::read(snapshot_path) {
+                let projection_is_valid =
+                    crate::storage::GraphSnapshot::from_bytes(&projection_bytes).is_ok();
+                let versioned_path =
+                    local_snapshot_versions_dir(snapshot_path).join(&authority.snapshot_file);
+                let authoritative_sha256 = local_file_sha256(&versioned_path)?;
+                let projection_sha256 = hex::encode(Sha256::digest(&projection_bytes));
+                if projection_is_valid && projection_sha256 != authoritative_sha256 {
+                    return Err(KinDbError::StorageError(format!(
+                        "legacy local writer replaced {} with valid snapshot bytes at authority head {legacy_generation}; refusing to erase mixed-version full-snapshot divergence",
+                        snapshot_path.display()
+                    )));
+                }
+            }
         }
         if authority.version == LOCAL_SNAPSHOT_AUTHORITY_LEGACY_VERSION
             && authority.snapshot_generation < authority.head_generation
@@ -598,8 +750,8 @@ fn read_local_authority_manifest(
                 authority.head_generation
             )));
         }
-        validate_local_acknowledged_deltas(snapshot_path, authority)?;
-        validate_local_residual_delta_artifacts(snapshot_path, authority)?;
+        let artifacts = load_local_delta_artifacts(snapshot_path)?;
+        validate_loaded_local_delta_artifacts(authority, &artifacts)?;
     }
     Ok(authority)
 }
@@ -628,26 +780,7 @@ fn write_local_authority(
         ))
     })?;
     let path = local_authority_path(snapshot_path);
-    match mmap::atomic_write_bytes_no_magic(&path, &bytes) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            // The atomic primitive can report a recovery-marker cleanup error
-            // after its rename and parent-directory fsync have already
-            // committed the new authority. Detect that irreversible state so
-            // callers advance their cursor instead of retrying from a stale
-            // generation and colliding with their own successful commit.
-            if std::fs::read(&path).ok().as_deref() == Some(bytes.as_slice()) {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %error,
-                    "local snapshot authority committed with deferred temp-marker cleanup"
-                );
-                Ok(())
-            } else {
-                Err(error)
-            }
-        }
-    }
+    mmap::atomic_write_bytes_no_magic(&path, &bytes)
 }
 
 fn local_delta_path(snapshot_path: &Path, generation: u64) -> PathBuf {
@@ -704,6 +837,25 @@ fn local_delta_files(snapshot_path: &Path) -> Result<Vec<(u64, PathBuf)>, KinDbE
     Ok(files)
 }
 
+fn load_local_delta_artifacts(
+    snapshot_path: &Path,
+) -> Result<Vec<(Generation, PathBuf, Vec<u8>)>, KinDbError> {
+    let mut artifacts = Vec::new();
+    for (generation, path) in local_delta_files(snapshot_path)? {
+        if !path.is_file() {
+            continue;
+        }
+        let bytes = std::fs::read(&path).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to read local delta {}: {error}",
+                path.display()
+            ))
+        })?;
+        artifacts.push((generation, path, bytes));
+    }
+    Ok(artifacts)
+}
+
 fn local_delta_count(snapshot_path: &Path) -> Result<usize, KinDbError> {
     Ok(local_delta_files(snapshot_path)?.len())
 }
@@ -754,13 +906,17 @@ fn apply_local_deltas(
     ),
     KinDbError,
 > {
-    let files = local_delta_files(snapshot_path)?;
+    run_local_delta_before_apply_read_hook();
+    if let Some(authority) = authority {
+        finalize_retired_local_quarantines(snapshot_path, authority)?;
+    }
+    let artifacts = load_local_delta_artifacts(snapshot_path)?;
     let Some(authority) = authority else {
-        if !files.is_empty() {
+        if !artifacts.is_empty() {
             return Err(KinDbError::StorageError(format!(
                 "local snapshot {} has {} deltas but no atomic snapshot-base authority",
                 snapshot_path.display(),
-                files.len()
+                artifacts.len()
             )));
         }
         return Ok((
@@ -770,6 +926,7 @@ fn apply_local_deltas(
             legacy_generation_hint(snapshot_path)?,
         ));
     };
+    validate_loaded_local_delta_artifacts(authority, &artifacts)?;
 
     let mut expected_generation =
         authority
@@ -788,7 +945,7 @@ fn apply_local_deltas(
         return Ok((snapshot, persisted_root_hash, 0, authority.head_generation));
     }
 
-    for (generation, path) in &files {
+    for (generation, _path, bytes) in &artifacts {
         if *generation <= authority.snapshot_generation {
             continue;
         }
@@ -802,13 +959,6 @@ fn apply_local_deltas(
                 "local delta chain is incomplete: expected generation {expected_generation}, found {generation}"
             )));
         }
-        run_local_delta_before_apply_read_hook();
-        let bytes = std::fs::read(path).map_err(|err| {
-            KinDbError::StorageError(format!(
-                "failed to read local delta {}: {err}",
-                path.display()
-            ))
-        })?;
         let identity = authority
             .acknowledged_deltas
             .iter()
@@ -818,14 +968,14 @@ fn apply_local_deltas(
                     "local snapshot authority does not bind delta generation {generation}"
                 ))
             })?;
-        let digest = hex::encode(Sha256::digest(&bytes));
+        let digest = hex::encode(Sha256::digest(bytes));
         if digest != identity.sha256 {
             return Err(KinDbError::StorageError(format!(
                 "acknowledged local delta digest mismatch at generation {generation} while loading replay bytes: expected {}, found {digest}; a mixed-version writer replaced committed journal bytes",
                 identity.sha256
             )));
         }
-        let delta = GraphSnapshotDelta::from_bytes(&bytes)?;
+        let delta = GraphSnapshotDelta::from_bytes(bytes)?;
         let expected_base = generation - 1;
         if delta.base_generation != expected_base {
             return Err(KinDbError::StorageError(format!(
@@ -868,6 +1018,13 @@ fn write_local_delta(
                     snapshot_path.display()
                 )));
             }
+            let legacy_generation = legacy_generation_hint(snapshot_path)?;
+            if legacy_generation != base_generation {
+                return Err(KinDbError::StorageError(format!(
+                    "legacy local snapshot generation mismatch for {}: caller supplied base {base_generation}, projection marker is {legacy_generation}; delta authority bootstrap was not committed",
+                    snapshot_path.display()
+                )));
+            }
             let snapshot_bytes = std::fs::read(snapshot_path).map_err(|error| {
                 KinDbError::StorageError(format!(
                     "failed to read legacy local snapshot {}: {error}",
@@ -887,12 +1044,29 @@ fn write_local_delta(
                 },
             )?;
             mmap::atomic_write_bytes(&versioned_path, &authoritative_snapshot_bytes)?;
+            let confirmed_snapshot_bytes = std::fs::read(snapshot_path).map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to re-read legacy local snapshot {} before delta authority bootstrap: {error}",
+                    snapshot_path.display()
+                ))
+            })?;
+            let confirmed_generation = legacy_generation_hint(snapshot_path)?;
+            if confirmed_snapshot_bytes != snapshot_bytes
+                || confirmed_generation != base_generation
+                || !local_delta_files(snapshot_path)?.is_empty()
+            {
+                return Err(KinDbError::StorageError(format!(
+                    "legacy local snapshot {} changed while bootstrapping delta authority; authority was not committed",
+                    snapshot_path.display()
+                )));
+            }
             let authority = LocalSnapshotAuthority {
                 version: LOCAL_SNAPSHOT_AUTHORITY_VERSION,
                 snapshot_generation: base_generation,
                 head_generation: base_generation,
                 snapshot_file: local_snapshot_file_name(base_generation),
                 snapshot_root_hash: hex::encode(snapshot_root_hash),
+                snapshot_sha256: hex::encode(Sha256::digest(&authoritative_snapshot_bytes)),
                 acknowledged_deltas: Vec::new(),
                 retired_deltas: Vec::new(),
             };
@@ -927,6 +1101,11 @@ fn write_local_delta(
     let path = local_delta_path(snapshot_path, next_generation);
     let bytes = delta.to_bytes()?;
     mmap::atomic_write_bytes_no_magic(&path, &bytes)?;
+    if authority.version < LOCAL_SNAPSHOT_AUTHORITY_VERSION {
+        let versioned_path =
+            local_snapshot_versions_dir(snapshot_path).join(&authority.snapshot_file);
+        authority.snapshot_sha256 = local_file_sha256(&versioned_path)?;
+    }
     authority.version = LOCAL_SNAPSHOT_AUTHORITY_VERSION;
     authority
         .retired_deltas
@@ -1023,17 +1202,15 @@ fn clear_exact_captured_local_deltas(
     captured: &[(Generation, PathBuf, Vec<u8>)],
 ) -> bool {
     let mut complete = true;
-    for (_, path, captured_bytes) in captured {
+    for (generation, path, captured_bytes) in captured {
         // A compare followed by unlink is itself racy: an old writer can
         // replace the deterministic path between those syscalls. Rename the
         // current path entry to a unique same-directory quarantine first.
         // Whatever won the rename race is then stable for byte comparison;
         // mismatches are preserved under a deliberately noncanonical `.kndd`
         // name so every later recovery fails closed.
-        let quarantine_path = path.with_file_name(format!(
-            ".kin-journal-cleanup-{}.kndd",
-            uuid::Uuid::new_v4()
-        ));
+        let captured_sha256 = hex::encode(Sha256::digest(captured_bytes));
+        let quarantine_path = quarantine_delta_path(path, *generation, &captured_sha256);
         match std::fs::rename(path, &quarantine_path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1043,11 +1220,20 @@ fn clear_exact_captured_local_deltas(
                 continue;
             }
         }
+        if let Err(error) = sync_parent_directory(&quarantine_path) {
+            complete = false;
+            tracing::warn!(path = %quarantine_path.display(), error = %error, "journal promotion committed; quarantined delta rename could not be made durable");
+            continue;
+        }
+        run_local_cleanup_after_quarantine_hook();
         match std::fs::read(&quarantine_path) {
             Ok(current_bytes) if current_bytes == *captured_bytes => {
                 if let Err(error) = std::fs::remove_file(&quarantine_path) {
                     complete = false;
                     tracing::warn!(path = %quarantine_path.display(), error = %error, "journal promotion committed; deferred quarantined captured-delta cleanup");
+                } else if let Err(error) = sync_parent_directory(&quarantine_path) {
+                    complete = false;
+                    tracing::warn!(path = %quarantine_path.display(), error = %error, "journal promotion committed; could not fsync captured-delta cleanup");
                 }
             }
             Ok(_) => {
@@ -1690,6 +1876,18 @@ impl SnapshotManager {
         mmap::atomic_write_bytes_no_magic(&cache_path, &bytes)
     }
 
+    fn invalidate_locate_cache(snapshot_path: &Path) -> Result<(), KinDbError> {
+        let cache_path = locate_cache_path_for(snapshot_path);
+        match std::fs::remove_file(&cache_path) {
+            Ok(()) => sync_parent_directory(&cache_path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(KinDbError::StorageError(format!(
+                "failed to invalidate locate cache {}: {error}",
+                cache_path.display()
+            ))),
+        }
+    }
+
     #[cfg(feature = "vector")]
     fn save_vector_index_bundle(
         path: &Path,
@@ -2283,6 +2481,14 @@ impl SnapshotManager {
                     skip_text_index,
                 )
             } else {
+                let deltas = local_delta_files(path)?;
+                if !deltas.is_empty() {
+                    return Err(KinDbError::StorageError(format!(
+                        "local snapshot {} has {} persisted deltas but no base snapshot or atomic authority",
+                        path.display(),
+                        deltas.len()
+                    )));
+                }
                 match text_index_path {
                     Some(p) => {
                         if !read_only {
@@ -2385,7 +2591,14 @@ impl SnapshotManager {
         )
         .entered();
         let authority = read_local_authority_manifest(path)?;
-        if (path.exists() || authority.is_some()) && local_delta_count(path)? > 0 {
+        let pending_deltas = local_delta_count(path)?;
+        if pending_deltas > 0 {
+            if !path.exists() && authority.is_none() {
+                return Err(KinDbError::StorageError(format!(
+                    "local snapshot {} has {pending_deltas} persisted deltas but no base snapshot or atomic authority",
+                    path.display()
+                )));
+            }
             tracing::info!(
                 path = %path.display(),
                 "bypassing locate cache because local snapshot deltas are pending"
@@ -2752,6 +2965,9 @@ impl SnapshotManager {
         } else {
             read_local_authority_manifest(path)?
         };
+        if captured_legacy_journal.is_none() {
+            reject_unbound_staged_local_deltas(path, current_authority.as_ref())?;
+        }
         let current_generation = match current_authority.as_ref() {
             Some(authority) => authority.head_generation,
             None => {
@@ -2831,11 +3047,17 @@ impl SnapshotManager {
         // Bind cleanup to the exact old journal bytes that current authority
         // already proves. Unknown or subsequently replaced artifacts are not
         // eligible for deletion and remain visible to fail-closed recovery.
+        if captured_legacy_journal.is_none() {
+            run_local_full_save_before_authority_commit_hook();
+        }
         let captured_for_cleanup = if captured_legacy_journal.is_none() {
             capture_authority_bound_local_deltas(path, current_authority.as_ref())?
         } else {
             Vec::new()
         };
+        if captured_legacy_journal.is_none() {
+            reject_unbound_staged_local_deltas(path, current_authority.as_ref())?;
+        }
 
         let authority = LocalSnapshotAuthority {
             version: LOCAL_SNAPSHOT_AUTHORITY_VERSION,
@@ -2843,6 +3065,7 @@ impl SnapshotManager {
             head_generation: new_generation,
             snapshot_file: local_snapshot_file_name(new_generation),
             snapshot_root_hash: hex::encode(graph_root_hash),
+            snapshot_sha256: hex::encode(Sha256::digest(&bytes)),
             acknowledged_deltas: Vec::new(),
             retired_deltas: captured_for_cleanup
                 .iter()
@@ -2854,6 +3077,9 @@ impl SnapshotManager {
         };
         write_local_authority(path, &authority)?;
         persistence_attempt.complete();
+        if let Err(error) = Self::invalidate_locate_cache(path) {
+            tracing::warn!(path = %path.display(), error = %error, "full snapshot committed; deferred locate-cache invalidation");
+        }
 
         // Compatibility projection and stale-journal cleanup are downstream of
         // the atomic authority commit. They must never make a committed save
@@ -2900,6 +3126,9 @@ impl SnapshotManager {
         let path = normalize_snapshot_path(path.into());
         let _lock_file = Self::acquire_static_write_lock(&path)?;
         let current_authority = read_local_authority_manifest_raw(&path)?;
+        if let Some(authority) = current_authority.as_ref() {
+            finalize_retired_local_quarantines(&path, authority)?;
+        }
         if let Some(committed_generation) = finalize_marker_only_local_legacy_rebuild(
             &path,
             current_authority.as_ref(),
@@ -3575,6 +3804,23 @@ mod tests {
     }
 
     #[test]
+    fn local_delta_authority_bootstrap_cas_checks_legacy_generation() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        std::fs::write(&path, GraphSnapshot::empty().to_bytes().unwrap()).unwrap();
+        std::fs::write(dir.path().join("generation"), b"7").unwrap();
+        let delta = GraphSnapshotDelta::empty(6);
+
+        let error = write_local_delta(&path, &delta, 6)
+            .expect_err("delta bootstrap must CAS the caller base against the legacy marker");
+        assert!(error
+            .to_string()
+            .contains("caller supplied base 6, projection marker is 7"));
+        assert!(!local_authority_path(&path).exists());
+        assert!(!local_delta_path(&path, 7).exists());
+    }
+
+    #[test]
     fn explicit_snapshot_manager_legacy_rebuild_promotes_caller_reconciled_graph() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");
@@ -3677,6 +3923,65 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_manager_v3_retired_authority_is_rejected_by_a_v2_reader_gate() {
+        #[derive(Deserialize)]
+        struct V2AuthorityEnvelope {
+            version: u32,
+        }
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let graph = InMemoryGraph::new();
+        let (_, base_generation) =
+            SnapshotManager::save_graph_with_generation(&path, &graph).unwrap();
+        graph.upsert_entity(&test_entity("retired_delta")).unwrap();
+        let head_generation = SnapshotManager::save_graph_delta(&path, &graph, base_generation)
+            .unwrap()
+            .unwrap();
+        SnapshotManager::save_graph_with_expected_generation(&path, &graph, head_generation)
+            .unwrap();
+
+        let bytes = std::fs::read(local_authority_path(&path)).unwrap();
+        let old_reader: V2AuthorityEnvelope = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(old_reader.version, LOCAL_SNAPSHOT_AUTHORITY_VERSION);
+        assert!(
+            !matches!(
+                old_reader.version,
+                LOCAL_SNAPSHOT_AUTHORITY_LEGACY_VERSION
+                    | LOCAL_SNAPSHOT_AUTHORITY_ACKNOWLEDGED_VERSION
+            ),
+            "a v2 reader must reject the v3 record before ignoring retired-delta semantics"
+        );
+    }
+
+    #[test]
+    fn local_authority_write_propagates_post_rename_parent_sync_failure() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let snapshot_bytes = GraphSnapshot::empty()
+            .to_bytes_with_persisted_root_hash([0; 32])
+            .unwrap();
+        let authority = LocalSnapshotAuthority {
+            version: LOCAL_SNAPSHOT_AUTHORITY_VERSION,
+            snapshot_generation: 1,
+            head_generation: 1,
+            snapshot_file: local_snapshot_file_name(1),
+            snapshot_root_hash: hex::encode([0; 32]),
+            snapshot_sha256: hex::encode(Sha256::digest(&snapshot_bytes)),
+            acknowledged_deltas: Vec::new(),
+            retired_deltas: Vec::new(),
+        };
+        mmap::fail_parent_sync_after(1);
+
+        let error = write_local_authority(&path, &authority)
+            .expect_err("authority write must not swallow a parent fsync failure");
+        assert!(error
+            .to_string()
+            .contains("injected parent-directory fsync failure"));
+        assert!(local_authority_path(&path).exists());
+    }
+
+    #[test]
     fn local_snapshot_authority_rejects_legacy_marker_ahead() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");
@@ -3688,6 +3993,59 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("legacy local writer advanced"));
+    }
+
+    #[test]
+    fn local_snapshot_authority_rejects_equal_head_legacy_full_divergence() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let graph = InMemoryGraph::new();
+        let (_, generation) = SnapshotManager::save_graph_with_generation(&path, &graph).unwrap();
+        let mut replacement = GraphSnapshot::empty();
+        replacement
+            .file_hashes
+            .insert("legacy-full.rs".to_string(), [4; 32]);
+        let replacement_bytes = replacement.to_bytes().unwrap();
+        mmap::atomic_write_bytes(&path, &replacement_bytes).unwrap();
+        std::fs::write(dir.path().join("generation"), generation.to_string()).unwrap();
+
+        let error = match SnapshotManager::open_without_text_index(&path) {
+            Ok(_) => panic!("valid equal-head legacy full snapshot divergence must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("valid snapshot bytes"));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            replacement_bytes,
+            "projection healing must not erase a valid mixed-version full commit"
+        );
+    }
+
+    #[test]
+    fn local_snapshot_authority_rejects_projection_advanced_to_delta_head() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let graph = InMemoryGraph::new();
+        let (_, base_generation) =
+            SnapshotManager::save_graph_with_generation(&path, &graph).unwrap();
+        graph.upsert_entity(&test_entity("delta")).unwrap();
+        let head_generation = SnapshotManager::save_graph_delta(&path, &graph, base_generation)
+            .unwrap()
+            .unwrap();
+        let mut replacement = GraphSnapshot::empty();
+        replacement
+            .file_hashes
+            .insert("legacy-head.rs".to_string(), [5; 32]);
+        let replacement_bytes = replacement.to_bytes().unwrap();
+        mmap::atomic_write_bytes(&path, &replacement_bytes).unwrap();
+        std::fs::write(dir.path().join("generation"), head_generation.to_string()).unwrap();
+
+        let error = match SnapshotManager::open_without_text_index(&path) {
+            Ok(_) => panic!("legacy marker at delta head must not be treated as the base"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("beyond atomic authority base"));
+        assert_eq!(std::fs::read(&path).unwrap(), replacement_bytes);
     }
 
     #[test]
@@ -3752,7 +4110,7 @@ mod tests {
             .expect("mutation must append a delta");
 
         // A legacy writer replaces the deterministic acknowledged filename
-        // and advances its marker to the same numeric head.
+        // without moving atomic authority.
         mmap::atomic_write_bytes_no_magic(
             &local_delta_path(&path, head_generation),
             &GraphSnapshotDelta::empty(base_generation)
@@ -3760,8 +4118,6 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        std::fs::write(dir.path().join("generation"), head_generation.to_string()).unwrap();
-
         let error = match SnapshotManager::open_without_text_index(&path) {
             Ok(_) => panic!("authority must bind the exact acknowledged delta bytes"),
             Err(error) => error,
@@ -3769,6 +4125,44 @@ mod tests {
         assert!(error
             .to_string()
             .contains("acknowledged local delta digest mismatch"));
+    }
+
+    #[test]
+    fn local_snapshot_authority_binds_non_entity_serialized_truth() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let graph = InMemoryGraph::new();
+        graph.upsert_entity(&test_entity("stable-root")).unwrap();
+        SnapshotManager::save_graph_with_generation(&path, &graph).unwrap();
+        let authority = read_local_authority_manifest_raw(&path).unwrap().unwrap();
+        let versioned_path = local_snapshot_versions_dir(&path).join(&authority.snapshot_file);
+        let bytes = std::fs::read(&versioned_path).unwrap();
+        let (mut snapshot, persisted_root) =
+            GraphSnapshot::from_bytes_with_persisted_root_hash(&bytes).unwrap();
+        let original_graph_root = compute_graph_root_hash(&snapshot);
+        snapshot
+            .file_hashes
+            .insert("tampered-non-entity.rs".to_string(), [8; 32]);
+        assert_eq!(
+            compute_graph_root_hash(&snapshot),
+            original_graph_root,
+            "entity/relation root intentionally does not cover file-hash truth"
+        );
+        let tampered = snapshot
+            .to_bytes_with_persisted_root_hash(persisted_root.unwrap())
+            .unwrap();
+        mmap::atomic_write_bytes(&versioned_path, &tampered).unwrap();
+
+        let error = match SnapshotManager::open_without_text_index(&path) {
+            Ok(_) => panic!("exact serialized authority must reject non-entity tampering"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("authoritative local snapshot digest mismatch"),
+            "unexpected serialized-authority error: {error}"
+        );
     }
 
     #[test]
@@ -3800,6 +4194,52 @@ mod tests {
         assert!(
             error.to_string().contains("while loading replay bytes"),
             "unexpected replay race error: {error}"
+        );
+    }
+
+    #[test]
+    fn local_snapshot_revalidates_retired_delta_replaced_after_manifest_read() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let mgr = SnapshotManager::new(&path);
+        let graph = mgr.graph();
+        graph.upsert_entity(&test_entity("base")).unwrap();
+        mgr.save().unwrap();
+        let base_generation = mgr.generation();
+        graph.upsert_entity(&test_entity("retired_delta")).unwrap();
+        let delta_generation = mgr.save_delta().unwrap().unwrap();
+        drop(mgr);
+
+        set_local_full_save_before_delta_cleanup_hook(|| {
+            panic!("simulated crash before canonical delta cleanup")
+        });
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            SnapshotManager::save_graph_with_expected_generation(
+                &path,
+                graph.as_ref(),
+                delta_generation,
+            )
+            .unwrap();
+        }));
+        assert!(crashed.is_err());
+        assert!(local_delta_path(&path, delta_generation).exists());
+
+        let replacement_path = local_delta_path(&path, delta_generation);
+        let replacement = GraphSnapshotDelta::empty(base_generation)
+            .to_bytes()
+            .unwrap();
+        set_local_delta_before_apply_read_hook(move || {
+            mmap::atomic_write_bytes_no_magic(&replacement_path, &replacement).unwrap();
+        });
+        let error = match SnapshotManager::open_without_text_index(&path) {
+            Ok(_) => panic!("retired bytes replaced after manifest validation must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("retired local delta digest mismatch"),
+            "unexpected retired replay race error: {error}"
         );
     }
 
@@ -3854,8 +4294,103 @@ mod tests {
             Err(error) => error,
         };
         assert!(
-            error.to_string().contains("invalid generation"),
+            error
+                .to_string()
+                .contains("quarantined delta digest mismatch"),
             "unexpected residual-journal error: {error}"
+        );
+    }
+
+    #[test]
+    fn local_snapshot_reopen_finalizes_exact_quarantine_left_by_cleanup_crash() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let mgr = SnapshotManager::new(&path);
+        let graph = mgr.graph();
+        graph.upsert_entity(&test_entity("base")).unwrap();
+        mgr.save().unwrap();
+        graph.upsert_entity(&test_entity("retired_delta")).unwrap();
+        let delta_generation = mgr.save_delta().unwrap().unwrap();
+        drop(mgr);
+
+        set_local_cleanup_after_quarantine_hook(|| panic!("simulated cleanup crash"));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            SnapshotManager::save_graph_with_expected_generation(
+                &path,
+                graph.as_ref(),
+                delta_generation,
+            )
+            .unwrap();
+        }));
+        assert!(crashed.is_err());
+        assert!(!local_delta_path(&path, delta_generation).exists());
+        let quarantined: Vec<_> = std::fs::read_dir(local_delta_dir_for(&path))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".kin-journal-cleanup-"))
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+
+        let reopened = SnapshotManager::open_without_text_index(&path)
+            .expect("exact authority-bound quarantine must be finalized on reopen");
+        assert_eq!(reopened.generation(), delta_generation + 1);
+        assert!(!quarantined[0].exists());
+    }
+
+    #[test]
+    fn local_snapshot_full_save_rejects_a_staged_next_delta_before_commit() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let graph = InMemoryGraph::new();
+        let (_, generation) = SnapshotManager::save_graph_with_generation(&path, &graph).unwrap();
+        std::fs::create_dir_all(local_delta_dir_for(&path)).unwrap();
+        mmap::atomic_write_bytes_no_magic(
+            &local_delta_path(&path, generation + 1),
+            &GraphSnapshotDelta::empty(generation).to_bytes().unwrap(),
+        )
+        .unwrap();
+
+        let error = SnapshotManager::save_graph_with_expected_generation(&path, &graph, generation)
+            .expect_err("full save must not commit over a staged next-generation delta");
+        assert!(error.to_string().contains("staged unacknowledged delta"));
+        assert_eq!(
+            read_local_authority_manifest_raw(&path)
+                .unwrap()
+                .unwrap()
+                .head_generation,
+            generation
+        );
+    }
+
+    #[test]
+    fn local_snapshot_full_save_rechecks_staged_delta_before_authority_commit() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let graph = InMemoryGraph::new();
+        let (_, generation) = SnapshotManager::save_graph_with_generation(&path, &graph).unwrap();
+        let staged_path = local_delta_path(&path, generation + 1);
+        set_local_full_save_before_authority_commit_hook(move || {
+            std::fs::create_dir_all(staged_path.parent().unwrap()).unwrap();
+            mmap::atomic_write_bytes_no_magic(
+                &staged_path,
+                &GraphSnapshotDelta::empty(generation).to_bytes().unwrap(),
+            )
+            .unwrap();
+        });
+
+        let error = SnapshotManager::save_graph_with_expected_generation(&path, &graph, generation)
+            .expect_err("the pre-commit rescan must catch a staged delta from a racing writer");
+        assert!(error.to_string().contains("staged unacknowledged delta"));
+        assert_eq!(
+            read_local_authority_manifest_raw(&path)
+                .unwrap()
+                .unwrap()
+                .head_generation,
+            generation
         );
     }
 
@@ -3871,11 +4406,12 @@ mod tests {
             std::fs::read(local_snapshot_versions_dir(&path).join(authority.snapshot_file))
                 .unwrap();
 
-        // Model an old writer replacing the compatibility bytes and stamping
-        // them with the same base generation. Matching generation metadata is
-        // insufficient when the projection identity is stale.
+        // Model a crash window with stale compatibility bytes and a marker
+        // still behind the newly committed authority. Equal-head valid bytes
+        // are mixed-version divergence and are rejected instead of healed.
         std::fs::write(&path, GraphSnapshot::empty().to_bytes().unwrap()).unwrap();
-        write_local_projection_generation(&path, authority.snapshot_generation).unwrap();
+        write_local_projection_generation(&path, authority.snapshot_generation.saturating_sub(1))
+            .unwrap();
         let reopened = SnapshotManager::open_without_text_index(&path).unwrap();
         assert!(reopened
             .graph()
@@ -4045,6 +4581,7 @@ mod tests {
                 head_generation: generation,
                 snapshot_file: local_snapshot_file_name(generation),
                 snapshot_root_hash: hex::encode(captured_root),
+                snapshot_sha256: hex::encode(Sha256::digest(&captured_bytes)),
                 acknowledged_deltas: Vec::new(),
                 retired_deltas: Vec::new(),
             },
@@ -4350,6 +4887,33 @@ mod tests {
         let path = dir.path().join("does_not_exist.kndb");
         let mgr = SnapshotManager::open(&path).unwrap();
         assert_eq!(mgr.graph().entity_count(), 0);
+    }
+
+    #[test]
+    fn missing_base_with_delta_journal_must_not_open_empty() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        std::fs::create_dir_all(local_delta_dir_for(&path)).unwrap();
+        mmap::atomic_write_bytes_no_magic(
+            &local_delta_path(&path, 1),
+            &GraphSnapshotDelta::empty(GENERATION_INIT)
+                .to_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let error = match SnapshotManager::open_without_text_index(&path) {
+            Ok(_) => panic!("a journal without a base must never open as an empty graph"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("persisted deltas but no base"));
+        let locate_error = match SnapshotManager::open_read_only_for_locate(&path) {
+            Ok(_) => panic!("locate-only open must enforce the same missing-base journal fence"),
+            Err(error) => error,
+        };
+        assert!(locate_error
+            .to_string()
+            .contains("persisted deltas but no base"));
     }
 
     #[test]
