@@ -10825,6 +10825,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cold_head_hydration_survives_restart_without_rehydrating() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let layout = state.layout.clone();
+        let git_head = setup_daemon_hydration_fixture(&state);
+        let imported_change = kin_git::semantic_change_id_from_git_oid_hex(&git_head).unwrap();
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/history")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "entity": "entity_that_does_not_exist",
+                            "reference": git_head,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let committed_generation = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(committed_generation > 0);
+        assert_eq!(
+            DaemonState::read_generation_marker(&layout),
+            committed_generation
+        );
+        assert!(state.graph.get_change(&imported_change).unwrap().is_some());
+        let index_path = layout.kindb_snapshot_path().with_extension("kidx");
+        let index_before_restart = kin_db::ReadIndex::load(&index_path).unwrap();
+        assert_eq!(
+            index_before_restart.entity_count,
+            state.graph.entity_count() as u32
+        );
+
+        drop(state);
+
+        let reopened = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        reopened
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            reopened
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            committed_generation
+        );
+        assert_eq!(
+            DaemonState::read_generation_marker(&layout),
+            committed_generation
+        );
+        assert!(
+            reopened
+                .graph
+                .get_change(&imported_change)
+                .unwrap()
+                .is_some(),
+            "cold HEAD hydration must reopen from durable graph authority"
+        );
+        assert!(
+            !kin_cli::commands::ref_lookup::git_ref_requires_hydration(
+                reopened.graph.as_ref(),
+                &git_head,
+            ),
+            "the reopened graph must recognize the imported Git head"
+        );
+        let reopened_index = kin_db::ReadIndex::load(&index_path).unwrap();
+        assert_eq!(
+            reopened_index.entity_count,
+            reopened.graph.entity_count() as u32
+        );
+
+        let generation_before_warm_read = reopened
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let mut events = reopened.event_tx.subscribe();
+        let response = router(Arc::clone(&reopened))
+            .oneshot(
+                Request::post("/history")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "entity": "hydrated_target",
+                            "reference": git_head,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            reopened
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation_before_warm_read,
+            "a warm ref query must not republish graph authority"
+        );
+        loop {
+            match events.try_recv() {
+                Ok(DaemonEvent::GraphRootChanged { new_root_hash, .. }) => panic!(
+                    "warm ref query after restart must not rehydrate, got new_root_hash={new_root_hash:?}"
+                ),
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn post_hydration_relative_ref_error_still_publishes_head_graph_growth() {
         let state = test_state();
         state
