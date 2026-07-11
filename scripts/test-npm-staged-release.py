@@ -154,6 +154,12 @@ if (command === 'channel') {
   console.log('latest');
 } else if (command === 'npm-channel') {
   const [packageName, channel] = args;
+  state.channel_reads = (state.channel_reads ?? 0) + 1;
+  fs.writeFileSync(statePath, JSON.stringify(state));
+  if (state.scenario === 'fail_post_stage_channel_read' && state.channel_reads >= 2) {
+    console.error('simulated npm registry outage after stage acceptance');
+    process.exit(1);
+  }
   console.log(state.tags?.[packageName]?.[channel] ?? '<none>');
 } else if (command === 'assert-not-rollback') {
   const [candidate, current, label = 'release channel'] = args;
@@ -320,6 +326,18 @@ def test_newer_channel_during_stage_requires_rejection() -> None:
     print("PASS: post-stage channel race fails with mandatory rejection")
 
 
+def test_post_stage_channel_read_failure_requires_rejection() -> None:
+    state = base_state(scenario="fail_post_stage_channel_read")
+    result, snapshot = run_stage(state)
+    assert result.returncode != 0
+    actual = json.loads(snapshot["state.json"])
+    assert actual["staged"][PACKAGE] == {"version": VERSION, "tag": "latest"}
+    assert "could not be re-read afterward" in result.stderr
+    assert "Treat 0.2.16 as pending" in result.stderr
+    assert "reject it before any approval or newer release" in result.stderr
+    print("PASS: post-stage registry outage requires pending-stage rejection")
+
+
 def run_wait(
     state: dict[str, object], attempts: int
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
@@ -402,6 +420,7 @@ def main() -> None:
     test_pending_stage_fails_actionably()
     test_newer_channel_before_stage_fails_without_submission()
     test_newer_channel_during_stage_requires_rejection()
+    test_post_stage_channel_read_failure_requires_rejection()
     test_waits_for_both_approvals()
     test_approval_timeout_blocks_latest()
     test_newer_channel_fails_closed()

@@ -112,6 +112,7 @@ def main() -> None:
         "assert_channel_not_newer after",
         "expected integrity=",
         "Never cut or approve a newer release while this older stage remains pending",
+        "Treat ${version} as pending and reject it before any approval or newer release",
     ):
         require(stager, policy, "OIDC npm staging helper")
     for policy in (

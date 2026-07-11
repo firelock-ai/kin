@@ -123,8 +123,21 @@ fi
 
 assert_channel_not_newer() {
   phase="$1"
+  set +e
   current="$(env -u NODE_AUTH_TOKEN -u NPM_TOKEN \
-    node "$release_order_script" npm-channel "$package" "$channel")"
+    node "$release_order_script" npm-channel "$package" "$channel" 2>&1)"
+  resolve_status=$?
+  set -e
+  if [ "$resolve_status" -ne 0 ]; then
+    printf '%s\n' "$current" >&2
+    if [ "$phase" = "after" ]; then
+      echo "::error::npm accepted the ${package}@${version} stage, but ${package}@${channel} could not be re-read afterward. Treat ${version} as pending and reject it before any approval or newer release unless an authenticated maintainer verifies this same release immediately." >&2
+    else
+      echo "::error::npm ${package}@${channel} could not be re-read immediately before staging ${version}; no stage was submitted." >&2
+    fi
+    return "$resolve_status"
+  fi
+
   set +e
   check_output="$(env -u NODE_AUTH_TOKEN -u NPM_TOKEN \
     node "$release_order_script" assert-not-rollback \
