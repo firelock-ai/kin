@@ -177,10 +177,9 @@ fn backend_artifacts_stay_consistent() {
 
     // Load and reconstruct: snapshot + delta should equal snapshot2.
     let (loaded_bytes, loaded_gen) = backend.load_snapshot("repo1").unwrap().unwrap();
-    // Note: save_delta advances the shared generation counter, so loaded_gen
-    // may be > gen1. The snapshot bytes are still from gen1's save, but the
-    // generation file reflects the latest write (including deltas).
-    assert!(loaded_gen >= gen1, "loaded gen should be >= gen1");
+    // The tuple generation must describe these exact base bytes. The
+    // acknowledged journal head is available through load_snapshot_authority.
+    assert_eq!(loaded_gen, gen1);
 
     let mut loaded_snapshot = GraphSnapshot::from_bytes(&loaded_bytes).unwrap();
     let deltas = backend.load_deltas_since("repo1", gen1).unwrap();

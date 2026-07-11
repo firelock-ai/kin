@@ -38,6 +38,73 @@ fn test_entity(name: &str) -> Entity {
 }
 
 #[test]
+fn static_writer_process_helper() {
+    let Ok(path) = std::env::var("KIN_DB_STATIC_WRITER_PATH") else {
+        return;
+    };
+    let output = std::env::var("KIN_DB_STATIC_WRITER_OUTPUT").unwrap();
+    let name = std::env::var("KIN_DB_STATIC_WRITER_NAME").unwrap();
+    let barrier = std::env::var("KIN_DB_STATIC_WRITER_BARRIER").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !std::path::Path::new(&barrier).exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for static-writer barrier"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let graph = InMemoryGraph::new();
+    graph.upsert_entity(&test_entity(&name)).unwrap();
+    let (_, generation) =
+        SnapshotManager::save_graph_with_generation(std::path::PathBuf::from(path), &graph)
+            .unwrap();
+    std::fs::write(output, generation.to_string()).unwrap();
+}
+
+#[test]
+fn static_full_writers_serialize_across_processes() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("kindb").join("graph.kndb");
+    let barrier = dir.path().join("start");
+    let executable = std::env::current_exe().unwrap();
+    let mut children = Vec::new();
+    for writer in ["first", "second"] {
+        let output = dir.path().join(format!("{writer}.generation"));
+        let child = std::process::Command::new(&executable)
+            .arg("--exact")
+            .arg("static_writer_process_helper")
+            .arg("--nocapture")
+            .env("KIN_DB_STATIC_WRITER_PATH", &path)
+            .env("KIN_DB_STATIC_WRITER_OUTPUT", &output)
+            .env("KIN_DB_STATIC_WRITER_NAME", writer)
+            .env("KIN_DB_STATIC_WRITER_BARRIER", &barrier)
+            .spawn()
+            .unwrap();
+        children.push((child, output));
+    }
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&barrier, b"go").unwrap();
+
+    let mut generations = Vec::new();
+    for (mut child, output) in children {
+        let status = child.wait().unwrap();
+        assert!(status.success(), "static writer child failed: {status}");
+        generations.push(
+            std::fs::read_to_string(output)
+                .unwrap()
+                .parse::<Generation>()
+                .unwrap(),
+        );
+    }
+    generations.sort_unstable();
+    assert_eq!(generations, vec![1, 2]);
+
+    let reopened = SnapshotManager::open_read_only(&path).unwrap();
+    assert_eq!(reopened.generation(), 2);
+    assert_eq!(reopened.graph().list_all_entities().unwrap().len(), 1);
+}
+
+#[test]
 fn flock_prevents_concurrent_open() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("kindb").join("graph.kndb");
