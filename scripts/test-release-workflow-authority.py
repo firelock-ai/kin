@@ -240,6 +240,28 @@ def main() -> None:
     ):
         require(build_job, policy, "cross-platform release lockfile authority")
 
+    publish_start = release.index("  publish:")
+    publish_end = release.index("\n  install_proof:", publish_start)
+    publish_job = release[publish_start:publish_end]
+    aggregate_start = publish_job.index(
+        "      - name: Aggregate per-artifact checksums"
+    )
+    aggregate_end = publish_job.index(
+        "      - name: Verify complete release asset inventory", aggregate_start
+    )
+    aggregate_step = publish_job[aggregate_start:aggregate_end]
+    for policy in (
+        "set -euo pipefail",
+        "tr -d '\\r' < \"$f\" >> checksums-sha256.txt",
+        "grep -q $'\\r' checksums-sha256.txt",
+        "aggregate checksum file still contains carriage returns",
+    ):
+        require(aggregate_step, policy, "cross-platform checksum aggregate")
+    if 'cat "$f" >> checksums-sha256.txt' in aggregate_step:
+        raise AssertionError(
+            "release checksum aggregation must not preserve Windows CRLF bytes"
+        )
+
     windows_start = ci_workflow.index("  windows-installer:")
     windows_end = ci_workflow.index("\n  check:", windows_start)
     windows_job = ci_workflow[windows_start:windows_end]
@@ -341,6 +363,17 @@ def main() -> None:
         require(publisher, policy, "OIDC npm publisher")
 
     verifier = (ROOT / "scripts" / "verify-npm-release.sh").read_text(encoding="utf-8")
+    for policy in (
+        'if remote_integrity="$(printf \'%s\\n\' "$remote_dist" | node -e',
+        'typeof dist.integrity !== "string"',
+        "complete dist metadata with integrity",
+    ):
+        require(verifier, policy, "retryable npm dist metadata verifier")
+    require(
+        ci_workflow,
+        "python3 ./scripts/test-verify-npm-release.py",
+        "partial npm metadata failure-injection regression",
+    )
     for helper_name, helper in (
         ("OIDC npm publisher", publisher),
         ("anonymous npm provenance verifier", verifier),

@@ -40,23 +40,33 @@ local_integrity="$(printf '%s\n' "$pack_json" | node -e '
 ')"
 
 remote_dist=""
+remote_integrity=""
 for attempt in $(seq 1 18); do
   remote_dist="$(env -u NODE_AUTH_TOKEN -u NPM_TOKEN NPM_CONFIG_USERCONFIG="$tmp/empty-npmrc" \
     npm view "${package}@${version}" dist --json 2>/dev/null || true)"
-  if [ -n "$remote_dist" ] && [ "$remote_dist" != "null" ]; then
+  if remote_integrity="$(printf '%s\n' "$remote_dist" | node -e '
+    let input=""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => {
+      try {
+        const dist=JSON.parse(input);
+        if (!dist || Array.isArray(dist) || typeof dist !== "object"
+            || typeof dist.integrity !== "string" || dist.integrity.length === 0) {
+          process.exit(2);
+        }
+        process.stdout.write(dist.integrity);
+      } catch {
+        process.exit(2);
+      }
+    });
+  ')"; then
     break
   fi
+  remote_integrity=""
   if [ "$attempt" -eq 18 ]; then
-    echo "error: npm did not expose ${package}@${version} for identity verification" >&2
+    echo "error: npm did not expose complete dist metadata with integrity for ${package}@${version}" >&2
     exit 1
   fi
   sleep 10
 done
-remote_integrity="$(printf '%s\n' "$remote_dist" | node -e '
-  let input=""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => {
-    const dist=JSON.parse(input); if (!dist.integrity) process.exit(2); process.stdout.write(dist.integrity);
-  });
-')"
 if [ "$remote_integrity" != "$local_integrity" ]; then
   echo "error: ${package}@${version} registry integrity does not match the checked-out package" >&2
   echo "local:  $local_integrity" >&2

@@ -76,6 +76,7 @@ jobs:
           python3 ./scripts/test-release-workflow-authority.py
           python3 ./scripts/test_installer_parity.py
           python3 ./scripts/test-npm-automatic-release.py
+          python3 ./scripts/test-verify-npm-release.py
           node --test \
             ./scripts/release-order.test.mjs \
             ./scripts/verify-npm-attestation.test.mjs
