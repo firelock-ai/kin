@@ -11,6 +11,9 @@ on:
   repository_dispatch:
     types: [dependency-updated]
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
@@ -73,6 +76,7 @@ jobs:
       - name: Test release ordering and npm provenance policy
         run: |
           python3 ./scripts/test-release-workflow-authority.py
+          python3 ./scripts/test-promote-npm-release.py
           node --test \
             ./scripts/release-order.test.mjs \
             ./scripts/verify-npm-attestation.test.mjs

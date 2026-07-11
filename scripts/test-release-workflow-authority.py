@@ -24,6 +24,7 @@ def main() -> None:
     retired = (
         "auto-tag-release.yml",
         "daemon-image.yml",
+        "kin-dependency-wave.yml",
         "publish-install-scripts.yml",
     )
     for name in retired:
@@ -56,13 +57,21 @@ def main() -> None:
         "EXPECTED_SOURCE_DIGEST: ${{ needs.build_daemon_image.outputs.digest }}",
         "release daemon image promotion",
     )
+    require(
+        release,
+        'exec bash scripts/promote-npm-release.sh "${GITHUB_REF_NAME#v}"',
+        "two-package npm promotion",
+    )
+    promoter = (ROOT / "scripts" / "promote-npm-release.sh").read_text(
+        encoding="utf-8"
+    )
     for compensation_policy in (
         "rollback_promotions()",
         "trap 'rollback_promotions $?' ERR",
         "npm promotion failed; restoring every channel changed by this run",
-        "npm ${FINAL_TAG} is already split",
+        "abort_promotion",
     ):
-        require(release, compensation_policy, "two-package npm promotion")
+        require(promoter, compensation_policy, "two-package npm promotion")
     for forbidden in (
         "workflow_dispatch",
         "branches: [main]",
@@ -95,6 +104,15 @@ def main() -> None:
 
     for workflow in sorted(WORKFLOWS.glob("*.yml")):
         content = workflow.read_text(encoding="utf-8")
+        header = content.split("\njobs:", maxsplit=1)[0]
+        if re.search(r"(?m)^permissions:\s*$", header) is None:
+            raise AssertionError(
+                f"{workflow.name} must set explicit top-level token permissions"
+            )
+        if re.search(r"(?m)^  contents:\s*read\s*$", header) is None:
+            raise AssertionError(
+                f"{workflow.name} must default its workflow token to contents: read"
+            )
         main_branch = re.search(
             r"(?m)^\s+branches:\s*\[\s*['\"]?main['\"]?\s*\]\s*$",
             content,
@@ -124,21 +142,6 @@ def main() -> None:
             raise AssertionError(
                 f"{workflow.name} exposes branch-selectable dispatch with a release-capable secret"
             )
-
-    dependency_wave = (WORKFLOWS / "kin-dependency-wave.yml").read_text(
-        encoding="utf-8"
-    )
-    dependency_pin = "d06908b534ad5a70bb0f39a1b2b8d6228acf70a4"
-    require(
-        dependency_wave,
-        f"cargo-dependency-wave.yml@{dependency_pin}",
-        "dependency-wave reusable workflow",
-    )
-    require(
-        dependency_wave,
-        f"kin-actions-ref: {dependency_pin}",
-        "dependency-wave helper checkout",
-    )
 
     print("release workflow authority is tag-only, protected, pinned, and GCP-free")
 
