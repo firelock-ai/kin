@@ -154,8 +154,16 @@ fn generation_staleness_detection() {
         "first save should advance generation"
     );
 
-    // Second save with correct expected generation succeeds.
-    let gen2 = backend.save_snapshot("test", &bytes, gen1).unwrap();
+    // Second save with correct expected generation succeeds with different
+    // content, so a later same-byte replay cannot be an exact idempotent retry.
+    let mut replacement = GraphSnapshot::empty();
+    replacement
+        .file_hashes
+        .insert("replacement.rs".to_string(), [1; 32]);
+    let replacement_bytes = replacement.to_bytes().unwrap();
+    let gen2 = backend
+        .save_snapshot("test", &replacement_bytes, gen1)
+        .unwrap();
     assert!(gen2 > gen1, "second save should advance generation");
 
     // Third save with stale generation (gen1 instead of gen2) should fail.

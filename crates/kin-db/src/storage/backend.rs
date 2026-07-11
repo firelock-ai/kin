@@ -8,7 +8,7 @@
 //! `backend.load_snapshot()` / `backend.save_snapshot()` without knowing
 //! the underlying storage medium.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -17,9 +17,10 @@ use sha2::{Digest, Sha256};
 use crate::error::KinDbError;
 use crate::storage::format::GraphSnapshot;
 use crate::storage::local_journal::{
-    delete_quarantined_delta_exact, load_quarantined_deltas, quarantine_delta_path,
-    sync_parent_directory,
+    delete_quarantined_delta_exact, is_quarantine_delta_name, load_quarantined_deltas,
+    quarantine_delta_path, quarantined_file_matches, sync_parent_directory,
 };
+use crate::storage::mmap::{self, AtomicWriteOutcome};
 
 /// Generation counter for compare-and-swap writes.
 ///
@@ -29,16 +30,6 @@ pub type Generation = u64;
 
 /// Sentinel value indicating no prior generation exists (first write).
 pub const GENERATION_INIT: Generation = 0;
-
-#[cfg(test)]
-std::thread_local! {
-    static LOCAL_PARENT_SYNC_FAILURE_COUNTDOWN: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-fn fail_local_parent_sync_after(successful_syncs: usize) {
-    LOCAL_PARENT_SYNC_FAILURE_COUNTDOWN.with(|countdown| countdown.set(Some(successful_syncs)));
-}
 
 pub(crate) fn checked_next_generation(
     generation: Generation,
@@ -402,6 +393,9 @@ pub struct LocalFileBackend {
     snapshot_before_authority_commit_hook:
         parking_lot::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
     #[cfg(test)]
+    snapshot_after_authority_before_projection_hook:
+        parking_lot::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
+    #[cfg(test)]
     legacy_migration_before_cas_hook:
         parking_lot::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
 }
@@ -416,7 +410,7 @@ struct LocalDeltaIdentity {
     sha256: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct LocalAuthorityRecord {
     version: u32,
     snapshot_generation: Generation,
@@ -447,6 +441,13 @@ struct LocalLegacyRebuildRecord {
     captured_deltas: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalLegacyProjectionIdentity {
+    snapshot_bytes: Option<Vec<u8>>,
+    generation_bytes: Option<Vec<u8>>,
+    generation: Generation,
+}
+
 impl LocalFileBackend {
     /// Create a new local backend rooted at `base_path`.
     pub fn new(base_path: impl Into<PathBuf>) -> Self {
@@ -466,6 +467,8 @@ impl LocalFileBackend {
             cleanup_after_quarantine_hook: parking_lot::Mutex::new(None),
             #[cfg(test)]
             snapshot_before_authority_commit_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            snapshot_after_authority_before_projection_hook: parking_lot::Mutex::new(None),
             #[cfg(test)]
             legacy_migration_before_cas_hook: parking_lot::Mutex::new(None),
         }
@@ -551,12 +554,21 @@ impl LocalFileBackend {
 
     fn read_legacy_generation(&self, repo_id: &str) -> Result<Generation, KinDbError> {
         let gen_path = self.generation_path(repo_id);
-        if !gen_path.exists() {
-            return Ok(GENERATION_INIT);
-        }
-        let contents = std::fs::read_to_string(&gen_path).map_err(|e| {
+        let bytes = match std::fs::symlink_metadata(&gen_path) {
+            Ok(_) => mmap::read_regular_bounded(&gen_path, "legacy generation marker", 64 * 1024)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(GENERATION_INIT)
+            }
+            Err(error) => {
+                return Err(KinDbError::StorageError(format!(
+                    "failed to inspect generation file {}: {error}",
+                    gen_path.display()
+                )))
+            }
+        };
+        let contents = std::str::from_utf8(&bytes).map_err(|error| {
             KinDbError::StorageError(format!(
-                "failed to read generation file {}: {e}",
+                "invalid UTF-8 generation in {}: {error}",
                 gen_path.display()
             ))
         })?;
@@ -565,6 +577,51 @@ impl LocalFileBackend {
         })
     }
 
+    fn capture_legacy_projection_unlocked(
+        &self,
+        repo_id: &str,
+    ) -> Result<LocalLegacyProjectionIdentity, KinDbError> {
+        fn read_optional(path: &Path, role: &str) -> Result<Option<Vec<u8>>, KinDbError> {
+            match std::fs::symlink_metadata(path) {
+                Ok(_) => mmap::read_regular_file(path, role).map(Some),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(KinDbError::StorageError(format!(
+                    "failed to capture {role} {}: {error}",
+                    path.display()
+                ))),
+            }
+        }
+
+        let snapshot_path = self.snapshot_path(repo_id);
+        let generation_path = self.generation_path(repo_id);
+        let snapshot_bytes = read_optional(&snapshot_path, "legacy snapshot projection")?;
+        let generation_bytes = read_optional(&generation_path, "legacy generation marker")?;
+        let generation = match generation_bytes.as_deref() {
+            Some(bytes) => std::str::from_utf8(bytes)
+                .map_err(|error| {
+                    KinDbError::StorageError(format!(
+                        "invalid UTF-8 generation in {}: {error}",
+                        generation_path.display()
+                    ))
+                })?
+                .trim()
+                .parse::<Generation>()
+                .map_err(|error| {
+                    KinDbError::StorageError(format!(
+                        "invalid generation in {}: {error}",
+                        generation_path.display()
+                    ))
+                })?,
+            None => GENERATION_INIT,
+        };
+        Ok(LocalLegacyProjectionIdentity {
+            snapshot_bytes,
+            generation_bytes,
+            generation,
+        })
+    }
+
+    #[cfg(test)]
     fn write_generation(&self, repo_id: &str, gen: Generation) -> Result<(), KinDbError> {
         let gen_path = self.generation_path(repo_id);
         if let Some(parent) = gen_path.parent() {
@@ -575,58 +632,10 @@ impl LocalFileBackend {
                 ))
             })?;
         }
-        // Atomic write: tmp → fsync → rename (crash-safe)
-        let tmp_path = gen_path.with_extension("tmp");
-        let mut file = std::fs::File::create(&tmp_path).map_err(|e| {
-            KinDbError::StorageError(format!(
-                "failed to create tmp generation file {}: {e}",
-                tmp_path.display()
-            ))
-        })?;
-        write!(file, "{}", gen).map_err(|e| {
-            KinDbError::StorageError(format!(
-                "failed to write tmp generation file {}: {e}",
-                tmp_path.display()
-            ))
-        })?;
-        file.sync_all().map_err(|e| {
-            KinDbError::StorageError(format!(
-                "failed to fsync tmp generation file {}: {e}",
-                tmp_path.display()
-            ))
-        })?;
-        std::fs::rename(&tmp_path, &gen_path).map_err(|e| {
-            KinDbError::StorageError(format!(
-                "failed to rename {} → {}: {e}",
-                tmp_path.display(),
-                gen_path.display()
-            ))
-        })?;
-        Self::sync_parent(&gen_path)
+        mmap::atomic_write_bytes_no_magic(&gen_path, gen.to_string().as_bytes())
     }
 
     fn sync_parent(path: &Path) -> Result<(), KinDbError> {
-        #[cfg(test)]
-        let inject_failure =
-            LOCAL_PARENT_SYNC_FAILURE_COUNTDOWN.with(|countdown| match countdown.get() {
-                Some(0) => {
-                    countdown.set(None);
-                    true
-                }
-                Some(remaining) => {
-                    countdown.set(Some(remaining - 1));
-                    false
-                }
-                None => false,
-            });
-        #[cfg(not(test))]
-        let inject_failure = false;
-        if inject_failure {
-            return Err(KinDbError::StorageError(format!(
-                "injected local parent-directory fsync failure for {}",
-                path.display()
-            )));
-        }
         let Some(parent) = path.parent() else {
             return Ok(());
         };
@@ -661,40 +670,7 @@ impl LocalFileBackend {
                 ))
             })?;
         }
-        let tmp_path = path.with_extension(format!(
-            "{}.tmp",
-            path.extension()
-                .and_then(|extension| extension.to_str())
-                .unwrap_or("file")
-        ));
-        {
-            let mut file = std::fs::File::create(&tmp_path).map_err(|error| {
-                KinDbError::StorageError(format!(
-                    "failed to create staged file {}: {error}",
-                    tmp_path.display()
-                ))
-            })?;
-            file.write_all(data).map_err(|error| {
-                KinDbError::StorageError(format!(
-                    "failed to write staged file {}: {error}",
-                    tmp_path.display()
-                ))
-            })?;
-            file.sync_all().map_err(|error| {
-                KinDbError::StorageError(format!(
-                    "failed to fsync staged file {}: {error}",
-                    tmp_path.display()
-                ))
-            })?;
-        }
-        std::fs::rename(&tmp_path, path).map_err(|error| {
-            KinDbError::StorageError(format!(
-                "failed to promote {} to {}: {error}",
-                tmp_path.display(),
-                path.display()
-            ))
-        })?;
-        Self::sync_parent(path)
+        mmap::atomic_write_bytes_no_magic(path, data)
     }
 
     fn snapshot_file_name(generation: Generation) -> String {
@@ -706,12 +682,7 @@ impl LocalFileBackend {
     }
 
     fn file_digest(path: &Path) -> Result<String, KinDbError> {
-        let mut file = std::fs::File::open(path).map_err(|error| {
-            KinDbError::StorageError(format!(
-                "failed to open {} for digest verification: {error}",
-                path.display()
-            ))
-        })?;
+        let mut file = mmap::open_regular_nofollow(path, "digest source")?;
         let mut hasher = Sha256::new();
         let mut buffer = [0u8; 64 * 1024];
         loop {
@@ -997,11 +968,9 @@ impl LocalFileBackend {
         let mut captured = Vec::new();
         for identity in identities {
             let path = self.delta_path(repo_id, identity.generation);
-            let bytes = match std::fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {
-                    continue;
-                }
+            let bytes = match std::fs::symlink_metadata(&path) {
+                Ok(_) => mmap::read_regular_file(&path, "authority-bound delta")?,
+                Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {
                     return Err(KinDbError::StorageError(format!(
                         "failed to capture authority-bound delta {} for repo {repo_id}: {error}",
@@ -1077,22 +1046,24 @@ impl LocalFileBackend {
             if let Some(hook) = self.cleanup_after_quarantine_hook.lock().take() {
                 hook();
             }
-            match std::fs::read(&quarantine_path) {
-                Ok(current_bytes) if current_bytes == *captured_bytes => {
-                    match std::fs::remove_file(&quarantine_path) {
-                        Ok(()) => {
-                            if let Err(error) = Self::sync_parent(&quarantine_path) {
-                                complete = false;
-                                tracing::warn!(repo_id, path = %quarantine_path.display(), error = %error, "journal promotion committed; could not fsync captured-delta cleanup");
-                            }
-                        }
-                        Err(error) => {
+            match quarantined_file_matches(
+                &quarantine_path,
+                &captured_sha256,
+                captured_bytes.len() as u64,
+            ) {
+                Ok(true) => match std::fs::remove_file(&quarantine_path) {
+                    Ok(()) => {
+                        if let Err(error) = Self::sync_parent(&quarantine_path) {
                             complete = false;
-                            tracing::warn!(repo_id, path = %quarantine_path.display(), error = %error, "journal promotion committed; deferred quarantined captured-delta cleanup");
+                            tracing::warn!(repo_id, path = %quarantine_path.display(), error = %error, "journal promotion committed; could not fsync captured-delta cleanup");
                         }
                     }
-                }
-                Ok(_) => {
+                    Err(error) => {
+                        complete = false;
+                        tracing::warn!(repo_id, path = %quarantine_path.display(), error = %error, "journal promotion committed; deferred quarantined captured-delta cleanup");
+                    }
+                },
+                Ok(false) => {
                     complete = false;
                     tracing::warn!(repo_id, path = %path.display(), quarantine = %quarantine_path.display(), "journal promotion preserved a delta that changed after capture");
                 }
@@ -1120,15 +1091,18 @@ impl LocalFileBackend {
         repo_id: &str,
     ) -> Result<Option<LocalAuthorityRecord>, KinDbError> {
         let path = self.authority_path(repo_id);
-        if !path.exists() {
-            return Ok(None);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(KinDbError::StorageError(format!(
+                    "failed to inspect local authority {}: {error}",
+                    path.display()
+                )))
+            }
         }
-        let bytes = std::fs::read(&path).map_err(|error| {
-            KinDbError::StorageError(format!(
-                "failed to read local authority {}: {error}",
-                path.display()
-            ))
-        })?;
+        mmap::confirm_installed_write(&path)?;
+        let bytes = mmap::read_regular_bounded(&path, "local authority", 1024 * 1024)?;
         let record: LocalAuthorityRecord = serde_json::from_slice(&bytes).map_err(|error| {
             KinDbError::StorageError(format!(
                 "invalid local authority {}: {error}",
@@ -1167,15 +1141,17 @@ impl LocalFileBackend {
         repo_id: &str,
     ) -> Result<Option<LocalLegacyRebuildRecord>, KinDbError> {
         let path = self.legacy_rebuild_path(repo_id);
-        if !path.exists() {
-            return Ok(None);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(KinDbError::StorageError(format!(
+                    "failed to inspect local legacy rebuild marker {}: {error}",
+                    path.display()
+                )))
+            }
         }
-        let bytes = std::fs::read(&path).map_err(|error| {
-            KinDbError::StorageError(format!(
-                "failed to read local legacy rebuild marker {}: {error}",
-                path.display()
-            ))
-        })?;
+        let bytes = mmap::read_regular_bounded(&path, "local legacy rebuild marker", 1024 * 1024)?;
         let marker: LocalLegacyRebuildRecord = serde_json::from_slice(&bytes).map_err(|error| {
             KinDbError::StorageError(format!(
                 "invalid local legacy rebuild marker {}: {error}",
@@ -1239,13 +1215,21 @@ impl LocalFileBackend {
         let Some(record) = record else {
             return Ok(None);
         };
-        self.finalize_retired_quarantines_unlocked(repo_id, &record)?;
         let rebuild_path = self.legacy_rebuild_path(repo_id);
-        if rebuild_path.exists() {
-            return Err(KinDbError::StorageError(format!(
-                "repo {repo_id} has a pending legacy-journal rebuild marker {}; retry the explicit rebuild after quiescing legacy writers",
-                rebuild_path.display()
-            )));
+        match std::fs::symlink_metadata(&rebuild_path) {
+            Ok(_) => {
+                return Err(KinDbError::StorageError(format!(
+                    "repo {repo_id} has a pending legacy-journal rebuild marker {}; retry the explicit rebuild after quiescing legacy writers",
+                    rebuild_path.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(KinDbError::StorageError(format!(
+                    "failed to inspect legacy-journal rebuild marker {}: {error}",
+                    rebuild_path.display()
+                )))
+            }
         }
         let legacy_generation = self.read_legacy_generation(repo_id)?;
         if legacy_generation > record.snapshot_generation {
@@ -1256,7 +1240,20 @@ impl LocalFileBackend {
         }
         if legacy_generation == record.head_generation {
             let projection_path = self.snapshot_path(repo_id);
-            if let Ok(projection_bytes) = std::fs::read(&projection_path) {
+            let projection_bytes = match std::fs::symlink_metadata(&projection_path) {
+                Ok(_) => Some(mmap::read_regular_file(
+                    &projection_path,
+                    "legacy snapshot projection",
+                )?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(KinDbError::StorageError(format!(
+                        "failed to inspect legacy snapshot projection {}: {error}",
+                        projection_path.display()
+                    )))
+                }
+            };
+            if let Some(projection_bytes) = projection_bytes {
                 let projection_is_valid = GraphSnapshot::from_bytes(&projection_bytes).is_ok();
                 let projection_sha256 = Self::snapshot_digest(&projection_bytes);
                 if projection_is_valid && projection_sha256 != record.snapshot_sha256 {
@@ -1280,34 +1277,106 @@ impl LocalFileBackend {
         Ok(Some(record))
     }
 
+    fn read_authoritative_snapshot_bytes_unlocked(
+        &self,
+        repo_id: &str,
+        record: &LocalAuthorityRecord,
+    ) -> Result<Vec<u8>, KinDbError> {
+        let path = self.snapshots_dir(repo_id).join(&record.snapshot_file);
+        let snapshot_bytes = mmap::read_regular_file(&path, "authoritative snapshot")?;
+        let digest = Self::snapshot_digest(&snapshot_bytes);
+        if digest != record.snapshot_sha256 {
+            return Err(KinDbError::StorageError(format!(
+                "authoritative snapshot digest mismatch for repo {repo_id}: expected {}, found {digest}",
+                record.snapshot_sha256
+            )));
+        }
+        GraphSnapshot::from_bytes(&snapshot_bytes).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "authoritative snapshot payload for repo {repo_id} is invalid: {error}"
+            ))
+        })?;
+        Ok(snapshot_bytes)
+    }
+
     fn refresh_compatibility_projection_unlocked(
         &self,
         repo_id: &str,
         record: &LocalAuthorityRecord,
         snapshot_bytes: &[u8],
+        expected: &LocalLegacyProjectionIdentity,
     ) {
-        // graph.kndb and graph.kndb.gen are one compatibility pair. The
-        // projection contains the immutable base bytes, so its marker is the
-        // base generation even when authority has acknowledged later deltas.
-        // Bytes are promoted first; a crash before the marker write is healed
-        // on the next locked load.
         let snapshot_path = self.snapshot_path(repo_id);
-        let projection_generation = self.read_legacy_generation(repo_id).ok();
-        let projection_matches_authority = snapshot_path.is_file()
-            && Self::file_digest(&snapshot_path)
-                .is_ok_and(|digest| digest == record.snapshot_sha256);
-        if !projection_matches_authority
-            || projection_generation != Some(record.snapshot_generation)
+        let generation_path = self.generation_path(repo_id);
+        let generation_bytes = record.snapshot_generation.to_string();
+        if expected.snapshot_bytes.as_deref() == Some(snapshot_bytes)
+            && expected.generation_bytes.as_deref() == Some(generation_bytes.as_bytes())
         {
-            if let Err(error) = Self::atomic_write(&snapshot_path, snapshot_bytes) {
-                tracing::warn!(repo_id, error = %error, "failed to heal local graph.kndb projection");
+            return;
+        }
+        let snapshot_claim = match mmap::claim_exact_path(
+            &snapshot_path,
+            expected.snapshot_bytes.as_deref(),
+            "legacy snapshot projection",
+        ) {
+            Ok(claim) => claim,
+            Err(error) => {
+                tracing::warn!(repo_id, error = %error, "preserved a racing legacy snapshot projection");
                 return;
             }
-        }
-        if projection_generation != Some(record.snapshot_generation) {
-            if let Err(error) = self.write_generation(repo_id, record.snapshot_generation) {
-                tracing::warn!(repo_id, error = %error, "failed to heal legacy generation projection");
+        };
+        let generation_claim = match mmap::claim_exact_path(
+            &generation_path,
+            expected.generation_bytes.as_deref(),
+            "legacy generation marker",
+        ) {
+            Ok(claim) => claim,
+            Err(error) => {
+                let _ = snapshot_claim.restore();
+                tracing::warn!(repo_id, error = %error, "preserved a racing legacy generation marker");
+                return;
             }
+        };
+
+        let snapshot_published = match mmap::publish_new_file_no_clobber(
+            &snapshot_path,
+            snapshot_bytes,
+            "legacy snapshot projection",
+        ) {
+            Ok(published) => published,
+            Err(error) => {
+                let _ = generation_claim.restore();
+                let _ = snapshot_claim.restore();
+                tracing::warn!(repo_id, error = %error, "failed to publish graph.kndb projection without clobbering");
+                return;
+            }
+        };
+        if snapshot_published {
+            match mmap::publish_new_file_no_clobber(
+                &generation_path,
+                generation_bytes.as_bytes(),
+                "legacy generation marker",
+            ) {
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = generation_claim.restore();
+                    let _ = snapshot_claim.release();
+                    tracing::warn!(repo_id, error = %error, "failed to publish projection generation without clobbering");
+                    return;
+                }
+            }
+        }
+        if snapshot_published {
+            let _ = generation_claim.release();
+        } else {
+            let _ = generation_claim.restore();
+        }
+        let _ = snapshot_claim.release();
+        if !snapshot_published {
+            tracing::warn!(
+                repo_id,
+                "preserved a racing legacy full-snapshot commit after authority promotion"
+            );
         }
     }
 
@@ -1384,21 +1453,18 @@ impl LocalFileBackend {
         repo_id: &str,
     ) -> Result<Option<SnapshotAuthority>, KinDbError> {
         if let Some(record) = self.read_authority_record_unlocked(repo_id)? {
-            let path = self.snapshots_dir(repo_id).join(&record.snapshot_file);
-            let snapshot_bytes = std::fs::read(&path).map_err(|error| {
-                KinDbError::StorageError(format!(
-                    "failed to read authoritative snapshot {}: {error}",
-                    path.display()
-                ))
-            })?;
-            let digest = Self::snapshot_digest(&snapshot_bytes);
-            if digest != record.snapshot_sha256 {
-                return Err(KinDbError::StorageError(format!(
-                    "authoritative snapshot digest mismatch for repo {repo_id}: expected {}, found {digest}",
-                    record.snapshot_sha256
-                )));
-            }
-            self.refresh_compatibility_projection_unlocked(repo_id, &record, &snapshot_bytes);
+            let snapshot_bytes =
+                self.read_authoritative_snapshot_bytes_unlocked(repo_id, &record)?;
+            // Cleanup is downstream of both authority-directory durability and
+            // exact authoritative payload verification.
+            self.finalize_retired_quarantines_unlocked(repo_id, &record)?;
+            let projection_identity = self.capture_legacy_projection_unlocked(repo_id)?;
+            self.refresh_compatibility_projection_unlocked(
+                repo_id,
+                &record,
+                &snapshot_bytes,
+                &projection_identity,
+            );
             if let Err(error) =
                 self.clear_superseded_snapshots_unlocked(repo_id, record.snapshot_generation)
             {
@@ -1411,6 +1477,13 @@ impl LocalFileBackend {
             }));
         }
 
+        let unbound_quarantines = load_quarantined_deltas(&self.deltas_dir(repo_id))?;
+        if !unbound_quarantines.is_empty() {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id} has {} quarantined deltas but no atomic authority; recovery is fail-closed",
+                unbound_quarantines.len()
+            )));
+        }
         let legacy_path = self.snapshot_path(repo_id);
         if !legacy_path.exists() {
             return Ok(None);
@@ -1420,12 +1493,8 @@ impl LocalFileBackend {
                 "legacy local repo {repo_id} has deltas but no persisted snapshot-base authority; refusing unprovable replay"
             )));
         }
-        let snapshot_bytes = std::fs::read(&legacy_path).map_err(|error| {
-            KinDbError::StorageError(format!(
-                "failed to read legacy snapshot {}: {error}",
-                legacy_path.display()
-            ))
-        })?;
+        let projection_identity = self.capture_legacy_projection_unlocked(repo_id)?;
+        let snapshot_bytes = mmap::read_regular_file(&legacy_path, "legacy snapshot")?;
         let _snapshot = GraphSnapshot::from_bytes(&snapshot_bytes)?;
         let generation = self.read_legacy_generation(repo_id)?;
         let versioned_path = self.versioned_snapshot_path(repo_id, generation);
@@ -1434,12 +1503,8 @@ impl LocalFileBackend {
         if let Some(hook) = self.legacy_migration_before_cas_hook.lock().take() {
             hook();
         }
-        let confirmed_snapshot_bytes = std::fs::read(&legacy_path).map_err(|error| {
-            KinDbError::StorageError(format!(
-                "failed to re-read legacy snapshot {} before authority migration: {error}",
-                legacy_path.display()
-            ))
-        })?;
+        let confirmed_snapshot_bytes =
+            mmap::read_regular_file(&legacy_path, "legacy snapshot CAS source")?;
         let confirmed_generation = self.read_legacy_generation(repo_id)?;
         if confirmed_snapshot_bytes != snapshot_bytes
             || confirmed_generation != generation
@@ -1459,7 +1524,12 @@ impl LocalFileBackend {
             retired_deltas: Vec::new(),
         };
         self.write_authority_unlocked(repo_id, &record)?;
-        self.refresh_compatibility_projection_unlocked(repo_id, &record, &snapshot_bytes);
+        self.refresh_compatibility_projection_unlocked(
+            repo_id,
+            &record,
+            &snapshot_bytes,
+            &projection_identity,
+        );
         if let Err(error) = self.clear_superseded_snapshots_unlocked(repo_id, generation) {
             tracing::warn!(repo_id, error = %error, "deferred superseded local snapshot cleanup");
         }
@@ -1479,13 +1549,14 @@ impl LocalFileBackend {
             KinDbError::StorageError(format!("failed to encode local authority: {error}"))
         })?;
         let path = self.authority_path(repo_id);
-        match Self::atomic_write(&path, &bytes) {
-            Ok(()) => Ok(()),
-            Err(error) if std::fs::read(&path).ok().as_deref() == Some(bytes.as_slice()) => {
-                tracing::warn!(repo_id, path = %path.display(), error = %error, "local authority rename installed the new cursor with deferred directory durability confirmation");
-                Ok(())
+        match mmap::atomic_write_bytes_no_magic_outcome(&path, &bytes)? {
+            AtomicWriteOutcome::Durable => Ok(()),
+            AtomicWriteOutcome::InstalledButNotSynced(error) => {
+                Err(KinDbError::StorageError(format!(
+                    "local authority {} was installed but its parent-directory durability is unconfirmed: {error}",
+                    path.display()
+                )))
             }
-            Err(error) => Err(error),
         }
     }
 
@@ -1510,6 +1581,9 @@ impl LocalFileBackend {
                 KinDbError::StorageError(format!("failed to read delta entry: {error}"))
             })?;
             let path = entry.path();
+            if is_quarantine_delta_name(&path) {
+                continue;
+            }
             if path.extension().and_then(|extension| extension.to_str()) != Some("kndd") {
                 continue;
             }
@@ -1546,14 +1620,7 @@ impl LocalFileBackend {
         entries
             .into_iter()
             .map(|(generation, path)| {
-                std::fs::read(&path)
-                    .map(|bytes| (bytes, generation))
-                    .map_err(|error| {
-                        KinDbError::StorageError(format!(
-                            "failed to read delta {}: {error}",
-                            path.display()
-                        ))
-                    })
+                mmap::read_regular_file(&path, "local delta").map(|bytes| (bytes, generation))
             })
             .collect()
     }
@@ -1594,6 +1661,14 @@ impl LocalFileBackend {
     #[cfg(test)]
     fn set_snapshot_before_authority_commit_hook(&self, hook: impl FnOnce() + Send + 'static) {
         *self.snapshot_before_authority_commit_hook.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn set_snapshot_after_authority_before_projection_hook(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        *self.snapshot_after_authority_before_projection_hook.lock() = Some(Box::new(hook));
     }
 
     #[cfg(test)]
@@ -1669,6 +1744,7 @@ impl StorageBackend for LocalFileBackend {
         let _lock = self.acquire_lock(repo_id)?;
         let current = self.load_authority_unlocked(repo_id)?;
         let current_record = self.read_authority_record_raw_unlocked(repo_id)?;
+        let projection_identity = self.capture_legacy_projection_unlocked(repo_id)?;
         match (current.as_ref(), current_record.as_ref()) {
             (Some(authority), Some(record))
                 if authority.snapshot_generation == record.snapshot_generation
@@ -1682,10 +1758,29 @@ impl StorageBackend for LocalFileBackend {
                 )));
             }
         }
-        self.reject_unbound_staged_deltas_unlocked(repo_id, current_record.as_ref())?;
         let current_gen = current
             .as_ref()
             .map_or(GENERATION_INIT, |authority| authority.head_generation);
+        let requested_digest = Self::snapshot_digest(data);
+        if let Some(record) = current_record.as_ref() {
+            let retry_generation = expected_gen.checked_add(1);
+            if retry_generation == Some(record.head_generation)
+                && record.snapshot_generation == record.head_generation
+                && record.snapshot_sha256 == requested_digest
+                && current.as_ref().is_some_and(|authority| {
+                    authority.snapshot_generation == record.snapshot_generation
+                        && authority.head_generation == record.head_generation
+                        && Self::snapshot_digest(&authority.snapshot_bytes) == requested_digest
+                })
+            {
+                // Exact serialized-content retries are idempotent whether the
+                // retained recovery marker survived or its cleanup already
+                // completed. Re-sync the authority directory before accepting.
+                mmap::sync_parent_dir(&self.authority_path(repo_id))?;
+                return Ok(record.head_generation);
+            }
+        }
+        self.reject_unbound_staged_deltas_unlocked(repo_id, current_record.as_ref())?;
         if current_gen != expected_gen {
             return Err(KinDbError::StorageError(format!(
                 "generation mismatch for repo {repo_id}: expected {expected_gen}, found {current_gen} \
@@ -1718,22 +1813,45 @@ impl StorageBackend for LocalFileBackend {
         let captured_for_cleanup =
             self.capture_authority_bound_deltas_unlocked(repo_id, current_record.as_ref())?;
         self.reject_unbound_staged_deltas_unlocked(repo_id, current_record.as_ref())?;
+        if self.capture_authority_bound_deltas_unlocked(repo_id, current_record.as_ref())?
+            != captured_for_cleanup
+            || self.read_authority_record_raw_unlocked(repo_id)? != current_record
+            || self.capture_legacy_projection_unlocked(repo_id)? != projection_identity
+        {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id} authority, journal, or legacy full-snapshot projection changed during full promotion; authority was not committed"
+            )));
+        }
 
         let record = LocalAuthorityRecord {
             version: LOCAL_AUTHORITY_VERSION,
             snapshot_generation: new_gen,
             head_generation: new_gen,
             snapshot_file: Self::snapshot_file_name(new_gen),
-            snapshot_sha256: Self::snapshot_digest(data),
+            snapshot_sha256: requested_digest,
             acknowledged_deltas: Vec::new(),
             retired_deltas: Self::delta_identities(&captured_for_cleanup),
         };
         self.write_authority_unlocked(repo_id, &record)?;
 
+        #[cfg(test)]
+        if let Some(hook) = self
+            .snapshot_after_authority_before_projection_hook
+            .lock()
+            .take()
+        {
+            hook();
+        }
+
         // These are compatibility projections, not authority. A failure after
         // the authority commit must not report the snapshot as uncommitted or
         // leave the caller using a stale CAS generation.
-        self.refresh_compatibility_projection_unlocked(repo_id, &record, data);
+        self.refresh_compatibility_projection_unlocked(
+            repo_id,
+            &record,
+            data,
+            &projection_identity,
+        );
         if let Err(error) = self.clear_superseded_snapshots_unlocked(repo_id, new_gen) {
             tracing::warn!(repo_id, error = %error, "deferred superseded local snapshot cleanup");
         }
@@ -1754,7 +1872,97 @@ impl StorageBackend for LocalFileBackend {
         // the only path allowed to reconcile those fail-closed states.
         let current_record = self.read_authority_record_raw_unlocked(repo_id)?;
         if let Some(record) = current_record.as_ref() {
+            self.read_authoritative_snapshot_bytes_unlocked(repo_id, record)?;
             self.finalize_retired_quarantines_unlocked(repo_id, record)?;
+        } else {
+            let unbound = load_quarantined_deltas(&self.deltas_dir(repo_id))?;
+            if !unbound.is_empty() {
+                return Err(KinDbError::StorageError(format!(
+                    "repo {repo_id} has {} quarantined deltas but no atomic authority; recovery is fail-closed",
+                    unbound.len()
+                )));
+            }
+        }
+        if let (Some(record), Some(marker)) = (
+            current_record.as_ref(),
+            self.read_legacy_rebuild_record_unlocked(repo_id)?,
+        ) {
+            if (expected_gen == marker.expected_generation
+                || expected_gen == marker.committed_generation)
+                && record.snapshot_generation == marker.committed_generation
+                && record.head_generation == marker.committed_generation
+            {
+                if record.snapshot_sha256 != Self::snapshot_digest(data) {
+                    return Err(KinDbError::StorageError(format!(
+                        "installed legacy rebuild for repo {repo_id} does not match the retry snapshot"
+                    )));
+                }
+                let marker_identities = marker
+                    .captured_deltas
+                    .iter()
+                    .map(|(name, sha256)| {
+                        let generation = name
+                            .strip_suffix(".kndd")
+                            .ok_or_else(|| {
+                                KinDbError::StorageError(format!(
+                                    "invalid captured legacy delta name {name} for repo {repo_id}"
+                                ))
+                            })?
+                            .parse::<Generation>()
+                            .map_err(|error| {
+                                KinDbError::StorageError(format!(
+                                    "invalid captured legacy delta name {name} for repo {repo_id}: {error}"
+                                ))
+                            })?;
+                        Ok(LocalDeltaIdentity {
+                            generation,
+                            sha256: sha256.clone(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, KinDbError>>()?;
+                if record.retired_deltas != marker_identities {
+                    return Err(KinDbError::StorageError(format!(
+                        "installed legacy rebuild authority for repo {repo_id} does not bind its captured journal"
+                    )));
+                }
+                let remaining = self.load_deltas_since_unlocked(repo_id, GENERATION_INIT)?;
+                for (bytes, generation) in &remaining {
+                    let digest = Self::snapshot_digest(bytes);
+                    if !marker_identities.iter().any(|identity| {
+                        identity.generation == *generation && identity.sha256 == digest
+                    }) {
+                        return Err(KinDbError::StorageError(format!(
+                            "legacy journal changed after the installed rebuild for repo {repo_id}; recovery is fail-closed"
+                        )));
+                    }
+                }
+                let cleanup_complete =
+                    self.clear_exact_captured_deltas_unlocked(repo_id, &remaining);
+                if cleanup_complete {
+                    let marker_path = self.legacy_rebuild_path(repo_id);
+                    match std::fs::remove_file(&marker_path) {
+                        Ok(()) => {
+                            if let Err(error) = Self::sync_parent(&marker_path) {
+                                tracing::warn!(repo_id, path = %marker_path.display(), error = %error, "confirmed legacy rebuild; deferred marker deletion durability");
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            if let Err(error) = Self::sync_parent(&marker_path) {
+                                tracing::warn!(repo_id, path = %marker_path.display(), error = %error, "confirmed legacy rebuild; deferred absent-marker durability confirmation");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(repo_id, path = %marker_path.display(), error = %error, "confirmed legacy rebuild; deferred marker cleanup");
+                        }
+                    }
+                }
+                if let Err(error) =
+                    self.clear_superseded_snapshots_unlocked(repo_id, marker.committed_generation)
+                {
+                    tracing::warn!(repo_id, error = %error, "confirmed legacy rebuild; deferred superseded snapshot cleanup");
+                }
+                return Ok(marker.committed_generation);
+            }
         }
         if let Some(committed_generation) = self.finalize_marker_only_legacy_rebuild_unlocked(
             repo_id,
@@ -1763,16 +1971,7 @@ impl StorageBackend for LocalFileBackend {
         )? {
             return Ok(committed_generation);
         }
-        let current_generation = current_record
-            .as_ref()
-            .map_or(self.read_legacy_generation(repo_id)?, |record| {
-                record.head_generation
-            });
-        if current_generation != expected_gen {
-            return Err(KinDbError::StorageError(format!(
-                "legacy journal rebuild generation mismatch for repo {repo_id}: expected {expected_gen}, found {current_generation}; quiesce old writers and reconcile again"
-            )));
-        }
+        let projection_identity = self.capture_legacy_projection_unlocked(repo_id)?;
         if current_record.is_none() && !self.snapshot_path(repo_id).exists() {
             return Err(KinDbError::StorageError(format!(
                 "repo {repo_id} has no legacy or authoritative base snapshot to rebuild"
@@ -1785,6 +1984,22 @@ impl StorageBackend for LocalFileBackend {
                 "repo {repo_id} has no legacy journal to rebuild"
             )));
         }
+        let journal_head = captured
+            .iter()
+            .map(|(_, generation)| *generation)
+            .max()
+            .unwrap_or(GENERATION_INIT);
+        let observed_head = current_record
+            .as_ref()
+            .map_or(GENERATION_INIT, |record| record.head_generation)
+            .max(projection_identity.generation)
+            .max(journal_head);
+        if expected_gen != observed_head {
+            return Err(KinDbError::StorageError(format!(
+                "legacy journal rebuild generation mismatch for repo {repo_id}: expected {expected_gen}, observed head {observed_head}; the supplied graph must be reconciled through the highest legacy cursor"
+            )));
+        }
+
         // Re-read the exact journal and CAS anchor immediately before staging.
         // Cooperative writers serialize on this lock; this second check also
         // catches a pre-authority writer that ignored it.
@@ -1795,22 +2010,19 @@ impl StorageBackend for LocalFileBackend {
                 .map_or(self.read_legacy_generation(repo_id)?, |record| {
                     record.head_generation
                 })
-                != expected_gen
+                != current_record
+                    .as_ref()
+                    .map_or(projection_identity.generation, |record| {
+                        record.head_generation
+                    })
+            || self.capture_legacy_projection_unlocked(repo_id)? != projection_identity
         {
             return Err(KinDbError::StorageError(format!(
                 "legacy journal changed while rebuilding repo {repo_id}; authority was not committed"
             )));
         }
 
-        let journal_head = captured
-            .iter()
-            .map(|(_, generation)| *generation)
-            .max()
-            .unwrap_or(expected_gen);
-        let new_gen = checked_next_generation(
-            expected_gen.max(journal_head),
-            "local legacy journal rebuild",
-        )?;
+        let new_gen = checked_next_generation(expected_gen, "local legacy journal rebuild")?;
         let versioned_path = self.versioned_snapshot_path(repo_id, new_gen);
         Self::atomic_write(&versioned_path, data)?;
 
@@ -1835,6 +2047,19 @@ impl StorageBackend for LocalFileBackend {
         })?;
         Self::atomic_write(&self.legacy_rebuild_path(repo_id), &rebuild_bytes)?;
 
+        #[cfg(test)]
+        if let Some(hook) = self.snapshot_before_authority_commit_hook.lock().take() {
+            hook();
+        }
+        if self.load_deltas_since_unlocked(repo_id, GENERATION_INIT)? != captured
+            || self.read_authority_record_raw_unlocked(repo_id)? != current_record
+            || self.capture_legacy_projection_unlocked(repo_id)? != projection_identity
+        {
+            return Err(KinDbError::StorageError(format!(
+                "legacy authority, journal, or full-snapshot projection changed while rebuilding repo {repo_id}; authority was not committed"
+            )));
+        }
+
         let record = LocalAuthorityRecord {
             version: LOCAL_AUTHORITY_VERSION,
             snapshot_generation: new_gen,
@@ -1845,7 +2070,20 @@ impl StorageBackend for LocalFileBackend {
             retired_deltas: Self::delta_identities(&captured),
         };
         self.write_authority_unlocked(repo_id, &record)?;
-        self.refresh_compatibility_projection_unlocked(repo_id, &record, data);
+        #[cfg(test)]
+        if let Some(hook) = self
+            .snapshot_after_authority_before_projection_hook
+            .lock()
+            .take()
+        {
+            hook();
+        }
+        self.refresh_compatibility_projection_unlocked(
+            repo_id,
+            &record,
+            data,
+            &projection_identity,
+        );
 
         #[cfg(test)]
         let skip_cleanup = self
@@ -1876,12 +2114,27 @@ impl StorageBackend for LocalFileBackend {
         base_gen: Generation,
     ) -> Result<Generation, KinDbError> {
         let _lock = self.acquire_lock(repo_id)?;
+        let _ = self.load_authority_unlocked(repo_id)?;
         let Some(mut record) = self.read_authority_record_unlocked(repo_id)? else {
             return Err(KinDbError::StorageError(format!(
                 "repo {repo_id} has no atomic local snapshot authority; persist a full snapshot before deltas"
             )));
         };
         let current_gen = record.head_generation;
+        let requested_digest = Self::snapshot_digest(delta_data);
+        if base_gen.checked_add(1) == Some(current_gen)
+            && record.acknowledged_deltas.last().is_some_and(|identity| {
+                identity.generation == current_gen && identity.sha256 == requested_digest
+            })
+            && mmap::read_regular_file(
+                &self.delta_path(repo_id, current_gen),
+                "idempotent local delta retry",
+            )
+            .is_ok_and(|bytes| bytes == delta_data)
+        {
+            mmap::sync_parent_dir(&self.authority_path(repo_id))?;
+            return Ok(current_gen);
+        }
         if current_gen != base_gen {
             return Err(KinDbError::StorageError(format!(
                 "delta base generation mismatch for repo {repo_id}: expected {base_gen}, found {current_gen}"
@@ -1904,7 +2157,7 @@ impl StorageBackend for LocalFileBackend {
             .retain(|identity| identity.generation != new_gen);
         record.acknowledged_deltas.push(LocalDeltaIdentity {
             generation: new_gen,
-            sha256: Self::snapshot_digest(delta_data),
+            sha256: requested_digest,
         });
         record.head_generation = new_gen;
         self.write_authority_unlocked(repo_id, &record)?;
@@ -1920,11 +2173,13 @@ impl StorageBackend for LocalFileBackend {
         since_gen: Generation,
     ) -> Result<Vec<(Vec<u8>, Generation)>, KinDbError> {
         let _lock = self.acquire_lock(repo_id)?;
+        let _ = self.load_authority_unlocked(repo_id)?;
         self.load_deltas_since_unlocked(repo_id, since_gen)
     }
 
     fn clear_deltas(&self, repo_id: &str) -> Result<(), KinDbError> {
         let _lock = self.acquire_lock(repo_id)?;
+        let _ = self.load_authority_unlocked(repo_id)?;
         #[cfg(test)]
         if let Some(hook) = self.compaction_before_delta_cleanup_hook.lock().take() {
             hook();
@@ -2073,8 +2328,15 @@ mod tests {
             .unwrap();
         assert_eq!(gen1, 1);
 
-        // Second write with correct generation succeeds
-        let gen2 = backend.save_snapshot("test-repo", &bytes, gen1).unwrap();
+        // Second write with correct generation succeeds with different bytes.
+        let mut replacement = GraphSnapshot::empty();
+        replacement
+            .file_hashes
+            .insert("replacement.rs".to_string(), [7; 32]);
+        let replacement_bytes = replacement.to_bytes().unwrap();
+        let gen2 = backend
+            .save_snapshot("test-repo", &replacement_bytes, gen1)
+            .unwrap();
         assert_eq!(gen2, 2);
 
         // Write with stale generation fails
@@ -2427,7 +2689,7 @@ mod tests {
         let retried = backend
             .rebuild_legacy_journal(repo_id, &reconciled.to_bytes().unwrap(), committed)
             .unwrap();
-        assert_eq!(retried, 10);
+        assert_eq!(retried, committed);
         assert!(!backend.delta_path(repo_id, 8).exists());
         assert!(!backend.legacy_rebuild_path(repo_id).exists());
         let recovered = load_recovered_snapshot(&backend, repo_id).unwrap().unwrap();
@@ -2628,7 +2890,7 @@ mod tests {
         let error = backend
             .rebuild_legacy_journal(repo_id, &bytes, 3)
             .expect_err("stale migration cursor must fail before authority commit");
-        assert!(error.to_string().contains("expected 3, found 4"));
+        assert!(error.to_string().contains("expected 3, observed head 4"));
         assert!(!backend.authority_path(repo_id).exists());
         assert!(backend.delta_path(repo_id, 4).exists());
     }
@@ -2978,24 +3240,346 @@ mod tests {
     }
 
     #[test]
-    fn local_authority_post_rename_sync_failure_returns_installed_cursor() {
+    fn local_full_authority_post_rename_sync_failure_retries_exact_cursor_without_early_gc() {
         let dir = TempDir::new().unwrap();
         let backend = LocalFileBackend::new(dir.path());
         let repo_id = "authority-post-rename-sync";
-        let bytes = GraphSnapshot::empty().to_bytes().unwrap();
-        // The versioned snapshot consumes the first parent sync. The next
-        // sync is authority.json after its atomic rename has installed bytes.
-        fail_local_parent_sync_after(1);
+        let base = GraphSnapshot::empty();
+        let gen1 = backend
+            .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let mut current = base.clone();
+        current.file_hashes.insert("delta.rs".to_string(), [9; 32]);
+        let delta = crate::storage::delta::compute_graph_delta(&base, &current, gen1);
+        let gen2 = backend
+            .save_delta(repo_id, &delta.to_bytes().unwrap(), gen1)
+            .unwrap();
+        let old_snapshot = backend.versioned_snapshot_path(repo_id, gen1);
+        let delta_path = backend.delta_path(repo_id, gen2);
+        backend.set_snapshot_before_authority_commit_hook(|| {
+            // Authority candidate publication and exact candidate claim consume
+            // two syncs; fail the destination rename sync.
+            mmap::fail_parent_sync_after(2);
+        });
+
+        let error = backend
+            .save_snapshot(repo_id, &current.to_bytes().unwrap(), gen2)
+            .expect_err("installed but unconfirmed authority must be reported");
+        assert!(error.to_string().contains("durability is unconfirmed"));
+        assert!(mmap::recovery_marker_path(&backend.authority_path(repo_id)).exists());
+        assert!(
+            old_snapshot.exists(),
+            "old base must not be GC'd before confirmation"
+        );
+        assert!(
+            delta_path.exists(),
+            "retired journal must not be GC'd before confirmation"
+        );
 
         let generation = backend
-            .save_snapshot(repo_id, &bytes, GENERATION_INIT)
-            .expect(
-                "an installed authority cursor must not be returned as an ordinary stale error",
-            );
-        assert_eq!(generation, 1);
+            .save_snapshot(repo_id, &current.to_bytes().unwrap(), gen2)
+            .expect("exact retry must confirm and return the installed cursor");
+        assert_eq!(generation, gen2 + 1);
+        assert!(!mmap::recovery_marker_path(&backend.authority_path(repo_id)).exists());
         let recovered = load_recovered_snapshot(&backend, repo_id).unwrap().unwrap();
         assert_eq!(recovered.generation, generation);
-        assert!(backend.authority_path(repo_id).exists());
+        assert_eq!(recovered.snapshot.file_hashes, current.file_hashes);
+    }
+
+    #[test]
+    fn local_delta_authority_post_rename_sync_failure_retries_exact_cursor() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "delta-authority-post-rename-sync";
+        let base = GraphSnapshot::empty();
+        let gen1 = backend
+            .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let delta = crate::storage::delta::GraphSnapshotDelta::empty(gen1);
+        let delta_bytes = delta.to_bytes().unwrap();
+        // The delta write consumes five syncs. Authority candidate install
+        // plus the exact candidate claim consume two more; fail its
+        // destination rename sync.
+        mmap::fail_parent_sync_after(7);
+
+        let error = backend
+            .save_delta(repo_id, &delta_bytes, gen1)
+            .expect_err("installed but unconfirmed delta authority must be reported");
+        assert!(error.to_string().contains("durability is unconfirmed"));
+        assert!(backend.delta_path(repo_id, gen1 + 1).exists());
+        assert!(mmap::recovery_marker_path(&backend.authority_path(repo_id)).exists());
+
+        let retried = backend
+            .save_delta(repo_id, &delta_bytes, gen1)
+            .expect("exact retry must confirm installed delta cursor");
+        assert_eq!(retried, gen1 + 1);
+        assert!(!mmap::recovery_marker_path(&backend.authority_path(repo_id)).exists());
+    }
+
+    #[test]
+    fn initial_full_promotion_cas_binds_legacy_projection_bytes_and_marker() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "initial-projection-race";
+        let mut requested = GraphSnapshot::empty();
+        requested
+            .file_hashes
+            .insert("requested.rs".to_string(), [1; 32]);
+        let mut raced = GraphSnapshot::empty();
+        raced.file_hashes.insert("raced.rs".to_string(), [2; 32]);
+        let raced_bytes = raced.to_bytes().unwrap();
+        let projection_path = backend.snapshot_path(repo_id);
+        let generation_path = backend.generation_path(repo_id);
+        let installed_race = raced_bytes.clone();
+        backend.set_snapshot_before_authority_commit_hook(move || {
+            std::fs::write(&projection_path, &installed_race).unwrap();
+            std::fs::write(&generation_path, b"1").unwrap();
+        });
+
+        let error = backend
+            .save_snapshot(repo_id, &requested.to_bytes().unwrap(), GENERATION_INIT)
+            .expect_err("racing legacy full commit must win CAS without being overwritten");
+        assert!(error
+            .to_string()
+            .contains("legacy full-snapshot projection changed"));
+        assert!(!backend.authority_path(repo_id).exists());
+        assert_eq!(
+            std::fs::read(backend.snapshot_path(repo_id)).unwrap(),
+            raced_bytes
+        );
+    }
+
+    #[test]
+    fn full_projection_publish_preserves_race_after_authority_commit() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "post-authority-projection-race";
+        let mut requested = GraphSnapshot::empty();
+        requested
+            .file_hashes
+            .insert("requested.rs".to_string(), [8; 32]);
+        let mut raced = GraphSnapshot::empty();
+        raced.file_hashes.insert("raced.rs".to_string(), [9; 32]);
+        let raced_bytes = raced.to_bytes().unwrap();
+        let projection_path = backend.snapshot_path(repo_id);
+        let generation_path = backend.generation_path(repo_id);
+        let installed_race = raced_bytes.clone();
+        backend.set_snapshot_after_authority_before_projection_hook(move || {
+            std::fs::write(&projection_path, &installed_race).unwrap();
+            std::fs::write(&generation_path, b"1").unwrap();
+        });
+
+        let committed = backend
+            .save_snapshot(repo_id, &requested.to_bytes().unwrap(), GENERATION_INIT)
+            .expect("authority commit remains successful when a legacy projection races");
+        assert_eq!(committed, 1);
+        assert_eq!(
+            std::fs::read(backend.snapshot_path(repo_id)).unwrap(),
+            raced_bytes
+        );
+        assert_eq!(
+            std::fs::read(backend.generation_path(repo_id)).unwrap(),
+            b"1"
+        );
+        let error = backend
+            .load_snapshot(repo_id)
+            .expect_err("preserved equal-head divergence must remain fail-closed");
+        assert!(error.to_string().contains("mixed-version"));
+    }
+
+    #[test]
+    fn quarantine_cleanup_waits_for_authoritative_snapshot_payload_verification() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "quarantine-after-payload";
+        let base = GraphSnapshot::empty();
+        let gen1 = backend
+            .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let delta_bytes = crate::storage::delta::GraphSnapshotDelta::empty(gen1)
+            .to_bytes()
+            .unwrap();
+        let gen2 = backend.save_delta(repo_id, &delta_bytes, gen1).unwrap();
+        let gen3 = backend
+            .save_snapshot(repo_id, &base.to_bytes().unwrap(), gen2)
+            .unwrap();
+        let canonical = backend.delta_path(repo_id, gen2);
+        let quarantine = quarantine_delta_path(
+            &canonical,
+            gen2,
+            &LocalFileBackend::snapshot_digest(&delta_bytes),
+        );
+        std::fs::rename(&canonical, &quarantine).unwrap();
+        std::fs::write(backend.versioned_snapshot_path(repo_id, gen3), b"corrupt").unwrap();
+
+        let error = backend
+            .load_snapshot(repo_id)
+            .expect_err("invalid authority payload must fail before quarantine cleanup");
+        assert!(error.to_string().contains("digest mismatch"));
+        assert!(
+            quarantine.exists(),
+            "forensic quarantine must remain after payload failure"
+        );
+    }
+
+    #[test]
+    fn direct_delta_load_finalizes_only_authority_bound_quarantine() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "direct-delta-quarantine";
+        let base = GraphSnapshot::empty();
+        let gen1 = backend
+            .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let delta_bytes = crate::storage::delta::GraphSnapshotDelta::empty(gen1)
+            .to_bytes()
+            .unwrap();
+        let gen2 = backend.save_delta(repo_id, &delta_bytes, gen1).unwrap();
+        backend
+            .save_snapshot(repo_id, &base.to_bytes().unwrap(), gen2)
+            .unwrap();
+        let canonical = backend.delta_path(repo_id, gen2);
+        let quarantine = quarantine_delta_path(
+            &canonical,
+            gen2,
+            &LocalFileBackend::snapshot_digest(&delta_bytes),
+        );
+        std::fs::rename(&canonical, &quarantine).unwrap();
+
+        let deltas = backend
+            .load_deltas_since(repo_id, GENERATION_INIT)
+            .expect("direct delta load must verify authority then finalize its quarantine");
+        assert!(deltas.is_empty());
+        assert!(!quarantine.exists());
+
+        let unbound_repo = "unbound-direct-delta-quarantine";
+        std::fs::create_dir_all(backend.deltas_dir(unbound_repo)).unwrap();
+        let unbound_canonical = backend.delta_path(unbound_repo, 1);
+        let unbound = quarantine_delta_path(
+            &unbound_canonical,
+            1,
+            &LocalFileBackend::snapshot_digest(&delta_bytes),
+        );
+        std::fs::write(&unbound, &delta_bytes).unwrap();
+        let error = backend
+            .load_deltas_since(unbound_repo, GENERATION_INIT)
+            .expect_err("quarantine without authority must fail closed");
+        assert!(error.to_string().contains("no atomic authority"));
+        assert!(unbound.exists());
+    }
+
+    #[test]
+    fn explicit_rebuild_floors_generation_above_ahead_legacy_marker() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "ahead-legacy-rebuild";
+        let base = GraphSnapshot::empty();
+        let authority_generation = backend
+            .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let legacy_generation = authority_generation + 1;
+        std::fs::create_dir_all(backend.deltas_dir(repo_id)).unwrap();
+        std::fs::write(
+            backend.delta_path(repo_id, legacy_generation),
+            crate::storage::delta::GraphSnapshotDelta::empty(authority_generation)
+                .to_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            backend.generation_path(repo_id),
+            legacy_generation.to_string(),
+        )
+        .unwrap();
+
+        let stale = backend
+            .rebuild_legacy_journal(repo_id, &base.to_bytes().unwrap(), authority_generation)
+            .expect_err("authority cursor below the journal head must be rejected");
+        assert!(stale
+            .to_string()
+            .contains(&format!("observed head {legacy_generation}")));
+        let committed = backend
+            .rebuild_legacy_journal(repo_id, &base.to_bytes().unwrap(), legacy_generation)
+            .expect("explicit rebuild should accept the fully reconciled legacy cursor");
+        assert_eq!(committed, legacy_generation + 1);
+    }
+
+    #[test]
+    fn explicit_rebuild_rejects_quarantine_without_authority() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "rebuild-unbound-quarantine";
+        let bytes = GraphSnapshot::empty().to_bytes().unwrap();
+        std::fs::create_dir_all(backend.deltas_dir(repo_id)).unwrap();
+        std::fs::write(backend.snapshot_path(repo_id), &bytes).unwrap();
+        std::fs::write(backend.generation_path(repo_id), b"1").unwrap();
+        let delta_bytes = crate::storage::delta::GraphSnapshotDelta::empty(GENERATION_INIT)
+            .to_bytes()
+            .unwrap();
+        std::fs::write(backend.delta_path(repo_id, 1), &delta_bytes).unwrap();
+        let quarantine = quarantine_delta_path(
+            &backend.delta_path(repo_id, 1),
+            1,
+            &LocalFileBackend::snapshot_digest(&delta_bytes),
+        );
+        std::fs::write(&quarantine, &delta_bytes).unwrap();
+
+        let error = backend
+            .rebuild_legacy_journal(repo_id, &bytes, 1)
+            .expect_err("explicit rebuild must reject quarantine without authority");
+        assert!(error.to_string().contains("no atomic authority"));
+        assert!(quarantine.exists());
+        assert!(!backend.authority_path(repo_id).exists());
+    }
+
+    #[test]
+    fn explicit_rebuild_cas_preserves_racing_legacy_full_commit() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "legacy-rebuild-projection-race";
+        let base = GraphSnapshot::empty();
+        let authority_generation = backend
+            .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let legacy_generation = authority_generation + 1;
+        std::fs::create_dir_all(backend.deltas_dir(repo_id)).unwrap();
+        std::fs::write(
+            backend.delta_path(repo_id, legacy_generation),
+            crate::storage::delta::GraphSnapshotDelta::empty(authority_generation)
+                .to_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            backend.generation_path(repo_id),
+            legacy_generation.to_string(),
+        )
+        .unwrap();
+        let mut raced = GraphSnapshot::empty();
+        raced.file_hashes.insert("raced.rs".to_string(), [4; 32]);
+        let raced_bytes = raced.to_bytes().unwrap();
+        let projection_path = backend.snapshot_path(repo_id);
+        let generation_path = backend.generation_path(repo_id);
+        let installed_race = raced_bytes.clone();
+        backend.set_snapshot_before_authority_commit_hook(move || {
+            std::fs::write(&projection_path, &installed_race).unwrap();
+            std::fs::write(&generation_path, (legacy_generation + 1).to_string()).unwrap();
+        });
+
+        let error = backend
+            .rebuild_legacy_journal(repo_id, &base.to_bytes().unwrap(), legacy_generation)
+            .expect_err("racing legacy full commit must abort rebuild authority CAS");
+        assert!(error
+            .to_string()
+            .contains("full-snapshot projection changed"));
+        let authority: LocalAuthorityRecord =
+            serde_json::from_slice(&std::fs::read(backend.authority_path(repo_id)).unwrap())
+                .unwrap();
+        assert_eq!(authority.head_generation, authority_generation);
+        assert_eq!(
+            std::fs::read(backend.snapshot_path(repo_id)).unwrap(),
+            raced_bytes
+        );
     }
 
     #[test]

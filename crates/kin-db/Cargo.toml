@@ -47,6 +47,7 @@ rustc-hash = "2.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
+libc = { workspace = true }
 bincode = "1"
 rmp-serde = "1"
 sha2 = "0.10"
