@@ -414,6 +414,11 @@ jobs:
             cross: false
 
     steps:
+      - name: Preserve tracked bytes on Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: git config --global core.autocrlf false
+
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -445,6 +450,35 @@ jobs:
           # Release inputs must never move under an unchanged Kin tag.
           ref: 48c757dfda2ca6b115f32d86875c6adde587b861
           persist-credentials: false
+
+      - name: Verify canonical release input bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const childProcess = require("child_process");
+          const crypto = require("crypto");
+          const fs = require("fs");
+          const path = require("path");
+
+          const sha256 = (bytes) =>
+            crypto.createHash("sha256").update(bytes).digest("hex");
+          for (const [label, root] of [["Kin", process.cwd()], ["kin-vfs", path.join(process.cwd(), "kin-vfs")]]) {
+            const tracked = childProcess.execFileSync(
+              "git",
+              ["cat-file", "blob", "HEAD:Cargo.lock"],
+              { cwd: root }
+            );
+            const working = fs.readFileSync(path.join(root, "Cargo.lock"));
+            if (!working.equals(tracked)) {
+              throw new Error(
+                `${label} Cargo.lock working bytes ${sha256(working)} do not match ` +
+                `tracked Git bytes ${sha256(tracked)}; refusing platform-specific release provenance`
+              );
+            }
+            console.log(`Verified canonical ${label} Cargo.lock bytes: ${sha256(tracked)}`);
+          }
+          NODE
 
       - name: Cache Cargo registry and build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.0.0

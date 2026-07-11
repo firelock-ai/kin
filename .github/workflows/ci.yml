@@ -89,6 +89,10 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
+      - name: Preserve tracked bytes on Windows
+        shell: bash
+        run: git config --global core.autocrlf false
+
       - uses: actions/checkout@v7
 
       - name: Test exact archive checksum selection (PowerShell 7)
@@ -140,13 +144,27 @@ jobs:
           "$bin_dir/kin-daemon.exe" --version
           "$bin_dir/kin.exe" bench-meta --json > "$RUNNER_TEMP/kin-build-meta.json"
           EXPECTED_SHA="$(git rev-parse HEAD)" node <<'NODE'
+          const childProcess = require("child_process");
+          const crypto = require("crypto");
           const fs = require("fs");
           const meta = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/kin-build-meta.json`, "utf8"));
           if (meta.kin_commit !== process.env.EXPECTED_SHA || meta.kin_dirty !== false || meta.kin_source_known !== true) {
             throw new Error("Windows release build did not prove a clean, known checkout");
           }
-          if (!/^[0-9a-f]{64}$/.test(meta.dependency_provenance ?? "")) {
-            throw new Error("Windows release build lacks Cargo.lock provenance");
+          const trackedLock = childProcess.execFileSync(
+            "git",
+            ["cat-file", "blob", "HEAD:Cargo.lock"]
+          );
+          const workingLock = fs.readFileSync("Cargo.lock");
+          if (!workingLock.equals(trackedLock)) {
+            throw new Error("Windows Cargo.lock working bytes do not match the tracked Git blob");
+          }
+          const expectedLock = crypto.createHash("sha256").update(trackedLock).digest("hex");
+          if (meta.dependency_provenance !== expectedLock) {
+            throw new Error(
+              `Windows embedded Cargo.lock provenance ${meta.dependency_provenance ?? "missing"} ` +
+              `does not match tracked Git bytes ${expectedLock}`
+            );
           }
           for (const feature of ["vector", "embeddings", "metal"]) {
             if (meta.feature_flags.includes(feature)) {
