@@ -55,6 +55,7 @@ def main() -> None:
         "github.event.workflow_run.conclusion == 'success'",
         "github.event.workflow_run.event == 'push'",
         "startsWith(github.event.workflow_run.head_branch, 'v')",
+        "!contains(github.event.workflow_run.head_branch, '-')",
         "environment: installer-dispatch",
         "timeout-minutes: 15",
         "SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}",
@@ -85,6 +86,19 @@ def main() -> None:
         'python3 scripts/verify_installer_parity.py "$KIN_TAG" --expected-sha "$KIN_SHA"',
     ):
         require(installer_callback, policy, "completed-release installer callback")
+
+    callback_admission_start = installer_callback.index("    if: >-")
+    callback_admission_end = installer_callback.index(
+        "    runs-on:", callback_admission_start
+    )
+    callback_admission = installer_callback[
+        callback_admission_start:callback_admission_end
+    ]
+    require(
+        callback_admission,
+        "!contains(github.event.workflow_run.head_branch, '-')",
+        "stable-only installer callback admission",
+    )
 
     for forbidden in (
         "workflow_dispatch:",
