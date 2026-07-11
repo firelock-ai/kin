@@ -7,15 +7,6 @@ on:
   push:
     tags:
       - "v*.*.*"
-  workflow_dispatch:
-    inputs:
-      notarize_on_linux:
-        description: >-
-          Notarize the macOS binaries from a Linux runner via rcodesign instead
-          of running xcrun notarytool on the macOS build runner. Leave unchecked
-          to use the native macOS notarytool path (the proven default).
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -35,11 +26,10 @@ jobs:
   # macOS legs still build + codesign natively; only the Apple Notary submission
   # moves to a 1x Linux runner (macOS minutes bill 10x) when this is on.
   #
-  # Source of truth, in order:
-  #   1. the workflow_dispatch boolean input (for one-off validation runs)
-  #   2. the repository variable NOTARIZE_ON_LINUX == 'true' (the persistent
-  #      cutover switch — flip it once the Linux leg is proven green)
-  # When neither is set, notarization stays on macOS notarytool (the fallback).
+  # The repository variable NOTARIZE_ON_LINUX is the cutover switch. Manual
+  # dispatch is intentionally disabled: a dispatch can target branch-controlled
+  # workflow code, which must never inherit Apple or package-publish secrets.
+  # When the variable is not true, notarization stays on native notarytool.
   config:
     name: Resolve release config
     runs-on: ubuntu-latest
@@ -51,14 +41,29 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+          fetch-depth: 0
+
+      - name: Require release tag on reviewed default-branch history
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin \
+            "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+          tag_commit="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
+          test "$tag_commit" = "$(git rev-parse HEAD)"
+          if ! git merge-base --is-ancestor \
+            "$tag_commit" "refs/remotes/origin/${DEFAULT_BRANCH}"; then
+            echo "::error::release tag $GITHUB_REF_NAME is not on reviewed $DEFAULT_BRANCH history"
+            exit 1
+          fi
 
       - name: Resolve notarize backend
         id: flags
         env:
-          DISPATCH_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.notarize_on_linux || '' }}
           REPO_VAR: ${{ vars.NOTARIZE_ON_LINUX }}
         run: |
-          if [ "$DISPATCH_INPUT" = "true" ] || [ "$REPO_VAR" = "true" ]; then
+          if [ "$REPO_VAR" = "true" ]; then
             echo "notarize_on_linux=true" >> "$GITHUB_OUTPUT"
             echo "Notarization backend: rcodesign on Linux"
           else
@@ -78,15 +83,13 @@ jobs:
           echo "release_channel=$channel" >> "$GITHUB_OUTPUT"
 
           for package in @kinlab/kin @kinlab/kin-mcp; do
-            current="$(env -u NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG=/dev/null \
-              npm view "${package}@${channel}" version 2>/dev/null || true)"
+            current="$(node scripts/release-order.mjs npm-channel "$package" "$channel")"
             node scripts/release-order.mjs assert-not-rollback \
               "$version" "$current" "npm ${package} ${channel}"
           done
 
           if [ "$channel" = "latest" ]; then
-            current_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" \
-              --jq .tag_name 2>/dev/null || true)"
+            current_tag="$(node scripts/release-order.mjs github-latest "$GITHUB_REPOSITORY")"
             current_version="${current_tag#v}"
             node scripts/release-order.mjs assert-not-rollback \
               "$version" "$current_version" "GitHub Latest"
@@ -100,8 +103,7 @@ jobs:
     # be created without one of the archives consumed by the installers.
     # Signing credentials are deliberately step-scoped below. The untrusted
     # Cargo build matrix never receives Apple secrets or a write-scoped token.
-    # Tagged releases still fail closed when any required credential is absent;
-    # branch workflow-dispatch runs may exercise unsigned build plumbing.
+    # Tagged releases fail closed when any required credential is absent.
     env:
       # When true, the macOS leg codesigns and uploads the signed-but-unnotarized
       # zip, and the separate notarize_linux job submits it to Apple Notary via
@@ -345,8 +347,7 @@ jobs:
 
       # --- macOS code signing + notarization -------------------------------
       # Tag releases fail closed when signing/notarization credentials are not
-      # configured. A branch workflow_dispatch may still exercise unsigned
-      # build plumbing because the publish job is tag-only below.
+      # configured.
       - name: Resolve macOS signing credential availability
         id: mac_signing
         if: ${{ runner.os == 'macOS' }}
@@ -1362,8 +1363,7 @@ jobs:
           # stale tag rerun from advancing one package and then discovering the
           # other package already has a newer public channel.
           for package in "${packages[@]}"; do
-            current="$(env -u NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG=/dev/null \
-              npm view "${package}@${FINAL_TAG}" version 2>/dev/null || true)"
+            current="$(node scripts/release-order.mjs npm-channel "$package" "$FINAL_TAG")"
             node scripts/release-order.mjs assert-not-rollback \
               "$VERSION" "$current" "npm ${package} ${FINAL_TAG}"
             candidate="$(env -u NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG=/dev/null \
@@ -1378,8 +1378,7 @@ jobs:
             # Re-read immediately before each write. Repository concurrency
             # serializes Kin releases; this second check also catches an
             # external/manual npm channel move during the run.
-            current="$(env -u NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG=/dev/null \
-              npm view "${package}@${FINAL_TAG}" version 2>/dev/null || true)"
+            current="$(node scripts/release-order.mjs npm-channel "$package" "$FINAL_TAG")"
             node scripts/release-order.mjs assert-not-rollback \
               "$VERSION" "$current" "npm ${package} ${FINAL_TAG}"
             if [ "$current" != "$VERSION" ]; then
@@ -1427,8 +1426,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          current_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" \
-            --jq .tag_name 2>/dev/null || true)"
+          current_tag="$(node scripts/release-order.mjs github-latest "$GITHUB_REPOSITORY")"
           current_version="${current_tag#v}"
           node scripts/release-order.mjs assert-not-rollback \
             "$version" "$current_version" "GitHub Latest"
@@ -1577,9 +1575,8 @@ jobs:
     name: Version-tag ghcr image
     needs: [publish, install_proof]
     # Mirror publish's always() guard so a skipped notarize_linux does not
-    # transitively skip this job, and only tag real version-tag pushes (not a
-    # workflow_dispatch on a branch) so `:<version>` never points at an
-    # unreleased or non-tag build.
+    # transitively skip this job, and only tag real version-tag pushes so
+    # `:<version>` never points at an unreleased build.
     if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     # Least privilege: read the repo (to peel the tag to its commit) and push
@@ -1646,26 +1643,65 @@ jobs:
           # Version tags are immutable release identities. A rerun may observe
           # an already-correct tag, but it must never overwrite a mismatched
           # digest even when the source commit tag still exists.
+          inspect_destination_digest() {
+            local destination="$1"
+            local output
+            for attempt in 1 2 3 4 5; do
+              if output="$(docker buildx imagetools inspect "$destination" \
+                --format '{{.Manifest.Digest}}' 2>&1)"; then
+                printf '%s\n' "$output"
+                return 0
+              fi
+
+              # This is the exact GHCR/buildx response for an absent manifest.
+              # Any auth, transport, rate-limit, or unrecognized registry error
+              # remains fatal instead of being treated as permission to write.
+              if [ "$output" = "ERROR: ${destination}: not found" ]; then
+                return 44
+              fi
+              if [ "$attempt" -eq 5 ]; then
+                printf '%s\n' "$output" >&2
+                echo "::error::could not establish immutable state for $destination" >&2
+                return 1
+              fi
+              sleep $(( attempt * 2 ))
+            done
+          }
+
           destinations=("${IMAGE}:${VERSION}" "${IMAGE}:${GITHUB_REF_NAME}")
+          missing_destinations=()
           for destination in "${destinations[@]}"; do
-            if docker buildx imagetools inspect "$destination" >/dev/null 2>&1; then
-              existing_digest="$(docker buildx imagetools inspect "$destination" --format '{{.Manifest.Digest}}')"
+            if existing_digest="$(inspect_destination_digest "$destination")"; then
               if [ "$existing_digest" != "$source_digest" ]; then
                 echo "::error::$destination already points at $existing_digest, expected immutable $source_digest"
                 exit 1
               fi
+            else
+              inspect_status=$?
+              if [ "$inspect_status" -ne 44 ]; then
+                exit "$inspect_status"
+              fi
+              missing_destinations+=("$destination")
             fi
           done
 
           # Registry-side manifest copy: `:<version>` and `:v<version>` become
-          # references to the exact commit-image digest. No layers are rebuilt.
-          docker buildx imagetools create \
-            --tag "${IMAGE}:${VERSION}" \
-            --tag "${IMAGE}:${GITHUB_REF_NAME}" \
-            "${IMAGE}@${source_digest}"
+          # references to the exact commit-image digest. No layers are rebuilt,
+          # no already-existing tag is rewritten, and prefer-index=false keeps
+          # a single-platform source manifest's digest unchanged.
+          if [ "${#missing_destinations[@]}" -gt 0 ]; then
+            tag_args=()
+            for destination in "${missing_destinations[@]}"; do
+              tag_args+=(--tag "$destination")
+            done
+            docker buildx imagetools create \
+              --prefer-index=false \
+              "${tag_args[@]}" \
+              "${IMAGE}@${source_digest}"
+          fi
 
           for destination in "${destinations[@]}"; do
-            actual_digest="$(docker buildx imagetools inspect "$destination" --format '{{.Manifest.Digest}}')"
+            actual_digest="$(inspect_destination_digest "$destination")"
             if [ "$actual_digest" != "$source_digest" ]; then
               echo "::error::$destination resolved to $actual_digest after tagging, expected $source_digest"
               exit 1

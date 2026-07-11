@@ -4,7 +4,24 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { assertNotRollback, compareSemver, parseSemver, releaseChannel } from './release-order.mjs';
+import {
+  assertNotRollback,
+  compareSemver,
+  parseSemver,
+  releaseChannel,
+  resolveGitHubLatest,
+  resolveNpmChannel,
+} from './release-order.mjs';
+
+function response(status, body, headers = {}) {
+  const normalized = new Map(Object.entries(headers).map(([key, value]) => [key.toLowerCase(), value]));
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: { get: (name) => normalized.get(name.toLowerCase()) ?? null },
+    text: async () => JSON.stringify(body),
+  };
+}
 
 test('orders stable and prerelease versions according to SemVer', () => {
   assert.equal(compareSemver('1.2.3', '1.2.3'), 0);
@@ -26,4 +43,45 @@ test('maps release channels and prevents rollback', () => {
   assert.doesNotThrow(() => assertNotRollback('1.2.3', '1.2.3'));
   assert.doesNotThrow(() => assertNotRollback('1.2.4', '1.2.3'));
   assert.throws(() => assertNotRollback('1.2.2', '1.2.3', 'npm latest'), /refusing to roll/);
+});
+
+test('reads npm channel authority from successful package metadata', async () => {
+  const fetchImpl = async () => response(200, {
+    'dist-tags': { latest: '1.2.3', beta: '1.3.0-beta.2' },
+  });
+  assert.equal(await resolveNpmChannel('@kinlab/kin', 'latest', { fetchImpl }), '1.2.3');
+  assert.equal(await resolveNpmChannel('@kinlab/kin', 'alpha', { fetchImpl }), '<none>');
+});
+
+test('retries transient npm authority failures and fails closed on package 404', async () => {
+  let calls = 0;
+  const retryFetch = async () => {
+    calls += 1;
+    return calls === 1
+      ? response(503, { error: 'unavailable' })
+      : response(200, { 'dist-tags': { latest: '1.2.4' } });
+  };
+  assert.equal(await resolveNpmChannel('@kinlab/kin', 'latest', {
+    fetchImpl: retryFetch,
+    sleepImpl: async () => {},
+  }), '1.2.4');
+  assert.equal(calls, 2);
+  await assert.rejects(
+    resolveNpmChannel('@kinlab/kin', 'latest', {
+      fetchImpl: async () => response(404, { error: 'not found' }),
+    }),
+    /HTTP 404/,
+  );
+});
+
+test('distinguishes an absent GitHub Latest release from API failure', async () => {
+  assert.equal(await resolveGitHubLatest('firelock-ai/kin', 'token', {
+    fetchImpl: async () => response(404, { message: 'Not Found' }),
+  }), '<none>');
+  await assert.rejects(
+    resolveGitHubLatest('firelock-ai/kin', 'token', {
+      fetchImpl: async () => response(401, { message: 'Bad credentials' }),
+    }),
+    /HTTP 401/,
+  );
 });
