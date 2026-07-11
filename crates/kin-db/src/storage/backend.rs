@@ -379,6 +379,11 @@ pub struct LocalFileBackend {
     fail_legacy_rebuild_cleanup: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     recovery_after_authority_hook: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
+    #[cfg(test)]
+    compaction_before_delta_cleanup_hook:
+        parking_lot::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
+    #[cfg(test)]
+    cleanup_after_quarantine_hook: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
 }
 
 const LOCAL_AUTHORITY_VERSION: u32 = 2;
@@ -403,6 +408,10 @@ struct LocalAuthorityRecord {
     /// authority head.
     #[serde(default)]
     acknowledged_deltas: Vec<LocalDeltaIdentity>,
+    /// Exact journal bytes already represented by the promoted full snapshot
+    /// but not necessarily removed yet. Cleanup may act only on these bytes.
+    #[serde(default)]
+    retired_deltas: Vec<LocalDeltaIdentity>,
 }
 
 const LOCAL_LEGACY_REBUILD_VERSION: u32 = 1;
@@ -430,6 +439,10 @@ impl LocalFileBackend {
             fail_legacy_rebuild_cleanup: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             recovery_after_authority_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            compaction_before_delta_cleanup_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            cleanup_after_quarantine_hook: parking_lot::Mutex::new(None),
         }
     }
 
@@ -675,9 +688,15 @@ impl LocalFileBackend {
         // record is intentionally accepted by the raw reader so the explicit
         // legacy rebuild path can capture and reconcile it; normal authority
         // reads reject it below before serving or writing.
-        if record.version == LOCAL_AUTHORITY_LEGACY_VERSION && record.acknowledged_deltas.is_empty()
-        {
-            return Ok(());
+        if record.version == LOCAL_AUTHORITY_LEGACY_VERSION {
+            if !record.retired_deltas.is_empty() {
+                return Err(KinDbError::StorageError(
+                    "legacy local authority cannot bind retired delta identities".to_string(),
+                ));
+            }
+            if record.acknowledged_deltas.is_empty() {
+                return Ok(());
+            }
         }
         let expected_count = record
             .head_generation
@@ -720,6 +739,30 @@ impl LocalFileBackend {
             if identity.sha256.len() != 64 || hex::decode(&identity.sha256).is_err() {
                 return Err(KinDbError::StorageError(format!(
                     "local authority delta generation {} has an invalid SHA-256 digest",
+                    identity.generation
+                )));
+            }
+        }
+        let mut bound_generations: std::collections::HashSet<Generation> = record
+            .acknowledged_deltas
+            .iter()
+            .map(|identity| identity.generation)
+            .collect();
+        for identity in &record.retired_deltas {
+            if identity.generation == GENERATION_INIT {
+                return Err(KinDbError::StorageError(
+                    "local authority has a retired delta at reserved generation 0".to_string(),
+                ));
+            }
+            if !bound_generations.insert(identity.generation) {
+                return Err(KinDbError::StorageError(format!(
+                    "local authority binds delta generation {} more than once",
+                    identity.generation
+                )));
+            }
+            if identity.sha256.len() != 64 || hex::decode(&identity.sha256).is_err() {
+                return Err(KinDbError::StorageError(format!(
+                    "local authority retired delta generation {} has an invalid SHA-256 digest",
                     identity.generation
                 )));
             }
@@ -790,6 +833,174 @@ impl LocalFileBackend {
             }
         }
         Ok(())
+    }
+
+    fn validate_residual_deltas_unlocked(
+        &self,
+        repo_id: &str,
+        record: &LocalAuthorityRecord,
+    ) -> Result<(), KinDbError> {
+        for (bytes, generation) in self.load_deltas_since_unlocked(repo_id, GENERATION_INIT)? {
+            if let Some(identity) = record
+                .acknowledged_deltas
+                .iter()
+                .find(|identity| identity.generation == generation)
+            {
+                let digest = Self::snapshot_digest(&bytes);
+                if digest != identity.sha256 {
+                    return Err(KinDbError::StorageError(format!(
+                        "acknowledged delta digest mismatch for repo {repo_id} generation {generation}: expected {}, found {digest}",
+                        identity.sha256
+                    )));
+                }
+                continue;
+            }
+            if let Some(identity) = record
+                .retired_deltas
+                .iter()
+                .find(|identity| identity.generation == generation)
+            {
+                let digest = Self::snapshot_digest(&bytes);
+                if digest != identity.sha256 {
+                    return Err(KinDbError::StorageError(format!(
+                        "retired delta digest mismatch for repo {repo_id} generation {generation}: expected {}, found {digest}; a mixed-version writer replaced bytes after full promotion",
+                        identity.sha256
+                    )));
+                }
+                continue;
+            }
+            if generation <= record.head_generation {
+                return Err(KinDbError::StorageError(format!(
+                    "repo {repo_id} authority head {} has an unbound residual delta at generation {generation}; recovery is fail-closed",
+                    record.head_generation
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn capture_delta_identities_unlocked(
+        &self,
+        repo_id: &str,
+        identities: &[LocalDeltaIdentity],
+        required: bool,
+    ) -> Result<Vec<PersistedDelta>, KinDbError> {
+        let mut captured = Vec::new();
+        for identity in identities {
+            let path = self.delta_path(repo_id, identity.generation);
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(KinDbError::StorageError(format!(
+                        "failed to capture authority-bound delta {} for repo {repo_id}: {error}",
+                        path.display()
+                    )));
+                }
+            };
+            let digest = Self::snapshot_digest(&bytes);
+            if digest != identity.sha256 {
+                return Err(KinDbError::StorageError(format!(
+                    "authority-bound delta digest mismatch for repo {repo_id} generation {} before full promotion: expected {}, found {digest}",
+                    identity.generation, identity.sha256
+                )));
+            }
+            captured.push((bytes, identity.generation));
+        }
+        Ok(captured)
+    }
+
+    fn capture_authority_bound_deltas_unlocked(
+        &self,
+        repo_id: &str,
+        record: Option<&LocalAuthorityRecord>,
+    ) -> Result<Vec<PersistedDelta>, KinDbError> {
+        let Some(record) = record else {
+            return Ok(Vec::new());
+        };
+        let mut captured =
+            self.capture_delta_identities_unlocked(repo_id, &record.acknowledged_deltas, true)?;
+        captured.extend(self.capture_delta_identities_unlocked(
+            repo_id,
+            &record.retired_deltas,
+            false,
+        )?);
+        Ok(captured)
+    }
+
+    fn delta_identities(captured: &[PersistedDelta]) -> Vec<LocalDeltaIdentity> {
+        captured
+            .iter()
+            .map(|(bytes, generation)| LocalDeltaIdentity {
+                generation: *generation,
+                sha256: Self::snapshot_digest(bytes),
+            })
+            .collect()
+    }
+
+    fn clear_exact_captured_deltas_unlocked(
+        &self,
+        repo_id: &str,
+        captured: &[PersistedDelta],
+    ) -> bool {
+        let mut complete = true;
+        for (captured_bytes, generation) in captured {
+            let path = self.delta_path(repo_id, *generation);
+            let quarantine_path = path.with_file_name(format!(
+                ".kin-journal-cleanup-{}.kndd",
+                uuid::Uuid::new_v4()
+            ));
+            match std::fs::rename(&path, &quarantine_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    complete = false;
+                    tracing::warn!(repo_id, path = %path.display(), error = %error, "journal promotion committed; could not quarantine captured delta for cleanup");
+                    continue;
+                }
+            }
+            #[cfg(test)]
+            if let Some(hook) = self.cleanup_after_quarantine_hook.lock().take() {
+                hook();
+            }
+            match std::fs::read(&quarantine_path) {
+                Ok(current_bytes) if current_bytes == *captured_bytes => {
+                    match std::fs::remove_file(&quarantine_path) {
+                        Ok(()) => {
+                            if let Err(error) = Self::sync_parent(&quarantine_path) {
+                                complete = false;
+                                tracing::warn!(repo_id, path = %quarantine_path.display(), error = %error, "journal promotion committed; could not fsync captured-delta cleanup");
+                            }
+                        }
+                        Err(error) => {
+                            complete = false;
+                            tracing::warn!(repo_id, path = %quarantine_path.display(), error = %error, "journal promotion committed; deferred quarantined captured-delta cleanup");
+                        }
+                    }
+                }
+                Ok(_) => {
+                    complete = false;
+                    tracing::warn!(repo_id, path = %path.display(), quarantine = %quarantine_path.display(), "journal promotion preserved a delta that changed after capture");
+                }
+                Err(error) => {
+                    complete = false;
+                    tracing::warn!(repo_id, path = %quarantine_path.display(), error = %error, "journal promotion committed; could not verify quarantined captured delta for cleanup");
+                }
+            }
+        }
+        match self.load_deltas_since_unlocked(repo_id, GENERATION_INIT) {
+            Ok(remaining) if remaining.is_empty() => complete,
+            Ok(remaining) => {
+                tracing::warn!(repo_id, remaining = remaining.len(), "journal promotion committed with residual journal artifacts; recovery remains fail-closed");
+                false
+            }
+            Err(error) => {
+                tracing::warn!(repo_id, error = %error, "journal promotion committed; could not verify journal drain");
+                false
+            }
+        }
     }
 
     fn read_authority_record_raw_unlocked(
@@ -939,6 +1150,7 @@ impl LocalFileBackend {
             )));
         }
         self.validate_acknowledged_deltas_unlocked(repo_id, &record)?;
+        self.validate_residual_deltas_unlocked(repo_id, &record)?;
         Ok(Some(record))
     }
 
@@ -1095,6 +1307,7 @@ impl LocalFileBackend {
             snapshot_file: Self::snapshot_file_name(generation),
             snapshot_sha256: Self::snapshot_digest(&snapshot_bytes),
             acknowledged_deltas: Vec::new(),
+            retired_deltas: Vec::new(),
         };
         self.write_authority_unlocked(repo_id, &record)?;
         self.refresh_compatibility_projection_unlocked(repo_id, &record, &snapshot_bytes);
@@ -1159,9 +1372,11 @@ impl LocalFileBackend {
                 ))
             })?;
             let canonical_name = format!("{generation:020}.kndd");
-            if path.file_name().and_then(|name| name.to_str()) != Some(canonical_name.as_str()) {
+            if generation == GENERATION_INIT
+                || path.file_name().and_then(|name| name.to_str()) != Some(canonical_name.as_str())
+            {
                 return Err(KinDbError::StorageError(format!(
-                    "delta authority {} has a noncanonical generation name",
+                    "delta authority {} has a reserved or noncanonical generation",
                     path.display()
                 )));
             }
@@ -1207,6 +1422,16 @@ impl LocalFileBackend {
     #[cfg(test)]
     fn set_recovery_after_authority_hook(&self, hook: impl FnOnce() + Send + 'static) {
         *self.recovery_after_authority_hook.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn set_compaction_before_delta_cleanup_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.compaction_before_delta_cleanup_hook.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn set_cleanup_after_quarantine_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.cleanup_after_quarantine_hook.lock() = Some(Box::new(hook));
     }
 }
 
@@ -1268,6 +1493,20 @@ impl StorageBackend for LocalFileBackend {
     ) -> Result<Generation, KinDbError> {
         let _lock = self.acquire_lock(repo_id)?;
         let current = self.load_authority_unlocked(repo_id)?;
+        let current_record = self.read_authority_record_raw_unlocked(repo_id)?;
+        match (current.as_ref(), current_record.as_ref()) {
+            (Some(authority), Some(record))
+                if authority.snapshot_generation == record.snapshot_generation
+                    && authority.head_generation == record.head_generation
+                    && Self::snapshot_digest(&authority.snapshot_bytes)
+                        == record.snapshot_sha256 => {}
+            (None, None) => {}
+            _ => {
+                return Err(KinDbError::StorageError(format!(
+                    "repo {repo_id} snapshot authority changed while preparing full promotion"
+                )));
+            }
+        }
         let current_gen = current
             .as_ref()
             .map_or(GENERATION_INIT, |authority| authority.head_generation);
@@ -1295,6 +1534,9 @@ impl StorageBackend for LocalFileBackend {
             ));
         }
 
+        let captured_for_cleanup =
+            self.capture_authority_bound_deltas_unlocked(repo_id, current_record.as_ref())?;
+
         let record = LocalAuthorityRecord {
             version: LOCAL_AUTHORITY_VERSION,
             snapshot_generation: new_gen,
@@ -1302,6 +1544,7 @@ impl StorageBackend for LocalFileBackend {
             snapshot_file: Self::snapshot_file_name(new_gen),
             snapshot_sha256: Self::snapshot_digest(data),
             acknowledged_deltas: Vec::new(),
+            retired_deltas: Self::delta_identities(&captured_for_cleanup),
         };
         self.write_authority_unlocked(repo_id, &record)?;
 
@@ -1414,50 +1657,19 @@ impl StorageBackend for LocalFileBackend {
             snapshot_file: Self::snapshot_file_name(new_gen),
             snapshot_sha256: Self::snapshot_digest(data),
             acknowledged_deltas: Vec::new(),
+            retired_deltas: Self::delta_identities(&captured),
         };
         self.write_authority_unlocked(repo_id, &record)?;
         self.refresh_compatibility_projection_unlocked(repo_id, &record, data);
 
-        let mut cleanup_complete = true;
         #[cfg(test)]
-        if self
+        let skip_cleanup = self
             .fail_legacy_rebuild_cleanup
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            cleanup_complete = false;
-        }
-        for (captured_bytes, generation) in &captured {
-            #[cfg(test)]
-            if !cleanup_complete {
-                break;
-            }
-            let path = self.delta_path(repo_id, *generation);
-            match std::fs::read(&path) {
-                Ok(current_bytes) if current_bytes == *captured_bytes => {
-                    if let Err(error) = std::fs::remove_file(&path) {
-                        cleanup_complete = false;
-                        tracing::warn!(repo_id, path = %path.display(), error = %error, "legacy rebuild committed; deferred captured-delta cleanup");
-                    }
-                }
-                Ok(_) => {
-                    cleanup_complete = false;
-                    tracing::warn!(repo_id, path = %path.display(), "legacy rebuild preserved a delta that changed after capture");
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    cleanup_complete = false;
-                    tracing::warn!(repo_id, path = %path.display(), error = %error, "legacy rebuild committed; could not verify captured delta for cleanup");
-                }
-            }
-        }
-        match self.load_deltas_since_unlocked(repo_id, GENERATION_INIT) {
-            Ok(remaining) if remaining.is_empty() => {}
-            Ok(_) => cleanup_complete = false,
-            Err(error) => {
-                cleanup_complete = false;
-                tracing::warn!(repo_id, generation = new_gen, error = %error, "legacy rebuild committed; could not verify journal drain");
-            }
-        }
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let skip_cleanup = false;
+        let cleanup_complete =
+            !skip_cleanup && self.clear_exact_captured_deltas_unlocked(repo_id, &captured);
         if cleanup_complete {
             let marker = self.legacy_rebuild_path(repo_id);
             if let Err(error) = std::fs::remove_file(&marker).and_then(|_| {
@@ -1502,6 +1714,9 @@ impl StorageBackend for LocalFileBackend {
         let delta_path = self.delta_path(repo_id, new_gen);
         Self::atomic_write(&delta_path, delta_data)?;
         record.version = LOCAL_AUTHORITY_VERSION;
+        record
+            .retired_deltas
+            .retain(|identity| identity.generation != new_gen);
         record.acknowledged_deltas.push(LocalDeltaIdentity {
             generation: new_gen,
             sha256: Self::snapshot_digest(delta_data),
@@ -1525,13 +1740,27 @@ impl StorageBackend for LocalFileBackend {
 
     fn clear_deltas(&self, repo_id: &str) -> Result<(), KinDbError> {
         let _lock = self.acquire_lock(repo_id)?;
-        if let Some(authority) = self.load_authority_unlocked(repo_id)? {
-            if authority.snapshot_generation != authority.head_generation {
-                return Err(KinDbError::StorageError(format!(
-                    "refusing to clear authoritative deltas for repo {repo_id}: snapshot generation {}, head {}",
-                    authority.snapshot_generation, authority.head_generation
-                )));
+        #[cfg(test)]
+        if let Some(hook) = self.compaction_before_delta_cleanup_hook.lock().take() {
+            hook();
+        }
+        let record = self.read_authority_record_unlocked(repo_id)?;
+        let Some(record) = record else {
+            if self
+                .load_deltas_since_unlocked(repo_id, GENERATION_INIT)?
+                .is_empty()
+            {
+                return Ok(());
             }
+            return Err(KinDbError::StorageError(format!(
+                "refusing to clear unbound deltas for repo {repo_id} without atomic authority"
+            )));
+        };
+        if record.snapshot_generation != record.head_generation {
+            return Err(KinDbError::StorageError(format!(
+                "refusing to clear authoritative deltas for repo {repo_id}: snapshot generation {}, head {}",
+                record.snapshot_generation, record.head_generation
+            )));
         }
         #[cfg(test)]
         if self
@@ -1542,28 +1771,12 @@ impl StorageBackend for LocalFileBackend {
                 "injected local delta cleanup failure".to_string(),
             ));
         }
-        let deltas_dir = self.deltas_dir(repo_id);
-        if !deltas_dir.exists() {
-            return Ok(());
-        }
-        for entry in std::fs::read_dir(&deltas_dir).map_err(|e| {
-            KinDbError::StorageError(format!(
-                "failed to read deltas directory {}: {e}",
-                deltas_dir.display()
-            ))
-        })? {
-            let entry = entry.map_err(|e| {
-                KinDbError::StorageError(format!("failed to read delta entry: {e}"))
-            })?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("kndd") {
-                std::fs::remove_file(&path).map_err(|e| {
-                    KinDbError::StorageError(format!(
-                        "failed to remove delta {}: {e}",
-                        path.display()
-                    ))
-                })?;
-            }
+        let captured =
+            self.capture_delta_identities_unlocked(repo_id, &record.retired_deltas, false)?;
+        if !self.clear_exact_captured_deltas_unlocked(repo_id, &captured) {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id} delta cleanup left residual journal artifacts; recovery remains fail-closed"
+            )));
         }
         Ok(())
     }
@@ -2037,6 +2250,48 @@ mod tests {
     }
 
     #[test]
+    fn local_legacy_rebuild_never_unlinks_a_post_quarantine_replacement() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "legacy-rebuild-unlink-race";
+        let base = GraphSnapshot::empty();
+        let captured = crate::storage::delta::GraphSnapshotDelta::empty(7)
+            .to_bytes()
+            .unwrap();
+        let mut replacement_delta = crate::storage::delta::GraphSnapshotDelta::empty(7);
+        replacement_delta
+            .file_hashes
+            .added
+            .push(("raced.rs".to_string(), [8; 32]));
+        let replacement = replacement_delta.to_bytes().unwrap();
+        std::fs::create_dir_all(backend.deltas_dir(repo_id)).unwrap();
+        std::fs::write(backend.snapshot_path(repo_id), base.to_bytes().unwrap()).unwrap();
+        std::fs::write(backend.generation_path(repo_id), b"8").unwrap();
+        std::fs::write(backend.delta_path(repo_id, 8), &captured).unwrap();
+
+        let delta_path = backend.delta_path(repo_id, 8);
+        let raced_path = delta_path.clone();
+        let expected_replacement = replacement.clone();
+        backend.set_cleanup_after_quarantine_hook(move || {
+            LocalFileBackend::atomic_write(&raced_path, &replacement).unwrap();
+        });
+
+        let committed = backend
+            .rebuild_legacy_journal(repo_id, &base.to_bytes().unwrap(), 8)
+            .expect("authority commit must survive a cleanup race");
+        assert_eq!(committed, 9);
+        assert_eq!(
+            std::fs::read(&delta_path).unwrap(),
+            expected_replacement,
+            "replacement installed after atomic quarantine must remain canonical"
+        );
+        assert!(backend.legacy_rebuild_path(repo_id).exists());
+        let error = load_recovered_snapshot(&backend, repo_id)
+            .expect_err("pending marker must keep raced legacy cleanup fail-closed");
+        assert!(error.to_string().contains("pending legacy-journal rebuild"));
+    }
+
+    #[test]
     fn local_v1_authority_journal_requires_and_supports_explicit_rebuild() {
         let dir = TempDir::new().unwrap();
         let backend = LocalFileBackend::new(dir.path());
@@ -2121,6 +2376,31 @@ mod tests {
         let error = load_recovered_snapshot(&backend, repo_id)
             .expect_err("mixed-version writer divergence must fail closed");
         assert!(error.to_string().contains("legacy local writer advanced"));
+    }
+
+    #[test]
+    fn local_atomic_authority_rejects_reserved_generation_delta_artifact() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "reserved-delta-generation";
+        backend
+            .save_snapshot(
+                repo_id,
+                &GraphSnapshot::empty().to_bytes().unwrap(),
+                GENERATION_INIT,
+            )
+            .unwrap();
+        LocalFileBackend::atomic_write(
+            &backend.delta_path(repo_id, GENERATION_INIT),
+            &crate::storage::delta::GraphSnapshotDelta::empty(GENERATION_INIT)
+                .to_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let error = load_recovered_snapshot(&backend, repo_id)
+            .expect_err("reserved generation-0 journal artifacts must fail closed");
+        assert!(error.to_string().contains("reserved or noncanonical"));
     }
 
     #[test]
@@ -2431,6 +2711,59 @@ mod tests {
         let recovered = load_recovered_snapshot(&backend, repo_id).unwrap().unwrap();
         assert_eq!(recovered.generation, committed);
         assert_eq!(recovered.snapshot.file_hashes, current.file_hashes);
+    }
+
+    #[test]
+    fn local_compaction_preserves_post_authority_replacement_and_fails_closed() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "compaction-cleanup-race";
+        let base = GraphSnapshot::empty();
+        let gen1 = backend
+            .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let mut current = base.clone();
+        current
+            .file_hashes
+            .insert("committed.rs".to_string(), [7; 32]);
+        let committed_delta = crate::storage::delta::compute_graph_delta(&base, &current, gen1);
+        let delta_generation = backend
+            .save_delta(repo_id, &committed_delta.to_bytes().unwrap(), gen1)
+            .unwrap();
+
+        let delta_path = backend.delta_path(repo_id, delta_generation);
+        let replacement = crate::storage::delta::GraphSnapshotDelta::empty(gen1)
+            .to_bytes()
+            .unwrap();
+        let expected_replacement = replacement.clone();
+        let raced_path = delta_path.clone();
+        backend.set_compaction_before_delta_cleanup_hook(move || {
+            LocalFileBackend::atomic_write(&raced_path, &replacement).unwrap();
+        });
+
+        let promoted_generation = backend
+            .compact_deltas(repo_id)
+            .expect("post-commit cleanup race must return the promoted cursor");
+        assert_eq!(promoted_generation, delta_generation + 1);
+        assert_eq!(
+            std::fs::read(&delta_path).unwrap(),
+            expected_replacement,
+            "cleanup must preserve journal bytes installed after authority commit"
+        );
+        let authority = backend
+            .read_authority_record_raw_unlocked(repo_id)
+            .unwrap()
+            .unwrap();
+        assert!(authority
+            .retired_deltas
+            .iter()
+            .any(|identity| identity.generation == delta_generation));
+        let error = load_recovered_snapshot(&backend, repo_id)
+            .expect_err("replacement of retired journal bytes must fail closed");
+        assert!(
+            error.to_string().contains("retired delta digest mismatch"),
+            "unexpected residual-journal error: {error}"
+        );
     }
 
     #[test]
