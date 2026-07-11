@@ -43,4 +43,10 @@ fn compat_json_stdout_is_pure_json_under_env_overrides() {
         parsed["graph_snapshot_version"].is_number(),
         "compat payload must carry a numeric graph_snapshot_version"
     );
+    assert!(parsed["build"]["sha"].is_string());
+    assert!(parsed["build"]["dirty"].is_boolean());
+    assert!(parsed["build"]["source_known"].is_boolean());
+    assert!(parsed["build"]["dependency_provenance"].is_string());
+    assert!(parsed["build"]["branch"].is_string());
+    assert!(parsed["build"]["built_at"].is_string());
 }

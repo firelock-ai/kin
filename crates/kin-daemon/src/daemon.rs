@@ -886,6 +886,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
         // (the queue is not persisted; coverage is, via graph-vs-index truth).
         // Idempotent (HashSet queues) — a fresh start that already enqueued via
         // reconcile is unaffected.
+        #[cfg(feature = "embeddings")]
         embed_state.graph.queue_missing_for_embedding();
         embed_state.graph.queue_missing_artifacts_for_embedding();
         let mut consecutive_panics: u32 = 0;
@@ -1043,6 +1044,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                                 "embedding worker hit a vector-index error — resetting vector index and re-queueing once"
                             );
                             embed_state.graph.reset_vector_index();
+                            #[cfg(feature = "embeddings")]
                             embed_state.graph.queue_missing_for_embedding();
                             embed_state.graph.queue_missing_artifacts_for_embedding();
                             index_reset_triggered = true;

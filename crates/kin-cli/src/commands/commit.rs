@@ -798,8 +798,10 @@ fn fetch_remote_catalog_filtered(names: &[&str]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "embeddings")]
     use kin_model::ArtifactId;
 
+    #[cfg(feature = "embeddings")]
     #[test]
     fn pending_embedding_work_counts_artifact_only_queue() {
         let graph = kin_db::InMemoryGraph::new();

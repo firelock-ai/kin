@@ -17,6 +17,7 @@ use crate::capability::LocateProfile;
 /// hashing keeps fusion/resolution iteration order stable across processes so
 /// float score accumulation and tie-breaks are bit-reproducible.
 type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
+#[cfg(feature = "vector")]
 type EntityStableKey = (String, String, EntityKind);
 type ResolveEntitiesOutput = (
     Vec<(String, f32)>,
@@ -103,6 +104,11 @@ pub struct RetrievalDegradation {
 /// error.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct SemanticCoverage {
+    /// Whether this build contains the vector retrieval capability at all.
+    /// Older payloads predate this field and came only from vector-enabled
+    /// builds, so absence deserializes to `true` for compatibility.
+    #[serde(default = "semantic_signal_supported_default")]
+    pub supported: bool,
     /// Entities with an embedding indexed in the vector store.
     pub indexed: usize,
     /// Total entities eligible for embedding.
@@ -116,6 +122,10 @@ pub struct SemanticCoverage {
     /// semantic signal was partial. Lexical + graph signals still ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+}
+
+fn semantic_signal_supported_default() -> bool {
+    true
 }
 
 impl LocateResult {
@@ -888,11 +898,13 @@ fn disqualifies_entity_dominant_top_path(path: &str) -> bool {
         || is_amalgamated_or_generated_path(path)
 }
 
+#[cfg(feature = "vector")]
 fn entity_stable_key(entity: &kin_model::Entity) -> Option<EntityStableKey> {
     let path = entity.file_origin.as_ref()?.0.clone();
     Some((path, entity.name.clone(), entity.kind))
 }
 
+#[cfg(feature = "vector")]
 fn entity_stable_key_from_retrieval_key(
     graph: &kin_db::InMemoryGraph,
     key: &kin_db::RetrievalKey,
@@ -913,10 +925,12 @@ fn entity_from_retrieval_key(
     }
 }
 
+#[cfg(feature = "vector")]
 fn embedding_status_complete(status: &kin_db::EmbeddingStatus) -> bool {
     status.total == 0 || (status.indexed == status.total && status.pending == 0)
 }
 
+#[cfg(feature = "vector")]
 fn embedding_status_summary(status: &kin_db::EmbeddingStatus) -> String {
     format!(
         "{}/{} indexed, {} unindexed, {} pending",
@@ -933,6 +947,7 @@ fn embedding_status_summary(status: &kin_db::EmbeddingStatus) -> String {
 /// benchmark-integrity (incomplete coverage refuses to score). An explicit
 /// `KIN_BYPASS_EMBEDDING_COVERAGE_CHECK=1` forces degradation even if strict
 /// was requested (kept for backward compatibility / tests).
+#[cfg(feature = "vector")]
 fn embedding_strict_mode() -> bool {
     locate_env_bool("KIN_REQUIRE_COMPLETE_EMBEDDINGS", false)
         && !locate_env_bool("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", false)
@@ -970,6 +985,7 @@ fn evaluate_embedding_coverage(
 ) -> Result<SemanticCoverage> {
     let status = effective_embedding_status(graph, vector_source);
 
+    #[cfg(feature = "vector")]
     if !embedding_status_complete(&status) && embedding_strict_mode() {
         anyhow::bail!(
             "semantic locate requires complete embeddings; graph has {}. Run `kin embed` until `kin status --json` reports embeddingsIndexed == embeddingsTotal and embeddingsPending == 0. (Set KIN_REQUIRE_COMPLETE_EMBEDDINGS=0 to allow graceful degradation.)",
@@ -985,21 +1001,40 @@ fn evaluate_embedding_coverage(
 /// returns, factored out so post-retrieval surfaces can re-report coverage
 /// without re-running the strict benchmark gate.
 fn coverage_from_status(status: &kin_db::EmbeddingStatus) -> SemanticCoverage {
-    let complete = embedding_status_complete(status);
-    let note = if complete {
-        None
-    } else {
-        Some(format!(
+    #[cfg(not(feature = "vector"))]
+    {
+        return SemanticCoverage {
+            supported: false,
+            indexed: status.indexed,
+            total: status.total,
+            pending: status.pending,
+            complete: false,
+            note: Some(
+                "semantic vector ranking is unsupported in this build; lexical and graph signals remain available"
+                    .to_string(),
+            ),
+        };
+    }
+
+    #[cfg(feature = "vector")]
+    {
+        let complete = embedding_status_complete(status);
+        let note = if complete {
+            None
+        } else {
+            Some(format!(
             "semantic signal partial: {} embedded. Lexical + graph results returned; run `kin embed` for full semantic ranking.",
             embedding_status_summary(status)
         ))
-    };
-    SemanticCoverage {
-        indexed: status.indexed,
-        total: status.total,
-        pending: status.pending,
-        complete,
-        note,
+        };
+        SemanticCoverage {
+            supported: true,
+            indexed: status.indexed,
+            total: status.total,
+            pending: status.pending,
+            complete,
+            note,
+        }
     }
 }
 
@@ -1036,6 +1071,19 @@ fn record_vector_index_degradation(
     sink: &mut Vec<RetrievalDegradation>,
 ) {
     if coverage.complete {
+        return;
+    }
+    if !coverage.supported {
+        record_degradation(
+            sink,
+            RetrievalDegradation {
+                component: "vector_index".to_string(),
+                reason: "feature_disabled".to_string(),
+                detail: "this Kin build does not include vector retrieval".to_string(),
+                remediation: "install a vector-enabled Kin build for semantic similarity search"
+                    .to_string(),
+            },
+        );
         return;
     }
     let vector_arm_present = coverage.indexed > 0
@@ -2924,167 +2972,176 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // must never trigger a mid-query network download); an explicit env value
     // always wins. A profile that WANTED the reranker but could not run it is
     // reported as a structured degradation, never silently skipped.
-    let ce_model_id = std::env::var("KIN_LOCATE_CROSS_ENCODER_MODEL")
-        .unwrap_or_else(|_| "BAAI/bge-reranker-base".to_string());
-    let ce_model_cached = crate::retrieval_profile::cross_encoder_model_cached(&ce_model_id);
-    if quality.cross_encoder_default(true)
-        && !ce_model_cached
-        && std::env::var("KIN_LOCATE_CROSS_ENCODER_ENABLED").is_err()
+    #[cfg(feature = "embeddings")]
     {
-        record_degradation(
-            &mut degradations,
-            RetrievalDegradation {
-                component: "cross_encoder".to_string(),
-                reason: "model_not_cached".to_string(),
-                detail: format!("reranker model {ce_model_id} is not in the local model cache"),
-                remediation: format!(
-                    "prefetch the model (set KIN_LOCATE_CROSS_ENCODER_ENABLED=1 once to \
+        let ce_model_id = std::env::var("KIN_LOCATE_CROSS_ENCODER_MODEL")
+            .unwrap_or_else(|_| "BAAI/bge-reranker-base".to_string());
+        let ce_model_cached = crate::retrieval_profile::cross_encoder_model_cached(&ce_model_id);
+        if quality.cross_encoder_default(true)
+            && !ce_model_cached
+            && std::env::var("KIN_LOCATE_CROSS_ENCODER_ENABLED").is_err()
+        {
+            record_degradation(
+                &mut degradations,
+                RetrievalDegradation {
+                    component: "cross_encoder".to_string(),
+                    reason: "model_not_cached".to_string(),
+                    detail: format!("reranker model {ce_model_id} is not in the local model cache"),
+                    remediation: format!(
+                        "prefetch the model (set KIN_LOCATE_CROSS_ENCODER_ENABLED=1 once to \
                      download {ce_model_id}), then rerun"
-                ),
-            },
-        );
-    }
-    if locate_env_bool(
-        "KIN_LOCATE_CROSS_ENCODER_ENABLED",
-        quality.cross_encoder_default(ce_model_cached),
-    ) {
-        let ltr_window = locate_env_usize("KIN_LOCATE_LTR_WINDOW", 20).min(fused.len());
-        if ltr_window > 0 {
-            // Gate the cross-encoder rerank on graph presence, not a live
-            // workspace root. The candidate text is built entirely from
-            // `graph_derived_candidate_text` (graph-owned artifact bodies), so the
-            // reranker only needs the graph's retrievable artifacts to score
-            // against. Scoped sessions run with `workspace_root = None` while
-            // keeping a populated graph, so the gate must key on the graph to stay
-            // effective in that mode.
-            if cross_encoder_has_graph_candidates(graph) {
-                let model_id = ce_model_id.clone();
-                let revision = std::env::var("KIN_LOCATE_CROSS_ENCODER_REVISION")
-                    .unwrap_or_else(|_| "main".to_string());
+                    ),
+                },
+            );
+        }
+        if locate_env_bool(
+            "KIN_LOCATE_CROSS_ENCODER_ENABLED",
+            quality.cross_encoder_default(ce_model_cached),
+        ) {
+            let ltr_window = locate_env_usize("KIN_LOCATE_LTR_WINDOW", 20).min(fused.len());
+            if ltr_window > 0 {
+                // Gate the cross-encoder rerank on graph presence, not a live
+                // workspace root. The candidate text is built entirely from
+                // `graph_derived_candidate_text` (graph-owned artifact bodies), so the
+                // reranker only needs the graph's retrievable artifacts to score
+                // against. Scoped sessions run with `workspace_root = None` while
+                // keeping a populated graph, so the gate must key on the graph to stay
+                // effective in that mode.
+                if cross_encoder_has_graph_candidates(graph) {
+                    let model_id = ce_model_id.clone();
+                    let revision = std::env::var("KIN_LOCATE_CROSS_ENCODER_REVISION")
+                        .unwrap_or_else(|_| "main".to_string());
 
-                // 1.7 latency gate: time model load + rerank so an over-budget
-                // rerank can fall back to the pre-rerank order (see
-                // rerank_within_budget). Budget unset (0) == prior behavior.
-                let rerank_started = std::time::Instant::now();
-                match kin_db::embed::rerank::CrossEncoder::new(&model_id, &revision) {
-                    Ok(encoder) => {
-                        let mut docs = Vec::new();
-                        let mut candidates = Vec::new();
+                    // 1.7 latency gate: time model load + rerank so an over-budget
+                    // rerank can fall back to the pre-rerank order (see
+                    // rerank_within_budget). Budget unset (0) == prior behavior.
+                    let rerank_started = std::time::Instant::now();
+                    match kin_db::embed::rerank::CrossEncoder::new(&model_id, &revision) {
+                        Ok(encoder) => {
+                            let mut docs = Vec::new();
+                            let mut candidates = Vec::new();
 
-                        for (path, score) in fused.iter().take(ltr_window) {
-                            let content = graph_derived_candidate_text(graph, path);
-                            docs.push(content);
-                            candidates.push((path.clone(), *score));
-                        }
+                            for (path, score) in fused.iter().take(ltr_window) {
+                                let content = graph_derived_candidate_text(graph, path);
+                                docs.push(content);
+                                candidates.push((path.clone(), *score));
+                            }
 
-                        let doc_refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
-                        if let Ok(scores) = encoder.rerank(text, &doc_refs) {
-                            let elapsed_ms = rerank_started.elapsed().as_millis();
-                            // Unset falls back to the active profile's budget;
-                            // an explicit `0` means unbounded (no latency gate),
-                            // matching `rerank_within_budget`'s 0-is-off contract —
-                            // never a 0 ms budget that gates every rerank.
-                            let profile_budget_ms = quality.rerank_latency_budget_ms_default();
-                            let profile_bound = if profile_budget_ms == 0 {
-                                kin_core::env_registry::MsBound::Unbounded
-                            } else {
-                                kin_core::env_registry::MsBound::Limited(profile_budget_ms as u64)
-                            };
-                            let budget_ms = kin_core::env_registry::env_ms_bound(
-                                "KIN_LOCATE_RERANK_LATENCY_BUDGET_MS",
-                                profile_bound,
-                            )
-                            .as_millis_u128();
-                            if rerank_within_budget(elapsed_ms, budget_ms) {
-                                // additive, promotion-only blend.
-                                // Legacy (default) OVERWRITES the fused score with the raw
-                                // cross-encoder logit and re-sorts purely by it — substitutive,
-                                // so it evicts multi-signal-corroborated golds whenever the
-                                // encoder prefers a single-signal filler. The blend squashes
-                                // each logit to (0,1), spread-normalizes, and ADDS a bounded
-                                // term so scores are monotonically non-decreasing (a gold can
-                                // only move up, never below its fused floor); confidence-gated
-                                // to skip flat distributions where the encoder isn't separating.
-                                if locate_env_bool(
-                                    "KIN_LOCATE_RERANK_BLEND",
-                                    quality.rerank_blend_default(),
-                                ) {
-                                    let sig: Vec<f32> =
-                                        scores.iter().map(|&l| 1.0 / (1.0 + (-l).exp())).collect();
-                                    let mn = sig.iter().copied().fold(f32::INFINITY, f32::min);
-                                    let mx = sig.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                                    let spread = mx - mn;
-                                    let w = locate_env_f32("KIN_LOCATE_RERANK_BLEND_WEIGHT", 0.04);
-                                    let min_spread =
-                                        locate_env_f32("KIN_LOCATE_RERANK_MIN_SPREAD", 0.10);
-                                    if spread >= min_spread {
-                                        for (i, s) in sig.iter().enumerate() {
-                                            candidates[i].1 += w * (s - mn) / spread.max(1e-6);
+                            let doc_refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
+                            if let Ok(scores) = encoder.rerank(text, &doc_refs) {
+                                let elapsed_ms = rerank_started.elapsed().as_millis();
+                                // Unset falls back to the active profile's budget;
+                                // an explicit `0` means unbounded (no latency gate),
+                                // matching `rerank_within_budget`'s 0-is-off contract —
+                                // never a 0 ms budget that gates every rerank.
+                                let profile_budget_ms = quality.rerank_latency_budget_ms_default();
+                                let profile_bound = if profile_budget_ms == 0 {
+                                    kin_core::env_registry::MsBound::Unbounded
+                                } else {
+                                    kin_core::env_registry::MsBound::Limited(
+                                        profile_budget_ms as u64,
+                                    )
+                                };
+                                let budget_ms = kin_core::env_registry::env_ms_bound(
+                                    "KIN_LOCATE_RERANK_LATENCY_BUDGET_MS",
+                                    profile_bound,
+                                )
+                                .as_millis_u128();
+                                if rerank_within_budget(elapsed_ms, budget_ms) {
+                                    // additive, promotion-only blend.
+                                    // Legacy (default) OVERWRITES the fused score with the raw
+                                    // cross-encoder logit and re-sorts purely by it — substitutive,
+                                    // so it evicts multi-signal-corroborated golds whenever the
+                                    // encoder prefers a single-signal filler. The blend squashes
+                                    // each logit to (0,1), spread-normalizes, and ADDS a bounded
+                                    // term so scores are monotonically non-decreasing (a gold can
+                                    // only move up, never below its fused floor); confidence-gated
+                                    // to skip flat distributions where the encoder isn't separating.
+                                    if locate_env_bool(
+                                        "KIN_LOCATE_RERANK_BLEND",
+                                        quality.rerank_blend_default(),
+                                    ) {
+                                        let sig: Vec<f32> = scores
+                                            .iter()
+                                            .map(|&l| 1.0 / (1.0 + (-l).exp()))
+                                            .collect();
+                                        let mn = sig.iter().copied().fold(f32::INFINITY, f32::min);
+                                        let mx =
+                                            sig.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                                        let spread = mx - mn;
+                                        let w =
+                                            locate_env_f32("KIN_LOCATE_RERANK_BLEND_WEIGHT", 0.04);
+                                        let min_spread =
+                                            locate_env_f32("KIN_LOCATE_RERANK_MIN_SPREAD", 0.10);
+                                        if spread >= min_spread {
+                                            for (i, s) in sig.iter().enumerate() {
+                                                candidates[i].1 += w * (s - mn) / spread.max(1e-6);
+                                            }
+                                        }
+                                    } else {
+                                        for (i, s) in scores.iter().enumerate() {
+                                            candidates[i].1 = *s;
                                         }
                                     }
-                                } else {
-                                    for (i, s) in scores.iter().enumerate() {
-                                        candidates[i].1 = *s;
+                                    candidates.sort_by(|a, b| {
+                                        b.1.partial_cmp(&a.1)
+                                            .unwrap_or(std::cmp::Ordering::Equal)
+                                            .then_with(|| a.0.cmp(&b.0))
+                                    });
+
+                                    let mut new_fused: Vec<(String, f32)> = candidates;
+                                    for (path, score) in fused.iter().skip(ltr_window) {
+                                        new_fused.push((path.clone(), *score));
                                     }
-                                }
-                                candidates.sort_by(|a, b| {
-                                    b.1.partial_cmp(&a.1)
-                                        .unwrap_or(std::cmp::Ordering::Equal)
-                                        .then_with(|| a.0.cmp(&b.0))
-                                });
+                                    fused = new_fused;
 
-                                let mut new_fused: Vec<(String, f32)> = candidates;
-                                for (path, score) in fused.iter().skip(ltr_window) {
-                                    new_fused.push((path.clone(), *score));
-                                }
-                                fused = new_fused;
-
-                                if explain {
-                                    record_debug_stage(
-                                        &mut score_breakdown,
-                                        &mut debug_info,
-                                        &fused,
-                                        "after_cross_encoder",
-                                    );
-                                }
-                            } else {
-                                // Latency gate tripped: the rerank stage exceeded its
-                                // budget, so keep the pre-rerank fusion order. The result
-                                // then respects the latency SLO deterministically instead
-                                // of surfacing an over-budget reranking.
-                                tracing::warn!(
-                                    "cross-encoder rerank gated: {elapsed_ms}ms exceeds \
+                                    if explain {
+                                        record_debug_stage(
+                                            &mut score_breakdown,
+                                            &mut debug_info,
+                                            &fused,
+                                            "after_cross_encoder",
+                                        );
+                                    }
+                                } else {
+                                    // Latency gate tripped: the rerank stage exceeded its
+                                    // budget, so keep the pre-rerank fusion order. The result
+                                    // then respects the latency SLO deterministically instead
+                                    // of surfacing an over-budget reranking.
+                                    tracing::warn!(
+                                        "cross-encoder rerank gated: {elapsed_ms}ms exceeds \
                                      KIN_LOCATE_RERANK_LATENCY_BUDGET_MS={budget_ms}ms; \
                                      keeping pre-rerank order"
-                                );
-                                record_degradation(
-                                    &mut degradations,
-                                    RetrievalDegradation {
-                                        component: "cross_encoder".to_string(),
-                                        reason: "latency_budget_exceeded".to_string(),
-                                        detail: format!(
+                                    );
+                                    record_degradation(
+                                        &mut degradations,
+                                        RetrievalDegradation {
+                                            component: "cross_encoder".to_string(),
+                                            reason: "latency_budget_exceeded".to_string(),
+                                            detail: format!(
                                             "rerank took {elapsed_ms}ms against a {budget_ms}ms \
                                              budget; pre-rerank order kept"
                                         ),
-                                        remediation: "raise KIN_LOCATE_RERANK_LATENCY_BUDGET_MS \
+                                            remediation:
+                                                "raise KIN_LOCATE_RERANK_LATENCY_BUDGET_MS \
                                                       or keep the fused order"
-                                            .to_string(),
-                                    },
-                                );
-                                if explain {
-                                    record_debug_stage(
-                                        &mut score_breakdown,
-                                        &mut debug_info,
-                                        &fused,
-                                        "cross_encoder_gated",
+                                                    .to_string(),
+                                        },
                                     );
+                                    if explain {
+                                        record_debug_stage(
+                                            &mut score_breakdown,
+                                            &mut debug_info,
+                                            &fused,
+                                            "cross_encoder_gated",
+                                        );
+                                    }
                                 }
                             }
                         }
-                    }
-                    Err(e) => {
-                        tracing::warn!("CrossEncoder init failed: {}", e);
-                        record_degradation(
+                        Err(e) => {
+                            tracing::warn!("CrossEncoder init failed: {}", e);
+                            record_degradation(
                             &mut degradations,
                             RetrievalDegradation {
                                 component: "cross_encoder".to_string(),
@@ -3096,25 +3153,43 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                                         .to_string(),
                             },
                         );
+                        }
                     }
-                }
-            } else {
-                tracing::warn!(
-                    "skipping cross-encoder rerank because the graph has no entities \
+                } else {
+                    tracing::warn!(
+                        "skipping cross-encoder rerank because the graph has no entities \
                      to derive candidate text from"
-                );
-                record_degradation(
-                    &mut degradations,
-                    RetrievalDegradation {
-                        component: "cross_encoder".to_string(),
-                        reason: "no_candidates".to_string(),
-                        detail: "graph has no retrievable artifacts to derive candidate text from"
-                            .to_string(),
-                        remediation: "re-ingest the repo so graph artifacts exist".to_string(),
-                    },
-                );
+                    );
+                    record_degradation(
+                        &mut degradations,
+                        RetrievalDegradation {
+                            component: "cross_encoder".to_string(),
+                            reason: "no_candidates".to_string(),
+                            detail:
+                                "graph has no retrievable artifacts to derive candidate text from"
+                                    .to_string(),
+                            remediation: "re-ingest the repo so graph artifacts exist".to_string(),
+                        },
+                    );
+                }
             }
         }
+    }
+
+    #[cfg(not(feature = "embeddings"))]
+    if locate_env_bool(
+        "KIN_LOCATE_CROSS_ENCODER_ENABLED",
+        quality.cross_encoder_default(false),
+    ) {
+        record_degradation(
+            &mut degradations,
+            RetrievalDegradation {
+                component: "cross_encoder".to_string(),
+                reason: "feature_disabled".to_string(),
+                detail: "cross-encoder reranking is unsupported in this build".to_string(),
+                remediation: "install a Kin build with embedding support".to_string(),
+            },
+        );
     }
 
     // Signal-aware demotion: files with zero signal evidence are filler from
@@ -8911,6 +8986,7 @@ fn graph_source_text(graph: &kin_db::InMemoryGraph, path: &str) -> Result<String
 /// artifact's stored source). A graph miss is reported as a typed graph gap and
 /// yields no text, so the cross-encoder never reranks a candidate from raw
 /// workspace disk contents.
+#[cfg(feature = "embeddings")]
 fn graph_derived_candidate_text(graph: &kin_db::InMemoryGraph, path: &str) -> String {
     match graph_source_text(graph, path) {
         Ok(body) => body,
@@ -8930,6 +9006,7 @@ fn graph_derived_candidate_text(graph: &kin_db::InMemoryGraph, path: &str) -> St
 /// with `workspace_root = None` while keeping a populated graph, and the
 /// candidate text is graph-owned, so keying the gate on the graph keeps the
 /// reranker effective in scoped mode.
+#[cfg(feature = "embeddings")]
 fn cross_encoder_has_graph_candidates(graph: &kin_db::InMemoryGraph) -> bool {
     graph.artifact_count() > 0
 }
@@ -9160,6 +9237,7 @@ fn extract_error_signals(
 /// (e.g. historical scoped-session graphs), the vector source graph (typically
 /// the HEAD graph) is used for semantic search. Results are then post-filtered
 /// to only retain entities that exist in the primary (scoped) graph.
+#[cfg(feature = "vector")]
 fn extract_embedding_signals(
     text: &str,
     graph: &kin_db::InMemoryGraph,
@@ -9371,6 +9449,29 @@ fn extract_embedding_signals(
     }
 
     Ok(entity_seeds)
+}
+
+#[cfg(not(feature = "vector"))]
+fn extract_embedding_signals(
+    _text: &str,
+    _graph: &kin_db::InMemoryGraph,
+    _test_query: bool,
+    _vector_source: Option<&kin_db::InMemoryGraph>,
+    _quality: crate::retrieval_profile::RetrievalProfile,
+    degradations: &mut Vec<RetrievalDegradation>,
+    _ledger: Option<&mut Vec<PruneEvent>>,
+) -> Result<HashMap<kin_model::EntityId, EntityDiscovery>> {
+    record_degradation(
+        degradations,
+        RetrievalDegradation {
+            component: "vector_index".to_string(),
+            reason: "feature_disabled".to_string(),
+            detail: "this Kin build does not include vector retrieval".to_string(),
+            remediation: "install a vector-enabled Kin build for semantic similarity search"
+                .to_string(),
+        },
+    );
+    Ok(HashMap::new())
 }
 
 fn extract_cochange_signals(
@@ -9624,6 +9725,7 @@ fn push_projection_reason(explain: &mut HashMap<String, Vec<String>>, path: &str
     }
 }
 
+#[cfg(feature = "vector")]
 fn push_semantic_query(
     queries: &mut Vec<(String, f32)>,
     seen: &mut HashSet<String>,
@@ -10811,6 +10913,7 @@ fn rrf_rank_lift_weights(num_lists: usize) -> Vec<f32> {
 /// Otherwise the rerank result is applied only when its measured latency is
 /// within budget; an over-budget rerank falls back to the pre-rerank order so
 /// the returned ranking is deterministic with respect to the latency cap.
+#[cfg(feature = "embeddings")]
 fn rerank_within_budget(elapsed_ms: u128, budget_ms: u128) -> bool {
     budget_ms == 0 || elapsed_ms <= budget_ms
 }
@@ -15682,6 +15785,7 @@ mod tests {
         assert!(record.text_terms.is_empty());
     }
 
+    #[cfg(feature = "embeddings")]
     #[test]
     fn graph_derived_candidate_text_serves_graph_body_and_ignores_disk() {
         let graph = kin_db::InMemoryGraph::new();
@@ -15707,6 +15811,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "embeddings")]
     #[test]
     fn cross_encoder_gate_keys_on_graph_presence_not_workspace_root() {
         // In scoped eval the daemon runs with `workspace_root = None` while still
@@ -15739,6 +15844,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "embeddings")]
     #[test]
     fn graph_derived_candidate_text_returns_empty_and_records_gap_on_graph_miss() {
         let graph = kin_db::InMemoryGraph::new();
@@ -16271,6 +16377,7 @@ mod tests {
         assert_eq!(base, ones);
     }
 
+    #[cfg(feature = "vector")]
     #[test]
     #[serial_test::serial]
     fn locate_strict_mode_rejects_incomplete_embeddings() {
@@ -16294,6 +16401,35 @@ mod tests {
             format!("{err}").contains("semantic locate requires complete embeddings"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[cfg(not(feature = "vector"))]
+    #[test]
+    #[serial_test::serial]
+    fn vector_free_locate_ignores_impossible_strict_embedding_gate() {
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = test_entity("handler", "src/lib.py", 1, 5);
+        graph.upsert_entity(&entity).unwrap();
+
+        std::env::set_var("KIN_REQUIRE_COMPLETE_EMBEDDINGS", "1");
+        std::env::remove_var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
+        let result = run_with_graph_capture(&graph, "handler failure", true, 10, true)
+            .expect("a vector-free build must still serve lexical and graph locate");
+        std::env::remove_var("KIN_REQUIRE_COMPLETE_EMBEDDINGS");
+
+        let coverage = result
+            .semantic_coverage
+            .expect("vector-free locate must report semantic capability");
+        assert!(!coverage.supported);
+        assert!(!coverage.complete);
+        let vector_degradations = result
+            .degradations
+            .iter()
+            .filter(|degradation| degradation.component == "vector_index")
+            .collect::<Vec<_>>();
+        assert_eq!(vector_degradations.len(), 1);
+        assert_eq!(vector_degradations[0].reason, "feature_disabled");
+        assert!(!vector_degradations[0].remediation.contains("kin embed"));
     }
 
     #[test]
@@ -18832,6 +18968,7 @@ mod tests {
         assert_eq!(score, 6.75);
     }
 
+    #[cfg(feature = "vector")]
     #[test]
     fn push_semantic_query_deduplicates_case_insensitively() {
         let mut queries = Vec::new();
@@ -22574,6 +22711,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "embeddings")]
     #[test]
     fn rerank_latency_gate_respects_budget() {
         // Budget 0 disables the gate → always apply (prior behavior preserved).
@@ -22587,6 +22725,7 @@ mod tests {
     #[test]
     fn coverage_banner_only_warns_on_degraded_signal() {
         let complete = SemanticCoverage {
+            supported: true,
             indexed: 10,
             total: 10,
             pending: 0,
@@ -22599,6 +22738,7 @@ mod tests {
         );
 
         let partial_with_note = SemanticCoverage {
+            supported: true,
             indexed: 4,
             total: 10,
             pending: 6,
@@ -22612,6 +22752,7 @@ mod tests {
         );
 
         let partial_no_note = SemanticCoverage {
+            supported: true,
             indexed: 4,
             total: 10,
             pending: 6,
