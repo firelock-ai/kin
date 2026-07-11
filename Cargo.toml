@@ -132,7 +132,7 @@ kin-review = { path = "crates/kin-review" }
 kin-migrate = { path = "crates/kin-migrate" }
 kin-runtime = { path = "crates/kin-runtime" }
 kin-buildinfo = { path = "crates/kin-buildinfo" }
-kin-cli = { path = "crates/kin-cli" }
+kin-cli = { path = "crates/kin-cli", default-features = false }
 kin-daemon = { path = "crates/kin-daemon" }
 kin-mcp = { path = "crates/kin-mcp" }
 kin-spine = { path = "crates/kin-spine" }
@@ -143,7 +143,7 @@ kin-lsp = { version = "0.2.2", registry = "kin" }
 # backend on every target (incl. Linux, where it cannot compile). Metal is re-enabled
 # additively on macOS via a `[target.'cfg(target_os = "macos")'.dependencies]` block in the
 # binary/runtime crates (kin-cli, kin-daemon). Feature unification makes that additive.
-kin-db = { version = "0.2.33", registry = "kin", default-features = false, features = ["vector", "embeddings"] }
+kin-db = { version = "0.2.34", registry = "kin", default-features = false }
 kin-vfs-core = { version = "0.1.3", registry = "kin" }
 
 [profile.release]

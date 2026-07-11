@@ -409,6 +409,7 @@ pub fn build_embed_response(
     // entries from masking real backfill work.
     let status = graph.embedding_status();
     if should_queue_missing_embedding_pass(status.indexed, status.total) {
+        #[cfg(feature = "embeddings")]
         graph.queue_missing_for_embedding();
         graph.queue_missing_artifacts_for_embedding();
     }

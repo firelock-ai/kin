@@ -28,24 +28,59 @@ per-artifact SHA-256 file:
 
 A convenience `checksums-sha256.txt` aggregating every per-artifact file is also
 attached to the release, but the installer verifies against the per-artifact
-`.sha256` file, not the aggregate.
+`.sha256` file, not the aggregate. Each archive also has a provenance manifest,
+and the release includes an aggregate manifest binding the Kin and pinned
+`kin-vfs` commits, both lockfile hashes, every archive hash, and every packaged
+binary hash. GitHub signs an artifact attestation over the final archives and
+aggregate manifest before the prerelease is created.
 
-The Windows leg is marked experimental (`continue-on-error`) while its
-vector-free dependency path is hardened, so it must not be treated as a fully
-supported, signed target.
+The Windows archive is a release-blocking target. It ships the supported
+vector-free runtime: graph, lexical, daemon, setup, and MCP surfaces are present,
+while vector similarity and local embedding are reported explicitly as
+unsupported. Windows VFS projection is also not shipped. The archive is
+checksum-protected and GitHub-attested, but is not OS-code-signed by this pipeline.
 
-## Two Independent Integrity Layers
+Every tag is first published as a non-latest prerelease. The anonymous install
+proof installs all five archives (Linux x86_64/aarch64, macOS x86_64/aarch64,
+and Windows x86_64), verifies the GitHub attestation plus exact tag/commit/lock
+provenance, and exercises a fresh repository, graph search/locate, MCP
+initialize/list/call, and all supported agent configuration writers. The four
+Unix legs additionally build embeddings and prove semantic search/locate at
+complete coverage. Both npm packages are then staged under their final channel
+through npm Trusted Publishing. An authenticated maintainer inspects the staged
+tarballs and approves both packages with 2FA; anonymous exact-byte, provenance,
+and install proof runs after approval. GitHub Latest is promoted only after
+every gate passes.
 
-Kin's release trust rests on two layers that are verified independently:
+The daemon container is a separate attested subject. The protected tag workflow
+builds one exact commit-tagged image in GHCR, verifies its embedded source and
+lockfile identity, then passes that digest to a separate attestation-only job.
+That job re-resolves the commit tag, refuses digest drift, attaches SLSA
+provenance to the immutable digest in GHCR, and self-verifies the repository,
+release workflow, source tag, peeled source commit, and hosted-runner identity.
+It cannot rebuild the image. Later version-tag promotion reuses that digest
+without rebuilding and never writes an implicit `latest` image.
+Hosted infrastructure may copy the exact manifest into its private registry,
+but that operation is a separately attested promotion, not a second build.
+
+## Three Independent Integrity Layers
+
+Kin's release trust rests on three layers that are verified independently:
 
 1. **A SHA-256 checksum** published next to every archive. This is the
    cross-platform integrity check the installer enforces on every platform.
-2. **Apple code-signing and notarization** of the macOS binaries. This is an
+2. **A GitHub artifact attestation** over the final archives and aggregate
+   provenance manifest. The release workflow signs it through GitHub OIDC;
+   install proof verifies the signer workflow, source tag, source commit, and
+   hosted-runner provenance. The convenience installers do not yet perform
+   this verification themselves, so users who need the additional supply-chain
+   check should run `gh attestation verify <archive> --repo firelock-ai/kin`.
+3. **Apple code-signing and notarization** of the macOS binaries. This is an
    OS-level authenticity and integrity check enforced by macOS Gatekeeper, and
    it applies only to the macOS artifacts.
 
-Linux and Windows artifacts rely on the SHA-256 layer (plus the integrity of the
-GitHub release asset host); they are not OS-code-signed by this pipeline today.
+Linux and Windows artifacts rely on the SHA-256 and GitHub-attestation layers;
+they are not OS-code-signed by this pipeline today.
 
 ## macOS Trust Chain
 
@@ -76,11 +111,10 @@ codesign --verify --strict --verbose=2 "$f"
   binary under a signed-looking name.
 
 The signing secrets are surfaced as job-level environment so steps can guard on
-`env.MACOS_CERTIFICATE != ''`. When those secrets are **absent**, every signing
-and notarization step is skipped and the pipeline still builds, packages, and
-publishes the (then-unsigned) binaries. A reviewer therefore cannot infer from
-the presence of a release alone that a given build was signed; signing is gated
-on the secrets being configured for that run.
+`env.MACOS_CERTIFICATE != ''`. Tagged releases require the certificate,
+password, and Developer ID and fail before packaging when any is absent. A
+manual branch workflow may exercise unsigned build plumbing, but the publish job
+is tag-only, so that path cannot create a public release.
 
 ### 2. Apple notarization
 
@@ -99,8 +133,9 @@ Notarization uploads the signed binaries to Apple, which scans them and, on
 success, issues a notarization ticket bound to the binaries' code-signing
 identity. The `--wait` makes the job block on the result (capped at 30 minutes so
 a stalled Apple queue fails fast rather than burning the runner), and a
-notarization rejection fails the job. This step runs only when both the signing
-certificate and `APPLE_ID` secrets are present.
+notarization rejection fails the job. Tagged releases require either the native
+Apple ID credential set or the explicitly selected Linux rcodesign credential
+set; missing credentials fail the release.
 
 ### 3. Online ticket validation (no stapling)
 
@@ -173,14 +208,35 @@ spctl --assess --type execute --verbose ./kin
   compromise of the release pipeline or its secrets could produce a validly
   signed malicious build. This is the standard trust assumption for
   CI-signed releases.
-- **Unsigned-but-published builds are possible.** Because every signing step is
-  guarded on the secrets being present, a run without those secrets publishes
-  unsigned binaries. Verify the macOS signature/notarization (above) rather than
-  assuming a release is signed.
-- **Linux/Windows have one integrity layer.** They are protected by the SHA-256
-  checksum and the release host, not by an OS code signature from this pipeline.
-  The checksum protects integrity (tamper-evidence) but not authorship
-  attribution the way a code signature does.
-- **npm and Homebrew distribution** are downstream of the GitHub release. The
-  npm wrapper publishes via OIDC Trusted Publishing (no long-lived `NPM_TOKEN`),
-  and the Homebrew tap consumes the published archives and their checksums.
+- **Tagged macOS publication is fail-closed.** Missing signing or notarization
+  credentials fail the tagged workflow, and publication cannot proceed. Manual
+  branch workflows may build unsigned binaries for diagnostics but cannot
+  publish a GitHub release.
+- **Linux/Windows have checksum plus workflow-attestation layers.** They do not
+  carry an OS code signature from this pipeline, but the release gate verifies
+  both the published SHA-256 sidecar and a GitHub artifact attestation pinned to
+  this repository, the release workflow, the source tag, and the source commit.
+  The installer itself performs the checksum verification; users who want the
+  separate authorship/provenance check can run `gh attestation verify`.
+- **npm and Homebrew distribution** are downstream of the GitHub release. Both
+  public npm packages trust only `firelock-ai/kin`'s `release.yml` in the
+  protected `release` environment, and that OIDC identity may only run
+  `npm stage publish`. It stages each version under its final channel without a
+  long-lived token. The maintainer should wait for both stage jobs to succeed,
+  then use an authenticated npm account to download both staged tarballs (for
+  example, with `npm stage download`) and compare their contents plus the
+  workflow-emitted SRI and SHA-1 values before approving either package with
+  2FA. The release workflow's OIDC identity deliberately cannot download or
+  inspect pending stages, so this pre-approval inspection is a human-enforced
+  gate. npm cannot make the two approvals atomic, so one package can still
+  become public before the other. Never cut or approve a newer release while an
+  older staged version remains pending. If the workflow fails or times out,
+  finish that same release immediately or reject every remaining staged version
+  before starting another release.
+- **npm's automated exact-byte proof is post-publication.** Approval makes the
+  npm version and final channel public before anonymous CI can fetch and verify
+  exact bytes, provenance, and clean install/provision behavior. A failure at
+  that point leaves an immutable public npm version requiring incident response;
+  it is not pre-public proof. GitHub Latest and the Homebrew tap remain blocked
+  until both npm versions and channels are visible and all post-public checks
+  pass.

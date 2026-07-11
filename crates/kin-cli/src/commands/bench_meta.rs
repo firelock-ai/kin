@@ -22,6 +22,8 @@ pub(crate) struct BenchMeta {
     embeddings: EmbeddingMeta,
     kin_commit: &'static str,
     kin_dirty: bool,
+    kin_source_known: bool,
+    dependency_provenance: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -133,6 +135,8 @@ pub async fn run(json: bool, prepared_state: bool) -> Result<()> {
         println!("feature_flags: {}", meta.feature_flags.join(","));
         println!("kin_commit: {}", meta.kin_commit);
         println!("kin_dirty: {}", meta.kin_dirty);
+        println!("kin_source_known: {}", meta.kin_source_known);
+        println!("dependency_provenance: {}", meta.dependency_provenance);
         if let Some(model_id) = meta.embeddings.model_id.as_deref() {
             println!("embedding_model_id: {}", model_id);
         }
@@ -162,6 +166,8 @@ pub(crate) fn build_meta() -> Result<BenchMeta> {
         embeddings: embedding_meta(),
         kin_commit: build.sha,
         kin_dirty: build.dirty,
+        kin_source_known: build.source_known,
+        dependency_provenance: build.dependency_provenance,
     })
 }
 

@@ -22,13 +22,16 @@
 //! concurrent reader either sees the entry or takes a cache miss — never a
 //! corrupt read.
 
+#[cfg(feature = "embeddings")]
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 
+#[cfg(feature = "embeddings")]
 use kin_db::embed::cache_admin::{self, CacheStats, GcOptions, GcReport};
 
 /// Render a byte count as a short human-readable string.
+#[cfg(feature = "embeddings")]
 fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
     let mut value = bytes as f64;
@@ -45,6 +48,7 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 /// Render a duration as a coarse age string (`3d`, `2h`, `5m`, `10s`).
+#[cfg(feature = "embeddings")]
 fn human_age(age: Duration) -> String {
     let secs = age.as_secs();
     if secs >= 86_400 {
@@ -59,12 +63,14 @@ fn human_age(age: Duration) -> String {
 }
 
 /// Age of `t` relative to `now`, clamped at zero for clock skew.
+#[cfg(feature = "embeddings")]
 fn age_of(t: SystemTime, now: SystemTime) -> Duration {
     now.duration_since(t).unwrap_or(Duration::ZERO)
 }
 
 /// Convert a `--budget-gb` flag / env value in gigabytes to bytes, rejecting
 /// non-positive or non-finite input the same way the env parser does.
+#[cfg(feature = "embeddings")]
 fn budget_gb_to_bytes(gb: f64) -> Option<u64> {
     if !gb.is_finite() || gb <= 0.0 {
         return None;
@@ -74,6 +80,7 @@ fn budget_gb_to_bytes(gb: f64) -> Option<u64> {
 
 /// Resolve the effective budget in bytes: an explicit `--budget-gb` flag wins,
 /// otherwise the `KIN_EMBED_CACHE_BUDGET_GB` environment default.
+#[cfg(feature = "embeddings")]
 fn resolve_budget(budget_gb: Option<f64>) -> Option<u64> {
     match budget_gb {
         Some(gb) => budget_gb_to_bytes(gb),
@@ -82,6 +89,7 @@ fn resolve_budget(budget_gb: Option<f64>) -> Option<u64> {
 }
 
 /// `kin cache status [--json]` — report cache size, composition, and age.
+#[cfg(feature = "embeddings")]
 pub async fn status(json: bool) -> Result<()> {
     let Some(base) = cache_admin::embedding_cache_base_dir() else {
         println!("kin cache status: no cache directory resolved (no home directory and KIN_EMBED_CACHE_DIR unset)");
@@ -100,6 +108,14 @@ pub async fn status(json: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "embeddings"))]
+pub async fn status(_json: bool) -> Result<()> {
+    anyhow::bail!(
+        "embedding cache management is unsupported in this build; install a Kin build with embedding support"
+    )
+}
+
+#[cfg(feature = "embeddings")]
 fn print_status_human(stats: &CacheStats, budget: Option<u64>, now: SystemTime) {
     println!("kin cache status");
     println!("  location: {}", stats.base.display());
@@ -179,6 +195,7 @@ fn print_status_human(stats: &CacheStats, budget: Option<u64>, now: SystemTime) 
     }
 }
 
+#[cfg(feature = "embeddings")]
 fn print_status_json(stats: &CacheStats, budget: Option<u64>, now: SystemTime) {
     let schema_versions: Vec<_> = stats
         .schema_versions
@@ -224,6 +241,7 @@ fn print_status_json(stats: &CacheStats, budget: Option<u64>, now: SystemTime) {
 
 /// `kin cache gc [--dry-run] [--budget-gb N] [--prune-stale-schema]` — reclaim
 /// space from the embedding cache.
+#[cfg(feature = "embeddings")]
 pub async fn gc(dry_run: bool, budget_gb: Option<f64>, prune_stale_schema: bool) -> Result<()> {
     let Some(base) = cache_admin::embedding_cache_base_dir() else {
         println!("kin cache gc: no cache directory resolved (no home directory and KIN_EMBED_CACHE_DIR unset)");
@@ -257,6 +275,14 @@ pub async fn gc(dry_run: bool, budget_gb: Option<f64>, prune_stale_schema: bool)
     Ok(())
 }
 
+#[cfg(not(feature = "embeddings"))]
+pub async fn gc(_dry_run: bool, _budget_gb: Option<f64>, _prune_stale_schema: bool) -> Result<()> {
+    anyhow::bail!(
+        "embedding cache management is unsupported in this build; install a Kin build with embedding support"
+    )
+}
+
+#[cfg(feature = "embeddings")]
 fn print_gc_report(report: &GcReport) {
     let verb = if report.dry_run {
         "would reclaim"
@@ -321,7 +347,21 @@ fn print_gc_report(report: &GcReport) {
     );
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "embeddings")))]
+mod unsupported_tests {
+    #[tokio::test]
+    async fn cache_commands_fail_loud_when_embeddings_are_disabled() {
+        for result in [
+            super::status(false).await,
+            super::gc(true, None, false).await,
+        ] {
+            let message = result.expect_err("vector-free cache command must be unsupported");
+            assert!(message.to_string().contains("unsupported in this build"));
+        }
+    }
+}
+
+#[cfg(all(test, feature = "embeddings"))]
 mod tests {
     use super::*;
 

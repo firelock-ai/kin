@@ -120,6 +120,14 @@ impl KinLayout {
         self.kindb_dir().join("graph.kndb")
     }
 
+    /// `.kin/kindb/head-generation` — daemon-published durable authority head.
+    ///
+    /// This is intentionally separate from `.kin/kindb/generation`, which is
+    /// owned by KinDB as the generation of its legacy compatibility projection.
+    pub fn kindb_head_generation_path(&self) -> PathBuf {
+        self.kindb_dir().join("head-generation")
+    }
+
     /// `.kin/kindb/graph.kvec` — persisted vector index aligned with the snapshot.
     pub fn kindb_vector_index_path(&self) -> PathBuf {
         self.kindb_snapshot_path().with_extension("kvec")
@@ -372,6 +380,10 @@ mod tests {
         assert_eq!(
             layout.kindb_snapshot_path(),
             PathBuf::from("/repo/.kin/kindb/graph.kndb")
+        );
+        assert_eq!(
+            layout.kindb_head_generation_path(),
+            PathBuf::from("/repo/.kin/kindb/head-generation")
         );
         assert_eq!(layout.objects_dir(), PathBuf::from("/repo/.kin/objects"));
         assert_eq!(layout.working_dir(), Path::new("/repo"));

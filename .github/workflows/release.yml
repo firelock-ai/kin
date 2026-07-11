@@ -7,18 +7,24 @@ on:
   push:
     tags:
       - "v*.*.*"
-  workflow_dispatch:
-    inputs:
-      notarize_on_linux:
-        description: >-
-          Notarize the macOS binaries from a Linux runner via rcodesign instead
-          of running xcrun notarytool on the macOS build runner. Leave unchecked
-          to use the native macOS notarytool path (the proven default).
-        type: boolean
-        default: false
 
 permissions:
-  contents: write
+  contents: read
+
+# External authority boundary: repository ruleset "Protect version release
+# tags" limits v* creation/update/deletion to the release captain, while the
+# protected `release` environment admits only v* tags and requires approval.
+# Every credential-bearing or public-write job below must keep that environment.
+# Both public npm packages trust only firelock-ai/kin + release.yml + environment
+# `release`, allow only `npm stage publish`, and disallow traditional tokens.
+# Keep the two stage jobs on that exact identity; approval remains human + 2FA.
+
+# Serialize every release channel. GitHub may replace an older pending run, so
+# every mutation also performs its own SemVer rollback check immediately before
+# moving a public tag.
+concurrency:
+  group: kin-release-promotion
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,24 +34,44 @@ jobs:
   # macOS legs still build + codesign natively; only the Apple Notary submission
   # moves to a 1x Linux runner (macOS minutes bill 10x) when this is on.
   #
-  # Source of truth, in order:
-  #   1. the workflow_dispatch boolean input (for one-off validation runs)
-  #   2. the repository variable NOTARIZE_ON_LINUX == 'true' (the persistent
-  #      cutover switch — flip it once the Linux leg is proven green)
-  # When neither is set, notarization stays on macOS notarytool (the fallback).
+  # The repository variable NOTARIZE_ON_LINUX is the cutover switch. Manual
+  # dispatch is intentionally disabled: a dispatch can target branch-controlled
+  # workflow code, which must never inherit Apple or package-publish secrets.
+  # When the variable is not true, notarization stays on native notarytool.
   config:
     name: Resolve release config
     runs-on: ubuntu-latest
     outputs:
       notarize_on_linux: ${{ steps.flags.outputs.notarize_on_linux }}
+      release_channel: ${{ steps.release_order.outputs.release_channel }}
     steps:
+      - name: Checkout release policy
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Require release tag on reviewed default-branch history
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin \
+            "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+          tag_commit="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
+          test "$tag_commit" = "$(git rev-parse HEAD)"
+          if ! git merge-base --is-ancestor \
+            "$tag_commit" "refs/remotes/origin/${DEFAULT_BRANCH}"; then
+            echo "::error::release tag $GITHUB_REF_NAME is not on reviewed $DEFAULT_BRANCH history"
+            exit 1
+          fi
+
       - name: Resolve notarize backend
         id: flags
         env:
-          DISPATCH_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.notarize_on_linux || '' }}
           REPO_VAR: ${{ vars.NOTARIZE_ON_LINUX }}
         run: |
-          if [ "$DISPATCH_INPUT" = "true" ] || [ "$REPO_VAR" = "true" ]; then
+          if [ "$REPO_VAR" = "true" ]; then
             echo "notarize_on_linux=true" >> "$GITHUB_OUTPUT"
             echo "Notarization backend: rcodesign on Linux"
           else
@@ -53,26 +79,295 @@ jobs:
             echo "Notarization backend: xcrun notarytool on macOS (default)"
           fi
 
+      - name: Refuse release-channel rollback
+        id: release_order
+        if: ${{ github.ref_type == 'tag' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          channel="$(node scripts/release-order.mjs channel "$version")"
+          echo "release_channel=$channel" >> "$GITHUB_OUTPUT"
+
+          for package in @kinlab/kin @kinlab/kin-mcp; do
+            current="$(node scripts/release-order.mjs npm-channel "$package" "$channel")"
+            node scripts/release-order.mjs assert-not-rollback \
+              "$version" "$current" "npm ${package} ${channel}"
+          done
+
+          if [ "$channel" = "latest" ]; then
+            current_tag="$(node scripts/release-order.mjs github-latest "$GITHUB_REPOSITORY")"
+            current_version="${current_tag#v}"
+            node scripts/release-order.mjs assert-not-rollback \
+              "$version" "$current_version" "GitHub Latest"
+          fi
+
+  # Publish the daemon image from the same externally-authorized tag workflow
+  # as every other release surface. Main pushes and manual dispatches never get
+  # package-write authority. The commit tag is an immutable staging identity;
+  # version_tag_image promotes that exact digest only after public install proof.
+  build_daemon_image:
+    name: Build immutable daemon image
+    needs: config
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+      commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Resolve release commit
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
+          test "$commit" = "$(git rev-parse HEAD)"
+          if ! printf '%s\n' "$commit" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::release tag did not resolve to a full commit id"
+            exit 1
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Publish or verify immutable commit image
+        id: publish
+        shell: bash
+        env:
+          COMMIT: ${{ steps.source.outputs.commit }}
+          IMAGE: ghcr.io/firelock-ai/kin
+        run: |
+          set -euo pipefail
+          source_image="${IMAGE}:${COMMIT}"
+
+          inspect_digest() {
+            local reference="$1"
+            local output
+            for attempt in 1 2 3 4 5; do
+              if output="$(docker buildx imagetools inspect "$reference" \
+                --format '{{.Manifest.Digest}}' 2>&1)"; then
+                printf '%s\n' "$output"
+                return 0
+              fi
+              if [ "$output" = "ERROR: ${reference}: not found" ]; then
+                return 44
+              fi
+              if [ "$attempt" -eq 5 ]; then
+                printf '%s\n' "$output" >&2
+                echo "::error::could not establish immutable state for $reference" >&2
+                return 1
+              fi
+              sleep $(( attempt * 2 ))
+            done
+          }
+
+          if digest="$(inspect_digest "$source_image")"; then
+            # A rerun never overwrites the commit identity. Verify the exact
+            # existing digest carries this checkout's source and lock metadata.
+            bash scripts/verify-container-build-info.sh \
+              "${IMAGE}@${digest}" "$COMMIT"
+            action="Verified existing"
+          else
+            inspect_status=$?
+            if [ "$inspect_status" -ne 44 ]; then
+              exit "$inspect_status"
+            fi
+
+            docker buildx build \
+              --file Dockerfile \
+              --load \
+              --platform linux/amd64 \
+              --provenance=false \
+              --build-arg "KIN_BUILD_GIT_SHA=${COMMIT}" \
+              --build-arg KIN_BUILD_DIRTY=false \
+              --build-arg "KIN_BUILD_BRANCH=${GITHUB_REF_NAME}" \
+              --cache-from type=gha \
+              --cache-to type=gha,mode=max \
+              --tag "$source_image" \
+              .
+            bash scripts/verify-container-build-info.sh "$source_image" "$COMMIT"
+
+            # Release concurrency serializes writers. Recheck immediately before
+            # the first write so a surprising pre-existing tag fails closed.
+            if existing="$(inspect_digest "$source_image")"; then
+              echo "::error::$source_image appeared concurrently at $existing; refusing to overwrite it"
+              exit 1
+            else
+              inspect_status=$?
+              if [ "$inspect_status" -ne 44 ]; then
+                exit "$inspect_status"
+              fi
+            fi
+
+            docker push "$source_image"
+            digest="$(inspect_digest "$source_image")"
+            bash scripts/verify-container-build-info.sh \
+              "${IMAGE}@${digest}" "$COMMIT"
+            action="Published"
+          fi
+
+          case "$digest" in
+            sha256:*) ;;
+            *)
+              echo "::error::could not resolve an immutable digest for $source_image"
+              exit 1
+              ;;
+          esac
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          {
+            echo "${action} immutable release image:"
+            echo ""
+            echo "- source: \`${source_image}\`"
+            echo "- digest: \`${digest}\`"
+            echo "- no mutable latest tag was written"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Attestation is intentionally separate from the image build. It may only
+  # inspect the immutable commit tag emitted above, and cannot rebuild or move
+  # it. This keeps OIDC/attestation authority out of the build job while still
+  # blocking every public release surface if exact OCI provenance is absent.
+  attest_daemon_image:
+    name: Attest immutable daemon image
+    needs: [config, build_daemon_image]
+    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Resolve peeled release commit
+        id: source
+        shell: bash
+        env:
+          EXPECTED_COMMIT: ${{ needs.build_daemon_image.outputs.commit }}
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
+          test "$commit" = "$(git rev-parse HEAD)"
+          if [ "$commit" != "$EXPECTED_COMMIT" ]; then
+            echo "::error::release tag peels to $commit, image job resolved to $EXPECTED_COMMIT"
+            exit 1
+          fi
+          if ! printf '%s\n' "$commit" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::release tag did not resolve to a full commit id"
+            exit 1
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Resolve exact immutable daemon digest
+        id: subject
+        shell: bash
+        env:
+          COMMIT: ${{ steps.source.outputs.commit }}
+          EXPECTED_DIGEST: ${{ needs.build_daemon_image.outputs.digest }}
+          IMAGE: ghcr.io/firelock-ai/kin
+        run: |
+          set -euo pipefail
+          reference="${IMAGE}:${COMMIT}"
+          digest="$(docker buildx imagetools inspect \
+            "$reference" --format '{{.Manifest.Digest}}')"
+          if ! printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::could not resolve an immutable manifest digest for $reference"
+            exit 1
+          fi
+          if [ "$digest" != "$EXPECTED_DIGEST" ]; then
+            echo "::error::$reference moved from release-built $EXPECTED_DIGEST to $digest"
+            exit 1
+          fi
+          bash scripts/verify-container-build-info.sh \
+            "${IMAGE}@${digest}" "$COMMIT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Attest immutable daemon image
+        # With no predicate inputs actions/attest emits SLSA provenance. Store
+        # the bundle next to the exact digest in GHCR for downstream admission.
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-name: ghcr.io/firelock-ai/kin
+          subject-digest: ${{ steps.subject.outputs.digest }}
+          push-to-registry: true
+          # The OCI bundle is required; the optional linked-artifact storage
+          # record (and its broader artifact-metadata permission) is not.
+          create-storage-record: false
+
+      - name: Verify immutable daemon image attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.subject.outputs.digest }}
+          COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          set -euo pipefail
+          verified=false
+          for attempt in 1 2 3 4 5; do
+            if gh attestation verify \
+              "oci://ghcr.io/firelock-ai/kin@${DIGEST}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --bundle-from-oci \
+              --predicate-type https://slsa.dev/provenance/v1 \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --signer-digest "$COMMIT" \
+              --source-digest "$COMMIT" \
+              --source-ref "$GITHUB_REF" \
+              --deny-self-hosted-runners; then
+              verified=true
+              break
+            fi
+            sleep $(( attempt * 2 ))
+          done
+          if [ "$verified" != true ]; then
+            echo "::error::could not verify the exact GHCR daemon image attestation"
+            exit 1
+          fi
+
   build:
     name: Build (${{ matrix.artifact }})
     needs: config
     runs-on: ${{ matrix.os }}
-    # Windows is a work-in-progress release target while the vector-free
-    # dependency path is hardened. It must not block the macOS/Linux release:
-    # the experimental leg is non-blocking so Publish Release + npm still run.
-    continue-on-error: ${{ matrix.experimental || false }}
-    # macOS signing/notarization secrets are surfaced as env so they can be used
-    # in step `if:` guards. The `secrets` context is NOT available in `if:`
-    # conditions, so guarding on `env.MACOS_CERTIFICATE != ''` is the supported
-    # pattern. When the secrets are unset every signing step is skipped and the
-    # pipeline still builds, packages, and publishes the (unsigned) binaries.
+    environment: release
+    # Every advertised platform is release-blocking. A public release must not
+    # be created without one of the archives consumed by the installers.
+    # Signing credentials are deliberately step-scoped below. The untrusted
+    # Cargo build matrix never receives Apple secrets or a write-scoped token.
+    # Tagged releases fail closed when any required credential is absent.
     env:
-      MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
-      MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
-      MACOS_DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       # When true, the macOS leg codesigns and uploads the signed-but-unnotarized
       # zip, and the separate notarize_linux job submits it to Apple Notary via
       # rcodesign. When false (default), the macOS leg notarizes inline with
@@ -99,7 +394,9 @@ jobs:
             artifact: kin-linux-aarch64
             shim_name: libkin_vfs_shim.so
             cross: false
-          - os: macos-latest
+          # Use an Intel host so this archive is executed before packaging;
+          # building x86_64 on an arm64 runner would leave it unproven.
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             artifact: kin-macos-x86_64
             shim_name: libkin_vfs_shim.dylib
@@ -114,15 +411,16 @@ jobs:
             artifact: kin-windows-x86_64
             shim_name: kin_vfs_shim.dll
             skip_vector: true
-            experimental: true
             cross: false
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@c0e9df88980754dd93e5833b8dcb1b304c1fe173 # 1.96.0
         with:
           # On the Linux legs the core (kin, kin-daemon) targets musl and the VFS
           # leg targets gnu (vfs_target), so both targets must be installed.
@@ -140,13 +438,16 @@ jobs:
         run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Checkout kin-vfs
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: firelock-ai/kin-vfs
           path: kin-vfs
+          # Release inputs must never move under an unchanged Kin tag.
+          ref: 48c757dfda2ca6b115f32d86875c6adde587b861
+          persist-credentials: false
 
       - name: Cache Cargo registry and build artifacts
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.0.0
         with:
           path: |
             ~/.cargo/registry
@@ -157,30 +458,22 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-
 
-      - name: Checkout kin-db (for Windows vector-free build)
-        if: ${{ matrix.skip_vector }}
-        uses: actions/checkout@v7
-        with:
-          repository: firelock-ai/kin-db
-          path: kin-db-local
-
-      - name: Patch kin-db to disable vector on Windows
-        if: ${{ matrix.skip_vector }}
+      - name: Assert clean release source
         shell: bash
         run: |
-          # 1. Remove vector feature from kin-db defaults
-          sed -i 's/^default = \["vector"\]/default = []/' kin-db-local/crates/kin-db/Cargo.toml
-          # 2. Remove features = ["vector"] from kin's dep on kin-db
-          sed -i 's/, features = \["vector"\]//' Cargo.toml
-          # 3. Point kin's dep to the patched local checkout
-          mkdir -p .cargo
-          cat >> .cargo/config.toml << 'TOML'
-          [patch."https://github.com/firelock-ai/kin-db.git"]
-          kin-db = { path = "kin-db-local/crates/kin-db" }
-          # kin-model is its own repo (no longer vendored under kin-db/crates) —
-          # it resolves from the main [patch.kin] git pin like every other
-          # platform; only kin-db needs the local vector-disabled override here.
-          TOML
+          set -euo pipefail
+          dirty="$(git status --porcelain --untracked-files=all)"
+          if [ -n "$dirty" ]; then
+            printf '%s\n' "$dirty" >&2
+            echo "::error::release checkout is not clean before compilation"
+            exit 1
+          fi
+          vfs_dirty="$(git -C kin-vfs status --porcelain --untracked-files=all)"
+          if [ -n "$vfs_dirty" ]; then
+            printf '%s\n' "$vfs_dirty" >&2
+            echo "::error::pinned kin-vfs checkout is not clean before compilation"
+            exit 1
+          fi
 
       - name: Build kin-cli + kin-daemon (native)
         if: ${{ !matrix.cross }}
@@ -193,14 +486,14 @@ jobs:
           # The daemon is the runtime: `kin init` works without it but
           # `kin status`/`kin search`/the MCP server all require kin-daemon on
           # PATH, so a clean public install must ship it alongside `kin`.
-          cargo build --release --target "$TARGET" -p kin-cli -p kin-daemon $FLAGS
+          cargo build --locked --release --target "$TARGET" -p kin-cli -p kin-daemon $FLAGS
         env:
           TARGET: ${{ matrix.target }}
           SKIP_VECTOR: ${{ matrix.skip_vector }}
 
       - name: Build kin-cli + kin-daemon (cross)
         if: ${{ matrix.cross }}
-        run: cross build --release --target "$TARGET" -p kin-cli -p kin-daemon
+        run: cross build --locked --release --target "$TARGET" -p kin-cli -p kin-daemon
         env:
           TARGET: ${{ matrix.target }}
 
@@ -213,8 +506,8 @@ jobs:
           # libc-specific: on Linux it builds against gnu (VFS_TARGET) so it can
           # preload into the host distro's glibc programs. macOS/Windows have no
           # vfs_target, so VFS_TARGET falls back to the core target there.
-          cargo build --release --target "$VFS_TARGET" -p kin-vfs-cli
-          cargo build --release --target "$VFS_TARGET" -p kin-vfs-shim
+          cargo build --locked --release --target "$VFS_TARGET" -p kin-vfs-cli
+          cargo build --locked --release --target "$VFS_TARGET" -p kin-vfs-shim
         env:
           VFS_TARGET: ${{ matrix.vfs_target || matrix.target }}
 
@@ -222,17 +515,147 @@ jobs:
         if: ${{ matrix.cross }}
         working-directory: kin-vfs
         run: |
-          cross build --release --target "$TARGET" -p kin-vfs-cli
-          cross build --release --target "$TARGET" -p kin-vfs-shim
+          cross build --locked --release --target "$TARGET" -p kin-vfs-cli
+          cross build --locked --release --target "$TARGET" -p kin-vfs-shim
         env:
           TARGET: ${{ matrix.target }}
 
+      - name: Verify native release build provenance
+        if: ${{ !matrix.cross }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          SKIP_VECTOR: ${{ matrix.skip_vector }}
+        run: |
+          set -euo pipefail
+          case "$RUNNER_ARCH:$TARGET" in
+            X64:x86_64-*|ARM64:aarch64-*) ;;
+            *)
+              echo "Skipping execution of cross-architecture artifact $TARGET on $RUNNER_ARCH; the matching macOS leg executes the same source and lock provenance."
+              exit 0
+              ;;
+          esac
+
+          suffix=""
+          [ "$RUNNER_OS" = "Windows" ] && suffix=".exe"
+          kin_bin="target/$TARGET/release/kin$suffix"
+          daemon_bin="target/$TARGET/release/kin-daemon$suffix"
+          provenance_dir="$RUNNER_TEMP/kin-release-provenance-$TARGET"
+          mkdir -p "$provenance_dir"
+          "$kin_bin" --version | tee "$provenance_dir/kin-version.txt"
+          "$daemon_bin" --version | tee "$provenance_dir/kin-daemon-version.txt"
+          "$kin_bin" bench-meta --json > "$provenance_dir/kin-build-meta.json"
+          expected_sha="$(git rev-parse HEAD)"
+
+          EXPECTED_SHA="$expected_sha" SKIP_VECTOR="$SKIP_VECTOR" PROVENANCE_DIR="$provenance_dir" node <<'NODE'
+          const crypto = require("crypto");
+          const fs = require("fs");
+          const expected = process.env.EXPECTED_SHA;
+          const dir = process.env.PROVENANCE_DIR;
+          const lines = ["kin-version.txt", "kin-daemon-version.txt"].map((path) =>
+            fs.readFileSync(`${dir}/${path}`, "utf8").trim()
+          );
+          const shas = lines.map((line) => {
+            const match = line.match(/\(([0-9a-f]{40})(-dirty)?\s/);
+            if (!match) throw new Error(`release version line lacks a full build SHA: ${line}`);
+            if (match[2]) throw new Error(`release binary was built dirty: ${line}`);
+            return match[1];
+          });
+          if (shas.some((sha) => sha !== expected) || shas[0] !== shas[1]) {
+            throw new Error(`release binary SHAs ${shas.join(", ")} do not match checkout ${expected}`);
+          }
+
+          const meta = JSON.parse(fs.readFileSync(`${dir}/kin-build-meta.json`, "utf8"));
+          if (process.env.GITHUB_REF_TYPE === "tag") {
+            const expectedVersion = process.env.GITHUB_REF_NAME.replace(/^v/, "");
+            if (meta.kin_version !== expectedVersion) {
+              throw new Error(`kin package version ${meta.kin_version ?? "missing"} does not match release tag ${expectedVersion}`);
+            }
+          }
+          if (meta.kin_commit !== expected || meta.kin_dirty !== false || meta.kin_source_known !== true) {
+            throw new Error("kin bench-meta did not prove a clean, known release source");
+          }
+          const tagLockSha = crypto.createHash("sha256").update(fs.readFileSync("Cargo.lock")).digest("hex");
+          if (meta.dependency_provenance !== tagLockSha) {
+            throw new Error(
+              `embedded Cargo.lock provenance ${meta.dependency_provenance ?? "missing"} ` +
+              `does not match tagged Cargo.lock ${tagLockSha}`
+            );
+          }
+          if (process.env.SKIP_VECTOR === "true") {
+            for (const feature of ["vector", "embeddings", "metal"]) {
+              if (meta.feature_flags.includes(feature)) {
+                throw new Error(`vector-free release unexpectedly enabled ${feature}`);
+              }
+            }
+          }
+          NODE
+
+      - name: Assert release build did not mutate source
+        shell: bash
+        run: |
+          set -euo pipefail
+          dirty="$(git status --porcelain --untracked-files=all)"
+          if [ -n "$dirty" ]; then
+            printf '%s\n' "$dirty" >&2
+            echo "::error::release build mutated the source checkout"
+            exit 1
+          fi
+          vfs_dirty="$(git -C kin-vfs status --porcelain --untracked-files=all)"
+          if [ -n "$vfs_dirty" ]; then
+            printf '%s\n' "$vfs_dirty" >&2
+            echo "::error::release build mutated the pinned kin-vfs checkout"
+            exit 1
+          fi
+
       # --- macOS code signing + notarization -------------------------------
-      # Runs only on the macOS legs, and only when signing secrets are present
-      # (see the job-level env block). Signing happens BEFORE packaging so the
-      # tarball + its published sha256 cover the signed binaries.
+      # Tag releases fail closed when signing/notarization credentials are not
+      # configured.
+      - name: Resolve macOS signing credential availability
+        id: mac_signing
+        if: ${{ runner.os == 'macOS' }}
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          MACOS_DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          signing_available=true
+          for name in MACOS_CERTIFICATE MACOS_CERTIFICATE_PWD MACOS_DEVELOPER_ID; do
+            if [ -z "${!name:-}" ]; then
+              signing_available=false
+            fi
+          done
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$signing_available" != "true" ]; then
+            echo "::error::MACOS_CERTIFICATE, MACOS_CERTIFICATE_PWD, and MACOS_DEVELOPER_ID are required for a tagged macOS release"
+            exit 1
+          fi
+
+          native_notary_available=true
+          if [ "$NOTARIZE_ON_LINUX" != "true" ]; then
+            for name in APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+              if [ -z "${!name:-}" ]; then
+                native_notary_available=false
+              fi
+            done
+            if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$native_notary_available" != "true" ]; then
+              echo "::error::APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, and APPLE_TEAM_ID are required for native macOS notarization"
+              exit 1
+            fi
+          fi
+          echo "signing_available=$signing_available" >> "$GITHUB_OUTPUT"
+          echo "native_notary_available=$native_notary_available" >> "$GITHUB_OUTPUT"
+
+      # Signing happens BEFORE packaging so the tarball + its published
+      # sha256 cover the signed binaries.
       - name: Import code signing certificate (macOS)
-        if: ${{ runner.os == 'macOS' && env.MACOS_CERTIFICATE != '' }}
+        if: ${{ runner.os == 'macOS' && steps.mac_signing.outputs.signing_available == 'true' }}
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
         run: |
           CERT_PATH="$RUNNER_TEMP/build_certificate.p12"
           KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
@@ -247,20 +670,20 @@ jobs:
           rm -f "$CERT_PATH"
 
       - name: Sign macOS binaries
-        if: ${{ runner.os == 'macOS' && env.MACOS_CERTIFICATE != '' }}
+        if: ${{ runner.os == 'macOS' && steps.mac_signing.outputs.signing_available == 'true' }}
         run: |
           for f in \
             "target/${TARGET}/release/kin" \
             "target/${TARGET}/release/kin-daemon" \
             "kin-vfs/target/${TARGET}/release/kin-vfs" \
             "kin-vfs/target/${TARGET}/release/${SHIM_NAME}"; do
-            if [ -f "$f" ]; then
-              codesign --force --options runtime --timestamp \
-                --sign "$MACOS_DEVELOPER_ID" "$f"
-              codesign --verify --strict --verbose=2 "$f"
-            fi
+            test -f "$f"
+            codesign --force --options runtime --timestamp \
+              --sign "$MACOS_DEVELOPER_ID" "$f"
+            codesign --verify --strict --verbose=2 "$f"
           done
         env:
+          MACOS_DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID }}
           TARGET: ${{ matrix.target }}
           SHIM_NAME: ${{ matrix.shim_name }}
 
@@ -271,7 +694,7 @@ jobs:
       # tool submits the zip. Built once here and reused by whichever backend
       # notarizes (macOS notarytool inline, or rcodesign on the Linux job).
       - name: Stage signed binaries for notarization (macOS)
-        if: ${{ runner.os == 'macOS' && env.MACOS_CERTIFICATE != '' && env.APPLE_ID != '' }}
+        if: ${{ runner.os == 'macOS' && steps.mac_signing.outputs.signing_available == 'true' && (env.NOTARIZE_ON_LINUX == 'true' || steps.mac_signing.outputs.native_notary_available == 'true') }}
         run: |
           NOTARIZE_ZIP="${ARTIFACT}-notarize.zip"
           FILES=()
@@ -292,7 +715,7 @@ jobs:
       # only when the Linux backend is NOT selected, so flipping NOTARIZE_ON_LINUX
       # cleanly swaps backends without ever double-submitting.
       - name: Notarize macOS binaries (notarytool)
-        if: ${{ runner.os == 'macOS' && env.MACOS_CERTIFICATE != '' && env.APPLE_ID != '' && env.NOTARIZE_ON_LINUX != 'true' }}
+        if: ${{ runner.os == 'macOS' && steps.mac_signing.outputs.native_notary_available == 'true' && env.NOTARIZE_ON_LINUX != 'true' }}
         run: |
           xcrun notarytool submit "${ARTIFACT}-notarize.zip" \
             --apple-id "$APPLE_ID" \
@@ -305,14 +728,17 @@ jobs:
           # online by Gatekeeper on first run. If a .dmg/.pkg installer is added
           # later, run `xcrun stapler staple <installer>` here.
         env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           ARTIFACT: ${{ matrix.artifact }}
 
       # Linux backend: hand the signed zip to the notarize_linux job, which
       # submits it to Apple Notary via rcodesign on a (10x cheaper) Linux runner.
       # The zip is short-lived job-internal plumbing, not a published artifact.
       - name: Upload signed binaries for Linux notarization
-        if: ${{ runner.os == 'macOS' && env.MACOS_CERTIFICATE != '' && env.APPLE_ID != '' && env.NOTARIZE_ON_LINUX == 'true' }}
-        uses: actions/upload-artifact@v7
+        if: ${{ runner.os == 'macOS' && steps.mac_signing.outputs.signing_available == 'true' && env.NOTARIZE_ON_LINUX == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
           name: ${{ matrix.artifact }}-notarize-zip
           path: ${{ matrix.artifact }}-notarize.zip
@@ -330,15 +756,16 @@ jobs:
           cp "target/${TARGET}/release/kin-daemon" "$ARTIFACT/"
           # kin-vfs (cli + shim) is built under VFS_TARGET, which on Linux is the
           # gnu triple (the shim is libc-specific) and elsewhere equals TARGET.
-          cp "kin-vfs/target/${VFS_TARGET}/release/kin-vfs" "$ARTIFACT/" 2>/dev/null || true
-          cp "kin-vfs/target/${VFS_TARGET}/release/${SHIM_NAME}" "$ARTIFACT/" 2>/dev/null || true
+          cp "kin-vfs/target/${VFS_TARGET}/release/kin-vfs" "$ARTIFACT/"
+          cp "kin-vfs/target/${VFS_TARGET}/release/${SHIM_NAME}" "$ARTIFACT/"
           tar czf "${ARTIFACT}.tar.gz" "$ARTIFACT"
-          # Assert the published archive actually contains kin-daemon so
-          # a daemon-less build can never be released green.
-          if ! tar tzf "${ARTIFACT}.tar.gz" | grep -q "/kin-daemon$"; then
-            echo "::error::kin-daemon missing from ${ARTIFACT}.tar.gz — refusing to publish a daemon-less archive"
-            exit 1
-          fi
+          # All supported Unix surfaces are mandatory release contents.
+          for required in kin kin-daemon kin-vfs "$SHIM_NAME"; do
+            if ! tar tzf "${ARTIFACT}.tar.gz" | grep -q "/${required}$"; then
+              echo "::error::$required missing from ${ARTIFACT}.tar.gz"
+              exit 1
+            fi
+          done
           shasum -a 256 "${ARTIFACT}.tar.gz" > "${ARTIFACT}.tar.gz.sha256"
         env:
           TARGET: ${{ matrix.target }}
@@ -372,8 +799,101 @@ jobs:
           ARTIFACT: ${{ matrix.artifact }}
           SHIM_NAME: ${{ matrix.shim_name }}
 
+      - name: Generate artifact provenance manifest
+        shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          TARGET: ${{ matrix.target }}
+          VFS_TARGET: ${{ matrix.vfs_target || matrix.target }}
+          EXPECTED_VFS_COMMIT: 48c757dfda2ca6b115f32d86875c6adde587b861
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const childProcess = require("child_process");
+          const crypto = require("crypto");
+          const fs = require("fs");
+          const path = require("path");
+
+          const artifact = process.env.ARTIFACT;
+          const target = process.env.TARGET;
+          const root = process.cwd();
+          const sha256 = (file) =>
+            crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+          const git = (cwd, ...args) =>
+            childProcess.execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+
+          const kinCommit = git(root, "rev-parse", "HEAD");
+          const vfsRoot = path.join(root, "kin-vfs");
+          const vfsCommit = git(vfsRoot, "rev-parse", "HEAD");
+          if (vfsCommit !== process.env.EXPECTED_VFS_COMMIT) {
+            throw new Error(`kin-vfs checkout ${vfsCommit} does not match pinned ${process.env.EXPECTED_VFS_COMMIT}`);
+          }
+
+          const kinLockSha = sha256(path.join(root, "Cargo.lock"));
+          const vfsLockSha = sha256(path.join(vfsRoot, "Cargo.lock"));
+          const buildMetaPath = path.join(
+            process.env.RUNNER_TEMP,
+            `kin-release-provenance-${target}`,
+            "kin-build-meta.json"
+          );
+          const buildMeta = JSON.parse(fs.readFileSync(buildMetaPath, "utf8"));
+          if (buildMeta.kin_commit !== kinCommit || buildMeta.dependency_provenance !== kinLockSha) {
+            throw new Error("embedded build provenance does not match the tagged Kin source and Cargo.lock");
+          }
+
+          const archives = [`${artifact}.tar.gz`, `${artifact}.zip`].filter((file) => fs.existsSync(file));
+          if (archives.length !== 1) {
+            throw new Error(`expected exactly one final archive for ${artifact}, found ${archives.join(", ") || "none"}`);
+          }
+          const archive = archives[0];
+          const contents = fs.readdirSync(artifact, { withFileTypes: true })
+            .filter((entry) => entry.isFile())
+            .map((entry) => {
+              const file = path.join(artifact, entry.name);
+              return {
+                name: entry.name,
+                sha256: sha256(file),
+                size_bytes: fs.statSync(file).size,
+              };
+            })
+            .sort((left, right) => left.name.localeCompare(right.name));
+          if (contents.length < 2) {
+            throw new Error(`${artifact} does not contain the mandatory kin and kin-daemon binaries`);
+          }
+
+          const manifest = {
+            schema_version: 1,
+            release_tag: process.env.GITHUB_REF_NAME,
+            artifact,
+            target,
+            vfs_target: process.env.VFS_TARGET,
+            kin: {
+              commit: kinCommit,
+              cargo_lock_sha256: kinLockSha,
+              embedded_dependency_provenance: buildMeta.dependency_provenance,
+            },
+            kin_vfs: {
+              commit: vfsCommit,
+              dirty: false,
+              cargo_lock_sha256: vfsLockSha,
+            },
+            archive: {
+              name: archive,
+              sha256: sha256(archive),
+              size_bytes: fs.statSync(archive).size,
+            },
+            archive_contents: contents,
+            workflow: {
+              repository: process.env.GITHUB_REPOSITORY,
+              run_id: process.env.GITHUB_RUN_ID,
+              run_attempt: process.env.GITHUB_RUN_ATTEMPT,
+            },
+          };
+          fs.writeFileSync(`${artifact}.provenance.json`, `${JSON.stringify(manifest, null, 2)}\n`);
+          NODE
+
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
           name: ${{ matrix.artifact }}
           path: |
@@ -381,6 +901,7 @@ jobs:
             ${{ matrix.artifact }}.tar.gz.sha256
             ${{ matrix.artifact }}.zip
             ${{ matrix.artifact }}.zip.sha256
+            ${{ matrix.artifact }}.provenance.json
 
   # Notarize the macOS binaries from a Linux runner via rcodesign (the
   # apple-codesign Rust tool). Runs ONLY when NOTARIZE_ON_LINUX is selected; the
@@ -395,16 +916,28 @@ jobs:
     needs: [config, build]
     if: ${{ needs.config.outputs.notarize_on_linux == 'true' }}
     runs-on: ubuntu-latest
+    environment: release
     env:
-      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
-      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-      APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
       # Pin rcodesign so a release never depends on a moving upstream binary.
       RCODESIGN_VERSION: "0.29.0"
       RCODESIGN_SHA256: "dbe85cedd8ee4217b64e9a0e4c2aef92ab8bcaaa41f20bde99781ff02e600002"
     steps:
+      - name: Require App Store Connect API credentials
+        env:
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          for name in APPLE_API_ISSUER_ID APPLE_API_KEY_ID APPLE_API_PRIVATE_KEY; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::$name is required when Linux notarization is selected"
+              exit 1
+            fi
+          done
+
       - name: Download signed notarization zips
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
         with:
           pattern: "*-notarize-zip"
           merge-multiple: true
@@ -420,7 +953,10 @@ jobs:
           rcodesign --version
 
       - name: Notarize signed binaries via rcodesign
-        if: ${{ env.APPLE_API_ISSUER_ID != '' && env.APPLE_API_KEY_ID != '' && env.APPLE_API_PRIVATE_KEY != '' }}
+        env:
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
         run: |
           # Reconstruct the App Store Connect API .p8 and fold it (with the
           # issuer + key id) into the single unified key JSON rcodesign expects.
@@ -460,19 +996,35 @@ jobs:
 
   publish:
     name: Publish Release
-    needs: [build, notarize_linux]
+    needs: [build, notarize_linux, attest_daemon_image]
     # notarize_linux is skipped on the default (macOS notarytool) path; publish
     # must still run then, but must NOT run if notarization actually failed or
     # was cancelled. `always() && !failure() && !cancelled()` lets a skipped
     # dependency through while still gating on a real Linux-notarize failure.
-    if: ${{ always() && !failure() && !cancelled() }}
+    if: ${{ always() && !failure() && !cancelled() && github.ref_type == 'tag' }}
     runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Checkout pinned kin-vfs provenance source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: firelock-ai/kin-vfs
+          path: release-inputs/kin-vfs
+          ref: 48c757dfda2ca6b115f32d86875c6adde587b861
+          persist-credentials: false
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
         with:
           merge-multiple: true
 
@@ -495,12 +1047,240 @@ jobs:
             cat "$f" >> checksums-sha256.txt
           done
 
+      - name: Verify complete release asset inventory
+        run: |
+          set -euo pipefail
+          assets=(
+            kin-linux-x86_64.tar.gz
+            kin-linux-aarch64.tar.gz
+            kin-macos-x86_64.tar.gz
+            kin-macos-aarch64.tar.gz
+            kin-windows-x86_64.zip
+          )
+          for asset in "${assets[@]}"; do
+            test -s "$asset"
+            test -s "$asset.sha256"
+            sha256sum -c "$asset.sha256"
+            case "$asset" in
+              *.tar.gz) artifact="${asset%.tar.gz}" ;;
+              *.zip) artifact="${asset%.zip}" ;;
+            esac
+            test -s "$artifact.provenance.json"
+          done
+          test -s checksums-sha256.txt
+
+      - name: Verify and aggregate release provenance
+        env:
+          EXPECTED_VFS_COMMIT: 48c757dfda2ca6b115f32d86875c6adde587b861
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const childProcess = require("child_process");
+          const crypto = require("crypto");
+          const fs = require("fs");
+          const os = require("os");
+          const path = require("path");
+
+          const root = process.cwd();
+          const sha256 = (file) =>
+            crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+          const git = (cwd, ...args) =>
+            childProcess.execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+          const fail = (condition, message) => {
+            if (!condition) throw new Error(message);
+          };
+          const specs = [
+            {
+              artifact: "kin-linux-x86_64",
+              archive: "kin-linux-x86_64.tar.gz",
+              target: "x86_64-unknown-linux-musl",
+              vfsTarget: "x86_64-unknown-linux-gnu",
+              required: ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.so"],
+            },
+            {
+              artifact: "kin-linux-aarch64",
+              archive: "kin-linux-aarch64.tar.gz",
+              target: "aarch64-unknown-linux-musl",
+              vfsTarget: "aarch64-unknown-linux-gnu",
+              required: ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.so"],
+            },
+            {
+              artifact: "kin-macos-x86_64",
+              archive: "kin-macos-x86_64.tar.gz",
+              target: "x86_64-apple-darwin",
+              vfsTarget: "x86_64-apple-darwin",
+              required: ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.dylib"],
+            },
+            {
+              artifact: "kin-macos-aarch64",
+              archive: "kin-macos-aarch64.tar.gz",
+              target: "aarch64-apple-darwin",
+              vfsTarget: "aarch64-apple-darwin",
+              required: ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.dylib"],
+            },
+            {
+              artifact: "kin-windows-x86_64",
+              archive: "kin-windows-x86_64.zip",
+              target: "x86_64-pc-windows-msvc",
+              vfsTarget: "x86_64-pc-windows-msvc",
+              required: ["kin.exe", "kin-daemon.exe"],
+            },
+          ];
+
+          const kinCommit = git(root, "rev-parse", "HEAD");
+          const kinLockSha = sha256(path.join(root, "Cargo.lock"));
+          const vfsRoot = path.join(root, "release-inputs", "kin-vfs");
+          const vfsCommit = git(vfsRoot, "rev-parse", "HEAD");
+          const vfsLockSha = sha256(path.join(vfsRoot, "Cargo.lock"));
+          fail(vfsCommit === process.env.EXPECTED_VFS_COMMIT,
+            `kin-vfs checkout ${vfsCommit} does not match pinned ${process.env.EXPECTED_VFS_COMMIT}`);
+
+          const artifacts = specs.map((spec) => {
+            const manifestPath = `${spec.artifact}.provenance.json`;
+            const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+            fail(manifest.schema_version === 1, `${manifestPath} has an unsupported schema`);
+            fail(manifest.release_tag === process.env.GITHUB_REF_NAME,
+              `${manifestPath} release tag does not match ${process.env.GITHUB_REF_NAME}`);
+            fail(manifest.artifact === spec.artifact, `${manifestPath} artifact identity is wrong`);
+            fail(manifest.target === spec.target, `${manifestPath} target identity is wrong`);
+            fail(manifest.vfs_target === spec.vfsTarget, `${manifestPath} kin-vfs target identity is wrong`);
+            fail(manifest.kin?.commit === kinCommit, `${manifestPath} Kin commit does not match the tag`);
+            fail(manifest.kin?.cargo_lock_sha256 === kinLockSha,
+              `${manifestPath} Kin Cargo.lock hash does not match the tag`);
+            fail(manifest.kin?.embedded_dependency_provenance === kinLockSha,
+              `${manifestPath} embedded dependency provenance does not match the tagged Cargo.lock`);
+            fail(manifest.kin_vfs?.commit === vfsCommit,
+              `${manifestPath} kin-vfs commit does not match the pinned checkout`);
+            fail(manifest.kin_vfs?.dirty === false,
+              `${manifestPath} does not certify a clean kin-vfs checkout`);
+            fail(manifest.kin_vfs?.cargo_lock_sha256 === vfsLockSha,
+              `${manifestPath} kin-vfs Cargo.lock hash does not match the pinned checkout`);
+            fail(manifest.archive?.name === spec.archive, `${manifestPath} archive name is wrong`);
+            fail(manifest.archive?.sha256 === sha256(spec.archive),
+              `${manifestPath} archive hash does not match the final archive`);
+            fail(manifest.archive?.size_bytes === fs.statSync(spec.archive).size,
+              `${manifestPath} archive size does not match the final archive`);
+            fail(Array.isArray(manifest.archive_contents), `${manifestPath} has no archive content hashes`);
+            fail(manifest.workflow?.repository === process.env.GITHUB_REPOSITORY,
+              `${manifestPath} repository identity does not match this run`);
+            fail(manifest.workflow?.run_id === process.env.GITHUB_RUN_ID,
+              `${manifestPath} run ID does not match this run`);
+            fail(manifest.workflow?.run_attempt === process.env.GITHUB_RUN_ATTEMPT,
+              `${manifestPath} run attempt does not match this run`);
+
+            const extractRoot = fs.mkdtempSync(path.join(os.tmpdir(), `${spec.artifact}-`));
+            try {
+              if (spec.archive.endsWith(".zip")) {
+                childProcess.execFileSync("unzip", ["-q", spec.archive, "-d", extractRoot]);
+              } else {
+                childProcess.execFileSync("tar", ["-xzf", spec.archive, "-C", extractRoot]);
+              }
+              const nested = path.join(extractRoot, spec.artifact);
+              const contentRoot = fs.existsSync(nested) ? nested : extractRoot;
+              const entries = fs.readdirSync(contentRoot, { withFileTypes: true });
+              fail(entries.every((entry) => entry.isFile()), `${spec.archive} has unexpected nested content`);
+              const actualNames = entries.map((entry) => entry.name).sort();
+              const manifestNames = manifest.archive_contents.map((entry) => entry.name).sort();
+              fail(JSON.stringify(actualNames) === JSON.stringify(manifestNames),
+                `${manifestPath} content inventory does not match ${spec.archive}`);
+              const records = new Map(manifest.archive_contents.map((entry) => [entry.name, entry]));
+              fail(records.size === manifest.archive_contents.length,
+                `${manifestPath} contains duplicate content records`);
+              for (const name of actualNames) {
+                const file = path.join(contentRoot, name);
+                const record = records.get(name);
+                fail(record?.sha256 === sha256(file), `${manifestPath} hash mismatch for ${name}`);
+                fail(record?.size_bytes === fs.statSync(file).size, `${manifestPath} size mismatch for ${name}`);
+              }
+              for (const required of spec.required) {
+                fail(records.has(required), `${spec.archive} is missing required ${required}`);
+              }
+            } finally {
+              fs.rmSync(extractRoot, { recursive: true, force: true });
+            }
+            return manifest;
+          });
+
+          const releaseManifest = {
+            schema_version: 1,
+            release_tag: process.env.GITHUB_REF_NAME,
+            kin: { commit: kinCommit, cargo_lock_sha256: kinLockSha },
+            kin_vfs: { commit: vfsCommit, dirty: false, cargo_lock_sha256: vfsLockSha },
+            artifacts,
+            workflow: {
+              repository: process.env.GITHUB_REPOSITORY,
+              run_id: process.env.GITHUB_RUN_ID,
+              run_attempt: process.env.GITHUB_RUN_ATTEMPT,
+            },
+          };
+          fs.writeFileSync("release-provenance.json", `${JSON.stringify(releaseManifest, null, 2)}\n`);
+          fs.writeFileSync(
+            "release-provenance.json.sha256",
+            `${sha256("release-provenance.json")}  release-provenance.json\n`
+          );
+          NODE
+          sha256sum -c release-provenance.json.sha256
+
+      - name: Inspect existing release state without demoting it
+        id: release_state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          response="$RUNNER_TEMP/existing-release.json"
+          code="$(curl --disable --silent --show-error \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -o "$response" -w '%{http_code}' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}")"
+          case "$code" in
+            200)
+              existing_final="$(jq -r '(.draft == false) and (.prerelease == false)' "$response")"
+              if [[ "$GITHUB_REF_NAME" == *-* ]] && [ "$existing_final" = "true" ]; then
+                echo "::error::prerelease tag $GITHUB_REF_NAME already exists as a stable GitHub release"
+                exit 1
+              fi
+              ;;
+            404)
+              existing_final=false
+              ;;
+            *)
+              cat "$response" >&2 || true
+              echo "::error::GitHub release lookup returned HTTP $code" >&2
+              exit 1
+              ;;
+          esac
+          tag_commit="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
+          test "$tag_commit" = "$(git rev-parse HEAD)"
+          echo "existing_final=$existing_final" >> "$GITHUB_OUTPUT"
+
+      - name: Attest final release archives and provenance
+        if: ${{ steps.release_state.outputs.existing_final != 'true' }}
+        # Fail closed: without a repository attestation, no public prerelease is
+        # created and no npm package can be staged from these archives.
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: |
+            kin-linux-x86_64.tar.gz
+            kin-linux-aarch64.tar.gz
+            kin-macos-x86_64.tar.gz
+            kin-macos-aarch64.tar.gz
+            kin-windows-x86_64.zip
+            release-provenance.json
+
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        if: ${{ steps.release_state.outputs.existing_final != 'true' }}
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           body_path: ./release-notes.md
           generate_release_notes: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          # Every tag starts non-latest so anonymous installation can exercise
+          # the public assets without exposing an unproven stable release as
+          # /releases/latest. Stable tags are promoted only after install_proof,
+          # both human npm approvals, provenance verification, and clean smoke.
+          prerelease: true
+          make_latest: false
+          fail_on_unmatched_files: true
           files: |
             kin-linux-x86_64.tar.gz
             kin-linux-x86_64.tar.gz.sha256
@@ -513,174 +1293,351 @@ jobs:
             kin-windows-x86_64.zip
             kin-windows-x86_64.zip.sha256
             checksums-sha256.txt
+            kin-linux-x86_64.provenance.json
+            kin-linux-aarch64.provenance.json
+            kin-macos-x86_64.provenance.json
+            kin-macos-aarch64.provenance.json
+            kin-windows-x86_64.provenance.json
+            release-provenance.json
+            release-provenance.json.sha256
 
-  publish_npm:
-    name: Publish npm Wrapper
+  # Releases created with GITHUB_TOKEN do not emit a second workflow run.
+  # Invoke the reusable anonymous install proof directly after assets are public.
+  install_proof:
+    name: Public Install Proof
     needs: publish
+    uses: ./.github/workflows/install-proof.yml
+    with:
+      release_tag: ${{ github.ref_name }}
+    permissions:
+      contents: read
+      attestations: read
+
+  stage_npm_compatibility:
+    name: Stage npm Compatibility Wrapper (@kinlab/kin-mcp)
+    needs: [publish, install_proof]
     # publish uses always() to survive a skipped notarize_linux (the default
     # macOS-notarytool path); mirror that guard here or GitHub transitively skips
     # this job whenever notarize_linux is skipped.
-    if: ${{ always() && !failure() && !cancelled() }}
+    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
-    # Trusted Publishing (OIDC): npm authenticates this workflow via a short-lived
-    # OIDC token instead of a long-lived NPM_TOKEN secret — no token to leak or
-    # rotate, and it satisfies the @kinlab org's 2FA-for-publish policy. Requires a
-    # Trusted Publisher configured on npm for @kinlab/kin-mcp pointing at
-    # firelock-ai/kin + this workflow (release.yml).
+    environment: release
     permissions:
       contents: read
       id-token: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+      - name: Checkout release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Install Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.0.0
         with:
-          node-version: 20
+          node-version: 24
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false
 
-      - name: Upgrade npm for OIDC trusted publishing (needs >= 11.5.1)
-        run: npm install -g npm@latest
-
-      - name: Verify npm package version matches tag
+      - name: Install staged-publishing npm CLI
         run: |
-          PACKAGE_VERSION=$(node -p "require('./packages/kin-mcp/package.json').version")
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          test "$PACKAGE_VERSION" = "$TAG_VERSION"
+          env -u NODE_AUTH_TOKEN -u NPM_TOKEN npm install --global npm@11.15.0
+          test "$(npm --version)" = "11.15.0"
 
-      - name: Resolve npm dist-tag
-        id: dist-tag
+      - name: Stage final-channel package with Trusted Publishing
+        id: npm_stage
         shell: bash
         run: |
-          ref="${GITHUB_REF_NAME#v}"
-          case "$ref" in
-            *-alpha*) tag="alpha" ;;
-            *-beta*) tag="beta" ;;
-            *-rc*) tag="rc" ;;
-            *) tag="latest" ;;
-          esac
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          exec bash scripts/stage-npm-release.sh \
+            ./packages/kin-mcp "$GITHUB_REF" "$(git rev-parse HEAD)"
 
-      - name: Publish npm package (Trusted Publishing via OIDC)
-        id: npm_pub
-        run: |
-          PKG=$(node -p "require('./packages/kin-mcp/package.json').name")
-          VER=$(node -p "require('./packages/kin-mcp/package.json').version")
-          echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
-          echo "ver=$VER" >> "$GITHUB_OUTPUT"
-          if npm view "${PKG}@${VER}" version >/dev/null 2>&1; then
-            echo "${PKG}@${VER} already published — skipping (idempotent recut)."
-            echo "published=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          npm publish ./packages/kin-mcp --access public --tag "${NPM_DIST_TAG}"
-          echo "published=true" >> "$GITHUB_OUTPUT"
-        env:
-          NPM_DIST_TAG: ${{ steps.dist-tag.outputs.tag }}
-
-      - name: Notify Discord (npm publish)
-        if: steps.npm_pub.outputs.published == 'true' && env.DISCORD_WEBHOOK_URL != ''
+      - name: Notify Discord (npm approval required)
+        if: steps.npm_stage.outputs.staged == 'true' && env.DISCORD_WEBHOOK_URL != ''
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          PKG: ${{ steps.npm_pub.outputs.pkg }}
-          VER: ${{ steps.npm_pub.outputs.ver }}
+          PKG: ${{ steps.npm_stage.outputs.package }}
+          VER: ${{ steps.npm_stage.outputs.version }}
+          CHANNEL: ${{ steps.npm_stage.outputs.channel }}
+          INTEGRITY: ${{ steps.npm_stage.outputs.integrity }}
+          SHASUM: ${{ steps.npm_stage.outputs.shasum }}
         run: |
-          jq -nc --arg c "📦 \`${PKG}@${VER}\` published to **npm**." '{content:$c}' \
+          jq -nc --arg c "📦 \`${PKG}@${VER}\` is staged for npm channel \`${CHANNEL}\`. Wait until BOTH npm stage jobs succeed. Before approval, an authenticated maintainer must download and inspect BOTH staged tarballs and match this package's expected SRI \`${INTEGRITY}\` and SHA-1 \`${SHASUM}\`. Then approve BOTH with 2FA. If the run fails or times out, reject remaining stages before any newer release. GitHub Latest remains blocked until both are approved and proven." '{content:$c}' \
             | curl -fsS -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
 
-  publish_npm_canonical:
-    name: Publish npm Canonical Package (@kinlab/kin)
-    needs: publish
-    # Runs parallel to publish_npm (independent packages: a kin-mcp registry
-    # failure must not block the canonical package, and vice versa). Mirror
-    # publish's always() guard so a skipped notarize_linux does not
-    # transitively skip this job.
-    if: ${{ always() && !failure() && !cancelled() }}
+  stage_npm_canonical:
+    name: Stage npm Canonical Package (@kinlab/kin)
+    needs: [publish, install_proof]
+    # Both stage jobs are mandatory. npm approvals remain separate human writes,
+    # so a partial approval can make one package public while GitHub Latest stays
+    # blocked waiting for the other package.
+    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
-    # Trusted Publishing (OIDC), same as publish_npm. Requires a Trusted
-    # Publisher configured on npm for @kinlab/kin pointing at firelock-ai/kin +
-    # this workflow (release.yml). Until that npm-side configuration (or a
-    # one-time manual first publish) exists, this job fails visibly here
-    # without affecting the release or the kin-mcp compatibility publish.
+    environment: release
     permissions:
       contents: read
       id-token: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+      - name: Checkout release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Install Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.0.0
         with:
-          node-version: 20
+          node-version: 24
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false
 
-      - name: Upgrade npm for OIDC trusted publishing (needs >= 11.5.1)
-        run: npm install -g npm@latest
-
-      - name: Verify npm package version matches tag
+      - name: Install staged-publishing npm CLI
         run: |
-          PACKAGE_VERSION=$(node -p "require('./packages/kin/package.json').version")
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          test "$PACKAGE_VERSION" = "$TAG_VERSION"
+          env -u NODE_AUTH_TOKEN -u NPM_TOKEN npm install --global npm@11.15.0
+          test "$(npm --version)" = "11.15.0"
 
       - name: Run launcher tests
         run: npm test --prefix ./packages/kin
 
-      - name: Resolve npm dist-tag
-        id: dist-tag
+      - name: Stage final-channel package with Trusted Publishing
+        id: npm_stage
         shell: bash
         run: |
-          ref="${GITHUB_REF_NAME#v}"
-          case "$ref" in
-            *-alpha*) tag="alpha" ;;
-            *-beta*) tag="beta" ;;
-            *-rc*) tag="rc" ;;
-            *) tag="latest" ;;
-          esac
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          exec bash scripts/stage-npm-release.sh \
+            ./packages/kin "$GITHUB_REF" "$(git rev-parse HEAD)"
 
-      - name: Publish npm package (Trusted Publishing via OIDC)
-        id: npm_pub_kin
-        run: |
-          PKG=$(node -p "require('./packages/kin/package.json').name")
-          VER=$(node -p "require('./packages/kin/package.json').version")
-          echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
-          echo "ver=$VER" >> "$GITHUB_OUTPUT"
-          if npm view "${PKG}@${VER}" version >/dev/null 2>&1; then
-            echo "${PKG}@${VER} already published — skipping (idempotent recut)."
-            echo "published=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          npm publish ./packages/kin --access public --tag "${NPM_DIST_TAG}"
-          echo "published=true" >> "$GITHUB_OUTPUT"
-        env:
-          NPM_DIST_TAG: ${{ steps.dist-tag.outputs.tag }}
-
-      - name: Notify Discord (npm publish)
-        if: steps.npm_pub_kin.outputs.published == 'true' && env.DISCORD_WEBHOOK_URL != ''
+      - name: Notify Discord (npm approval required)
+        if: steps.npm_stage.outputs.staged == 'true' && env.DISCORD_WEBHOOK_URL != ''
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          PKG: ${{ steps.npm_pub_kin.outputs.pkg }}
-          VER: ${{ steps.npm_pub_kin.outputs.ver }}
+          PKG: ${{ steps.npm_stage.outputs.package }}
+          VER: ${{ steps.npm_stage.outputs.version }}
+          CHANNEL: ${{ steps.npm_stage.outputs.channel }}
+          INTEGRITY: ${{ steps.npm_stage.outputs.integrity }}
+          SHASUM: ${{ steps.npm_stage.outputs.shasum }}
         run: |
-          jq -nc --arg c "📦 \`${PKG}@${VER}\` published to **npm** (canonical Kin install surface)." '{content:$c}' \
+          jq -nc --arg c "📦 \`${PKG}@${VER}\` is staged for npm channel \`${CHANNEL}\`. Wait until BOTH npm stage jobs succeed. Before approval, an authenticated maintainer must download and inspect BOTH staged tarballs and match this package's expected SRI \`${INTEGRITY}\` and SHA-1 \`${SHASUM}\`. Then approve BOTH with 2FA. If the run fails or times out, reject remaining stages before any newer release. GitHub Latest remains blocked until both are approved and proven." '{content:$c}' \
             | curl -fsS -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
 
-  publish_boundary_contracts:
-    name: Publish boundary contracts to KinLab
-    needs: publish
-    # Mirror publish's always() guard so a skipped notarize_linux does not
-    # transitively skip this job.
-    if: ${{ always() && !failure() && !cancelled() }}
+  wait_for_npm_approval:
+    name: Wait for Both Human npm Approvals
+    needs: [stage_npm_canonical, stage_npm_compatibility, version_tag_image]
+    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+      - name: Checkout release policy
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Install Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install staged-publishing npm CLI
+        run: |
+          env -u NODE_AUTH_TOKEN -u NPM_TOKEN npm install --global npm@11.15.0
+          test "$(npm --version)" = "11.15.0"
+
+      - name: Wait for both versions and final channels
+        env:
+          NPM_APPROVAL_ATTEMPTS: 90
+          NPM_APPROVAL_DELAY_SECONDS: 20
+        run: bash scripts/wait-npm-approval.sh "${GITHUB_REF_NAME#v}"
+
+  verify_npm_approved:
+    name: Verify Approved npm Provenance (${{ matrix.package }})
+    needs: wait_for_npm_approval
+    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: "@kinlab/kin"
+            package_dir: ./packages/kin
+          - package: "@kinlab/kin-mcp"
+            package_dir: ./packages/kin-mcp
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install pinned npm CLI
+        run: |
+          env -u NODE_AUTH_TOKEN -u NPM_TOKEN npm install --global npm@11.15.0
+          test "$(npm --version)" = "11.15.0"
+
+      - name: Verify exact public bytes and OIDC provenance
+        env:
+          PACKAGE: ${{ matrix.package }}
+          PACKAGE_DIR: ${{ matrix.package_dir }}
+        run: |
+          bash scripts/verify-npm-release.sh \
+            "$PACKAGE" "${GITHUB_REF_NAME#v}" "$PACKAGE_DIR" \
+            "$GITHUB_REF" "$(git rev-parse HEAD)"
+
+  smoke_npm_approved:
+    name: Anonymous Approved npm Smoke (${{ matrix.package }})
+    needs: verify_npm_approved
+    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: "@kinlab/kin"
+            binary: kin
+            surface: canonical
+          - package: "@kinlab/kin-mcp"
+            binary: kin-mcp
+            surface: compatibility
+    steps:
+      - name: Install Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install exact approved version and provision without credentials
+        shell: bash
+        env:
+          PACKAGE: ${{ matrix.package }}
+          BINARY: ${{ matrix.binary }}
+          SURFACE: ${{ matrix.surface }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          mkdir -p "$tmp/home"
+          : > "$tmp/empty-npmrc"
+
+          env -u NODE_AUTH_TOKEN -u NPM_TOKEN \
+            HOME="$tmp/home" \
+            NPM_CONFIG_CACHE="$tmp/npm-cache" \
+            NPM_CONFIG_USERCONFIG="$tmp/empty-npmrc" \
+            npm install --global --prefix "$tmp/prefix" --no-audit --no-fund \
+            "${PACKAGE}@${VERSION}"
+          launcher="$tmp/prefix/bin/$BINARY"
+          test -x "$launcher"
+
+          if [ "$SURFACE" = "canonical" ]; then
+            output="$(HOME="$tmp/home" KIN_HOME="$tmp/kin-home" "$launcher" --version)"
+            printf '%s\n' "$output"
+            case "$output" in
+              "kin $VERSION"*) ;;
+              *)
+                echo "::error::$PACKAGE provisioned a binary that did not report Kin $VERSION"
+                exit 1
+                ;;
+            esac
+          else
+            kin_bin="$(HOME="$tmp/home" KIN_MCP_CACHE_DIR="$tmp/kin-mcp-cache" "$launcher" --print-bin)"
+            daemon_bin="$(HOME="$tmp/home" KIN_MCP_CACHE_DIR="$tmp/kin-mcp-cache" "$launcher" --print-daemon-bin)"
+            test -x "$kin_bin"
+            test -x "$daemon_bin"
+            "$kin_bin" --version
+            "$daemon_bin" --version
+          fi
+
+  finalize_release:
+    name: Promote Proven Release
+    needs: [publish, install_proof, version_tag_image, smoke_npm_approved]
+    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout release policy
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Promote stable tag after public and npm proof
+        if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          channel="$(node scripts/release-order.mjs channel "$version")"
+          for package in @kinlab/kin @kinlab/kin-mcp; do
+            npm_version="$(node scripts/release-order.mjs npm-channel "$package" "$channel")"
+            if [ "$npm_version" != "$version" ]; then
+              echo "::error::npm ${package}@${channel} moved to ${npm_version}; GitHub Latest remains blocked"
+              exit 1
+            fi
+          done
+          current_tag="$(node scripts/release-order.mjs github-latest "$GITHUB_REPOSITORY")"
+          current_version="${current_tag#v}"
+          node scripts/release-order.mjs assert-not-rollback \
+            "$version" "$current_version" "GitHub Latest"
+
+          if [ "$current_tag" != "$GITHUB_REF_NAME" ]; then
+            gh release edit "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" --prerelease=false --latest
+          fi
+
+      - name: Verify final release channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          actual="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq '.prerelease')"
+          expected=true
+          case "$GITHUB_REF_NAME" in
+            *-*) ;;
+            *) expected=false ;;
+          esac
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::release prerelease=$actual, expected $expected after proof"
+            exit 1
+          fi
+          if [ "$expected" = "false" ]; then
+            latest="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name')"
+            if [ "$latest" != "$GITHUB_REF_NAME" ]; then
+              echo "::error::GitHub Latest resolved to $latest, expected $GITHUB_REF_NAME"
+              exit 1
+            fi
+          fi
+
+  publish_boundary_contracts:
+    name: Post-release boundary contracts publish
+    needs: [publish, install_proof, finalize_release]
+    # Mirror publish's always() guard so a skipped notarize_linux does not
+    # transitively skip this job.
+    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    environment: release
+    # The public release is already final. This private-registry integration is
+    # observable follow-up work, not a gate that can falsely imply rollback.
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.0.0
         with:
           node-version: 20
 
@@ -711,22 +1668,29 @@ jobs:
             | curl -fsS -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
 
   bump_homebrew:
-    name: Trigger & verify Homebrew formula bump
-    needs: publish
+    name: Post-release Homebrew formula update
+    needs: [publish, install_proof, finalize_release]
     # Mirror publish's always() guard so a skipped notarize_linux does not
     # transitively skip this job.
-    if: ${{ always() && !failure() && !cancelled() }}
+    # The tap follows GitHub Latest, so prereleases must not enter this path.
+    # Homebrew is a post-release integration and cannot atomically gate a
+    # GitHub/npm release that is already public.
+    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
+    environment: release
+    continue-on-error: true
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Dispatch update to the homebrew-kin tap
         env:
           TAP_DISPATCH_TOKEN: ${{ secrets.KIN_CI_BOT_TOKEN }}
         run: |
           if [ -z "${TAP_DISPATCH_TOKEN:-}" ]; then
-            echo "::warning::KIN_CI_BOT_TOKEN is not configured; skipping the best-effort dispatch. The public formula outcome gate below still runs for version tags."
+            echo "::warning::KIN_CI_BOT_TOKEN is not configured; skipping the best-effort dispatch. The post-release formula check below still runs."
             exit 0
           fi
           # Convenience dispatch: the tap also self-updates on its 6h schedule, so a
@@ -742,7 +1706,7 @@ jobs:
           if [ "$code" = "204" ]; then
             echo "Dispatched kin-release to firelock-ai/homebrew-kin"
           else
-            echo "::warning::Homebrew tap dispatch returned HTTP ${code}; continuing to the mandatory public formula outcome gate."
+            echo "::warning::Homebrew tap dispatch returned HTTP ${code}; continuing to the post-release public formula check."
             cat /tmp/tap-dispatch.out 2>/dev/null || true
           fi
 
@@ -754,31 +1718,24 @@ jobs:
       # actually cut, mirroring version_tag_image's bounded poll-for-outcome
       # below rather than trusting the dispatch response as release proof.
       - name: Verify the tap formula actually bumped to this version
-        # Dispatch is only an accelerator. Every real version-tag release must
-        # prove the public tap outcome, including when the token is absent or
-        # GitHub rejects the dispatch request.
+        # Dispatch is only an accelerator. Record the real public tap outcome,
+        # including when the token is absent or GitHub rejects the dispatch.
         if: ${{ startsWith(github.ref, 'refs/tags/v') }}
         run: |
           bash scripts/verify-homebrew-formula.sh "$GITHUB_REF_NAME"
 
-  # Version-tag the public daemon image so operators can pin a release
-  # (`docker pull ghcr.io/firelock-ai/kin:0.2.7`). daemon-image.yml already pushed
-  # `ghcr.io/firelock-ai/kin:<commit-sha>` + `:latest` on the main push that this
-  # release was cut from; here we add `:<version>` and `:v<version>` as extra tags
-  # pointing at that same image — a registry-side manifest copy, no rebuild — so
-  # the version tags resolve to the exact image built for the release commit. Kept
-  # out of daemon-image.yml on purpose: rebuilding on the tag would produce a
-  # second, differently-built image, and "on a version tag" logic belongs with the
-  # other release surfaces here.
+  # Promote the immutable commit image built by this release workflow so
+  # operators can pin a version (`docker pull ghcr.io/firelock-ai/kin:0.2.7`).
+  # No main-push workflow, GCP identity, or mutable latest tag participates.
   version_tag_image:
     name: Version-tag ghcr image
-    needs: publish
+    needs: [publish, install_proof, build_daemon_image, attest_daemon_image]
     # Mirror publish's always() guard so a skipped notarize_linux does not
-    # transitively skip this job, and only tag real version-tag pushes (not a
-    # workflow_dispatch on a branch) so `:<version>` never points at an
-    # unreleased or non-tag build.
+    # transitively skip this job, and only tag real version-tag pushes so
+    # `:<version>` never points at an unreleased build.
     if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
+    environment: release
     # Least privilege: read the repo (to peel the tag to its commit) and push
     # tags to ghcr — not the workflow-level `contents: write`.
     permissions:
@@ -786,63 +1743,123 @@ jobs:
       packages: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.0.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Version-tag the release commit's daemon image (no rebuild)
         env:
           IMAGE: ghcr.io/firelock-ai/kin
+          EXPECTED_COMMIT: ${{ needs.build_daemon_image.outputs.commit }}
+          EXPECTED_SOURCE_DIGEST: ${{ needs.build_daemon_image.outputs.digest }}
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
 
-          # daemon-image.yml tags every push to main as `${IMAGE}:<commit-sha>`
-          # (github.sha on a branch push is the head commit) plus `:latest`. The
-          # release tag was cut on that same commit, so peel the tag to its commit
-          # and retag THAT image. Peel with git rather than trusting github.sha,
-          # whose value for an annotated tag is the tag object, not the commit the
-          # daemon image was keyed on.
+          # Peel with git rather than trusting github.sha, whose value for an
+          # annotated tag is the tag object rather than the target commit.
           COMMIT="$(git rev-parse HEAD)"
+          if [ "$COMMIT" != "$EXPECTED_COMMIT" ]; then
+            echo "::error::release checkout resolved to $COMMIT, image job resolved to $EXPECTED_COMMIT"
+            exit 1
+          fi
           SRC="${IMAGE}:${COMMIT}"
 
-          # daemon-image.yml (push:main) and this release run were kicked off by the
-          # same bump commit, so the commit image is normally already present by the
-          # time Publish Release finishes. Poll rather than assume: a hand-pushed tag
-          # or a slow/failed daemon-image build then fails loud instead of silently
-          # tagging nothing.
-          deadline=$(( SECONDS + 1800 ))
-          until docker buildx imagetools inspect "$SRC" >/dev/null 2>&1; do
-            if [ "$SECONDS" -ge "$deadline" ]; then
-              echo "::error::$SRC was not found after 30m — daemon-image.yml did not publish an image for this commit (did it run and succeed?). Refusing to version-tag via a rebuild."
+          source_digest="$(docker buildx imagetools inspect "$SRC" --format '{{.Manifest.Digest}}')"
+          case "$source_digest" in
+            sha256:*) ;;
+            *)
+              echo "::error::could not resolve an immutable manifest digest for $SRC"
               exit 1
+              ;;
+          esac
+          if [ "$source_digest" != "$EXPECTED_SOURCE_DIGEST" ]; then
+            echo "::error::$SRC moved from release-built $EXPECTED_SOURCE_DIGEST to $source_digest"
+            exit 1
+          fi
+
+          # Version tags are immutable release identities. A rerun may observe
+          # an already-correct tag, but it must never overwrite a mismatched
+          # digest even when the source commit tag still exists.
+          inspect_destination_digest() {
+            local destination="$1"
+            local output
+            for attempt in 1 2 3 4 5; do
+              if output="$(docker buildx imagetools inspect "$destination" \
+                --format '{{.Manifest.Digest}}' 2>&1)"; then
+                printf '%s\n' "$output"
+                return 0
+              fi
+
+              # This is the exact GHCR/buildx response for an absent manifest.
+              # Any auth, transport, rate-limit, or unrecognized registry error
+              # remains fatal instead of being treated as permission to write.
+              if [ "$output" = "ERROR: ${destination}: not found" ]; then
+                return 44
+              fi
+              if [ "$attempt" -eq 5 ]; then
+                printf '%s\n' "$output" >&2
+                echo "::error::could not establish immutable state for $destination" >&2
+                return 1
+              fi
+              sleep $(( attempt * 2 ))
+            done
+          }
+
+          destinations=("${IMAGE}:${VERSION}" "${IMAGE}:${GITHUB_REF_NAME}")
+          missing_destinations=()
+          for destination in "${destinations[@]}"; do
+            if existing_digest="$(inspect_destination_digest "$destination")"; then
+              if [ "$existing_digest" != "$source_digest" ]; then
+                echo "::error::$destination already points at $existing_digest, expected immutable $source_digest"
+                exit 1
+              fi
+            else
+              inspect_status=$?
+              if [ "$inspect_status" -ne 44 ]; then
+                exit "$inspect_status"
+              fi
+              missing_destinations+=("$destination")
             fi
-            echo "Waiting for $SRC (published by daemon-image.yml on the main push)…"
-            sleep 20
           done
 
-          # Registry-side manifest copy: `:<version>` and `:v<version>` become new
-          # tags pointing at the same image as `:<commit>` and `:latest` — no pull,
-          # no push of layers, no rebuild, just extra manifest references to pin.
-          docker buildx imagetools create \
-            --tag "${IMAGE}:${VERSION}" \
-            --tag "${IMAGE}:${GITHUB_REF_NAME}" \
-            "$SRC"
+          # Registry-side manifest copy: `:<version>` and `:v<version>` become
+          # references to the exact commit-image digest. No layers are rebuilt,
+          # no already-existing tag is rewritten, and prefer-index=false keeps
+          # a single-platform source manifest's digest unchanged.
+          if [ "${#missing_destinations[@]}" -gt 0 ]; then
+            tag_args=()
+            for destination in "${missing_destinations[@]}"; do
+              tag_args+=(--tag "$destination")
+            done
+            docker buildx imagetools create \
+              --prefer-index=false \
+              "${tag_args[@]}" \
+              "${IMAGE}@${source_digest}"
+          fi
 
-          digest="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{.Manifest.Digest}}' 2>/dev/null || true)"
+          for destination in "${destinations[@]}"; do
+            actual_digest="$(inspect_destination_digest "$destination")"
+            if [ "$actual_digest" != "$source_digest" ]; then
+              echo "::error::$destination resolved to $actual_digest after tagging, expected $source_digest"
+              exit 1
+            fi
+          done
           {
             echo "Version-tagged the release daemon image (no rebuild):"
             echo ""
             echo "- \`${IMAGE}:${VERSION}\`"
             echo "- \`${IMAGE}:${GITHUB_REF_NAME}\`"
             echo "- source: \`${SRC}\`"
-            if [ -n "${digest}" ]; then echo "- digest: \`${digest}\`"; fi
+            echo "- digest: \`${source_digest}\`"
           } >> "$GITHUB_STEP_SUMMARY"

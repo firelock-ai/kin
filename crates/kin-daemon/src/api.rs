@@ -98,7 +98,7 @@ pub struct HealthResponse {
     /// until restart. A true value drives `status: "attention"`.
     #[serde(default)]
     pub embed_worker_failed: bool,
-    /// Monotonic snapshot generation marker (`.kin/kindb/generation`), bumped
+    /// Monotonic authority-head marker (`.kin/kindb/head-generation`), bumped
     /// when the daemon commits a newer graph snapshot. A freshness token that
     /// lets clients and the MCP envelope express `graph_as_of` and detect stale
     /// reads. Additive; `0` before the first snapshot is committed.
@@ -119,6 +119,10 @@ pub struct HealthResponse {
 pub struct BuildResponse {
     pub sha: String,
     pub dirty: bool,
+    #[serde(default)]
+    pub source_known: bool,
+    #[serde(default)]
+    pub dependency_provenance: String,
     pub built_at: String,
 }
 
@@ -532,6 +536,8 @@ fn current_build_response() -> BuildResponse {
     BuildResponse {
         sha: info.sha.to_string(),
         dirty: info.dirty,
+        source_known: info.source_known,
+        dependency_provenance: info.dependency_provenance.to_string(),
         built_at: info.built_at.to_string(),
     }
 }
@@ -1927,8 +1933,12 @@ async fn command_status(
             .clone()
             .unwrap_or_else(|| "unknown".to_string()),
         cli_dirty: request.cli_dirty,
+        cli_source_known: request.cli_source_known,
+        cli_dependency_provenance: request.cli_dependency_provenance.clone(),
         daemon_sha: daemon_build.sha.to_string(),
         daemon_dirty: daemon_build.dirty,
+        daemon_source_known: daemon_build.source_known,
+        daemon_dependency_provenance: daemon_build.dependency_provenance.to_string(),
     };
     let response = kin_cli::commands::status::build_command_status_response(
         summary,
@@ -3805,113 +3815,127 @@ async fn note(
 async fn embed(
     State(state): State<Arc<DaemonState>>,
     Json(req): Json<kin_cli::commands::embed::EmbedRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if !state
-        .is_initialized
-        .load(std::sync::atomic::Ordering::Relaxed)
+) -> Result<Json<kin_cli::commands::embed::EmbedResponse>, (StatusCode, String)> {
+    #[cfg(not(feature = "embeddings"))]
     {
+        let _ = (state, req);
         return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "daemon not fully initialized".to_string(),
+            StatusCode::NOT_IMPLEMENTED,
+            "this Kin build does not include embedding support".to_string(),
         ));
     }
 
-    let state_for_embed = Arc::clone(&state);
-    let result = tokio::task::spawn_blocking(move || {
-        let bounded_request = req.max_seconds.is_some_and(|seconds| seconds > 0);
-        if bounded_request {
-            state_for_embed.pause_background_embed();
-        } else {
-            state_for_embed.resume_background_embed();
-        }
-        // Mark the explicit pass before waiting on the embedding mutex. The
-        // background worker checks this flag between batches and stands down,
-        // so a foreground bounded embed cannot be starved by worker re-locks.
-        let _embed_pass = state_for_embed.begin_embed_pass();
-        let _guard = state_for_embed
-            .embedding_work
-            .lock()
-            .map_err(|_| "embedding work lock poisoned".to_string())?;
-        // Suppress the background idle flush for the duration of the pass —
-        // this handler does its own pre/per-batch/post persistence, and a
-        // full-graph flush per feed gap amplifies FS churn on large repos.
-
-        // Pin graph.kndb on disk at the current root hash H before embedding so
-        // the per-batch kvec flushes (which tag metadata with H) match on reopen.
-        // The vector index is a pure sidecar (not in the merkle root), so
-        // embedding never changes H; this only closes the mutated-but-unsaved
-        // window. Cost: one snapshot write up front.
-        // save_snapshot() acquires persist_lock internally; the non-reentrant std
-        // Mutex self-deadlocks if we hold persist_lock across this call (this was
-        // the daemon embed hang — the worker wedged here before embedding started).
-        state_for_embed
-            .save_snapshot()
-            .map_err(|error| format!("embed pre-persist save failed: {error:#}"))?;
-
-        let persist_state = Arc::clone(&state_for_embed);
-        let persist_batch =
-            || -> Result<(), kin_db::KinDbError> { persist_foreground_embed_batch(&persist_state) };
-
-        // Rebuild migration: drop any loaded vector index (which may be sized to
-        // an older model's dimension, e.g. a 384-dim index that rejects the
-        // current 768-dim model) and re-queue every entity/artifact so the embed
-        // pass below recreates the index at the live embedder dimension. The
-        // per-batch persist then overwrites the stale on-disk sidecar. The
-        // explicit re-queue guarantees a FULL rebuild even if the embedding queue
-        // already held a partial set from prior graph mutations (the gated
-        // queue-missing pass in build_embed_response only fires on an empty
-        // queue). A normal embed (rebuild=false) leaves graph state untouched.
-        if req.rebuild {
-            state_for_embed.graph.reset_vector_index();
-            state_for_embed.graph.queue_missing_for_embedding();
-            state_for_embed
-                .graph
-                .queue_missing_artifacts_for_embedding();
+    #[cfg(feature = "embeddings")]
+    {
+        if !state
+            .is_initialized
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "daemon not fully initialized".to_string(),
+            ));
         }
 
-        let is_cancelled = || {
-            state_for_embed
-                .is_shutdown
-                .load(std::sync::atomic::Ordering::Relaxed)
-        };
+        let state_for_embed = Arc::clone(&state);
+        let result = tokio::task::spawn_blocking(move || {
+            let bounded_request = req.max_seconds.is_some_and(|seconds| seconds > 0);
+            if bounded_request {
+                state_for_embed.pause_background_embed();
+            } else {
+                state_for_embed.resume_background_embed();
+            }
+            // Mark the explicit pass before waiting on the embedding mutex. The
+            // background worker checks this flag between batches and stands down,
+            // so a foreground bounded embed cannot be starved by worker re-locks.
+            let _embed_pass = state_for_embed.begin_embed_pass();
+            let _guard = state_for_embed
+                .embedding_work
+                .lock()
+                .map_err(|_| "embedding work lock poisoned".to_string())?;
+            // Suppress the background idle flush for the duration of the pass —
+            // this handler does its own pre/per-batch/post persistence, and a
+            // full-graph flush per feed gap amplifies FS churn on large repos.
 
-        let result = kin_cli::commands::embed::build_embed_response(
-            &state_for_embed.layout,
-            state_for_embed.graph.as_ref(),
-            &req,
-            persist_batch,
-            is_cancelled,
-        )
-        .map_err(|error| format!("embed build failed: {error:#}"))?;
-        if !bounded_request || !result.result.time_limited {
-            state_for_embed.resume_background_embed();
-        }
-        if result.result.total_entities > 0 || result.result.total_artifacts > 0 {
-            state_for_embed.bump_version();
+            // Pin graph.kndb on disk at the current root hash H before embedding so
+            // the per-batch kvec flushes (which tag metadata with H) match on reopen.
+            // The vector index is a pure sidecar (not in the merkle root), so
+            // embedding never changes H; this only closes the mutated-but-unsaved
+            // window. Cost: one snapshot write up front.
+            // save_snapshot() acquires persist_lock internally; the non-reentrant std
+            // Mutex self-deadlocks if we hold persist_lock across this call (this was
+            // the daemon embed hang — the worker wedged here before embedding started).
             state_for_embed
                 .save_snapshot()
-                .map_err(|error| format!("embed snapshot save failed: {error:#}"))?;
-            state_for_embed.mark_clean();
-            // A time-limited pass stopped mid-drain, so the throttled per-batch
-            // sidecar flush may not have captured the vectors embedded since the
-            // last throttle tick. Force one sidecar write at the pass boundary so
-            // a graceful daemon exit before the next pass resumes with the full
-            // pass persisted. A pass that drained the queue already wrote the
-            // sidecar unconditionally, so this only fires when work remains.
-            if result.result.time_limited {
+                .map_err(|error| format!("embed pre-persist save failed: {error:#}"))?;
+
+            let persist_state = Arc::clone(&state_for_embed);
+            let persist_batch = || -> Result<(), kin_db::KinDbError> {
+                persist_foreground_embed_batch(&persist_state)
+            };
+
+            // Rebuild migration: drop any loaded vector index (which may be sized to
+            // an older model's dimension, e.g. a 384-dim index that rejects the
+            // current 768-dim model) and re-queue every entity/artifact so the embed
+            // pass below recreates the index at the live embedder dimension. The
+            // per-batch persist then overwrites the stale on-disk sidecar. The
+            // explicit re-queue guarantees a FULL rebuild even if the embedding queue
+            // already held a partial set from prior graph mutations (the gated
+            // queue-missing pass in build_embed_response only fires on an empty
+            // queue). A normal embed (rebuild=false) leaves graph state untouched.
+            if req.rebuild {
+                state_for_embed.graph.reset_vector_index();
+                state_for_embed.graph.queue_missing_for_embedding();
                 state_for_embed
-                    .persist_vector_sidecar()
-                    .map_err(|error| format!("embed sidecar persist failed: {error:#}"))?;
+                    .graph
+                    .queue_missing_artifacts_for_embedding();
             }
-        }
-        Ok::<_, String>(result)
-    })
-    .await
-    .map_err(internal_error)?
-    .map_err(internal_error)?;
-    Ok(Json(result))
+
+            let is_cancelled = || {
+                state_for_embed
+                    .is_shutdown
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            };
+
+            let result = kin_cli::commands::embed::build_embed_response(
+                &state_for_embed.layout,
+                state_for_embed.graph.as_ref(),
+                &req,
+                persist_batch,
+                is_cancelled,
+            )
+            .map_err(|error| format!("embed build failed: {error:#}"))?;
+            if !bounded_request || !result.result.time_limited {
+                state_for_embed.resume_background_embed();
+            }
+            if result.result.total_entities > 0 || result.result.total_artifacts > 0 {
+                state_for_embed.bump_version();
+                state_for_embed
+                    .save_snapshot()
+                    .map_err(|error| format!("embed snapshot save failed: {error:#}"))?;
+                state_for_embed.mark_clean();
+                // A time-limited pass stopped mid-drain, so the throttled per-batch
+                // sidecar flush may not have captured the vectors embedded since the
+                // last throttle tick. Force one sidecar write at the pass boundary so
+                // a graceful daemon exit before the next pass resumes with the full
+                // pass persisted. A pass that drained the queue already wrote the
+                // sidecar unconditionally, so this only fires when work remains.
+                if result.result.time_limited {
+                    state_for_embed
+                        .persist_vector_sidecar()
+                        .map_err(|error| format!("embed sidecar persist failed: {error:#}"))?;
+                }
+            }
+            Ok::<_, String>(result)
+        })
+        .await
+        .map_err(internal_error)?
+        .map_err(internal_error)?;
+        Ok(Json(result))
+    }
 }
 
+#[cfg(feature = "embeddings")]
 fn persist_foreground_embed_batch(state: &DaemonState) -> Result<(), kin_db::KinDbError> {
     state.flush_embed_progress().map(|_| ()).map_err(|error| {
         kin_db::KinDbError::StorageError(format!("embed progress flush failed: {error:#}"))
@@ -9190,11 +9214,11 @@ mod tests {
     #[tokio::test]
     async fn health_surfaces_graph_generation_marker() {
         // /health must read and surface the persisted snapshot generation marker
-        // (.kin/kindb/generation) so the MCP envelope can express graph_as_of.
+        // (.kin/kindb/head-generation) so the MCP envelope can express graph_as_of.
         let state = test_state();
         let kindb = state.layout.root().join("kindb");
         std::fs::create_dir_all(&kindb).unwrap();
-        std::fs::write(kindb.join("generation"), "7").unwrap();
+        std::fs::write(kindb.join("head-generation"), "7").unwrap();
 
         let app = router(state);
         let response = app
@@ -10490,6 +10514,7 @@ mod tests {
         assert!(result.text.contains("1 review(s)"));
     }
 
+    #[cfg(feature = "embeddings")]
     #[tokio::test]
     async fn embed_endpoint_uses_daemon_graph() {
         let state = test_state();
@@ -10527,6 +10552,7 @@ mod tests {
             .any(|line| line.contains("No retrievable graph objects found")));
     }
 
+    #[cfg(feature = "embeddings")]
     #[test]
     fn foreground_embed_batch_flush_checkpoints_sidecar_on_throttle() {
         let state = test_state();

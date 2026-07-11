@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+#[cfg(feature = "vector")]
 use kin_db::EntityStore;
 use serde_json::Value;
 use std::fs;
@@ -8,8 +9,10 @@ use std::path::Path;
 use std::process::Command;
 use tempfile::tempdir;
 
+#[cfg(feature = "vector")]
 mod common;
 
+#[cfg(feature = "vector")]
 fn find_cache_graph_path(cache_dir: &Path) -> std::path::PathBuf {
     let manifest_path = find_cache_manifest_path(cache_dir);
     let manifest: Value =
@@ -76,6 +79,7 @@ fn git_head(path: &Path) -> String {
         .to_string()
 }
 
+#[cfg(feature = "vector")]
 fn seed_cached_vectors(cache_graph_path: &Path) {
     let snapshot = kin_db::SnapshotManager::open(cache_graph_path).expect("open cache graph");
     let graph = snapshot.graph();
@@ -419,6 +423,7 @@ fn init_json_reports_warm_cache_hits_for_same_repo_identity() {
     assert!(second_payload["pending_embeddings"].is_u64());
 }
 
+#[cfg(feature = "vector")]
 #[test]
 fn init_json_reports_vector_reuse_for_non_entity_warm_deltas() {
     let root = tempdir().expect("temp root");

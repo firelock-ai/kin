@@ -1,6 +1,9 @@
 FROM rust:slim AS builder
 RUN apt-get update && apt-get install -y git pkg-config libssl-dev g++ && rm -rf /var/lib/apt/lists/*
 ARG KIN_DB_REF=main
+ARG KIN_BUILD_GIT_SHA=""
+ARG KIN_BUILD_DIRTY=""
+ARG KIN_BUILD_BRANCH=""
 
 # Cargo will fetch the pinned kin-db dependency from Cargo.lock.
 WORKDIR /build
@@ -19,7 +22,18 @@ RUN test -f .cargo/config.toml && grep -q '^\[registries\.kin\]' .cargo/config.t
 # the whole build; raise the retry budget so a transient blip is ridden out.
 ENV CARGO_NET_RETRY=10
 # kin-daemon needs --features gcs for GCS StorageBackend in cloud deployment.
-RUN cargo build --release --features gcs --bin kin-daemon --bin kin
+# `.dockerignore` deliberately excludes `.git`, so hosted image builders pass
+# the exact source identity as an atomic three-value override. A local image
+# build may omit all three and remains explicitly unknown/dirty; supplying only
+# part of the identity fails in kin-buildinfo rather than looking trustworthy.
+RUN if [ -n "$KIN_BUILD_GIT_SHA" ] || [ -n "$KIN_BUILD_DIRTY" ] || [ -n "$KIN_BUILD_BRANCH" ]; then \
+      KIN_BUILD_GIT_SHA_OVERRIDE="$KIN_BUILD_GIT_SHA" \
+      KIN_BUILD_DIRTY_OVERRIDE="$KIN_BUILD_DIRTY" \
+      KIN_BUILD_BRANCH_OVERRIDE="$KIN_BUILD_BRANCH" \
+      cargo build --locked --release --features gcs --bin kin-daemon --bin kin; \
+    else \
+      cargo build --locked --release --features gcs --bin kin-daemon --bin kin; \
+    fi
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get upgrade -y && apt-get install -y ca-certificates curl libssl3 && rm -rf /var/lib/apt/lists/*
