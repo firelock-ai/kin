@@ -105,9 +105,22 @@ if [ "$mode" = "publish" ] && [ -n "${GITHUB_OUTPUT:-}" ]; then
 fi
 
 npm_view_version() {
-  env -u NODE_AUTH_TOKEN -u NPM_TOKEN \
+  spec="$1"
+  set +e
+  output="$(env -u NODE_AUTH_TOKEN -u NPM_TOKEN \
     NPM_CONFIG_USERCONFIG="$tmp/empty-npmrc" \
-    npm view "$1" version 2>/dev/null || true
+    npm view "$spec" version 2>&1)"
+  view_status=$?
+  set -e
+  if [ "$view_status" -eq 0 ]; then
+    printf '%s\n' "$output"
+    return 0
+  fi
+  case "$output" in
+    *E404*|*"404 Not Found"*|*"is not in this registry"*) return 44 ;;
+  esac
+  printf '%s\n' "$output" >&2
+  return "$view_status"
 }
 
 read_channel() {
@@ -132,7 +145,16 @@ require_exact_channel() {
   fi
 }
 
+set +e
 public_version="$(npm_view_version "${package}@${version}")"
+public_status=$?
+set -e
+if [ "$public_status" -eq 44 ]; then
+  public_version=""
+elif [ "$public_status" -ne 0 ]; then
+  echo "::error::npm could not establish whether ${package}@${version} is already public. Only an explicit E404 is accepted as absence; no publish authority was granted." >&2
+  exit "$public_status"
+fi
 if [ -n "$public_version" ]; then
   if [ "$public_version" != "$version" ]; then
     echo "error: npm returned unexpected public identity ${package}@${public_version}" >&2
@@ -185,10 +207,14 @@ if [ "$publish_status" -ne 0 ]; then
   # bytes, provenance, and final channel from this same release.
   accepted=""
   for attempt in 1 2 3 4 5 6; do
+    set +e
     accepted="$(npm_view_version "${package}@${version}")"
-    if [ "$accepted" = "$version" ]; then
+    accepted_status=$?
+    set -e
+    if [ "$accepted_status" -eq 0 ] && [ "$accepted" = "$version" ]; then
       break
     fi
+    accepted=""
     if [ "$attempt" -lt 6 ]; then
       sleep 5
     fi

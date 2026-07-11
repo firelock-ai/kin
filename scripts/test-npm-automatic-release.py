@@ -63,6 +63,11 @@ if args[:1] == ["pack"]:
     }]))
 elif args[:1] == ["view"]:
     package, selector = split_spec(args[1])
+    if (state.get("scenario") == "targeted_view_outage" and
+            selector == state.get("target_version")):
+        save()
+        print("npm error code E503\nnpm error registry unavailable", file=sys.stderr)
+        raise SystemExit(1)
     value = None
     if selector in state.get("public", {}).get(package, []):
         value = selector
@@ -70,6 +75,7 @@ elif args[:1] == ["view"]:
         value = state.get("tags", {}).get(package, {}).get(selector)
     save()
     if value is None:
+        print("npm error code E404\nnpm error version not found", file=sys.stderr)
         raise SystemExit(1)
     print(value)
 elif args[:1] == ["publish"]:
@@ -276,16 +282,72 @@ def test_existing_preflight_requires_exact_public_proof() -> None:
     print("PASS: existing package preflight verifies bytes, provenance, and channel")
 
 
+def test_targeted_view_outage_is_not_treated_as_absence() -> None:
+    state = base_state(
+        scenario="targeted_view_outage",
+        target_version=VERSION,
+        public={PACKAGE: [VERSION], OTHER_PACKAGE: []},
+        tags={PACKAGE: {"latest": VERSION}, OTHER_PACKAGE: {"latest": OLD_VERSION}},
+    )
+    result, snapshot = run_publish(state, preflight=True)
+    assert result.returncode != 0
+    actual = json.loads(snapshot["state.json"])
+    assert not any(command[:1] == ["publish"] for command in actual["commands"])
+    assert "Only an explicit E404 is accepted as absence" in result.stderr
+    assert "no publish authority was granted" in result.stderr
+    assert "verify.json" not in snapshot
+    print("PASS: targeted npm lookup outage fails closed before publish authority")
+
+
 def test_bad_existing_package_blocks_absent_sibling_before_any_publish() -> None:
     state = base_state(
         public={PACKAGE: [VERSION], OTHER_PACKAGE: []},
         tags={PACKAGE: {"latest": VERSION}, OTHER_PACKAGE: {"latest": OLD_VERSION}},
     )
-    result, snapshot = run_publish(state, preflight=True, verify_fail=True)
+    owner, package_dir, env = harness()
+    tmp = Path(owner.name)
+    other_dir = tmp / "other-package"
+    other_dir.mkdir()
+    (other_dir / "package.json").write_text(
+        json.dumps({"name": OTHER_PACKAGE, "version": VERSION}), encoding="utf-8"
+    )
+    state_path = tmp / "state.json"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    env["FAKE_VERIFY_FAIL"] = "1"
+    commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+    ).strip()
+    pipeline = r"""
+set -euo pipefail
+bash "$1" --preflight "$2" "$4" "$5"
+bash "$1" --preflight "$3" "$4" "$5"
+bash "$1" "$2" "$4" "$5"
+bash "$1" "$3" "$4" "$5"
+"""
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            pipeline,
+            "npm-two-package-preflight",
+            str(PUBLISHER),
+            str(package_dir),
+            str(other_dir),
+            REF,
+            commit,
+        ],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    snapshot = json.loads(state_path.read_text())
+    owner.cleanup()
     assert result.returncode != 0
-    actual = json.loads(snapshot["state.json"])
-    assert VERSION not in actual["public"][OTHER_PACKAGE]
-    assert not any(command[:1] == ["publish"] for command in actual["commands"])
+    assert VERSION not in snapshot["public"][OTHER_PACKAGE]
+    assert not any(command[:1] == ["publish"] for command in snapshot["commands"])
+    assert sum(command[:1] == ["pack"] for command in snapshot["commands"]) == 1
     assert "simulated exact-byte or provenance failure" in result.stderr
     print("PASS: bad existing package blocks absent sibling before either publish job")
 
@@ -393,6 +455,7 @@ def test_post_publish_channel_read_failure_blocks_finalization() -> None:
 def main() -> None:
     test_absent_preflight_proves_channel_without_mutation()
     test_existing_preflight_requires_exact_public_proof()
+    test_targeted_view_outage_is_not_treated_as_absence()
     test_bad_existing_package_blocks_absent_sibling_before_any_publish()
     test_new_publish()
     test_public_rerun_verifies_before_skip()
