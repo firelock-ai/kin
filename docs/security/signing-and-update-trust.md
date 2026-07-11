@@ -46,9 +46,19 @@ and Windows x86_64), verifies the GitHub attestation plus exact tag/commit/lock
 provenance, and exercises a fresh repository, graph search/locate, MCP
 initialize/list/call, and all supported agent configuration writers. The four
 Unix legs additionally build embeddings and prove semantic search/locate at
-complete coverage. Both npm packages are then published under a provisional
-tag and anonymously installed and exercised. A stable tag reaches npm
-`latest` and GitHub Latest only after every gate passes.
+complete coverage. Both npm packages are then staged under their final channel
+through npm Trusted Publishing. An authenticated maintainer inspects the staged
+tarballs and approves both packages with 2FA; anonymous exact-byte, provenance,
+and install proof runs after approval. GitHub Latest is promoted only after
+every gate passes.
+
+The daemon container is a separate attested subject. The protected tag workflow
+builds one exact commit-tagged image in GHCR, verifies its embedded source and
+lockfile identity, attaches SLSA provenance to that immutable digest, and
+self-verifies the tag/ref/workflow identity. Later version-tag promotion reuses
+that digest without rebuilding and never writes an implicit `latest` image.
+Hosted infrastructure may copy the exact manifest into its private registry,
+but that operation is a separately attested promotion, not a second build.
 
 ## Three Independent Integrity Layers
 
