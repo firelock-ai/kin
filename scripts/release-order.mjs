@@ -122,7 +122,11 @@ export async function resolveNpmChannel(packageName, channel, options = {}) {
       ...options,
     },
   );
-  const current = metadata?.['dist-tags']?.[channel];
+  const distTags = metadata?.['dist-tags'];
+  if (distTags === null || typeof distTags !== 'object' || Array.isArray(distTags)) {
+    throw new Error(`npm metadata for ${packageName} has no valid dist-tags authority`);
+  }
+  const current = distTags[channel];
   if (current === undefined) return '<none>';
   parseSemver(current);
   return current;

@@ -11,6 +11,11 @@ on:
 permissions:
   contents: read
 
+# External authority boundary: repository ruleset "Protect version release
+# tags" limits v* creation/update/deletion to the release captain, while the
+# protected `release` environment admits only v* tags and requires approval.
+# Every credential-bearing or public-write job below must keep that environment.
+
 # Serialize every release channel. GitHub may replace an older pending run, so
 # every mutation also performs its own SemVer rollback check immediately before
 # moving a public tag.
@@ -99,6 +104,7 @@ jobs:
     name: Build (${{ matrix.artifact }})
     needs: config
     runs-on: ${{ matrix.os }}
+    environment: release
     # Every advertised platform is release-blocking. A public release must not
     # be created without one of the archives consumed by the installers.
     # Signing credentials are deliberately step-scoped below. The untrusted
@@ -653,6 +659,7 @@ jobs:
     needs: [config, build]
     if: ${{ needs.config.outputs.notarize_on_linux == 'true' }}
     runs-on: ubuntu-latest
+    environment: release
     env:
       # Pin rcodesign so a release never depends on a moving upstream binary.
       RCODESIGN_VERSION: "0.29.0"
@@ -739,6 +746,7 @@ jobs:
     # dependency through while still gating on a real Linux-notarize failure.
     if: ${{ always() && !failure() && !cancelled() && github.ref_type == 'tag' }}
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write
       id-token: write
@@ -1056,6 +1064,7 @@ jobs:
     # this job whenever notarize_linux is skipped.
     if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
+    environment: release
     # New versions use npm Trusted Publishing (OIDC). The token secret is used
     # only to restore the provisional tag on an idempotent rerun; npm dist-tag
     # mutation is not supported by Trusted Publishing.
@@ -1151,6 +1160,7 @@ jobs:
     # anonymous smoke and promotion gates below.
     if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
+    environment: release
     # Trusted Publishing is the publication credential. NPM_TOKEN is limited to
     # dist-tag restoration/promotion because OIDC does not authorize dist-tag.
     permissions:
@@ -1326,6 +1336,7 @@ jobs:
     needs: [publish_npm, publish_npm_canonical, smoke_npm_candidates, version_tag_image]
     if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: read
     steps:
@@ -1411,6 +1422,7 @@ jobs:
     needs: [publish, install_proof, version_tag_image, promote_npm]
     if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write
     steps:
@@ -1466,6 +1478,7 @@ jobs:
     # transitively skip this job.
     if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
+    environment: release
     # The public release is already final. This private-registry integration is
     # observable follow-up work, not a gate that can falsely imply rollback.
     continue-on-error: true
@@ -1516,6 +1529,7 @@ jobs:
     # GitHub/npm release that is already public.
     if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
+    environment: release
     continue-on-error: true
     steps:
       - name: Checkout
@@ -1579,6 +1593,7 @@ jobs:
     # `:<version>` never points at an unreleased build.
     if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
+    environment: release
     # Least privilege: read the repo (to peel the tag to its commit) and push
     # tags to ghcr — not the workflow-level `contents: write`.
     permissions:

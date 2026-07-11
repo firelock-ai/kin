@@ -72,6 +72,12 @@ test('retries transient npm authority failures and fails closed on package 404',
     }),
     /HTTP 404/,
   );
+  await assert.rejects(
+    resolveNpmChannel('@kinlab/kin', 'latest', {
+      fetchImpl: async () => response(200, {}),
+    }),
+    /no valid dist-tags authority/,
+  );
 });
 
 test('distinguishes an absent GitHub Latest release from API failure', async () => {
