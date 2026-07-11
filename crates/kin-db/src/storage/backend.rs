@@ -8,7 +8,7 @@
 //! `backend.load_snapshot()` / `backend.save_snapshot()` without knowing
 //! the underlying storage medium.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -379,7 +379,14 @@ pub struct LocalFileBackend {
     fail_legacy_rebuild_cleanup: std::sync::atomic::AtomicBool,
 }
 
-const LOCAL_AUTHORITY_VERSION: u32 = 1;
+const LOCAL_AUTHORITY_VERSION: u32 = 2;
+const LOCAL_AUTHORITY_LEGACY_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LocalDeltaIdentity {
+    generation: Generation,
+    sha256: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalAuthorityRecord {
@@ -388,6 +395,12 @@ struct LocalAuthorityRecord {
     head_generation: Generation,
     snapshot_file: String,
     snapshot_sha256: String,
+    /// Exact bytes acknowledged for every generation after the immutable
+    /// snapshot base. A generation number alone is insufficient: a legacy
+    /// writer can replace the deterministic delta filename without moving the
+    /// authority head.
+    #[serde(default)]
+    acknowledged_deltas: Vec<LocalDeltaIdentity>,
 }
 
 const LOCAL_LEGACY_REBUILD_VERSION: u32 = 1;
@@ -629,6 +642,126 @@ impl LocalFileBackend {
         hex::encode(Sha256::digest(bytes))
     }
 
+    fn file_digest(path: &Path) -> Result<String, KinDbError> {
+        let mut file = std::fs::File::open(path).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to open {} for digest verification: {error}",
+                path.display()
+            ))
+        })?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer).map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to read {} for digest verification: {error}",
+                    path.display()
+                ))
+            })?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(hex::encode(hasher.finalize()))
+    }
+
+    fn validate_delta_identities(record: &LocalAuthorityRecord) -> Result<(), KinDbError> {
+        // Version 1 committed only base/head numbers. A journal-bearing v1
+        // record is intentionally accepted by the raw reader so the explicit
+        // legacy rebuild path can capture and reconcile it; normal authority
+        // reads reject it below before serving or writing.
+        if record.version == LOCAL_AUTHORITY_LEGACY_VERSION && record.acknowledged_deltas.is_empty()
+        {
+            return Ok(());
+        }
+        let expected_count = record
+            .head_generation
+            .checked_sub(record.snapshot_generation)
+            .ok_or_else(|| {
+                KinDbError::StorageError("local authority generation range underflow".to_string())
+            })?;
+        let expected_count = usize::try_from(expected_count).map_err(|_| {
+            KinDbError::StorageError(
+                "local authority delta range does not fit in memory".to_string(),
+            )
+        })?;
+        if record.acknowledged_deltas.len() != expected_count {
+            return Err(KinDbError::StorageError(format!(
+                "local authority generation range {}..={} declares {} acknowledged delta identities; expected {expected_count}",
+                record.snapshot_generation.saturating_add(1),
+                record.head_generation,
+                record.acknowledged_deltas.len()
+            )));
+        }
+        for (offset, identity) in record.acknowledged_deltas.iter().enumerate() {
+            let offset = Generation::try_from(offset).map_err(|_| {
+                KinDbError::StorageError("local authority delta offset overflow".to_string())
+            })?;
+            let expected_generation = record
+                .snapshot_generation
+                .checked_add(offset)
+                .and_then(|generation| generation.checked_add(1))
+                .ok_or_else(|| {
+                    KinDbError::StorageError(
+                        "local authority delta generation overflow".to_string(),
+                    )
+                })?;
+            if identity.generation != expected_generation {
+                return Err(KinDbError::StorageError(format!(
+                    "local authority delta identity {} names generation {}, expected {expected_generation}",
+                    offset, identity.generation
+                )));
+            }
+            if identity.sha256.len() != 64 || hex::decode(&identity.sha256).is_err() {
+                return Err(KinDbError::StorageError(format!(
+                    "local authority delta generation {} has an invalid SHA-256 digest",
+                    identity.generation
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_acknowledged_deltas_unlocked(
+        &self,
+        repo_id: &str,
+        record: &LocalAuthorityRecord,
+    ) -> Result<(), KinDbError> {
+        for (index, identity) in record.acknowledged_deltas.iter().enumerate() {
+            let path = self.delta_path(repo_id, identity.generation);
+            if !path.exists() {
+                if let Some(next) = record.acknowledged_deltas[index + 1..]
+                    .iter()
+                    .find(|next| self.delta_path(repo_id, next.generation).exists())
+                {
+                    return Err(KinDbError::StorageError(format!(
+                        "repo {repo_id} delta chain is incomplete: expected generation {}, found {}",
+                        identity.generation, next.generation
+                    )));
+                }
+                return Err(KinDbError::StorageError(format!(
+                    "repo {repo_id} delta chain ended at generation {}, acknowledged head is {}",
+                    identity.generation - 1,
+                    record.head_generation
+                )));
+            }
+            let digest = Self::file_digest(&path).map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "acknowledged delta generation {} for repo {repo_id} is unavailable: {error}",
+                    identity.generation
+                ))
+            })?;
+            if digest != identity.sha256 {
+                return Err(KinDbError::StorageError(format!(
+                    "acknowledged delta digest mismatch for repo {repo_id} generation {}: expected {}, found {digest}; a mixed-version writer replaced committed journal bytes",
+                    identity.generation, identity.sha256
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn read_authority_record_raw_unlocked(
         &self,
         repo_id: &str,
@@ -649,7 +782,9 @@ impl LocalFileBackend {
                 path.display()
             ))
         })?;
-        if record.version != LOCAL_AUTHORITY_VERSION {
+        if record.version != LOCAL_AUTHORITY_VERSION
+            && record.version != LOCAL_AUTHORITY_LEGACY_VERSION
+        {
             return Err(KinDbError::StorageError(format!(
                 "unsupported local authority version {} in {}",
                 record.version,
@@ -669,7 +804,77 @@ impl LocalFileBackend {
                 record.snapshot_file
             )));
         }
+        Self::validate_delta_identities(&record)?;
         Ok(Some(record))
+    }
+
+    fn read_legacy_rebuild_record_unlocked(
+        &self,
+        repo_id: &str,
+    ) -> Result<Option<LocalLegacyRebuildRecord>, KinDbError> {
+        let path = self.legacy_rebuild_path(repo_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&path).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to read local legacy rebuild marker {}: {error}",
+                path.display()
+            ))
+        })?;
+        let marker: LocalLegacyRebuildRecord = serde_json::from_slice(&bytes).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "invalid local legacy rebuild marker {}: {error}",
+                path.display()
+            ))
+        })?;
+        if marker.version != LOCAL_LEGACY_REBUILD_VERSION {
+            return Err(KinDbError::StorageError(format!(
+                "unsupported local legacy rebuild marker version {} in {}",
+                marker.version,
+                path.display()
+            )));
+        }
+        Ok(Some(marker))
+    }
+
+    fn finalize_marker_only_legacy_rebuild_unlocked(
+        &self,
+        repo_id: &str,
+        current_record: Option<&LocalAuthorityRecord>,
+        expected_gen: Generation,
+    ) -> Result<Option<Generation>, KinDbError> {
+        let Some(marker) = self.read_legacy_rebuild_record_unlocked(repo_id)? else {
+            return Ok(None);
+        };
+        let authority_matches = current_record.is_some_and(|record| {
+            record.snapshot_generation == marker.committed_generation
+                && record.head_generation == marker.committed_generation
+        });
+        if !authority_matches || expected_gen != marker.committed_generation {
+            return Ok(None);
+        }
+        if !self
+            .load_deltas_since_unlocked(repo_id, GENERATION_INIT)?
+            .is_empty()
+        {
+            return Ok(None);
+        }
+
+        let path = self.legacy_rebuild_path(repo_id);
+        match std::fs::remove_file(&path).and_then(|_| {
+            Self::sync_parent(&path).map_err(|error| std::io::Error::other(error.to_string()))
+        }) {
+            Ok(()) => {}
+            Err(error) => tracing::warn!(
+                repo_id,
+                path = %path.display(),
+                generation = marker.committed_generation,
+                error = %error,
+                "legacy rebuild authority and journal are finalized; deferred rebuild-marker cleanup"
+            ),
+        }
+        Ok(Some(marker.committed_generation))
     }
 
     fn read_authority_record_unlocked(
@@ -694,6 +899,16 @@ impl LocalFileBackend {
                 record.head_generation
             )));
         }
+        if record.version == LOCAL_AUTHORITY_LEGACY_VERSION
+            && record.snapshot_generation < record.head_generation
+        {
+            return Err(KinDbError::StorageError(format!(
+                "legacy local authority for repo {repo_id} acknowledges generations {}..={} without exact delta identities; quiesce old writers and run the explicit legacy journal rebuild",
+                record.snapshot_generation + 1,
+                record.head_generation
+            )));
+        }
+        self.validate_acknowledged_deltas_unlocked(repo_id, &record)?;
         Ok(Some(record))
     }
 
@@ -710,7 +925,12 @@ impl LocalFileBackend {
         // on the next locked load.
         let snapshot_path = self.snapshot_path(repo_id);
         let projection_generation = self.read_legacy_generation(repo_id).ok();
-        if !snapshot_path.is_file() || projection_generation != Some(record.snapshot_generation) {
+        let projection_matches_authority = snapshot_path.is_file()
+            && Self::file_digest(&snapshot_path)
+                .is_ok_and(|digest| digest == record.snapshot_sha256);
+        if !projection_matches_authority
+            || projection_generation != Some(record.snapshot_generation)
+        {
             if let Err(error) = Self::atomic_write(&snapshot_path, snapshot_bytes) {
                 tracing::warn!(repo_id, error = %error, "failed to heal local graph.kndb projection");
                 return;
@@ -844,6 +1064,7 @@ impl LocalFileBackend {
             head_generation: generation,
             snapshot_file: Self::snapshot_file_name(generation),
             snapshot_sha256: Self::snapshot_digest(&snapshot_bytes),
+            acknowledged_deltas: Vec::new(),
         };
         self.write_authority_unlocked(repo_id, &record)?;
         self.refresh_compatibility_projection_unlocked(repo_id, &record, &snapshot_bytes);
@@ -1024,6 +1245,7 @@ impl StorageBackend for LocalFileBackend {
             head_generation: new_gen,
             snapshot_file: Self::snapshot_file_name(new_gen),
             snapshot_sha256: Self::snapshot_digest(data),
+            acknowledged_deltas: Vec::new(),
         };
         self.write_authority_unlocked(repo_id, &record)?;
 
@@ -1050,6 +1272,13 @@ impl StorageBackend for LocalFileBackend {
         // rebuild and legacy-marker fences. The explicit rebuild operation is
         // the only path allowed to reconcile those fail-closed states.
         let current_record = self.read_authority_record_raw_unlocked(repo_id)?;
+        if let Some(committed_generation) = self.finalize_marker_only_legacy_rebuild_unlocked(
+            repo_id,
+            current_record.as_ref(),
+            expected_gen,
+        )? {
+            return Ok(committed_generation);
+        }
         let current_generation = current_record
             .as_ref()
             .map_or(self.read_legacy_generation(repo_id)?, |record| {
@@ -1128,6 +1357,7 @@ impl StorageBackend for LocalFileBackend {
             head_generation: new_gen,
             snapshot_file: Self::snapshot_file_name(new_gen),
             snapshot_sha256: Self::snapshot_digest(data),
+            acknowledged_deltas: Vec::new(),
         };
         self.write_authority_unlocked(repo_id, &record)?;
         self.refresh_compatibility_projection_unlocked(repo_id, &record, data);
@@ -1215,6 +1445,11 @@ impl StorageBackend for LocalFileBackend {
         let new_gen = checked_next_generation(current_gen, "local delta")?;
         let delta_path = self.delta_path(repo_id, new_gen);
         Self::atomic_write(&delta_path, delta_data)?;
+        record.version = LOCAL_AUTHORITY_VERSION;
+        record.acknowledged_deltas.push(LocalDeltaIdentity {
+            generation: new_gen,
+            sha256: Self::snapshot_digest(delta_data),
+        });
         record.head_generation = new_gen;
         self.write_authority_unlocked(repo_id, &record)?;
         // graph.kndb still contains the immutable base bytes, so its legacy
@@ -1524,9 +1759,15 @@ mod tests {
         assert_eq!(authority.snapshot_generation, gen1);
         assert_eq!(authority.head_generation, gen2);
 
-        // Model a crash after replacing projection bytes but before its marker.
+        // Model an old writer replacing the projection bytes and relabeling
+        // them with the same base generation. Generation equality alone must
+        // not suppress identity-based projection healing.
         std::fs::write(backend.snapshot_path(repo_id), b"stale projection").unwrap();
-        std::fs::write(backend.generation_path(repo_id), b"0").unwrap();
+        std::fs::write(
+            backend.generation_path(repo_id),
+            gen1.to_string().as_bytes(),
+        )
+        .unwrap();
         let reopened = LocalFileBackend::new(dir.path());
         let (healed, healed_generation) = reopened.load_snapshot(repo_id).unwrap().unwrap();
         assert_eq!(healed, base_bytes);
@@ -1679,6 +1920,104 @@ mod tests {
     }
 
     #[test]
+    fn local_legacy_rebuild_retry_finalizes_lingering_marker_without_new_commit() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "legacy-rebuild-marker-retry";
+        let base = GraphSnapshot::empty();
+        let mut reconciled = base.clone();
+        reconciled
+            .file_hashes
+            .insert("reconciled.rs".to_string(), [9; 32]);
+        let delta_bytes = crate::storage::delta::GraphSnapshotDelta::empty(7)
+            .to_bytes()
+            .unwrap();
+        std::fs::create_dir_all(backend.deltas_dir(repo_id)).unwrap();
+        std::fs::write(backend.snapshot_path(repo_id), base.to_bytes().unwrap()).unwrap();
+        std::fs::write(backend.generation_path(repo_id), b"8").unwrap();
+        std::fs::write(backend.delta_path(repo_id, 8), &delta_bytes).unwrap();
+
+        let committed = backend
+            .rebuild_legacy_journal(repo_id, &reconciled.to_bytes().unwrap(), 8)
+            .unwrap();
+        assert_eq!(committed, 9);
+        assert!(backend
+            .load_deltas_since_unlocked(repo_id, GENERATION_INIT)
+            .unwrap()
+            .is_empty());
+
+        // Model a crash/failure after the journal drain but before unlinking
+        // the durable rebuild marker.
+        let lingering = LocalLegacyRebuildRecord {
+            version: LOCAL_LEGACY_REBUILD_VERSION,
+            expected_generation: 8,
+            committed_generation: committed,
+            captured_deltas: vec![(
+                format!("{:020}.kndd", 8),
+                LocalFileBackend::snapshot_digest(&delta_bytes),
+            )],
+        };
+        LocalFileBackend::atomic_write(
+            &backend.legacy_rebuild_path(repo_id),
+            &serde_json::to_vec(&lingering).unwrap(),
+        )
+        .unwrap();
+
+        let retried = backend
+            .rebuild_legacy_journal(repo_id, &reconciled.to_bytes().unwrap(), committed)
+            .expect("marker-only retry must finalize idempotently");
+        assert_eq!(retried, committed);
+        assert!(!backend.legacy_rebuild_path(repo_id).exists());
+        assert!(!backend
+            .versioned_snapshot_path(repo_id, committed + 1)
+            .exists());
+        assert_eq!(
+            load_recovered_snapshot(&backend, repo_id)
+                .unwrap()
+                .unwrap()
+                .generation,
+            committed
+        );
+    }
+
+    #[test]
+    fn local_v1_authority_journal_requires_and_supports_explicit_rebuild() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "legacy-v1-authority";
+        let base = GraphSnapshot::empty();
+        let base_generation = backend
+            .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let mut reconciled = base.clone();
+        reconciled.file_hashes.insert("v1.rs".to_string(), [4; 32]);
+        let delta = crate::storage::delta::compute_graph_delta(&base, &reconciled, base_generation);
+        let head_generation = backend
+            .save_delta(repo_id, &delta.to_bytes().unwrap(), base_generation)
+            .unwrap();
+
+        let mut legacy = backend
+            .read_authority_record_raw_unlocked(repo_id)
+            .unwrap()
+            .unwrap();
+        legacy.version = LOCAL_AUTHORITY_LEGACY_VERSION;
+        legacy.acknowledged_deltas.clear();
+        backend.write_authority_unlocked(repo_id, &legacy).unwrap();
+
+        let error = load_recovered_snapshot(&backend, repo_id)
+            .expect_err("v1 journal authority must not be served without byte identities");
+        assert!(error.to_string().contains("without exact delta identities"));
+
+        let committed = backend
+            .rebuild_legacy_journal(repo_id, &reconciled.to_bytes().unwrap(), head_generation)
+            .expect("raw rebuild path must migrate v1 journal authority");
+        assert_eq!(committed, head_generation + 1);
+        let recovered = load_recovered_snapshot(&backend, repo_id).unwrap().unwrap();
+        assert_eq!(recovered.generation, committed);
+        assert_eq!(recovered.snapshot.file_hashes, reconciled.file_hashes);
+    }
+
+    #[test]
     fn local_legacy_rebuild_rejects_stale_quiesce_cursor_without_mutation() {
         let dir = TempDir::new().unwrap();
         let backend = LocalFileBackend::new(dir.path());
@@ -1726,6 +2065,42 @@ mod tests {
         let error = load_recovered_snapshot(&backend, repo_id)
             .expect_err("mixed-version writer divergence must fail closed");
         assert!(error.to_string().contains("legacy local writer advanced"));
+    }
+
+    #[test]
+    fn local_atomic_authority_rejects_replaced_acknowledged_delta_at_same_head() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "mixed-version-replaced-delta";
+        let base = GraphSnapshot::empty();
+        let gen1 = backend
+            .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let mut current = base.clone();
+        current
+            .file_hashes
+            .insert("committed.rs".to_string(), [7; 32]);
+        let committed = crate::storage::delta::compute_graph_delta(&base, &current, gen1);
+        let gen2 = backend
+            .save_delta(repo_id, &committed.to_bytes().unwrap(), gen1)
+            .unwrap();
+
+        // A pre-authority writer uses the deterministic generation filename,
+        // replaces the already-acknowledged bytes, and advances only its
+        // compatibility marker to the same numeric head.
+        let replacement = crate::storage::delta::GraphSnapshotDelta::empty(gen1);
+        LocalFileBackend::atomic_write(
+            &backend.delta_path(repo_id, gen2),
+            &replacement.to_bytes().unwrap(),
+        )
+        .unwrap();
+        backend.write_generation(repo_id, gen2).unwrap();
+
+        let error = load_recovered_snapshot(&backend, repo_id)
+            .expect_err("authority must bind the exact acknowledged delta bytes");
+        assert!(error
+            .to_string()
+            .contains("acknowledged delta digest mismatch"));
     }
 
     #[test]
