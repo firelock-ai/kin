@@ -1702,9 +1702,10 @@ impl DaemonState {
                 expected_gen
             }
         } else if force_full {
-            let (_, generation) = kin_db::SnapshotManager::save_graph_with_generation(
+            let (_, generation) = kin_db::SnapshotManager::save_graph_with_expected_generation(
                 self.layout.kindb_snapshot_path(),
                 self.graph.as_ref(),
+                expected_gen,
             )
             .map_err(DaemonError::from)?;
             committed = true;
@@ -3511,6 +3512,59 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert!(names.contains("first_local"));
         assert!(names.contains("second_local"));
+    }
+
+    #[test]
+    fn default_local_force_full_rejects_stale_daemon_generation() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+        let snapshot_path = layout.kindb_snapshot_path();
+        let state = DaemonState::open(layout.clone()).unwrap();
+        let stale_generation = state.snapshot_generation.load(Ordering::SeqCst);
+
+        let external = kin_db::InMemoryGraph::new();
+        let external_entity = test_entity("external_writer", "src/external.rs");
+        external.upsert_entity(&external_entity).unwrap();
+        let (_, external_generation) =
+            kin_db::SnapshotManager::save_graph_with_expected_generation(
+                &snapshot_path,
+                &external,
+                stale_generation,
+            )
+            .unwrap();
+        assert_eq!(external_generation, stale_generation + 1);
+
+        let stale_entity = test_entity("stale_daemon", "src/stale.rs");
+        state.graph.upsert_entity(&stale_entity).unwrap();
+        let error = state
+            .save_snapshot_full()
+            .expect_err("stale full daemon writer must lose the generation CAS");
+        assert!(error.to_string().contains(&format!(
+            "expected {stale_generation}, found {external_generation}"
+        )));
+        assert_eq!(
+            state.snapshot_generation.load(Ordering::SeqCst),
+            stale_generation,
+            "failed stale save must not advance its in-memory cursor"
+        );
+        drop(state);
+
+        let reopened = DaemonState::open(layout).unwrap();
+        assert_eq!(
+            reopened.snapshot_generation.load(Ordering::SeqCst),
+            external_generation
+        );
+        assert!(reopened
+            .graph
+            .get_entity(&external_entity.id)
+            .unwrap()
+            .is_some());
+        assert!(reopened
+            .graph
+            .get_entity(&stale_entity.id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
