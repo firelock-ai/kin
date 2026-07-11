@@ -70,6 +70,15 @@ jobs:
       - name: Test @kinlab/kin-mcp (compatibility wrapper)
         run: npm run test:unit --prefix ./packages/kin-mcp && npm run lint --prefix ./packages/kin-mcp
 
+      - name: Test release ordering and npm provenance policy
+        run: |
+          node --test \
+            ./scripts/release-order.test.mjs \
+            ./scripts/verify-npm-attestation.test.mjs
+          node --check ./scripts/release-order.mjs
+          node --check ./scripts/verify-npm-attestation.mjs
+          bash -n ./scripts/verify-npm-release.sh
+
   windows-installer:
     name: Windows installer + vector-free release build
     runs-on: windows-latest

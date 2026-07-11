@@ -18,7 +18,14 @@ on:
         default: false
 
 permissions:
-  contents: write
+  contents: read
+
+# Serialize every release channel. GitHub may replace an older pending run, so
+# every mutation also performs its own SemVer rollback check immediately before
+# moving a public tag.
+concurrency:
+  group: kin-release-promotion
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -38,7 +45,13 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       notarize_on_linux: ${{ steps.flags.outputs.notarize_on_linux }}
+      release_channel: ${{ steps.release_order.outputs.release_channel }}
     steps:
+      - name: Checkout release policy
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
       - name: Resolve notarize backend
         id: flags
         env:
@@ -53,24 +66,43 @@ jobs:
             echo "Notarization backend: xcrun notarytool on macOS (default)"
           fi
 
+      - name: Refuse release-channel rollback
+        id: release_order
+        if: ${{ github.ref_type == 'tag' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          channel="$(node scripts/release-order.mjs channel "$version")"
+          echo "release_channel=$channel" >> "$GITHUB_OUTPUT"
+
+          for package in @kinlab/kin @kinlab/kin-mcp; do
+            current="$(env -u NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG=/dev/null \
+              npm view "${package}@${channel}" version 2>/dev/null || true)"
+            node scripts/release-order.mjs assert-not-rollback \
+              "$version" "$current" "npm ${package} ${channel}"
+          done
+
+          if [ "$channel" = "latest" ]; then
+            current_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" \
+              --jq .tag_name 2>/dev/null || true)"
+            current_version="${current_tag#v}"
+            node scripts/release-order.mjs assert-not-rollback \
+              "$version" "$current_version" "GitHub Latest"
+          fi
+
   build:
     name: Build (${{ matrix.artifact }})
     needs: config
     runs-on: ${{ matrix.os }}
     # Every advertised platform is release-blocking. A public release must not
     # be created without one of the archives consumed by the installers.
-    # macOS signing/notarization secrets are surfaced as env so they can be used
-    # in step `if:` guards. The `secrets` context is NOT available in `if:`
-    # conditions, so guarding on `env.MACOS_CERTIFICATE != ''` is the supported
-    # pattern. Tagged releases separately require every credential and fail
-    # closed; branch workflow-dispatch runs may still exercise unsigned builds.
+    # Signing credentials are deliberately step-scoped below. The untrusted
+    # Cargo build matrix never receives Apple secrets or a write-scoped token.
+    # Tagged releases still fail closed when any required credential is absent;
+    # branch workflow-dispatch runs may exercise unsigned build plumbing.
     env:
-      MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
-      MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
-      MACOS_DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       # When true, the macOS leg codesigns and uploads the signed-but-unnotarized
       # zip, and the separate notarize_linux job submits it to Apple Notary via
       # rcodesign. When false (default), the macOS leg notarizes inline with
@@ -118,10 +150,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@c0e9df88980754dd93e5833b8dcb1b304c1fe173 # 1.96.0
         with:
           # On the Linux legs the core (kin, kin-daemon) targets musl and the VFS
           # leg targets gnu (vfs_target), so both targets must be installed.
@@ -139,15 +173,16 @@ jobs:
         run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Checkout kin-vfs
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: firelock-ai/kin-vfs
           path: kin-vfs
           # Release inputs must never move under an unchanged Kin tag.
           ref: 48c757dfda2ca6b115f32d86875c6adde587b861
+          persist-credentials: false
 
       - name: Cache Cargo registry and build artifacts
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.0.0
         with:
           path: |
             ~/.cargo/registry
@@ -166,6 +201,12 @@ jobs:
           if [ -n "$dirty" ]; then
             printf '%s\n' "$dirty" >&2
             echo "::error::release checkout is not clean before compilation"
+            exit 1
+          fi
+          vfs_dirty="$(git -C kin-vfs status --porcelain --untracked-files=all)"
+          if [ -n "$vfs_dirty" ]; then
+            printf '%s\n' "$vfs_dirty" >&2
+            echo "::error::pinned kin-vfs checkout is not clean before compilation"
             exit 1
           fi
 
@@ -295,34 +336,62 @@ jobs:
             echo "::error::release build mutated the source checkout"
             exit 1
           fi
+          vfs_dirty="$(git -C kin-vfs status --porcelain --untracked-files=all)"
+          if [ -n "$vfs_dirty" ]; then
+            printf '%s\n' "$vfs_dirty" >&2
+            echo "::error::release build mutated the pinned kin-vfs checkout"
+            exit 1
+          fi
 
       # --- macOS code signing + notarization -------------------------------
       # Tag releases fail closed when signing/notarization credentials are not
       # configured. A branch workflow_dispatch may still exercise unsigned
       # build plumbing because the publish job is tag-only below.
-      - name: Require macOS release signing credentials
-        if: ${{ runner.os == 'macOS' && github.ref_type == 'tag' }}
+      - name: Resolve macOS signing credential availability
+        id: mac_signing
+        if: ${{ runner.os == 'macOS' }}
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          MACOS_DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
+          signing_available=true
           for name in MACOS_CERTIFICATE MACOS_CERTIFICATE_PWD MACOS_DEVELOPER_ID; do
             if [ -z "${!name:-}" ]; then
-              echo "::error::$name is required for a tagged macOS release"
-              exit 1
+              signing_available=false
             fi
           done
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$signing_available" != "true" ]; then
+            echo "::error::MACOS_CERTIFICATE, MACOS_CERTIFICATE_PWD, and MACOS_DEVELOPER_ID are required for a tagged macOS release"
+            exit 1
+          fi
+
+          native_notary_available=true
           if [ "$NOTARIZE_ON_LINUX" != "true" ]; then
             for name in APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
               if [ -z "${!name:-}" ]; then
-                echo "::error::$name is required for native macOS notarization"
-                exit 1
+                native_notary_available=false
               fi
             done
+            if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$native_notary_available" != "true" ]; then
+              echo "::error::APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, and APPLE_TEAM_ID are required for native macOS notarization"
+              exit 1
+            fi
           fi
+          echo "signing_available=$signing_available" >> "$GITHUB_OUTPUT"
+          echo "native_notary_available=$native_notary_available" >> "$GITHUB_OUTPUT"
 
       # Signing happens BEFORE packaging so the tarball + its published
       # sha256 cover the signed binaries.
       - name: Import code signing certificate (macOS)
-        if: ${{ runner.os == 'macOS' && env.MACOS_CERTIFICATE != '' }}
+        if: ${{ runner.os == 'macOS' && steps.mac_signing.outputs.signing_available == 'true' }}
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
         run: |
           CERT_PATH="$RUNNER_TEMP/build_certificate.p12"
           KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
@@ -337,7 +406,7 @@ jobs:
           rm -f "$CERT_PATH"
 
       - name: Sign macOS binaries
-        if: ${{ runner.os == 'macOS' && env.MACOS_CERTIFICATE != '' }}
+        if: ${{ runner.os == 'macOS' && steps.mac_signing.outputs.signing_available == 'true' }}
         run: |
           for f in \
             "target/${TARGET}/release/kin" \
@@ -350,6 +419,7 @@ jobs:
             codesign --verify --strict --verbose=2 "$f"
           done
         env:
+          MACOS_DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID }}
           TARGET: ${{ matrix.target }}
           SHIM_NAME: ${{ matrix.shim_name }}
 
@@ -360,7 +430,7 @@ jobs:
       # tool submits the zip. Built once here and reused by whichever backend
       # notarizes (macOS notarytool inline, or rcodesign on the Linux job).
       - name: Stage signed binaries for notarization (macOS)
-        if: ${{ runner.os == 'macOS' && env.MACOS_CERTIFICATE != '' && (env.NOTARIZE_ON_LINUX == 'true' || env.APPLE_ID != '') }}
+        if: ${{ runner.os == 'macOS' && steps.mac_signing.outputs.signing_available == 'true' && (env.NOTARIZE_ON_LINUX == 'true' || steps.mac_signing.outputs.native_notary_available == 'true') }}
         run: |
           NOTARIZE_ZIP="${ARTIFACT}-notarize.zip"
           FILES=()
@@ -381,7 +451,7 @@ jobs:
       # only when the Linux backend is NOT selected, so flipping NOTARIZE_ON_LINUX
       # cleanly swaps backends without ever double-submitting.
       - name: Notarize macOS binaries (notarytool)
-        if: ${{ runner.os == 'macOS' && env.MACOS_CERTIFICATE != '' && env.APPLE_ID != '' && env.NOTARIZE_ON_LINUX != 'true' }}
+        if: ${{ runner.os == 'macOS' && steps.mac_signing.outputs.native_notary_available == 'true' && env.NOTARIZE_ON_LINUX != 'true' }}
         run: |
           xcrun notarytool submit "${ARTIFACT}-notarize.zip" \
             --apple-id "$APPLE_ID" \
@@ -394,14 +464,17 @@ jobs:
           # online by Gatekeeper on first run. If a .dmg/.pkg installer is added
           # later, run `xcrun stapler staple <installer>` here.
         env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           ARTIFACT: ${{ matrix.artifact }}
 
       # Linux backend: hand the signed zip to the notarize_linux job, which
       # submits it to Apple Notary via rcodesign on a (10x cheaper) Linux runner.
       # The zip is short-lived job-internal plumbing, not a published artifact.
       - name: Upload signed binaries for Linux notarization
-        if: ${{ runner.os == 'macOS' && env.MACOS_CERTIFICATE != '' && env.NOTARIZE_ON_LINUX == 'true' }}
-        uses: actions/upload-artifact@v7
+        if: ${{ runner.os == 'macOS' && steps.mac_signing.outputs.signing_available == 'true' && env.NOTARIZE_ON_LINUX == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
           name: ${{ matrix.artifact }}-notarize-zip
           path: ${{ matrix.artifact }}-notarize.zip
@@ -537,6 +610,7 @@ jobs:
             },
             kin_vfs: {
               commit: vfsCommit,
+              dirty: false,
               cargo_lock_sha256: vfsLockSha,
             },
             archive: {
@@ -555,7 +629,7 @@ jobs:
           NODE
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
           name: ${{ matrix.artifact }}
           path: |
@@ -579,14 +653,15 @@ jobs:
     if: ${{ needs.config.outputs.notarize_on_linux == 'true' }}
     runs-on: ubuntu-latest
     env:
-      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
-      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-      APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
       # Pin rcodesign so a release never depends on a moving upstream binary.
       RCODESIGN_VERSION: "0.29.0"
       RCODESIGN_SHA256: "dbe85cedd8ee4217b64e9a0e4c2aef92ab8bcaaa41f20bde99781ff02e600002"
     steps:
       - name: Require App Store Connect API credentials
+        env:
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
         run: |
           set -euo pipefail
           for name in APPLE_API_ISSUER_ID APPLE_API_KEY_ID APPLE_API_PRIVATE_KEY; do
@@ -597,7 +672,7 @@ jobs:
           done
 
       - name: Download signed notarization zips
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
         with:
           pattern: "*-notarize-zip"
           merge-multiple: true
@@ -613,6 +688,10 @@ jobs:
           rcodesign --version
 
       - name: Notarize signed binaries via rcodesign
+        env:
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
         run: |
           # Reconstruct the App Store Connect API .p8 and fold it (with the
           # issuer + key id) into the single unified key JSON rcodesign expects.
@@ -666,17 +745,20 @@ jobs:
       artifact-metadata: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Checkout pinned kin-vfs provenance source
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: firelock-ai/kin-vfs
           path: release-inputs/kin-vfs
           ref: 48c757dfda2ca6b115f32d86875c6adde587b861
+          persist-credentials: false
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
         with:
           merge-multiple: true
 
@@ -803,6 +885,8 @@ jobs:
               `${manifestPath} embedded dependency provenance does not match the tagged Cargo.lock`);
             fail(manifest.kin_vfs?.commit === vfsCommit,
               `${manifestPath} kin-vfs commit does not match the pinned checkout`);
+            fail(manifest.kin_vfs?.dirty === false,
+              `${manifestPath} does not certify a clean kin-vfs checkout`);
             fail(manifest.kin_vfs?.cargo_lock_sha256 === vfsLockSha,
               `${manifestPath} kin-vfs Cargo.lock hash does not match the pinned checkout`);
             fail(manifest.archive?.name === spec.archive, `${manifestPath} archive name is wrong`);
@@ -855,7 +939,7 @@ jobs:
             schema_version: 1,
             release_tag: process.env.GITHUB_REF_NAME,
             kin: { commit: kinCommit, cargo_lock_sha256: kinLockSha },
-            kin_vfs: { commit: vfsCommit, cargo_lock_sha256: vfsLockSha },
+            kin_vfs: { commit: vfsCommit, dirty: false, cargo_lock_sha256: vfsLockSha },
             artifacts,
             workflow: {
               repository: process.env.GITHUB_REPOSITORY,
@@ -871,7 +955,41 @@ jobs:
           NODE
           sha256sum -c release-provenance.json.sha256
 
+      - name: Inspect existing release state without demoting it
+        id: release_state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          response="$RUNNER_TEMP/existing-release.json"
+          code="$(curl --disable --silent --show-error \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -o "$response" -w '%{http_code}' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}")"
+          case "$code" in
+            200)
+              existing_final="$(jq -r '(.draft == false) and (.prerelease == false)' "$response")"
+              if [[ "$GITHUB_REF_NAME" == *-* ]] && [ "$existing_final" = "true" ]; then
+                echo "::error::prerelease tag $GITHUB_REF_NAME already exists as a stable GitHub release"
+                exit 1
+              fi
+              ;;
+            404)
+              existing_final=false
+              ;;
+            *)
+              cat "$response" >&2 || true
+              echo "::error::GitHub release lookup returned HTTP $code" >&2
+              exit 1
+              ;;
+          esac
+          tag_commit="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
+          test "$tag_commit" = "$(git rev-parse HEAD)"
+          echo "existing_final=$existing_final" >> "$GITHUB_OUTPUT"
+
       - name: Attest final release archives and provenance
+        if: ${{ steps.release_state.outputs.existing_final != 'true' }}
         # Fail closed: without a repository attestation, no public prerelease is
         # created and no npm candidate can be provisioned from these archives.
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
@@ -885,7 +1003,8 @@ jobs:
             release-provenance.json
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        if: ${{ steps.release_state.outputs.existing_final != 'true' }}
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           body_path: ./release-notes.md
           generate_release_notes: true
@@ -944,16 +1063,18 @@ jobs:
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Install Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.0.0
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
       - name: Upgrade npm for OIDC trusted publishing (needs >= 11.5.1)
-        run: npm install -g npm@latest
+        run: npm install -g npm@11.12.1
 
       - name: Verify npm package version matches tag
         run: |
@@ -970,23 +1091,45 @@ jobs:
           set -euo pipefail
           PKG=$(node -p "require('./packages/kin-mcp/package.json').name")
           VER=$(node -p "require('./packages/kin-mcp/package.json').version")
+          EXPECTED_COMMIT="$(git rev-parse HEAD)"
           CANDIDATE_TAG="release-candidate-$(printf '%s' "$VER" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
           {
             echo "pkg=$PKG"
             echo "ver=$VER"
             echo "candidate_tag=$CANDIDATE_TAG"
           } >> "$GITHUB_OUTPUT"
+          pack_dir="$RUNNER_TEMP/npm-pack-kin-mcp"
+          mkdir -p "$pack_dir"
+          pack_json="$(env -u NODE_AUTH_TOKEN -u NPM_TOKEN \
+            npm pack ./packages/kin-mcp --json --pack-destination "$pack_dir")"
+          tarball="$(printf '%s\n' "$pack_json" | node -e '
+            let input=""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => {
+              const records=JSON.parse(input); if (records.length !== 1 || !records[0].filename) process.exit(2);
+              process.stdout.write(records[0].filename);
+            });
+          ')"
+          tarball="$pack_dir/$tarball"
+
           if env -u NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG=/dev/null npm view "${PKG}@${VER}" version >/dev/null 2>&1; then
-            if [ -z "${NPM_TOKEN:-}" ]; then
-              echo "::error::NPM_TOKEN is required to restore $CANDIDATE_TAG on an idempotent rerun"
-              exit 1
+            env -u NPM_TOKEN bash scripts/verify-npm-release.sh \
+              "$PKG" "$VER" ./packages/kin-mcp "$GITHUB_REF" "$EXPECTED_COMMIT"
+            current_candidate="$(env -u NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG=/dev/null \
+              npm view "${PKG}@${CANDIDATE_TAG}" version 2>/dev/null || true)"
+            if [ "$current_candidate" != "$VER" ]; then
+              if [ -z "${NPM_TOKEN:-}" ]; then
+                echo "::error::NPM_TOKEN is required to restore $CANDIDATE_TAG on an idempotent rerun"
+                exit 1
+              fi
+              env NODE_AUTH_TOKEN="$NPM_TOKEN" npm dist-tag add "${PKG}@${VER}" "$CANDIDATE_TAG"
             fi
-            env NODE_AUTH_TOKEN="$NPM_TOKEN" npm dist-tag add "${PKG}@${VER}" "$CANDIDATE_TAG"
-            echo "${PKG}@${VER} already existed; restored provisional tag $CANDIDATE_TAG."
+            echo "${PKG}@${VER} already existed; identity verified and provisional tag restored."
             echo "published=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          env -u NODE_AUTH_TOKEN npm publish ./packages/kin-mcp --access public --tag "$CANDIDATE_TAG"
+          env -u NODE_AUTH_TOKEN -u NPM_TOKEN \
+            npm publish "$tarball" --access public --tag "$CANDIDATE_TAG"
+          env -u NPM_TOKEN bash scripts/verify-npm-release.sh \
+            "$PKG" "$VER" ./packages/kin-mcp "$GITHUB_REF" "$EXPECTED_COMMIT"
           echo "published=true" >> "$GITHUB_OUTPUT"
 
       - name: Notify Discord (npm candidate)
@@ -1014,16 +1157,18 @@ jobs:
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Install Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.0.0
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
       - name: Upgrade npm for OIDC trusted publishing (needs >= 11.5.1)
-        run: npm install -g npm@latest
+        run: npm install -g npm@11.12.1
 
       - name: Verify npm package version matches tag
         run: |
@@ -1043,23 +1188,45 @@ jobs:
           set -euo pipefail
           PKG=$(node -p "require('./packages/kin/package.json').name")
           VER=$(node -p "require('./packages/kin/package.json').version")
+          EXPECTED_COMMIT="$(git rev-parse HEAD)"
           CANDIDATE_TAG="release-candidate-$(printf '%s' "$VER" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
           {
             echo "pkg=$PKG"
             echo "ver=$VER"
             echo "candidate_tag=$CANDIDATE_TAG"
           } >> "$GITHUB_OUTPUT"
+          pack_dir="$RUNNER_TEMP/npm-pack-kin"
+          mkdir -p "$pack_dir"
+          pack_json="$(env -u NODE_AUTH_TOKEN -u NPM_TOKEN \
+            npm pack ./packages/kin --json --pack-destination "$pack_dir")"
+          tarball="$(printf '%s\n' "$pack_json" | node -e '
+            let input=""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => {
+              const records=JSON.parse(input); if (records.length !== 1 || !records[0].filename) process.exit(2);
+              process.stdout.write(records[0].filename);
+            });
+          ')"
+          tarball="$pack_dir/$tarball"
+
           if env -u NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG=/dev/null npm view "${PKG}@${VER}" version >/dev/null 2>&1; then
-            if [ -z "${NPM_TOKEN:-}" ]; then
-              echo "::error::NPM_TOKEN is required to restore $CANDIDATE_TAG on an idempotent rerun"
-              exit 1
+            env -u NPM_TOKEN bash scripts/verify-npm-release.sh \
+              "$PKG" "$VER" ./packages/kin "$GITHUB_REF" "$EXPECTED_COMMIT"
+            current_candidate="$(env -u NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG=/dev/null \
+              npm view "${PKG}@${CANDIDATE_TAG}" version 2>/dev/null || true)"
+            if [ "$current_candidate" != "$VER" ]; then
+              if [ -z "${NPM_TOKEN:-}" ]; then
+                echo "::error::NPM_TOKEN is required to restore $CANDIDATE_TAG on an idempotent rerun"
+                exit 1
+              fi
+              env NODE_AUTH_TOKEN="$NPM_TOKEN" npm dist-tag add "${PKG}@${VER}" "$CANDIDATE_TAG"
             fi
-            env NODE_AUTH_TOKEN="$NPM_TOKEN" npm dist-tag add "${PKG}@${VER}" "$CANDIDATE_TAG"
-            echo "${PKG}@${VER} already existed; restored provisional tag $CANDIDATE_TAG."
+            echo "${PKG}@${VER} already existed; identity verified and provisional tag restored."
             echo "published=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          env -u NODE_AUTH_TOKEN npm publish ./packages/kin --access public --tag "$CANDIDATE_TAG"
+          env -u NODE_AUTH_TOKEN -u NPM_TOKEN \
+            npm publish "$tarball" --access public --tag "$CANDIDATE_TAG"
+          env -u NPM_TOKEN bash scripts/verify-npm-release.sh \
+            "$PKG" "$VER" ./packages/kin "$GITHUB_REF" "$EXPECTED_COMMIT"
           echo "published=true" >> "$GITHUB_OUTPUT"
 
       - name: Notify Discord (npm candidate)
@@ -1092,7 +1259,7 @@ jobs:
             surface: compatibility
     steps:
       - name: Install Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.0.0
         with:
           node-version: 24
 
@@ -1155,20 +1322,25 @@ jobs:
 
   promote_npm:
     name: Promote Proven npm Packages
-    needs: [publish_npm, publish_npm_canonical, smoke_npm_candidates]
+    needs: [publish_npm, publish_npm_canonical, smoke_npm_candidates, version_tag_image]
     if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
+      - name: Checkout release policy
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
       - name: Install Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.0.0
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
       - name: Upgrade npm
-        run: npm install -g npm@latest
+        run: npm install -g npm@11.12.1
 
       - name: Promote both proven package versions
         shell: bash
@@ -1183,20 +1355,36 @@ jobs:
 
           VERSION="${GITHUB_REF_NAME#v}"
           CANDIDATE_TAG="release-candidate-$(printf '%s' "$VERSION" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
-          case "$VERSION" in
-            *-alpha*) FINAL_TAG="alpha" ;;
-            *-beta*) FINAL_TAG="beta" ;;
-            *-rc*) FINAL_TAG="rc" ;;
-            *-*)
-              echo "::error::unsupported npm prerelease channel in $VERSION; expected alpha, beta, or rc"
-              exit 1
-              ;;
-            *) FINAL_TAG="latest" ;;
-          esac
+          FINAL_TAG="$(node scripts/release-order.mjs channel "$VERSION")"
           packages=("@kinlab/kin" "@kinlab/kin-mcp")
 
+          # Preflight every package before mutating either channel. This keeps a
+          # stale tag rerun from advancing one package and then discovering the
+          # other package already has a newer public channel.
           for package in "${packages[@]}"; do
-            env NODE_AUTH_TOKEN="$NPM_TOKEN" npm dist-tag add "${package}@${VERSION}" "$FINAL_TAG"
+            current="$(env -u NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG=/dev/null \
+              npm view "${package}@${FINAL_TAG}" version 2>/dev/null || true)"
+            node scripts/release-order.mjs assert-not-rollback \
+              "$VERSION" "$current" "npm ${package} ${FINAL_TAG}"
+            candidate="$(env -u NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG=/dev/null \
+              npm view "${package}@${CANDIDATE_TAG}" version 2>/dev/null || true)"
+            if [ "$candidate" != "$VERSION" ]; then
+              echo "::error::${package}@${CANDIDATE_TAG} resolved to ${candidate:-<none>}, expected $VERSION"
+              exit 1
+            fi
+          done
+
+          for package in "${packages[@]}"; do
+            # Re-read immediately before each write. Repository concurrency
+            # serializes Kin releases; this second check also catches an
+            # external/manual npm channel move during the run.
+            current="$(env -u NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG=/dev/null \
+              npm view "${package}@${FINAL_TAG}" version 2>/dev/null || true)"
+            node scripts/release-order.mjs assert-not-rollback \
+              "$VERSION" "$current" "npm ${package} ${FINAL_TAG}"
+            if [ "$current" != "$VERSION" ]; then
+              env NODE_AUTH_TOKEN="$NPM_TOKEN" npm dist-tag add "${package}@${VERSION}" "$FINAL_TAG"
+            fi
           done
 
           for package in "${packages[@]}"; do
@@ -1221,17 +1409,34 @@ jobs:
 
   finalize_release:
     name: Promote Proven Release
-    needs: [publish, install_proof, promote_npm]
+    needs: [publish, install_proof, version_tag_image, promote_npm]
     if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - name: Checkout release policy
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
       - name: Promote stable tag after public and npm proof
         if: ${{ !contains(github.ref_name, '-') }}
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --prerelease=false --latest
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          current_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" \
+            --jq .tag_name 2>/dev/null || true)"
+          current_version="${current_tag#v}"
+          node scripts/release-order.mjs assert-not-rollback \
+            "$version" "$current_version" "GitHub Latest"
+
+          if [ "$current_tag" != "$GITHUB_REF_NAME" ]; then
+            gh release edit "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" --prerelease=false --latest
+          fi
 
       - name: Verify final release channel
         env:
@@ -1257,18 +1462,23 @@ jobs:
           fi
 
   publish_boundary_contracts:
-    name: Publish boundary contracts to KinLab
+    name: Post-release boundary contracts publish
     needs: [publish, install_proof, finalize_release]
     # Mirror publish's always() guard so a skipped notarize_linux does not
     # transitively skip this job.
     if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
+    # The public release is already final. This private-registry integration is
+    # observable follow-up work, not a gate that can falsely imply rollback.
+    continue-on-error: true
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Install Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.0.0
         with:
           node-version: 20
 
@@ -1299,22 +1509,28 @@ jobs:
             | curl -fsS -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
 
   bump_homebrew:
-    name: Trigger & verify Homebrew formula bump
+    name: Post-release Homebrew formula update
     needs: [publish, install_proof, finalize_release]
     # Mirror publish's always() guard so a skipped notarize_linux does not
     # transitively skip this job.
-    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    # The tap follows GitHub Latest, so prereleases must not enter this path.
+    # Homebrew is a post-release integration and cannot atomically gate a
+    # GitHub/npm release that is already public.
+    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Dispatch update to the homebrew-kin tap
         env:
           TAP_DISPATCH_TOKEN: ${{ secrets.KIN_CI_BOT_TOKEN }}
         run: |
           if [ -z "${TAP_DISPATCH_TOKEN:-}" ]; then
-            echo "::warning::KIN_CI_BOT_TOKEN is not configured; skipping the best-effort dispatch. The public formula outcome gate below still runs for version tags."
+            echo "::warning::KIN_CI_BOT_TOKEN is not configured; skipping the best-effort dispatch. The post-release formula check below still runs."
             exit 0
           fi
           # Convenience dispatch: the tap also self-updates on its 6h schedule, so a
@@ -1330,7 +1546,7 @@ jobs:
           if [ "$code" = "204" ]; then
             echo "Dispatched kin-release to firelock-ai/homebrew-kin"
           else
-            echo "::warning::Homebrew tap dispatch returned HTTP ${code}; continuing to the mandatory public formula outcome gate."
+            echo "::warning::Homebrew tap dispatch returned HTTP ${code}; continuing to the post-release public formula check."
             cat /tmp/tap-dispatch.out 2>/dev/null || true
           fi
 
@@ -1342,9 +1558,8 @@ jobs:
       # actually cut, mirroring version_tag_image's bounded poll-for-outcome
       # below rather than trusting the dispatch response as release proof.
       - name: Verify the tap formula actually bumped to this version
-        # Dispatch is only an accelerator. Every real version-tag release must
-        # prove the public tap outcome, including when the token is absent or
-        # GitHub rejects the dispatch request.
+        # Dispatch is only an accelerator. Record the real public tap outcome,
+        # including when the token is absent or GitHub rejects the dispatch.
         if: ${{ startsWith(github.ref, 'refs/tags/v') }}
         run: |
           bash scripts/verify-homebrew-formula.sh "$GITHUB_REF_NAME"
@@ -1360,7 +1575,7 @@ jobs:
   # other release surfaces here.
   version_tag_image:
     name: Version-tag ghcr image
-    needs: [publish, install_proof, finalize_release]
+    needs: [publish, install_proof]
     # Mirror publish's always() guard so a skipped notarize_linux does not
     # transitively skip this job, and only tag real version-tag pushes (not a
     # workflow_dispatch on a branch) so `:<version>` never points at an
@@ -1374,17 +1589,19 @@ jobs:
       packages: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.0.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Version-tag the release commit's daemon image (no rebuild)
         env:
@@ -1417,20 +1634,48 @@ jobs:
             sleep 20
           done
 
-          # Registry-side manifest copy: `:<version>` and `:v<version>` become new
-          # tags pointing at the same image as `:<commit>` and `:latest` — no pull,
-          # no push of layers, no rebuild, just extra manifest references to pin.
+          source_digest="$(docker buildx imagetools inspect "$SRC" --format '{{.Manifest.Digest}}')"
+          case "$source_digest" in
+            sha256:*) ;;
+            *)
+              echo "::error::could not resolve an immutable manifest digest for $SRC"
+              exit 1
+              ;;
+          esac
+
+          # Version tags are immutable release identities. A rerun may observe
+          # an already-correct tag, but it must never overwrite a mismatched
+          # digest even when the source commit tag still exists.
+          destinations=("${IMAGE}:${VERSION}" "${IMAGE}:${GITHUB_REF_NAME}")
+          for destination in "${destinations[@]}"; do
+            if docker buildx imagetools inspect "$destination" >/dev/null 2>&1; then
+              existing_digest="$(docker buildx imagetools inspect "$destination" --format '{{.Manifest.Digest}}')"
+              if [ "$existing_digest" != "$source_digest" ]; then
+                echo "::error::$destination already points at $existing_digest, expected immutable $source_digest"
+                exit 1
+              fi
+            fi
+          done
+
+          # Registry-side manifest copy: `:<version>` and `:v<version>` become
+          # references to the exact commit-image digest. No layers are rebuilt.
           docker buildx imagetools create \
             --tag "${IMAGE}:${VERSION}" \
             --tag "${IMAGE}:${GITHUB_REF_NAME}" \
-            "$SRC"
+            "${IMAGE}@${source_digest}"
 
-          digest="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{.Manifest.Digest}}' 2>/dev/null || true)"
+          for destination in "${destinations[@]}"; do
+            actual_digest="$(docker buildx imagetools inspect "$destination" --format '{{.Manifest.Digest}}')"
+            if [ "$actual_digest" != "$source_digest" ]; then
+              echo "::error::$destination resolved to $actual_digest after tagging, expected $source_digest"
+              exit 1
+            fi
+          done
           {
             echo "Version-tagged the release daemon image (no rebuild):"
             echo ""
             echo "- \`${IMAGE}:${VERSION}\`"
             echo "- \`${IMAGE}:${GITHUB_REF_NAME}\`"
             echo "- source: \`${SRC}\`"
-            if [ -n "${digest}" ]; then echo "- digest: \`${digest}\`"; fi
+            echo "- digest: \`${source_digest}\`"
           } >> "$GITHUB_STEP_SUMMARY"
