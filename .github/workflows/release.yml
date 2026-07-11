@@ -116,6 +116,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     outputs:
       digest: ${{ steps.publish.outputs.digest }}
       commit: ${{ steps.source.outputs.commit }}
@@ -240,6 +242,47 @@ jobs:
             echo "- digest: \`${digest}\`"
             echo "- no mutable latest tag was written"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest immutable daemon image
+        # Store SLSA provenance next to the exact digest in GHCR so staging and
+        # production admission can verify the protected tag workflow identity.
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-name: ghcr.io/firelock-ai/kin
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+          # Keep authority minimal: the registry attestation is required, but
+          # the optional linked-artifact storage record is not.
+          create-storage-record: false
+
+      - name: Verify immutable daemon image attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.publish.outputs.digest }}
+          COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          set -euo pipefail
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}"
+          verified=false
+          for attempt in 1 2 3 4 5; do
+            if gh attestation verify \
+              "oci://ghcr.io/firelock-ai/kin@${DIGEST}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --predicate-type https://slsa.dev/provenance/v1 \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --signer-digest "$COMMIT" \
+              --cert-identity "$identity" \
+              --source-ref "$GITHUB_REF" \
+              --deny-self-hosted-runners; then
+              verified=true
+              break
+            fi
+            sleep $(( attempt * 2 ))
+          done
+          if [ "$verified" != true ]; then
+            echo "::error::could not verify the exact GHCR daemon image attestation"
+            exit 1
+          fi
 
   build:
     name: Build (${{ matrix.artifact }})

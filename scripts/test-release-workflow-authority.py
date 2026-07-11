@@ -34,12 +34,21 @@ def main() -> None:
             )
 
     release = RELEASE.read_text(encoding="utf-8")
+    docker_workflow = (WORKFLOWS / "docker.yml").read_text(encoding="utf-8")
     if "workflow_dispatch:" in release:
         raise AssertionError(
             "release.yml must not expose branch-selectable workflow_dispatch"
         )
     require(release, 'tags:\n      - "v*.*.*"', "release trigger")
     require(release, "  build_daemon_image:", "release daemon image job")
+
+    for policy in (
+        "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+        "docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f",
+        "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8",
+        "Keep polling the bounded log authority even",
+    ):
+        require(docker_workflow, policy, "Docker CI authority and smoke gate")
 
     image_start = release.index("  build_daemon_image:")
     image_end = release.index("\n  build:", image_start)
@@ -48,8 +57,23 @@ def main() -> None:
         "needs: config",
         "environment: release",
         "packages: write",
+        "id-token: write",
+        "attestations: write",
         "ghcr.io/firelock-ai/kin",
         "verify-container-build-info.sh",
+        "Attest immutable daemon image",
+        "subject-name: ghcr.io/firelock-ai/kin",
+        "subject-digest: ${{ steps.publish.outputs.digest }}",
+        "push-to-registry: true",
+        "create-storage-record: false",
+        "Verify immutable daemon image attestation",
+        '"oci://ghcr.io/firelock-ai/kin@${DIGEST}"',
+        "--predicate-type https://slsa.dev/provenance/v1",
+        '--signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"',
+        '--signer-digest "$COMMIT"',
+        '--cert-identity "$identity"',
+        '--source-ref "$GITHUB_REF"',
+        "--deny-self-hosted-runners",
     ):
         require(image_job, policy, "release daemon image job")
     require(
@@ -170,7 +194,6 @@ def main() -> None:
     for forbidden in (
         "workflow_dispatch",
         "branches: [main]",
-        "id-token: write",
         "WIF_PROVIDER",
         "WIF_SERVICE_ACCOUNT",
         "us-central1-docker.pkg.dev",
