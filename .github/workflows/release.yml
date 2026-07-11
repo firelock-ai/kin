@@ -1241,8 +1241,10 @@ jobs:
           PKG: ${{ steps.npm_stage.outputs.package }}
           VER: ${{ steps.npm_stage.outputs.version }}
           CHANNEL: ${{ steps.npm_stage.outputs.channel }}
+          INTEGRITY: ${{ steps.npm_stage.outputs.integrity }}
+          SHASUM: ${{ steps.npm_stage.outputs.shasum }}
         run: |
-          jq -nc --arg c "📦 \`${PKG}@${VER}\` is staged for npm channel \`${CHANNEL}\`. Wait until BOTH npm stage jobs succeed, then approve BOTH packages in npm's Staged Packages UI with 2FA. GitHub Latest remains blocked until both are approved and proven." '{content:$c}' \
+          jq -nc --arg c "📦 \`${PKG}@${VER}\` is staged for npm channel \`${CHANNEL}\`. Wait until BOTH npm stage jobs succeed. Before approval, an authenticated maintainer must download and inspect BOTH staged tarballs and match this package's expected SRI \`${INTEGRITY}\` and SHA-1 \`${SHASUM}\`. Then approve BOTH with 2FA. If the run fails or times out, reject remaining stages before any newer release. GitHub Latest remains blocked until both are approved and proven." '{content:$c}' \
             | curl -fsS -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
 
   stage_npm_canonical:
@@ -1292,8 +1294,10 @@ jobs:
           PKG: ${{ steps.npm_stage.outputs.package }}
           VER: ${{ steps.npm_stage.outputs.version }}
           CHANNEL: ${{ steps.npm_stage.outputs.channel }}
+          INTEGRITY: ${{ steps.npm_stage.outputs.integrity }}
+          SHASUM: ${{ steps.npm_stage.outputs.shasum }}
         run: |
-          jq -nc --arg c "📦 \`${PKG}@${VER}\` is staged for npm channel \`${CHANNEL}\`. Wait until BOTH npm stage jobs succeed, then approve BOTH packages in npm's Staged Packages UI with 2FA. GitHub Latest remains blocked until both are approved and proven." '{content:$c}' \
+          jq -nc --arg c "📦 \`${PKG}@${VER}\` is staged for npm channel \`${CHANNEL}\`. Wait until BOTH npm stage jobs succeed. Before approval, an authenticated maintainer must download and inspect BOTH staged tarballs and match this package's expected SRI \`${INTEGRITY}\` and SHA-1 \`${SHASUM}\`. Then approve BOTH with 2FA. If the run fails or times out, reject remaining stages before any newer release. GitHub Latest remains blocked until both are approved and proven." '{content:$c}' \
             | curl -fsS -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
 
   wait_for_npm_approval:

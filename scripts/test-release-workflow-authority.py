@@ -93,7 +93,9 @@ def main() -> None:
         '"${PACKAGE}@${VERSION}"',
         "needs: [publish, install_proof, version_tag_image, smoke_npm_approved]",
         "GitHub Latest remains blocked",
-        "Wait until BOTH npm stage jobs succeed, then approve BOTH packages",
+        "Wait until BOTH npm stage jobs succeed",
+        "download and inspect BOTH staged tarballs",
+        "reject remaining stages before any newer release",
     ):
         require(release, policy, "two-package staged npm release gate")
 
@@ -104,7 +106,12 @@ def main() -> None:
         "--provenance",
         "exact bytes and provenance verified before skipping staging",
         "OIDC identity cannot inspect staged packages",
-        "human 2FA approval is required",
+        "human 2FA approval",
+        'node "$release_order_script" npm-channel "$package" "$channel"',
+        "assert_channel_not_newer before",
+        "assert_channel_not_newer after",
+        "expected integrity=",
+        "Never cut or approve a newer release while this older stage remains pending",
     ):
         require(stager, policy, "OIDC npm staging helper")
     for policy in (
@@ -113,6 +120,7 @@ def main() -> None:
         "already newer",
         "Timed out waiting for both npm approvals",
         "GitHub Latest was not promoted",
+        "Never leave an older stage pending across releases",
     ):
         require(waiter, policy, "anonymous npm approval waiter")
 

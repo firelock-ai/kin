@@ -58,7 +58,7 @@ for attempt in $(seq 1 "$attempts"); do
     if [ -n "$channel_version" ] && [ "$channel_version" != "$version" ]; then
       comparison="$(node "$script_dir/release-order.mjs" compare "$channel_version" "$version")"
       if [ "$comparison" = "1" ]; then
-        echo "::error::npm ${package}@${channel} is already newer at ${channel_version}; refusing to wait for or roll it back to ${version}. GitHub Latest remains blocked." >&2
+        echo "::error::npm ${package}@${channel} is already newer at ${channel_version}; refusing to wait for or roll it back to ${version}. Reject every still-pending ${version} stage from this run before any approval or newer release, and never approve it after the channel has advanced. GitHub Latest remains blocked." >&2
         exit 1
       fi
     fi
@@ -86,5 +86,5 @@ for attempt in $(seq 1 "$attempts"); do
   fi
 done
 
-echo "::error::Timed out waiting for both npm approvals. @kinlab/kin public=${last_public[0]} ${channel}=${last_channel[0]}; @kinlab/kin-mcp public=${last_public[1]} ${channel}=${last_channel[1]}. Review npm Staged Packages, approve the remaining version with 2FA or reject it, then rerun. Any already-approved package remains public; GitHub Latest was not promoted." >&2
+echo "::error::Timed out waiting for both npm approvals. @kinlab/kin public=${last_public[0]} ${channel}=${last_channel[0]}; @kinlab/kin-mcp public=${last_public[1]} ${channel}=${last_channel[1]}. Review npm Staged Packages and either finish this same release now or reject every still-pending ${version} stage before cutting or approving any newer release. Never leave an older stage pending across releases. Any already-approved package remains public; GitHub Latest was not promoted." >&2
 exit 1

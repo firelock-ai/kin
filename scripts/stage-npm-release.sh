@@ -20,6 +20,7 @@ expected_commit="$3"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd -- "$script_dir/.." && pwd)"
 verify_script="${NPM_RELEASE_VERIFY_SCRIPT:-$script_dir/verify-npm-release.sh}"
+release_order_script="${NPM_RELEASE_ORDER_SCRIPT:-$script_dir/release-order.mjs}"
 
 if [ ! -f "$package_dir/package.json" ]; then
   echo "error: package manifest not found: $package_dir/package.json" >&2
@@ -54,7 +55,7 @@ if [ "$expected_ref" != "refs/tags/v${version}" ]; then
   exit 2
 fi
 
-channel="$(node "$script_dir/release-order.mjs" channel "$version")"
+channel="$(node "$release_order_script" channel "$version")"
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
   {
     echo "package=$package"
@@ -88,17 +89,64 @@ fi
 pack_json="$(env -u NODE_AUTH_TOKEN -u NPM_TOKEN \
   NPM_CONFIG_USERCONFIG="$tmp/empty-npmrc" \
   npm pack "$package_dir" --json --pack-destination "$tmp/pack")"
-tarball="$(printf '%s\n' "$pack_json" | node -e '
+pack_field() {
+  printf '%s\n' "$pack_json" | node -e '
   let input = "";
   process.stdin.on("data", (chunk) => { input += chunk; });
   process.stdin.on("end", () => {
     const records = JSON.parse(input);
-    if (records.length !== 1 || typeof records[0].filename !== "string") process.exit(2);
-    process.stdout.write(records[0].filename);
+    const field = process.argv[1];
+    if (records.length !== 1 || typeof records[0][field] !== "string") process.exit(2);
+    process.stdout.write(records[0][field]);
   });
-')"
-tarball="$tmp/pack/$tarball"
+  ' "$1"
+}
+tarball_name="$(pack_field filename)"
+integrity="$(pack_field integrity)"
+shasum="$(pack_field shasum)"
+tarball="$tmp/pack/$tarball_name"
 test -f "$tarball"
+case "$integrity" in
+  sha512-*) ;;
+  *) echo "error: npm pack returned an invalid SHA-512 integrity for ${package}@${version}" >&2; exit 1 ;;
+esac
+if ! printf '%s\n' "$shasum" | grep -Eq '^[0-9a-f]{40}$'; then
+  echo "error: npm pack returned an invalid SHA-1 shasum for ${package}@${version}" >&2
+  exit 1
+fi
+if [ -n "${GITHUB_OUTPUT:-}" ]; then
+  {
+    echo "integrity=$integrity"
+    echo "shasum=$shasum"
+  } >> "$GITHUB_OUTPUT"
+fi
+
+assert_channel_not_newer() {
+  phase="$1"
+  current="$(env -u NODE_AUTH_TOKEN -u NPM_TOKEN \
+    node "$release_order_script" npm-channel "$package" "$channel")"
+  set +e
+  check_output="$(env -u NODE_AUTH_TOKEN -u NPM_TOKEN \
+    node "$release_order_script" assert-not-rollback \
+      "$version" "$current" "npm ${package} ${channel}" 2>&1)"
+  check_status=$?
+  set -e
+  printf '%s\n' "$check_output"
+  if [ "$check_status" -eq 0 ]; then
+    return 0
+  fi
+  if [ "$phase" = "after" ]; then
+    echo "::error::npm ${package}@${channel} advanced to ${current} while ${package}@${version} was being staged. Reject the newly pending ${version} stage before any approval or newer release; never approve it after the channel has advanced." >&2
+  else
+    echo "::error::npm ${package}@${channel} advanced to ${current} immediately before staging ${version}; no stage was submitted. Resolve every older pending stage before cutting or approving another release." >&2
+  fi
+  return "$check_status"
+}
+
+# The config job checks release order before long build/proof jobs. Re-read the
+# anonymous registry authority at the last possible moment so a newer release
+# cannot advance this channel during that gap and be rolled back by approval.
+assert_channel_not_newer before
 
 set +e
 stage_output="$(env -u NODE_AUTH_TOKEN -u NPM_TOKEN \
@@ -109,11 +157,16 @@ stage_status=$?
 set -e
 printf '%s\n' "$stage_output"
 if [ "$stage_status" -ne 0 ]; then
-  echo "::error::npm could not stage ${package}@${version} for ${channel}. If this exact version is already pending approval, npm's version-uniqueness rule causes this retry to fail and the OIDC identity cannot inspect staged packages. Approve it with 2FA in npm Staged Packages and rerun, or reject it there before retrying. GitHub Latest remains blocked." >&2
+  echo "::error::npm could not stage ${package}@${version} for ${channel}. If this exact version is already pending approval, npm's version-uniqueness rule causes this retry to fail and the OIDC identity cannot inspect staged packages. Approve it with 2FA only to finish this same release, or reject it there before retrying. Never cut or approve a newer release while this older stage remains pending. GitHub Latest remains blocked." >&2
   exit "$stage_status"
 fi
 
-echo "Staged ${package}@${version} with immutable npm channel ${channel}; human 2FA approval is required before it becomes public."
+# A competing release can still advance between the pre-stage read and npm's
+# stage write. The stage is not public yet, so fail with an explicit rejection
+# requirement before a human can accidentally approve an older pending version.
+assert_channel_not_newer after
+
+echo "Staged ${package}@${version} with immutable npm channel ${channel}; expected integrity=${integrity} shasum=${shasum}. Authenticated inspection and human 2FA approval are required before it becomes public."
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
   echo "staged=true" >> "$GITHUB_OUTPUT"
 fi

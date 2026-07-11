@@ -210,9 +210,20 @@ spctl --assess --type execute --verbose ./kin
   protected `release` environment, and that OIDC identity may only run
   `npm stage publish`. It stages each version under its final channel without a
   long-lived token. The maintainer should wait for both stage jobs to succeed,
-  then approve both packages separately with 2FA; npm cannot make those two
-  approvals atomic, so one package can still become public before the other.
-  GitHub Latest remains blocked until both versions and channels are anonymously
-  visible, their exact bytes and provenance verify, and clean
-  install/provision smoke passes for both packages. The Homebrew tap consumes
-  the published archives and checksums only after that gate.
+  then use an authenticated npm account to download both staged tarballs (for
+  example, with `npm stage download`) and compare their contents plus the
+  workflow-emitted SRI and SHA-1 values before approving either package with
+  2FA. The release workflow's OIDC identity deliberately cannot download or
+  inspect pending stages, so this pre-approval inspection is a human-enforced
+  gate. npm cannot make the two approvals atomic, so one package can still
+  become public before the other. Never cut or approve a newer release while an
+  older staged version remains pending. If the workflow fails or times out,
+  finish that same release immediately or reject every remaining staged version
+  before starting another release.
+- **npm's automated exact-byte proof is post-publication.** Approval makes the
+  npm version and final channel public before anonymous CI can fetch and verify
+  exact bytes, provenance, and clean install/provision behavior. A failure at
+  that point leaves an immutable public npm version requiring incident response;
+  it is not pre-public proof. GitHub Latest and the Homebrew tap remain blocked
+  until both npm versions and channels are visible and all post-public checks
+  pass.

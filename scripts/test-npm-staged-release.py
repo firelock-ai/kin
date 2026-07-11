@@ -54,8 +54,14 @@ if args[:1] == ["pack"]:
     destination.mkdir(parents=True, exist_ok=True)
     (destination / filename).write_bytes(b"deterministic fake tarball")
     state["last_pack"] = {"package": manifest["name"], "version": manifest["version"]}
+    if state.get("scenario") == "advance_before_stage":
+        state["tags"][manifest["name"]]["latest"] = state["newer"]
     save()
-    print(json.dumps([{"filename": filename, "integrity": "sha512-fake"}]))
+    print(json.dumps([{
+        "filename": filename,
+        "integrity": "sha512-ZGV0ZXJtaW5pc3RpYy1mYWtlLWludGVncml0eQ==",
+        "shasum": "0123456789abcdef0123456789abcdef01234567"
+    }]))
 elif args[:1] == ["view"]:
     package, selector = split_spec(args[1])
     scenario = state.get("scenario", "static")
@@ -100,6 +106,8 @@ elif args[:2] == ["stage", "publish"]:
         print("npm error E409 version already exists as a staged version", file=sys.stderr)
         raise SystemExit(1)
     state["staged"][package] = {"version": version, "tag": tag}
+    if state.get("scenario") == "advance_during_stage":
+        state["tags"][package][tag] = state["newer"]
     save()
     print(f"staged {package}@{version} tag={tag}")
 elif args[:1] == ["publish"] or args[:1] == ["dist-tag"]:
@@ -123,6 +131,41 @@ if os.environ.get("NODE_AUTH_TOKEN") or os.environ.get("NPM_TOKEN"):
     print("fake verifier detected inherited registry credentials", file=sys.stderr)
     raise SystemExit(96)
 pathlib.Path(os.environ["FAKE_VERIFY_LOG"]).write_text(json.dumps(sys.argv[1:]))
+"""
+
+
+FAKE_RELEASE_ORDER = r"""#!/usr/bin/env node
+import fs from 'node:fs';
+
+const statePath = process.env.FAKE_NPM_STATE;
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const [command, ...args] = process.argv.slice(2);
+
+const compare = (left, right) => {
+  const a = left.split('.').map(Number);
+  const b = right.split('.').map(Number);
+  for (let i = 0; i < 3; i += 1) {
+    if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+  }
+  return 0;
+};
+
+if (command === 'channel') {
+  console.log('latest');
+} else if (command === 'npm-channel') {
+  const [packageName, channel] = args;
+  console.log(state.tags?.[packageName]?.[channel] ?? '<none>');
+} else if (command === 'assert-not-rollback') {
+  const [candidate, current, label = 'release channel'] = args;
+  if (current !== '<none>' && compare(candidate, current) < 0) {
+    console.error(`${label} is already ${current}; refusing to roll it back to ${candidate}`);
+    process.exit(1);
+  }
+  console.log(`${label} may advance from ${current} to ${candidate}`);
+} else {
+  console.error(`unsupported fake release-order command: ${command}`);
+  process.exit(98);
+}
 """
 
 
@@ -153,6 +196,7 @@ def harness() -> tuple[tempfile.TemporaryDirectory[str], Path, dict[str, str]]:
     bin_dir.mkdir()
     write_executable(bin_dir / "npm", FAKE_NPM)
     write_executable(bin_dir / "verify", FAKE_VERIFY)
+    write_executable(bin_dir / "release-order.mjs", FAKE_RELEASE_ORDER)
     package_dir = tmp / "package"
     package_dir.mkdir()
     (package_dir / "package.json").write_text(
@@ -165,6 +209,7 @@ def harness() -> tuple[tempfile.TemporaryDirectory[str], Path, dict[str, str]]:
             "FAKE_NPM_STATE": str(tmp / "state.json"),
             "FAKE_VERIFY_LOG": str(tmp / "verify.json"),
             "NPM_RELEASE_VERIFY_SCRIPT": str(bin_dir / "verify"),
+            "NPM_RELEASE_ORDER_SCRIPT": str(bin_dir / "release-order.mjs"),
             "GITHUB_OUTPUT": str(tmp / "github-output"),
             "NODE_AUTH_TOKEN": "must-not-reach-npm",
             "NPM_TOKEN": "must-not-reach-npm",
@@ -213,6 +258,9 @@ def test_new_stage() -> None:
         command[:1] in (["publish"], ["dist-tag"]) for command in state["commands"]
     )
     assert b"staged=true" in snapshot["github-output"]
+    assert b"integrity=sha512-" in snapshot["github-output"]
+    assert b"shasum=0123456789abcdef0123456789abcdef01234567" in snapshot["github-output"]
+    assert "expected integrity=sha512-" in result.stdout
     assert "verify.json" not in snapshot
     print("PASS: new version is staged under its final channel")
 
@@ -242,8 +290,34 @@ def test_pending_stage_fails_actionably() -> None:
     assert "OIDC identity cannot inspect staged packages" in result.stderr
     assert "Approve it with 2FA" in result.stderr
     assert "GitHub Latest remains blocked" in result.stderr
+    assert "Never cut or approve a newer release" in result.stderr
     assert "verify.json" not in snapshot
     print("PASS: pending staged version fails loud with human recovery instructions")
+
+
+def test_newer_channel_before_stage_fails_without_submission() -> None:
+    state = base_state(scenario="advance_before_stage", newer=NEWER_VERSION)
+    result, snapshot = run_stage(state)
+    assert result.returncode != 0
+    actual = json.loads(snapshot["state.json"])
+    assert not any(
+        command[:2] == ["stage", "publish"] for command in actual["commands"]
+    )
+    assert "immediately before staging" in result.stderr
+    assert "no stage was submitted" in result.stderr
+    print("PASS: channel advancement during build fails before staging")
+
+
+def test_newer_channel_during_stage_requires_rejection() -> None:
+    state = base_state(scenario="advance_during_stage", newer=NEWER_VERSION)
+    result, snapshot = run_stage(state)
+    assert result.returncode != 0
+    actual = json.loads(snapshot["state.json"])
+    assert actual["staged"][PACKAGE] == {"version": VERSION, "tag": "latest"}
+    assert "advanced to" in result.stderr
+    assert "Reject the newly pending" in result.stderr
+    assert "never approve it" in result.stderr
+    print("PASS: post-stage channel race fails with mandatory rejection")
 
 
 def run_wait(
@@ -302,6 +376,7 @@ def test_approval_timeout_blocks_latest() -> None:
     assert result.returncode != 0
     assert "Timed out waiting for both npm approvals" in result.stderr
     assert "GitHub Latest was not promoted" in result.stderr
+    assert "Never leave an older stage pending across releases" in result.stderr
     print("PASS: bounded approval timeout keeps GitHub Latest blocked")
 
 
@@ -317,6 +392,7 @@ def test_newer_channel_fails_closed() -> None:
     assert result.returncode != 0
     assert "already newer" in result.stderr
     assert "GitHub Latest remains blocked" in result.stderr
+    assert "never approve it after the channel has advanced" in result.stderr
     print("PASS: newer final channel fails closed without rollback")
 
 
@@ -324,6 +400,8 @@ def main() -> None:
     test_new_stage()
     test_public_rerun_verifies_before_skip()
     test_pending_stage_fails_actionably()
+    test_newer_channel_before_stage_fails_without_submission()
+    test_newer_channel_during_stage_requires_rejection()
     test_waits_for_both_approvals()
     test_approval_timeout_blocks_latest()
     test_newer_channel_fails_closed()
