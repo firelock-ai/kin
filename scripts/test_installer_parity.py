@@ -8,8 +8,14 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest import mock
 
-from verify_installer_parity import ParityError, sha256, verify_payloads
+from verify_installer_parity import (
+    ParityError,
+    fetch_response,
+    sha256,
+    verify_payloads,
+)
 
 
 TAG = "v0.2.16"
@@ -33,13 +39,15 @@ def manifest() -> bytes:
 
 
 class InstallerParityTests(unittest.TestCase):
-    def verify(self, **overrides: bytes) -> None:
+    def verify(self, **overrides: bytes | str | None) -> None:
         values = {
             "source_install": INSTALL,
             "source_install_ps1": INSTALL_PS1,
             "public_install": INSTALL,
             "public_install_ps1": INSTALL_PS1,
             "public_manifest": manifest(),
+            "public_install_generation": "101",
+            "public_install_ps1_generation": "102",
         }
         values.update(overrides)
         verify_payloads(tag=TAG, commit=COMMIT, **values)
@@ -60,6 +68,33 @@ class InstallerParityTests(unittest.TestCase):
         wrong["tag"] = "v0.2.15"
         with self.assertRaisesRegex(ParityError, "current.json tag"):
             self.verify(public_manifest=json.dumps(wrong).encode())
+
+    def test_manifest_generation_must_match_public_header(self) -> None:
+        wrong = json.loads(manifest())
+        wrong["install_generation"] = "999"
+        with self.assertRaisesRegex(ParityError, "current.json install_generation"):
+            self.verify(public_manifest=json.dumps(wrong).encode())
+
+    def test_both_public_generation_headers_are_required(self) -> None:
+        with self.assertRaisesRegex(
+            ParityError, "missing or invalid x-goog-generation"
+        ):
+            self.verify(public_install_ps1_generation=None)
+
+    @mock.patch("verify_installer_parity.urllib.request.urlopen")
+    def test_fetch_response_captures_generation_header(
+        self, urlopen: mock.MagicMock
+    ) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = INSTALL
+        response.headers.get.return_value = " 777 "
+        urlopen.return_value = response
+
+        fetched = fetch_response("https://install.example.test/install", attempts=1)
+
+        self.assertEqual(fetched.body, INSTALL)
+        self.assertEqual(fetched.generation, "777")
 
 
 if __name__ == "__main__":

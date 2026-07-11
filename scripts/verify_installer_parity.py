@@ -33,6 +33,14 @@ class ParityError(RuntimeError):
 class ParityResult:
     install_sha256: str
     install_ps1_sha256: str
+    install_generation: str
+    install_ps1_generation: str
+
+
+@dataclass(frozen=True)
+class FetchResult:
+    body: bytes
+    generation: str | None
 
 
 def sha256(data: bytes) -> str:
@@ -48,6 +56,8 @@ def verify_payloads(
     public_install: bytes,
     public_install_ps1: bytes,
     public_manifest: bytes,
+    public_install_generation: str | None,
+    public_install_ps1_generation: str | None,
 ) -> ParityResult:
     if TAG_RE.fullmatch(tag) is None:
         raise ParityError(f"invalid stable release tag: {tag}")
@@ -69,10 +79,22 @@ def verify_payloads(
             f"expected {ps1_sha}, served {public_ps1_sha}"
         )
 
+    public_generations = {
+        "install_generation": public_install_generation,
+        "install_ps1_generation": public_install_ps1_generation,
+    }
+    for key, value in public_generations.items():
+        if value is None or re.fullmatch(r"[0-9]+", value) is None:
+            raise ParityError(
+                f"public endpoint has missing or invalid x-goog-generation for {key}"
+            )
+
     try:
         manifest: Any = json.loads(public_manifest)
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
-        raise ParityError(f"public current.json is missing or invalid: {error}") from error
+        raise ParityError(
+            f"public current.json is missing or invalid: {error}"
+        ) from error
     if not isinstance(manifest, dict):
         raise ParityError("public current.json is not a JSON object")
     expected = {
@@ -81,31 +103,43 @@ def verify_payloads(
         "sha": commit,
         "install_sha256": install_sha,
         "install_ps1_sha256": ps1_sha,
+        **public_generations,
     }
     for key, value in expected.items():
         if manifest.get(key) != value:
             raise ParityError(
                 f"public current.json {key}={manifest.get(key)!r}, expected {value!r}"
             )
-    for key in ("install_generation", "install_ps1_generation"):
-        if re.fullmatch(r"[0-9]+", str(manifest.get(key, ""))) is None:
-            raise ParityError(f"public current.json has invalid {key}")
+    return ParityResult(
+        install_sha,
+        ps1_sha,
+        public_install_generation,
+        public_install_ps1_generation,
+    )
 
-    return ParityResult(install_sha, ps1_sha)
 
-
-def fetch(url: str, attempts: int = 4) -> bytes:
-    request = urllib.request.Request(url, headers={"User-Agent": "kin-installer-parity"})
+def fetch_response(url: str, attempts: int = 4) -> FetchResult:
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "kin-installer-parity"}
+    )
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
-                return response.read()
+                generation = response.headers.get("x-goog-generation")
+                return FetchResult(
+                    body=response.read(),
+                    generation=generation.strip() if generation is not None else None,
+                )
         except (urllib.error.URLError, TimeoutError) as error:
             last_error = error
             if attempt < attempts:
                 time.sleep(attempt * 2)
     raise ParityError(f"could not fetch {url}: {last_error}")
+
+
+def fetch(url: str, attempts: int = 4) -> bytes:
+    return fetch_response(url, attempts).body
 
 
 def resolve_tag(repository: str, tag: str) -> str:
@@ -156,22 +190,31 @@ def main() -> int:
             )
         raw = f"https://raw.githubusercontent.com/{args.repository}/{commit}/scripts"
         base = args.base_url.rstrip("/")
+        public_install = fetch_response(f"{base}/install")
+        public_install_ps1 = fetch_response(f"{base}/install.ps1")
         result = verify_payloads(
             tag=args.tag,
             commit=commit,
             source_install=fetch(f"{raw}/install.sh"),
             source_install_ps1=fetch(f"{raw}/install.ps1"),
-            public_install=fetch(f"{base}/install"),
-            public_install_ps1=fetch(f"{base}/install.ps1"),
+            public_install=public_install.body,
+            public_install_ps1=public_install_ps1.body,
             public_manifest=fetch(f"{base}/current.json"),
+            public_install_generation=public_install.generation,
+            public_install_ps1_generation=public_install_ps1.generation,
         )
-    except (ParityError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+    except (
+        ParityError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ) as error:
         print(f"installer parity failed: {error}", file=sys.stderr)
         return 1
 
     print(
         f"installer parity verified: {args.tag}@{commit} "
-        f"install={result.install_sha256} install.ps1={result.install_ps1_sha256}"
+        f"install={result.install_sha256}#{result.install_generation} "
+        f"install.ps1={result.install_ps1_sha256}#{result.install_ps1_generation}"
     )
     return 0
 
