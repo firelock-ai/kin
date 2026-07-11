@@ -12903,7 +12903,10 @@ mod tests {
         #[cfg(feature = "vector")]
         assert_eq!(stats.pending_embedding_count, 6);
         #[cfg(not(feature = "vector"))]
-        assert_eq!(stats.pending_embedding_count, 0);
+        assert_eq!(
+            stats.pending_embedding_count, stats.total_entities,
+            "without a vector index every entity remains an unindexed embedding gap"
+        );
         #[cfg(feature = "vector")]
         assert!((stats.embedding_coverage_percent - 33.33333333333333).abs() < 0.001);
         #[cfg(not(feature = "vector"))]
