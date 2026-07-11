@@ -676,10 +676,11 @@ fn refresh_lock_entry(repo_dir: &Path, crate_name: &str, version: &str) {
 /// `kin release intent <repo>` — release-intent gate for one repo.
 ///
 /// For `kin`, this defers to the canonical `scripts/release-intent.mjs` gate
-/// (npm == Cargo version, non-empty CHANGELOG section, version strictly forward)
-/// — the same gate `auto-tag-release.yml` runs. For a library repo, it asserts
-/// the local version is ahead of the newest published version and points at the
-/// registry-clean proof. Returns a non-zero process exit on failure.
+/// (tag-bound package versions == Cargo version, non-empty CHANGELOG section,
+/// version strictly forward) — the same pre-tag gate the release captain runs.
+/// For a library repo, it asserts the local version is ahead of the newest
+/// published version and points at the registry-clean proof. Returns a non-zero
+/// process exit on failure.
 pub async fn intent(repo: String) -> Result<()> {
     let ws = workspace_root()?;
     let repo_dir = ws.join(&repo);

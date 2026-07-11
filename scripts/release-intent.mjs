@@ -10,10 +10,10 @@ const run = promisify(execFile);
 // the workspace version and asserts every surface that a tag-driven release
 // depends on is already in sync, BEFORE a tag is cut:
 //
-//   - every npm package version (packages/kin-mcp and the canonical
-//     packages/kin) equals the workspace version — release.yml's npm staging
-//     jobs hard-assert this, so a mismatch would otherwise only surface AFTER
-//     the tag is already pushed;
+//   - every tag-bound npm package version (packages/kin-mcp, the canonical
+//     packages/kin, and packages/boundary-contracts) equals the workspace
+//     version — release.yml's registry staging/publish jobs hard-assert this,
+//     so a mismatch would otherwise only surface AFTER the tag is pushed;
 //   - a CHANGELOG section exists for the version (required for a stable
 //     release; a warning for a prerelease, which falls back to auto-notes);
 //   - the version moves strictly forward of the newest existing vX.Y.Z tag.
@@ -47,7 +47,7 @@ function parseArgs(argv) {
   }
   return {
     manifest: args.get('manifest') ?? 'Cargo.toml',
-    npm: (args.get('npm') ?? 'packages/kin-mcp/package.json,packages/kin/package.json')
+    npm: (args.get('npm') ?? 'packages/kin-mcp/package.json,packages/kin/package.json,packages/boundary-contracts/package.json')
       .split(',')
       .map((p) => p.trim())
       .filter(Boolean),
