@@ -133,6 +133,17 @@ def main() -> None:
         "SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}",
         "KIN_TAG: ${{ github.event.workflow_run.head_branch }}",
         "KIN_SHA: ${{ github.event.workflow_run.head_sha }}",
+        "Require current callback authority without blocking unrelated main progress",
+        '"repos/${GITHUB_REPOSITORY}/compare/${GITHUB_SHA}...${current}"',
+        '[ "$ancestry" = ahead ] || [ "$ancestry" = identical ]',
+        "authority_paths=(",
+        ".github/workflows/publish-release-installers.yml",
+        "scripts/verify-homebrew-formula.sh",
+        "scripts/validate-homebrew-formula.py",
+        "scripts/verify_installer_parity.py",
+        '"repos/${GITHUB_REPOSITORY}/contents/${path}?ref=${GITHUB_SHA}"',
+        '"repos/${GITHUB_REPOSITORY}/contents/${path}?ref=${current}"',
+        "callback authority changed on main after this event",
         'gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"',
         '[ "$(jq -r .status <<< "$run")" = completed ]',
         '[ "$(jq -r .conclusion <<< "$run")" = success ]',
@@ -165,6 +176,12 @@ def main() -> None:
         'python3 scripts/verify_installer_parity.py "$KIN_TAG" --expected-sha "$KIN_SHA"',
     ):
         require(installer_callback, policy, "completed-release follow-up callback")
+
+    if '[ "$current" = "$GITHUB_SHA" ]' in installer_callback:
+        raise AssertionError(
+            "the callback must tolerate unrelated forward progress on main while "
+            "pinning its runtime authority blobs"
+        )
 
     for policy in (
         "`firelock-ai/homebrew-kin` and `firelock-ai/kin-infra`",

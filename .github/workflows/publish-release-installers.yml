@@ -46,7 +46,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Require exact current default-branch callback
+      - name: Require current callback authority without blocking unrelated main progress
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -54,7 +54,29 @@ jobs:
           [ "$GITHUB_REF" = refs/heads/main ]
           current="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
           [ "$(git rev-parse HEAD)" = "$GITHUB_SHA" ]
-          [ "$current" = "$GITHUB_SHA" ]
+          ancestry="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/compare/${GITHUB_SHA}...${current}" \
+            --jq .status)"
+          [ "$ancestry" = ahead ] || [ "$ancestry" = identical ]
+
+          authority_paths=(
+            .github/workflows/publish-release-installers.yml
+            scripts/verify-homebrew-formula.sh
+            scripts/validate-homebrew-formula.py
+            scripts/verify_installer_parity.py
+          )
+          for path in "${authority_paths[@]}"; do
+            event_blob="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/contents/${path}?ref=${GITHUB_SHA}" \
+              --jq .sha)"
+            current_blob="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/contents/${path}?ref=${current}" \
+              --jq .sha)"
+            if [ "$event_blob" != "$current_blob" ]; then
+              echo "::error::callback authority changed on main after this event: ${path}"
+              exit 1
+            fi
+          done
 
       - name: Revalidate completed public release provenance
         id: provenance
