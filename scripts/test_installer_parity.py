@@ -18,7 +18,7 @@ from verify_installer_parity import (
 )
 
 
-TAG = "v0.2.18"
+TAG = "v0.2.19"
 COMMIT = "a" * 40
 INSTALL = b"#!/bin/sh\necho kin\n"
 INSTALL_PS1 = b'Write-Output "Kin"\n'
@@ -65,7 +65,7 @@ class InstallerParityTests(unittest.TestCase):
 
     def test_manifest_must_bind_exact_tag(self) -> None:
         wrong = json.loads(manifest())
-        wrong["tag"] = "v0.2.17"
+        wrong["tag"] = "v0.2.18"
         with self.assertRaisesRegex(ParityError, "current.json tag"):
             self.verify(public_manifest=json.dumps(wrong).encode())
 

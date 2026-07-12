@@ -174,7 +174,7 @@ def resolve_tag(repository: str, tag: str) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("tag", help="Exact stable release tag, for example v0.2.18")
+    parser.add_argument("tag", help="Exact stable release tag, for example v0.2.19")
     parser.add_argument("--expected-sha", help="Optional expected peeled 40-hex commit")
     parser.add_argument("--repository", default=DEFAULT_REPOSITORY)
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
