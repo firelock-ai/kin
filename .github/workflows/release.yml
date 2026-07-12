@@ -448,7 +448,7 @@ jobs:
           repository: firelock-ai/kin-vfs
           path: kin-vfs
           # Release inputs must never move under an unchanged Kin tag.
-          ref: 48c757dfda2ca6b115f32d86875c6adde587b861
+          ref: 64d94af54cd049a54c999e20857f5eec4bcde45c
           persist-credentials: false
 
       - name: Verify canonical release input bytes
@@ -839,7 +839,7 @@ jobs:
           ARTIFACT: ${{ matrix.artifact }}
           TARGET: ${{ matrix.target }}
           VFS_TARGET: ${{ matrix.vfs_target || matrix.target }}
-          EXPECTED_VFS_COMMIT: 48c757dfda2ca6b115f32d86875c6adde587b861
+          EXPECTED_VFS_COMMIT: 64d94af54cd049a54c999e20857f5eec4bcde45c
         run: |
           set -euo pipefail
           node <<'NODE'
@@ -1054,7 +1054,7 @@ jobs:
         with:
           repository: firelock-ai/kin-vfs
           path: release-inputs/kin-vfs
-          ref: 48c757dfda2ca6b115f32d86875c6adde587b861
+          ref: 64d94af54cd049a54c999e20857f5eec4bcde45c
           persist-credentials: false
 
       - name: Download all artifacts
@@ -1112,7 +1112,7 @@ jobs:
 
       - name: Verify and aggregate release provenance
         env:
-          EXPECTED_VFS_COMMIT: 48c757dfda2ca6b115f32d86875c6adde587b861
+          EXPECTED_VFS_COMMIT: 64d94af54cd049a54c999e20857f5eec4bcde45c
         run: |
           set -euo pipefail
           node <<'NODE'
