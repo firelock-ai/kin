@@ -760,8 +760,14 @@ fn resolve_relations(
     let mut resolved = Vec::new();
     let mut relation_indices = HashMap::new();
     let mut unresolved = Vec::new();
+    let call_extraction_complete = !extracted
+        .iter()
+        .any(kin_parser::is_call_extraction_incomplete_marker);
 
     for rel in extracted {
+        if kin_parser::is_call_extraction_incomplete_marker(rel) {
+            continue;
+        }
         let src = entities.iter().find(|e| e.name == rel.src_name);
         let dst = entities.iter().find(|e| e.name == rel.dst_name);
 
@@ -788,6 +794,7 @@ fn resolve_relations(
                             rel.kind,
                             rel.call_shape.as_ref(),
                             parse_completeness,
+                            call_extraction_complete,
                         ),
                     },
                 );
@@ -954,6 +961,65 @@ mod tests {
         assert_eq!(
             edge.evidence[0].parser_rule.as_deref(),
             Some(crate::linker::CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1)
+        );
+        assert!(edge.evidence[0].call_shape.is_none());
+    }
+
+    #[test]
+    fn incomplete_python_call_extraction_downgrades_same_file_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(dir.path().join("blobs")).unwrap();
+        let py_file = dir.path().join("test.py");
+        std::fs::write(
+            &py_file,
+            b"def target(ext, args):\n    return ext, args\n\ndef other(ext, args):\n    return ext, args\n\ndef caller(flag):\n    target(1, 2)\n    return (target if flag else other)(ext=1, args=2)\n",
+        )
+        .unwrap();
+
+        let indexed = IndexPipeline::new()
+            .index_file(&py_file, &blob_store)
+            .expect("index syntax-valid Python source");
+        assert!(matches!(indexed.parse_state, ParseState::Valid));
+        assert!(matches!(
+            indexed.file_layout.parse_completeness,
+            ParseCompleteness::Full
+        ));
+        assert!(
+            indexed
+                .extracted_relations
+                .iter()
+                .any(kin_parser::is_call_extraction_incomplete_marker),
+            "raw parser marker must survive for later linking and history"
+        );
+        assert!(
+            indexed.unresolved_relations.iter().all(|relation| {
+                relation.dst_name != kin_parser::CALL_EXTRACTION_INCOMPLETE_MARKER_V1
+            }),
+            "the control record must never become an unresolved semantic relation"
+        );
+        let caller = indexed
+            .entities
+            .iter()
+            .find(|entity| entity.name == "caller")
+            .expect("caller entity");
+        let target = indexed
+            .entities
+            .iter()
+            .find(|entity| entity.name == "target")
+            .expect("target entity");
+        let edge = indexed
+            .relations
+            .iter()
+            .find(|relation| {
+                relation.kind == kin_model::RelationKind::Calls
+                    && relation.src == kin_model::GraphNodeId::Entity(caller.id)
+                    && relation.dst == kin_model::GraphNodeId::Entity(target.id)
+            })
+            .expect("surviving same-file target edge");
+        assert_eq!(edge.evidence.len(), 1);
+        assert_eq!(
+            edge.evidence[0].parser_rule.as_deref(),
+            Some(crate::linker::CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1)
         );
         assert!(edge.evidence[0].call_shape.is_none());
     }

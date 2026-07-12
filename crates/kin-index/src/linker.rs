@@ -16,7 +16,9 @@ use kin_model::{
     ArtifactId, Entity, EntityId, EntityKind, GraphNodeId, LanguageId, ParseCompleteness, Relation,
     RelationEvidence, RelationId, RelationKind, RelationOrigin, Visibility,
 };
-use kin_parser::{CallArgShape, ExtractedRelation, FileImport};
+use kin_parser::{
+    is_call_extraction_incomplete_marker, CallArgShape, ExtractedRelation, FileImport,
+};
 
 /// Persisted provenance marker for call-shape evidence produced by a linker
 /// that preserves every occurrence on one logical `(src, dst, Calls)` edge.
@@ -36,6 +38,13 @@ pub const CALL_SHAPE_EVIDENCE_AGGREGATION_V1: &str = "call_shape_aggregation_v1"
 /// Review treats this explicit unshaped record as unknown/blocking evidence.
 pub const CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1: &str = "call_shape_incomplete_parse_v1";
 
+/// Persisted fail-closed marker for a syntax-valid file whose adapter could not
+/// represent every call expression as a named edge. This is deliberately
+/// distinct from parse recovery: the source parsed, but call extraction was not
+/// exhaustive, so shaped occurrences cannot certify a parameter rename.
+pub const CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1: &str =
+    "call_shape_incomplete_extraction_v1";
+
 /// File-level certificate that the parser observed the complete source file.
 /// Ref-scoped review requires this positive evidence because old graph history
 /// has no way to distinguish a full parse from a recovered parse that omitted
@@ -44,6 +53,11 @@ pub const CALL_SHAPE_PARSE_COVERAGE_FULL_V1: &str = "call_shape_parse_coverage_f
 
 /// File-level marker that call-site coverage is incomplete or unknown.
 pub const CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1: &str = "call_shape_parse_coverage_incomplete_v1";
+
+/// File-level marker that syntax was valid but named-call extraction was not
+/// exhaustive.
+pub const CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1: &str =
+    "call_shape_extraction_coverage_incomplete_v1";
 
 /// Per-file parse completeness supplied by ingestion paths that have parser
 /// state available. Kept separate from [`FileParseData`] so adding the safety
@@ -492,17 +506,31 @@ fn resolve_one_file(
 ) -> Vec<Relation> {
     let mut resolved = Vec::new();
     let mut relation_indices = HashMap::new();
+    let call_extraction_complete = !file
+        .relations
+        .iter()
+        .any(is_call_extraction_incomplete_marker);
     let parse_completeness = completeness
         .and_then(|by_file| by_file.get(&file.file_path))
         .unwrap_or(&FULL_PARSE_COMPLETENESS);
     let make_relation = |rel: &ExtractedRelation, src, dst, confidence| {
-        make_relation(rel, src, dst, confidence, parse_completeness)
+        make_relation(
+            rel,
+            src,
+            dst,
+            confidence,
+            parse_completeness,
+            call_extraction_complete,
+        )
     };
     // Lazily resolved once per file: only ambiguous name buckets need them.
     let mut caller_import_targets: Option<HashSet<String>> = None;
     let mut caller_include_closure: Option<HashMap<String, usize>> = None;
 
     for rel in &file.relations {
+        if is_call_extraction_incomplete_marker(rel) {
+            continue;
+        }
         let src_id = ctx
             .entity_by_file_name
             .get(&(file.file_path.as_str(), rel.src_name.as_str()));
@@ -2416,6 +2444,7 @@ fn make_relation(
     dst: EntityId,
     confidence: f32,
     parse_completeness: &ParseCompleteness,
+    call_extraction_complete: bool,
 ) -> Relation {
     let kind = rel.kind;
     let origin = if confidence >= 1.0 {
@@ -2436,7 +2465,12 @@ fn make_relation(
         origin,
         created_in: None,
         import_source: None,
-        evidence: call_shape_evidence(rel.kind, rel.call_shape.as_ref(), parse_completeness),
+        evidence: call_shape_evidence(
+            rel.kind,
+            rel.call_shape.as_ref(),
+            parse_completeness,
+            call_extraction_complete,
+        ),
     }
 }
 
@@ -2449,9 +2483,17 @@ pub(crate) fn call_shape_evidence(
     kind: RelationKind,
     shape: Option<&CallArgShape>,
     parse_completeness: &ParseCompleteness,
+    call_extraction_complete: bool,
 ) -> Vec<RelationEvidence> {
     if kind != RelationKind::Calls {
         return Vec::new();
+    }
+    if !call_extraction_complete {
+        return vec![RelationEvidence {
+            parser_rule: Some(CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1.to_string()),
+            call_shape: None,
+            ..RelationEvidence::default()
+        }];
     }
     if !matches!(parse_completeness, ParseCompleteness::Full) {
         return vec![RelationEvidence {
@@ -2611,9 +2653,16 @@ const CALL_SHAPE_COVERAGE_INCOMPLETE_HUB_PREFIX: &str =
 fn make_parse_coverage_relation(
     file_path: &str,
     completeness: Option<&ParseCompleteness>,
+    call_extraction_complete: bool,
 ) -> Relation {
-    let is_full = matches!(completeness, Some(ParseCompleteness::Full));
-    let (hub_prefix, parser_rule, token) = if is_full {
+    let is_full = call_extraction_complete && matches!(completeness, Some(ParseCompleteness::Full));
+    let (hub_prefix, parser_rule, token) = if !call_extraction_complete {
+        (
+            CALL_SHAPE_COVERAGE_INCOMPLETE_HUB_PREFIX,
+            CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1,
+            "call-extraction-incomplete",
+        )
+    } else if is_full {
         (
             CALL_SHAPE_COVERAGE_FULL_HUB_PREFIX,
             CALL_SHAPE_PARSE_COVERAGE_FULL_V1,
@@ -2664,9 +2713,14 @@ fn append_parse_coverage_relations(
     let mut seen = HashSet::new();
     for file in files {
         if seen.insert(file.file_path.as_str()) {
+            let call_extraction_complete = !file
+                .relations
+                .iter()
+                .any(is_call_extraction_incomplete_marker);
             resolved.push(make_parse_coverage_relation(
                 &file.file_path,
                 completeness.get(&file.file_path),
+                call_extraction_complete,
             ));
         }
     }
@@ -3663,16 +3717,30 @@ fn resolve_one_file_incremental(
 ) -> Vec<Relation> {
     let mut resolved = Vec::new();
     let mut relation_indices = HashMap::new();
+    let call_extraction_complete = !file
+        .relations
+        .iter()
+        .any(is_call_extraction_incomplete_marker);
     let parse_completeness = completeness
         .and_then(|by_file| by_file.get(&file.file_path))
         .unwrap_or(&FULL_PARSE_COMPLETENESS);
     let make_relation = |rel: &ExtractedRelation, src, dst, confidence| {
-        make_relation(rel, src, dst, confidence, parse_completeness)
+        make_relation(
+            rel,
+            src,
+            dst,
+            confidence,
+            parse_completeness,
+            call_extraction_complete,
+        )
     };
     // Lazily resolved once per file: only ambiguous name buckets need them.
     let mut caller_import_targets: Option<HashSet<String>> = None;
     let mut caller_include_closure: Option<HashMap<String, usize>> = None;
     for rel in &file.relations {
+        if is_call_extraction_incomplete_marker(rel) {
+            continue;
+        }
         let src_id = linker
             .entity_by_file_name
             .get(&file.file_path)
@@ -4637,6 +4705,81 @@ mod tests {
             assert!(relations.iter().any(|relation| {
                 relation.evidence.iter().any(|evidence| {
                     evidence.parser_rule.as_deref() == Some(CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1)
+                })
+            }));
+        }
+    }
+
+    #[test]
+    fn incomplete_call_extraction_downgrades_batch_incremental_and_compatibility_paths() {
+        let caller = make_entity("caller", "src/a.py");
+        let target = make_entity("target", "src/a.py");
+        let files = vec![FileParseData {
+            file_path: "src/a.py".to_string(),
+            entities: vec![caller.clone(), target.clone()],
+            relations: vec![
+                ExtractedRelation {
+                    call_shape: Some(CallArgShape {
+                        positional: 2,
+                        ..CallArgShape::default()
+                    }),
+                    kind: RelationKind::Calls,
+                    src_name: "caller".to_string(),
+                    dst_name: "target".to_string(),
+                    import_source: None,
+                },
+                kin_parser::call_extraction_incomplete_marker(),
+            ],
+            imports: vec![],
+        }];
+        let evidence = |relations: &[Relation]| {
+            find_calls_edge(relations, &caller, &target)
+                .expect("surviving named call edge")
+                .evidence
+                .clone()
+        };
+        let assert_downgraded = |relations: &[Relation]| {
+            let evidence = evidence(relations);
+            assert_eq!(evidence.len(), 1);
+            assert_eq!(
+                evidence[0].parser_rule.as_deref(),
+                Some(CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1)
+            );
+            assert!(evidence[0].call_shape.is_none());
+            assert!(relations.iter().all(|relation| {
+                relation.evidence.iter().all(|evidence| {
+                    evidence.token.as_deref()
+                        != Some(kin_parser::CALL_EXTRACTION_INCOMPLETE_MARKER_V1)
+                })
+            }));
+        };
+
+        let mut linker = IncrementalLinker::new();
+        linker.add_file("src/a.py", &[caller.clone(), target.clone()]);
+        let compat_batch = link_cross_file(&files);
+        let compat_incremental = link_cross_file_incremental(&files, &linker);
+        assert_downgraded(&compat_batch);
+        assert_downgraded(&compat_incremental);
+        assert_eq!(evidence(&compat_batch), evidence(&compat_incremental));
+
+        let completeness =
+            FileParseCompletenessMap::from([("src/a.py".to_string(), ParseCompleteness::Full)]);
+        let batch = link_cross_file_with_completeness(&files, &completeness);
+        let incremental =
+            link_cross_file_incremental_with_completeness(&files, &linker, &completeness);
+        assert_downgraded(&batch);
+        assert_downgraded(&incremental);
+        for relations in [&batch, &incremental] {
+            assert!(relations.iter().any(|relation| {
+                relation.evidence.iter().any(|evidence| {
+                    evidence.parser_rule.as_deref()
+                        == Some(CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1)
+                        && evidence.token.as_deref() == Some("call-extraction-incomplete")
+                })
+            }));
+            assert!(relations.iter().all(|relation| {
+                relation.evidence.iter().all(|evidence| {
+                    evidence.parser_rule.as_deref() != Some(CALL_SHAPE_PARSE_COVERAGE_FULL_V1)
                 })
             }));
         }

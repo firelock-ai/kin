@@ -36,7 +36,10 @@
 //!     top-level function that encloses them).
 
 use kin_model::{EntityKind, FilePathId, RelationKind};
-use kin_parser::{ExtractedRelation, LanguageAdapter, ParseOutput, PythonAdapter};
+use kin_parser::{
+    is_call_extraction_incomplete_marker, ExtractedRelation, LanguageAdapter, ParseOutput,
+    PythonAdapter,
+};
 
 fn extract(source: &str) -> ParseOutput {
     let adapter = PythonAdapter;
@@ -111,6 +114,79 @@ fn bare_call_with_import_carries_import_source() {
         hits[0].import_source.as_deref(),
         Some("helpers"),
         "an imported bare callee carries its import path as import_source"
+    );
+}
+
+#[test]
+fn parenthesized_named_call_preserves_exact_argument_shape() {
+    let output = extract(
+        "def target(ext, args):\n    return ext, args\n\ndef caller():\n    return ((target))(args=2, ext=1)\n",
+    );
+    let hits = calls_named(&output, "target");
+    assert_eq!(hits.len(), 1, "wrapped named call must be extracted once");
+    let shape = hits[0].call_shape.as_ref().expect("wrapped call shape");
+    assert_eq!(shape.positional, 0);
+    assert_eq!(shape.keywords, vec!["args".to_string(), "ext".to_string()]);
+    assert!(!shape.has_var_positional);
+    assert!(!shape.has_var_keyword);
+    assert!(
+        !output
+            .relations
+            .iter()
+            .any(is_call_extraction_incomplete_marker),
+        "transparent parentheses must not degrade file-level call coverage"
+    );
+}
+
+#[test]
+fn parenthesized_self_attribute_keeps_class_qualification() {
+    let output = extract(
+        "class Service:\n    def target(self, value):\n        return value\n\n    def caller(self):\n        return (self.target)(value=1)\n",
+    );
+    let hits = calls_named(&output, "Service.target");
+    assert_eq!(hits.len(), 1, "wrapped self call must stay class-qualified");
+    assert_eq!(
+        hits[0]
+            .call_shape
+            .as_ref()
+            .expect("wrapped self shape")
+            .keywords,
+        vec!["value".to_string()]
+    );
+    assert!(
+        !output
+            .relations
+            .iter()
+            .any(is_call_extraction_incomplete_marker),
+        "a resolvable wrapped attribute must retain complete coverage"
+    );
+}
+
+#[test]
+fn dynamic_callee_emits_one_incomplete_extraction_marker() {
+    let output = extract(
+        "def target(ext, args):\n    return ext, args\n\ndef other(ext, args):\n    return ext, args\n\ndef caller(flag):\n    target(1, 2)\n    return (target if flag else other)(ext=1, args=2)\n",
+    );
+    assert_eq!(
+        output
+            .relations
+            .iter()
+            .filter(|relation| is_call_extraction_incomplete_marker(relation))
+            .count(),
+        1,
+        "one file-level marker covers every unsupported callee"
+    );
+}
+
+#[test]
+fn module_scope_call_emits_incomplete_extraction_marker() {
+    let output = extract("def target(ext, args):\n    return ext, args\n\ntarget(ext=1, args=2)\n");
+    assert!(
+        output
+            .relations
+            .iter()
+            .any(is_call_extraction_incomplete_marker),
+        "an unowned module-scope call must prevent a full call-coverage claim"
     );
 }
 

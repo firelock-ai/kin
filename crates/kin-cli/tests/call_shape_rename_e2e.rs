@@ -24,13 +24,14 @@
 use kin_db::{EntityStore, InMemoryGraph};
 use kin_index::{
     link_cross_file, link_cross_file_with_completeness, FileParseCompletenessMap, FileParseData,
-    CALL_SHAPE_EVIDENCE_AGGREGATION_V1, CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1,
+    CALL_SHAPE_EVIDENCE_AGGREGATION_V1, CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1,
+    CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1, CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1,
 };
 use kin_model::review::{RiskLevel, RiskSummary};
 use kin_model::{
     Entity, FileLayout, FilePathId, GraphNodeId, ImportSection, ParseCompleteness, RelationKind,
 };
-use kin_parser::{LanguageAdapter, PythonAdapter};
+use kin_parser::{is_call_extraction_incomplete_marker, LanguageAdapter, PythonAdapter};
 use kin_review::{
     analyze_impact, collect_inline_comments, derive_shadow_policy, EntityChange, EntityChangeKind,
     InlineCommentKind, Review, SemanticDiff, ShadowGateVerdict,
@@ -436,6 +437,22 @@ def caller():
     return target("explicit")
 "#;
 
+const PARSED_NONE_TYPE_EXPRESSION_DEFAULT_OLD: &str = r#"def target(value=type(None)):
+    return value
+
+
+def caller():
+    return target("explicit")
+"#;
+
+const PARSED_NONE_TYPE_EXPRESSION_DEFAULT_NEW: &str = r#"def target(value=types.NoneType):
+    return value
+
+
+def caller():
+    return target("explicit")
+"#;
+
 const PARSED_LARGER_IDENTIFIER_DEFAULT_OLD: &str = r#"def target(value=mytype(None)):
     return value
 
@@ -478,6 +495,30 @@ def target(ext, args):
 const COMPLETE_POSITIONAL_CALLER: &str = "\
 def caller():
     return target(1, 2)
+";
+
+const WRAPPED_KEYWORD_CALLER: &str = "\
+def target(ext, args):
+    return ext, args
+
+
+def caller():
+    target(1, 2)
+    return ((target))(ext=1, args=2)
+";
+
+const DYNAMIC_CALLEE_WITH_POSITIONAL_TARGET: &str = "\
+def target(ext, args):
+    return ext, args
+
+
+def other(ext, args):
+    return ext, args
+
+
+def caller(flag):
+    target(1, 2)
+    return (target if flag else other)(ext=1, args=2)
 ";
 
 const INCOMPLETE_ONLY_KEYWORD_CALLER: &str = "\
@@ -562,6 +603,82 @@ fn e2e_keyword_caller_rename_is_breaking() {
     assert!(
         kinds.contains(&InlineCommentKind::Breaking),
         "keyword caller of the renamed param must break: {kinds:?}"
+    );
+}
+
+#[test]
+fn e2e_parenthesized_keyword_caller_rename_is_breaking() {
+    let (verdict, files, relations) = link_and_shadow_analysis(
+        WRAPPED_KEYWORD_CALLER,
+        "def target(ext, args)",
+        "def target(ext, lines)",
+    );
+    assert_eq!(verdict, ShadowGateVerdict::WouldBlock);
+    assert!(
+        !files[0]
+            .relations
+            .iter()
+            .any(is_call_extraction_incomplete_marker),
+        "transparent callee parentheses must be extracted, not merely failed closed"
+    );
+    let target = find_entity(&files, "target");
+    let inbound = relations
+        .iter()
+        .find(|relation| {
+            relation.kind == RelationKind::Calls && relation.dst == GraphNodeId::Entity(target.id)
+        })
+        .expect("logical caller-to-target edge");
+    assert!(inbound.evidence.iter().any(|evidence| {
+        evidence
+            .call_shape
+            .as_ref()
+            .is_some_and(|shape| shape.keywords == ["args", "ext"])
+    }));
+}
+
+#[test]
+fn e2e_unhandled_dynamic_callee_invalidates_call_coverage() {
+    let (verdict, files, relations) = link_and_shadow_analysis(
+        DYNAMIC_CALLEE_WITH_POSITIONAL_TARGET,
+        "def target(ext, args)",
+        "def target(ext, lines)",
+    );
+    assert_eq!(
+        verdict,
+        ShadowGateVerdict::WouldBlock,
+        "a surviving positional call cannot certify a rename when another call is unrepresentable"
+    );
+    assert!(
+        files[0]
+            .relations
+            .iter()
+            .any(is_call_extraction_incomplete_marker),
+        "the raw parser seam must preserve negative extraction coverage"
+    );
+    let target = find_entity(&files, "target");
+    let inbound = relations
+        .iter()
+        .find(|relation| {
+            relation.kind == RelationKind::Calls && relation.dst == GraphNodeId::Entity(target.id)
+        })
+        .expect("surviving positional target edge");
+    assert!(inbound.evidence.iter().any(|evidence| {
+        evidence.parser_rule.as_deref() == Some(CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1)
+            && evidence.call_shape.is_none()
+    }));
+    assert!(relations.iter().any(|relation| {
+        relation.evidence.iter().any(|evidence| {
+            evidence.parser_rule.as_deref() == Some(CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1)
+        })
+    }));
+    assert!(
+        relations.iter().all(|relation| {
+            relation.evidence.iter().all(|evidence| {
+                evidence.parser_rule.as_deref()
+                    != Some(kin_index::CALL_SHAPE_PARSE_COVERAGE_FULL_V1)
+            })
+        }),
+        "the file must not retain a positive full-coverage certificate"
     );
 }
 
@@ -905,6 +1022,21 @@ fn e2e_parsed_none_type_text_and_larger_identifier_defaults_stay_blocking() {
             "NoneType spelling normalization must not rewrite {label}"
         );
     }
+}
+
+#[test]
+fn e2e_none_type_expression_default_swap_stays_blocking_without_binding_proof() {
+    let (verdict, old_signature, new_signature) = link_and_shadow_verdict_from_sources(
+        PARSED_NONE_TYPE_EXPRESSION_DEFAULT_OLD,
+        PARSED_NONE_TYPE_EXPRESSION_DEFAULT_NEW,
+    );
+    assert!(old_signature.contains("value=type(None)"));
+    assert!(new_signature.contains("value=types.NoneType"));
+    assert_eq!(
+        verdict,
+        ShadowGateVerdict::WouldBlock,
+        "signature text alone cannot prove the builtin and module bindings"
+    );
 }
 
 #[test]

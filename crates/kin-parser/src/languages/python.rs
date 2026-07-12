@@ -9,8 +9,8 @@ use crate::adapter::{
 };
 use crate::error::Result;
 use crate::extract::{
-    CallArgShape, ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport,
-    ImportedName, ParseOutput,
+    call_extraction_incomplete_marker, CallArgShape, ExtractedEntity, ExtractedRelation,
+    ExtractedTest, ExtractedTestKind, FileImport, ImportedName, ParseOutput,
 };
 
 pub struct PythonAdapter;
@@ -45,11 +45,20 @@ impl LanguageAdapter for PythonAdapter {
         let mut entities = Vec::new();
         let mut relations = Vec::new();
         let mut imports = Vec::new();
+        let mut call_audit = PythonCallExtractionAudit::default();
         let root = tree.root_node();
         let mut cursor = root.walk();
 
         for child in root.children(&mut cursor) {
-            extract_py_node(&child, source, file_id, None, &mut entities, &mut relations);
+            extract_py_node(
+                &child,
+                source,
+                file_id,
+                None,
+                &mut entities,
+                &mut relations,
+                &mut call_audit,
+            );
             // Extract imports at top level
             match child.kind() {
                 "import_statement" => {
@@ -64,6 +73,15 @@ impl LanguageAdapter for PythonAdapter {
                 }
                 _ => {}
             }
+        }
+
+        // A syntax-valid tree can still contain a call shape this adapter did
+        // not represent, for example a dynamic callee or a call at module/class
+        // scope where no callable entity owns the edge. Keep syntax state and
+        // call-extraction coverage separate: carry one reserved negative record
+        // to the linker, which fails closed without rejecting the valid file.
+        if call_audit.incomplete || has_unobserved_call(&root, &call_audit.seen_calls) {
+            relations.push(call_extraction_incomplete_marker());
         }
 
         // Build import lookup: local_name -> module_path
@@ -159,6 +177,7 @@ fn extract_py_node(
     class_ctx: Option<&str>,
     entities: &mut Vec<ExtractedEntity>,
     relations: &mut Vec<ExtractedRelation>,
+    call_audit: &mut PythonCallExtractionAudit,
 ) {
     match node.kind() {
         "function_definition" => {
@@ -184,7 +203,7 @@ fn extract_py_node(
                     span: span_from_node(node, file_id),
                 });
                 // Extract calls within function/method body
-                extract_calls_from_context(node, source, &name, class_ctx, relations);
+                extract_calls_from_context(node, source, &name, class_ctx, relations, call_audit);
                 if let Some(cls) = class_ctx {
                     relations.push(ExtractedRelation {
                         call_shape: None,
@@ -257,7 +276,15 @@ fn extract_py_node(
                 if let Some(body) = node.child_by_field_name("body") {
                     let mut body_cursor = body.walk();
                     for member in body.children(&mut body_cursor) {
-                        extract_py_node(&member, source, file_id, Some(&name), entities, relations);
+                        extract_py_node(
+                            &member,
+                            source,
+                            file_id,
+                            Some(&name),
+                            entities,
+                            relations,
+                            call_audit,
+                        );
                     }
                 }
             }
@@ -270,7 +297,9 @@ fn extract_py_node(
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if child.kind() == "function_definition" || child.kind() == "class_definition" {
-                    extract_py_node(&child, source, file_id, class_ctx, entities, relations);
+                    extract_py_node(
+                        &child, source, file_id, class_ctx, entities, relations, call_audit,
+                    );
                     // Prepend decorator names to the last-added entity's signature
                     if !decorators.is_empty() {
                         if let Some(last) = entities.last_mut() {
@@ -303,7 +332,9 @@ fn extract_py_node(
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if child.kind() == "assignment" || child.kind() == "assignment_statement" {
-                    extract_py_node(&child, source, file_id, class_ctx, entities, relations);
+                    extract_py_node(
+                        &child, source, file_id, class_ctx, entities, relations, call_audit,
+                    );
                 }
             }
         }
@@ -452,6 +483,67 @@ fn extract_module_docstring(root: &tree_sitter::Node, source: &[u8]) -> Option<S
     }
 }
 
+#[derive(Default)]
+struct PythonCallExtractionAudit {
+    seen_calls: std::collections::HashSet<(usize, usize)>,
+    incomplete: bool,
+}
+
+fn has_unobserved_call(
+    node: &tree_sitter::Node,
+    seen_calls: &std::collections::HashSet<(usize, usize)>,
+) -> bool {
+    if node.kind() == "call" && !seen_calls.contains(&(node.start_byte(), node.end_byte())) {
+        return true;
+    }
+    let mut cursor = node.walk();
+    let found = node
+        .children(&mut cursor)
+        .any(|child| has_unobserved_call(&child, seen_calls));
+    found
+}
+
+/// Resolve the statically named portion of a Python callee. Parentheses are a
+/// transparent expression wrapper, so `(target)(...)` has the same named
+/// target as `target(...)`. Other expression forms (conditional, subscript,
+/// returned callable, lambda, and so on) do not prove one destination and must
+/// leave file-level call coverage incomplete.
+fn extract_named_callee(
+    function: &tree_sitter::Node,
+    source: &[u8],
+    class_ctx: Option<&str>,
+) -> Option<String> {
+    let name = match function.kind() {
+        "parenthesized_expression" => {
+            let mut cursor = function.walk();
+            let mut named = function.named_children(&mut cursor);
+            let inner = named.next()?;
+            if named.next().is_some() {
+                return None;
+            }
+            return extract_named_callee(&inner, source, class_ctx);
+        }
+        "attribute" => {
+            let attr = function
+                .child_by_field_name("attribute")?
+                .utf8_text(source)
+                .ok()?;
+            let self_or_cls_receiver = function
+                .child_by_field_name("object")
+                .filter(|obj| obj.kind() == "identifier")
+                .and_then(|obj| obj.utf8_text(source).ok())
+                .is_some_and(|text| text == "self" || text == "cls");
+            match class_ctx {
+                Some(cls) if self_or_cls_receiver => format!("{cls}.{attr}"),
+                _ => attr.to_string(),
+            }
+        }
+        "identifier" => function.utf8_text(source).ok()?.to_string(),
+        _ => return None,
+    };
+    is_valid_callee_name(&name).then_some(name)
+}
+
 /// Extract all function/method calls within a function/method body.
 fn extract_calls_from_context(
     node: &tree_sitter::Node,
@@ -459,58 +551,38 @@ fn extract_calls_from_context(
     context_name: &str,
     class_ctx: Option<&str>,
     relations: &mut Vec<ExtractedRelation>,
+    call_audit: &mut PythonCallExtractionAudit,
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "call" {
-            if let Some(function) = child.child_by_field_name("function") {
-                let callee_name = match function.kind() {
-                    "attribute" => {
-                        let attr = function
-                            .child_by_field_name("attribute")
-                            .map(|f| f.utf8_text(source).unwrap_or("").to_string())
-                            .unwrap_or_default();
-                        // `self.m()` / `cls.m()` dispatch through the enclosing
-                        // class, so qualify the callee with it: the linker can
-                        // then resolve an inherited method through the class's
-                        // Extends chain instead of fanning out on the bare name.
-                        // Any other receiver (`obj.m()`, `self.store.m()`) stays
-                        // bare — its type is unknown at parse time.
-                        let self_or_cls_receiver = function
-                            .child_by_field_name("object")
-                            .filter(|obj| obj.kind() == "identifier")
-                            .and_then(|obj| obj.utf8_text(source).ok())
-                            .map(|text| text == "self" || text == "cls")
-                            .unwrap_or(false);
-                        match class_ctx {
-                            Some(cls) if self_or_cls_receiver && !attr.is_empty() => {
-                                format!("{}.{}", cls, attr)
-                            }
-                            _ => attr,
-                        }
-                    }
-                    "identifier" => {
-                        let raw = function.utf8_text(source).unwrap_or("");
-                        raw.strip_prefix("self.")
-                            .or_else(|| raw.strip_prefix("cls."))
-                            .unwrap_or(raw)
-                            .to_string()
-                    }
-                    _ => String::new(),
-                };
-                if is_valid_callee_name(&callee_name) {
-                    relations.push(ExtractedRelation {
-                        call_shape: Some(extract_call_arg_shape(&child, source)),
-                        kind: kin_model::RelationKind::Calls,
-                        src_name: context_name.to_string(),
-                        dst_name: callee_name,
-                        import_source: None,
-                    });
-                }
+            call_audit
+                .seen_calls
+                .insert((child.start_byte(), child.end_byte()));
+            let callee_name = child
+                .child_by_field_name("function")
+                .and_then(|function| extract_named_callee(&function, source, class_ctx));
+            if let Some(callee_name) = callee_name {
+                relations.push(ExtractedRelation {
+                    call_shape: Some(extract_call_arg_shape(&child, source)),
+                    kind: kin_model::RelationKind::Calls,
+                    src_name: context_name.to_string(),
+                    dst_name: callee_name,
+                    import_source: None,
+                });
+            } else {
+                call_audit.incomplete = true;
             }
         }
         // Recurse into child nodes
-        extract_calls_from_context(&child, source, context_name, class_ctx, relations);
+        extract_calls_from_context(
+            &child,
+            source,
+            context_name,
+            class_ctx,
+            relations,
+            call_audit,
+        );
     }
 }
 

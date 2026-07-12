@@ -141,7 +141,6 @@ pub fn signature_runtime_neutral(old: &str, new: &str) -> bool {
     signature_strengthened_only(old, new)
         || python_signatures_runtime_neutral(old, new)
         || python_collector_only_rename(old, new)
-        || python_none_type_spelling_neutral(old, new)
         || go_struct_field_addition_only(old, new)
 }
 
@@ -151,105 +150,6 @@ pub fn signature_runtime_neutral(old: &str, new: &str) -> bool {
 /// channel, while role changes remain structural and fail closed.
 fn python_collector_only_rename(old: &str, new: &str) -> bool {
     matches!(arity_preserving_rename(old, new), Some(renamed) if renamed.is_empty())
-}
-
-/// True when `old` and `new` are identical once the two explicit spellings of
-/// the `NoneType` singleton — the builtin expression `type(None)` and
-/// `types.NoneType` — are folded to one form. Python 3.10+ guarantees
-/// `type(None) is types.NoneType`, so a declaration that swaps those expression
-/// spellings changes no runtime contract. The fold is token-aware: quoted text,
-/// larger identifiers such as `mytype`, and attribute calls such as
-/// `obj.type(None)` are never rewritten. Bare `NoneType` is not folded because
-/// its meaning depends on a `from types import` binding absent from the text.
-fn python_none_type_spelling_neutral(old: &str, new: &str) -> bool {
-    let old_has_def = find_python_def_keyword(old).is_some();
-    let new_has_def = find_python_def_keyword(new).is_some();
-    if old_has_def || new_has_def {
-        // A function declaration must pass the same header validator as every
-        // other Python-neutral path. This prevents the exact NoneType spelling
-        // fold from becoming a side door around an unknown pre-def prefix.
-        if !old_has_def
-            || !new_has_def
-            || python_signature_parts(old).is_none()
-            || python_signature_parts(new).is_none()
-        {
-            return false;
-        }
-    }
-    match (
-        fold_python_none_type_expressions(old),
-        fold_python_none_type_expressions(new),
-    ) {
-        (Some(old), Some(new)) => old == new,
-        _ => false,
-    }
-}
-
-/// Canonicalize standalone builtin `type(None)` expressions without rewriting
-/// source substrings that merely contain those bytes. This lightweight lexical
-/// pass is deliberately narrower than general Python normalization: it skips
-/// complete string literals byte-for-byte, rejects comments/interpolated or
-/// malformed strings, requires identifier token boundaries, and refuses a
-/// `type` token selected through attribute access. Whitespace between the four
-/// expression tokens is formatting and may differ.
-fn fold_python_none_type_expressions(signature: &str) -> Option<String> {
-    fn skip_ascii_whitespace(bytes: &[u8], mut i: usize) -> usize {
-        while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
-            i += 1;
-        }
-        i
-    }
-
-    let bytes = signature.as_bytes();
-    let mut folded = String::with_capacity(signature.len());
-    let mut i = 0usize;
-
-    while i < bytes.len() {
-        if matches!(bytes[i], b'\'' | b'"') {
-            let end = python_quote_end(bytes, i)?;
-            folded.push_str(&signature[i..end]);
-            i = end;
-            continue;
-        }
-        if bytes[i] == b'#' {
-            return None;
-        }
-        // Outside a string, Python only permits `\` as an explicit physical
-        // line continuation. Signature extraction can collapse the newline and
-        // leave the slash adjacent to an attribute selector (`obj.\ type`), so
-        // this lightweight lexer cannot safely decide whether `type` is the
-        // builtin. Fail closed instead of normalizing through the selector.
-        if bytes[i] == b'\\' {
-            return None;
-        }
-
-        if python_keyword_at(bytes, i, b"type") {
-            let previous_non_space = bytes[..i]
-                .iter()
-                .rfind(|byte| !byte.is_ascii_whitespace())
-                .copied();
-            if previous_non_space != Some(b'.') {
-                let open = skip_ascii_whitespace(bytes, i + "type".len());
-                if bytes.get(open) == Some(&b'(') {
-                    let none = skip_ascii_whitespace(bytes, open + 1);
-                    if python_keyword_at(bytes, none, b"None") {
-                        let close = skip_ascii_whitespace(bytes, none + "None".len());
-                        if bytes.get(close) == Some(&b')') {
-                            folded.push_str("types.NoneType");
-                            i = close + 1;
-                            continue;
-                        }
-                    }
-                }
-            }
-        }
-
-        let ch = signature[i..].chars().next()?;
-        folded.push(ch);
-        i += ch.len_utf8();
-    }
-
-    Some(folded)
 }
 
 /// The runtime declaration mode, callable name, and normalized parameter list
@@ -1539,6 +1439,57 @@ mod tests {
     }
 
     #[test]
+    fn none_type_default_spelling_change_stays_breaking_inline() {
+        let mut old = test_entity_with_span("target", "src/mod.py", 1, 2);
+        old.language = LanguageId::Python;
+        old.signature = "def target(value=type(None))".to_string();
+        let mut new = old.clone();
+        new.signature = "def target(value=types.NoneType)".to_string();
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 1,
+                strong_consumer_count: 1,
+                contract_consumer_count: 0,
+                consumer_files: vec!["src/caller.py".to_string()],
+                covering_tests: 0,
+                consumers_migrated_in_diff: 0,
+                call_shapes: ConsumerCallShapeSummary {
+                    all_consumers_shaped_calls: true,
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        };
+
+        let comments = collect_inline_comments(&diff, &impact);
+        assert!(
+            comments
+                .iter()
+                .any(|comment| comment.kind == InlineCommentKind::SignatureChange),
+            "binding-unknown NoneType spellings must keep the signature finding: {comments:?}"
+        );
+        assert!(
+            comments
+                .iter()
+                .any(|comment| comment.kind == InlineCommentKind::Breaking),
+            "binding-unknown NoneType spellings must remain blocking: {comments:?}"
+        );
+    }
+
+    #[test]
     fn positional_rename_with_async_mode_change_stays_breaking_inline() {
         let mut old = test_entity_with_span("target", "src/mod.py", 1, 2);
         old.language = LanguageId::Python;
@@ -2465,20 +2416,21 @@ mod tests {
         ));
     }
 
-    /// fd21f82aa8 shape: swapping the `type(None)` spelling for `types.NoneType`
-    /// changes no runtime contract, whether it appears in a default value or a
-    /// bare module-level declaration whose text carries the reference.
+    /// Signature text cannot prove that `type` still names the builtin or that
+    /// `types` still names the standard-library module. Keep this change in the
+    /// attention channel; graph binding evidence may prove equivalence in the
+    /// body-comparison path, but the lexical signature path must fail closed.
     #[test]
-    fn python_none_type_spelling_swap_is_runtime_neutral() {
-        assert!(signature_runtime_neutral(
+    fn python_none_type_spelling_swap_is_not_signature_neutral() {
+        assert!(!signature_runtime_neutral(
             "def f(x=type(None))",
             "def f(x=types.NoneType)"
         ));
-        assert!(signature_runtime_neutral(
+        assert!(!signature_runtime_neutral(
             "def f(x=type ( None ))",
             "def f(x=types.NoneType)"
         ));
-        assert!(signature_runtime_neutral(
+        assert!(!signature_runtime_neutral(
             "PROTECTED = (bool, int, type(None), bytes)",
             "PROTECTED = (bool, int, types.NoneType, bytes)"
         ));

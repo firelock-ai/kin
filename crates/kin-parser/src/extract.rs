@@ -12,6 +12,15 @@ pub const COMMAND_EFFECT_CONTRACT_KEY: &str = "command_effect_contract";
 pub const FILE_IMPORT_CONTEXT_KEY: &str = "file_import_context";
 pub const FILE_SURFACE_CONTEXT_KEY: &str = "file_surface_context";
 
+/// Reserved parser-to-linker control record: at least one source-level call in
+/// this file could not be represented as a named [`ExtractedRelation`]. The
+/// record is carried through the existing raw-relation seam so published
+/// `ParseOutput` and linker input structs remain source compatible. Linkers
+/// consume it as negative call-coverage evidence and never materialize it as a
+/// graph relation.
+pub const CALL_EXTRACTION_INCOMPLETE_MARKER_V1: &str =
+    "kin-internal://call-extraction-coverage/incomplete-v1";
+
 /// Raw extracted entity before ID assignment.
 #[derive(Debug, Clone)]
 pub struct ExtractedEntity {
@@ -167,6 +176,26 @@ pub struct ExtractedRelation {
     /// argument-incompatible candidates out of the call's binding set instead of
     /// fanning out to every same-named overload.
     pub call_shape: Option<CallArgShape>,
+}
+
+/// Construct the reserved negative call-extraction coverage record.
+pub fn call_extraction_incomplete_marker() -> ExtractedRelation {
+    ExtractedRelation {
+        kind: RelationKind::DependsOn,
+        src_name: String::new(),
+        dst_name: CALL_EXTRACTION_INCOMPLETE_MARKER_V1.to_string(),
+        import_source: None,
+        call_shape: None,
+    }
+}
+
+/// Whether a raw parser relation is the reserved negative call-coverage record.
+pub fn is_call_extraction_incomplete_marker(relation: &ExtractedRelation) -> bool {
+    relation.kind == RelationKind::DependsOn
+        && relation.src_name.is_empty()
+        && relation.dst_name == CALL_EXTRACTION_INCOMPLETE_MARKER_V1
+        && relation.import_source.is_none()
+        && relation.call_shape.is_none()
 }
 
 /// A single import declaration from source code.
