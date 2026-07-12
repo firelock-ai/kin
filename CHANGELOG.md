@@ -7,8 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.17] - 2026-07-11
+
+This patch restores the promised graph-backed filesystem bridge and tightens the
+automatic release verifier without changing Kin's public CLI surface.
+
 ### Fixed
 
+- `kin-vfs` now translates intercepted host paths into repo-relative graph keys before
+  daemon requests, preserves launcher-verified canonical and lexical workspace roots,
+  and rejects traversal, containment, or alias ambiguity from graph authority.
 - Post-release verification now waits for complete npm integrity metadata, and
   cross-platform checksum aggregation normalizes Windows CRLF sidecars to LF.
 
@@ -476,7 +484,8 @@ Historical note: this snapshot predates the public GitHub prerelease series and 
 - Daemon mode for background file watching (`kin-daemon`)
 - 19-crate workspace architecture
 
-[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.16...HEAD
+[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.17...HEAD
+[0.2.17]: https://github.com/firelock-ai/kin/compare/v0.2.16...v0.2.17
 [0.2.16]: https://github.com/firelock-ai/kin/compare/v0.2.15...v0.2.16
 [0.2.1]: https://github.com/firelock-ai/kin/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/firelock-ai/kin/compare/v0.1.0-alpha.25...v0.2.0

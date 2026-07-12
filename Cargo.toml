@@ -27,7 +27,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.16"
+version = "0.2.17"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Troy Fortin <troy@firelock.ai>"]
@@ -144,7 +144,7 @@ kin-lsp = { version = "0.2.2", registry = "kin" }
 # additively on macOS via a `[target.'cfg(target_os = "macos")'.dependencies]` block in the
 # binary/runtime crates (kin-cli, kin-daemon). Feature unification makes that additive.
 kin-db = { version = "0.2.35", registry = "kin", default-features = false }
-kin-vfs-core = { version = "0.1.3", registry = "kin" }
+kin-vfs-core = { version = "0.1.4", registry = "kin" }
 
 [profile.release]
 opt-level = 3

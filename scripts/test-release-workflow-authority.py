@@ -158,6 +158,9 @@ def main() -> None:
     attestation_job = release[attestation_start:attestation_end]
     for policy in (
         "needs: [config, build_daemon_image]",
+        "always()",
+        "needs.config.result == 'success'",
+        "needs.build_daemon_image.result == 'success'",
         "environment: release",
         "packages: write",
         "id-token: write",
@@ -199,11 +202,27 @@ def main() -> None:
             "release daemon path must contain exactly one image build command"
         )
 
-    require(
-        release,
-        "needs: [build, notarize_linux, attest_daemon_image]",
-        "public release daemon attestation gate",
-    )
+    publish_start = release.index("  publish:")
+    publish_end = release.index("\n  install_proof:", publish_start)
+    publish_job = release[publish_start:publish_end]
+    for policy in (
+        "needs: [config, build, notarize_linux, attest_daemon_image]",
+        "always()",
+        "needs.config.result == 'success'",
+        "needs.build.result == 'success'",
+        "needs.attest_daemon_image.result == 'success'",
+        "needs.config.outputs.notarize_on_linux == 'true'",
+        "needs.notarize_linux.result == 'success'",
+        "needs.config.outputs.notarize_on_linux == 'false'",
+        "needs.notarize_linux.result == 'skipped'",
+    ):
+        require(publish_job, policy, "first GitHub Release write admission")
+    for forbidden in ("!failure()", "!cancelled()"):
+        if forbidden in publish_job:
+            raise AssertionError(
+                "first GitHub Release write must use exact direct-needs results, "
+                f"not permissive aggregate state: {forbidden}"
+            )
     require(
         release,
         "needs: [publish, install_proof, build_daemon_image, attest_daemon_image]",
@@ -240,9 +259,6 @@ def main() -> None:
     ):
         require(build_job, policy, "cross-platform release lockfile authority")
 
-    publish_start = release.index("  publish:")
-    publish_end = release.index("\n  install_proof:", publish_start)
-    publish_job = release[publish_start:publish_end]
     aggregate_start = publish_job.index(
         "      - name: Aggregate per-artifact checksums"
     )
@@ -299,6 +315,8 @@ def main() -> None:
     npm_preflight = release[preflight_start:preflight_end]
     for policy in (
         "needs: [publish, install_proof]",
+        "needs.publish.result == 'success'",
+        "needs.install_proof.result == 'success'",
         "npm test --prefix ./packages/kin",
         "npm test --prefix ./packages/kin-mcp",
         "for package_dir in ./packages/kin ./packages/kin-mcp",
@@ -322,6 +340,9 @@ def main() -> None:
         publish_job = release[start:end]
         for policy in (
             "needs: [publish, install_proof, npm_publish_preflight]",
+            "needs.publish.result == 'success'",
+            "needs.install_proof.result == 'success'",
+            "needs.npm_publish_preflight.result == 'success'",
             "environment: release",
             "id-token: write",
             "npm@11.15.0",
@@ -329,6 +350,60 @@ def main() -> None:
             package_dir,
         ):
             require(publish_job, policy, f"{job} trusted publishing")
+
+    install_proof_start = release.index("  install_proof:")
+    install_proof_end = release.index(
+        "\n  npm_publish_preflight:", install_proof_start
+    )
+    install_proof_job = release[install_proof_start:install_proof_end]
+    for policy in (
+        "needs: publish",
+        "always()",
+        "needs.publish.result == 'success'",
+        "uses: ./.github/workflows/install-proof.yml",
+    ):
+        require(install_proof_job, policy, "mandatory public install proof")
+
+    exact_result_gates = {
+        "verify_npm_published": (
+            "needs.publish_npm_canonical.result == 'success'",
+            "needs.publish_npm_compatibility.result == 'success'",
+            "needs.version_tag_image.result == 'success'",
+        ),
+        "smoke_npm_published": (
+            "needs.verify_npm_published.result == 'success'",
+        ),
+        "finalize_release": (
+            "needs.publish.result == 'success'",
+            "needs.install_proof.result == 'success'",
+            "needs.version_tag_image.result == 'success'",
+            "needs.smoke_npm_published.result == 'success'",
+        ),
+        "publish_boundary_contracts": (
+            "needs.publish.result == 'success'",
+            "needs.install_proof.result == 'success'",
+            "needs.finalize_release.result == 'success'",
+        ),
+        "bump_homebrew": (
+            "needs.publish.result == 'success'",
+            "needs.install_proof.result == 'success'",
+            "needs.finalize_release.result == 'success'",
+        ),
+        "version_tag_image": (
+            "needs.publish.result == 'success'",
+            "needs.install_proof.result == 'success'",
+            "needs.build_daemon_image.result == 'success'",
+            "needs.attest_daemon_image.result == 'success'",
+        ),
+    }
+    for job, policies in exact_result_gates.items():
+        start = release.index(f"  {job}:")
+        match = re.search(r"(?m)^  [a-zA-Z0-9_]+:\s*$", release[start + 3 :])
+        end = start + 3 + match.start() if match else len(release)
+        job_body = release[start:end]
+        require(job_body, "always()", f"{job} exact result admission")
+        for policy in policies:
+            require(job_body, policy, f"{job} exact result admission")
 
     for policy in (
         "needs: [publish_npm_canonical, publish_npm_compatibility, version_tag_image]",
