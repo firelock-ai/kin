@@ -1,0 +1,22 @@
+name: Link Check
+
+on:
+  pull_request:
+    paths:
+      - "README.md"
+      - "CONTRIBUTING.md"
+      - "SECURITY.md"
+      - "docs/quickstart.md"
+
+jobs:
+  link-check:
+    name: Check documentation links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Links
+        uses: lycheeverse/lychee-action@v1.10.0
+        with:
+          args: --config lychee.toml './README.md' './CONTRIBUTING.md' './SECURITY.md' './docs/quickstart.md'
+          fail: true

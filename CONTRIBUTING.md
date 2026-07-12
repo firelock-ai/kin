@@ -27,6 +27,12 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
+To verify public documentation links locally before opening a pull request, you can use [`lychee`](https://lychee.cli.rs/):
+
+```sh
+lychee --config lychee.toml './README.md' './CONTRIBUTING.md' './SECURITY.md' './docs/quickstart.md'
+```
+
 CI treats clippy warnings as errors (`-D warnings`), so a clean clippy run
 locally avoids surprises.
 

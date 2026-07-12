@@ -1,0 +1,10 @@
+# lychee config file
+timeout = 20
+max_retries = 3
+
+# Exclude GitHub badges, auth-only routes, and known rate-limited hosts
+exclude = [
+  "https://github.com/firelock-ai/kin/actions/workflows/.*",
+  "https://github.com/firelock-ai/kin/settings/.*",
+  "https://img.shields.io/.*"
+]
