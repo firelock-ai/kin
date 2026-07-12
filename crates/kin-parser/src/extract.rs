@@ -13,11 +13,12 @@ pub const FILE_IMPORT_CONTEXT_KEY: &str = "file_import_context";
 pub const FILE_SURFACE_CONTEXT_KEY: &str = "file_surface_context";
 
 /// Reserved parser-to-linker control record: at least one source-level call in
-/// this file could not be represented as a named [`ExtractedRelation`]. The
-/// record is carried through the existing raw-relation seam so published
-/// `ParseOutput` and linker input structs remain source compatible. Linkers
-/// consume it as negative call-coverage evidence and never materialize it as a
-/// graph relation.
+/// this file could not be represented with a statically proven named target.
+/// This includes wholly unrepresentable callees and receiver calls whose leaf
+/// name is retained for recall but whose owning type is unknown. The record is
+/// carried through the existing raw-relation seam so published `ParseOutput`
+/// and linker input structs remain source compatible. Linkers consume it as
+/// negative call-coverage evidence and never materialize it as a graph relation.
 pub const CALL_EXTRACTION_INCOMPLETE_MARKER_V1: &str =
     "kin-internal://call-extraction-coverage/incomplete-v1";
 

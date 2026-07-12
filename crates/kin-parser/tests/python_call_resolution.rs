@@ -10,8 +10,10 @@
 //! Python narrows attribute callees to their **leaf name at extraction time**,
 //! with one deliberate exception. `module.func()`, `obj.method()`, and
 //! `self.member.save()` all emit a `Calls` edge whose `dst_name` is the trailing
-//! identifier (`func`, `method`, `save`) — their receiver's type is unknowable
-//! at parse time. But `self.m()` / `cls.m()` dispatch through the *enclosing
+//! identifier (`func`, `method`, `save`). Their receiver's type is unknowable at
+//! parse time, so the file also carries negative call-coverage evidence; the
+//! leaf edge is useful for recall but cannot certify a safe rename. But direct
+//! `self.m()` / `cls.m()` dispatch through the *enclosing
 //! class*, so they emit the class-qualified form (`Service.validate`): that
 //! qualifier is what lets the linker resolve an inherited method through the
 //! class's Extends chain instead of fanning out on the bare name. Because the
@@ -215,6 +217,13 @@ fn module_attribute_call_narrows_to_leaf_name() {
         "dotted form must not appear as a Calls dst_name, got {:?}",
         calls(&output)
     );
+    assert!(
+        output
+            .relations
+            .iter()
+            .any(is_call_extraction_incomplete_marker),
+        "leaf-only module receiver evidence must not certify complete call resolution"
+    );
 }
 
 // ---- method calls on an instance ----
@@ -244,6 +253,13 @@ fn method_call_on_instance_narrows_to_leaf_name() {
         calls(&output)
     );
     assert!(has_entity(&output, EntityKind::Method, "Service.run"));
+    assert!(
+        output
+            .relations
+            .iter()
+            .any(is_call_extraction_incomplete_marker),
+        "an untyped instance receiver must preserve negative call-coverage evidence"
+    );
 }
 
 // ---- nesting recursion ----

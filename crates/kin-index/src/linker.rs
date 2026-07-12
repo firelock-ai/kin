@@ -39,9 +39,10 @@ pub const CALL_SHAPE_EVIDENCE_AGGREGATION_V1: &str = "call_shape_aggregation_v1"
 pub const CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1: &str = "call_shape_incomplete_parse_v1";
 
 /// Persisted fail-closed marker for a syntax-valid file whose adapter could not
-/// represent every call expression as a named edge. This is deliberately
-/// distinct from parse recovery: the source parsed, but call extraction was not
-/// exhaustive, so shaped occurrences cannot certify a parameter rename.
+/// represent every call expression with a statically proven named target. This
+/// is deliberately distinct from parse recovery: the source parsed, but call
+/// extraction or receiver resolution was not exhaustive, so shaped occurrences
+/// cannot certify a parameter rename.
 pub const CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1: &str =
     "call_shape_incomplete_extraction_v1";
 
@@ -54,8 +55,8 @@ pub const CALL_SHAPE_PARSE_COVERAGE_FULL_V1: &str = "call_shape_parse_coverage_f
 /// File-level marker that call-site coverage is incomplete or unknown.
 pub const CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1: &str = "call_shape_parse_coverage_incomplete_v1";
 
-/// File-level marker that syntax was valid but named-call extraction was not
-/// exhaustive.
+/// File-level marker that syntax was valid but named-call extraction or
+/// receiver resolution was not exhaustive.
 pub const CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1: &str =
     "call_shape_extraction_coverage_incomplete_v1";
 

@@ -164,8 +164,13 @@ fn shadow_verdict(graph: &InMemoryGraph, diff: SemanticDiff) -> ShadowGateVerdic
 }
 
 /// The rename diff for `target`: same entity id, signature `old_sig` -> `new_sig`.
-fn rename_diff(files: &[FileParseData], old_sig: &str, new_sig: &str) -> SemanticDiff {
-    let target = find_entity(files, "target");
+fn rename_diff_for_entity(
+    files: &[FileParseData],
+    entity_name: &str,
+    old_sig: &str,
+    new_sig: &str,
+) -> SemanticDiff {
+    let target = find_entity(files, entity_name);
     let mut old = target.clone();
     old.signature = old_sig.to_string();
     let mut new = target.clone();
@@ -177,6 +182,10 @@ fn rename_diff(files: &[FileParseData], old_sig: &str, new_sig: &str) -> Semanti
         }],
         ..Default::default()
     }
+}
+
+fn rename_diff(files: &[FileParseData], old_sig: &str, new_sig: &str) -> SemanticDiff {
+    rename_diff_for_entity(files, "target", old_sig, new_sig)
 }
 
 /// Parse, link, persist, and run the INLINE review gate over a rename of
@@ -679,6 +688,132 @@ fn e2e_unhandled_dynamic_callee_invalidates_call_coverage() {
             })
         }),
         "the file must not retain a positive full-coverage certificate"
+    );
+}
+
+#[test]
+fn e2e_unproven_receiver_cannot_hide_keyword_call_behind_same_file_decoy() {
+    let service = parse_python(
+        "service.py",
+        r#"class C:
+    def target(self, ext, args):
+        return ext, args
+
+    def positional(self):
+        return self.target(1, 2)
+"#,
+    );
+    let caller = parse_python(
+        "caller.py",
+        r#"def target(ext, args):
+    return ext, args
+
+def invoke(obj=C):
+    return obj.target(args=2, ext=1)
+"#,
+    );
+    assert!(
+        caller
+            .relations
+            .iter()
+            .any(is_call_extraction_incomplete_marker),
+        "an untyped receiver call must carry negative call-coverage evidence"
+    );
+
+    let (files, relations, graph) = link_parsed_files_into_graph(vec![service, caller]);
+    assert!(relations.iter().any(|relation| {
+        relation.evidence.iter().any(|evidence| {
+            evidence.parser_rule.as_deref() == Some(CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1)
+                && evidence.source_path.as_deref() == Some("caller.py")
+        })
+    }));
+
+    let target = find_entity(&files, "C.target");
+    let diff = rename_diff_for_entity(
+        &files,
+        "C.target",
+        "def target(self, ext, args)",
+        "def target(self, ext, lines)",
+    );
+    let impact = analyze_impact(&graph, &diff).expect("analyze receiver-decoy impact");
+    assert!(
+        !impact
+            .entity_impact(&target.id)
+            .expect("C.target impact")
+            .call_shapes
+            .all_consumers_shaped_calls,
+        "a same-file free-function decoy must not certify an untyped receiver call"
+    );
+    assert_eq!(
+        shadow_verdict(&graph, diff),
+        ShadowGateVerdict::WouldBlock,
+        "the hidden keyword caller must keep the method rename blocking"
+    );
+}
+
+#[test]
+fn e2e_unproven_receiver_above_fanout_cap_keeps_negative_coverage() {
+    let service = parse_python(
+        "service.py",
+        r#"class C:
+    def target(self, ext, args):
+        return ext, args
+
+    def positional(self):
+        return self.target(1, 2)
+"#,
+    );
+    let caller = parse_python(
+        "caller.py",
+        r#"def invoke(obj=C):
+    return obj.target(args=2, ext=1)
+"#,
+    );
+    assert!(
+        caller
+            .relations
+            .iter()
+            .any(is_call_extraction_incomplete_marker),
+        "an untyped receiver call must stay negative even when fanout is capped"
+    );
+
+    let mut files = vec![service, caller];
+    for index in 0..8 {
+        files.push(parse_python(
+            &format!("impl_{index}.py"),
+            &format!(
+                "class Impl{index}:\n    def target(self, ext, args):\n        return ext, args\n"
+            ),
+        ));
+    }
+    let (files, relations, graph) = link_parsed_files_into_graph(files);
+    assert!(relations.iter().any(|relation| {
+        relation.evidence.iter().any(|evidence| {
+            evidence.parser_rule.as_deref() == Some(CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1)
+                && evidence.source_path.as_deref() == Some("caller.py")
+        })
+    }));
+
+    let target = find_entity(&files, "C.target");
+    let diff = rename_diff_for_entity(
+        &files,
+        "C.target",
+        "def target(self, ext, args)",
+        "def target(self, ext, lines)",
+    );
+    let impact = analyze_impact(&graph, &diff).expect("analyze capped-receiver impact");
+    assert!(
+        !impact
+            .entity_impact(&target.id)
+            .expect("C.target impact")
+            .call_shapes
+            .all_consumers_shaped_calls,
+        "dropping an over-cap receiver fanout must not leave full call coverage"
+    );
+    assert_eq!(
+        shadow_verdict(&graph, diff),
+        ShadowGateVerdict::WouldBlock,
+        "an over-cap receiver call must keep the method rename blocking"
     );
 }
 

@@ -76,10 +76,11 @@ impl LanguageAdapter for PythonAdapter {
         }
 
         // A syntax-valid tree can still contain a call shape this adapter did
-        // not represent, for example a dynamic callee or a call at module/class
-        // scope where no callable entity owns the edge. Keep syntax state and
-        // call-extraction coverage separate: carry one reserved negative record
-        // to the linker, which fails closed without rejecting the valid file.
+        // not represent with a proven destination, for example a dynamic callee,
+        // an untyped receiver, or a call at module/class scope where no callable
+        // entity owns the edge. Keep syntax state and call-coverage completeness
+        // separate: carry one reserved negative record to the linker, which
+        // fails closed without rejecting the valid file.
         if call_audit.incomplete || has_unobserved_call(&root, &call_audit.seen_calls) {
             relations.push(call_extraction_incomplete_marker());
         }
@@ -503,17 +504,26 @@ fn has_unobserved_call(
     found
 }
 
+struct PythonNamedCallee {
+    name: String,
+    resolution_proven: bool,
+}
+
 /// Resolve the statically named portion of a Python callee. Parentheses are a
 /// transparent expression wrapper, so `(target)(...)` has the same named
-/// target as `target(...)`. Other expression forms (conditional, subscript,
-/// returned callable, lambda, and so on) do not prove one destination and must
-/// leave file-level call coverage incomplete.
+/// target as `target(...)`. A direct `self`/`cls` receiver is pinned to the
+/// enclosing class. Other attribute receivers retain their historical bare
+/// leaf for recall, but cannot prove which class owns that method: the linker
+/// may otherwise bind a same-file free-function decoy or drop an over-cap
+/// method fanout. Callers must therefore preserve the edge while downgrading
+/// file-level call coverage. Other expression forms (conditional, subscript,
+/// returned callable, lambda, and so on) do not prove one destination either.
 fn extract_named_callee(
     function: &tree_sitter::Node,
     source: &[u8],
     class_ctx: Option<&str>,
-) -> Option<String> {
-    let name = match function.kind() {
+) -> Option<PythonNamedCallee> {
+    let callee = match function.kind() {
         "parenthesized_expression" => {
             let mut cursor = function.walk();
             let mut named = function.named_children(&mut cursor);
@@ -534,14 +544,23 @@ fn extract_named_callee(
                 .and_then(|obj| obj.utf8_text(source).ok())
                 .is_some_and(|text| text == "self" || text == "cls");
             match class_ctx {
-                Some(cls) if self_or_cls_receiver => format!("{cls}.{attr}"),
-                _ => attr.to_string(),
+                Some(cls) if self_or_cls_receiver => PythonNamedCallee {
+                    name: format!("{cls}.{attr}"),
+                    resolution_proven: true,
+                },
+                _ => PythonNamedCallee {
+                    name: attr.to_string(),
+                    resolution_proven: false,
+                },
             }
         }
-        "identifier" => function.utf8_text(source).ok()?.to_string(),
+        "identifier" => PythonNamedCallee {
+            name: function.utf8_text(source).ok()?.to_string(),
+            resolution_proven: true,
+        },
         _ => return None,
     };
-    is_valid_callee_name(&name).then_some(name)
+    is_valid_callee_name(&callee.name).then_some(callee)
 }
 
 /// Extract all function/method calls within a function/method body.
@@ -559,17 +578,20 @@ fn extract_calls_from_context(
             call_audit
                 .seen_calls
                 .insert((child.start_byte(), child.end_byte()));
-            let callee_name = child
+            let callee = child
                 .child_by_field_name("function")
                 .and_then(|function| extract_named_callee(&function, source, class_ctx));
-            if let Some(callee_name) = callee_name {
+            if let Some(callee) = callee {
                 relations.push(ExtractedRelation {
                     call_shape: Some(extract_call_arg_shape(&child, source)),
                     kind: kin_model::RelationKind::Calls,
                     src_name: context_name.to_string(),
-                    dst_name: callee_name,
+                    dst_name: callee.name,
                     import_source: None,
                 });
+                if !callee.resolution_proven {
+                    call_audit.incomplete = true;
+                }
             } else {
                 call_audit.incomplete = true;
             }
