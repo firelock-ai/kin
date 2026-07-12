@@ -1348,6 +1348,15 @@ jobs:
   install_proof:
     name: Public Install Proof
     needs: publish
+    # publish intentionally tolerates a skipped optional notarization job. Force
+    # this reusable workflow to run after that successful publish instead of
+    # inheriting the skipped ancestor, and fail closed on every other outcome.
+    if: >-
+      ${{
+        always() &&
+        needs.publish.result == 'success' &&
+        startsWith(github.ref, 'refs/tags/v')
+      }}
     uses: ./.github/workflows/install-proof.yml
     with:
       release_tag: ${{ github.ref_name }}
@@ -1358,7 +1367,13 @@ jobs:
   npm_publish_preflight:
     name: Preflight Both npm Packages
     needs: [publish, install_proof]
-    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    if: >-
+      ${{
+        always() &&
+        needs.publish.result == 'success' &&
+        needs.install_proof.result == 'success' &&
+        startsWith(github.ref, 'refs/tags/v')
+      }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -1394,10 +1409,14 @@ jobs:
   publish_npm_compatibility:
     name: Publish npm Compatibility Wrapper (@kinlab/kin-mcp)
     needs: [publish, install_proof, npm_publish_preflight]
-    # publish uses always() to survive a skipped notarize_linux (the default
-    # macOS-notarytool path); mirror that guard here or GitHub transitively skips
-    # this job whenever notarize_linux is skipped.
-    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    if: >-
+      ${{
+        always() &&
+        needs.publish.result == 'success' &&
+        needs.install_proof.result == 'success' &&
+        needs.npm_publish_preflight.result == 'success' &&
+        startsWith(github.ref, 'refs/tags/v')
+      }}
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -1450,7 +1469,14 @@ jobs:
     # Both publish jobs are mandatory. A transient failure can make one package
     # public before the other; an idempotent rerun verifies the first and
     # completes the second while GitHub Latest remains blocked.
-    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    if: >-
+      ${{
+        always() &&
+        needs.publish.result == 'success' &&
+        needs.install_proof.result == 'success' &&
+        needs.npm_publish_preflight.result == 'success' &&
+        startsWith(github.ref, 'refs/tags/v')
+      }}
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -1500,7 +1526,14 @@ jobs:
   verify_npm_published:
     name: Verify Published npm Provenance (${{ matrix.package }})
     needs: [publish_npm_canonical, publish_npm_compatibility, version_tag_image]
-    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    if: >-
+      ${{
+        always() &&
+        needs.publish_npm_canonical.result == 'success' &&
+        needs.publish_npm_compatibility.result == 'success' &&
+        needs.version_tag_image.result == 'success' &&
+        startsWith(github.ref, 'refs/tags/v')
+      }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -1542,7 +1575,12 @@ jobs:
   smoke_npm_published:
     name: Anonymous Published npm Smoke (${{ matrix.package }})
     needs: verify_npm_published
-    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    if: >-
+      ${{
+        always() &&
+        needs.verify_npm_published.result == 'success' &&
+        startsWith(github.ref, 'refs/tags/v')
+      }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -1609,7 +1647,15 @@ jobs:
   finalize_release:
     name: Promote Proven Release
     needs: [publish, install_proof, version_tag_image, smoke_npm_published]
-    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    if: >-
+      ${{
+        always() &&
+        needs.publish.result == 'success' &&
+        needs.install_proof.result == 'success' &&
+        needs.version_tag_image.result == 'success' &&
+        needs.smoke_npm_published.result == 'success' &&
+        startsWith(github.ref, 'refs/tags/v')
+      }}
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -1671,9 +1717,14 @@ jobs:
   publish_boundary_contracts:
     name: Post-release boundary contracts publish
     needs: [publish, install_proof, finalize_release]
-    # Mirror publish's always() guard so a skipped notarize_linux does not
-    # transitively skip this job.
-    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    if: >-
+      ${{
+        always() &&
+        needs.publish.result == 'success' &&
+        needs.install_proof.result == 'success' &&
+        needs.finalize_release.result == 'success' &&
+        startsWith(github.ref, 'refs/tags/v')
+      }}
     runs-on: ubuntu-latest
     environment: release
     # The public release is already final. This private-registry integration is
@@ -1719,12 +1770,18 @@ jobs:
   bump_homebrew:
     name: Post-release Homebrew formula update
     needs: [publish, install_proof, finalize_release]
-    # Mirror publish's always() guard so a skipped notarize_linux does not
-    # transitively skip this job.
     # The tap follows GitHub Latest, so prereleases must not enter this path.
     # Homebrew is a post-release integration and cannot atomically gate a
     # GitHub/npm release that is already public.
-    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
+    if: >-
+      ${{
+        always() &&
+        needs.publish.result == 'success' &&
+        needs.install_proof.result == 'success' &&
+        needs.finalize_release.result == 'success' &&
+        startsWith(github.ref, 'refs/tags/v') &&
+        !contains(github.ref_name, '-')
+      }}
     runs-on: ubuntu-latest
     environment: release
     continue-on-error: true
@@ -1779,10 +1836,16 @@ jobs:
   version_tag_image:
     name: Version-tag ghcr image
     needs: [publish, install_proof, build_daemon_image, attest_daemon_image]
-    # Mirror publish's always() guard so a skipped notarize_linux does not
-    # transitively skip this job, and only tag real version-tag pushes so
-    # `:<version>` never points at an unreleased build.
-    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    # Only tag real version pushes after every direct authority input succeeds.
+    if: >-
+      ${{
+        always() &&
+        needs.publish.result == 'success' &&
+        needs.install_proof.result == 'success' &&
+        needs.build_daemon_image.result == 'success' &&
+        needs.attest_daemon_image.result == 'success' &&
+        startsWith(github.ref, 'refs/tags/v')
+      }}
     runs-on: ubuntu-latest
     environment: release
     # Least privilege: read the repo (to peel the tag to its commit) and push
