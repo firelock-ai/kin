@@ -2254,7 +2254,7 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
         assert!(coverage.relations.iter().any(|relation| {
             relation.evidence.iter().any(|evidence| {
                 evidence.parser_rule.as_deref()
-                    == Some(kin_index::CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1)
+                    == Some(kin_index::CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1)
                     && evidence.source_path.as_deref() == Some("src/lib.py")
             })
         }));
