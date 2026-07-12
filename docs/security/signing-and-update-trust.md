@@ -101,7 +101,7 @@ before an announcement or public-launch claim. The gate compares both served
 scripts with the exact peeled release commit and requires `/current.json` to
 bind the same tag, commit, hashes, and GCS generations. Even wording-only drift
 in `install.ps1` fails this gate. For the first migration to the atomic
-publisher, leave both readiness variables unset, publish the exact release via
+publisher, leave `RELEASE_FOLLOWUP_READY` unset, publish the exact release via
 the protected break-glass workflow, prove parity, and only then set
 `RELEASE_FOLLOWUP_READY` to `true` for future completed-release callbacks.
 
