@@ -16,19 +16,19 @@ pub const VFS_PROTOCOL_VERSION: u32 = 1;
 /// Request from VFS shim to daemon.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum VfsRequest {
-    /// Get metadata for a path.
+    /// Get metadata for a repo-relative graph path (empty string is root).
     Stat { path: String },
 
-    /// List directory contents.
+    /// List directory contents for a repo-relative graph path.
     ReadDir { path: String },
 
-    /// Read file content (full or range).
+    /// Read file content (full or range) by repo-relative graph path.
     Read { path: String, offset: u64, len: u64 },
 
-    /// Read symbolic link target.
+    /// Read symbolic link target by repo-relative graph path.
     ReadLink { path: String },
 
-    /// Check if path is accessible.
+    /// Check if a repo-relative graph path is accessible.
     Access { path: String, mode: u32 },
 
     /// Keepalive ping.
