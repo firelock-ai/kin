@@ -58,6 +58,9 @@ submit it) and that it may be distributed under the Apache License 2.0 that
 governs this repository. Bot-authored commits (Dependabot, GitHub Actions)
 are exempt.
 
+The DCO sign-off is the only contributor agreement required. There is no
+separate CLA or account allowlist.
+
 ## AI-Assisted Contributions
 
 Kin is built with significant AI assistance, and we welcome AI-assisted
@@ -78,7 +81,7 @@ contributions from the community. A few requirements:
 ## Commit Messages
 
 This repository uses [Conventional Commits](https://www.conventionalcommits.org/).
-Recent history shows the expected shape — a `type(scope): summary` subject:
+Recent history shows the expected shape: a `type(scope): summary` subject:
 
 ```
 fix(locate): make scoring pipeline deterministic with explicit tie-breaks
@@ -97,7 +100,7 @@ Public Git history is part of the product, so keep it clean and reviewable:
 
 - **Keep branch names topical, not tracker-coded.** Prefer short, descriptive
   names like `fix/locate-tie-breaks` or `docs/contributing-hygiene`. Avoid
-  embedding internal issue or tracker IDs in a branch name — a squash merge
+  embedding internal issue or tracker IDs in a branch name. A squash merge
   copies the branch name into the public commit subject, so anything in the
   branch name lands in history verbatim.
 - **Write durable subjects and bodies.** Commit messages should describe the
@@ -105,12 +108,12 @@ Public Git history is part of the product, so keep it clean and reviewable:
   identifiers, and automated authorship trailers out of public commit
   metadata; link that context from the pull request instead.
 - **Don't bypass the hooks.** Repository hooks normalize commit metadata for
-  consistency — don't skip them with `--no-verify`.
+  consistency; don't skip them with `--no-verify`.
 
 ## Pull Requests
 
 - **Keep PRs scoped.** Stage only the files your change actually needs.
-  Unrelated cleanups belong in their own PR — this keeps review focused and
+  Unrelated cleanups belong in their own PR. This keeps review focused and
   history bisectable.
 - Fill out the [pull request template](.github/PULL_REQUEST_TEMPLATE.md).
 - Make sure `cargo fmt`, `cargo clippy`, and `cargo test` all pass.
@@ -122,8 +125,8 @@ Public Git history is part of the product, so keep it clean and reviewable:
 File issues on [firelock-ai/kin](https://github.com/firelock-ai/kin/issues)
 using the provided templates:
 
-- **Bug reports** — use the bug report template.
-- **Feature requests** — use the feature request template.
+- **Bug reports:** use the bug report template.
+- **Feature requests:** use the feature request template.
 
 For security vulnerabilities, do **not** open a public issue. Follow the
 private reporting process in [SECURITY.md](SECURITY.md).

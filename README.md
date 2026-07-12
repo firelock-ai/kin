@@ -1,6 +1,6 @@
 # Kin
 
-> **AI writes code. Kin proves it safe to ship.**
+> **AI writes code. Kin records what it means.**
 > AI made code cheap to write and expensive to trust.
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
@@ -8,7 +8,7 @@
 [![kinlab.ai](https://img.shields.io/badge/hosted-kinlab.ai-111111.svg)](https://kinlab.ai)
 
 AI agents now generate code faster than teams can review it. The hard part is no longer
-writing a change — it's trusting one: knowing what it actually touches, whether it silently
+writing a change. It is trusting one: knowing what it actually touches, whether it silently
 reverts an earlier fix, and how far its blast radius reaches before it merges. Git tracks
 lines and files, so it can't answer those questions directly. Kin is **the system of record
 for AI-written software**: it represents your codebase as a graph of entities and
@@ -21,12 +21,12 @@ relations and reasons over that graph instead of over text diffs.
 Kin is a graph-native repository substrate. Instead of files and line diffs, it models
 software as a semantic graph:
 
-- **Entities** — functions, methods, classes, structs, traits, enums, interfaces, types, constants.
-- **Relations** — calls, imports, references, inheritance.
+- **Entities:** functions, methods, classes, structs, traits, enums, interfaces, types, constants.
+- **Relations:** calls, imports, references, inheritance.
 
 The graph is the source of authority. Your filesystem becomes a derived projection over that
 graph truth, served transparently to existing editors and compilers through the `kin-vfs`
-virtual filesystem — so every tool you already use keeps working, unchanged.
+virtual filesystem, so every tool you already use keeps working unchanged.
 
 Because Kin reasons over entities and relations, it can answer questions a line-diff tool
 can't: which callers a change reaches, whether an edit undoes an earlier one, and what the
@@ -65,7 +65,7 @@ curl -fsSL https://get.kinlab.dev/install | sh
 On **Windows**, use PowerShell (`irm https://get.kinlab.dev/install.ps1 | iex`). The native
 Windows build is a supported vector-free runtime for graph, lexical, daemon, setup, and MCP
 workflows, with vector similarity and filesystem projection explicitly unsupported. For the
-complete vector-enabled/projection experience, install under WSL2 — see
+complete vector-enabled/projection experience, install under WSL2; see
 [docs/windows-wsl2.md](docs/windows-wsl2.md).
 
 **For AI agents.** `kin setup --intent agent` wires Kin's built-in MCP server into every
@@ -87,9 +87,18 @@ kin setup                            # wire Kin's MCP tools into your AI agents
                                      #   (detects Claude Code, Cursor, Codex, Gemini, Windsurf)
 kin init                             # new no-Git folders become Kin-native by default;
                                      # existing Git repos import recent history by default
-kin locate "webhook retries twice"   # find the entities/files behind an issue
-kin refs charge_customer             # who calls, imports, or references this entity
-kin review shadow main..HEAD         # report-only merge-gate verdict:
+kin status                           # confirm the repo and graph are ready
+kin overview                         # inspect indexed languages, entities, and top files
+kin setup status                     # verify the local install and integrations
+```
+
+Then use names and questions from your own repository. Replace the uppercase
+placeholders with an entity and base branch that exist in that repository:
+
+```sh
+kin locate "where are webhook retries handled"  # find entities/files behind an issue
+kin refs ENTITY_NAME                            # show callers, imports, and references
+kin review shadow BASE_BRANCH..HEAD             # emit a report-only review verdict:
                                      #   blast radius, repair context, audit evidence
 ```
 
@@ -102,16 +111,16 @@ status` (or `kin doctor --fix`) verifies your setup end to end.
 
 ## What you get
 
-**Report-only review — the shadow merge gate.** `kin review shadow <base>..<head>` evaluates a
+**Report-only review: the shadow merge gate.** `kin review shadow <base>..<head>` evaluates a
 PR-shaped change and emits a report-only verdict: blast radius, repair context, and audit
 evidence. It never blocks and never mutates graph state, so you can run it in CI or locally as
-evidence. Because Kin tracks entities over time, the report surfaces what a text diff misses —
+evidence. Because Kin tracks entities over time, the report surfaces what a text diff misses,
 for example, a change that silently reverts an earlier fix shows up as evidence instead of
 slipping through.
 
 **Semantic locate, refs, and trace.** Ask for the entities behind an issue (`kin locate`), the
 upstream callers/importers/references of an entity (`kin refs`), or an entire call and
-data-flow chain in a single call (`kin trace`, `kin trace-data-flow`) — instead of looping over
+data-flow chain in a single call (`kin trace`, `kin trace-data-flow`) instead of looping over
 file reads. Add embeddings (`kin embed`) for vector similarity in `kin locate` and
 `kin search --semantic`.
 
@@ -132,7 +141,7 @@ modification.
 
 ## How it relates to Git
 
-Kin coexists with Git — it does not rewrite or replace your Git history or remotes. `kin init`
+Kin coexists with Git. It does not rewrite or replace your Git history or remotes. `kin init`
 bootstraps your current tree as semantic truth and imports recent Git history by default
 (`--git-history off|recent|full`); `kin migrate` handles deep, full-history import.
 
@@ -149,11 +158,13 @@ interop boundary.
 
 ## Proof posture
 
-We keep benchmark claims narrow and reproducible. On the current citable evaluation, Kin's
-`locate` is a **statistical tie with `grep` on F1**, with Kin ahead on **precision and
-specificity**, and Kin's retrieval pipeline is **bit-identical across runs** (deterministic).
-We are not claiming a speed or token-savings win. Full methodology, tasks, and artifacts live
-in the [kin-bench](https://github.com/firelock-ai/kin-bench) proof package.
+We keep benchmark claims narrow and reproducible. On the current citable, preregistered
+evaluation of 26 Multi-SWE-Bench retrieval tasks, Kin replayed bit-identically on **26 of 26**
+tasks versus **3 of 26** for the lexical baseline. Symbol F1 was **.318 versus .289**, and line
+F1 was **.307 versus .266**. File F1 was a statistical tie, and cost was at parity
+(1.00x tokens, 0.95x tool calls). We are not claiming a broad retrieval, speed, or token-savings
+win. Full methodology, tasks, and artifacts live in the
+[public preregistered v2 proof package](https://firelock.ai/labs/kin-proof).
 
 ---
 
@@ -161,11 +172,11 @@ in the [kin-bench](https://github.com/firelock-ai/kin-bench) proof package.
 
 Kin is one system with a few clear surfaces:
 
-- **[kin](https://github.com/firelock-ai/kin)** — the semantic system of record (this repo): CLI, daemon, MCP server, projections, reconcile, review, provenance.
-- **[kin-vfs](https://github.com/firelock-ai/kin-vfs)** — the transparent virtual filesystem that serves graph-backed files to any tool, unchanged.
-- **[kin-editor](https://github.com/firelock-ai/kin-editor)** — the VS Code extension: entity explorer, semantic search, trace, rename/review.
-- **[kin-mcp](https://www.npmjs.com/package/@kinlab/kin-mcp)** — the MCP server that gives AI agents Kin's semantic tools (bundled in this repo; published as `@kinlab/kin-mcp`).
-- **[kinlab.ai](https://kinlab.ai)** — the hosted collaboration and control-plane layer.
+- **[kin](https://github.com/firelock-ai/kin):** the semantic system of record (this repo): CLI, daemon, MCP server, projections, reconcile, review, provenance.
+- **[kin-vfs](https://github.com/firelock-ai/kin-vfs):** the transparent virtual filesystem that serves graph-backed files to any tool, unchanged.
+- **[kin-editor](https://github.com/firelock-ai/kin-editor):** the VS Code extension: entity explorer, semantic search, trace, rename/review.
+- **[kin-mcp](https://www.npmjs.com/package/@kinlab/kin-mcp):** the MCP server that gives AI agents Kin's semantic tools (bundled in this repo; published as `@kinlab/kin-mcp`).
+- **[kinlab.ai](https://kinlab.ai):** the hosted collaboration and control-plane layer.
 
 Supporting substrate:
 [kin-db](https://github.com/firelock-ai/kin-db) (graph storage, snapshots, text + vector search) ·
@@ -174,14 +185,14 @@ Supporting substrate:
 [kin-vector](https://github.com/firelock-ai/kin-vector) ·
 [kin-infer](https://github.com/firelock-ai/kin-infer) ·
 [kin-lsp](https://github.com/firelock-ai/kin-lsp) ·
-[kin-model](https://github.com/firelock-ai/kin-model) ·
-[kin-bench](https://github.com/firelock-ai/kin-bench).
+[kin-model](https://github.com/firelock-ai/kin-model), with benchmark evidence published through
+the [public proof package](https://firelock.ai/labs/kin-proof).
 
 ---
 
 ## Status & roadmap
 
-Kin is **0.2.x** — pre-1.0 and under active development. Expect rough edges and breaking
+Kin is **0.2.x**, pre-1.0 and under active development. Expect rough edges and breaking
 changes between releases. Being precise about what is and isn't ready today:
 
 - **Install surface.** Native binaries ship on GitHub Releases and via the install script; the canonical `@kinlab/kin` npm package (`npm i -g @kinlab/kin`, or `npx -y @kinlab/kin`) provisions the same managed `kin` + `kin-daemon` release for npm-based workflows. `@kinlab/kin-mcp` remains published as a compatibility wrapper.
@@ -191,6 +202,19 @@ changes between releases. Being precise about what is and isn't ready today:
 - **Graph-first, with transitional compatibility.** The graph is the authority for Kin's own commands. File-first and Git-interop paths are supported as a migration boundary, not the long-term model.
 
 To understand the philosophy behind Kin, see the [thesis document](docs/thesis.md).
+
+---
+
+## Community and support
+
+- Ask questions, share feedback, and show what you are building in
+  [GitHub Discussions](https://github.com/firelock-ai/kin/discussions).
+- Report reproducible bugs or request features through
+  [GitHub Issues](https://github.com/firelock-ai/kin/issues/new/choose).
+- Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. DCO
+  sign-off is the only contributor agreement required.
+- Report security issues privately through the process in
+  [SECURITY.md](SECURITY.md), never through a public issue.
 
 ---
 
