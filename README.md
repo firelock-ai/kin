@@ -4,7 +4,7 @@
 > AI made code cheap to write and expensive to trust.
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Release](https://img.shields.io/badge/release-v0.2.17-6E56CF.svg)](https://github.com/firelock-ai/kin/releases)
+[![Latest release](https://img.shields.io/badge/release-latest-6E56CF.svg)](https://github.com/firelock-ai/kin/releases/latest)
 [![kinlab.ai](https://img.shields.io/badge/hosted-kinlab.ai-111111.svg)](https://kinlab.ai)
 
 AI agents now generate code faster than teams can review it. The hard part is no longer
@@ -36,8 +36,8 @@ real blast radius of a merge is.
 
 ## Install
 
-Kin ships as native binaries on [GitHub Releases](https://github.com/firelock-ai/kin/releases)
-(currently **v0.2.17**) for five targets: macOS (Apple Silicon and Intel), Linux (x86_64 and
+Kin ships as native binaries on [GitHub Releases](https://github.com/firelock-ai/kin/releases/latest)
+for five targets: macOS (Apple Silicon and Intel), Linux (x86_64 and
 aarch64, static musl), and Windows (x86_64, supported for the vector-free surface described below).
 
 **Direct download.** Grab the archive for your platform, verify its checksum, and extract.
@@ -45,8 +45,8 @@ The release publishes a `.sha256` next to every archive.
 
 ```sh
 # Apple Silicon macOS shown; swap in your platform's archive name.
-curl -fsSLO https://github.com/firelock-ai/kin/releases/download/v0.2.17/kin-macos-aarch64.tar.gz
-curl -fsSLO https://github.com/firelock-ai/kin/releases/download/v0.2.17/kin-macos-aarch64.tar.gz.sha256
+curl -fsSLO https://github.com/firelock-ai/kin/releases/latest/download/kin-macos-aarch64.tar.gz
+curl -fsSLO https://github.com/firelock-ai/kin/releases/latest/download/kin-macos-aarch64.tar.gz.sha256
 shasum -a 256 -c kin-macos-aarch64.tar.gz.sha256
 tar xzf kin-macos-aarch64.tar.gz      # contains the `kin` and `kin-daemon` binaries
 ```
@@ -70,7 +70,7 @@ complete vector-enabled/projection experience, install under WSL2 — see
 
 **For AI agents.** `kin setup --intent agent` wires Kin's built-in MCP server into every
 detected assistant with the curated `agent-default` tool profile. npm users can install the
-canonical launcher with `npm install -g @kinlab/kin` (**0.2.17**) and run the same setup
+canonical launcher with `npm install -g @kinlab/kin@latest` and run the same setup
 command; the older `@kinlab/kin-mcp` package remains as a compatibility wrapper.
 
 See [docs/quickstart.md](docs/quickstart.md) for installer environment variables

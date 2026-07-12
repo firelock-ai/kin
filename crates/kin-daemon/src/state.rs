@@ -24,6 +24,23 @@ use crate::session_registry::SessionCoordinator;
 pub const RECON_IDLE: u8 = 0;
 pub const RECON_PROCESSING: u8 = 1;
 
+/// Flush a directory entry after an atomic namespace update where the host
+/// supports opening directories as files. Windows rejects
+/// `std::fs::File::open(directory)` with ERROR_ACCESS_DENIED, so attempting the
+/// Unix durability primitive there prevents an otherwise healthy persisted
+/// graph from reopening at all. The file payload is still flushed before its
+/// atomic rename on every platform; only the stronger parent-directory power-
+/// loss guarantee is Unix-specific.
+#[cfg(unix)]
+fn sync_directory_metadata(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(path).and_then(|directory| directory.sync_all())
+}
+
+#[cfg(not(unix))]
+fn sync_directory_metadata(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// On-disk home for in-flight MCP transactions.
 ///
 /// Lives under `.kin/` (not the working tree), so it is never reconciled or
@@ -2029,9 +2046,7 @@ impl DaemonState {
             return Err(DaemonError::Io(error));
         }
         if let Some(parent) = index_path.parent() {
-            std::fs::File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(DaemonError::Io)?;
+            sync_directory_metadata(parent).map_err(DaemonError::Io)?;
         }
         self.persisted_entity_count
             .store(persisted_entity_count, Ordering::SeqCst);
@@ -2048,9 +2063,7 @@ impl DaemonState {
             Err(error) => return Err(DaemonError::Io(error)),
         }
         if let Some(parent) = index_path.parent() {
-            std::fs::File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(DaemonError::Io)?;
+            sync_directory_metadata(parent).map_err(DaemonError::Io)?;
         }
         Ok(index_path)
     }
@@ -2151,9 +2164,7 @@ impl DaemonState {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(DaemonError::Io(error));
         }
-        std::fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(DaemonError::Io)?;
+        sync_directory_metadata(parent).map_err(DaemonError::Io)?;
         Ok(())
     }
 
@@ -2567,6 +2578,13 @@ mod tests {
     };
     use kin_reconcile::ReconcileOutcome;
     use serde_json::json;
+
+    #[test]
+    fn directory_metadata_sync_is_portable() {
+        let directory = tempfile::tempdir().unwrap();
+        sync_directory_metadata(directory.path())
+            .expect("directory metadata sync must not reject a valid host directory");
+    }
 
     struct CleanupFailOnceBackend {
         inner: kin_db::LocalFileBackend,
