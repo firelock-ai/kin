@@ -51,6 +51,12 @@ channel through protected npm Trusted Publishing with short-lived OIDC.
 Anonymous exact-byte, provenance, and install proof runs after publication.
 GitHub Latest is promoted only after both packages pass every gate.
 
+The protected `release` environment intentionally has no required reviewer.
+After the release captain creates an authorized version tag on reviewed `main`,
+the tag policy, main-ancestor check, exact Trusted Publishing identity, and
+post-publication proofs admit and verify every public release surface without a
+second manual approval.
+
 The daemon container is a separate attested subject. The protected tag workflow
 builds one exact commit-tagged image in GHCR, verifies its embedded source and
 lockfile identity, then passes that digest to a separate attestation-only job.
@@ -84,7 +90,7 @@ from protected `main`. That environment holds `KIN_RELEASE_APP_ID` and
 minimum permission required to create a repository dispatch, plus Actions read
 permission so the callback can wait for and verify both exact downstream runs.
 The downstream `installer` environment and its dedicated WIF identity remain a
-separate approval and authorization boundary. Missing environments, secrets, a
+separate cloud authorization boundary. Missing environments, secrets, a
 disabled downstream workflow, or a non-successful Release run fail closed and
 leave the currently served installer generations unchanged.
 
