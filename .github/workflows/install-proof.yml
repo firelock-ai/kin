@@ -197,15 +197,22 @@ jobs:
           PROOF_SHELL: ${{ matrix.setup-shell }}
         run: |
           set -euo pipefail
-          case "$RUNNER_OS" in
-            Linux)
+          case "$PROOF_SHELL" in
+            bash)
               unset PSModulePath PSVersionTable
               export SHELL=/bin/bash
+              printf 'SHELL=%s\n' "$SHELL" >> "$GITHUB_ENV"
               ;;
-            macOS)
+            zsh)
               unset PSModulePath PSVersionTable
               export SHELL=/bin/zsh
+              printf 'SHELL=%s\n' "$SHELL" >> "$GITHUB_ENV"
               ;;
+            powershell)
+              # Windows has no Unix embedding follow-up and setup receives the
+              # explicit PowerShell choice below.
+              ;;
+            *) echo "unsupported install-proof setup shell: $PROOF_SHELL" >&2; exit 1 ;;
           esac
 
           # A fresh repo so the daemon has something to initialize against —
@@ -336,8 +343,24 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         working-directory: kin-install-proof
+        env:
+          PROOF_SHELL: ${{ matrix.setup-shell }}
         run: |
           set -euo pipefail
+          # Every Actions step receives a fresh process environment. Reassert
+          # the shell under test here and remove ambient PowerShell markers
+          # before setup health re-detects the installed hook.
+          case "$PROOF_SHELL" in
+            bash)
+              unset PSModulePath PSVersionTable
+              export SHELL=/bin/bash
+              ;;
+            zsh)
+              unset PSModulePath PSVersionTable
+              export SHELL=/bin/zsh
+              ;;
+            *) echo "unsupported Unix install-proof shell: $PROOF_SHELL" >&2; exit 1 ;;
+          esac
           kin embed --max-seconds 300 --json | tee kin-embed.json
           kin status --json | tee kin-embedded-status.json
           kin setup status --json | tee kin-embedded-health.json
@@ -409,6 +432,10 @@ jobs:
             path,
             JSON.parse(fs.readFileSync(path, "utf8")),
           ]);
+          const nonHealthyChecks = (report) => (report.checks ?? [])
+            .filter((check) => check.status !== "healthy")
+            .map((check) => `${check.id}=${check.status}`)
+            .join(", ") || "none";
           const required = new Map([
             ["kin_binary", "healthy"],
             ["kin_daemon_binary", "healthy"],
@@ -426,7 +453,9 @@ jobs:
 
           for (const [path, report] of reports) {
             if (report.healthy !== true) {
-              throw new Error(`${path}: overall health is not true`);
+              throw new Error(
+                `${path}: overall healthy=${report.healthy}; non-healthy checks: ${nonHealthyChecks(report)}`
+              );
             }
             const checks = new Map(report.checks.map((check) => [check.id, check]));
             for (const [id, expected] of required) {
@@ -499,7 +528,11 @@ jobs:
               const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
               const readiness = report.checks?.find((check) => check.id === "semantic_query_readiness")?.status;
               if (report.healthy !== true || readiness !== "healthy") {
-                throw new Error(`${reportPath}: semantic_query_readiness is ${readiness ?? "missing"}, expected healthy`);
+                throw new Error(
+                  `${reportPath}: overall healthy=${report.healthy}; ` +
+                  `semantic_query_readiness=${readiness ?? "missing"}; ` +
+                  `non-healthy checks: ${nonHealthyChecks(report)}`
+                );
               }
             }
             const semanticSearch = JSON.parse(fs.readFileSync("kin-semantic-search.json", "utf8"));

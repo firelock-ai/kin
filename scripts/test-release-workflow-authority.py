@@ -12,7 +12,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = ROOT / ".github" / "workflows"
+README = ROOT / "README.md"
 RELEASE = WORKFLOWS / "release.yml"
+INSTALL_PROOF = WORKFLOWS / "install-proof.yml"
 INSTALLER_CALLBACK = WORKFLOWS / "publish-release-installers.yml"
 
 
@@ -35,6 +37,8 @@ def main() -> None:
             )
 
     release = RELEASE.read_text(encoding="utf-8")
+    install_proof = INSTALL_PROOF.read_text(encoding="utf-8")
+    readme = README.read_text(encoding="utf-8")
     ci_workflow = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
     installer_callback = INSTALLER_CALLBACK.read_text(encoding="utf-8")
     docker_workflow = (WORKFLOWS / "docker.yml").read_text(encoding="utf-8")
@@ -45,6 +49,66 @@ def main() -> None:
     require(release, 'tags:\n      - "v*.*.*"', "release trigger")
     require(release, "  build_daemon_image:", "release daemon image job")
     require(release, "  attest_daemon_image:", "release daemon attestation job")
+
+    pinned_readme_version = re.search(r"\bv?\d+\.\d+\.\d+\b", readme)
+    if pinned_readme_version:
+        raise AssertionError(
+            "README must follow the proven latest release instead of pinning "
+            f"{pinned_readme_version.group(0)}"
+        )
+    for policy in (
+        "[![Latest release](https://img.shields.io/badge/release-latest-6E56CF.svg)]",
+        "https://github.com/firelock-ai/kin/releases/latest",
+        "https://github.com/firelock-ai/kin/releases/latest/download/",
+        "npm install -g @kinlab/kin@latest",
+    ):
+        require(readme, policy, "moving latest-release README reference")
+    if "img.shields.io/github/v/release" in readme:
+        raise AssertionError(
+            "README release badge must follow /releases/latest, not an unpromoted GitHub tag"
+        )
+
+    first_run_start = install_proof.index(
+        "      - name: First-run repository, daemon, and setup proof"
+    )
+    embedding_start = install_proof.index(
+        "      - name: Unix embedding and semantic retrieval proof",
+        first_run_start,
+    )
+    validation_start = install_proof.index(
+        "      - name: Validate installed capability proof",
+        embedding_start,
+    )
+    first_run = install_proof[first_run_start:embedding_start]
+    embedding = install_proof[embedding_start:validation_start]
+    for policy in (
+        'case "$PROOF_SHELL" in',
+        "export SHELL=/bin/bash",
+        "export SHELL=/bin/zsh",
+        "printf 'SHELL=%s\\n' \"$SHELL\" >> \"$GITHUB_ENV\"",
+    ):
+        require(first_run, policy, "cross-step install-proof shell pin")
+    for policy in (
+        "PROOF_SHELL: ${{ matrix.setup-shell }}",
+        'case "$PROOF_SHELL" in',
+        "unset PSModulePath PSVersionTable",
+        "export SHELL=/bin/bash",
+        "export SHELL=/bin/zsh",
+    ):
+        require(embedding, policy, "embedded-health shell reset")
+    for policy in (
+        "overall healthy=${report.healthy}",
+        "non-healthy checks: ${nonHealthyChecks(report)}",
+    ):
+        require(install_proof, policy, "actionable install-proof health failure")
+
+    for policy in (
+        "Reopen a fresh Windows graph through the daemon",
+        "kin.exe status --json > kin-status.json",
+        "test -s .kin/kindb/head-generation",
+        "test -s .kin/kindb/graph.kidx",
+    ):
+        require(ci_workflow, policy, "Windows daemon reopen regression")
 
     for policy in (
         'workflows: ["Release"]',
