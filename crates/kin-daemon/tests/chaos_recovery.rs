@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::net::TcpListener;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -9,14 +8,6 @@ use std::time::{Duration, Instant};
 use kin_daemon::api::HealthResponse;
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
-
-fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 /// Readiness budget for a daemon to come up. Generous enough that two CI runs
 /// sharing a runner (a push build and a pull_request build on the same commit)
@@ -268,24 +259,25 @@ async fn daemon_exits_after_idle_timeout_and_removes_endpoint_files() {
     let idle_timeout = Duration::from_secs(15);
     let idle_secs = idle_timeout.as_secs().to_string();
 
-    let port = free_port();
+    // Keep port selection atomic with the daemon's bind. Pre-selecting a free
+    // port and releasing it creates a TOCTOU window under parallel CI load.
     let mut child = spawn_daemon_with_env(
         repo.path(),
-        port,
+        0,
         &[
             ("KIN_DAEMON_DISABLE_LSP", "1"),
             ("KIN_DAEMON_IDLE_TIMEOUT_SECS", idle_secs.as_str()),
         ],
     );
+    let port = read_published_port(&mut child, repo.path()).await;
 
     wait_for_serving(&mut child, port).await;
 
     let daemon_port = repo.path().join(".kin/daemon.port");
     let daemon_pid = repo.path().join(".kin/daemon.pid");
-    // Poll for the endpoint files instead of asserting they are present the
-    // instant the socket accepts: observing them can lag the socket becoming
-    // connectable on a loaded runner, and they must still be there before the
-    // idle timer removes them.
+    // read_published_port already observed daemon.port. Poll both endpoint
+    // files here so this test keeps asserting the complete publication contract
+    // before the idle timer removes them.
     wait_for_path(
         &daemon_port,
         "daemon did not write port file",
@@ -331,15 +323,18 @@ async fn daemon_exits_after_dirty_repo_control_dir_is_removed() {
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
 
-    let port = free_port();
+    // Keep port selection atomic with the daemon's bind. The published-port
+    // handshake identifies this child, so readiness cannot be satisfied by an
+    // unrelated listener that won a pre-selected port.
     let mut child = spawn_daemon_with_env(
         repo.path(),
-        port,
+        0,
         &[
             ("KIN_DAEMON_DISABLE_LSP", "1"),
             ("KIN_DAEMON_IDLE_TIMEOUT_SECS", "30"),
         ],
     );
+    let port = read_published_port(&mut child, repo.path()).await;
 
     wait_for_serving(&mut child, port).await;
     create_branch(repo.path(), port, "dirty-before-delete").await;
