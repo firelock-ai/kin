@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 
-name: Dispatch Release Installers
+name: Publish Release Follow-Ups
 
 # This callback runs from reviewed default-branch workflow bytes only after the
 # tag-only Release workflow has fully completed successfully. It has no cloud
 # credential and cannot write Kin contents; its single capability is minting a
-# short-lived GitHub App token scoped to firelock-ai/kin-infra and requesting
-# the protected downstream atomic publisher.
+# short-lived GitHub App token scoped only to firelock-ai/homebrew-kin and
+# firelock-ai/kin-infra. It requests both downstream publishers and proves the
+# workflows completed before accepting either public outcome.
 on:
   workflow_run:
     workflows: ["Release"]
@@ -18,21 +19,21 @@ permissions:
   contents: read
 
 concurrency:
-  group: kin-installer-dispatch-${{ github.event.workflow_run.id }}
+  group: kin-release-follow-ups-${{ github.event.workflow_run.id }}
   cancel-in-progress: false
 
 jobs:
   dispatch:
     if: >-
-      vars.INSTALLER_DISPATCH_READY == 'true' &&
+      vars.RELEASE_FOLLOWUP_READY == 'true' &&
       github.event.workflow_run.status == 'completed' &&
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
       startsWith(github.event.workflow_run.head_branch, 'v') &&
       !contains(github.event.workflow_run.head_branch, '-')
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    environment: installer-dispatch
+    timeout-minutes: 30
+    environment: release-followups
     env:
       SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
       KIN_TAG: ${{ github.event.workflow_run.head_branch }}
@@ -45,7 +46,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Require exact current default-branch callback
+      - name: Require current callback authority without blocking unrelated main progress
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -53,7 +54,29 @@ jobs:
           [ "$GITHUB_REF" = refs/heads/main ]
           current="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
           [ "$(git rev-parse HEAD)" = "$GITHUB_SHA" ]
-          [ "$current" = "$GITHUB_SHA" ]
+          ancestry="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/compare/${GITHUB_SHA}...${current}" \
+            --jq .status)"
+          [ "$ancestry" = ahead ] || [ "$ancestry" = identical ]
+
+          authority_paths=(
+            .github/workflows/publish-release-installers.yml
+            scripts/verify-homebrew-formula.sh
+            scripts/validate-homebrew-formula.py
+            scripts/verify_installer_parity.py
+          )
+          for path in "${authority_paths[@]}"; do
+            event_blob="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/contents/${path}?ref=${GITHUB_SHA}" \
+              --jq .sha)"
+            current_blob="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/contents/${path}?ref=${current}" \
+              --jq .sha)"
+            if [ "$event_blob" != "$current_blob" ]; then
+              echo "::error::callback authority changed on main after this event: ${path}"
+              exit 1
+            fi
+          done
 
       - name: Revalidate completed public release provenance
         id: provenance
@@ -123,19 +146,47 @@ jobs:
           echo "install_sha256=$install_sha256" >> "$GITHUB_OUTPUT"
           echo "install_ps1_sha256=$install_ps1_sha256" >> "$GITHUB_OUTPUT"
 
-      - name: Mint installer-dispatch GitHub App token
+      - name: Mint release-follow-up GitHub App token
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ secrets.KIN_INSTALLER_APP_ID }}
-          private-key: ${{ secrets.KIN_INSTALLER_APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.KIN_RELEASE_APP_ID }}
+          private-key: ${{ secrets.KIN_RELEASE_APP_PRIVATE_KEY }}
           owner: firelock-ai
-          repositories: kin-infra
+          repositories: |
+            homebrew-kin
+            kin-infra
           permission-actions: read
           permission-contents: write
 
+      - name: Request Homebrew formula update
+        id: homebrew-dispatch
+        env:
+          DISPATCH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          dispatched_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          payload="$(jq -n \
+            --arg tag "$KIN_TAG" \
+            --arg sha "$KIN_SHA" \
+            --arg run_id "$SOURCE_RUN_ID" \
+            '{event_type:"kin-release",client_payload:{schema_version:1,kin_tag:$tag,kin_sha:$sha,release_workflow_run_id:$run_id}}')"
+          code="$(curl -sS -o /tmp/homebrew-dispatch-response -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/firelock-ai/homebrew-kin/dispatches \
+            -d "$payload")"
+          if [ "$code" != 204 ]; then
+            echo "::error::Homebrew repository dispatch returned HTTP $code"
+            cat /tmp/homebrew-dispatch-response
+            exit 1
+          fi
+          echo "dispatched_at=$dispatched_at" >> "$GITHUB_OUTPUT"
+
       - name: Request protected atomic installer publication
-        id: dispatch
+        id: installer-dispatch
         env:
           DISPATCH_TOKEN: ${{ steps.app-token.outputs.token }}
           RELEASE_ID: ${{ steps.provenance.outputs.release_id }}
@@ -175,10 +226,57 @@ jobs:
             echo "- install.ps1: \`${INSTALL_PS1_SHA256}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Prove downstream activation and public byte parity
+      - name: Prove Homebrew workflow and public formula
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          DISPATCHED_AT: ${{ steps.dispatch.outputs.dispatched_at }}
+          DISPATCHED_AT: ${{ steps.homebrew-dispatch.outputs.dispatched_at }}
+          KIN_HOMEBREW_VERIFY_MAX_WAIT_SECONDS: 900
+        run: |
+          set -euo pipefail
+          expected_title="Update formula ${KIN_TAG} from Kin run ${SOURCE_RUN_ID}"
+          downstream_id=""
+          for _ in $(seq 1 36); do
+            runs="$(gh api \
+              'repos/firelock-ai/homebrew-kin/actions/workflows/update-formula.yml/runs?event=repository_dispatch&per_page=20')"
+            downstream_id="$(jq -r \
+              --arg title "$expected_title" --arg dispatched_at "$DISPATCHED_AT" \
+              '[.workflow_runs[] | select(.display_title == $title and .created_at >= $dispatched_at)] | sort_by(.created_at) | last | .id // empty' \
+              <<< "$runs")"
+            if [ -n "$downstream_id" ]; then
+              state="$(gh api "repos/firelock-ai/homebrew-kin/actions/runs/${downstream_id}")"
+              status="$(jq -r .status <<< "$state")"
+              if [ "$status" = completed ]; then
+                [ "$(jq -r .conclusion <<< "$state")" = success ]
+                [ "$(jq -r .event <<< "$state")" = repository_dispatch ]
+                [ "$(jq -r .path <<< "$state")" = .github/workflows/update-formula.yml ]
+                [ "$(jq -r .head_branch <<< "$state")" = main ]
+                [ "$(jq -r .repository.full_name <<< "$state")" = firelock-ai/homebrew-kin ]
+                break
+              fi
+            fi
+            sleep 10
+          done
+          [ -n "$downstream_id" ] || {
+            echo "::error::no downstream Homebrew workflow run started"
+            exit 1
+          }
+          [ "${status:-}" = completed ] || {
+            echo "::error::downstream Homebrew workflow did not complete within the proof window"
+            exit 1
+          }
+
+          bash scripts/verify-homebrew-formula.sh "$KIN_TAG"
+          {
+            echo "Homebrew proof:"
+            echo ""
+            echo "- homebrew-kin run: \`${downstream_id}\`"
+            echo "- public formula version, URLs, and all four checksums match the release"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prove installer activation and public byte parity
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          DISPATCHED_AT: ${{ steps.installer-dispatch.outputs.dispatched_at }}
         run: |
           set -euo pipefail
           expected_title="Publish installers ${KIN_TAG} from Kin run ${SOURCE_RUN_ID}"
