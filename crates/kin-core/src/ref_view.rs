@@ -10,8 +10,8 @@ use kin_blobs::BlobStore;
 use kin_db::{GraphSnapshot, InMemoryGraph};
 use kin_index::{
     build_projection_derived_relations_for_file, extract_artifact,
-    link_cross_file_against_entities, FileClassification, FileClassifier, FileParseData,
-    IndexPipeline,
+    link_cross_file_against_entities_with_completeness, FileClassification, FileClassifier,
+    FileParseCompletenessMap, FileParseData, IndexPipeline,
 };
 use kin_model::{
     ArtifactDeltaKind, ArtifactId, ChangeStore, EntityId, EntityKind, FileLayout, FilePathId,
@@ -1157,6 +1157,7 @@ fn rebuild_entity_source_file_layouts(
             };
 
             if indexed.indexed_file.entities.is_empty() {
+                snapshot.file_layouts.push(indexed.indexed_file.file_layout);
                 continue;
             }
 
@@ -1195,16 +1196,36 @@ fn rebuild_entity_source_file_layouts(
         ));
     }
 
+    snapshot.file_layouts.extend(parsed_layouts);
     if !rebuilt_entities.is_empty() {
-        snapshot.file_layouts.extend(parsed_layouts);
         for entity in rebuilt_entities {
             snapshot.entities.insert(entity.id, entity);
         }
+    }
 
+    let mut parse_completeness = FileParseCompletenessMap::new();
+    let mut linked_file_paths = parsed_files
+        .iter()
+        .map(|file| file.file_path.clone())
+        .collect::<HashSet<_>>();
+    for layout in &snapshot.file_layouts {
+        parse_completeness.insert(layout.file_id.0.clone(), layout.parse_completeness.clone());
+        if linked_file_paths.insert(layout.file_id.0.clone()) {
+            parsed_files.push(FileParseData {
+                file_path: layout.file_id.0.clone(),
+                entities: Vec::new(),
+                relations: Vec::new(),
+                imports: Vec::new(),
+            });
+        }
+    }
+
+    if !parsed_files.is_empty() {
         let universe_entities = snapshot.entities.values().cloned().collect::<Vec<_>>();
-        parsed_relations.extend(link_cross_file_against_entities(
+        parsed_relations.extend(link_cross_file_against_entities_with_completeness(
             &parsed_files,
             &universe_entities,
+            &parse_completeness,
         ));
     }
 
@@ -1260,6 +1281,10 @@ fn enrich_sparse_historical_source_file(
         .iter()
         .any(|entity| !lifecycle.is_alive_at_ref(entity));
     if any_stale {
+        let parse_completeness = ParseCompleteness::Partial(
+            "historical ref view layout reparsed without binding because persisted entities were not alive at ref"
+                .to_string(),
+        );
         let file_layout = build_entity_file_layout(
             &indexed_file.file_id,
             &indexed_file.entities,
@@ -1271,10 +1296,7 @@ fn enrich_sparse_historical_source_file(
                     SourceRegion::EntityRef { byte_range, .. }
                     | SourceRegion::Trivia { byte_range } => byte_range.end,
                 }),
-            ParseCompleteness::Partial(
-                "historical ref view layout reparsed without binding because persisted entities were not alive at ref"
-                    .to_string(),
-            ),
+            parse_completeness.clone(),
         );
         return Some(HistoricalSourceFileEnrichment {
             entities: indexed_file.entities.clone(),
@@ -1291,6 +1313,9 @@ fn enrich_sparse_historical_source_file(
     let stabilized_entities =
         stabilize_parsed_entities(persisted_entities, indexed_file.entities, lifecycle);
     let merged_entities = merge_historical_file_entities(persisted_entities, stabilized_entities);
+    let parse_completeness = ParseCompleteness::Partial(
+        "historical ref view layout enriched from parsed blob and persisted entity IDs".to_string(),
+    );
     let file_layout = build_entity_file_layout(
         &indexed_file.file_id,
         &merged_entities,
@@ -1302,10 +1327,7 @@ fn enrich_sparse_historical_source_file(
                 SourceRegion::EntityRef { byte_range, .. }
                 | SourceRegion::Trivia { byte_range } => byte_range.end,
             }),
-        ParseCompleteness::Partial(
-            "historical ref view layout enriched from parsed blob and persisted entity IDs"
-                .to_string(),
-        ),
+        parse_completeness.clone(),
     );
 
     Some(HistoricalSourceFileEnrichment {
@@ -2215,6 +2237,27 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
             entity_region_count >= 3,
             "enriched layout should include regions for parsed entities, got {entity_region_count}"
         );
+        assert!(matches!(
+            layout.parse_completeness,
+            ParseCompleteness::Partial(_)
+        ));
+        let artifact_id = historical
+            .artifact_id_for_path(&FilePathId::new("src/lib.py"))
+            .expect("historical source artifact id");
+        let coverage = historical
+            .traverse(
+                &kin_model::GraphNodeId::Artifact(artifact_id),
+                &[RelationKind::DependsOn],
+                1,
+            )
+            .unwrap();
+        assert!(coverage.relations.iter().any(|relation| {
+            relation.evidence.iter().any(|evidence| {
+                evidence.parser_rule.as_deref()
+                    == Some(kin_index::CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1)
+                    && evidence.source_path.as_deref() == Some("src/lib.py")
+            })
+        }));
     }
 
     #[test]

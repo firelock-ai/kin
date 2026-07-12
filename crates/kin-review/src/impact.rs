@@ -39,6 +39,14 @@ fn entity_identity_key(entity: &Entity) -> (String, String, String) {
 /// by construction, so a ref-scoped implementation cannot be misused to
 /// mutate graph state.
 pub trait ImpactGraph {
+    /// Whether graph-owned parser coverage proves every entity-bearing source
+    /// file was parsed fully. The default is fail-closed so implementations of
+    /// the older public trait remain source-compatible without certifying new
+    /// rename-neutralization behavior accidentally.
+    fn call_shape_parse_coverage_complete(&self) -> Result<bool, ReviewError> {
+        Ok(false)
+    }
+
     fn get_entity(&self, id: &EntityId) -> Result<Option<Entity>, ReviewError>;
     fn get_relations(
         &self,
@@ -71,6 +79,67 @@ pub trait ImpactGraph {
 pub struct LiveGraph<'a, G>(pub &'a G);
 
 impl<G: GraphStore> ImpactGraph for LiveGraph<'_, G> {
+    fn call_shape_parse_coverage_complete(&self) -> Result<bool, ReviewError> {
+        let layouts = self.0.list_file_layouts().map_err(ReviewError::graph)?;
+        let entities = self.0.list_all_entities().map_err(ReviewError::graph)?;
+        let mut source_files = BTreeSet::new();
+
+        for layout in layouts {
+            if !matches!(
+                layout.parse_completeness,
+                kin_model::ParseCompleteness::Full
+            ) {
+                return Ok(false);
+            }
+            source_files.insert(layout.file_id.0);
+        }
+        for entity in entities {
+            if let Some(file) = entity.file_origin {
+                source_files.insert(file.0);
+            } else if let Some(span) = entity.span {
+                source_files.insert(span.file.0);
+            }
+        }
+
+        for file in source_files {
+            let file_id = kin_model::FilePathId::new(&file);
+            let Some(artifact_id) = self.0.artifact_id_for_path(&file_id) else {
+                return Ok(false);
+            };
+            let artifact = GraphNodeId::Artifact(artifact_id);
+            let neighborhood = self
+                .0
+                .traverse(&artifact, &[RelationKind::DependsOn], 1)
+                .map_err(ReviewError::graph)?;
+            let mut full = false;
+            for relation in neighborhood
+                .relations
+                .iter()
+                .filter(|relation| relation.src == artifact)
+            {
+                for evidence in &relation.evidence {
+                    match evidence.parser_rule.as_deref() {
+                        Some(
+                            kin_index::CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1
+                            | kin_index::CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1,
+                        ) => return Ok(false),
+                        Some(kin_index::CALL_SHAPE_PARSE_COVERAGE_FULL_V1)
+                            if evidence.source_path.as_deref() == Some(file.as_str()) =>
+                        {
+                            full = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if !full {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
     fn get_entity(&self, id: &EntityId) -> Result<Option<Entity>, ReviewError> {
         self.0.get_entity(id).map_err(ReviewError::graph)
     }
@@ -326,6 +395,7 @@ pub fn analyze_impact_at<I: ImpactGraph>(
     let mut seen_tests = HashSet::new();
 
     let mut entity_impacts: Vec<EntityImpact> = Vec::new();
+    let call_shape_parse_coverage_complete = graph.call_shape_parse_coverage_complete()?;
 
     for &entity_id in &changed_ids {
         // Per-entity inbound attribution accumulated alongside the global
@@ -352,7 +422,7 @@ pub fn analyze_impact_at<I: ImpactGraph>(
         // accumulate a distinct union only; iteration order never reaches output.
         let mut ent_caller_keyword_names: BTreeSet<String> = BTreeSet::new();
         let mut ent_any_var_keyword_caller = false;
-        let mut ent_all_consumers_shaped_calls = true;
+        let mut ent_all_consumers_shaped_calls = call_shape_parse_coverage_complete;
 
         // Find relations pointing TO this entity (callers, dependents, etc.).
         // `get_relations` serves outgoing edges only, so the inbound harvest
@@ -427,21 +497,36 @@ pub fn analyze_impact_at<I: ImpactGraph>(
                 if let Some(file) = entity_file(&entity) {
                     ent_consumer_files.insert(file);
                 }
-                // Distill this consumer edge's call-site argument shape. A rename
-                // is only provably safe when every counted consumer is a call
-                // carrying shape evidence; a non-call edge, or a call with no
-                // captured shape, leaves it unprovable.
+                // Distill every call-site argument shape retained on this logical
+                // consumer edge. A single caller can invoke the same target many
+                // times, so relation evidence is a per-site set rather than a
+                // scalar. A rename is only provably safe when every counted
+                // consumer is a call and every occurrence carries shape evidence
+                // stamped by the complete-occurrence aggregator. A non-call edge,
+                // an older empty edge, an explicit unshaped occurrence, or legacy
+                // first-occurrence evidence without the marker leaves it
+                // unprovable.
                 if rel.kind == RelationKind::Calls {
-                    match rel.evidence.iter().find_map(|ev| ev.call_shape.as_ref()) {
-                        Some(shape) => {
-                            for keyword in &shape.keywords {
-                                ent_caller_keyword_names.insert(keyword.clone());
+                    if rel.evidence.is_empty() {
+                        ent_all_consumers_shaped_calls = false;
+                    }
+                    for evidence in &rel.evidence {
+                        match evidence.call_shape.as_ref() {
+                            Some(shape) => {
+                                if evidence.parser_rule.as_deref()
+                                    != Some(kin_index::CALL_SHAPE_EVIDENCE_AGGREGATION_V1)
+                                {
+                                    ent_all_consumers_shaped_calls = false;
+                                }
+                                for keyword in &shape.keywords {
+                                    ent_caller_keyword_names.insert(keyword.clone());
+                                }
+                                if shape.has_var_keyword {
+                                    ent_any_var_keyword_caller = true;
+                                }
                             }
-                            if shape.has_var_keyword {
-                                ent_any_var_keyword_caller = true;
-                            }
+                            None => ent_all_consumers_shaped_calls = false,
                         }
-                        None => ent_all_consumers_shaped_calls = false,
                     }
                 } else {
                     ent_all_consumers_shaped_calls = false;
@@ -638,6 +723,7 @@ mod tests {
         Visibility,
     };
     use kin_model::ids::*;
+    use kin_model::EntityStore;
 
     fn test_entity(name: &str) -> Entity {
         Entity {
@@ -788,6 +874,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn live_coverage_fails_closed_when_stale_full_and_extraction_incomplete_coexist() {
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = entity_in_file("target", "src/lib.py", 1);
+        let completeness = kin_index::FileParseCompletenessMap::from([(
+            "src/lib.py".to_string(),
+            kin_model::ParseCompleteness::Full,
+        )]);
+        let complete_files = [kin_index::FileParseData {
+            file_path: "src/lib.py".to_string(),
+            entities: vec![entity.clone()],
+            relations: Vec::new(),
+            imports: Vec::new(),
+        }];
+        let mut coverage =
+            kin_index::link_cross_file_with_completeness(&complete_files, &completeness);
+        let mut extraction_incomplete = coverage[0].clone();
+        extraction_incomplete.id = RelationId::from_bytes([0xee; 16]);
+        extraction_incomplete.dst = GraphNodeId::Artifact(kin_model::ArtifactId::seed_from_path(
+            "kin-internal://test/extraction-incomplete/src/lib.py",
+        ));
+        extraction_incomplete.evidence = vec![RelationEvidence {
+            source_path: Some("src/lib.py".to_string()),
+            parser_rule: Some(kin_index::CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1.to_string()),
+            ..RelationEvidence::default()
+        }];
+        coverage.push(extraction_incomplete);
+
+        graph
+            .upsert_file_layout(&kin_model::FileLayout {
+                file_id: FilePathId::new("src/lib.py"),
+                parse_completeness: kin_model::ParseCompleteness::Full,
+                imports: kin_model::ImportSection {
+                    byte_range: 0..0,
+                    items: Vec::new(),
+                },
+                regions: Vec::new(),
+            })
+            .unwrap();
+        graph.upsert_entity(&entity).unwrap();
+        for relation in coverage {
+            graph.upsert_relation(&relation).unwrap();
+        }
+
+        assert!(
+            !LiveGraph(&graph)
+                .call_shape_parse_coverage_complete()
+                .unwrap(),
+            "explicit extraction-incomplete evidence must dominate a stale full marker"
+        );
+    }
+
     fn modified(entity: &Entity) -> EntityChange {
         EntityChange {
             entity_id: entity.id,
@@ -809,6 +947,10 @@ mod tests {
     }
 
     impl ImpactGraph for MockImpactGraph {
+        fn call_shape_parse_coverage_complete(&self) -> Result<bool, ReviewError> {
+            Ok(true)
+        }
+
         fn get_entity(&self, id: &EntityId) -> Result<Option<Entity>, ReviewError> {
             Ok(self.entities.get(id).cloned())
         }
@@ -992,6 +1134,14 @@ mod tests {
     // ── Call-site argument-shape harvest + arity-preserving rename gating ──
 
     fn calls_with_shape(src: &Entity, dst: &Entity, shape: CallArgShape) -> Relation {
+        calls_with_shapes(src, dst, vec![Some(shape)])
+    }
+
+    fn calls_with_shapes(
+        src: &Entity,
+        dst: &Entity,
+        shapes: Vec<Option<CallArgShape>>,
+    ) -> Relation {
         Relation {
             id: RelationId::new(),
             kind: RelationKind::Calls,
@@ -1001,10 +1151,16 @@ mod tests {
             origin: RelationOrigin::Parsed,
             created_in: None,
             import_source: None,
-            evidence: vec![RelationEvidence {
-                call_shape: Some(shape),
-                ..RelationEvidence::default()
-            }],
+            evidence: shapes
+                .into_iter()
+                .map(|call_shape| RelationEvidence {
+                    parser_rule: call_shape
+                        .as_ref()
+                        .map(|_| kin_index::CALL_SHAPE_EVIDENCE_AGGREGATION_V1.to_string()),
+                    call_shape,
+                    ..RelationEvidence::default()
+                })
+                .collect(),
         }
     }
 
@@ -1095,6 +1251,68 @@ mod tests {
         );
         assert!(!summary.any_var_keyword_caller);
         assert!(summary.caller_keyword_names.contains("args"));
+    }
+
+    #[test]
+    fn harvest_fails_closed_when_any_call_occurrence_lacks_shape() {
+        let target = target_entity(RENAME_NEW);
+        let caller = entity_in_file("caller", "src/caller.py", 1);
+        let mut graph = MockImpactGraph::default();
+        graph.entities.insert(target.id, target.clone());
+        graph.entities.insert(caller.id, caller.clone());
+        graph.inbound.insert(
+            target.id,
+            vec![calls_with_shapes(
+                &caller,
+                &target,
+                vec![
+                    Some(CallArgShape::new(
+                        1,
+                        vec!["safe_other_keyword".to_string()],
+                        false,
+                        false,
+                    )),
+                    None,
+                ],
+            )],
+        );
+        let diff = SemanticDiff {
+            entity_changes: vec![modified(&target)],
+            ..Default::default()
+        };
+        let report = analyze_impact_at(&graph, &diff).unwrap();
+        let summary = &report.entity_impact(&target.id).unwrap().call_shapes;
+
+        assert!(summary.caller_keyword_names.contains("safe_other_keyword"));
+        assert!(
+            !summary.all_consumers_shaped_calls,
+            "one unshaped occurrence makes the entire rename proof incomplete"
+        );
+    }
+
+    #[test]
+    fn harvest_fails_closed_when_shape_lacks_complete_aggregation_marker() {
+        let target = target_entity(RENAME_NEW);
+        let caller = entity_in_file("caller", "src/caller.py", 1);
+        let mut legacy =
+            calls_with_shape(&caller, &target, CallArgShape::new(2, vec![], false, false));
+        legacy.evidence[0].parser_rule = None;
+
+        let mut graph = MockImpactGraph::default();
+        graph.entities.insert(target.id, target.clone());
+        graph.entities.insert(caller.id, caller);
+        graph.inbound.insert(target.id, vec![legacy]);
+        let diff = SemanticDiff {
+            entity_changes: vec![modified(&target)],
+            ..Default::default()
+        };
+        let report = analyze_impact_at(&graph, &diff).unwrap();
+        let summary = &report.entity_impact(&target.id).unwrap().call_shapes;
+
+        assert!(
+            !summary.all_consumers_shaped_calls,
+            "a v0.2.15 shaped record without the aggregation marker is incomplete proof"
+        );
     }
 
     #[test]

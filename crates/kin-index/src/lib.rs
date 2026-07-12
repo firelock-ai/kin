@@ -28,8 +28,13 @@ pub use fingerprint::{
 pub use linker::{
     build_projection_derived_relations_for_file, build_projection_derived_relations_from_markers,
     extract_projection_source_markers, link_cross_file, link_cross_file_against_entities,
-    link_cross_file_incremental, CrossFileLinker, FileParseData, IncrementalLinker,
+    link_cross_file_against_entities_with_completeness, link_cross_file_incremental,
+    link_cross_file_incremental_with_completeness, link_cross_file_with_completeness,
+    CrossFileLinker, FileParseCompletenessMap, FileParseData, IncrementalLinker,
     IncrementalLinkerCheckpointV1, LinkingOutcome, UnresolvedRelation,
+    CALL_SHAPE_EVIDENCE_AGGREGATION_V1, CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1,
+    CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1, CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1,
+    CALL_SHAPE_PARSE_COVERAGE_FULL_V1, CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1,
     INCREMENTAL_LINKER_CHECKPOINT_VERSION, KIN_INDEX_CRATE_VERSION,
 };
 pub use overlay::{apply_file_removal, apply_to_graph, ApplyResult};

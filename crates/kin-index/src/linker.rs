@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,10 +13,59 @@ use tracing::debug;
 use sha2::{Digest, Sha256};
 
 use kin_model::{
-    ArtifactId, Entity, EntityId, EntityKind, GraphNodeId, LanguageId, Relation, RelationEvidence,
-    RelationId, RelationKind, RelationOrigin, Visibility,
+    ArtifactId, Entity, EntityId, EntityKind, GraphNodeId, LanguageId, ParseCompleteness, Relation,
+    RelationEvidence, RelationId, RelationKind, RelationOrigin, Visibility,
 };
-use kin_parser::{CallArgShape, ExtractedRelation, FileImport};
+use kin_parser::{
+    is_call_extraction_incomplete_marker, CallArgShape, ExtractedRelation, FileImport,
+};
+
+/// Persisted provenance marker for call-shape evidence produced by a linker
+/// that preserves every occurrence on one logical `(src, dst, Calls)` edge.
+///
+/// v0.2.15 could persist one shaped occurrence while silently dropping later
+/// calls from the same caller to the same target. Those legacy records already
+/// have `call_shape: Some(_)`, so shape presence alone cannot certify complete
+/// evidence after an upgrade. New full-file batch and incremental linking stamp
+/// every shaped record with this marker; review requires it before a rename may
+/// be neutralized. `parser_rule` is defaultable in storage, making an older
+/// record's absent marker a conservative, backward-compatible `unknown`.
+pub const CALL_SHAPE_EVIDENCE_AGGREGATION_V1: &str = "call_shape_aggregation_v1";
+
+/// Persisted fail-closed marker for call evidence recovered from a parse that
+/// was not fully valid. A recovered tree can omit call sites, so even a shaped
+/// occurrence cannot certify that every call on the logical edge was observed.
+/// Review treats this explicit unshaped record as unknown/blocking evidence.
+pub const CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1: &str = "call_shape_incomplete_parse_v1";
+
+/// Persisted fail-closed marker for a syntax-valid file whose adapter could not
+/// represent every call expression with a statically proven named target. This
+/// is deliberately distinct from parse recovery: the source parsed, but call
+/// extraction or receiver resolution was not exhaustive, so shaped occurrences
+/// cannot certify a parameter rename.
+pub const CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1: &str =
+    "call_shape_incomplete_extraction_v1";
+
+/// File-level certificate that the parser observed the complete source file.
+/// Ref-scoped review requires this positive evidence because old graph history
+/// has no way to distinguish a full parse from a recovered parse that omitted
+/// every relevant call.
+pub const CALL_SHAPE_PARSE_COVERAGE_FULL_V1: &str = "call_shape_parse_coverage_full_v1";
+
+/// File-level marker that call-site coverage is incomplete or unknown.
+pub const CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1: &str = "call_shape_parse_coverage_incomplete_v1";
+
+/// File-level marker that syntax was valid but named-call extraction or
+/// receiver resolution was not exhaustive.
+pub const CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1: &str =
+    "call_shape_extraction_coverage_incomplete_v1";
+
+/// Per-file parse completeness supplied by ingestion paths that have parser
+/// state available. Kept separate from [`FileParseData`] so adding the safety
+/// signal does not break downstream struct literals for the published API.
+pub type FileParseCompletenessMap = HashMap<String, ParseCompleteness>;
+
+const FULL_PARSE_COMPLETENESS: ParseCompleteness = ParseCompleteness::Full;
 
 /// Result of resolving a single unresolved relation.
 #[derive(Debug)]
@@ -102,12 +151,31 @@ const INDEX_FILENAMES: &[&str] = &["index.ts", "index.tsx", "index.js", "index.j
 ///
 /// Returns a deduplicated list of resolved Relations.
 pub fn link_cross_file(files: &[FileParseData]) -> Vec<Relation> {
+    link_cross_file_internal(files, None)
+}
+
+/// Resolve cross-file relations with explicit parser completeness.
+///
+/// Unlike the compatibility [`link_cross_file`] entry point, this path emits a
+/// positive or negative file-level call-coverage certificate even when parser
+/// recovery omitted every call relation in that file.
+pub fn link_cross_file_with_completeness(
+    files: &[FileParseData],
+    completeness: &FileParseCompletenessMap,
+) -> Vec<Relation> {
+    link_cross_file_internal(files, Some(completeness))
+}
+
+fn link_cross_file_internal(
+    files: &[FileParseData],
+    completeness: Option<&FileParseCompletenessMap>,
+) -> Vec<Relation> {
     let _span = tracing::info_span!("kin.index.link_cross_file", files = files.len()).entered();
     let universe_entities: Vec<Entity> = files
         .iter()
         .flat_map(|file| file.entities.iter().cloned())
         .collect();
-    link_cross_file_against_entities(files, &universe_entities)
+    link_cross_file_against_entities_internal(files, &universe_entities, completeness)
 }
 
 /// Resolve cross-file relations while carrying parser-emitted tests alongside the input.
@@ -122,6 +190,24 @@ pub fn link_cross_file_with_tests(files: &[FileParseDataWithTests]) -> Vec<Relat
         })
         .collect();
     link_cross_file(&linkable)
+}
+
+/// Resolve cross-file relations while retaining parser tests and explicit
+/// parse completeness.
+pub fn link_cross_file_with_tests_and_completeness(
+    files: &[FileParseDataWithTests],
+    completeness: &FileParseCompletenessMap,
+) -> Vec<Relation> {
+    let linkable: Vec<FileParseData> = files
+        .iter()
+        .map(|file| FileParseData {
+            file_path: file.file_path.clone(),
+            entities: file.entities.clone(),
+            relations: file.relations.clone(),
+            imports: file.imports.clone(),
+        })
+        .collect();
+    link_cross_file_with_completeness(&linkable, completeness)
 }
 
 /// Total order over entities so cross-file linking is order-independent.
@@ -168,6 +254,24 @@ pub fn link_cross_file_against_entities(
     files: &[FileParseData],
     universe_entities: &[Entity],
 ) -> Vec<Relation> {
+    link_cross_file_against_entities_internal(files, universe_entities, None)
+}
+
+/// Resolve a parsed subset against a broader entity universe while honoring
+/// explicit parser completeness.
+pub fn link_cross_file_against_entities_with_completeness(
+    files: &[FileParseData],
+    universe_entities: &[Entity],
+    completeness: &FileParseCompletenessMap,
+) -> Vec<Relation> {
+    link_cross_file_against_entities_internal(files, universe_entities, Some(completeness))
+}
+
+fn link_cross_file_against_entities_internal(
+    files: &[FileParseData],
+    universe_entities: &[Entity],
+    completeness: Option<&FileParseCompletenessMap>,
+) -> Vec<Relation> {
     let _span = tracing::info_span!(
         "kin.index.link_cross_file_against_entities",
         files = files.len(),
@@ -198,7 +302,7 @@ pub fn link_cross_file_against_entities(
         files
             .par_iter()
             .map(|file| {
-                let relations = resolve_one_file(file, &ctx);
+                let relations = resolve_one_file(file, &ctx, completeness);
                 if total_files > 50 {
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                     let total =
@@ -219,7 +323,7 @@ pub fn link_cross_file_against_entities(
             .collect()
     };
 
-    let resolved = merge_resolved(per_file_relations, files, &ctx);
+    let resolved = merge_resolved(per_file_relations, files, &ctx, completeness);
 
     if total_files > 0 {
         eprintln!(); // newline after \r progress
@@ -394,15 +498,40 @@ fn build_link_context<'a>(
 /// Resolve the name-based relations of a single file into entity-ID relations.
 ///
 /// All reads are against the shared read-only [`LinkContext`]; the only mutable
-/// state is a file-local dedup set, so this is pure with respect to other files.
-fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation> {
+/// state is a file-local relation accumulator, so this is pure with respect to
+/// other files.
+fn resolve_one_file(
+    file: &FileParseData,
+    ctx: &LinkContext<'_>,
+    completeness: Option<&FileParseCompletenessMap>,
+) -> Vec<Relation> {
     let mut resolved = Vec::new();
-    let mut seen: HashSet<(EntityId, EntityId, RelationKind)> = HashSet::new();
+    let mut relation_indices = HashMap::new();
+    let call_extraction_complete = !file
+        .relations
+        .iter()
+        .any(is_call_extraction_incomplete_marker);
+    let parse_completeness = completeness
+        .and_then(|by_file| by_file.get(&file.file_path))
+        .unwrap_or(&FULL_PARSE_COMPLETENESS);
+    let make_relation = |rel: &ExtractedRelation, src, dst, confidence| {
+        make_relation(
+            rel,
+            src,
+            dst,
+            confidence,
+            parse_completeness,
+            call_extraction_complete,
+        )
+    };
     // Lazily resolved once per file: only ambiguous name buckets need them.
     let mut caller_import_targets: Option<HashSet<String>> = None;
     let mut caller_include_closure: Option<HashMap<String, usize>> = None;
 
     for rel in &file.relations {
+        if is_call_extraction_incomplete_marker(rel) {
+            continue;
+        }
         let src_id = ctx
             .entity_by_file_name
             .get(&(file.file_path.as_str(), rel.src_name.as_str()));
@@ -431,9 +560,11 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
         if rel.kind == RelationKind::UsesMacro {
             if let Some(&dst_id) = dst_same_file {
                 if ctx.entity_kind_by_id.get(&dst_id) == Some(&EntityKind::Macro) {
-                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                        resolved.push(make_relation(rel, src_id, dst_id, 1.0));
-                    }
+                    accumulate_relation(
+                        &mut resolved,
+                        &mut relation_indices,
+                        make_relation(rel, src_id, dst_id, 1.0),
+                    );
                     continue;
                 }
             }
@@ -445,9 +576,11 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                 &ctx.entity_by_file_name,
                 &ctx.entity_kind_by_id,
             ) {
-                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                    resolved.push(make_relation(rel, src_id, dst_id, 0.95));
-                }
+                accumulate_relation(
+                    &mut resolved,
+                    &mut relation_indices,
+                    make_relation(rel, src_id, dst_id, 0.95),
+                );
                 continue;
             }
 
@@ -469,9 +602,11 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
         // so they carry the (c) name-match confidence (0.7), below the
         // parser-certain same-file edge (1.0).
         if let Some(&dst_id) = dst_same_file {
-            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                resolved.push(make_relation(rel, src_id, dst_id, 1.0));
-            }
+            accumulate_relation(
+                &mut resolved,
+                &mut relation_indices,
+                make_relation(rel, src_id, dst_id, 1.0),
+            );
             let mut cross_file_twins: HashSet<EntityId> = HashSet::new();
             distinct_cross_file_targets(
                 ctx.entity_by_name.get(rel.dst_name.as_str()),
@@ -482,9 +617,11 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                 prune_ids_by_arity(cross_file_twins, call_arity, &ctx.entity_arity_by_id);
             if !cross_file_twins.is_empty() && cross_file_twins.len() < AMBIGUOUS_CALL_FANOUT_CAP {
                 for cross_id in sorted_fanout_targets(cross_file_twins) {
-                    if add_deduped(&mut seen, src_id, cross_id, rel.kind) {
-                        resolved.push(make_relation(rel, src_id, cross_id, 0.7));
-                    }
+                    accumulate_relation(
+                        &mut resolved,
+                        &mut relation_indices,
+                        make_relation(rel, src_id, cross_id, 0.7),
+                    );
                 }
             }
             continue;
@@ -513,14 +650,11 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                     if let Some(dst_id) =
                         resolve_inherited_method(&file.file_path, owner, method, ctx)
                     {
-                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                            resolved.push(make_relation(
-                                rel,
-                                src_id,
-                                dst_id,
-                                INHERITED_METHOD_CONFIDENCE,
-                            ));
-                        }
+                        accumulate_relation(
+                            &mut resolved,
+                            &mut relation_indices,
+                            make_relation(rel, src_id, dst_id, INHERITED_METHOD_CONFIDENCE),
+                        );
                         continue;
                     }
                     dst_lookup = method;
@@ -547,9 +681,11 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                         None
                     };
                     if let Some(dst_id) = dst_id {
-                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                            resolved.push(make_relation(rel, src_id, dst_id, 0.95));
-                        }
+                        accumulate_relation(
+                            &mut resolved,
+                            &mut relation_indices,
+                            make_relation(rel, src_id, dst_id, 0.95),
+                        );
                         continue;
                     }
                 }
@@ -568,9 +704,11 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                             .entity_by_file_name
                             .get(&(target_file.as_str(), member_name))
                         {
-                            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                                resolved.push(make_relation(rel, src_id, dst_id, 0.9));
-                            }
+                            accumulate_relation(
+                                &mut resolved,
+                                &mut relation_indices,
+                                make_relation(rel, src_id, dst_id, 0.9),
+                            );
                             continue;
                         }
                     }
@@ -602,9 +740,11 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
             &other_file_candidates,
         ) {
             ImportPinnedTarget::Resolved(dst_id) => {
-                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                    resolved.push(make_relation(rel, src_id, dst_id, IMPORT_PINNED_CONFIDENCE));
-                }
+                accumulate_relation(
+                    &mut resolved,
+                    &mut relation_indices,
+                    make_relation(rel, src_id, dst_id, IMPORT_PINNED_CONFIDENCE),
+                );
                 continue;
             }
             ImportPinnedTarget::PinnedMiss => name_fallback_allowed = false,
@@ -656,10 +796,12 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                     None => (other_file_candidates[0].1, 0.7),
                 }
             };
-            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                resolved.push(make_relation(rel, src_id, dst_id, confidence));
-                linked = true;
-            }
+            accumulate_relation(
+                &mut resolved,
+                &mut relation_indices,
+                make_relation(rel, src_id, dst_id, confidence),
+            );
+            linked = true;
         }
 
         // (c2) Receiver-method calls (`x.method()`) arrive as the bare method
@@ -681,10 +823,12 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                 prune_ids_by_arity(distinct_targets, call_arity, &ctx.entity_arity_by_id);
             if (1..=AMBIGUOUS_CALL_FANOUT_CAP).contains(&distinct_targets.len()) {
                 for dst_id in sorted_fanout_targets(distinct_targets) {
-                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                        resolved.push(make_relation(rel, src_id, dst_id, 0.3));
-                        linked = true;
-                    }
+                    accumulate_relation(
+                        &mut resolved,
+                        &mut relation_indices,
+                        make_relation(rel, src_id, dst_id, 0.3),
+                    );
+                    linked = true;
                 }
             }
         }
@@ -706,15 +850,12 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                     if let Some(dst_id) =
                         resolve_inherited_method(&owner_file, &owner_class, method, ctx)
                     {
-                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                            resolved.push(make_relation(
-                                rel,
-                                src_id,
-                                dst_id,
-                                INHERITED_METHOD_CONFIDENCE,
-                            ));
-                            linked = true;
-                        }
+                        accumulate_relation(
+                            &mut resolved,
+                            &mut relation_indices,
+                            make_relation(rel, src_id, dst_id, INHERITED_METHOD_CONFIDENCE),
+                        );
+                        linked = true;
                     }
                 }
             }
@@ -740,15 +881,12 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                 call_arity,
                 ctx,
             ) {
-                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                    resolved.push(make_relation(
-                        rel,
-                        src_id,
-                        dst_id,
-                        QUALIFIED_SUFFIX_CONFIDENCE,
-                    ));
-                    linked = true;
-                }
+                accumulate_relation(
+                    &mut resolved,
+                    &mut relation_indices,
+                    make_relation(rel, src_id, dst_id, QUALIFIED_SUFFIX_CONFIDENCE),
+                );
+                linked = true;
             }
         }
 
@@ -765,11 +903,7 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
         if let Some(external) =
             make_external_reference_relation(rel, src_id, &file.file_path, &ctx.known_files)
         {
-            if let GraphNodeId::Entity(dst_id) = external.dst {
-                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                    resolved.push(external);
-                }
-            }
+            accumulate_relation(&mut resolved, &mut relation_indices, external);
             continue;
         }
 
@@ -792,14 +926,13 @@ fn merge_resolved(
     per_file_relations: Vec<Vec<Relation>>,
     files: &[FileParseData],
     ctx: &LinkContext<'_>,
+    completeness: Option<&FileParseCompletenessMap>,
 ) -> Vec<Relation> {
     let mut resolved = Vec::new();
-    let mut seen: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
+    let mut relation_indices = HashMap::new();
     for file_relations in per_file_relations {
         for rel in file_relations {
-            if seen.insert((rel.src, rel.dst, rel.kind)) {
-                resolved.push(rel);
-            }
+            accumulate_relation(&mut resolved, &mut relation_indices, rel);
         }
     }
 
@@ -841,6 +974,8 @@ fn merge_resolved(
         }
     }
 
+    append_parse_coverage_relations(&mut resolved, files, completeness);
+
     resolved
 }
 
@@ -854,9 +989,9 @@ fn link_cross_file_against_entities_serial(
     let ctx = build_link_context(files, universe_entities);
     let per_file_relations: Vec<Vec<Relation>> = files
         .iter()
-        .map(|file| resolve_one_file(file, &ctx))
+        .map(|file| resolve_one_file(file, &ctx, None))
         .collect();
-    merge_resolved(per_file_relations, files, &ctx)
+    merge_resolved(per_file_relations, files, &ctx, None)
 }
 
 /// Serial counterpart of [`build_include_graph`], retained as the byte-identical
@@ -901,12 +1036,10 @@ fn merge_resolved_serial(
     ctx: &LinkContext<'_>,
 ) -> Vec<Relation> {
     let mut resolved = Vec::new();
-    let mut seen: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
+    let mut relation_indices = HashMap::new();
     for file_relations in per_file_relations {
         for rel in file_relations {
-            if seen.insert((rel.src, rel.dst, rel.kind)) {
-                resolved.push(rel);
-            }
+            accumulate_relation(&mut resolved, &mut relation_indices, rel);
         }
     }
     let mut seen_artifact: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
@@ -1090,14 +1223,166 @@ fn resolve_reachable_macro_target_incremental(
     None
 }
 
-/// Try to insert a (src, dst, kind) triple; returns true if it was new.
-fn add_deduped(
-    seen: &mut HashSet<(EntityId, EntityId, RelationKind)>,
-    src: EntityId,
-    dst: EntityId,
-    kind: RelationKind,
-) -> bool {
-    seen.insert((src, dst, kind))
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CallShapeEvidenceKey {
+    positional: u32,
+    keywords: Vec<String>,
+    has_var_positional: bool,
+    has_var_keyword: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CallEvidenceKey {
+    source_span: Option<(String, usize, usize, u32, u32, u32, u32)>,
+    parser_rule: Option<String>,
+    token: Option<String>,
+    source_path: Option<String>,
+    resolved_path: Option<String>,
+    call_shape: Option<CallShapeEvidenceKey>,
+}
+
+fn canonicalize_call_evidence(evidence: &mut Vec<RelationEvidence>) {
+    let mut canonical = BTreeMap::<CallEvidenceKey, RelationEvidence>::new();
+
+    for mut record in evidence.drain(..) {
+        if let Some(shape) = &mut record.call_shape {
+            shape.keywords.sort();
+            shape.keywords.dedup();
+        }
+        // Exhaustive destructuring makes a future RelationEvidence field fail
+        // compilation until the deterministic key explicitly accounts for it.
+        let RelationEvidence {
+            source_span,
+            parser_rule,
+            token,
+            source_path,
+            resolved_path,
+            occurrence_count: _,
+            call_shape,
+        } = &record;
+        let key = CallEvidenceKey {
+            source_span: source_span.as_ref().map(|span| {
+                (
+                    span.file.to_string(),
+                    span.start_byte,
+                    span.end_byte,
+                    span.start_line,
+                    span.start_col,
+                    span.end_line,
+                    span.end_col,
+                )
+            }),
+            parser_rule: parser_rule.clone(),
+            token: token.clone(),
+            source_path: source_path.clone(),
+            resolved_path: resolved_path.clone(),
+            call_shape: call_shape.as_ref().map(|shape| {
+                let kin_model::CallArgShape {
+                    positional,
+                    keywords,
+                    has_var_positional,
+                    has_var_keyword,
+                } = shape;
+                CallShapeEvidenceKey {
+                    positional: *positional,
+                    keywords: keywords.clone(),
+                    has_var_positional: *has_var_positional,
+                    has_var_keyword: *has_var_keyword,
+                }
+            }),
+        };
+        match canonical.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(record);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let occurrence_count = entry
+                    .get()
+                    .occurrence_count
+                    .saturating_add(record.occurrence_count);
+                entry.get_mut().occurrence_count = occurrence_count;
+            }
+        }
+    }
+
+    evidence.extend(canonical.into_values());
+}
+
+fn relation_origin_priority(origin: RelationOrigin) -> u8 {
+    match origin {
+        RelationOrigin::Manual => 4,
+        RelationOrigin::Lsp => 3,
+        RelationOrigin::Parsed => 2,
+        RelationOrigin::Inferred => 1,
+    }
+}
+
+/// Merge scalar metadata without making the retained relation depend on which
+/// source occurrence happened to be linked first. Confidence is the review
+/// gate's authority, so the strongest resolution wins and carries its origin.
+/// Equal-confidence origins use the same provenance ordering as semantic
+/// resolution elsewhere in Kin. Import sources are explanatory rather than a
+/// strength signal; retain one deterministically instead of dropping a later
+/// source-bearing occurrence.
+fn merge_relation_metadata(existing: &mut Relation, incoming: &Relation) {
+    let incoming_is_stronger = match incoming.confidence.total_cmp(&existing.confidence) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Equal => {
+            relation_origin_priority(incoming.origin) > relation_origin_priority(existing.origin)
+        }
+        std::cmp::Ordering::Less => false,
+    };
+    if incoming_is_stronger {
+        existing.confidence = incoming.confidence;
+        existing.origin = incoming.origin;
+    }
+
+    match (&existing.import_source, &incoming.import_source) {
+        (None, Some(_)) => existing.import_source.clone_from(&incoming.import_source),
+        (Some(current), Some(candidate)) if candidate < current => {
+            existing.import_source.clone_from(&incoming.import_source);
+        }
+        _ => {}
+    }
+}
+
+/// Insert one logical relation, preserving every call-site shape on repeated
+/// `(src, dst, Calls)` edges. Relation IDs intentionally identify the logical
+/// caller/callee edge rather than an individual source occurrence, so distinct
+/// shapes live as deterministic evidence records and identical shapes collapse
+/// through `occurrence_count`. An empty evidence vector is an older or
+/// shape-blind call site; when mixed with shaped occurrences it becomes an
+/// explicit `call_shape: None` marker so downstream proof fails closed.
+pub(crate) fn accumulate_relation(
+    resolved: &mut Vec<Relation>,
+    relation_indices: &mut HashMap<(GraphNodeId, GraphNodeId, RelationKind), usize>,
+    mut relation: Relation,
+) {
+    let key = (relation.src, relation.dst, relation.kind);
+    let Some(&index) = relation_indices.get(&key) else {
+        relation_indices.insert(key, resolved.len());
+        resolved.push(relation);
+        return;
+    };
+
+    let existing = &mut resolved[index];
+    merge_relation_metadata(existing, &relation);
+
+    if relation.kind != RelationKind::Calls {
+        return;
+    }
+
+    let existing_missing_shape = existing.evidence.is_empty();
+    let incoming_missing_shape = relation.evidence.is_empty();
+    if existing_missing_shape {
+        existing.evidence.push(RelationEvidence::default());
+    }
+    if incoming_missing_shape {
+        existing.evidence.push(RelationEvidence::default());
+    } else {
+        existing.evidence.append(&mut relation.evidence);
+    }
+    canonicalize_call_evidence(&mut existing.evidence);
 }
 
 /// Split a dotted member access like `util.finalizeIssue` into the import alias (`util`)
@@ -2159,6 +2444,8 @@ fn make_relation(
     src: EntityId,
     dst: EntityId,
     confidence: f32,
+    parse_completeness: &ParseCompleteness,
+    call_extraction_complete: bool,
 ) -> Relation {
     let kind = rel.kind;
     let origin = if confidence >= 1.0 {
@@ -2179,16 +2466,46 @@ fn make_relation(
         origin,
         created_in: None,
         import_source: None,
-        evidence: call_shape_evidence(rel.call_shape.as_ref()),
+        evidence: call_shape_evidence(
+            rel.kind,
+            rel.call_shape.as_ref(),
+            parse_completeness,
+            call_extraction_complete,
+        ),
     }
 }
 
 /// Convert a parser-side [`CallArgShape`] into stored relation evidence carrying
-/// the graph-model shape mirror. Empty when the call site recorded no shape, so
-/// non-call and shape-blind edges stay evidence-free as before.
-pub(crate) fn call_shape_evidence(shape: Option<&CallArgShape>) -> Vec<RelationEvidence> {
+/// the graph-model shape mirror. Fully parsed shaped calls receive the complete
+/// aggregation certificate; recovered calls receive an explicit unshaped
+/// marker because the parse may have omitted sibling occurrences. Non-call and
+/// fully parsed shape-blind edges stay evidence-free as before.
+pub(crate) fn call_shape_evidence(
+    kind: RelationKind,
+    shape: Option<&CallArgShape>,
+    parse_completeness: &ParseCompleteness,
+    call_extraction_complete: bool,
+) -> Vec<RelationEvidence> {
+    if kind != RelationKind::Calls {
+        return Vec::new();
+    }
+    if !call_extraction_complete {
+        return vec![RelationEvidence {
+            parser_rule: Some(CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1.to_string()),
+            call_shape: None,
+            ..RelationEvidence::default()
+        }];
+    }
+    if !matches!(parse_completeness, ParseCompleteness::Full) {
+        return vec![RelationEvidence {
+            parser_rule: Some(CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1.to_string()),
+            call_shape: None,
+            ..RelationEvidence::default()
+        }];
+    }
     match shape {
         Some(shape) => vec![RelationEvidence {
+            parser_rule: Some(CALL_SHAPE_EVIDENCE_AGGREGATION_V1.to_string()),
             call_shape: Some(kin_model::CallArgShape::new(
                 shape.positional,
                 shape.keywords.clone(),
@@ -2323,6 +2640,91 @@ where
         import_source: Some(import.module_path.clone()),
         evidence: vec![evidence],
     })
+}
+
+const CALL_SHAPE_COVERAGE_FULL_HUB_PREFIX: &str =
+    "kin-internal://call-shape-parse-coverage/full-v1/";
+const CALL_SHAPE_COVERAGE_INCOMPLETE_HUB_PREFIX: &str =
+    "kin-internal://call-shape-parse-coverage/incomplete-v1/";
+
+/// Build the graph-owned file-level call-coverage certificate used by
+/// ref-scoped review. The destination hub differs across states so a
+/// Full-to-Partial transition changes relation identity even in history paths
+/// that compare relation IDs before deciding what to replace.
+fn make_parse_coverage_relation(
+    file_path: &str,
+    completeness: Option<&ParseCompleteness>,
+    call_extraction_complete: bool,
+) -> Relation {
+    let is_full = call_extraction_complete && matches!(completeness, Some(ParseCompleteness::Full));
+    let (hub_prefix, parser_rule, token) = if !call_extraction_complete {
+        (
+            CALL_SHAPE_COVERAGE_INCOMPLETE_HUB_PREFIX,
+            CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1,
+            "call-extraction-incomplete",
+        )
+    } else if is_full {
+        (
+            CALL_SHAPE_COVERAGE_FULL_HUB_PREFIX,
+            CALL_SHAPE_PARSE_COVERAGE_FULL_V1,
+            "full",
+        )
+    } else {
+        (
+            CALL_SHAPE_COVERAGE_INCOMPLETE_HUB_PREFIX,
+            CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1,
+            completeness
+                .map(ParseCompleteness::bucket)
+                .unwrap_or("missing"),
+        )
+    };
+    // Each file gets its own reserved status endpoint. A shared hub would make
+    // unrelated source artifacts appear connected at traversal depth two.
+    let hub = format!("{hub_prefix}{file_path}");
+    let src = GraphNodeId::Artifact(ArtifactId::seed_from_path(file_path));
+    let dst = GraphNodeId::Artifact(ArtifactId::seed_from_path(&hub));
+    let kind = RelationKind::DependsOn;
+    Relation {
+        id: stable_relation_node_id(&src, &dst, &kind),
+        kind,
+        src,
+        dst,
+        confidence: 1.0,
+        origin: RelationOrigin::Parsed,
+        created_in: None,
+        import_source: None,
+        evidence: vec![RelationEvidence {
+            token: Some(token.to_string()),
+            source_path: Some(file_path.to_string()),
+            parser_rule: Some(parser_rule.to_string()),
+            occurrence_count: 1,
+            ..RelationEvidence::default()
+        }],
+    }
+}
+
+fn append_parse_coverage_relations(
+    resolved: &mut Vec<Relation>,
+    files: &[FileParseData],
+    completeness: Option<&FileParseCompletenessMap>,
+) {
+    let Some(completeness) = completeness else {
+        return;
+    };
+    let mut seen = HashSet::new();
+    for file in files {
+        if seen.insert(file.file_path.as_str()) {
+            let call_extraction_complete = !file
+                .relations
+                .iter()
+                .any(is_call_extraction_incomplete_marker);
+            resolved.push(make_parse_coverage_relation(
+                &file.file_path,
+                completeness.get(&file.file_path),
+                call_extraction_complete,
+            ));
+        }
+    }
 }
 
 /// Build artifact-level provenance edges for generated projection files.
@@ -3221,6 +3623,24 @@ pub fn link_cross_file_incremental(
     files: &[FileParseData],
     linker: &IncrementalLinker,
 ) -> Vec<Relation> {
+    link_cross_file_incremental_internal(files, linker, None)
+}
+
+/// Resolve cross-file relations through the incremental indexes while
+/// preserving explicit file-level parse coverage.
+pub fn link_cross_file_incremental_with_completeness(
+    files: &[FileParseData],
+    linker: &IncrementalLinker,
+    completeness: &FileParseCompletenessMap,
+) -> Vec<Relation> {
+    link_cross_file_incremental_internal(files, linker, Some(completeness))
+}
+
+fn link_cross_file_incremental_internal(
+    files: &[FileParseData],
+    linker: &IncrementalLinker,
+    completeness: Option<&FileParseCompletenessMap>,
+) -> Vec<Relation> {
     let _span =
         tracing::info_span!("kin.index.link_cross_file_incremental", files = files.len()).entered();
 
@@ -3254,6 +3674,7 @@ pub fn link_cross_file_incremental(
                 &import_map,
                 &include_graph,
                 &class_bases,
+                completeness,
             );
             if total_files > 50 {
                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3276,7 +3697,7 @@ pub fn link_cross_file_incremental(
         eprintln!(); // newline after \r progress
     }
 
-    merge_incremental_resolved(per_file_relations, files, linker)
+    merge_incremental_resolved(per_file_relations, files, linker, completeness)
 }
 
 /// Resolve the name-based relations of a single file into entity-ID relations
@@ -3293,13 +3714,34 @@ fn resolve_one_file_incremental(
     import_map: &HashMap<&str, HashMap<&str, (&str, &str)>>,
     include_graph: &HashMap<String, Vec<String>>,
     class_bases: &HashMap<String, Vec<(String, Vec<String>)>>,
+    completeness: Option<&FileParseCompletenessMap>,
 ) -> Vec<Relation> {
     let mut resolved = Vec::new();
-    let mut seen: HashSet<(EntityId, EntityId, RelationKind)> = HashSet::new();
+    let mut relation_indices = HashMap::new();
+    let call_extraction_complete = !file
+        .relations
+        .iter()
+        .any(is_call_extraction_incomplete_marker);
+    let parse_completeness = completeness
+        .and_then(|by_file| by_file.get(&file.file_path))
+        .unwrap_or(&FULL_PARSE_COMPLETENESS);
+    let make_relation = |rel: &ExtractedRelation, src, dst, confidence| {
+        make_relation(
+            rel,
+            src,
+            dst,
+            confidence,
+            parse_completeness,
+            call_extraction_complete,
+        )
+    };
     // Lazily resolved once per file: only ambiguous name buckets need them.
     let mut caller_import_targets: Option<HashSet<String>> = None;
     let mut caller_include_closure: Option<HashMap<String, usize>> = None;
     for rel in &file.relations {
+        if is_call_extraction_incomplete_marker(rel) {
+            continue;
+        }
         let src_id = linker
             .entity_by_file_name
             .get(&file.file_path)
@@ -3332,9 +3774,11 @@ fn resolve_one_file_incremental(
         if rel.kind == RelationKind::UsesMacro {
             if let Some(dst_id) = dst_same_file {
                 if linker.entity_kind_by_id.get(&dst_id) == Some(&EntityKind::Macro) {
-                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                        resolved.push(make_relation(rel, src_id, dst_id, 1.0));
-                    }
+                    accumulate_relation(
+                        &mut resolved,
+                        &mut relation_indices,
+                        make_relation(rel, src_id, dst_id, 1.0),
+                    );
                     continue;
                 }
             }
@@ -3345,9 +3789,11 @@ fn resolve_one_file_incremental(
                 &include_graph,
                 linker,
             ) {
-                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                    resolved.push(make_relation(rel, src_id, dst_id, 0.95));
-                }
+                accumulate_relation(
+                    &mut resolved,
+                    &mut relation_indices,
+                    make_relation(rel, src_id, dst_id, 0.95),
+                );
                 continue;
             }
 
@@ -3367,9 +3813,11 @@ fn resolve_one_file_incremental(
         // the same-file target plus its cross-file twins stay within the cap.
         // Cross-file twins carry the (c) name-match confidence (0.7).
         if let Some(dst_id) = dst_same_file {
-            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                resolved.push(make_relation(rel, src_id, dst_id, 1.0));
-            }
+            accumulate_relation(
+                &mut resolved,
+                &mut relation_indices,
+                make_relation(rel, src_id, dst_id, 1.0),
+            );
             let mut cross_file_twins: HashSet<EntityId> = HashSet::new();
             if let Some(candidates) = linker.entity_by_name.get(&rel.dst_name) {
                 for (fp, id) in candidates {
@@ -3382,9 +3830,11 @@ fn resolve_one_file_incremental(
                 prune_ids_by_arity(cross_file_twins, call_arity, &linker.entity_arity_by_id);
             if !cross_file_twins.is_empty() && cross_file_twins.len() < AMBIGUOUS_CALL_FANOUT_CAP {
                 for cross_id in sorted_fanout_targets(cross_file_twins) {
-                    if add_deduped(&mut seen, src_id, cross_id, rel.kind) {
-                        resolved.push(make_relation(rel, src_id, cross_id, 0.7));
-                    }
+                    accumulate_relation(
+                        &mut resolved,
+                        &mut relation_indices,
+                        make_relation(rel, src_id, cross_id, 0.7),
+                    );
                 }
             }
             continue;
@@ -3413,14 +3863,11 @@ fn resolve_one_file_incremental(
                         &import_map,
                         &class_bases,
                     ) {
-                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                            resolved.push(make_relation(
-                                rel,
-                                src_id,
-                                dst_id,
-                                INHERITED_METHOD_CONFIDENCE,
-                            ));
-                        }
+                        accumulate_relation(
+                            &mut resolved,
+                            &mut relation_indices,
+                            make_relation(rel, src_id, dst_id, INHERITED_METHOD_CONFIDENCE),
+                        );
                         continue;
                     }
                     dst_lookup = method;
@@ -3447,9 +3894,11 @@ fn resolve_one_file_incremental(
                         None
                     };
                     if let Some(dst_id) = dst_id {
-                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                            resolved.push(make_relation(rel, src_id, dst_id, 0.95));
-                        }
+                        accumulate_relation(
+                            &mut resolved,
+                            &mut relation_indices,
+                            make_relation(rel, src_id, dst_id, 0.95),
+                        );
                         continue;
                     }
                 }
@@ -3466,9 +3915,11 @@ fn resolve_one_file_incremental(
                             .get(&target_file)
                             .and_then(|m| m.get(member_name))
                         {
-                            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                                resolved.push(make_relation(rel, src_id, dst_id, 0.9));
-                            }
+                            accumulate_relation(
+                                &mut resolved,
+                                &mut relation_indices,
+                                make_relation(rel, src_id, dst_id, 0.9),
+                            );
                             continue;
                         }
                     }
@@ -3506,9 +3957,11 @@ fn resolve_one_file_incremental(
             &other_file_candidates,
         ) {
             ImportPinnedTarget::Resolved(dst_id) => {
-                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                    resolved.push(make_relation(rel, src_id, dst_id, IMPORT_PINNED_CONFIDENCE));
-                }
+                accumulate_relation(
+                    &mut resolved,
+                    &mut relation_indices,
+                    make_relation(rel, src_id, dst_id, IMPORT_PINNED_CONFIDENCE),
+                );
                 continue;
             }
             ImportPinnedTarget::PinnedMiss => name_fallback_allowed = false,
@@ -3560,9 +4013,11 @@ fn resolve_one_file_incremental(
                     None => (other_file_candidates[0].1, 0.7),
                 }
             };
-            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                resolved.push(make_relation(rel, src_id, dst_id, confidence));
-            }
+            accumulate_relation(
+                &mut resolved,
+                &mut relation_indices,
+                make_relation(rel, src_id, dst_id, confidence),
+            );
             continue;
         }
 
@@ -3587,9 +4042,11 @@ fn resolve_one_file_incremental(
                     prune_ids_by_arity(distinct_targets, call_arity, &linker.entity_arity_by_id);
                 if (1..=AMBIGUOUS_CALL_FANOUT_CAP).contains(&distinct_targets.len()) {
                     for dst_id in sorted_fanout_targets(distinct_targets) {
-                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                            resolved.push(make_relation(rel, src_id, dst_id, 0.3));
-                        }
+                        accumulate_relation(
+                            &mut resolved,
+                            &mut relation_indices,
+                            make_relation(rel, src_id, dst_id, 0.3),
+                        );
                     }
                     continue;
                 }
@@ -3614,14 +4071,11 @@ fn resolve_one_file_incremental(
                         &import_map,
                         &class_bases,
                     ) {
-                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                            resolved.push(make_relation(
-                                rel,
-                                src_id,
-                                dst_id,
-                                INHERITED_METHOD_CONFIDENCE,
-                            ));
-                        }
+                        accumulate_relation(
+                            &mut resolved,
+                            &mut relation_indices,
+                            make_relation(rel, src_id, dst_id, INHERITED_METHOD_CONFIDENCE),
+                        );
                         continue;
                     }
                 }
@@ -3644,14 +4098,11 @@ fn resolve_one_file_incremental(
             );
             if !qualified_targets.is_empty() {
                 for dst_id in qualified_targets {
-                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                        resolved.push(make_relation(
-                            rel,
-                            src_id,
-                            dst_id,
-                            QUALIFIED_SUFFIX_CONFIDENCE,
-                        ));
-                    }
+                    accumulate_relation(
+                        &mut resolved,
+                        &mut relation_indices,
+                        make_relation(rel, src_id, dst_id, QUALIFIED_SUFFIX_CONFIDENCE),
+                    );
                 }
                 continue;
             }
@@ -3665,11 +4116,7 @@ fn resolve_one_file_incremental(
         if let Some(external) =
             make_external_reference_relation(rel, src_id, &file.file_path, &linker.known_files)
         {
-            if let GraphNodeId::Entity(dst_id) = external.dst {
-                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                    resolved.push(external);
-                }
-            }
+            accumulate_relation(&mut resolved, &mut relation_indices, external);
             continue;
         }
     }
@@ -3759,14 +4206,13 @@ fn merge_incremental_resolved(
     per_file_relations: Vec<Vec<Relation>>,
     files: &[FileParseData],
     linker: &IncrementalLinker,
+    completeness: Option<&FileParseCompletenessMap>,
 ) -> Vec<Relation> {
     let mut resolved = Vec::new();
-    let mut seen: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
+    let mut relation_indices = HashMap::new();
     for file_relations in per_file_relations {
         for rel in file_relations {
-            if seen.insert((rel.src, rel.dst, rel.kind)) {
-                resolved.push(rel);
-            }
+            accumulate_relation(&mut resolved, &mut relation_indices, rel);
         }
     }
 
@@ -3784,6 +4230,8 @@ fn merge_incremental_resolved(
             }
         }
     }
+
+    append_parse_coverage_relations(&mut resolved, files, completeness);
 
     resolved
 }
@@ -3803,10 +4251,17 @@ fn link_cross_file_incremental_serial(
     let per_file_relations: Vec<Vec<Relation>> = files
         .iter()
         .map(|file| {
-            resolve_one_file_incremental(file, linker, &import_map, &include_graph, &class_bases)
+            resolve_one_file_incremental(
+                file,
+                linker,
+                &import_map,
+                &include_graph,
+                &class_bases,
+                None,
+            )
         })
         .collect();
-    merge_incremental_resolved(per_file_relations, files, linker)
+    merge_incremental_resolved(per_file_relations, files, linker, None)
 }
 
 /// Normalize a path by resolving `.` and `..` components without touching the filesystem.
@@ -3835,6 +4290,23 @@ mod tests {
         ArtifactId, EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm,
         GraphNodeId, Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
     };
+
+    #[test]
+    fn published_file_parse_carriers_keep_the_pre_completeness_struct_literal_api() {
+        let _plain = FileParseData {
+            file_path: "src/lib.py".to_string(),
+            entities: Vec::new(),
+            relations: Vec::new(),
+            imports: Vec::new(),
+        };
+        let _with_tests = FileParseDataWithTests {
+            file_path: "src/lib.py".to_string(),
+            entities: Vec::new(),
+            relations: Vec::new(),
+            imports: Vec::new(),
+            tests: Vec::new(),
+        };
+    }
 
     #[test]
     fn incremental_linker_checkpoint_is_canonical_round_trippable_and_fail_loud() {
@@ -4047,6 +4519,431 @@ mod tests {
         assert_eq!(result[0].src, GraphNodeId::Entity(e1.id));
         assert_eq!(result[0].dst, GraphNodeId::Entity(e2.id));
         assert_eq!(result[0].confidence, 1.0);
+    }
+
+    #[test]
+    fn repeated_call_shapes_are_complete_deterministic_and_batch_incremental_equal() {
+        let caller = make_entity("caller", "src/a.py");
+        let target = make_entity("target", "src/a.py");
+        let positional_two = CallArgShape {
+            positional: 2,
+            ..CallArgShape::default()
+        };
+        let keyword = CallArgShape {
+            positional: 1,
+            keywords: vec!["args".to_string()],
+            ..CallArgShape::default()
+        };
+        let var_positional = CallArgShape {
+            has_var_positional: true,
+            ..CallArgShape::default()
+        };
+        let forward_shapes = vec![
+            Some(positional_two.clone()),
+            Some(keyword.clone()),
+            Some(positional_two),
+            Some(var_positional),
+        ];
+
+        let build = |mut shapes: Vec<Option<CallArgShape>>| FileParseData {
+            file_path: "src/a.py".to_string(),
+            entities: vec![caller.clone(), target.clone()],
+            relations: shapes
+                .drain(..)
+                .map(|call_shape| ExtractedRelation {
+                    call_shape,
+                    kind: RelationKind::Calls,
+                    src_name: "caller".to_string(),
+                    dst_name: "target".to_string(),
+                    import_source: None,
+                })
+                .collect(),
+            imports: vec![],
+        };
+        let edge_evidence = |relations: &[Relation]| {
+            find_calls_edge(relations, &caller, &target)
+                .expect("logical caller-target edge")
+                .evidence
+                .clone()
+        };
+
+        let forward = vec![build(forward_shapes.clone())];
+        let mut reversed_shapes = forward_shapes;
+        reversed_shapes.reverse();
+        let reversed = vec![build(reversed_shapes)];
+        let batch_forward = edge_evidence(&link_cross_file(&forward));
+        let batch_reversed = edge_evidence(&link_cross_file(&reversed));
+
+        let mut incremental = IncrementalLinker::new();
+        incremental.add_file("src/a.py", &[caller.clone(), target.clone()]);
+        let incremental_forward =
+            edge_evidence(&link_cross_file_incremental(&forward, &incremental));
+        let incremental_reversed =
+            edge_evidence(&link_cross_file_incremental(&reversed, &incremental));
+
+        assert_eq!(batch_forward, batch_reversed);
+        assert_eq!(batch_forward, incremental_forward);
+        assert_eq!(batch_forward, incremental_reversed);
+        assert_eq!(batch_forward.len(), 3, "three distinct call shapes");
+        assert_eq!(
+            batch_forward
+                .iter()
+                .map(|evidence| evidence.occurrence_count)
+                .sum::<u32>(),
+            4,
+            "all four call sites survive through occurrence counts"
+        );
+        assert!(batch_forward.iter().any(|evidence| {
+            evidence.occurrence_count == 2
+                && evidence
+                    .call_shape
+                    .as_ref()
+                    .is_some_and(|shape| shape.positional == 2)
+        }));
+        assert!(batch_forward.iter().any(|evidence| {
+            evidence
+                .call_shape
+                .as_ref()
+                .is_some_and(|shape| shape.keywords == ["args"])
+        }));
+        assert!(batch_forward.iter().any(|evidence| {
+            evidence
+                .call_shape
+                .as_ref()
+                .is_some_and(|shape| shape.has_var_positional)
+        }));
+    }
+
+    #[test]
+    fn repeated_call_with_any_missing_shape_retains_fail_closed_marker() {
+        let caller = make_entity("caller", "src/a.py");
+        let target = make_entity("target", "src/a.py");
+        let build = |shapes: Vec<Option<CallArgShape>>| FileParseData {
+            file_path: "src/a.py".to_string(),
+            entities: vec![caller.clone(), target.clone()],
+            relations: shapes
+                .into_iter()
+                .map(|call_shape| ExtractedRelation {
+                    call_shape,
+                    kind: RelationKind::Calls,
+                    src_name: "caller".to_string(),
+                    dst_name: "target".to_string(),
+                    import_source: None,
+                })
+                .collect(),
+            imports: vec![],
+        };
+        let shaped = Some(CallArgShape {
+            positional: 2,
+            ..CallArgShape::default()
+        });
+        let forward = vec![build(vec![shaped.clone(), None])];
+        let reversed = vec![build(vec![None, shaped])];
+        let evidence = |files: &[FileParseData]| {
+            find_calls_edge(&link_cross_file(files), &caller, &target)
+                .expect("logical caller-target edge")
+                .evidence
+                .clone()
+        };
+
+        let forward_evidence = evidence(&forward);
+        let reversed_evidence = evidence(&reversed);
+        assert_eq!(forward_evidence, reversed_evidence);
+        assert_eq!(forward_evidence.len(), 2);
+        assert!(forward_evidence
+            .iter()
+            .any(|record| record.call_shape.is_none()));
+        assert!(forward_evidence
+            .iter()
+            .any(|record| record.call_shape.is_some()));
+    }
+
+    #[test]
+    fn incomplete_parse_call_evidence_is_explicit_and_never_certified() {
+        let caller = make_entity("caller", "src/a.py");
+        let target = make_entity("target", "src/a.py");
+        let files = vec![FileParseData {
+            file_path: "src/a.py".to_string(),
+            entities: vec![caller.clone(), target.clone()],
+            relations: vec![ExtractedRelation {
+                call_shape: Some(CallArgShape {
+                    positional: 2,
+                    ..CallArgShape::default()
+                }),
+                kind: RelationKind::Calls,
+                src_name: "caller".to_string(),
+                dst_name: "target".to_string(),
+                import_source: None,
+            }],
+            imports: vec![],
+        }];
+        let completeness = FileParseCompletenessMap::from([(
+            "src/a.py".to_string(),
+            ParseCompleteness::Partial("tree-sitter recovered from one error range".to_string()),
+        )]);
+        let evidence = |relations: &[Relation]| {
+            find_calls_edge(relations, &caller, &target)
+                .expect("recovered call edge")
+                .evidence
+                .clone()
+        };
+
+        let batch_relations = link_cross_file_with_completeness(&files, &completeness);
+        let batch = evidence(&batch_relations);
+        let mut linker = IncrementalLinker::new();
+        linker.add_file("src/a.py", &[caller.clone(), target.clone()]);
+        let incremental_relations =
+            link_cross_file_incremental_with_completeness(&files, &linker, &completeness);
+        let incremental = evidence(&incremental_relations);
+        assert_eq!(batch, incremental);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(
+            batch[0].parser_rule.as_deref(),
+            Some(CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1)
+        );
+        assert!(batch[0].call_shape.is_none());
+        for relations in [&batch_relations, &incremental_relations] {
+            assert!(relations.iter().any(|relation| {
+                relation.evidence.iter().any(|evidence| {
+                    evidence.parser_rule.as_deref() == Some(CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1)
+                })
+            }));
+        }
+    }
+
+    #[test]
+    fn incomplete_call_extraction_downgrades_batch_incremental_and_compatibility_paths() {
+        let caller = make_entity("caller", "src/a.py");
+        let target = make_entity("target", "src/a.py");
+        let files = vec![FileParseData {
+            file_path: "src/a.py".to_string(),
+            entities: vec![caller.clone(), target.clone()],
+            relations: vec![
+                ExtractedRelation {
+                    call_shape: Some(CallArgShape {
+                        positional: 2,
+                        ..CallArgShape::default()
+                    }),
+                    kind: RelationKind::Calls,
+                    src_name: "caller".to_string(),
+                    dst_name: "target".to_string(),
+                    import_source: None,
+                },
+                kin_parser::call_extraction_incomplete_marker(),
+            ],
+            imports: vec![],
+        }];
+        let evidence = |relations: &[Relation]| {
+            find_calls_edge(relations, &caller, &target)
+                .expect("surviving named call edge")
+                .evidence
+                .clone()
+        };
+        let assert_downgraded = |relations: &[Relation]| {
+            let evidence = evidence(relations);
+            assert_eq!(evidence.len(), 1);
+            assert_eq!(
+                evidence[0].parser_rule.as_deref(),
+                Some(CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1)
+            );
+            assert!(evidence[0].call_shape.is_none());
+            assert!(relations.iter().all(|relation| {
+                relation.evidence.iter().all(|evidence| {
+                    evidence.token.as_deref()
+                        != Some(kin_parser::CALL_EXTRACTION_INCOMPLETE_MARKER_V1)
+                })
+            }));
+        };
+
+        let mut linker = IncrementalLinker::new();
+        linker.add_file("src/a.py", &[caller.clone(), target.clone()]);
+        let compat_batch = link_cross_file(&files);
+        let compat_incremental = link_cross_file_incremental(&files, &linker);
+        assert_downgraded(&compat_batch);
+        assert_downgraded(&compat_incremental);
+        assert_eq!(evidence(&compat_batch), evidence(&compat_incremental));
+
+        let completeness =
+            FileParseCompletenessMap::from([("src/a.py".to_string(), ParseCompleteness::Full)]);
+        let batch = link_cross_file_with_completeness(&files, &completeness);
+        let incremental =
+            link_cross_file_incremental_with_completeness(&files, &linker, &completeness);
+        assert_downgraded(&batch);
+        assert_downgraded(&incremental);
+        for relations in [&batch, &incremental] {
+            assert!(relations.iter().any(|relation| {
+                relation.evidence.iter().any(|evidence| {
+                    evidence.parser_rule.as_deref()
+                        == Some(CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1)
+                        && evidence.token.as_deref() == Some("call-extraction-incomplete")
+                })
+            }));
+            assert!(relations.iter().all(|relation| {
+                relation.evidence.iter().all(|evidence| {
+                    evidence.parser_rule.as_deref() != Some(CALL_SHAPE_PARSE_COVERAGE_FULL_V1)
+                })
+            }));
+        }
+    }
+
+    #[test]
+    fn omitted_only_call_file_emits_coverage_gap_in_batch_and_incremental_linking() {
+        let target = make_entity("target", "src/defs.py");
+        let caller = make_entity("caller", "src/good.py");
+        let broken = make_entity("broken", "src/bad.py");
+        let files = vec![
+            FileParseData {
+                file_path: "src/defs.py".to_string(),
+                entities: vec![target.clone()],
+                relations: Vec::new(),
+                imports: Vec::new(),
+            },
+            FileParseData {
+                file_path: "src/good.py".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![ExtractedRelation {
+                    call_shape: Some(CallArgShape {
+                        positional: 1,
+                        ..CallArgShape::default()
+                    }),
+                    kind: RelationKind::Calls,
+                    src_name: "caller".to_string(),
+                    dst_name: "target".to_string(),
+                    import_source: None,
+                }],
+                imports: Vec::new(),
+            },
+            FileParseData {
+                file_path: "src/bad.py".to_string(),
+                entities: vec![broken.clone()],
+                relations: Vec::new(),
+                imports: Vec::new(),
+            },
+        ];
+        let completeness = FileParseCompletenessMap::from([
+            ("src/defs.py".to_string(), ParseCompleteness::Full),
+            ("src/good.py".to_string(), ParseCompleteness::Full),
+            (
+                "src/bad.py".to_string(),
+                ParseCompleteness::Partial("recovered malformed keyword call".to_string()),
+            ),
+        ]);
+
+        let batch = link_cross_file_with_completeness(&files, &completeness);
+        let mut linker = IncrementalLinker::new();
+        for file in &files {
+            linker.add_file(&file.file_path, &file.entities);
+        }
+        let incremental =
+            link_cross_file_incremental_with_completeness(&files, &linker, &completeness);
+
+        for relations in [&batch, &incremental] {
+            let inbound = find_calls_edge(relations, &caller, &target)
+                .expect("the independent full positional call must link");
+            assert!(inbound.evidence.iter().all(|evidence| {
+                evidence.parser_rule.as_deref() == Some(CALL_SHAPE_EVIDENCE_AGGREGATION_V1)
+                    && evidence.call_shape.is_some()
+            }));
+            assert!(relations
+                .iter()
+                .any(|relation| relation.evidence.iter().any(|evidence| {
+                    evidence.parser_rule.as_deref() == Some(CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1)
+                        && evidence.source_path.as_deref() == Some("src/bad.py")
+                })));
+        }
+
+        let all_full = FileParseCompletenessMap::from([
+            ("src/defs.py".to_string(), ParseCompleteness::Full),
+            ("src/good.py".to_string(), ParseCompleteness::Full),
+            ("src/bad.py".to_string(), ParseCompleteness::Full),
+        ]);
+        let restored = link_cross_file_with_completeness(&files, &all_full);
+        let marker_id = |relations: &[Relation], parser_rule: &str| {
+            relations
+                .iter()
+                .find(|relation| {
+                    relation.evidence.iter().any(|evidence| {
+                        evidence.parser_rule.as_deref() == Some(parser_rule)
+                            && evidence.source_path.as_deref() == Some("src/bad.py")
+                    })
+                })
+                .expect("bad.py coverage marker")
+                .id
+        };
+        assert_ne!(
+            marker_id(&batch, CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1),
+            marker_id(&restored, CALL_SHAPE_PARSE_COVERAGE_FULL_V1),
+            "Full/Partial transitions need distinct IDs so incremental history replaces the marker"
+        );
+    }
+
+    #[test]
+    fn repeated_call_metadata_keeps_strongest_resolution_independent_of_source_order() {
+        let caller = rust_fn("caller", "src/caller.rs");
+        let target = make_method_entity("Widget::make", "src/model.rs");
+        let build = |strong_first: bool| {
+            let mut relations = vec![
+                calls_relation("caller", "Widget::make"),
+                calls_relation("caller", "make"),
+            ];
+            if !strong_first {
+                relations.reverse();
+            }
+            vec![
+                FileParseData {
+                    file_path: "src/caller.rs".to_string(),
+                    entities: vec![caller.clone()],
+                    relations,
+                    imports: vec![],
+                },
+                FileParseData {
+                    file_path: "src/model.rs".to_string(),
+                    entities: vec![target.clone()],
+                    relations: vec![],
+                    imports: vec![],
+                },
+            ]
+        };
+        let batch_edge = |files: &[FileParseData]| {
+            find_calls_edge(&link_cross_file(files), &caller, &target)
+                .expect("qualified and bare calls should resolve to one logical edge")
+                .clone()
+        };
+        let incremental_edge = |files: &[FileParseData]| {
+            let mut linker = IncrementalLinker::new();
+            for file in files {
+                linker.add_file(&file.file_path, &file.entities);
+            }
+            find_calls_edge(
+                &link_cross_file_incremental(files, &linker),
+                &caller,
+                &target,
+            )
+            .expect("incremental qualified and bare calls should resolve to one logical edge")
+            .clone()
+        };
+
+        let forward = build(true);
+        let reversed = build(false);
+        let batch_forward = batch_edge(&forward);
+        let batch_reversed = batch_edge(&reversed);
+        let incremental_forward = incremental_edge(&forward);
+        let incremental_reversed = incremental_edge(&reversed);
+
+        let canonical = serde_json::to_value(&batch_forward).unwrap();
+        assert_eq!(canonical, serde_json::to_value(&batch_reversed).unwrap());
+        assert_eq!(
+            canonical,
+            serde_json::to_value(&incremental_forward).unwrap()
+        );
+        assert_eq!(
+            canonical,
+            serde_json::to_value(&incremental_reversed).unwrap()
+        );
+        assert_eq!(batch_forward.confidence, 0.7);
+        assert_eq!(batch_forward.origin, RelationOrigin::Inferred);
+        assert_eq!(batch_forward.evidence.len(), 1);
+        assert_eq!(batch_forward.evidence[0].occurrence_count, 2);
     }
 
     #[test]
@@ -4391,12 +5288,16 @@ mod tests {
 
         // resolve_one_file is deterministic, so building the per-file relations
         // twice yields identical inputs for the two merge paths.
-        let pfr_parallel: Vec<Vec<Relation>> =
-            files.iter().map(|f| resolve_one_file(f, &ctx)).collect();
-        let pfr_serial: Vec<Vec<Relation>> =
-            files.iter().map(|f| resolve_one_file(f, &ctx)).collect();
+        let pfr_parallel: Vec<Vec<Relation>> = files
+            .iter()
+            .map(|f| resolve_one_file(f, &ctx, None))
+            .collect();
+        let pfr_serial: Vec<Vec<Relation>> = files
+            .iter()
+            .map(|f| resolve_one_file(f, &ctx, None))
+            .collect();
 
-        let parallel = merge_resolved(pfr_parallel, &files, &ctx);
+        let parallel = merge_resolved(pfr_parallel, &files, &ctx, None);
         let serial = merge_resolved_serial(pfr_serial, &files, &ctx);
 
         assert_eq!(

@@ -226,6 +226,40 @@ pub fn collect_ancestry<G: GraphStore>(
 }
 
 impl<G: GraphStore> ImpactGraph for GraphAtRef<'_, G> {
+    fn call_shape_parse_coverage_complete(&self) -> Result<bool, ReviewError> {
+        let source_files = self
+            .entities
+            .values()
+            .filter_map(|entity| {
+                entity
+                    .file_origin
+                    .as_ref()
+                    .map(|file| file.0.clone())
+                    .or_else(|| entity.span.as_ref().map(|span| span.file.0.clone()))
+            })
+            .collect::<HashSet<_>>();
+        let mut full_files = HashSet::new();
+
+        for relation in self.relations.values() {
+            for evidence in &relation.evidence {
+                match evidence.parser_rule.as_deref() {
+                    Some(
+                        kin_index::CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1
+                        | kin_index::CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1,
+                    ) => return Ok(false),
+                    Some(kin_index::CALL_SHAPE_PARSE_COVERAGE_FULL_V1) => {
+                        if let Some(file) = evidence.source_path.as_ref() {
+                            full_files.insert(file.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(source_files.is_subset(&full_files))
+    }
+
     fn get_entity(&self, id: &EntityId) -> Result<Option<Entity>, ReviewError> {
         Ok(self.entities.get(id).cloned())
     }
@@ -423,6 +457,180 @@ mod tests {
             import_source: None,
             evidence: vec![],
         }
+    }
+
+    #[test]
+    fn ref_scoped_parse_coverage_requires_positive_full_file_markers() {
+        let live = InMemoryGraph::new();
+        let at = SemanticChangeId::from_hash(Hash256::from_bytes([0x7a; 32]));
+        let mut entity = test_entity("target");
+        entity.file_origin = Some(FilePathId::new("src/lib.py"));
+        let files = [kin_index::FileParseData {
+            file_path: "src/lib.py".to_string(),
+            entities: vec![entity.clone()],
+            relations: Vec::new(),
+            imports: Vec::new(),
+        }];
+
+        let materialize = |parse_completeness| {
+            let completeness = kin_index::FileParseCompletenessMap::from([(
+                "src/lib.py".to_string(),
+                parse_completeness,
+            )]);
+            let relations = kin_index::link_cross_file_with_completeness(&files, &completeness)
+                .into_iter()
+                .map(|relation| (relation.id, relation))
+                .collect();
+            GraphAtRef::from_state(
+                &live,
+                at,
+                HashSet::from([at]),
+                ResolvedGraphState {
+                    entities: HashMap::from([(entity.id, entity.clone())]),
+                    relations,
+                    ..ResolvedGraphState::default()
+                },
+            )
+        };
+
+        let legacy = GraphAtRef::from_state(
+            &live,
+            at,
+            HashSet::from([at]),
+            ResolvedGraphState {
+                entities: HashMap::from([(entity.id, entity.clone())]),
+                ..ResolvedGraphState::default()
+            },
+        );
+        assert!(!legacy.call_shape_parse_coverage_complete().unwrap());
+        assert!(materialize(kin_model::ParseCompleteness::Full)
+            .call_shape_parse_coverage_complete()
+            .unwrap());
+        assert!(!materialize(kin_model::ParseCompleteness::Partial(
+            "recovered malformed call".to_string()
+        ))
+        .call_shape_parse_coverage_complete()
+        .unwrap());
+
+        let full_completeness = kin_index::FileParseCompletenessMap::from([(
+            "src/lib.py".to_string(),
+            kin_model::ParseCompleteness::Full,
+        )]);
+        let mut dual_relations =
+            kin_index::link_cross_file_with_completeness(&files, &full_completeness)
+                .into_iter()
+                .map(|relation| (relation.id, relation))
+                .collect::<HashMap<_, _>>();
+        let mut extraction_incomplete =
+            test_relation(0x7c, entity.id, entity.id, RelationKind::DependsOn);
+        extraction_incomplete.evidence = vec![kin_model::RelationEvidence {
+            source_path: Some("src/lib.py".to_string()),
+            parser_rule: Some(kin_index::CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1.to_string()),
+            ..kin_model::RelationEvidence::default()
+        }];
+        dual_relations.insert(extraction_incomplete.id, extraction_incomplete);
+        let dual_state = GraphAtRef::from_state(
+            &live,
+            at,
+            HashSet::from([at]),
+            ResolvedGraphState {
+                entities: HashMap::from([(entity.id, entity.clone())]),
+                relations: dual_relations,
+                ..ResolvedGraphState::default()
+            },
+        );
+        assert!(
+            !dual_state.call_shape_parse_coverage_complete().unwrap(),
+            "historical extraction-incomplete evidence must dominate a stale full marker"
+        );
+
+        let mut target = test_entity("target");
+        target.file_origin = Some(FilePathId::new("src/defs.py"));
+        target.signature = "def target(ext, args)".to_string();
+        let mut caller = test_entity("caller");
+        caller.file_origin = Some(FilePathId::new("src/good.py"));
+        let mut broken = test_entity("broken");
+        broken.file_origin = Some(FilePathId::new("src/bad.py"));
+        let coverage_files = [
+            kin_index::FileParseData {
+                file_path: "src/defs.py".to_string(),
+                entities: vec![target.clone()],
+                relations: Vec::new(),
+                imports: Vec::new(),
+            },
+            kin_index::FileParseData {
+                file_path: "src/good.py".to_string(),
+                entities: vec![caller.clone()],
+                relations: Vec::new(),
+                imports: Vec::new(),
+            },
+            kin_index::FileParseData {
+                file_path: "src/bad.py".to_string(),
+                entities: vec![broken.clone()],
+                relations: Vec::new(),
+                imports: Vec::new(),
+            },
+        ];
+        let completeness = kin_index::FileParseCompletenessMap::from([
+            (
+                "src/defs.py".to_string(),
+                kin_model::ParseCompleteness::Full,
+            ),
+            (
+                "src/good.py".to_string(),
+                kin_model::ParseCompleteness::Full,
+            ),
+            (
+                "src/bad.py".to_string(),
+                kin_model::ParseCompleteness::Partial("omitted keyword call".to_string()),
+            ),
+        ]);
+        let mut relations =
+            kin_index::link_cross_file_with_completeness(&coverage_files, &completeness)
+                .into_iter()
+                .map(|relation| (relation.id, relation))
+                .collect::<HashMap<_, _>>();
+        let mut positional_call = test_relation(0x7b, caller.id, target.id, RelationKind::Calls);
+        positional_call.evidence = vec![kin_model::RelationEvidence {
+            parser_rule: Some(kin_index::CALL_SHAPE_EVIDENCE_AGGREGATION_V1.to_string()),
+            call_shape: Some(kin_model::CallArgShape::new(2, Vec::new(), false, false)),
+            ..kin_model::RelationEvidence::default()
+        }];
+        relations.insert(positional_call.id, positional_call);
+        let historical = GraphAtRef::from_state(
+            &live,
+            at,
+            HashSet::from([at]),
+            ResolvedGraphState {
+                entities: HashMap::from([
+                    (target.id, target.clone()),
+                    (caller.id, caller),
+                    (broken.id, broken),
+                ]),
+                relations,
+                ..ResolvedGraphState::default()
+            },
+        );
+        let mut renamed = target.clone();
+        renamed.signature = "def target(ext, lines)".to_string();
+        let diff = crate::diff::SemanticDiff {
+            entity_changes: vec![crate::diff::EntityChange {
+                entity_id: target.id,
+                kind: crate::diff::EntityChangeKind::Modified {
+                    old: target,
+                    new: renamed,
+                },
+            }],
+            ..crate::diff::SemanticDiff::default()
+        };
+        let impact = crate::impact::analyze_impact_at(&historical, &diff).unwrap();
+        assert!(
+            !impact
+                .entity_impact(&diff.entity_changes[0].entity_id)
+                .unwrap()
+                .call_shapes
+                .all_consumers_shaped_calls
+        );
     }
 
     fn change_id(byte: u8) -> SemanticChangeId {

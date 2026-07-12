@@ -140,46 +140,89 @@ pub fn signature_runtime_neutral(old: &str, new: &str) -> bool {
     }
     signature_strengthened_only(old, new)
         || python_signatures_runtime_neutral(old, new)
-        || python_none_type_spelling_neutral(old, new)
+        || python_collector_only_rename(old, new)
         || go_struct_field_addition_only(old, new)
 }
 
-/// True when `old` and `new` are identical once the two explicit spellings of
-/// the `NoneType` singleton — `type(None)` and `types.NoneType` — are folded to
-/// one form. Python 3.10+ guarantees `type(None) is types.NoneType`, so a
-/// declaration that swaps one spelling for the other (a default value, or a
-/// non-`def` module-level declaration whose text carries the reference) changes
-/// no runtime contract. Only that exact spelling is folded, so any other type
-/// difference still counts and is never masked. Bare `NoneType` is not folded —
-/// its meaning depends on a `from types import` binding absent from the text.
-fn python_none_type_spelling_neutral(old: &str, new: &str) -> bool {
-    fn fold(signature: &str) -> String {
-        signature.replace("type(None)", "types.NoneType")
-    }
-    fold(old) == fold(new)
+/// Renaming only Python's local variadic collector bindings (`*args` and/or
+/// `**kwargs`) cannot strand a caller: neither binding is caller-addressable by
+/// name. Treat it like an annotation-only signature edit across every review
+/// channel, while role changes remain structural and fail closed.
+fn python_collector_only_rename(old: &str, new: &str) -> bool {
+    matches!(arity_preserving_rename(old, new), Some(renamed) if renamed.is_empty())
 }
 
-/// The callable name and normalized parameter list of a Python `def`, or
-/// `None` when the text is not one. Annotations, comments, and whitespace are
-/// normalized away so two annotation-only variants compare equal.
-fn python_signature_parts(signature: &str) -> Option<(String, Vec<String>)> {
-    let without_comment = signature.split('#').next().unwrap_or(signature).trim();
-    let def_pos = without_comment.find("def ")?;
-    let after_def = &without_comment[def_pos + 4..];
-    let name_end = after_def.find('(')?;
-    let name = after_def[..name_end].trim();
+/// The runtime declaration mode, callable name, and normalized parameter list
+/// of a Python `def`, or `None` when the text is not one. Python permits exactly
+/// one meaningful header prefix here: `async`. Recording it explicitly keeps a
+/// sync/async transition out of every runtime-neutral classifier. Any other
+/// pre-`def` text is not a declaration shape this scanner can prove, so it fails
+/// closed instead of being silently discarded. Annotations and non-semantic
+/// whitespace are normalized away so two annotation-only variants compare
+/// equal; ambiguous comments or malformed syntax likewise fail closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PythonSignatureParts {
+    is_async: bool,
+    name: String,
+    params: Vec<String>,
+}
+
+fn python_signature_parts(signature: &str) -> Option<PythonSignatureParts> {
+    let signature = signature.trim();
+    let def_pos = find_python_def_keyword(signature)?;
+    let is_async = match signature[..def_pos].trim() {
+        "" => false,
+        "async" => true,
+        _ => return None,
+    };
+    let mut name_start = def_pos + "def".len();
+    while signature
+        .as_bytes()
+        .get(name_start)
+        .is_some_and(u8::is_ascii_whitespace)
+    {
+        name_start += 1;
+    }
+    let name_end = signature[name_start..].find('(')? + name_start;
+    let name = signature[name_start..name_end].trim();
     if name.is_empty() {
         return None;
     }
 
-    let params_start = def_pos + 4 + name_end;
-    let params_end = matching_paren(without_comment, params_start)?;
-    let params = &without_comment[params_start + 1..params_end];
-    let params = split_python_params(params)
+    let params_end = matching_paren(signature, name_end)?;
+    let params = &signature[name_end + 1..params_end];
+    let params = split_python_params(params)?
         .into_iter()
         .map(|param| normalize_python_param(&param))
-        .collect::<Vec<_>>();
-    Some((name.to_string(), params))
+        .collect::<Option<Vec<_>>>()?;
+    Some(PythonSignatureParts {
+        is_async,
+        name: name.to_string(),
+        params,
+    })
+}
+
+/// Find the first standalone Python `def` token outside quoted text. Prefix
+/// validation belongs to [`python_signature_parts`]: an unquoted comment or any
+/// other text before the declaration remains in that prefix and therefore fails
+/// closed instead of hiding the declaration from sibling classifiers.
+fn find_python_def_keyword(signature: &str) -> Option<usize> {
+    let bytes = signature.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if matches!(bytes[i], b'\'' | b'"') {
+            i = python_quote_end(bytes, i)?;
+            continue;
+        }
+        if bytes[i..].starts_with(b"def")
+            && (i == 0 || !python_identifier_byte(bytes[i - 1]))
+            && bytes.get(i + 3).is_some_and(u8::is_ascii_whitespace)
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// True when `old` → `new` preserves the Python runtime call contract: same
@@ -190,31 +233,33 @@ fn python_signature_parts(signature: &str) -> Option<(String, Vec<String>)> {
 /// renaming, retyping, or removing a parameter — or appending a required one —
 /// is never neutral.
 fn python_signatures_runtime_neutral(old: &str, new: &str) -> bool {
-    let (Some((old_name, old_params)), Some((new_name, new_params))) =
-        (python_signature_parts(old), python_signature_parts(new))
-    else {
+    let (Some(old), Some(new)) = (python_signature_parts(old), python_signature_parts(new)) else {
         return false;
     };
-    if old_name != new_name {
+    if old.is_async != new.is_async || old.name != new.name {
         return false;
     }
-    if old_params == new_params {
+    if old.params == new.params {
         return true;
     }
-    if new_params.len() <= old_params.len() || new_params[..old_params.len()] != old_params[..] {
+    if new.params.len() <= old.params.len() || new.params[..old.params.len()] != old.params[..] {
         return false;
     }
-    new_params[old_params.len()..]
+    new.params[old.params.len()..]
         .iter()
         .all(|param| python_param_adds_no_required_arg(param))
 }
 
 /// A normalized Python parameter that a caller can omit: it carries a default
-/// (`name=…`) or is a `*`, `/`, `*args`, or `**kwargs` marker rather than a
-/// bare required parameter.
+/// (`name=…`) or is a `*`, `*args`, or `**kwargs` marker rather than a bare
+/// required parameter. `/` is deliberately excluded because appending it
+/// changes the call mode of preceding parameters.
 fn python_param_adds_no_required_arg(param: &str) -> bool {
     let param = param.trim();
-    param.contains('=') || param == "/" || param.starts_with('*')
+    // A newly appended `/` is not neutral: it retroactively makes all
+    // preceding parameters positional-only and can strand keyword callers.
+    // `*`/`*args`/`**kwargs` do not add a required argument themselves.
+    param.contains('=') || param.starts_with('*')
 }
 
 /// The call-contract role of a normalized Python parameter. A rename is only
@@ -263,44 +308,77 @@ fn python_param_identifier(param: &str) -> &str {
     }
 }
 
+/// The normalized default expression for a Python parameter, when present.
+/// `python_signature_parts` has already removed annotations and normalized
+/// formatting, so equality here is deliberately strict: a rename is only
+/// eligible for the runtime-neutral path when every position keeps the same
+/// optionality and the same normalized default expression.
+fn python_param_default(param: &str) -> Option<&str> {
+    // Normalized parameters contain no annotation and place their outer
+    // default delimiter first, so `split_once` cannot confuse an `=` inside the
+    // already-normalized default expression.
+    param.split_once('=').map(|(_, default)| default)
+}
+
 /// When `old` → `new` is an arity-preserving pure parameter RENAME of the same
-/// Python `def` — same callable name, same parameter count, every position
-/// keeps its role, and at least one normal parameter's identifier changes —
-/// returns the OLD identifiers of the renamed normal positions. Returns `None`
-/// otherwise.
+/// Python `def` — same sync/async mode, same callable name, same parameter
+/// count, every position keeps its role, and at least one normal parameter's
+/// identifier changes — returns the OLD identifiers of the renamed normal
+/// positions. Returns `None` otherwise.
 ///
 /// The result is the set of names whose by-keyword call sites a rename could
 /// strand, so a caller-shape check can decide whether the rename is actually
-/// runtime-neutral. Excluded, because they are not caller-safe renames or not
-/// renames at all:
+/// runtime-neutral. Every parameter default must also be byte-equivalent after
+/// formatting normalization; call-shape evidence cannot neutralize an added,
+/// removed, or changed default. Excluded, because they are not caller-safe
+/// renames or not renames at all:
 /// - reorders — a new identifier that reuses any old parameter's identifier;
 ///   swapping positions changes positional call semantics, not just names;
 /// - role changes at any position (normal ↔ `*args`/`**kwargs`/marker);
+/// - any added, removed, or changed parameter default;
 /// - retype- or default-only edits (identifier unchanged);
 /// - arity changes or non-`def` text.
 ///
-/// Renames of `*args`/`**kwargs` collectors are not reported: no caller can
-/// target them by name, so renaming one strands nothing. Positions are visited
-/// left to right, so the returned order is deterministic.
+/// Renamed `*args`/`**kwargs` bindings do not contribute caller-addressable
+/// names: no caller can target them, so a pure collector-only rename returns
+/// `Some([])` to distinguish that inherently neutral edit from `None` (not a
+/// safe rename).
+/// Positions are visited left to right, so the returned order is deterministic.
 pub fn arity_preserving_rename(old: &str, new: &str) -> Option<Vec<String>> {
     if old == new {
         return None;
     }
-    let (old_name, old_params) = python_signature_parts(old)?;
-    let (new_name, new_params) = python_signature_parts(new)?;
-    if old_name != new_name || old_params.len() != new_params.len() {
+    let old = python_signature_parts(old)?;
+    let new = python_signature_parts(new)?;
+    if old.is_async != new.is_async || old.name != new.name || old.params.len() != new.params.len()
+    {
         return None;
     }
-    let old_identifiers: std::collections::BTreeSet<&str> = old_params
+    let old_identifiers: std::collections::BTreeSet<&str> = old
+        .params
         .iter()
         .map(|p| python_param_identifier(p))
         .filter(|id| !id.is_empty())
         .collect();
 
     let mut renamed = Vec::new();
-    for (old_param, new_param) in old_params.iter().zip(new_params.iter()) {
+    let mut saw_rename = false;
+    for (old_param, new_param) in old.params.iter().zip(new.params.iter()) {
+        if python_param_default(old_param) != python_param_default(new_param) {
+            // Adding, removing, or changing any default changes the callable's
+            // runtime contract. Positional call-shape evidence can prove a
+            // pure name change harmless; it cannot make a simultaneous default
+            // change harmless.
+            return None;
+        }
         let old_role = python_param_role(old_param);
         if old_role != python_param_role(new_param) {
+            return None;
+        }
+        if old_role == PyParamRole::Marker && old_param != new_param {
+            // `/` and `*` are not interchangeable markers: changing one to the
+            // other reclassifies neighboring parameters and changes how callers
+            // may pass them.
             return None;
         }
         let old_id = python_param_identifier(old_param);
@@ -308,6 +386,7 @@ pub fn arity_preserving_rename(old: &str, new: &str) -> Option<Vec<String>> {
         if old_id == new_id {
             continue;
         }
+        saw_rename = true;
         if old_role != PyParamRole::Normal {
             // Renaming a `*args`/`**kwargs` collector strands no caller.
             continue;
@@ -320,10 +399,10 @@ pub fn arity_preserving_rename(old: &str, new: &str) -> Option<Vec<String>> {
         renamed.push(old_id.to_string());
     }
 
-    if renamed.is_empty() {
-        None
-    } else {
+    if saw_rename {
         Some(renamed)
+    } else {
+        None
     }
 }
 
@@ -335,11 +414,14 @@ pub fn rename_is_runtime_neutral_for_consumers(
     renamed_old_names: &[String],
     summary: &ConsumerCallShapeSummary,
 ) -> bool {
-    summary.all_consumers_shaped_calls
-        && !summary.any_var_keyword_caller
-        && renamed_old_names
-            .iter()
-            .all(|name| !summary.caller_keyword_names.contains(name.as_str()))
+    // An empty set represents a verified collector-only rename. Collector
+    // bindings are never caller-addressable, so no call-shape proof is needed.
+    renamed_old_names.is_empty()
+        || (summary.all_consumers_shaped_calls
+            && !summary.any_var_keyword_caller
+            && renamed_old_names
+                .iter()
+                .all(|name| !summary.caller_keyword_names.contains(name.as_str())))
 }
 
 /// True when `old` and `new` are Go struct type signatures that differ ONLY by
@@ -410,110 +492,329 @@ fn matching_paren(input: &str, open_byte: usize) -> Option<usize> {
     if input.as_bytes().get(open_byte).copied() != Some(b'(') {
         return None;
     }
-    let mut depth = 0i32;
-    for (idx, ch) in input.char_indices().skip_while(|(idx, _)| *idx < open_byte) {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(idx);
+    let bytes = input.as_bytes();
+    let mut expected_closers = vec![b')'];
+    let mut i = open_byte + 1;
+    while i < bytes.len() {
+        if matches!(bytes[i], b'\'' | b'"') {
+            i = python_quote_end(bytes, i)?;
+            continue;
+        }
+        if bytes[i] == b'#' {
+            // Production signatures collapse line boundaries, so an unquoted
+            // comment cannot be skipped without risking that its text hides a
+            // later parameter. Fail closed.
+            return None;
+        }
+        match bytes[i] {
+            b'(' => expected_closers.push(b')'),
+            b'[' => expected_closers.push(b']'),
+            b'{' => expected_closers.push(b'}'),
+            b')' | b']' | b'}' => {
+                if expected_closers.pop() != Some(bytes[i]) {
+                    return None;
+                }
+                if expected_closers.is_empty() {
+                    return Some(i);
                 }
             }
             _ => {}
         }
+        i += 1;
     }
     None
 }
 
-fn split_python_params(params: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut bracket_depth = 0i32;
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-
-    for ch in params.chars() {
-        if let Some(q) = quote {
-            current.push(ch);
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == q {
-                quote = None;
+/// End byte immediately after a single- or triple-quoted Python string that
+/// starts at `start`. Escapes are honored; unterminated strings fail closed.
+fn python_quote_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let delimiter = *bytes.get(start)?;
+    if !matches!(delimiter, b'\'' | b'"') {
+        return None;
+    }
+    if python_string_prefix_is_interpolated(bytes, start) {
+        // Python 3.12 permits same-quoted strings inside an f-string
+        // replacement field. A quote-only scanner cannot distinguish those
+        // nested expressions from the outer delimiter, so fail closed rather
+        // than truncate the parameter list and hide a later contract change.
+        return None;
+    }
+    let width = if bytes.get(start..start + 3) == Some(&[delimiter; 3]) {
+        3
+    } else {
+        1
+    };
+    let mut i = start + width;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            // Raw strings still use a backslash to prevent the following quote
+            // from terminating the literal. A dangling escape is malformed.
+            i = i.checked_add(2)?;
+            if i > bytes.len() {
+                return None;
             }
             continue;
         }
-
-        match ch {
-            '\'' | '"' => {
-                quote = Some(ch);
-                current.push(ch);
+        if width == 3 {
+            if bytes.get(i..i + 3) == Some(&[delimiter; 3]) {
+                return Some(i + 3);
             }
-            '[' | '(' | '{' => {
-                bracket_depth += 1;
-                current.push(ch);
-            }
-            ']' | ')' | '}' => {
-                bracket_depth -= 1;
-                current.push(ch);
-            }
-            ',' if bracket_depth == 0 => {
-                parts.push(current.trim().to_string());
-                current.clear();
-            }
-            _ => current.push(ch),
+        } else if bytes[i] == delimiter {
+            return Some(i + 1);
         }
+        if width == 1 && matches!(bytes[i], b'\n' | b'\r') {
+            return None;
+        }
+        i += 1;
     }
-
-    if !current.trim().is_empty() {
-        parts.push(current.trim().to_string());
-    }
-    parts
+    None
 }
 
-fn normalize_python_param(param: &str) -> String {
+/// Whether the quote at `start` carries an interpolated-string prefix.
+/// Contiguous ASCII letters are sufficient here: valid Python prefixes are
+/// adjacent to the delimiter, and treating an invalid longer prefix as
+/// unsupported is the conservative review behavior.
+fn python_string_prefix_is_interpolated(bytes: &[u8], start: usize) -> bool {
+    let mut prefix_start = start;
+    while prefix_start > 0 && bytes[prefix_start - 1].is_ascii_alphabetic() {
+        prefix_start -= 1;
+    }
+    bytes[prefix_start..start]
+        .iter()
+        .any(|byte| matches!(byte, b'f' | b'F' | b't' | b'T'))
+}
+
+fn python_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || !byte.is_ascii()
+}
+
+fn python_keyword_at(bytes: &[u8], start: usize, keyword: &[u8]) -> bool {
+    bytes.get(start..start + keyword.len()) == Some(keyword)
+        && (start == 0 || !python_identifier_byte(bytes[start - 1]))
+        && bytes
+            .get(start + keyword.len())
+            .is_none_or(|byte| !python_identifier_byte(*byte))
+}
+
+/// Split a Python parameter list while respecting nested delimiters, quoted
+/// strings, escapes, and the comma-bearing header of an unparenthesized lambda
+/// default (`cb=lambda x, y: ...`). Any malformed or ambiguous structure fails
+/// closed instead of returning a partial parameter list.
+fn split_python_params(params: &str) -> Option<Vec<String>> {
+    let mut parts = Vec::new();
+    let bytes = params.as_bytes();
+    let mut expected_closers = Vec::new();
+    let mut lambda_headers = 0usize;
+    let mut part_start = 0usize;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if matches!(bytes[i], b'\'' | b'"') {
+            i = python_quote_end(bytes, i)?;
+            continue;
+        }
+        if bytes[i] == b'#' {
+            return None;
+        }
+        if expected_closers.is_empty() && python_keyword_at(bytes, i, b"lambda") {
+            lambda_headers += 1;
+            i += "lambda".len();
+            continue;
+        }
+        match bytes[i] {
+            b'(' => expected_closers.push(b')'),
+            b'[' => expected_closers.push(b']'),
+            b'{' => expected_closers.push(b'}'),
+            b')' | b']' | b'}' => {
+                if expected_closers.pop() != Some(bytes[i]) {
+                    return None;
+                }
+            }
+            b':' if expected_closers.is_empty() && lambda_headers > 0 => {
+                lambda_headers -= 1;
+            }
+            b',' if expected_closers.is_empty() && lambda_headers == 0 => {
+                let part = params[part_start..i].trim();
+                if part.is_empty() {
+                    return None;
+                }
+                parts.push(part.to_string());
+                part_start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    if !expected_closers.is_empty() || lambda_headers != 0 {
+        return None;
+    }
+    let tail = params[part_start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail.to_string());
+    } else if part_start == 0 {
+        return Some(Vec::new());
+    }
+    Some(parts)
+}
+
+fn normalize_python_param(param: &str) -> Option<String> {
     let trimmed = param.trim();
-    let (before_default, default) = match top_level_char(trimmed, '=') {
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (before_default, default) = match top_level_char(trimmed, '=').ok()? {
         Some(idx) => (&trimmed[..idx], Some(&trimmed[idx + 1..])),
         None => (trimmed, None),
     };
-    let name = match top_level_char(before_default, ':') {
+    let name = match top_level_char(before_default, ':').ok()? {
         Some(idx) => before_default[..idx].trim(),
         None => before_default.trim(),
     };
     let name = name.split_whitespace().collect::<String>();
+    if name.is_empty() {
+        return None;
+    }
     match default {
-        Some(default) => format!("{name}={}", default.split_whitespace().collect::<String>()),
-        None => name,
+        Some(default) => Some(format!("{name}={}", normalize_python_default(default)?)),
+        None => Some(name),
     }
 }
 
-fn top_level_char(input: &str, needle: char) -> Option<usize> {
-    let mut bracket_depth = 0i32;
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for (idx, ch) in input.char_indices() {
-        if let Some(q) = quote {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == q {
-                quote = None;
-            }
+/// Remove formatting whitespace from a Python default expression without
+/// erasing whitespace inside string literals or token boundaries. The previous
+/// blanket `split_whitespace` normalization made both `"a b"`/`"ab"` and
+/// `not x`/`notx` indistinguishable, allowing semantic default changes through
+/// the rename-neutral path.
+fn normalize_python_default(default: &str) -> Option<String> {
+    let default = default.trim();
+    if default.is_empty() {
+        return None;
+    }
+    let bytes = default.as_bytes();
+    let mut normalized = String::with_capacity(default.len());
+    let mut expected_closers = Vec::new();
+    let mut pending_space = false;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let ch = default[i..].chars().next()?;
+        if ch.is_whitespace() {
+            pending_space = true;
+            i += ch.len_utf8();
             continue;
         }
+        if matches!(bytes[i], b'\'' | b'"') {
+            if pending_space
+                && normalized
+                    .chars()
+                    .last()
+                    .is_some_and(|previous| python_default_space_is_semantic(previous, ch))
+            {
+                normalized.push(' ');
+            }
+            let end = python_quote_end(bytes, i)?;
+            normalized.push_str(&default[i..end]);
+            pending_space = false;
+            i = end;
+            continue;
+        }
+        if bytes[i] == b'#' {
+            return None;
+        }
+        if pending_space
+            && normalized
+                .chars()
+                .last()
+                .is_some_and(|previous| python_default_space_is_semantic(previous, ch))
+        {
+            normalized.push(' ');
+        }
+        pending_space = false;
         match ch {
-            '\'' | '"' => quote = Some(ch),
-            '[' | '(' | '{' => bracket_depth += 1,
-            ']' | ')' | '}' => bracket_depth -= 1,
-            _ if ch == needle && bracket_depth == 0 => return Some(idx),
+            '(' => expected_closers.push(')'),
+            '[' => expected_closers.push(']'),
+            '{' => expected_closers.push('}'),
+            ')' | ']' | '}' => {
+                if expected_closers.pop() != Some(ch) {
+                    return None;
+                }
+            }
             _ => {}
         }
+        normalized.push(ch);
+        i += ch.len_utf8();
     }
-    None
+
+    if expected_closers.is_empty() {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+/// Whether removing a whitespace run would merge Python tokens or create a
+/// different operator. Whitespace around ordinary punctuation/operators is
+/// formatting; boundaries between words (`not x`, `x and y`), adjacent
+/// operator characters, string prefixes, and numeric dots are semantic.
+fn python_default_space_is_semantic(previous: char, next: char) -> bool {
+    fn word(ch: char) -> bool {
+        ch.is_alphanumeric() || ch == '_'
+    }
+    fn token_end(ch: char) -> bool {
+        word(ch) || matches!(ch, ')' | ']' | '}' | '\'' | '"')
+    }
+    fn token_start(ch: char) -> bool {
+        word(ch) || matches!(ch, '\'' | '"')
+    }
+    fn operator(ch: char) -> bool {
+        matches!(
+            ch,
+            '+' | '-' | '*' | '/' | '%' | '@' | '<' | '>' | '=' | '!' | '&' | '|' | '^' | '~' | ':'
+        )
+    }
+
+    (token_end(previous) && token_start(next))
+        || (operator(previous) && operator(next))
+        || (previous.is_ascii_digit() && next == '.')
+        || (previous == '.' && next.is_ascii_digit())
+}
+
+/// Locate a delimiter at top-level outside nested delimiters and quoted text.
+/// Malformed structure is an error so callers can fail closed rather than
+/// interpreting a partial parameter.
+fn top_level_char(input: &str, needle: char) -> Result<Option<usize>, ()> {
+    let bytes = input.as_bytes();
+    let mut expected_closers = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if matches!(bytes[i], b'\'' | b'"') {
+            i = python_quote_end(bytes, i).ok_or(())?;
+            continue;
+        }
+        if bytes[i] == b'#' {
+            return Err(());
+        }
+        let ch = input[i..].chars().next().ok_or(())?;
+        match ch {
+            '(' => expected_closers.push(')'),
+            '[' => expected_closers.push(']'),
+            '{' => expected_closers.push('}'),
+            ')' | ']' | '}' => {
+                if expected_closers.pop() != Some(ch) {
+                    return Err(());
+                }
+            }
+            _ if ch == needle && expected_closers.is_empty() => return Ok(Some(i)),
+            _ => {}
+        }
+        i += ch.len_utf8();
+    }
+    if expected_closers.is_empty() {
+        Ok(None)
+    } else {
+        Err(())
+    }
 }
 
 /// Collect line-level inline comments from a review's diff and impact data.
@@ -1080,6 +1381,216 @@ mod tests {
         assert!(comments
             .iter()
             .any(|c| c.kind == InlineCommentKind::Breaking));
+    }
+
+    #[test]
+    fn positional_rename_with_default_change_stays_breaking_inline() {
+        // Call-shape evidence proves every known caller passes positionally,
+        // but it cannot neutralize a simultaneous default-value change: callers
+        // outside the observed graph may omit that argument, and the callable's
+        // runtime contract changed independently of the rename.
+        let mut old = test_entity_with_span("target", "src/mod.py", 1, 2);
+        old.language = LanguageId::Python;
+        old.signature = "def target(ext, args=1)".to_string();
+        let mut new = old.clone();
+        new.signature = "def target(ext, lines=2)".to_string();
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 1,
+                strong_consumer_count: 1,
+                contract_consumer_count: 0,
+                consumer_files: vec!["src/caller.py".to_string()],
+                covering_tests: 0,
+                consumers_migrated_in_diff: 0,
+                call_shapes: ConsumerCallShapeSummary {
+                    all_consumers_shaped_calls: true,
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        };
+
+        let comments = collect_inline_comments(&diff, &impact);
+        assert!(
+            comments
+                .iter()
+                .any(|comment| comment.kind == InlineCommentKind::Breaking),
+            "default changes must keep the inline channel blocking: {comments:?}"
+        );
+        assert!(
+            comments.iter().all(|comment| !comment
+                .message
+                .contains("pass positionally — no runtime break")),
+            "default changes must never carry the rename-neutral proof: {comments:?}"
+        );
+    }
+
+    #[test]
+    fn none_type_default_spelling_change_stays_breaking_inline() {
+        let mut old = test_entity_with_span("target", "src/mod.py", 1, 2);
+        old.language = LanguageId::Python;
+        old.signature = "def target(value=type(None))".to_string();
+        let mut new = old.clone();
+        new.signature = "def target(value=types.NoneType)".to_string();
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 1,
+                strong_consumer_count: 1,
+                contract_consumer_count: 0,
+                consumer_files: vec!["src/caller.py".to_string()],
+                covering_tests: 0,
+                consumers_migrated_in_diff: 0,
+                call_shapes: ConsumerCallShapeSummary {
+                    all_consumers_shaped_calls: true,
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        };
+
+        let comments = collect_inline_comments(&diff, &impact);
+        assert!(
+            comments
+                .iter()
+                .any(|comment| comment.kind == InlineCommentKind::SignatureChange),
+            "binding-unknown NoneType spellings must keep the signature finding: {comments:?}"
+        );
+        assert!(
+            comments
+                .iter()
+                .any(|comment| comment.kind == InlineCommentKind::Breaking),
+            "binding-unknown NoneType spellings must remain blocking: {comments:?}"
+        );
+    }
+
+    #[test]
+    fn positional_rename_with_async_mode_change_stays_breaking_inline() {
+        let mut old = test_entity_with_span("target", "src/mod.py", 1, 2);
+        old.language = LanguageId::Python;
+        old.signature = "def target(ext, args)".to_string();
+        let mut new = old.clone();
+        new.signature = "async def target(ext, lines)".to_string();
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 1,
+                strong_consumer_count: 1,
+                contract_consumer_count: 0,
+                consumer_files: vec!["src/caller.py".to_string()],
+                covering_tests: 0,
+                consumers_migrated_in_diff: 0,
+                call_shapes: ConsumerCallShapeSummary {
+                    all_consumers_shaped_calls: true,
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        };
+
+        let comments = collect_inline_comments(&diff, &impact);
+        assert!(
+            comments
+                .iter()
+                .any(|comment| comment.kind == InlineCommentKind::Breaking),
+            "sync-to-async must keep the inline channel blocking: {comments:?}"
+        );
+        assert!(
+            comments.iter().all(|comment| !comment
+                .message
+                .contains("pass positionally — no runtime break")),
+            "an async-mode change must never carry rename-neutral proof: {comments:?}"
+        );
+    }
+
+    #[test]
+    fn collector_only_rename_is_neutral_but_role_change_breaks_inline() {
+        let mut old = test_entity_with_span("target", "src/mod.py", 1, 2);
+        old.language = LanguageId::Python;
+        old.signature = "def target(ext, *args, **kwargs)".to_string();
+        let mut renamed = old.clone();
+        renamed.signature = "def target(ext, *items, **options)".to_string();
+        let impact = ImpactReport {
+            changed_ids: vec![renamed.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: renamed.id,
+                consumer_count: 1,
+                strong_consumer_count: 1,
+                contract_consumer_count: 0,
+                consumer_files: vec!["src/caller.py".to_string()],
+                covering_tests: 0,
+                consumers_migrated_in_diff: 0,
+                // No call-shape proof is needed for local collector bindings.
+                call_shapes: ConsumerCallShapeSummary::default(),
+            }],
+            ..Default::default()
+        };
+        let diff_for = |new: Entity| SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new,
+                },
+            }],
+            ..Default::default()
+        };
+
+        let neutral = collect_inline_comments(&diff_for(renamed.clone()), &impact);
+        assert!(
+            neutral.iter().all(|comment| !matches!(
+                comment.kind,
+                InlineCommentKind::SignatureChange | InlineCommentKind::Breaking
+            )),
+            "collector-only binding renames are runtime-neutral: {neutral:?}"
+        );
+
+        let mut role_changed = renamed;
+        role_changed.signature = "def target(ext, **args)".to_string();
+        let blocking = collect_inline_comments(&diff_for(role_changed), &impact);
+        assert!(
+            blocking
+                .iter()
+                .any(|comment| comment.kind == InlineCommentKind::Breaking),
+            "changing *args to **args changes the call contract: {blocking:?}"
+        );
     }
 
     #[test]
@@ -1855,6 +2366,44 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn python_declaration_mode_and_unknown_headers_fail_closed() {
+        assert!(signature_runtime_neutral(
+            "async def target(value)",
+            "async def target(value: int)"
+        ));
+        assert!(!signature_runtime_neutral(
+            "def target(value)",
+            "async def target(value)"
+        ));
+        assert_eq!(
+            arity_preserving_rename("def target(ext, args)", "async def target(ext, lines)"),
+            None,
+            "sync-to-async is a runtime contract change, not a pure rename"
+        );
+        assert_eq!(
+            arity_preserving_rename("async def target(ext, args)", "def target(ext, lines)"),
+            None,
+            "async-to-sync is a runtime contract change, not a pure rename"
+        );
+        assert_eq!(
+            arity_preserving_rename(
+                "decorated def target(ext, args)",
+                "decorated def target(ext, lines)"
+            ),
+            None,
+            "unrecognized pre-def text cannot enter a neutral classifier"
+        );
+        assert!(!signature_runtime_neutral(
+            "decorated def target(value=type(None))",
+            "decorated def target(value=types.NoneType)"
+        ));
+        assert!(!signature_runtime_neutral(
+            "# stale comment def target(value=type(None))",
+            "# stale comment def target(value=types.NoneType)"
+        ));
+    }
+
     /// d25c3ad241 shape: widening a return annotation (`-> str` to
     /// `-> Optional[str]`) changes no call contract — the parameter list (name +
     /// arity + param names) is unchanged. Regression lock so the return-annotation
@@ -1867,16 +2416,21 @@ mod tests {
         ));
     }
 
-    /// fd21f82aa8 shape: swapping the `type(None)` spelling for `types.NoneType`
-    /// changes no runtime contract, whether it appears in a default value or a
-    /// bare module-level declaration whose text carries the reference.
+    /// Signature text cannot prove that `type` still names the builtin or that
+    /// `types` still names the standard-library module. Keep this change in the
+    /// attention channel; graph binding evidence may prove equivalence in the
+    /// body-comparison path, but the lexical signature path must fail closed.
     #[test]
-    fn python_none_type_spelling_swap_is_runtime_neutral() {
-        assert!(signature_runtime_neutral(
+    fn python_none_type_spelling_swap_is_not_signature_neutral() {
+        assert!(!signature_runtime_neutral(
             "def f(x=type(None))",
             "def f(x=types.NoneType)"
         ));
-        assert!(signature_runtime_neutral(
+        assert!(!signature_runtime_neutral(
+            "def f(x=type ( None ))",
+            "def f(x=types.NoneType)"
+        ));
+        assert!(!signature_runtime_neutral(
             "PROTECTED = (bool, int, type(None), bytes)",
             "PROTECTED = (bool, int, types.NoneType, bytes)"
         ));
@@ -1898,6 +2452,22 @@ mod tests {
         assert!(!signature_runtime_neutral(
             "PROTECTED = (bool, int, type(None), bytes)",
             "PROTECTED = (bool, int, NoneType, bytes)"
+        ));
+        assert!(!signature_runtime_neutral(
+            r#"def f(x="type(None)")"#,
+            r#"def f(x="types.NoneType")"#
+        ));
+        assert!(!signature_runtime_neutral(
+            "def f(x=mytype(None))",
+            "def f(x=mytypes.NoneType)"
+        ));
+        assert!(!signature_runtime_neutral(
+            "def f(x=obj.type(None))",
+            "def f(x=obj.types.NoneType)"
+        ));
+        assert!(!signature_runtime_neutral(
+            "def f(x=obj.\\ type(None))",
+            "def f(x=obj.\\ types.NoneType)"
         ));
     }
 
@@ -1921,6 +2491,133 @@ mod tests {
         assert_eq!(
             arity_preserving_rename("def f(a: int = 1)", "def f(b: int = 1)"),
             Some(vec!["a".to_string()])
+        );
+        // Formatting-only changes to a structured default normalize away.
+        assert_eq!(
+            arity_preserving_rename(
+                "def f(a = (1, 2), limit = {'x': 3})",
+                "def f(b=(1,2), limit={'x':3})"
+            ),
+            Some(vec!["a".to_string()])
+        );
+    }
+
+    #[test]
+    fn arity_preserving_rename_rejects_default_contract_changes() {
+        // Changed, added, and removed defaults all alter the runtime contract.
+        assert_eq!(arity_preserving_rename("def f(a=1)", "def f(b=2)"), None);
+        assert_eq!(arity_preserving_rename("def f(a)", "def f(b=1)"), None);
+        assert_eq!(arity_preserving_rename("def f(a=1)", "def f(b)"), None);
+        // A default change on an otherwise unchanged parameter is equally
+        // disqualifying when another position is renamed.
+        assert_eq!(
+            arity_preserving_rename("def f(a, limit=1)", "def f(b, limit=2)"),
+            None
+        );
+        // Whitespace inside a string literal is data, not formatting.
+        assert_eq!(
+            arity_preserving_rename("def f(a='x y')", "def f(b='xy')"),
+            None
+        );
+        // Whitespace that separates Python tokens is semantic, not formatting.
+        assert_eq!(
+            arity_preserving_rename("def f(a=not x)", "def f(b=notx)"),
+            None
+        );
+        assert_eq!(
+            arity_preserving_rename("def f(a=x and y)", "def f(b=xandy)"),
+            None
+        );
+        // A quoted closing parenthesis must not hide a later default change.
+        assert_eq!(
+            arity_preserving_rename(r#"def f(a=")", tail=1)"#, r#"def f(b=")", tail=2)"#),
+            None
+        );
+        assert_eq!(
+            arity_preserving_rename(r#"def f(a=")", tail=1)"#, r#"def f(b=")", tail=1)"#),
+            Some(vec!["a".to_string()])
+        );
+        // Python 3.12 permits a same-quoted string inside an f-string
+        // replacement field. The lightweight signature scanner deliberately
+        // fails closed on interpolated strings so that an inner `)` can never
+        // hide a changed later default.
+        for interpolated_default in [
+            r#"f"{foo(")")}""#,
+            r#"F"{foo(")")}""#,
+            r#"rf"{foo(")")}""#,
+            r#"fr"{foo(")")}""#,
+            r#"f'{foo(')')}'"#,
+            r##"f"{ {"x": ")"} }""##,
+            r##"f"{x:{foo(")")}}""##,
+            r####"f"""value""""####,
+        ] {
+            let old = format!("def f(a={interpolated_default}, tail=1)");
+            let changed_tail = format!("def f(b={interpolated_default}, tail=2)");
+            let rename_only = format!("def f(b={interpolated_default}, tail=1)");
+            assert_eq!(
+                arity_preserving_rename(&old, &changed_tail),
+                None,
+                "interpolated default must not hide a later contract change: {interpolated_default}"
+            );
+            assert_eq!(
+                arity_preserving_rename(&old, &rename_only),
+                None,
+                "interpolated defaults deliberately fail closed: {interpolated_default}"
+            );
+        }
+        // Non-interpolated raw and bytes literals still use the precise quote
+        // scanner and remain eligible for rename-only classification.
+        assert_eq!(
+            arity_preserving_rename(r#"def f(a=r")", tail=1)"#, r#"def f(b=r")", tail=1)"#),
+            Some(vec!["a".to_string()])
+        );
+        assert_eq!(
+            arity_preserving_rename(r#"def f(a=b")", tail=1)"#, r#"def f(b=b")", tail=1)"#),
+            Some(vec!["a".to_string()])
+        );
+        // Escaped delimiters and triple-quoted defaults are scanned as complete
+        // literals; neither may expose their `)` to the outer signature scan.
+        assert_eq!(
+            arity_preserving_rename(
+                r#"def f(a="escaped \") text", tail=1)"#,
+                r#"def f(b="escaped \") text", tail=2)"#
+            ),
+            None
+        );
+        assert_eq!(
+            arity_preserving_rename(
+                r#"def f(a="""multi ) value""", tail=1)"#,
+                r#"def f(b="""multi ) value""", tail=2)"#
+            ),
+            None
+        );
+        // Commas in an unparenthesized lambda header belong to the default;
+        // they must not split the outer declaration or hide `tail`.
+        assert_eq!(
+            arity_preserving_rename(
+                "def f(a=lambda x, y: (x, y), tail=1)",
+                "def f(b=lambda x, y: (x, y), tail=2)"
+            ),
+            None
+        );
+        assert_eq!(
+            arity_preserving_rename(
+                "def f(a=lambda x, y: (x, y), tail=1)",
+                "def f(b=lambda x, y: (x, y), tail=1)"
+            ),
+            Some(vec!["a".to_string()])
+        );
+        // Unterminated quotes and unbalanced nesting fail closed.
+        assert_eq!(
+            arity_preserving_rename(
+                r#"def f(a="unterminated, tail=1)"#,
+                r#"def f(b="unterminated, tail=1)"#
+            ),
+            None
+        );
+        assert_eq!(
+            arity_preserving_rename("def f(a=(1, 2, tail=1)", "def f(b=(1, 2, tail=1)"),
+            None
         );
     }
 
@@ -1958,11 +2655,18 @@ mod tests {
 
     #[test]
     fn arity_preserving_rename_ignores_collectors_and_role_changes() {
-        // Renaming `*args`/`**kwargs` collectors strands no caller.
+        // Renaming only `*args`/`**kwargs` collectors strands no caller. The
+        // empty name set distinguishes it from `None` (not a safe rename), and
+        // every review channel treats it as runtime-neutral without call-shape
+        // evidence.
         assert_eq!(
             arity_preserving_rename("def f(a, *args, **kwargs)", "def f(a, *rest, **opts)"),
-            None
+            Some(vec![])
         );
+        assert!(signature_runtime_neutral(
+            "def f(a, *args, **kwargs)",
+            "def f(a, *rest, **opts)"
+        ));
         // A normal rename alongside a collector rename reports only the normal one.
         assert_eq!(
             arity_preserving_rename("def f(a, *args)", "def f(b, *rest)"),
@@ -1970,6 +2674,27 @@ mod tests {
         );
         // Reclassifying a position (normal → `*args`) is structural, not a rename.
         assert_eq!(arity_preserving_rename("def f(a, b)", "def f(a, *b)"), None);
+        assert!(!signature_runtime_neutral(
+            "def f(a, *args)",
+            "def f(a, **args)"
+        ));
+    }
+
+    #[test]
+    fn python_markers_keep_identity_and_position() {
+        assert_eq!(
+            arity_preserving_rename("def f(a, /, b)", "def f(x, /, b)"),
+            Some(vec!["a".to_string()])
+        );
+        assert_eq!(
+            arity_preserving_rename("def f(a, /, b)", "def f(x, *, b)"),
+            None
+        );
+        assert_eq!(
+            arity_preserving_rename("def f(a, *, b=1)", "def f(x, /, b=1)"),
+            None
+        );
+        assert!(!signature_runtime_neutral("def f(a)", "def f(a, /)"));
     }
 
     #[test]
@@ -2027,13 +2752,12 @@ mod tests {
             &missing_shape
         ));
 
-        // A rename with no consumers at all is vacuously neutral: an empty
-        // real-consumer set is already handled upstream as no downstream risk.
-        let no_consumers = ConsumerCallShapeSummary {
-            all_consumers_shaped_calls: true,
-            ..Default::default()
-        };
-        assert!(rename_is_runtime_neutral_for_consumers(&[], &no_consumers));
+        // An empty renamed-name set is the explicit collector-only
+        // classification, inherently neutral even without shaped consumers.
+        assert!(rename_is_runtime_neutral_for_consumers(
+            &[],
+            &ConsumerCallShapeSummary::default()
+        ));
     }
 
     #[test]
@@ -2077,6 +2801,8 @@ mod tests {
             "def f(self, a, b)",
             "def f(self, b, a, c=1)"
         ));
+        // Appending `/` changes every preceding parameter to positional-only.
+        assert!(!signature_runtime_neutral("def f(a)", "def f(a, /)"));
     }
 
     #[test]

@@ -10,8 +10,10 @@
 //! Python narrows attribute callees to their **leaf name at extraction time**,
 //! with one deliberate exception. `module.func()`, `obj.method()`, and
 //! `self.member.save()` all emit a `Calls` edge whose `dst_name` is the trailing
-//! identifier (`func`, `method`, `save`) — their receiver's type is unknowable
-//! at parse time. But `self.m()` / `cls.m()` dispatch through the *enclosing
+//! identifier (`func`, `method`, `save`). Their receiver's type is unknowable at
+//! parse time, so the file also carries negative call-coverage evidence; the
+//! leaf edge is useful for recall but cannot certify a safe rename. But direct
+//! `self.m()` / `cls.m()` dispatch through the *enclosing
 //! class*, so they emit the class-qualified form (`Service.validate`): that
 //! qualifier is what lets the linker resolve an inherited method through the
 //! class's Extends chain instead of fanning out on the bare name. Because the
@@ -36,7 +38,10 @@
 //!     top-level function that encloses them).
 
 use kin_model::{EntityKind, FilePathId, RelationKind};
-use kin_parser::{ExtractedRelation, LanguageAdapter, ParseOutput, PythonAdapter};
+use kin_parser::{
+    is_call_extraction_incomplete_marker, ExtractedRelation, LanguageAdapter, ParseOutput,
+    PythonAdapter,
+};
 
 fn extract(source: &str) -> ParseOutput {
     let adapter = PythonAdapter;
@@ -114,6 +119,79 @@ fn bare_call_with_import_carries_import_source() {
     );
 }
 
+#[test]
+fn parenthesized_named_call_preserves_exact_argument_shape() {
+    let output = extract(
+        "def target(ext, args):\n    return ext, args\n\ndef caller():\n    return ((target))(args=2, ext=1)\n",
+    );
+    let hits = calls_named(&output, "target");
+    assert_eq!(hits.len(), 1, "wrapped named call must be extracted once");
+    let shape = hits[0].call_shape.as_ref().expect("wrapped call shape");
+    assert_eq!(shape.positional, 0);
+    assert_eq!(shape.keywords, vec!["args".to_string(), "ext".to_string()]);
+    assert!(!shape.has_var_positional);
+    assert!(!shape.has_var_keyword);
+    assert!(
+        !output
+            .relations
+            .iter()
+            .any(is_call_extraction_incomplete_marker),
+        "transparent parentheses must not degrade file-level call coverage"
+    );
+}
+
+#[test]
+fn parenthesized_self_attribute_keeps_class_qualification() {
+    let output = extract(
+        "class Service:\n    def target(self, value):\n        return value\n\n    def caller(self):\n        return (self.target)(value=1)\n",
+    );
+    let hits = calls_named(&output, "Service.target");
+    assert_eq!(hits.len(), 1, "wrapped self call must stay class-qualified");
+    assert_eq!(
+        hits[0]
+            .call_shape
+            .as_ref()
+            .expect("wrapped self shape")
+            .keywords,
+        vec!["value".to_string()]
+    );
+    assert!(
+        !output
+            .relations
+            .iter()
+            .any(is_call_extraction_incomplete_marker),
+        "a resolvable wrapped attribute must retain complete coverage"
+    );
+}
+
+#[test]
+fn dynamic_callee_emits_one_incomplete_extraction_marker() {
+    let output = extract(
+        "def target(ext, args):\n    return ext, args\n\ndef other(ext, args):\n    return ext, args\n\ndef caller(flag):\n    target(1, 2)\n    return (target if flag else other)(ext=1, args=2)\n",
+    );
+    assert_eq!(
+        output
+            .relations
+            .iter()
+            .filter(|relation| is_call_extraction_incomplete_marker(relation))
+            .count(),
+        1,
+        "one file-level marker covers every unsupported callee"
+    );
+}
+
+#[test]
+fn module_scope_call_emits_incomplete_extraction_marker() {
+    let output = extract("def target(ext, args):\n    return ext, args\n\ntarget(ext=1, args=2)\n");
+    assert!(
+        output
+            .relations
+            .iter()
+            .any(is_call_extraction_incomplete_marker),
+        "an unowned module-scope call must prevent a full call-coverage claim"
+    );
+}
+
 // ---- module-attribute calls ----
 
 #[test]
@@ -138,6 +216,13 @@ fn module_attribute_call_narrows_to_leaf_name() {
         !calls(&output).iter().any(|r| r.dst_name.contains('.')),
         "dotted form must not appear as a Calls dst_name, got {:?}",
         calls(&output)
+    );
+    assert!(
+        output
+            .relations
+            .iter()
+            .any(is_call_extraction_incomplete_marker),
+        "leaf-only module receiver evidence must not certify complete call resolution"
     );
 }
 
@@ -168,6 +253,13 @@ fn method_call_on_instance_narrows_to_leaf_name() {
         calls(&output)
     );
     assert!(has_entity(&output, EntityKind::Method, "Service.run"));
+    assert!(
+        output
+            .relations
+            .iter()
+            .any(is_call_extraction_incomplete_marker),
+        "an untyped instance receiver must preserve negative call-coverage evidence"
+    );
 }
 
 // ---- nesting recursion ----

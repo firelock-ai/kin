@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use tracing::debug;
@@ -158,14 +159,10 @@ impl IndexPipeline {
             kin_parser::attach_go_command_effect_contract_metadata(&tree, source, &mut entities);
         }
 
-        let (relations, unresolved_relations) = resolve_relations(&extracted_relations, &entities);
-        let file_layout = build_layout(
-            file_id,
-            &entities,
-            source.len(),
-            &[],
-            ParseCompleteness::from_parse_state(&parse_state),
-        );
+        let parse_completeness = ParseCompleteness::from_parse_state(&parse_state);
+        let (relations, unresolved_relations) =
+            resolve_relations(&extracted_relations, &entities, &parse_completeness);
+        let file_layout = build_layout(file_id, &entities, source.len(), &[], parse_completeness);
 
         debug!(
             path = %file_id,
@@ -299,14 +296,10 @@ impl IndexPipeline {
         }
 
         // Resolve extracted relations to model relations using entity name mapping
-        let (relations, unresolved_relations) = resolve_relations(&extracted_relations, &entities);
-        let file_layout = build_layout(
-            file_id,
-            &entities,
-            source.len(),
-            &[],
-            ParseCompleteness::from_parse_state(&parse_state),
-        );
+        let parse_completeness = ParseCompleteness::from_parse_state(&parse_state);
+        let (relations, unresolved_relations) =
+            resolve_relations(&extracted_relations, &entities, &parse_completeness);
+        let file_layout = build_layout(file_id, &entities, source.len(), &[], parse_completeness);
 
         debug!(
             path = %path.display(),
@@ -762,32 +755,49 @@ pub fn classify_file_role(path: &str) -> EntityRole {
 fn resolve_relations(
     extracted: &[kin_parser::ExtractedRelation],
     entities: &[Entity],
+    parse_completeness: &ParseCompleteness,
 ) -> (Vec<Relation>, Vec<UnresolvedRelation>) {
     let mut resolved = Vec::new();
+    let mut relation_indices = HashMap::new();
     let mut unresolved = Vec::new();
+    let call_extraction_complete = !extracted
+        .iter()
+        .any(kin_parser::is_call_extraction_incomplete_marker);
 
     for rel in extracted {
+        if kin_parser::is_call_extraction_incomplete_marker(rel) {
+            continue;
+        }
         let src = entities.iter().find(|e| e.name == rel.src_name);
         let dst = entities.iter().find(|e| e.name == rel.dst_name);
 
         match (src, dst) {
             (Some(s), Some(d)) => {
                 // Same-file relation: fully resolved
-                resolved.push(Relation {
-                    id: RelationId::from_content(
-                        &s.id.0.to_string(),
-                        &d.id.0.to_string(),
-                        &format!("{:?}", rel.kind),
-                    ),
-                    kind: rel.kind,
-                    src: kin_model::GraphNodeId::Entity(s.id),
-                    dst: kin_model::GraphNodeId::Entity(d.id),
-                    confidence: 1.0,
-                    origin: RelationOrigin::Parsed,
-                    created_in: None,
-                    import_source: rel.import_source.clone(),
-                    evidence: crate::linker::call_shape_evidence(rel.call_shape.as_ref()),
-                });
+                crate::linker::accumulate_relation(
+                    &mut resolved,
+                    &mut relation_indices,
+                    Relation {
+                        id: RelationId::from_content(
+                            &s.id.0.to_string(),
+                            &d.id.0.to_string(),
+                            &format!("{:?}", rel.kind),
+                        ),
+                        kind: rel.kind,
+                        src: kin_model::GraphNodeId::Entity(s.id),
+                        dst: kin_model::GraphNodeId::Entity(d.id),
+                        confidence: 1.0,
+                        origin: RelationOrigin::Parsed,
+                        created_in: None,
+                        import_source: rel.import_source.clone(),
+                        evidence: crate::linker::call_shape_evidence(
+                            rel.kind,
+                            rel.call_shape.as_ref(),
+                            parse_completeness,
+                            call_extraction_complete,
+                        ),
+                    },
+                );
             }
             (Some(s), None) => {
                 // Partial resolution: src found, dst is cross-file
@@ -866,6 +876,152 @@ mod tests {
                 .any(|entity| entity.kind == kin_model::EntityKind::Function
                     && entity.name == "greet")
         );
+    }
+
+    #[test]
+    fn index_python_repeated_calls_aggregate_shape_evidence_order_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(dir.path().join("blobs")).unwrap();
+        let pipeline = IndexPipeline::new();
+        let py_file = dir.path().join("test.py");
+        let forward = b"def target(ext, args):\n    return ext, args\n\n\ndef caller():\n    target(1, 2)\n    return target(3, args=4)\n";
+        let reversed = b"def target(ext, args):\n    return ext, args\n\n\ndef caller():\n    target(3, args=4)\n    return target(1, 2)\n";
+        let evidence_for = |source: &[u8]| {
+            std::fs::write(&py_file, source).unwrap();
+            let indexed = pipeline.index_file(&py_file, &blob_store).unwrap();
+            let caller = indexed
+                .entities
+                .iter()
+                .find(|entity| entity.name == "caller")
+                .expect("caller entity");
+            let target = indexed
+                .entities
+                .iter()
+                .find(|entity| entity.name == "target")
+                .expect("target entity");
+            indexed
+                .relations
+                .iter()
+                .find(|relation| {
+                    relation.kind == kin_model::RelationKind::Calls
+                        && relation.src == kin_model::GraphNodeId::Entity(caller.id)
+                        && relation.dst == kin_model::GraphNodeId::Entity(target.id)
+                })
+                .expect("one logical Calls edge")
+                .evidence
+                .clone()
+        };
+
+        let forward_evidence = evidence_for(forward);
+        let reversed_evidence = evidence_for(reversed);
+        assert_eq!(forward_evidence, reversed_evidence);
+        assert_eq!(forward_evidence.len(), 2);
+        assert!(forward_evidence.iter().any(|evidence| {
+            evidence
+                .call_shape
+                .as_ref()
+                .is_some_and(|shape| shape.keywords == ["args"])
+        }));
+    }
+
+    #[test]
+    fn incomplete_python_parse_marks_same_file_call_shape_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(dir.path().join("blobs")).unwrap();
+        let pipeline = IndexPipeline::new();
+        let py_file = dir.path().join("test.py");
+        std::fs::write(
+            &py_file,
+            b"def target(ext, args):\n    return ext, args\n\n\ndef caller():\n    target(1, 2)\n    return target(3, args=4\n",
+        )
+        .unwrap();
+
+        let indexed = pipeline.index_file(&py_file, &blob_store).unwrap();
+        assert!(matches!(indexed.parse_state, ParseState::Incomplete { .. }));
+        let caller = indexed
+            .entities
+            .iter()
+            .find(|entity| entity.name == "caller")
+            .expect("caller entity");
+        let target = indexed
+            .entities
+            .iter()
+            .find(|entity| entity.name == "target")
+            .expect("target entity");
+        let edge = indexed
+            .relations
+            .iter()
+            .find(|relation| {
+                relation.kind == kin_model::RelationKind::Calls
+                    && relation.src == kin_model::GraphNodeId::Entity(caller.id)
+                    && relation.dst == kin_model::GraphNodeId::Entity(target.id)
+            })
+            .expect("surviving positional call edge");
+        assert_eq!(edge.evidence.len(), 1);
+        assert_eq!(
+            edge.evidence[0].parser_rule.as_deref(),
+            Some(crate::linker::CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1)
+        );
+        assert!(edge.evidence[0].call_shape.is_none());
+    }
+
+    #[test]
+    fn incomplete_python_call_extraction_downgrades_same_file_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(dir.path().join("blobs")).unwrap();
+        let py_file = dir.path().join("test.py");
+        std::fs::write(
+            &py_file,
+            b"def target(ext, args):\n    return ext, args\n\ndef other(ext, args):\n    return ext, args\n\ndef caller(flag):\n    target(1, 2)\n    return (target if flag else other)(ext=1, args=2)\n",
+        )
+        .unwrap();
+
+        let indexed = IndexPipeline::new()
+            .index_file(&py_file, &blob_store)
+            .expect("index syntax-valid Python source");
+        assert!(matches!(indexed.parse_state, ParseState::Valid));
+        assert!(matches!(
+            indexed.file_layout.parse_completeness,
+            ParseCompleteness::Full
+        ));
+        assert!(
+            indexed
+                .extracted_relations
+                .iter()
+                .any(kin_parser::is_call_extraction_incomplete_marker),
+            "raw parser marker must survive for later linking and history"
+        );
+        assert!(
+            indexed.unresolved_relations.iter().all(|relation| {
+                relation.dst_name != kin_parser::CALL_EXTRACTION_INCOMPLETE_MARKER_V1
+            }),
+            "the control record must never become an unresolved semantic relation"
+        );
+        let caller = indexed
+            .entities
+            .iter()
+            .find(|entity| entity.name == "caller")
+            .expect("caller entity");
+        let target = indexed
+            .entities
+            .iter()
+            .find(|entity| entity.name == "target")
+            .expect("target entity");
+        let edge = indexed
+            .relations
+            .iter()
+            .find(|relation| {
+                relation.kind == kin_model::RelationKind::Calls
+                    && relation.src == kin_model::GraphNodeId::Entity(caller.id)
+                    && relation.dst == kin_model::GraphNodeId::Entity(target.id)
+            })
+            .expect("surviving same-file target edge");
+        assert_eq!(edge.evidence.len(), 1);
+        assert_eq!(
+            edge.evidence[0].parser_rule.as_deref(),
+            Some(crate::linker::CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1)
+        );
+        assert!(edge.evidence[0].call_shape.is_none());
     }
 
     #[test]

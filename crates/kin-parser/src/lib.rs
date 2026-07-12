@@ -28,7 +28,7 @@ pub const PARSER_SCHEMA_EPOCH: &str = "parser-schema-2026-03-29-v1";
 /// doubt, bump — a spurious bump only costs a cold re-parse, while a missed bump
 /// silently serves stale semantics (the stale-binary class of bug). Mirrors
 /// kin-db's `GraphSnapshot::CURRENT_VERSION` convention.
-pub const PARSER_SEMANTICS_VERSION: u32 = 1;
+pub const PARSER_SEMANTICS_VERSION: u32 = 4;
 
 pub mod adapter;
 pub mod error;
@@ -40,9 +40,11 @@ pub mod todos;
 pub use adapter::{EditHint, LanguageAdapter};
 pub use error::{ParseError, Result};
 pub use extract::{
-    attach_file_context_metadata, CallArgShape, ExtractedEntity, ExtractedRelation, ExtractedTest,
-    ExtractedTestKind, FileImport, ImportedName, ParseOutput, COMMAND_EFFECT_CONTRACT_KEY,
-    FILE_IMPORT_CONTEXT_KEY, FILE_SURFACE_CONTEXT_KEY,
+    attach_file_context_metadata, call_extraction_incomplete_marker,
+    is_call_extraction_incomplete_marker, CallArgShape, ExtractedEntity, ExtractedRelation,
+    ExtractedTest, ExtractedTestKind, FileImport, ImportedName, ParseOutput,
+    CALL_EXTRACTION_INCOMPLETE_MARKER_V1, COMMAND_EFFECT_CONTRACT_KEY, FILE_IMPORT_CONTEXT_KEY,
+    FILE_SURFACE_CONTEXT_KEY,
 };
 pub use languages::{
     attach_go_command_effect_contract_metadata, AdapterRegistry, CAdapter, CSharpAdapter,

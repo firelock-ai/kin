@@ -502,6 +502,7 @@ fn persist_semantic_index<G: GraphStore>(
     let mut entities_extracted = 0usize;
     let mut relations_extracted = 0usize;
     let mut file_parse_data: Vec<kin_index::linker::FileParseDataWithTests> = Vec::new();
+    let mut parse_completeness_by_file = kin_index::FileParseCompletenessMap::new();
 
     let indexed_files = if proof_profile_requested()? {
         index_planned_files_serial(plan, blob_store, &workspace_root)?
@@ -514,6 +515,12 @@ fn persist_semantic_index<G: GraphStore>(
     for indexed in indexed_files {
         let entity_count = indexed.indexed_file.entities.len();
         let relation_count = indexed.indexed_file.relations.len();
+        let parse_completeness = indexed.indexed_file.file_layout.parse_completeness.clone();
+        parse_completeness_by_file
+            .insert(indexed.indexed_file.file_id.0.clone(), parse_completeness);
+        graph
+            .upsert_file_layout(&indexed.indexed_file.file_layout)
+            .map_err(|e| MigrateError::Graph(e.to_string()))?;
         all_entities.extend(indexed.indexed_file.entities.iter().cloned());
         all_relations.extend(indexed.indexed_file.relations);
 
@@ -542,7 +549,10 @@ fn persist_semantic_index<G: GraphStore>(
         let _span =
             tracing::info_span!("kin.migrate.link_cross_file", files = file_parse_data.len())
                 .entered();
-        kin_index::linker::link_cross_file_with_tests(&file_parse_data)
+        kin_index::linker::link_cross_file_with_tests_and_completeness(
+            &file_parse_data,
+            &parse_completeness_by_file,
+        )
     };
     graph
         .upsert_relations_batch(&cross_file_relations)
@@ -2015,12 +2025,13 @@ mod tests {
 
         // Reported counts are correct for the fixture (six entities: module
         // `helper`, fns `entry`/`value`/`doubled`, struct `Widget`, method
-        // `Widget::new`; five relations: two `Contains`, three `Calls` — the
+        // `Widget::new`; seven relations: two `Contains`, three `Calls`, and
+        // one file-level parse-coverage certificate per source file. The
         // module-qualified `helper::value()` call resolves through the
-        // qualified-path linker stage alongside the two bare calls).
+        // qualified-path linker stage alongside the two bare calls.
         assert_eq!(result_a.files_indexed, 2, "files_indexed");
         assert_eq!(result_a.entities_extracted, 6, "entities_extracted");
-        assert_eq!(result_a.relations_extracted, 5, "relations_extracted");
+        assert_eq!(result_a.relations_extracted, 7, "relations_extracted");
 
         // Counts are stable run-to-run.
         assert_eq!(result_a.files_indexed, result_b.files_indexed);
