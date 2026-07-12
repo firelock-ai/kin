@@ -825,6 +825,28 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_required_tools_do_not_use_local_handlers() {
+        struct RemoveCreatedKinDir(Option<std::path::PathBuf>);
+
+        impl Drop for RemoveCreatedKinDir {
+            fn drop(&mut self) {
+                if let Some(path) = self.0.take() {
+                    let _ = std::fs::remove_dir(path);
+                }
+            }
+        }
+
+        // Bind this end-to-end dispatch test to a Kin repository explicitly.
+        // Without `.kin`, the production delegate correctly reports the
+        // distinct "not inside a kin repository" state before it can prove the
+        // daemon-required branch this test is intended to lock down.
+        let kin_dir = std::env::current_dir().unwrap().join(".kin");
+        let remove_kin_dir = match std::fs::create_dir(&kin_dir) {
+            Ok(()) => RemoveCreatedKinDir(Some(kin_dir)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && kin_dir.is_dir() => {
+                RemoveCreatedKinDir(None)
+            }
+            Err(error) => panic!("failed to establish Kin repo fixture: {error}"),
+        };
         std::env::remove_var("KIN_DAEMON_URL");
         let config = McpServerConfig::default();
         let sessions = SessionRegistry::new();
@@ -841,6 +863,7 @@ mod tests {
             ContentBlock::Text { text } => text,
         };
         assert!(text.contains("Kin daemon is required"));
+        drop(remove_kin_dir);
     }
 
     #[tokio::test]

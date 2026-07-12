@@ -9,27 +9,57 @@
 name: Install Proof
 
 on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Exact public release tag to install and verify.
+        required: true
+        type: string
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Optional exact release tag; blank verifies the latest public release.
+        required: false
+        type: string
+  release:
+    types: [published]
   schedule:
     # Weekly — catch a broken release / installer / endpoint before users do.
     - cron: "0 12 * * 1"
 
 permissions:
   contents: read
+  attestations: read
 
 jobs:
   install-proof:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            setup-shell: bash
+          - os: ubuntu-24.04-arm
+            setup-shell: bash
+          - os: macos-latest
+            setup-shell: zsh
+          - os: macos-15-intel
+            setup-shell: zsh
+          - os: windows-latest
+            setup-shell: powershell
     steps:
       - name: Public install (Unix)
         if: runner.os != 'Windows'
+        env:
+          RELEASE_EVENT_TAG: ${{ inputs.release_tag || github.event.release.tag_name || '' }}
         run: |
           set -eu
+          if [ -n "$RELEASE_EVENT_TAG" ]; then
+            export KIN_VERSION="${RELEASE_EVENT_TAG#v}"
+          fi
           # CI/non-interactive install. NOTE the env var binds to `sh`, not
           # `curl` — `KIN_NO_SETUP=1 curl … | sh` would set it only for curl and
           # the piped script would never see it (it would then try the
@@ -41,35 +71,495 @@ jobs:
       - name: Public install (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          RELEASE_EVENT_TAG: ${{ inputs.release_tag || github.event.release.tag_name || '' }}
         run: |
           $ErrorActionPreference = "Stop"
+          if ($env:RELEASE_EVENT_TAG) {
+            $env:KIN_VERSION = $env:RELEASE_EVENT_TAG.TrimStart("v")
+          }
           $env:KIN_NO_SETUP = "1"
           irm https://get.kinlab.dev/install.ps1 | iex
           "$HOME\.kin\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Verify binaries installed + runnable
-        run: |
-          kin --version
-          kin-daemon --version
-
-      - name: Daemon + setup health checklist (honest per-OS)
         shell: bash
+        env:
+          RELEASE_EVENT_TAG: ${{ inputs.release_tag || github.event.release.tag_name || '' }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "::group::kin setup status --json"
-          kin setup status --json || echo "(setup status returned non-zero — see output above)"
-          echo "::endgroup::"
-          echo "::group::kin doctor"
-          kin doctor || echo "(doctor reported issues — informational on a bare runner)"
-          echo "::endgroup::"
+          set -euo pipefail
+          kin_version_line="$(kin --version)"
+          daemon_version_line="$(kin-daemon --version)"
+          printf '%s\n' "$kin_version_line" | tee kin-version.txt
+          printf '%s\n' "$daemon_version_line" | tee kin-daemon-version.txt
 
-      - name: Daemon liveness smoke
+          expected_tag="$RELEASE_EVENT_TAG"
+          if [ -z "$expected_tag" ]; then
+            latest_url="$(curl -fsSLI \
+              --retry 5 --retry-all-errors --retry-delay 2 \
+              -o /dev/null -w '%{url_effective}' \
+              https://github.com/firelock-ai/kin/releases/latest)"
+            expected_tag="${latest_url##*/}"
+            printf '%s\n' "$latest_url" > latest-release-url.txt
+          fi
+          case "$expected_tag" in
+            v[0-9]*) ;;
+            *) echo "could not resolve a version tag from '$expected_tag'" >&2; exit 1 ;;
+          esac
+
+          tag_refs="$(git ls-remote --tags https://github.com/firelock-ai/kin.git \
+            "refs/tags/$expected_tag" "refs/tags/$expected_tag^{}")"
+          expected_commit="$(printf '%s\n' "$tag_refs" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
+          if [ -z "$expected_commit" ]; then
+            expected_commit="$(printf '%s\n' "$tag_refs" | awk 'NR == 1 {print $1}')"
+          fi
+          if ! printf '%s\n' "$expected_commit" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "could not resolve the 40-hex commit for $expected_tag" >&2
+            exit 1
+          fi
+
+          installed_version="$(printf '%s\n' "$kin_version_line" | awk '{print $2}')"
+          installed_daemon_version="$(printf '%s\n' "$daemon_version_line" | awk '{print $2}')"
+          expected_version="${expected_tag#v}"
+          if [ "$installed_version" != "$expected_version" ]; then
+            echo "installed kin $installed_version, expected latest release $expected_version" >&2
+            exit 1
+          fi
+          if [ "$installed_daemon_version" != "$expected_version" ]; then
+            echo "installed kin-daemon $installed_daemon_version, expected latest release $expected_version" >&2
+            exit 1
+          fi
+          printf '%s\n' "$expected_version" > expected-version.txt
+          printf '%s\n' "$expected_commit" > expected-commit.txt
+
+          # Independently bind the installed binaries' embedded dependency
+          # provenance to the Cargo.lock at the public release tag. The
+          # binaries report their build-time hash; this fetch computes the
+          # expected value from public source rather than trusting that report.
+          EXPECTED_COMMIT="$expected_commit" node <<'NODE'
+          const crypto = require("crypto");
+          const fs = require("fs");
+
+          (async () => {
+            const url = `https://raw.githubusercontent.com/firelock-ai/kin/${process.env.EXPECTED_COMMIT}/Cargo.lock`;
+            const response = await fetch(url);
+            if (!response.ok) {
+              throw new Error(`failed to fetch release Cargo.lock: ${response.status} ${response.statusText}`);
+            }
+            const lock = Buffer.from(await response.arrayBuffer());
+            const digest = crypto.createHash("sha256").update(lock).digest("hex");
+            fs.writeFileSync("expected-lock-sha.txt", `${digest}\n`);
+          })().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
+
+          case "$RUNNER_OS/$RUNNER_ARCH" in
+            Linux/X64) release_asset="kin-linux-x86_64.tar.gz" ;;
+            Linux/ARM64) release_asset="kin-linux-aarch64.tar.gz" ;;
+            macOS/X64) release_asset="kin-macos-x86_64.tar.gz" ;;
+            macOS/ARM64) release_asset="kin-macos-aarch64.tar.gz" ;;
+            Windows/X64) release_asset="kin-windows-x86_64.zip" ;;
+            *) echo "unsupported install-proof runner $RUNNER_OS/$RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
+            "https://github.com/firelock-ai/kin/releases/download/$expected_tag/$release_asset" \
+            -o "attested-$release_asset"
+
+          # The install itself is anonymous. This separate cryptographic lookup
+          # uses the job's read-only GitHub token to query the public attestation
+          # API, and pins the signer workflow, source tag, and source commit.
+          verified=false
+          for attempt in $(seq 1 18); do
+            if gh attestation verify "attested-$release_asset" \
+              --repo firelock-ai/kin \
+              --signer-workflow firelock-ai/kin/.github/workflows/release.yml \
+              --source-ref "refs/tags/$expected_tag" \
+              --source-digest "$expected_commit" \
+              --deny-self-hosted-runners \
+              --format json > attestation-verification.json; then
+              verified=true
+              break
+            fi
+            if [ "$attempt" -eq 18 ]; then
+              echo "release attestation did not become verifiable" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          test "$verified" = true
+
+      - name: First-run repository, daemon, and setup proof
         shell: bash
+        env:
+          PROOF_SHELL: ${{ matrix.setup-shell }}
         run: |
+          set -euo pipefail
+          case "$PROOF_SHELL" in
+            bash)
+              unset PSModulePath PSVersionTable
+              export SHELL=/bin/bash
+              printf 'SHELL=%s\n' "$SHELL" >> "$GITHUB_ENV"
+              ;;
+            zsh)
+              unset PSModulePath PSVersionTable
+              export SHELL=/bin/zsh
+              printf 'SHELL=%s\n' "$SHELL" >> "$GITHUB_ENV"
+              ;;
+            powershell)
+              # Windows has no Unix embedding follow-up and setup receives the
+              # explicit PowerShell choice below.
+              ;;
+            *) echo "unsupported install-proof setup shell: $PROOF_SHELL" >&2; exit 1 ;;
+          esac
+
           # A fresh repo so the daemon has something to initialize against —
           # proves the installed daemon actually starts and serves on this OS.
           mkdir -p kin-install-proof && cd kin-install-proof
           git init -q && git config user.email ci@firelock.ai && git config user.name ci
           printf 'def hello():\n    return 42\n' > probe.py
           git add -A && git commit -qm "probe"
-          kin init || echo "(kin init returned non-zero — captured for the per-OS report)"
-          kin status || echo "(kin status returned non-zero — captured for the per-OS report)"
+          kin init 2>&1 | tee kin-init.txt
+          # Do not pipe this command through tee. On Windows, the daemon child
+          # inherits the pipe and keeps it open until idle shutdown, which makes
+          # the shell wait for the daemon and then tests a process that just exited.
+          kin status > kin-status.txt 2>&1
+          cat kin-status.txt
+          kin status --json > kin-status.json 2>&1
+          cat kin-status.json
+          # Prove every supported agent-client config writer without requiring
+          # the proprietary clients on a public runner. Detection is PATH-based;
+          # these inert shims make setup exercise the real merge paths while the
+          # MCP process itself is exercised separately below.
+          fake_agent_bin="$RUNNER_TEMP/kin-proof-agent-bin"
+          mkdir -p "$fake_agent_bin"
+          for agent in claude cursor codex gemini windsurf; do
+            if [ "$RUNNER_OS" = "Windows" ]; then
+              # which-rs follows PATHEXT on Windows, so use a real .exe rather
+              # than relying on shell-script executability through MSYS.
+              cp "$(command -v kin)" "$fake_agent_bin/$agent.exe"
+            else
+              printf '#!/bin/sh\nexit 0\n' > "$fake_agent_bin/$agent"
+              chmod +x "$fake_agent_bin/$agent"
+            fi
+          done
+          export PATH="$fake_agent_bin:$PATH"
+
+          kin setup --no-interactive --intent agent --shell "$PROOF_SHELL" \
+            2>&1 | tee kin-setup.txt
+          kin setup status --json | tee kin-health.json
+          kin doctor --json | tee kin-doctor.json
+
+      - name: Graph query and MCP tool-call proof
+        shell: bash
+        working-directory: kin-install-proof
+        run: |
+          set -euo pipefail
+          kin search hello --json | tee kin-search.json
+          kin locate hello --json --explain --max-files 5 | tee kin-locate.json
+
+          # Drive the installed MCP stdio server through initialize, tools/list,
+          # and a real graph-backed semantic_search call. Node owns the timeout
+          # so this behaves the same on Linux, macOS, and Windows.
+          node <<'NODE'
+          const fs = require("fs");
+          const { spawn } = require("child_process");
+
+          const requests = [
+            { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
+            { jsonrpc: "2.0", method: "notifications/initialized", params: {} },
+            { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
+            {
+              jsonrpc: "2.0",
+              id: 3,
+              method: "tools/call",
+              params: {
+                name: "semantic_search",
+                arguments: { query: "hello", compact: true, limit: 5 },
+              },
+            },
+          ];
+
+          const child = spawn("kin", ["mcp", "start", "--repo", "."], {
+            cwd: process.cwd(),
+            env: process.env,
+            stdio: ["pipe", "pipe", "pipe"],
+          });
+          let stdout = "";
+          let stderr = "";
+          let settled = false;
+          const finish = (error) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            fs.writeFileSync("kin-mcp-out.jsonl", stdout);
+            fs.writeFileSync("kin-mcp-err.txt", stderr);
+            if (error) {
+              console.error(error);
+              console.error(stderr);
+              process.exit(1);
+            }
+          };
+          const timer = setTimeout(() => {
+            child.kill("SIGKILL");
+            finish(new Error("installed MCP server did not exit within 60 seconds"));
+          }, 60_000);
+          child.stdout.on("data", (chunk) => { stdout += chunk; });
+          child.stderr.on("data", (chunk) => { stderr += chunk; });
+          child.on("error", finish);
+          child.on("close", (code) => {
+            if (code !== 0) {
+              finish(new Error(`installed MCP server exited ${code}`));
+              return;
+            }
+            try {
+              const messages = stdout
+                .split(/\r?\n/)
+                .filter((line) => line.trim().startsWith("{"))
+                .map((line) => JSON.parse(line));
+              const byId = new Map(messages.filter((message) => message.id != null).map((message) => [message.id, message]));
+              if (!byId.get(1)?.result) throw new Error("MCP initialize response missing");
+              if (!JSON.stringify(byId.get(2)?.result ?? {}).includes("semantic_search")) {
+                throw new Error("MCP tools/list omitted semantic_search");
+              }
+              const call = byId.get(3);
+              if (!call?.result || call.error || call.result.isError === true) {
+                throw new Error(`MCP semantic_search failed: ${JSON.stringify(call ?? null)}`);
+              }
+              if (!JSON.stringify(call.result).includes("hello") || !JSON.stringify(call.result).includes("probe.py")) {
+                throw new Error("MCP semantic_search did not return the seeded hello entity");
+              }
+              finish();
+            } catch (error) {
+              finish(error);
+            }
+          });
+          child.stdin.end(`${requests.map((request) => JSON.stringify(request)).join("\n")}\n`);
+          NODE
+
+      - name: Unix embedding and semantic retrieval proof
+        if: runner.os != 'Windows'
+        shell: bash
+        working-directory: kin-install-proof
+        env:
+          PROOF_SHELL: ${{ matrix.setup-shell }}
+        run: |
+          set -euo pipefail
+          # Every Actions step receives a fresh process environment. Reassert
+          # the shell under test here and remove ambient PowerShell markers
+          # before setup health re-detects the installed hook.
+          case "$PROOF_SHELL" in
+            bash)
+              unset PSModulePath PSVersionTable
+              export SHELL=/bin/bash
+              ;;
+            zsh)
+              unset PSModulePath PSVersionTable
+              export SHELL=/bin/zsh
+              ;;
+            *) echo "unsupported Unix install-proof shell: $PROOF_SHELL" >&2; exit 1 ;;
+          esac
+          kin embed --max-seconds 300 --json | tee kin-embed.json
+          kin status --json | tee kin-embedded-status.json
+          kin setup status --json | tee kin-embedded-health.json
+          kin doctor --json | tee kin-embedded-doctor.json
+          kin search hello --semantic --json | tee kin-semantic-search.json
+          kin locate hello --json --explain --max-files 5 | tee kin-semantic-locate.json
+
+      - name: Validate installed capability proof
+        shell: bash
+        working-directory: kin-install-proof
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require("fs");
+          const os = require("os");
+          const path = require("path");
+          const runnerOs = process.env.RUNNER_OS;
+          const expectedCommit = fs.readFileSync("../expected-commit.txt", "utf8").trim();
+          const expectedLock = fs.readFileSync("../expected-lock-sha.txt", "utf8").trim();
+          const status = JSON.parse(fs.readFileSync("kin-status.json", "utf8"));
+          const build = status.build;
+          if (!build) {
+            throw new Error("kin-status.json: build provenance is missing");
+          }
+          const fullSha = /^[0-9a-f]{40}$/;
+          const lockSha = /^[0-9a-f]{64}$/;
+          for (const side of ["cli", "daemon"]) {
+            const sha = build[`${side}_sha`];
+            const dirty = build[`${side}_dirty`];
+            const sourceKnown = build[`${side}_source_known`];
+            const provenance = build[`${side}_dependency_provenance`];
+            if (!fullSha.test(sha ?? "")) {
+              throw new Error(`${side} build SHA is not a full 40-hex commit: ${sha ?? "missing"}`);
+            }
+            if (sha !== expectedCommit) {
+              throw new Error(`${side} build SHA ${sha} does not match release tag ${expectedCommit}`);
+            }
+            if (dirty !== false) {
+              throw new Error(`${side} release binary is dirty or did not report a clean build`);
+            }
+            if (sourceKnown !== true) {
+              throw new Error(`${side} release binary did not prove source_known=true`);
+            }
+            if (!lockSha.test(provenance ?? "")) {
+              throw new Error(`${side} Cargo.lock provenance is missing or malformed`);
+            }
+            if (provenance !== expectedLock) {
+              throw new Error(`${side} Cargo.lock provenance ${provenance} does not match release source ${expectedLock}`);
+            }
+          }
+          if (build.cli_dependency_provenance !== build.daemon_dependency_provenance) {
+            throw new Error("CLI and daemon were built from different Cargo.lock provenance");
+          }
+          const semanticCoverage = status.semantic_coverage;
+          if (!semanticCoverage) {
+            throw new Error("kin-status.json: semantic_coverage is missing");
+          }
+          if (runnerOs === "Windows") {
+            if (semanticCoverage.supported !== false || semanticCoverage.complete !== false) {
+              throw new Error("Windows vector-free status must report semantic coverage as unsupported and incomplete");
+            }
+            if ((semanticCoverage.note ?? "").includes("kin embed")) {
+              throw new Error("Windows vector-free status offers impossible kin embed remediation");
+            }
+          } else if (semanticCoverage.supported !== true) {
+            throw new Error(`${runnerOs} release unexpectedly lacks semantic vector support`);
+          }
+          const reports = ["kin-health.json", "kin-doctor.json"].map((path) => [
+            path,
+            JSON.parse(fs.readFileSync(path, "utf8")),
+          ]);
+          const nonHealthyChecks = (report) => (report.checks ?? [])
+            .filter((check) => check.status !== "healthy")
+            .map((check) => `${check.id}=${check.status}`)
+            .join(", ") || "none";
+          const required = new Map([
+            ["kin_binary", "healthy"],
+            ["kin_daemon_binary", "healthy"],
+            ["daemon_running", "healthy"],
+            ["repo_init", "healthy"],
+            ["shell_path", "healthy"],
+            ["setup_ledger", "healthy"],
+            ["vfs_projection", runnerOs === "Windows" ? "unsupported" : "healthy"],
+            ["mcp_client_claude", "healthy"],
+            ["mcp_client_cursor", "healthy"],
+            ["mcp_client_codex", "healthy"],
+            ["mcp_client_gemini", "healthy"],
+            ["mcp_client_windsurf", "healthy"],
+          ]);
+
+          for (const [path, report] of reports) {
+            if (report.healthy !== true) {
+              throw new Error(
+                `${path}: overall healthy=${report.healthy}; non-healthy checks: ${nonHealthyChecks(report)}`
+              );
+            }
+            const checks = new Map(report.checks.map((check) => [check.id, check]));
+            for (const [id, expected] of required) {
+              const actual = checks.get(id)?.status;
+              if (actual !== expected) {
+                throw new Error(`${path}: ${id} is ${actual ?? "missing"}, expected ${expected}`);
+              }
+            }
+            const semanticReadiness = checks.get("semantic_query_readiness")?.status;
+            if (runnerOs === "Windows") {
+              if (semanticReadiness !== "unsupported") {
+                throw new Error(`${path}: semantic_query_readiness is ${semanticReadiness ?? "missing"}, expected unsupported`);
+              }
+            } else if (!["healthy", "stale"].includes(semanticReadiness)) {
+              throw new Error(`${path}: semantic_query_readiness is ${semanticReadiness ?? "missing"}, expected healthy or stale`);
+            }
+            const hardFailures = report.checks.filter((check) =>
+              check.status === "missing" || check.status === "misconfigured"
+            );
+            if (hardFailures.length > 0) {
+              throw new Error(`${path}: hard failures: ${hardFailures.map((c) => c.id).join(", ")}`);
+            }
+          }
+
+          const search = JSON.parse(fs.readFileSync("kin-search.json", "utf8"));
+          if (!Array.isArray(search) || !search.some((record) => record.name === "hello" && record.file === "probe.py")) {
+            throw new Error("lexical kin search did not return the seeded hello entity");
+          }
+          const locate = JSON.parse(fs.readFileSync("kin-locate.json", "utf8"));
+          if (!locate.files?.some((entry) => entry.path === "probe.py")) {
+            throw new Error("kin locate did not return the seeded probe.py graph artifact");
+          }
+
+          const home = os.homedir();
+          const jsonConfigs = [
+            path.join(home, ".claude.json"),
+            path.join(home, ".cursor", "mcp.json"),
+            path.join(home, ".gemini", "settings.json"),
+            path.join(home, ".codeium", "windsurf", "mcp_config.json"),
+          ];
+          for (const configPath of jsonConfigs) {
+            const entry = JSON.parse(fs.readFileSync(configPath, "utf8"))?.mcpServers?.kin;
+            if (!entry || JSON.stringify(entry.args) !== JSON.stringify(["mcp", "start"]) || entry.env?.KIN_MCP_TOOL_PROFILE !== "agent-default") {
+              throw new Error(`${configPath}: Kin MCP entry is missing or malformed`);
+            }
+          }
+          const codexConfig = fs.readFileSync(path.join(home, ".codex", "config.toml"), "utf8");
+          if (!codexConfig.includes("[mcp_servers.kin]") || !codexConfig.includes('args = ["mcp", "start"]') || !codexConfig.includes("KIN_MCP_TOOL_PROFILE = \"agent-default\"")) {
+            throw new Error("Codex Kin MCP config is missing or malformed");
+          }
+
+          if (runnerOs === "Windows") {
+            const vectorDegradations = (locate.degradations ?? []).filter((entry) => entry.component === "vector_index");
+            if (vectorDegradations.length !== 1 || vectorDegradations[0].reason !== "feature_disabled") {
+              throw new Error(`Windows locate must report one feature_disabled vector degradation: ${JSON.stringify(vectorDegradations)}`);
+            }
+            if ((vectorDegradations[0].remediation ?? "").includes("kin embed")) {
+              throw new Error("Windows vector-free locate offers impossible kin embed remediation");
+            }
+          } else {
+            const embed = JSON.parse(fs.readFileSync("kin-embed.json", "utf8"));
+            if (embed.pending_entities !== 0 || embed.pending_artifacts !== 0 || embed.time_limited === true) {
+              throw new Error(`bounded clean-install embedding did not reach full coverage: ${JSON.stringify(embed)}`);
+            }
+            const embeddedStatus = JSON.parse(fs.readFileSync("kin-embedded-status.json", "utf8"));
+            if (embeddedStatus.semantic_coverage?.supported !== true || embeddedStatus.semantic_coverage?.complete !== true) {
+              throw new Error("Unix status did not prove complete semantic coverage after embedding");
+            }
+            for (const reportPath of ["kin-embedded-health.json", "kin-embedded-doctor.json"]) {
+              const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
+              const readiness = report.checks?.find((check) => check.id === "semantic_query_readiness")?.status;
+              if (report.healthy !== true || readiness !== "healthy") {
+                throw new Error(
+                  `${reportPath}: overall healthy=${report.healthy}; ` +
+                  `semantic_query_readiness=${readiness ?? "missing"}; ` +
+                  `non-healthy checks: ${nonHealthyChecks(report)}`
+                );
+              }
+            }
+            const semanticSearch = JSON.parse(fs.readFileSync("kin-semantic-search.json", "utf8"));
+            if (!Array.isArray(semanticSearch) || !semanticSearch.some((record) => record.name === "hello" && record.file === "probe.py")) {
+              throw new Error("semantic kin search did not return the seeded hello entity");
+            }
+            const semanticLocate = JSON.parse(fs.readFileSync("kin-semantic-locate.json", "utf8"));
+            if (semanticLocate.semantic_coverage?.supported !== true || semanticLocate.semantic_coverage?.complete !== true || !semanticLocate.files?.some((entry) => entry.path === "probe.py")) {
+              throw new Error("semantic kin locate did not prove complete coverage and return probe.py");
+            }
+          }
+          NODE
+
+      - name: Preserve proof reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: install-proof-${{ matrix.os }}-${{ github.run_id }}
+          if-no-files-found: warn
+          retention-days: 30
+          path: |
+            kin-version.txt
+            kin-daemon-version.txt
+            expected-version.txt
+            expected-commit.txt
+            expected-lock-sha.txt
+            attestation-verification.json
+            latest-release-url.txt
+            kin-install-proof/*.txt
+            kin-install-proof/*.json

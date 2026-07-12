@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::state::{
     CachedLocateRanking, CachedSemanticPage, DaemonEvent, DaemonState, ProjectionChangedSet,
-    VfsTreeCacheKey, VfsTreeSnapshot, LOCATE_RANKING_CACHE_CAP,
+    RequestGraphAuthority, VfsTreeCacheKey, VfsTreeSnapshot, LOCATE_RANKING_CACHE_CAP,
 };
 
 use axum::extract::{Path, Query, State};
@@ -98,7 +98,7 @@ pub struct HealthResponse {
     /// until restart. A true value drives `status: "attention"`.
     #[serde(default)]
     pub embed_worker_failed: bool,
-    /// Monotonic snapshot generation marker (`.kin/kindb/generation`), bumped
+    /// Monotonic authority-head marker (`.kin/kindb/head-generation`), bumped
     /// when the daemon commits a newer graph snapshot. A freshness token that
     /// lets clients and the MCP envelope express `graph_as_of` and detect stale
     /// reads. Additive; `0` before the first snapshot is committed.
@@ -119,6 +119,10 @@ pub struct HealthResponse {
 pub struct BuildResponse {
     pub sha: String,
     pub dirty: bool,
+    #[serde(default)]
+    pub source_known: bool,
+    #[serde(default)]
+    pub dependency_provenance: String,
     pub built_at: String,
 }
 
@@ -532,6 +536,8 @@ fn current_build_response() -> BuildResponse {
     BuildResponse {
         sha: info.sha.to_string(),
         dirty: info.dirty,
+        source_known: info.source_known,
+        dependency_provenance: info.dependency_provenance.to_string(),
         built_at: info.built_at.to_string(),
     }
 }
@@ -1194,6 +1200,114 @@ async fn resolve_session_graph(
     state.graph_for_request(session_id).await
 }
 
+/// Resolve the graph together with the authority that owns ref hydration.
+///
+/// A request may wait a long time for the serialized hydration gate. Resolve
+/// once to decide whether the gate is needed, then resolve again after owning
+/// it so a session-scope change during that wait cannot send mutation to an
+/// orphaned graph. The state helper also refreshes an active scope's write
+/// lease because hydration mutates that graph even though this is a query
+/// endpoint.
+async fn resolve_ref_hydration_graph(
+    state: &DaemonState,
+    session_id: Option<&SessionId>,
+    references: &[&str],
+) -> (
+    Arc<kin_db::InMemoryGraph>,
+    RequestGraphAuthority,
+    Option<tokio::sync::OwnedMutexGuard<()>>,
+) {
+    let mut hydration_gate = None;
+    loop {
+        let (graph, authority) = state
+            .graph_for_ref_hydration_with_authority(session_id)
+            .await;
+        let needs_hydration = references.iter().any(|reference| {
+            kin_cli::commands::ref_lookup::git_ref_requires_hydration(graph.as_ref(), reference)
+        });
+        if needs_hydration && hydration_gate.is_none() {
+            hydration_gate = Some(Arc::clone(&state.hydration_gate).lock_owned().await);
+            // The session scope may have changed while the gate was held by a
+            // different request. Select the current graph/authority again
+            // before performing any mutation.
+            continue;
+        }
+        return (graph, authority, hydration_gate);
+    }
+}
+
+async fn ensure_ref_hydration_authority_is_current(
+    state: &DaemonState,
+    graph: &Arc<kin_db::InMemoryGraph>,
+    authority: RequestGraphAuthority,
+    session_id: Option<&SessionId>,
+    hydrated_changes: usize,
+) -> Result<(), (StatusCode, String)> {
+    if hydrated_changes == 0
+        || state
+            .ref_hydration_authority_is_current(session_id, graph, authority)
+            .await
+    {
+        return Ok(());
+    }
+
+    Err((
+        StatusCode::CONFLICT,
+        "session temporal scope changed or expired during ref hydration; retry against the current scope"
+            .to_string(),
+    ))
+}
+
+/// Publish a completed ref hydration at the correct graph-authority boundary.
+///
+/// This is called immediately after ref preparation and before entity
+/// rendering. A later missing/ambiguous entity error therefore cannot leave a
+/// mutated HEAD graph unversioned and unsaved. Session-scope graph growth stays
+/// private and ephemeral by design, so it is logged but never published as a
+/// global root change or persisted through `state.graph`.
+fn acknowledge_ref_hydration(
+    state: &DaemonState,
+    authority: RequestGraphAuthority,
+    session_id: Option<&SessionId>,
+    hydrated_changes: usize,
+    operation: &'static str,
+    event_label: &'static str,
+) -> Result<(), (StatusCode, String)> {
+    if hydrated_changes == 0 {
+        return Ok(());
+    }
+
+    match authority {
+        RequestGraphAuthority::Head => {
+            tracing::info!(
+                hydrated_changes,
+                operation,
+                graph_authority = "head",
+                "historical ref hydration changed the durable graph"
+            );
+            state.bump_version();
+            state
+                .save_snapshot_with_event(DaemonEvent::GraphRootChanged {
+                    old_root_hash: None,
+                    new_root_hash: event_label.to_string(),
+                })
+                .map_err(internal_error)?;
+            state.mark_clean();
+        }
+        RequestGraphAuthority::SessionScope => {
+            tracing::info!(
+                hydrated_changes,
+                operation,
+                ?session_id,
+                graph_authority = "session-scope",
+                "historical ref hydration changed a private session graph"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// GET /health — liveness check with extended diagnostics.
 /// Supports `?repo=X` to report health for a specific repo's graph.
 async fn health(
@@ -1820,8 +1934,12 @@ async fn command_status(
             .clone()
             .unwrap_or_else(|| "unknown".to_string()),
         cli_dirty: request.cli_dirty,
+        cli_source_known: request.cli_source_known,
+        cli_dependency_provenance: request.cli_dependency_provenance.clone(),
         daemon_sha: daemon_build.sha.to_string(),
         daemon_dirty: daemon_build.dirty,
+        daemon_source_known: daemon_build.source_known,
+        daemon_dependency_provenance: daemon_build.dependency_provenance.to_string(),
     };
     let response = kin_cli::commands::status::build_command_status_response(
         summary,
@@ -3523,6 +3641,62 @@ async fn review(
         ));
     }
 
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let req = match req {
+        kin_cli::commands::review::ReviewRequest::Shadow {
+            base,
+            head,
+            title,
+            source_url,
+            author,
+            json,
+        } => {
+            let references = [base.as_str(), head.as_str()];
+            let (graph, authority, hydration_gate) =
+                resolve_ref_hydration_graph(&state, session_id.as_ref(), &references).await;
+            let prepared = kin_cli::commands::review::prepare_shadow_request(
+                &state.layout,
+                graph.as_ref(),
+                base,
+                head,
+                title,
+                source_url,
+                author,
+                json,
+            );
+            let hydrated_changes = prepared.hydrated_changes();
+            ensure_ref_hydration_authority_is_current(
+                &state,
+                &graph,
+                authority,
+                session_id.as_ref(),
+                hydrated_changes,
+            )
+            .await?;
+            acknowledge_ref_hydration(
+                &state,
+                authority,
+                session_id.as_ref(),
+                hydrated_changes,
+                "review",
+                "review-hydration",
+            )?;
+            drop(hydration_gate);
+
+            let response =
+                kin_cli::commands::review::render_prepared_shadow_request(graph.as_ref(), prepared)
+                    .map_err(|error| {
+                        if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
+                            (StatusCode::BAD_REQUEST, format!("{error:#}"))
+                        } else {
+                            internal_error(error)
+                        }
+                    })?;
+            return Ok(Json(response));
+        }
+        request => request,
+    };
+
     let mutates = matches!(
         req,
         kin_cli::commands::review::ReviewRequest::Create { .. }
@@ -3536,60 +3710,12 @@ async fn review(
     let graph = if mutates {
         Arc::clone(&state.graph)
     } else {
-        let session_id = extract_session_id_from_headers(&headers)?;
         resolve_session_graph(&state, session_id.as_ref()).await
-    };
-    // A shadow review over an unimported Git ref lazily imports its full
-    // ancestry; serialize that against every other daemon hydration so two deep
-    // imports never run at once. Already-imported (or non-Git) refs skip the
-    // gate and stay on the fast path.
-    let needs_hydration = match &req {
-        kin_cli::commands::review::ReviewRequest::Shadow { base, head, .. } => {
-            kin_cli::commands::ref_lookup::git_ref_requires_hydration(graph.as_ref(), base)
-                || kin_cli::commands::ref_lookup::git_ref_requires_hydration(graph.as_ref(), head)
-        }
-        _ => false,
-    };
-    let _hydration_gate = if needs_hydration {
-        Some(state.hydration_gate.lock().await)
-    } else {
-        None
     };
     let execution =
         kin_cli::commands::review::execute_review_request(&state.layout, graph.as_ref(), req)
             .await
-            .map_err(|err| {
-                // A ref the resolver cannot make sense of is the caller's
-                // input, not a server fault — e.g. a shadow request naming a
-                // ref that doesn't exist or uses syntax the resolver doesn't
-                // understand — so it is reported as a client error with the
-                // full "why" chain instead of falling into the generic
-                // internal-error path.
-                if kin_cli::commands::ref_lookup::is_ref_resolution_error(&err) {
-                    (StatusCode::BAD_REQUEST, format!("{err:#}"))
-                } else {
-                    internal_error(err)
-                }
-            })?;
-    if execution.hydrated_changes > 0 {
-        tracing::info!(
-            hydrated_changes = execution.hydrated_changes,
-            review_mutations = 0u64,
-            "shadow review hydrated historical changes into the graph"
-        );
-        state.bump_version();
-        state.save_snapshot().map_err(internal_error)?;
-        state.mark_clean();
-        // A live SSE subscriber (e.g. the VFS daemon) should hear about this
-        // graph growth exactly like any other root change, not just the
-        // `mutated` case below — otherwise a hydration-only shadow review is
-        // invisible to anything watching /events in real time, even though
-        // it just persisted a potentially large import.
-        state.emit_event(DaemonEvent::GraphRootChanged {
-            old_root_hash: None,
-            new_root_hash: "review-hydration".to_string(),
-        });
-    }
+            .map_err(internal_error)?;
     if execution.mutated {
         state.bump_version();
         state.emit_event(DaemonEvent::GraphRootChanged {
@@ -3690,113 +3816,127 @@ async fn note(
 async fn embed(
     State(state): State<Arc<DaemonState>>,
     Json(req): Json<kin_cli::commands::embed::EmbedRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if !state
-        .is_initialized
-        .load(std::sync::atomic::Ordering::Relaxed)
+) -> Result<Json<kin_cli::commands::embed::EmbedResponse>, (StatusCode, String)> {
+    #[cfg(not(feature = "embeddings"))]
     {
+        let _ = (state, req);
         return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "daemon not fully initialized".to_string(),
+            StatusCode::NOT_IMPLEMENTED,
+            "this Kin build does not include embedding support".to_string(),
         ));
     }
 
-    let state_for_embed = Arc::clone(&state);
-    let result = tokio::task::spawn_blocking(move || {
-        let bounded_request = req.max_seconds.is_some_and(|seconds| seconds > 0);
-        if bounded_request {
-            state_for_embed.pause_background_embed();
-        } else {
-            state_for_embed.resume_background_embed();
-        }
-        // Mark the explicit pass before waiting on the embedding mutex. The
-        // background worker checks this flag between batches and stands down,
-        // so a foreground bounded embed cannot be starved by worker re-locks.
-        let _embed_pass = state_for_embed.begin_embed_pass();
-        let _guard = state_for_embed
-            .embedding_work
-            .lock()
-            .map_err(|_| "embedding work lock poisoned".to_string())?;
-        // Suppress the background idle flush for the duration of the pass —
-        // this handler does its own pre/per-batch/post persistence, and a
-        // full-graph flush per feed gap amplifies FS churn on large repos.
-
-        // Pin graph.kndb on disk at the current root hash H before embedding so
-        // the per-batch kvec flushes (which tag metadata with H) match on reopen.
-        // The vector index is a pure sidecar (not in the merkle root), so
-        // embedding never changes H; this only closes the mutated-but-unsaved
-        // window. Cost: one snapshot write up front.
-        // save_snapshot() acquires persist_lock internally; the non-reentrant std
-        // Mutex self-deadlocks if we hold persist_lock across this call (this was
-        // the daemon embed hang — the worker wedged here before embedding started).
-        state_for_embed
-            .save_snapshot()
-            .map_err(|error| format!("embed pre-persist save failed: {error:#}"))?;
-
-        let persist_state = Arc::clone(&state_for_embed);
-        let persist_batch =
-            || -> Result<(), kin_db::KinDbError> { persist_foreground_embed_batch(&persist_state) };
-
-        // Rebuild migration: drop any loaded vector index (which may be sized to
-        // an older model's dimension, e.g. a 384-dim index that rejects the
-        // current 768-dim model) and re-queue every entity/artifact so the embed
-        // pass below recreates the index at the live embedder dimension. The
-        // per-batch persist then overwrites the stale on-disk sidecar. The
-        // explicit re-queue guarantees a FULL rebuild even if the embedding queue
-        // already held a partial set from prior graph mutations (the gated
-        // queue-missing pass in build_embed_response only fires on an empty
-        // queue). A normal embed (rebuild=false) leaves graph state untouched.
-        if req.rebuild {
-            state_for_embed.graph.reset_vector_index();
-            state_for_embed.graph.queue_missing_for_embedding();
-            state_for_embed
-                .graph
-                .queue_missing_artifacts_for_embedding();
+    #[cfg(feature = "embeddings")]
+    {
+        if !state
+            .is_initialized
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "daemon not fully initialized".to_string(),
+            ));
         }
 
-        let is_cancelled = || {
-            state_for_embed
-                .is_shutdown
-                .load(std::sync::atomic::Ordering::Relaxed)
-        };
+        let state_for_embed = Arc::clone(&state);
+        let result = tokio::task::spawn_blocking(move || {
+            let bounded_request = req.max_seconds.is_some_and(|seconds| seconds > 0);
+            if bounded_request {
+                state_for_embed.pause_background_embed();
+            } else {
+                state_for_embed.resume_background_embed();
+            }
+            // Mark the explicit pass before waiting on the embedding mutex. The
+            // background worker checks this flag between batches and stands down,
+            // so a foreground bounded embed cannot be starved by worker re-locks.
+            let _embed_pass = state_for_embed.begin_embed_pass();
+            let _guard = state_for_embed
+                .embedding_work
+                .lock()
+                .map_err(|_| "embedding work lock poisoned".to_string())?;
+            // Suppress the background idle flush for the duration of the pass —
+            // this handler does its own pre/per-batch/post persistence, and a
+            // full-graph flush per feed gap amplifies FS churn on large repos.
 
-        let result = kin_cli::commands::embed::build_embed_response(
-            &state_for_embed.layout,
-            state_for_embed.graph.as_ref(),
-            &req,
-            persist_batch,
-            is_cancelled,
-        )
-        .map_err(|error| format!("embed build failed: {error:#}"))?;
-        if !bounded_request || !result.result.time_limited {
-            state_for_embed.resume_background_embed();
-        }
-        if result.result.total_entities > 0 || result.result.total_artifacts > 0 {
-            state_for_embed.bump_version();
+            // Pin graph.kndb on disk at the current root hash H before embedding so
+            // the per-batch kvec flushes (which tag metadata with H) match on reopen.
+            // The vector index is a pure sidecar (not in the merkle root), so
+            // embedding never changes H; this only closes the mutated-but-unsaved
+            // window. Cost: one snapshot write up front.
+            // save_snapshot() acquires persist_lock internally; the non-reentrant std
+            // Mutex self-deadlocks if we hold persist_lock across this call (this was
+            // the daemon embed hang — the worker wedged here before embedding started).
             state_for_embed
                 .save_snapshot()
-                .map_err(|error| format!("embed snapshot save failed: {error:#}"))?;
-            state_for_embed.mark_clean();
-            // A time-limited pass stopped mid-drain, so the throttled per-batch
-            // sidecar flush may not have captured the vectors embedded since the
-            // last throttle tick. Force one sidecar write at the pass boundary so
-            // a graceful daemon exit before the next pass resumes with the full
-            // pass persisted. A pass that drained the queue already wrote the
-            // sidecar unconditionally, so this only fires when work remains.
-            if result.result.time_limited {
+                .map_err(|error| format!("embed pre-persist save failed: {error:#}"))?;
+
+            let persist_state = Arc::clone(&state_for_embed);
+            let persist_batch = || -> Result<(), kin_db::KinDbError> {
+                persist_foreground_embed_batch(&persist_state)
+            };
+
+            // Rebuild migration: drop any loaded vector index (which may be sized to
+            // an older model's dimension, e.g. a 384-dim index that rejects the
+            // current 768-dim model) and re-queue every entity/artifact so the embed
+            // pass below recreates the index at the live embedder dimension. The
+            // per-batch persist then overwrites the stale on-disk sidecar. The
+            // explicit re-queue guarantees a FULL rebuild even if the embedding queue
+            // already held a partial set from prior graph mutations (the gated
+            // queue-missing pass in build_embed_response only fires on an empty
+            // queue). A normal embed (rebuild=false) leaves graph state untouched.
+            if req.rebuild {
+                state_for_embed.graph.reset_vector_index();
+                state_for_embed.graph.queue_missing_for_embedding();
                 state_for_embed
-                    .persist_vector_sidecar()
-                    .map_err(|error| format!("embed sidecar persist failed: {error:#}"))?;
+                    .graph
+                    .queue_missing_artifacts_for_embedding();
             }
-        }
-        Ok::<_, String>(result)
-    })
-    .await
-    .map_err(internal_error)?
-    .map_err(internal_error)?;
-    Ok(Json(result))
+
+            let is_cancelled = || {
+                state_for_embed
+                    .is_shutdown
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            };
+
+            let result = kin_cli::commands::embed::build_embed_response(
+                &state_for_embed.layout,
+                state_for_embed.graph.as_ref(),
+                &req,
+                persist_batch,
+                is_cancelled,
+            )
+            .map_err(|error| format!("embed build failed: {error:#}"))?;
+            if !bounded_request || !result.result.time_limited {
+                state_for_embed.resume_background_embed();
+            }
+            if result.result.total_entities > 0 || result.result.total_artifacts > 0 {
+                state_for_embed.bump_version();
+                state_for_embed
+                    .save_snapshot()
+                    .map_err(|error| format!("embed snapshot save failed: {error:#}"))?;
+                state_for_embed.mark_clean();
+                // A time-limited pass stopped mid-drain, so the throttled per-batch
+                // sidecar flush may not have captured the vectors embedded since the
+                // last throttle tick. Force one sidecar write at the pass boundary so
+                // a graceful daemon exit before the next pass resumes with the full
+                // pass persisted. A pass that drained the queue already wrote the
+                // sidecar unconditionally, so this only fires when work remains.
+                if result.result.time_limited {
+                    state_for_embed
+                        .persist_vector_sidecar()
+                        .map_err(|error| format!("embed sidecar persist failed: {error:#}"))?;
+                }
+            }
+            Ok::<_, String>(result)
+        })
+        .await
+        .map_err(internal_error)?
+        .map_err(internal_error)?;
+        Ok(Json(result))
+    }
 }
 
+#[cfg(feature = "embeddings")]
 fn persist_foreground_embed_batch(state: &DaemonState) -> Result<(), kin_db::KinDbError> {
     state.flush_embed_progress().map(|_| ()).map_err(|error| {
         kin_db::KinDbError::StorageError(format!("embed progress flush failed: {error:#}"))
@@ -3820,39 +3960,44 @@ async fn blame(
     }
 
     let session_id = extract_session_id_from_headers(&headers)?;
-    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
     // Blaming at an unimported Git ref lazily imports its full ancestry;
     // serialize that against every other daemon hydration. Already-imported (or
     // absent) refs skip the gate and stay on the fast path.
-    let needs_hydration = req.reference.as_deref().is_some_and(|reference| {
-        kin_cli::commands::ref_lookup::git_ref_requires_hydration(graph.as_ref(), reference)
-    });
-    let _hydration_gate = if needs_hydration {
-        Some(state.hydration_gate.lock().await)
-    } else {
-        None
-    };
-    let execution =
-        kin_cli::commands::blame::execute_blame_request(&state.layout, graph.as_ref(), &req)
+    let reference = req.reference.as_deref();
+    let (graph, authority, hydration_gate) =
+        resolve_ref_hydration_graph(&state, session_id.as_ref(), reference.as_slice()).await;
+    let prepared =
+        kin_cli::commands::blame::prepare_blame_request(&state.layout, graph.as_ref(), &req)
             .map_err(internal_error)?;
-    if execution.hydrated_changes > 0 {
-        tracing::info!(
-            hydrated_changes = execution.hydrated_changes,
-            "blame hydrated historical changes into the graph"
-        );
-        state.bump_version();
-        state.save_snapshot().map_err(internal_error)?;
-        state.mark_clean();
-        // A live SSE subscriber (e.g. the VFS daemon) should hear about this
-        // graph growth exactly like any other root change — otherwise a
-        // hydration-only blame is invisible to anything watching /events in
-        // real time, even though it just persisted a potentially large import.
-        state.emit_event(DaemonEvent::GraphRootChanged {
-            old_root_hash: None,
-            new_root_hash: "blame-hydration".to_string(),
-        });
-    }
-    Ok(Json(execution.response))
+    let hydrated_changes = prepared.hydrated_changes();
+    ensure_ref_hydration_authority_is_current(
+        &state,
+        &graph,
+        authority,
+        session_id.as_ref(),
+        hydrated_changes,
+    )
+    .await?;
+    acknowledge_ref_hydration(
+        &state,
+        authority,
+        session_id.as_ref(),
+        hydrated_changes,
+        "blame",
+        "blame-hydration",
+    )?;
+    drop(hydration_gate);
+
+    let response =
+        kin_cli::commands::blame::render_prepared_blame_request(graph.as_ref(), &req, prepared)
+            .map_err(|error| {
+                if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
+                    (StatusCode::BAD_REQUEST, format!("{error:#}"))
+                } else {
+                    internal_error(error)
+                }
+            })?;
+    Ok(Json(response))
 }
 
 /// POST /history — render entity history from daemon-owned graph state.
@@ -3872,39 +4017,44 @@ async fn history(
     }
 
     let session_id = extract_session_id_from_headers(&headers)?;
-    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
     // History at an unimported Git ref lazily imports its full ancestry;
     // serialize that against every other daemon hydration. Already-imported (or
     // absent) refs skip the gate and stay on the fast path.
-    let needs_hydration = req.reference.as_deref().is_some_and(|reference| {
-        kin_cli::commands::ref_lookup::git_ref_requires_hydration(graph.as_ref(), reference)
-    });
-    let _hydration_gate = if needs_hydration {
-        Some(state.hydration_gate.lock().await)
-    } else {
-        None
-    };
-    let execution =
-        kin_cli::commands::history::execute_history_request(&state.layout, graph.as_ref(), &req)
+    let reference = req.reference.as_deref();
+    let (graph, authority, hydration_gate) =
+        resolve_ref_hydration_graph(&state, session_id.as_ref(), reference.as_slice()).await;
+    let prepared =
+        kin_cli::commands::history::prepare_history_request(&state.layout, graph.as_ref(), &req)
             .map_err(internal_error)?;
-    if execution.hydrated_changes > 0 {
-        tracing::info!(
-            hydrated_changes = execution.hydrated_changes,
-            "history hydrated historical changes into the graph"
-        );
-        state.bump_version();
-        state.save_snapshot().map_err(internal_error)?;
-        state.mark_clean();
-        // A live SSE subscriber (e.g. the VFS daemon) should hear about this
-        // graph growth exactly like any other root change — otherwise a
-        // hydration-only history is invisible to anything watching /events in
-        // real time, even though it just persisted a potentially large import.
-        state.emit_event(DaemonEvent::GraphRootChanged {
-            old_root_hash: None,
-            new_root_hash: "history-hydration".to_string(),
-        });
-    }
-    Ok(Json(execution.response))
+    let hydrated_changes = prepared.hydrated_changes();
+    ensure_ref_hydration_authority_is_current(
+        &state,
+        &graph,
+        authority,
+        session_id.as_ref(),
+        hydrated_changes,
+    )
+    .await?;
+    acknowledge_ref_hydration(
+        &state,
+        authority,
+        session_id.as_ref(),
+        hydrated_changes,
+        "history",
+        "history-hydration",
+    )?;
+    drop(hydration_gate);
+
+    let response =
+        kin_cli::commands::history::render_prepared_history_request(graph.as_ref(), &req, prepared)
+            .map_err(|error| {
+                if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
+                    (StatusCode::BAD_REQUEST, format!("{error:#}"))
+                } else {
+                    internal_error(error)
+                }
+            })?;
+    Ok(Json(response))
 }
 
 /// POST /verify/run — execute and persist a verification run in daemon state.
@@ -8743,6 +8893,62 @@ mod tests {
         Arc::new(DaemonState::open(layout).unwrap())
     }
 
+    fn run_hydration_fixture_git(repo: &FsPath, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_DATE", "1000000000 +0000")
+            .env("GIT_COMMITTER_DATE", "1000000000 +0000")
+            .output()
+            .expect("run hydration fixture git command");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("git output is utf8")
+            .trim()
+            .to_string()
+    }
+
+    /// Create a real Git commit outside graph truth. A ref query against the
+    /// returned oid must therefore take the daemon's cold hydration path.
+    fn setup_daemon_hydration_fixture(state: &DaemonState) -> String {
+        let repo = state.layout.working_dir();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(
+            repo.join("src/lib.rs"),
+            "pub fn hydrated_target(value: u64) -> u64 {\n    value + 1\n}\n",
+        )
+        .unwrap();
+
+        run_hydration_fixture_git(repo, &["init", "--quiet"]);
+        run_hydration_fixture_git(
+            repo,
+            &["config", "user.email", "hydration-test@example.com"],
+        );
+        run_hydration_fixture_git(repo, &["config", "user.name", "Hydration Test"]);
+        run_hydration_fixture_git(repo, &["add", "src/lib.rs"]);
+        run_hydration_fixture_git(repo, &["commit", "--quiet", "-m", "add hydrated target"]);
+        run_hydration_fixture_git(repo, &["rev-parse", "HEAD"])
+    }
+
+    fn setup_daemon_shadow_hydration_fixture(state: &DaemonState) -> (String, String) {
+        let base = setup_daemon_hydration_fixture(state);
+        let repo = state.layout.working_dir();
+        std::fs::write(
+            repo.join("src/lib.rs"),
+            "pub fn hydrated_target(value: u64) -> u64 {\n    value + 2\n}\n",
+        )
+        .unwrap();
+        run_hydration_fixture_git(repo, &["add", "src/lib.rs"]);
+        run_hydration_fixture_git(repo, &["commit", "--quiet", "-m", "change hydrated target"]);
+        let head = run_hydration_fixture_git(repo, &["rev-parse", "HEAD"]);
+        (base, head)
+    }
+
     #[tokio::test]
     async fn bind_api_listener_reports_real_ephemeral_port() {
         // Runs under a Tokio runtime because binding a tokio TcpListener needs
@@ -9009,11 +9215,11 @@ mod tests {
     #[tokio::test]
     async fn health_surfaces_graph_generation_marker() {
         // /health must read and surface the persisted snapshot generation marker
-        // (.kin/kindb/generation) so the MCP envelope can express graph_as_of.
+        // (.kin/kindb/head-generation) so the MCP envelope can express graph_as_of.
         let state = test_state();
         let kindb = state.layout.root().join("kindb");
         std::fs::create_dir_all(&kindb).unwrap();
-        std::fs::write(kindb.join("generation"), "7").unwrap();
+        std::fs::write(kindb.join("head-generation"), "7").unwrap();
 
         let app = router(state);
         let response = app
@@ -10309,6 +10515,7 @@ mod tests {
         assert!(result.text.contains("1 review(s)"));
     }
 
+    #[cfg(feature = "embeddings")]
     #[tokio::test]
     async fn embed_endpoint_uses_daemon_graph() {
         let state = test_state();
@@ -10346,6 +10553,7 @@ mod tests {
             .any(|line| line.contains("No retrievable graph objects found")));
     }
 
+    #[cfg(feature = "embeddings")]
     #[test]
     fn foreground_embed_batch_flush_checkpoints_sidecar_on_throttle() {
         let state = test_state();
@@ -10472,6 +10680,531 @@ mod tests {
             .lines
             .iter()
             .any(|line| line.contains("add handler")));
+    }
+
+    #[tokio::test]
+    async fn cold_shadow_review_uses_head_or_session_hydration_authority() {
+        for scoped in [false, true] {
+            let state = test_state();
+            state
+                .is_initialized
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let (base, head) = setup_daemon_shadow_hydration_fixture(&state);
+            let base_change = kin_git::semantic_change_id_from_git_oid_hex(&base).unwrap();
+            let head_change = kin_git::semantic_change_id_from_git_oid_hex(&head).unwrap();
+            let session_id = SessionId::new();
+            let scoped_graph = Arc::new(kin_db::InMemoryGraph::new());
+            if scoped {
+                state
+                    .set_session_scope(
+                        &session_id,
+                        head.clone(),
+                        head_change,
+                        Arc::clone(&scoped_graph),
+                    )
+                    .await;
+            }
+
+            let version_before = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+            let snapshot_path = state.layout.kindb_snapshot_path();
+            let mut events = state.event_tx.subscribe();
+            let app = router(Arc::clone(&state));
+            let mut request = Request::post("/review").header("content-type", "application/json");
+            if scoped {
+                request = request.header("x-kin-session", session_id.to_string());
+            }
+            let response = app
+                .oneshot(
+                    request
+                        .body(Body::from(
+                            serde_json::json!({
+                                "op": "shadow",
+                                "base": base,
+                                "head": head,
+                                "json": true,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let target_graph = if scoped {
+                scoped_graph.as_ref()
+            } else {
+                state.graph.as_ref()
+            };
+            assert!(target_graph.get_change(&base_change).unwrap().is_some());
+            assert!(target_graph.get_change(&head_change).unwrap().is_some());
+            assert!(!state.is_dirty());
+
+            if scoped {
+                assert!(state.graph.get_change(&base_change).unwrap().is_none());
+                assert!(state.graph.get_change(&head_change).unwrap().is_none());
+                assert_eq!(
+                    state.vfs_version.load(std::sync::atomic::Ordering::SeqCst),
+                    version_before
+                );
+                assert!(!snapshot_path.exists());
+                assert!(matches!(
+                    events.try_recv(),
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                ));
+            } else {
+                assert_eq!(
+                    state.vfs_version.load(std::sync::atomic::Ordering::SeqCst),
+                    version_before + 1
+                );
+                assert!(snapshot_path.exists());
+                match events
+                    .try_recv()
+                    .expect("HEAD shadow hydration must emit an event")
+                {
+                    DaemonEvent::GraphRootChanged { new_root_hash, .. } => {
+                        assert_eq!(new_root_hash, "review-hydration")
+                    }
+                    other => panic!("shadow review emitted the wrong event: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn post_hydration_render_error_still_publishes_head_graph_growth() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let git_head = setup_daemon_hydration_fixture(&state);
+        let imported_change = kin_git::semantic_change_id_from_git_oid_hex(&git_head).unwrap();
+        let version_before = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+        let mut events = state.event_tx.subscribe();
+        let app = router(Arc::clone(&state));
+
+        let response = app
+            .oneshot(
+                Request::post("/history")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "entity": "entity_that_does_not_exist",
+                            "reference": git_head,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(state.graph.get_change(&imported_change).unwrap().is_some());
+        assert_eq!(
+            state.vfs_version.load(std::sync::atomic::Ordering::SeqCst),
+            version_before + 1
+        );
+        assert!(!state.is_dirty());
+
+        let snapshot_path = state.layout.kindb_snapshot_path();
+        assert!(snapshot_path.exists());
+        let snapshot = kin_db::SnapshotManager::open(&snapshot_path).unwrap();
+        assert!(
+            snapshot
+                .graph()
+                .get_change(&imported_change)
+                .unwrap()
+                .is_some(),
+            "hydration must be durable before rendering reports its error"
+        );
+        match events.try_recv().expect("hydration must emit an event") {
+            DaemonEvent::GraphRootChanged { new_root_hash, .. } => {
+                assert_eq!(new_root_hash, "history-hydration")
+            }
+            other => panic!("history hydration emitted the wrong event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_head_hydration_survives_restart_without_rehydrating() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let layout = state.layout.clone();
+        let git_head = setup_daemon_hydration_fixture(&state);
+        let imported_change = kin_git::semantic_change_id_from_git_oid_hex(&git_head).unwrap();
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/history")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "entity": "entity_that_does_not_exist",
+                            "reference": git_head,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let committed_generation = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(committed_generation > 0);
+        assert_eq!(
+            DaemonState::read_generation_marker(&layout),
+            committed_generation
+        );
+        assert!(state.graph.get_change(&imported_change).unwrap().is_some());
+        let index_path = layout.kindb_snapshot_path().with_extension("kidx");
+        let index_before_restart = kin_db::ReadIndex::load(&index_path).unwrap();
+        assert_eq!(
+            index_before_restart.entity_count,
+            state.graph.entity_count() as u32
+        );
+
+        drop(state);
+
+        let reopened = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        reopened
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            reopened
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            committed_generation
+        );
+        assert_eq!(
+            DaemonState::read_generation_marker(&layout),
+            committed_generation
+        );
+        assert!(
+            reopened
+                .graph
+                .get_change(&imported_change)
+                .unwrap()
+                .is_some(),
+            "cold HEAD hydration must reopen from durable graph authority"
+        );
+        assert!(
+            !kin_cli::commands::ref_lookup::git_ref_requires_hydration(
+                reopened.graph.as_ref(),
+                &git_head,
+            ),
+            "the reopened graph must recognize the imported Git head"
+        );
+        let reopened_index = kin_db::ReadIndex::load(&index_path).unwrap();
+        assert_eq!(
+            reopened_index.entity_count,
+            reopened.graph.entity_count() as u32
+        );
+
+        let generation_before_warm_read = reopened
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let mut events = reopened.event_tx.subscribe();
+        let response = router(Arc::clone(&reopened))
+            .oneshot(
+                Request::post("/history")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "entity": "hydrated_target",
+                            "reference": git_head,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            reopened
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation_before_warm_read,
+            "a warm ref query must not republish graph authority"
+        );
+        loop {
+            match events.try_recv() {
+                Ok(DaemonEvent::GraphRootChanged { new_root_hash, .. }) => panic!(
+                    "warm ref query after restart must not rehydrate, got new_root_hash={new_root_hash:?}"
+                ),
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_hydration_emits_once_after_finalization_retry() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let git_head = setup_daemon_hydration_fixture(&state);
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let mut events = state.event_tx.subscribe();
+        state.fail_next_finalization_for_test();
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/history")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "entity": "entity_that_does_not_exist",
+                            "reference": git_head,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation_before + 1,
+            "authority must remain committed when derived finalization fails"
+        );
+        assert!(state.is_dirty(), "the retry wakeup must remain armed");
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        state
+            .save_snapshot()
+            .expect("retry must finalize the committed generation");
+        state.mark_clean();
+        match events
+            .try_recv()
+            .expect("successful finalization must release the queued event")
+        {
+            DaemonEvent::GraphRootChanged { new_root_hash, .. } => {
+                assert_eq!(new_root_hash, "history-hydration")
+            }
+            other => panic!("hydration retry emitted the wrong event: {other:?}"),
+        }
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        state
+            .save_snapshot()
+            .expect("a later no-op save must remain healthy");
+        state.mark_clean();
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hydration_event_waits_for_own_persistence_generation() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let git_head = setup_daemon_hydration_fixture(&state);
+        let imported_change = kin_git::semantic_change_id_from_git_oid_hex(&git_head).unwrap();
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let mut events = state.event_tx.subscribe();
+
+        let (lock_held_tx, lock_held_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let state_for_older_save = Arc::clone(&state);
+        let older_save = tokio::task::spawn_blocking(move || {
+            let _persist_guard = state_for_older_save
+                .persist_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            lock_held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        lock_held_rx.recv().unwrap();
+
+        let request_state = Arc::clone(&state);
+        let request_head = git_head.clone();
+        let request = tokio::spawn(async move {
+            router(request_state)
+                .oneshot(
+                    Request::post("/history")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "entity": "entity_that_does_not_exist",
+                                "reference": request_head,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+
+        for _ in 0..100 {
+            if state.graph.get_change(&imported_change).unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            state.graph.get_change(&imported_change).unwrap().is_some(),
+            "hydration must reach the save boundary while the older generation holds the lock"
+        );
+        assert!(
+            !state.persistence_event_is_queued_for_test(),
+            "the hydration event must not be visible to an older finalizer"
+        );
+        state.emit_pending_persistence_event_for_test();
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        release_tx.send(()).unwrap();
+        older_save.await.unwrap();
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation_before + 1
+        );
+        match events
+            .try_recv()
+            .expect("hydration generation finalization must emit the queued event")
+        {
+            DaemonEvent::GraphRootChanged { new_root_hash, .. } => {
+                assert_eq!(new_root_hash, "history-hydration")
+            }
+            other => panic!("hydration generation emitted the wrong event: {other:?}"),
+        }
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn event_bearing_noop_save_emits_after_concurrent_persistence() {
+        let state = test_state();
+        let git_head = setup_daemon_hydration_fixture(&state);
+        let prepared =
+            kin_cli::commands::ref_lookup::prepare_ref_importing_git_if_needed_with_report(
+                state.graph.as_ref(),
+                &state.layout,
+                Some(&git_head),
+            );
+        assert_eq!(prepared.hydrated_changes, 1);
+        prepared.into_result().unwrap();
+        state.bump_version();
+
+        let mut events = state.event_tx.subscribe();
+        state
+            .save_snapshot()
+            .expect("concurrent ordinary save must persist the hydrated graph");
+        state.mark_clean();
+        let persisted_generation = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        state
+            .save_snapshot_with_event(DaemonEvent::GraphRootChanged {
+                old_root_hash: None,
+                new_root_hash: "history-hydration".to_string(),
+            })
+            .expect("event-bearing no-op save must recognize already-durable authority");
+        state.mark_clean();
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            persisted_generation,
+            "the event-bearing save should not invent another generation"
+        );
+        match events
+            .try_recv()
+            .expect("already-durable hydration must release its queued event")
+        {
+            DaemonEvent::GraphRootChanged { new_root_hash, .. } => {
+                assert_eq!(new_root_hash, "history-hydration")
+            }
+            other => panic!("event-bearing no-op save emitted the wrong event: {other:?}"),
+        }
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn post_hydration_relative_ref_error_still_publishes_head_graph_growth() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let git_head = setup_daemon_hydration_fixture(&state);
+        let imported_change = kin_git::semantic_change_id_from_git_oid_hex(&git_head).unwrap();
+        let invalid_relative_ref = format!("{git_head}^2");
+        let version_before = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+        let mut events = state.event_tx.subscribe();
+        let app = router(Arc::clone(&state));
+
+        let response = app
+            .oneshot(
+                Request::post("/history")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "entity": "hydrated_target",
+                            "reference": invalid_relative_ref,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(state.graph.get_change(&imported_change).unwrap().is_some());
+        assert_eq!(
+            state.vfs_version.load(std::sync::atomic::Ordering::SeqCst),
+            version_before + 1
+        );
+        assert!(state.layout.kindb_snapshot_path().exists());
+        match events.try_recv().expect("hydration must emit an event") {
+            DaemonEvent::GraphRootChanged { new_root_hash, .. } => {
+                assert_eq!(new_root_hash, "history-hydration")
+            }
+            other => panic!("history hydration emitted the wrong event: {other:?}"),
+        }
     }
 
     // A blame/history request that resolves an already-present head imports

@@ -1,6 +1,6 @@
 {
   "name": "@kinlab/kin-mcp",
-  "version": "0.2.15",
+  "version": "0.2.18",
   "description": "Start Kin's MCP server — the system of record for AI-written software — through an npm-friendly wrapper.",
   "type": "module",
   "bin": {
@@ -13,7 +13,7 @@
     "package.json"
   ],
   "scripts": {
-    "test": "node --test",
+    "test": "node --test ./test/index.test.js",
     "test:unit": "node --test ./test/index.test.js",
     "lint": "node --check ./bin/kin-mcp.js && node --check ./src/index.js && node --check ./test/index.test.js && node --check ./test/smoke-first-run.mjs",
     "smoke": "node ./test/smoke-first-run.mjs"

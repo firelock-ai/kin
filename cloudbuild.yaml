@@ -21,12 +21,18 @@ steps:
       - |
         branch_tag="$(echo "${BRANCH_NAME:-detached}" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9._-]#-#g' | sed 's#-\{2,\}#-#g' | sed 's#^-##; s#-$##' | cut -c1-120)"
         branch_tag="${branch_tag:-detached}"
+        build_branch="${BRANCH_NAME:-detached}"
         docker build \
           --build-arg "KIN_DB_REF=${_KIN_DB_REF}" \
+          --build-arg "KIN_BUILD_GIT_SHA=${COMMIT_SHA}" \
+          --build-arg "KIN_BUILD_DIRTY=false" \
+          --build-arg "KIN_BUILD_BRANCH=${build_branch}" \
           -t "${_AR_REGISTRY}/kin-daemon:${COMMIT_SHA}" \
           -t "${_AR_REGISTRY}/kin-daemon:${branch_tag}" \
           -f Dockerfile \
           .
+        bash scripts/verify-container-build-info.sh \
+          "${_AR_REGISTRY}/kin-daemon:${COMMIT_SHA}" "${COMMIT_SHA}"
     id: 'build-kin-daemon'
 
   # Tag as staging-latest when pushing to main

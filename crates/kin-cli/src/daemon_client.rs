@@ -50,6 +50,10 @@ pub struct HealthResponse {
 pub struct BuildResponse {
     pub sha: String,
     pub dirty: bool,
+    #[serde(default)]
+    pub source_known: bool,
+    #[serde(default)]
+    pub dependency_provenance: String,
     pub built_at: String,
 }
 

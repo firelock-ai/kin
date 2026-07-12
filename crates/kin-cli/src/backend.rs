@@ -199,11 +199,13 @@ async fn open_snapshot_daemon_first_with_mode(
         })?;
 
     // Try daemon bootstrap using the repo-scoped URL
-    let snapshot = fetch_daemon_graph(&daemon_url).await.map_err(|error| {
-        kin_db::KinDbError::StorageError(format!(
-            "kin daemon bootstrap failed from {daemon_url}: {error}"
-        ))
-    })?;
+    let snapshot = fetch_daemon_graph(&daemon_url, layout)
+        .await
+        .map_err(|error| {
+            kin_db::KinDbError::StorageError(format!(
+                "kin daemon bootstrap failed from {daemon_url}: {error}"
+            ))
+        })?;
 
     if !read_only {
         return Err(kin_db::KinDbError::StorageError(
@@ -221,6 +223,7 @@ async fn open_snapshot_daemon_first_with_mode(
 /// Load the persisted HNSW vector index into the graph if available.
 /// Non-fatal: if the file doesn't exist or fails to load, semantic search
 /// gracefully returns empty results.
+#[cfg(feature = "vector")]
 fn load_vector_index_if_exists(snap: &kin_db::SnapshotManager, layout: &kin_core::KinLayout) {
     let _span = tracing::info_span!(
         "kindb.load_vector_index_if_exists",
@@ -242,6 +245,9 @@ fn load_vector_index_if_exists(snap: &kin_db::SnapshotManager, layout: &kin_core
         }
     }
 }
+
+#[cfg(not(feature = "vector"))]
+fn load_vector_index_if_exists(_snap: &kin_db::SnapshotManager, _layout: &kin_core::KinLayout) {}
 
 /// Fetch the graph from the daemon's `/graph/bootstrap` endpoint.
 /// Returns `None` if the daemon is unreachable or returns an error.
@@ -275,9 +281,12 @@ fn graph_from_bootstrap_snapshot(
 /// `reqwest::Client` (as opposed to `DaemonClient`, which attaches this
 /// automatically at construction). Every helper in this module talks to the
 /// repo-scoped daemon directly rather than through `DaemonClient`, so each
-/// one needs this explicitly.
-fn with_daemon_auth(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    match crate::daemon_client::resolve_daemon_auth_token() {
+/// one needs the token resolved from that repo's layout explicitly.
+fn with_daemon_auth(
+    request: reqwest::RequestBuilder,
+    layout: &kin_core::KinLayout,
+) -> reqwest::RequestBuilder {
+    match crate::daemon_client::resolve_daemon_auth_token_for_layout(layout) {
         Some(token) => request.bearer_auth(token),
         None => request,
     }
@@ -285,6 +294,7 @@ fn with_daemon_auth(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder
 
 async fn fetch_daemon_graph(
     daemon_url: &str,
+    layout: &kin_core::KinLayout,
 ) -> std::result::Result<kin_db::GraphSnapshot, String> {
     let _span = tracing::info_span!("kin.backend.fetch_daemon_graph").entered();
     let bootstrap_timeout_secs = std::env::var("KIN_DAEMON_BOOTSTRAP_TIMEOUT_SECS")
@@ -298,10 +308,13 @@ async fn fetch_daemon_graph(
         .build()
         .map_err(|error| format!("build daemon bootstrap client: {error}"))?;
 
-    let resp = with_daemon_auth(client.get(format!(
-        "{}/graph/bootstrap",
-        daemon_url.trim_end_matches('/')
-    )))
+    let resp = with_daemon_auth(
+        client.get(format!(
+            "{}/graph/bootstrap",
+            daemon_url.trim_end_matches('/')
+        )),
+        layout,
+    )
     .send()
     .await
     .map_err(|error| format!("send graph bootstrap request: {error}"))?;
@@ -340,11 +353,14 @@ pub async fn require_daemon_update_head(
         "head": head_id,
     });
 
-    let resp = with_daemon_auth(client.put(format!(
-        "{}/v1/graph/branches/{}/head",
-        daemon_url.trim_end_matches('/'),
-        branch_name
-    )))
+    let resp = with_daemon_auth(
+        client.put(format!(
+            "{}/v1/graph/branches/{}/head",
+            daemon_url.trim_end_matches('/'),
+            branch_name
+        )),
+        layout,
+    )
     .json(&payload)
     .send()
     .await?;
@@ -378,10 +394,13 @@ pub async fn require_daemon_commit(
         "branch_name": branch_name,
     });
 
-    let resp = with_daemon_auth(client.post(format!(
-        "{}/v1/graph/commit",
-        daemon_url.trim_end_matches('/')
-    )))
+    let resp = with_daemon_auth(
+        client.post(format!(
+            "{}/v1/graph/commit",
+            daemon_url.trim_end_matches('/')
+        )),
+        layout,
+    )
     .json(&payload)
     .send()
     .await?;
@@ -432,10 +451,13 @@ pub async fn require_daemon_graph_mutations(
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
-    let resp = with_daemon_auth(client.post(format!(
-        "{}/v1/graph/mutations",
-        daemon_url.trim_end_matches('/')
-    )))
+    let resp = with_daemon_auth(
+        client.post(format!(
+            "{}/v1/graph/mutations",
+            daemon_url.trim_end_matches('/')
+        )),
+        layout,
+    )
     .json(&batch)
     .send()
     .await?;
@@ -471,10 +493,13 @@ pub async fn get_spine_impact(
         .timeout(Duration::from_secs(10))
         .build()?;
 
-    let resp = with_daemon_auth(client.get(format!(
-        "{}/v1/spine/impact",
-        daemon_url.trim_end_matches('/')
-    )))
+    let resp = with_daemon_auth(
+        client.get(format!(
+            "{}/v1/spine/impact",
+            daemon_url.trim_end_matches('/')
+        )),
+        layout,
+    )
     .query(&[
         ("repo", repo_id),
         ("entity", &entity_id.to_string()),
@@ -517,10 +542,13 @@ pub async fn get_spine_xref(
         .timeout(Duration::from_secs(10))
         .build()?;
 
-    let resp = with_daemon_auth(client.get(format!(
-        "{}/v1/spine/xref",
-        daemon_url.trim_end_matches('/')
-    )))
+    let resp = with_daemon_auth(
+        client.get(format!(
+            "{}/v1/spine/xref",
+            daemon_url.trim_end_matches('/')
+        )),
+        layout,
+    )
     .query(&[("repo", repo_id), ("entity", &entity_id.to_string())])
     .send()
     .await;

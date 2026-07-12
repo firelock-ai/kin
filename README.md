@@ -4,7 +4,7 @@
 > AI made code cheap to write and expensive to trust.
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Release](https://img.shields.io/badge/release-v0.2.15-6E56CF.svg)](https://github.com/firelock-ai/kin/releases)
+[![Latest release](https://img.shields.io/badge/release-latest-6E56CF.svg)](https://github.com/firelock-ai/kin/releases/latest)
 [![kinlab.ai](https://img.shields.io/badge/hosted-kinlab.ai-111111.svg)](https://kinlab.ai)
 
 AI agents now generate code faster than teams can review it. The hard part is no longer
@@ -36,17 +36,17 @@ real blast radius of a merge is.
 
 ## Install
 
-Kin ships as native binaries on [GitHub Releases](https://github.com/firelock-ai/kin/releases)
-(currently **v0.2.15**) for five targets: macOS (Apple Silicon and Intel), Linux (x86_64 and
-aarch64, static musl), and Windows (x86_64 — a limited, work-in-progress build; see below).
+Kin ships as native binaries on [GitHub Releases](https://github.com/firelock-ai/kin/releases/latest)
+for five targets: macOS (Apple Silicon and Intel), Linux (x86_64 and
+aarch64, static musl), and Windows (x86_64, supported for the vector-free surface described below).
 
 **Direct download.** Grab the archive for your platform, verify its checksum, and extract.
 The release publishes a `.sha256` next to every archive.
 
 ```sh
 # Apple Silicon macOS shown; swap in your platform's archive name.
-curl -fsSLO https://github.com/firelock-ai/kin/releases/download/v0.2.15/kin-macos-aarch64.tar.gz
-curl -fsSLO https://github.com/firelock-ai/kin/releases/download/v0.2.15/kin-macos-aarch64.tar.gz.sha256
+curl -fsSLO https://github.com/firelock-ai/kin/releases/latest/download/kin-macos-aarch64.tar.gz
+curl -fsSLO https://github.com/firelock-ai/kin/releases/latest/download/kin-macos-aarch64.tar.gz.sha256
 shasum -a 256 -c kin-macos-aarch64.tar.gz.sha256
 tar xzf kin-macos-aarch64.tar.gz      # contains the `kin` and `kin-daemon` binaries
 ```
@@ -63,13 +63,14 @@ curl -fsSL https://get.kinlab.dev/install | sh
 ```
 
 On **Windows**, use PowerShell (`irm https://get.kinlab.dev/install.ps1 | iex`). The native
-Windows build is a limited, vector-free convenience binary with no filesystem projection. For
-the complete, vector-enabled Kin, install under WSL2 — see
+Windows build is a supported vector-free runtime for graph, lexical, daemon, setup, and MCP
+workflows, with vector similarity and filesystem projection explicitly unsupported. For the
+complete vector-enabled/projection experience, install under WSL2 — see
 [docs/windows-wsl2.md](docs/windows-wsl2.md).
 
 **For AI agents.** `kin setup --intent agent` wires Kin's built-in MCP server into every
 detected assistant with the curated `agent-default` tool profile. npm users can install the
-canonical launcher with `npm install -g @kinlab/kin` (**0.2.15**) and run the same setup
+canonical launcher with `npm install -g @kinlab/kin@latest` and run the same setup
 command; the older `@kinlab/kin-mcp` package remains as a compatibility wrapper.
 
 See [docs/quickstart.md](docs/quickstart.md) for installer environment variables
@@ -184,7 +185,7 @@ Kin is **0.2.x** — pre-1.0 and under active development. Expect rough edges an
 changes between releases. Being precise about what is and isn't ready today:
 
 - **Install surface.** Native binaries ship on GitHub Releases and via the install script; the canonical `@kinlab/kin` npm package (`npm i -g @kinlab/kin`, or `npx -y @kinlab/kin`) provisions the same managed `kin` + `kin-daemon` release for npm-based workflows. `@kinlab/kin-mcp` remains published as a compatibility wrapper.
-- **Windows.** The native Windows binary is a limited, vector-free build with no filesystem projection. Use WSL2 for the complete experience.
+- **Windows.** The native Windows binary is a supported vector-free build for graph, lexical, daemon, setup, and MCP workflows; vector similarity and filesystem projection are unsupported. Use WSL2 for the complete experience.
 - **Semantic search.** `kin init` builds the graph without embeddings; run `kin embed` to enable vector search. Until then, `locate`/`search` run on lexical + graph signals and say so.
 - **Hosted KinLab.** Connecting a repo to hosted KinLab is coming soon; it is not yet a first-run flow.
 - **Graph-first, with transitional compatibility.** The graph is the authority for Kin's own commands. File-first and Git-interop paths are supported as a migration boundary, not the long-term model.

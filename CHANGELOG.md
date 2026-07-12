@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.18] - 2026-07-11
+
+This patch supersedes the quarantined v0.2.17 prerelease. It carries forward
+the graph-backed VFS bridge and release-verification hardening from that tag,
+then fixes the defects exposed by the mandatory clean-install proof.
+
+The v0.2.17 signed assets remain available for audit, but npm, GHCR version
+tags, Homebrew, installers, and GitHub Latest were never promoted. The complete
+last-stable diff is [v0.2.16...v0.2.18](https://github.com/firelock-ai/kin/compare/v0.2.16...v0.2.18).
+
+### Fixed
+
+- `kin-vfs` translates intercepted host paths into repo-relative graph keys,
+  preserves canonical and lexical workspace roots, and rejects ambiguous or
+  escaping paths before they can reach graph authority.
+- Windows daemon reopen no longer applies the Unix-only parent-directory fsync
+  primitive that caused `ERROR_ACCESS_DENIED` after loading a persisted graph.
+- Public install proof now preserves the selected Unix shell across Actions
+  steps, reports the exact unhealthy checks, and exercises a native Windows
+  init-to-daemon-reopen smoke before a release can reach npm or GitHub Latest.
+- README install links now follow the proven GitHub Latest release instead of
+  advertising an unpromoted tag.
+
+## [0.2.17] - 2026-07-11
+
+This patch restores the promised graph-backed filesystem bridge and tightens the
+automatic release verifier without changing Kin's public CLI surface.
+
+### Fixed
+
+- `kin-vfs` now translates intercepted host paths into repo-relative graph keys before
+  daemon requests, preserves launcher-verified canonical and lexical workspace roots,
+  and rejects traversal, containment, or alias ambiguity from graph authority.
+- Post-release verification now waits for complete npm integrity metadata, and
+  cross-platform checksum aggregation normalizes Windows CRLF sidecars to LF.
+
+## [0.2.16] - 2026-07-11
+
+Graph authority is more durable across long imports and daemon restarts, while
+agent-facing retrieval and review surfaces explain their evidence more clearly and the
+release path fails closed on artifact provenance.
+
+### Added
+
+- History hydration checkpoints let interrupted imports resume from deterministic,
+  graph-owned progress instead of replaying completed work.
+- `semantic_locate` now reports per-hit `match_evidence` on both the default cosine
+  path and the opt-in fused path; fused multi-query fan-out and reciprocal-rank fusion
+  are available without changing the honest default.
+- Shadow review keeps rename-neutral downstream risk proportionate, excludes
+  derived-copy consumers, and stamps range depth plus a non-demoting deep-history
+  evidence ceiling when a deep range yields no blast radius.
+
+### Changed
+
+- Graph-derived VFS snapshot materialization is cached with single-flight fills, so
+  concurrent readers reuse the same authoritative projection work.
+- `history` and `blame` route lazy hydration through the owning graph authority:
+  HEAD-owned growth is persisted and broadcast only when changes were inserted, while
+  session-scoped growth stays private.
+- Pin `kin-db` 0.2.35 for the storage and snapshot-lock lifecycle used by restart-safe
+  daemon authority.
+
+### Fixed
+
+- Daemon reopen now replays the authoritative storage delta chain and restores the exact
+  generation; completed HEAD hydration survives restart without replay, and its
+  invalidation event is emitted once its persistence generation finalizes.
+- Reconcile bursts retain their full bounded backlog instead of discarding events past
+  the first batch.
+- Release automation now binds Windows checksums to exact archives, gates GitHub Latest
+  on anonymous install proof and automatically published, provenance-verified npm
+  packages, preserves tracked lockfile bytes across operating systems, validates the
+  public Homebrew formula outcome, and attests the immutable daemon image.
+
 ## [0.2.15] - 2026-07-08
 
 Sharper shadow review: behavior-equivalence fingerprinting, call-site argument shapes,
@@ -432,7 +507,10 @@ Historical note: this snapshot predates the public GitHub prerelease series and 
 - Daemon mode for background file watching (`kin-daemon`)
 - 19-crate workspace architecture
 
-[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.1...HEAD
+[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.18...HEAD
+[0.2.18]: https://github.com/firelock-ai/kin/compare/v0.2.17...v0.2.18
+[0.2.17]: https://github.com/firelock-ai/kin/compare/v0.2.16...v0.2.17
+[0.2.16]: https://github.com/firelock-ai/kin/compare/v0.2.15...v0.2.16
 [0.2.1]: https://github.com/firelock-ai/kin/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/firelock-ai/kin/compare/v0.1.0-alpha.25...v0.2.0
 [0.1.0-alpha.25]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0-alpha.25

@@ -13,9 +13,9 @@
 #   $env:KIN_NO_SETUP = "1"     Skip interactive setup after install
 #   $env:KIN_BASE_URL = "..."   Install from a mirror (CI smoke tests / offline)
 #
-# Note: the native Windows build is a limited, vector-free convenience binary
-# with no filesystem projection. For the full experience, install under WSL2
-# (see docs/windows-wsl2.md).
+# Note: the native Windows build is a supported vector-free runtime for graph,
+# lexical, daemon, setup, and MCP workflows. Vector similarity and filesystem
+# projection are unsupported; use WSL2 for the complete experience.
 
 $ErrorActionPreference = "Stop"
 
@@ -114,13 +114,13 @@ Write-Host ""
 
 Write-Info "Platform: windows ($Arch)"
 
-# The native Windows binary is a limited convenience build: it is vector-free
-# (semantic search disabled) and does NOT provide the transparent filesystem
+# The native Windows binary is a supported subset: it is vector-free
+# (semantic vector similarity disabled) and does NOT provide the transparent filesystem
 # projection. Projection relies on Unix library-injection (LD_PRELOAD /
 # DYLD_INSERT_LIBRARIES), which native Windows does not offer. For the complete,
 # vector-enabled Kin with working projection, install under WSL2 instead — see
 # docs/windows-wsl2.md.
-Write-Host "  ! Native Windows build is vector-free and has no filesystem projection." -ForegroundColor Yellow
+Write-Host "  ! Native Windows supports graph + lexical workflows; vector similarity and filesystem projection are unavailable." -ForegroundColor Yellow
 Write-Host "    For the full experience, install under WSL2 (see docs/windows-wsl2.md)." -ForegroundColor DarkGray
 Write-Host ""
 

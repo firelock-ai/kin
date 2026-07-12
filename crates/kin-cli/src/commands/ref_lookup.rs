@@ -67,6 +67,31 @@ pub struct ResolvedRef {
     pub hydrated_changes: usize,
 }
 
+/// A ref-resolution attempt separated from the mutation owner's publication
+/// boundary.
+///
+/// Hydrating a Git ref can successfully insert its ancestry and then fail
+/// while applying a trailing relative hop (for example `<oid>^2` on a
+/// single-parent commit). Keeping that final resolution error beside the real
+/// insertion count lets daemon owners persist or retain the graph growth
+/// before surfacing the caller's invalid ref.
+#[derive(Debug)]
+pub struct PreparedRefResolution {
+    resolution: Result<SemanticChangeId>,
+    pub hydrated_changes: usize,
+}
+
+impl PreparedRefResolution {
+    pub fn into_result(self) -> Result<ResolvedRef> {
+        let head = self.resolution?;
+        Ok(ResolvedRef {
+            head,
+            hydrated_git_history: self.hydrated_changes > 0,
+            hydrated_changes: self.hydrated_changes,
+        })
+    }
+}
+
 pub fn resolve_ref<G>(
     graph: &G,
     layout: &kin_core::KinLayout,
@@ -110,7 +135,7 @@ pub fn resolve_ref_importing_git_if_needed_with_report(
     layout: &kin_core::KinLayout,
     reference: Option<&str>,
 ) -> Result<ResolvedRef> {
-    resolve_ref_importing_git_if_needed_with_report_inner(graph, layout, reference)
+    prepare_ref_importing_git_if_needed_with_report(graph, layout, reference).into_result()
 }
 
 pub fn resolve_ref_importing_git_if_needed_for_locate_with_report(
@@ -126,26 +151,44 @@ fn resolve_ref_importing_git_if_needed_with_report_inner(
     layout: &kin_core::KinLayout,
     reference: Option<&str>,
 ) -> Result<ResolvedRef> {
+    prepare_ref_importing_git_if_needed_with_report(graph, layout, reference).into_result()
+}
+
+pub fn prepare_ref_importing_git_if_needed_with_report(
+    graph: &kin_db::InMemoryGraph,
+    layout: &kin_core::KinLayout,
+    reference: Option<&str>,
+) -> PreparedRefResolution {
     match resolve_ref(graph, layout, reference) {
-        Ok(head) => Ok(ResolvedRef {
-            head,
-            hydrated_git_history: false,
+        Ok(head) => PreparedRefResolution {
+            resolution: Ok(head),
             hydrated_changes: 0,
-        }),
+        },
         Err(original_err) => {
             let Some(reference) = reference else {
-                return Err(original_err);
+                return PreparedRefResolution {
+                    resolution: Err(original_err),
+                    hydrated_changes: 0,
+                };
             };
             let Some(git_oid) = extract_git_ref(reference) else {
-                return Err(original_err);
+                return PreparedRefResolution {
+                    resolution: Err(original_err),
+                    hydrated_changes: 0,
+                };
             };
-            let hydrated_changes = hydrate_imported_git_ref(graph, layout, git_oid)?;
-            let head = resolve_ref(graph, layout, Some(reference))?;
-            Ok(ResolvedRef {
-                head,
-                hydrated_git_history: hydrated_changes > 0,
-                hydrated_changes,
-            })
+            match hydrate_imported_git_ref(graph, layout, git_oid) {
+                Ok(hydrated_changes) => PreparedRefResolution {
+                    // Preserve a relative-hop error until the graph owner has
+                    // acknowledged the successful ancestry insertion.
+                    resolution: resolve_ref(graph, layout, Some(reference)),
+                    hydrated_changes,
+                },
+                Err(error) => PreparedRefResolution {
+                    resolution: Err(error),
+                    hydrated_changes: 0,
+                },
+            }
         }
     }
 }

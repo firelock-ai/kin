@@ -335,12 +335,21 @@ async fn async_main() -> i32 {
     // the JSON and be misread as a stale/incompatible daemon. A compat probe is
     // a pure metadata query needing neither logging nor env enforcement.
     if args.compat_json {
+        let build = kin_buildinfo::get();
         println!(
             "{}",
             serde_json::json!({
                 "schema": "kin.daemon.compat.v1",
                 "version": env!("CARGO_PKG_VERSION"),
                 "graph_snapshot_version": kin_db::GraphSnapshot::CURRENT_VERSION,
+                "build": {
+                    "sha": build.sha,
+                    "dirty": build.dirty,
+                    "source_known": build.source_known,
+                    "dependency_provenance": build.dependency_provenance,
+                    "branch": build.branch,
+                    "built_at": build.built_at,
+                },
             })
         );
         return 0;
