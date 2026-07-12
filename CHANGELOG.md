@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.18] - 2026-07-11
+
+This patch supersedes the quarantined v0.2.17 prerelease. It carries forward
+the graph-backed VFS bridge and release-verification hardening from that tag,
+then fixes the defects exposed by the mandatory clean-install proof.
+
+The v0.2.17 signed assets remain available for audit, but npm, GHCR version
+tags, Homebrew, installers, and GitHub Latest were never promoted. The complete
+last-stable diff is [v0.2.16...v0.2.18](https://github.com/firelock-ai/kin/compare/v0.2.16...v0.2.18).
+
+### Fixed
+
+- `kin-vfs` translates intercepted host paths into repo-relative graph keys,
+  preserves canonical and lexical workspace roots, and rejects ambiguous or
+  escaping paths before they can reach graph authority.
+- Windows daemon reopen no longer applies the Unix-only parent-directory fsync
+  primitive that caused `ERROR_ACCESS_DENIED` after loading a persisted graph.
+- Public install proof now preserves the selected Unix shell across Actions
+  steps, reports the exact unhealthy checks, and exercises a native Windows
+  init-to-daemon-reopen smoke before a release can reach npm or GitHub Latest.
+- README install links now follow the proven GitHub Latest release instead of
+  advertising an unpromoted tag.
+
 ## [0.2.17] - 2026-07-11
 
 This patch restores the promised graph-backed filesystem bridge and tightens the
@@ -484,7 +507,8 @@ Historical note: this snapshot predates the public GitHub prerelease series and 
 - Daemon mode for background file watching (`kin-daemon`)
 - 19-crate workspace architecture
 
-[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.17...HEAD
+[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.18...HEAD
+[0.2.18]: https://github.com/firelock-ai/kin/compare/v0.2.17...v0.2.18
 [0.2.17]: https://github.com/firelock-ai/kin/compare/v0.2.16...v0.2.17
 [0.2.16]: https://github.com/firelock-ai/kin/compare/v0.2.15...v0.2.16
 [0.2.1]: https://github.com/firelock-ai/kin/compare/v0.2.0...v0.2.1
