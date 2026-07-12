@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Public positioning now separates citable retrieval evidence from report-only
+  review behavior and links the artifact-backed public proof package.
+- External contributions now use the documented DCO sign-off only; the
+  nonfunctional base-branch CLA allowlist gate has been removed.
+
 ## [0.2.18] - 2026-07-11
 
 This patch supersedes the quarantined v0.2.17 prerelease. It carries forward
