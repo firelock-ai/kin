@@ -158,6 +158,9 @@ def main() -> None:
     attestation_job = release[attestation_start:attestation_end]
     for policy in (
         "needs: [config, build_daemon_image]",
+        "always()",
+        "needs.config.result == 'success'",
+        "needs.build_daemon_image.result == 'success'",
         "environment: release",
         "packages: write",
         "id-token: write",
@@ -199,11 +202,27 @@ def main() -> None:
             "release daemon path must contain exactly one image build command"
         )
 
-    require(
-        release,
-        "needs: [build, notarize_linux, attest_daemon_image]",
-        "public release daemon attestation gate",
-    )
+    publish_start = release.index("  publish:")
+    publish_end = release.index("\n  install_proof:", publish_start)
+    publish_job = release[publish_start:publish_end]
+    for policy in (
+        "needs: [config, build, notarize_linux, attest_daemon_image]",
+        "always()",
+        "needs.config.result == 'success'",
+        "needs.build.result == 'success'",
+        "needs.attest_daemon_image.result == 'success'",
+        "needs.config.outputs.notarize_on_linux == 'true'",
+        "needs.notarize_linux.result == 'success'",
+        "needs.config.outputs.notarize_on_linux == 'false'",
+        "needs.notarize_linux.result == 'skipped'",
+    ):
+        require(publish_job, policy, "first GitHub Release write admission")
+    for forbidden in ("!failure()", "!cancelled()"):
+        if forbidden in publish_job:
+            raise AssertionError(
+                "first GitHub Release write must use exact direct-needs results, "
+                f"not permissive aggregate state: {forbidden}"
+            )
     require(
         release,
         "needs: [publish, install_proof, build_daemon_image, attest_daemon_image]",
@@ -240,9 +259,6 @@ def main() -> None:
     ):
         require(build_job, policy, "cross-platform release lockfile authority")
 
-    publish_start = release.index("  publish:")
-    publish_end = release.index("\n  install_proof:", publish_start)
-    publish_job = release[publish_start:publish_end]
     aggregate_start = publish_job.index(
         "      - name: Aggregate per-artifact checksums"
     )

@@ -248,7 +248,13 @@ jobs:
   attest_daemon_image:
     name: Attest immutable daemon image
     needs: [config, build_daemon_image]
-    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    if: >-
+      ${{
+        always() &&
+        needs.config.result == 'success' &&
+        needs.build_daemon_image.result == 'success' &&
+        startsWith(github.ref, 'refs/tags/v')
+      }}
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -1030,12 +1036,29 @@ jobs:
 
   publish:
     name: Publish Release
-    needs: [build, notarize_linux, attest_daemon_image]
-    # notarize_linux is skipped on the default (macOS notarytool) path; publish
-    # must still run then, but must NOT run if notarization actually failed or
-    # was cancelled. `always() && !failure() && !cancelled()` lets a skipped
-    # dependency through while still gating on a real Linux-notarize failure.
-    if: ${{ always() && !failure() && !cancelled() && github.ref_type == 'tag' }}
+    needs: [config, build, notarize_linux, attest_daemon_image]
+    # A skipped Linux notarization job is admissible only when the reviewed
+    # config selected native macOS notarytool. Every other direct authority
+    # input must report an exact successful result before the first public
+    # GitHub Release write is allowed.
+    if: >-
+      ${{
+        always() &&
+        needs.config.result == 'success' &&
+        needs.build.result == 'success' &&
+        needs.attest_daemon_image.result == 'success' &&
+        (
+          (
+            needs.config.outputs.notarize_on_linux == 'true' &&
+            needs.notarize_linux.result == 'success'
+          ) ||
+          (
+            needs.config.outputs.notarize_on_linux == 'false' &&
+            needs.notarize_linux.result == 'skipped'
+          )
+        ) &&
+        github.ref_type == 'tag'
+      }}
     runs-on: ubuntu-latest
     environment: release
     permissions:
