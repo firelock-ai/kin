@@ -13,7 +13,7 @@ permissions:
 
 # External authority boundary: repository ruleset "Protect version release
 # tags" limits v* creation/update/deletion to the release captain, while the
-# protected `release` environment admits only v* tags and requires approval.
+# protected `release` environment automatically admits only v* tags.
 # Every credential-bearing or public-write job below must keep that environment.
 # Both public npm packages trust only firelock-ai/kin + release.yml + environment
 # `release`, allow `npm publish` through short-lived OIDC, and disallow
