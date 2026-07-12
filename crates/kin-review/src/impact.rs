@@ -119,9 +119,10 @@ impl<G: GraphStore> ImpactGraph for LiveGraph<'_, G> {
             {
                 for evidence in &relation.evidence {
                     match evidence.parser_rule.as_deref() {
-                        Some(kin_index::CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1) => {
-                            return Ok(false)
-                        }
+                        Some(
+                            kin_index::CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1
+                            | kin_index::CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1,
+                        ) => return Ok(false),
                         Some(kin_index::CALL_SHAPE_PARSE_COVERAGE_FULL_V1)
                             if evidence.source_path.as_deref() == Some(file.as_str()) =>
                         {
@@ -722,6 +723,7 @@ mod tests {
         Visibility,
     };
     use kin_model::ids::*;
+    use kin_model::EntityStore;
 
     fn test_entity(name: &str) -> Entity {
         Entity {
@@ -870,6 +872,58 @@ mod tests {
             import_source: None,
             evidence: vec![],
         }
+    }
+
+    #[test]
+    fn live_coverage_fails_closed_when_stale_full_and_extraction_incomplete_coexist() {
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = entity_in_file("target", "src/lib.py", 1);
+        let completeness = kin_index::FileParseCompletenessMap::from([(
+            "src/lib.py".to_string(),
+            kin_model::ParseCompleteness::Full,
+        )]);
+        let complete_files = [kin_index::FileParseData {
+            file_path: "src/lib.py".to_string(),
+            entities: vec![entity.clone()],
+            relations: Vec::new(),
+            imports: Vec::new(),
+        }];
+        let mut coverage =
+            kin_index::link_cross_file_with_completeness(&complete_files, &completeness);
+        let mut extraction_incomplete = coverage[0].clone();
+        extraction_incomplete.id = RelationId::from_bytes([0xee; 16]);
+        extraction_incomplete.dst = GraphNodeId::Artifact(kin_model::ArtifactId::seed_from_path(
+            "kin-internal://test/extraction-incomplete/src/lib.py",
+        ));
+        extraction_incomplete.evidence = vec![RelationEvidence {
+            source_path: Some("src/lib.py".to_string()),
+            parser_rule: Some(kin_index::CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1.to_string()),
+            ..RelationEvidence::default()
+        }];
+        coverage.push(extraction_incomplete);
+
+        graph
+            .upsert_file_layout(&kin_model::FileLayout {
+                file_id: FilePathId::new("src/lib.py"),
+                parse_completeness: kin_model::ParseCompleteness::Full,
+                imports: kin_model::ImportSection {
+                    byte_range: 0..0,
+                    items: Vec::new(),
+                },
+                regions: Vec::new(),
+            })
+            .unwrap();
+        graph.upsert_entity(&entity).unwrap();
+        for relation in coverage {
+            graph.upsert_relation(&relation).unwrap();
+        }
+
+        assert!(
+            !LiveGraph(&graph)
+                .call_shape_parse_coverage_complete()
+                .unwrap(),
+            "explicit extraction-incomplete evidence must dominate a stale full marker"
+        );
     }
 
     fn modified(entity: &Entity) -> EntityChange {

@@ -243,7 +243,10 @@ impl<G: GraphStore> ImpactGraph for GraphAtRef<'_, G> {
         for relation in self.relations.values() {
             for evidence in &relation.evidence {
                 match evidence.parser_rule.as_deref() {
-                    Some(kin_index::CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1) => return Ok(false),
+                    Some(
+                        kin_index::CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1
+                        | kin_index::CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1,
+                    ) => return Ok(false),
                     Some(kin_index::CALL_SHAPE_PARSE_COVERAGE_FULL_V1) => {
                         if let Some(file) = evidence.source_path.as_ref() {
                             full_files.insert(file.clone());
@@ -508,6 +511,38 @@ mod tests {
         ))
         .call_shape_parse_coverage_complete()
         .unwrap());
+
+        let full_completeness = kin_index::FileParseCompletenessMap::from([(
+            "src/lib.py".to_string(),
+            kin_model::ParseCompleteness::Full,
+        )]);
+        let mut dual_relations =
+            kin_index::link_cross_file_with_completeness(&files, &full_completeness)
+                .into_iter()
+                .map(|relation| (relation.id, relation))
+                .collect::<HashMap<_, _>>();
+        let mut extraction_incomplete =
+            test_relation(0x7c, entity.id, entity.id, RelationKind::DependsOn);
+        extraction_incomplete.evidence = vec![kin_model::RelationEvidence {
+            source_path: Some("src/lib.py".to_string()),
+            parser_rule: Some(kin_index::CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1.to_string()),
+            ..kin_model::RelationEvidence::default()
+        }];
+        dual_relations.insert(extraction_incomplete.id, extraction_incomplete);
+        let dual_state = GraphAtRef::from_state(
+            &live,
+            at,
+            HashSet::from([at]),
+            ResolvedGraphState {
+                entities: HashMap::from([(entity.id, entity.clone())]),
+                relations: dual_relations,
+                ..ResolvedGraphState::default()
+            },
+        );
+        assert!(
+            !dual_state.call_shape_parse_coverage_complete().unwrap(),
+            "historical extraction-incomplete evidence must dominate a stale full marker"
+        );
 
         let mut target = test_entity("target");
         target.file_origin = Some(FilePathId::new("src/defs.py"));
