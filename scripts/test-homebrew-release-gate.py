@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 
-"""Deterministic tests for the mandatory public Homebrew release gate."""
+"""Deterministic tests for the public Homebrew release follow-up proof."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPTS_DIR.parent
 VERIFIER = SCRIPTS_DIR / "verify-homebrew-formula.sh"
 VALIDATOR = SCRIPTS_DIR / "validate-homebrew-formula.py"
-WORKFLOW = ROOT / ".github/workflows/release.yml"
+WORKFLOW = ROOT / ".github/workflows/publish-release-installers.yml"
 
 FIXTURE_CHECKSUMS = {
     "kin-macos-aarch64.tar.gz": "a" * 64,
@@ -868,17 +868,14 @@ def test_release_defaults_remain_1800_seconds_and_90_attempts() -> None:
 
 def test_dispatch_result_cannot_skip_verification() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
-    marker = "      - name: Verify the tap formula actually bumped to this version\n"
+    marker = "      - name: Prove Homebrew workflow and public formula\n"
     start = workflow.index(marker)
     next_step = workflow.find("\n      - name:", start + len(marker))
     verification_step = workflow[start : next_step if next_step != -1 else None]
 
-    assert "startsWith(github.ref, 'refs/tags/v')" in verification_step
-    assert (
-        'bash scripts/verify-homebrew-formula.sh "$GITHUB_REF_NAME"'
-        in verification_step
-    )
-    assert "steps.dispatch.outputs" not in verification_step
+    assert 'bash scripts/verify-homebrew-formula.sh "$KIN_TAG"' in verification_step
+    assert "steps.homebrew-dispatch.outputs.dispatched_at" in verification_step
+    assert "if:" not in verification_step
     assert "TAP_DISPATCH_TOKEN" not in verification_step
 
 

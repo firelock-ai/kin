@@ -16,6 +16,7 @@ README = ROOT / "README.md"
 RELEASE = WORKFLOWS / "release.yml"
 INSTALL_PROOF = WORKFLOWS / "install-proof.yml"
 INSTALLER_CALLBACK = WORKFLOWS / "publish-release-installers.yml"
+UPDATE_TRUST = ROOT / "docs" / "security" / "signing-and-update-trust.md"
 
 
 def require(content: str, needle: str, context: str) -> None:
@@ -41,7 +42,13 @@ def main() -> None:
     readme = README.read_text(encoding="utf-8")
     ci_workflow = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
     installer_callback = INSTALLER_CALLBACK.read_text(encoding="utf-8")
+    update_trust = UPDATE_TRUST.read_text(encoding="utf-8")
     docker_workflow = (WORKFLOWS / "docker.yml").read_text(encoding="utf-8")
+    if "KIN_CI_BOT_TOKEN" in release or "bump_homebrew:" in release:
+        raise AssertionError(
+            "release.yml must not use a long-lived PAT or wait on cross-repo "
+            "follow-ups before the completed-release callback can run"
+        )
     if "workflow_dispatch:" in release:
         raise AssertionError(
             "release.yml must not expose branch-selectable workflow_dispatch"
@@ -115,14 +122,14 @@ def main() -> None:
         "types: [completed]",
         "actions: read",
         "contents: read",
-        "vars.INSTALLER_DISPATCH_READY == 'true'",
+        "vars.RELEASE_FOLLOWUP_READY == 'true'",
         "github.event.workflow_run.status == 'completed'",
         "github.event.workflow_run.conclusion == 'success'",
         "github.event.workflow_run.event == 'push'",
         "startsWith(github.event.workflow_run.head_branch, 'v')",
         "!contains(github.event.workflow_run.head_branch, '-')",
-        "environment: installer-dispatch",
-        "timeout-minutes: 15",
+        "environment: release-followups",
+        "timeout-minutes: 30",
         "SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}",
         "KIN_TAG: ${{ github.event.workflow_run.head_branch }}",
         "KIN_SHA: ${{ github.event.workflow_run.head_sha }}",
@@ -135,11 +142,18 @@ def main() -> None:
         'gh api "repos/${GITHUB_REPOSITORY}/releases/latest"',
         "ref: ${{ env.KIN_SHA }}",
         "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
-        "secrets.KIN_INSTALLER_APP_ID",
-        "secrets.KIN_INSTALLER_APP_PRIVATE_KEY",
-        "repositories: kin-infra",
+        "secrets.KIN_RELEASE_APP_ID",
+        "secrets.KIN_RELEASE_APP_PRIVATE_KEY",
+        "repositories: |",
+        "homebrew-kin",
+        "kin-infra",
         "permission-actions: read",
         "permission-contents: write",
+        'event_type:"kin-release"',
+        "https://api.github.com/repos/firelock-ai/homebrew-kin/dispatches",
+        "Update formula ${KIN_TAG} from Kin run ${SOURCE_RUN_ID}",
+        "actions/workflows/update-formula.yml/runs?event=repository_dispatch",
+        'bash scripts/verify-homebrew-formula.sh "$KIN_TAG"',
         'event_type:"publish-install"',
         "schema_version:1",
         "release_workflow_run_id:$run_id",
@@ -150,7 +164,17 @@ def main() -> None:
         "the workflow may still be disabled",
         'python3 scripts/verify_installer_parity.py "$KIN_TAG" --expected-sha "$KIN_SHA"',
     ):
-        require(installer_callback, policy, "completed-release installer callback")
+        require(installer_callback, policy, "completed-release follow-up callback")
+
+    for policy in (
+        "`firelock-ai/homebrew-kin` and `firelock-ai/kin-infra`",
+        "`KIN_RELEASE_APP_ID`",
+        "`KIN_RELEASE_APP_PRIVATE_KEY`",
+        "`RELEASE_FOLLOWUP_READY`",
+        "Contents write permission",
+        "Actions read",
+    ):
+        require(update_trust, policy, "release follow-up trust documentation")
 
     callback_admission_start = installer_callback.index("    if: >-")
     callback_admission_end = installer_callback.index(
@@ -444,11 +468,6 @@ def main() -> None:
             "needs.smoke_npm_published.result == 'success'",
         ),
         "publish_boundary_contracts": (
-            "needs.publish.result == 'success'",
-            "needs.install_proof.result == 'success'",
-            "needs.finalize_release.result == 'success'",
-        ),
-        "bump_homebrew": (
             "needs.publish.result == 'success'",
             "needs.install_proof.result == 'success'",
             "needs.finalize_release.result == 'success'",
