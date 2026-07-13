@@ -746,7 +746,10 @@ fn collect_files_recursive(
             }
             collect_files_recursive(root, &path, files)?;
         } else if path.is_file() {
-            files.push(path);
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            if kin_index::should_index_repo_relative_path(rel) {
+                files.push(path);
+            }
         }
     }
 
@@ -850,6 +853,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
         std::fs::create_dir_all(root.join(".kin/internal")).unwrap();
         std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        std::fs::create_dir_all(root.join(".agents")).unwrap();
 
         std::fs::write(root.join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
         std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
@@ -857,6 +861,12 @@ mod tests {
         std::fs::write(root.join(".github/workflows/ci.yml"), "name: ci\n").unwrap();
         std::fs::write(root.join(".kin/internal/state.json"), "{}\n").unwrap();
         std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            root.join(".agents/mcp_config.json"),
+            "{\"mcpServers\":{}}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join(".agents/instructions.md"), "# Keep\n").unwrap();
 
         let files = collect_all_files(root).unwrap();
         let collected: std::collections::HashSet<String> = files
@@ -873,8 +883,10 @@ mod tests {
         assert!(collected.contains(".dockerignore"));
         assert!(collected.contains(".github/workflows/ci.yml"));
         assert!(collected.contains("src/lib.rs"));
+        assert!(collected.contains(".agents/instructions.md"));
         assert!(!collected.contains(".kin/internal/state.json"));
         assert!(!collected.contains(".git/HEAD"));
+        assert!(!collected.contains(".agents/mcp_config.json"));
     }
 
     #[test]

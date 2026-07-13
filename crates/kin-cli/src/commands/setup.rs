@@ -755,30 +755,35 @@ fn prompt_yn(prompt: &str, default_yes: bool, interactive: bool) -> bool {
 
 /// The MCP server entry we inject for Kin.
 ///
-/// Prefers an absolute path to the `kin` binary (resolved from the current
-/// executable) so the entry works in agent processes that do not inherit the
-/// user's PATH.
+/// Prefers the managed launcher and then the PATH-visible launcher so upgrades
+/// do not strand client configs on a versioned Cellar or build-directory path.
+/// The running executable is only a fallback when no stable launcher exists.
 ///
 /// The entry starts the MCP server in single-repo mode. Most clients launch it
 /// from the active workspace, so `kin mcp start` resolves that working
-/// directory (or `KIN_DAEMON_URL` when a session pinned one). Global client
-/// entries deliberately stay cwd-free; only a client-supported workspace
-/// config may pin its own repository root.
+/// directory (or `KIN_DAEMON_URL` when a session pinned one). New global client
+/// entries are cwd-free, while an existing cwd is preserved as user-owned
+/// launch policy. A client-supported workspace config may pin its repository.
 fn kin_mcp_entry() -> serde_json::Value {
     kin_mcp_entry_with_cwd(None)
 }
 
 fn kin_mcp_entry_with_cwd(cwd: Option<&Path>) -> serde_json::Value {
-    // Try to resolve an absolute path from the running executable.  The
-    // installed binary lives alongside the other kin-* binaries, so
-    // current_exe() gives us the right directory.
-    let command = if let Ok(exe) = env::current_exe() {
-        // current_exe may be e.g. /Users/foo/.cargo/bin/kin — use it directly.
-        exe.to_string_lossy().into_owned()
-    } else {
-        // Fallback: bare name relying on PATH (previous behaviour).
-        "kin".to_string()
-    };
+    kin_mcp_entry_for_command(preferred_kin_mcp_launcher(), cwd)
+}
+
+pub(crate) fn preferred_kin_mcp_launcher() -> String {
+    let managed = kin_dir()
+        .ok()
+        .map(|home| home.join("bin").join(kin_launcher_filename()));
+    select_kin_mcp_launcher(
+        managed,
+        check_binary_in_path("kin"),
+        env::current_exe().ok(),
+    )
+}
+
+fn kin_mcp_entry_for_command(command: String, cwd: Option<&Path>) -> serde_json::Value {
     let mut entry = serde_json::json!({
         "command": command,
         "args": ["mcp", "start"],
@@ -788,6 +793,54 @@ fn kin_mcp_entry_with_cwd(cwd: Option<&Path>) -> serde_json::Value {
         entry["cwd"] = serde_json::Value::String(cwd.to_string_lossy().into_owned());
     }
     entry
+}
+
+fn kin_launcher_filename() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "kin.exe"
+    } else {
+        "kin"
+    }
+}
+
+fn is_usable_kin_launcher(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn select_kin_mcp_launcher(
+    managed: Option<PathBuf>,
+    path_launcher: Option<PathBuf>,
+    current_exe: Option<PathBuf>,
+) -> String {
+    let current_dir = env::current_dir().ok();
+    managed
+        .into_iter()
+        .chain(path_launcher)
+        .chain(current_exe)
+        .filter_map(|candidate| {
+            if candidate.is_absolute() {
+                Some(candidate)
+            } else {
+                current_dir.as_ref().map(|cwd| cwd.join(candidate))
+            }
+        })
+        .find(|candidate| is_usable_kin_launcher(candidate))
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "kin".to_string())
 }
 
 /// Describes an AI assistant we can auto-configure.
@@ -942,6 +995,85 @@ fn merge_mcp_config_with_cwd(path: &PathBuf, cwd: &Path) -> Result<()> {
     merge_mcp_config_entry(path, kin_mcp_entry_with_cwd(Some(cwd)))
 }
 
+/// Atomically replace setup-managed state while retaining the permissions of
+/// an existing file. A symlinked path keeps the symlink and replaces its target
+/// instead of silently turning the symlink into a regular file.
+fn write_config_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_config_atomically_with(path, bytes, |temp, destination| {
+        temp.persist(destination)
+            .map(|_| ())
+            .map_err(|error| error.error)
+    })
+}
+
+fn write_config_atomically_with(
+    path: &Path,
+    bytes: &[u8],
+    persist: impl FnOnce(tempfile::NamedTempFile, &Path) -> io::Result<()>,
+) -> Result<()> {
+    let destination = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            path.canonicalize().with_context(|| {
+                format!(
+                    "client config symlink {} does not resolve to a writable file",
+                    path.display()
+                )
+            })?
+        }
+        Ok(_) => path.to_path_buf(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => path.to_path_buf(),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect client config {}", path.display()))
+        }
+    };
+    let parent = destination
+        .parent()
+        .context("client config path has no parent directory")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create directory {}", parent.display()))?;
+
+    let existing_permissions = match fs::metadata(&destination) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read permissions for client config {}",
+                    destination.display()
+                )
+            })
+        }
+    };
+
+    let mut temp = tempfile::Builder::new()
+        .prefix(kin_index::REPO_LOCAL_MCP_CONFIG_TEMP_PREFIX)
+        .tempfile_in(parent)
+        .with_context(|| format!("failed to stage client config in {}", parent.display()))?;
+    temp.write_all(bytes)
+        .with_context(|| format!("failed to stage client config {}", destination.display()))?;
+    temp.as_file_mut()
+        .sync_all()
+        .with_context(|| format!("failed to sync client config {}", destination.display()))?;
+    if let Some(permissions) = existing_permissions {
+        temp.as_file()
+            .set_permissions(permissions)
+            .with_context(|| {
+                format!(
+                    "failed to preserve permissions for client config {}",
+                    destination.display()
+                )
+            })?;
+    }
+
+    persist(temp, &destination).with_context(|| {
+        format!(
+            "failed to atomically replace client config {}",
+            destination.display()
+        )
+    })
+}
+
 fn merge_mcp_config_entry(path: &PathBuf, kin_entry: serde_json::Value) -> Result<()> {
     let mut root: serde_json::Value = if path.exists() {
         let content = fs::read_to_string(path)
@@ -995,6 +1127,7 @@ fn merge_mcp_config_entry(path: &PathBuf, kin_entry: serde_json::Value) -> Resul
             path.display()
         );
     }
+    let kin_entry_preexisted = servers.contains_key("kin");
     let existing = servers
         .entry("kin".to_string())
         .or_insert_with(|| serde_json::json!({}));
@@ -1014,9 +1147,11 @@ fn merge_mcp_config_entry(path: &PathBuf, kin_entry: serde_json::Value) -> Resul
         Some(value) => {
             existing.insert("cwd".to_string(), value.clone());
         }
+        // A cwd on a pre-existing entry is user-owned policy unless ownership
+        // can be proven. This merge has no such proof, so preserve it. Newly
+        // created global entries start without cwd.
+        None if kin_entry_preexisted => {}
         None => {
-            // A cwd in the global entry is an unsafe last-writer-wins repo pin.
-            // Workspace-local Antigravity entries explicitly supply one.
             existing.remove("cwd");
         }
     }
@@ -1052,7 +1187,7 @@ fn merge_mcp_config_entry(path: &PathBuf, kin_entry: serde_json::Value) -> Resul
     }
     let formatted =
         serde_json::to_string_pretty(&root).context("failed to serialize MCP config")?;
-    fs::write(path, formatted).with_context(|| format!("failed to write {}", path.display()))?;
+    write_config_atomically(path, formatted.as_bytes())?;
 
     Ok(())
 }
@@ -1139,7 +1274,9 @@ fn merge_mcp_config_toml(path: &PathBuf, cwd: Option<&Path>) -> Result<()> {
     let kin_servers = doc["mcp_servers"]
         .as_table_mut()
         .expect("mcp_servers was normalized to a table");
-    let kin_table = match kin_servers.remove("kin") {
+    let existing_kin = kin_servers.remove("kin");
+    let kin_entry_preexisted = existing_kin.is_some();
+    let kin_table = match existing_kin {
         Some(item) => match item.into_table() {
             Ok(table) => table,
             Err(item) => match item.into_value() {
@@ -1163,9 +1300,9 @@ fn merge_mcp_config_toml(path: &PathBuf, cwd: Option<&Path>) -> Result<()> {
     kin.insert("args", value(args));
     if let Some(cwd) = cwd {
         kin.insert("cwd", value(cwd.to_string_lossy().into_owned()));
-    } else {
-        // Global Codex config must resolve from the active workspace. A static
-        // cwd silently sends every other workspace to the wrong Kin daemon.
+    } else if !kin_entry_preexisted {
+        // New global entries inherit the client launch directory. Preserve cwd
+        // on a pre-existing entry as user-owned launch policy.
         kin.remove("cwd");
     }
     match kin.get_mut("env") {
@@ -1190,8 +1327,7 @@ fn merge_mcp_config_toml(path: &PathBuf, cwd: Option<&Path>) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
-    fs::write(path, doc.to_string())
-        .with_context(|| format!("failed to write {}", path.display()))?;
+    write_config_atomically(path, doc.to_string().as_bytes())?;
 
     Ok(())
 }
@@ -1201,9 +1337,9 @@ fn merge_mcp_config_toml(path: &PathBuf, cwd: Option<&Path>) -> Result<()> {
 /// Codex reads MCP servers from `~/.codex/config.toml` (`[mcp_servers.<name>]`
 /// tables with `command`/`args`/`env`), not from an `mcp.json` file. Codex
 /// 0.144.1 does not reliably load project-local MCP tables, so Kin keeps one
-/// safe global entry with no static cwd. The MCP process therefore resolves the
-/// active launch directory; ambiguous non-repo umbrella launches fail loud and
-/// can opt into `KIN_MCP_REPO` rather than silently querying the wrong graph.
+/// global entry. New entries omit cwd and resolve the active launch directory;
+/// existing cwd policy is preserved so umbrella-launched clients can remain
+/// explicitly bound to their intended repository.
 fn configure_codex() -> Result<PathBuf> {
     let home = home_dir()?;
     configure_codex_at(&home)
@@ -1221,7 +1357,7 @@ fn configure_codex_at(home: &Path) -> Result<PathBuf> {
 /// global MCP file at `~/.gemini/config/mcp_config.json`, while current clients
 /// also load `.agents/mcp_config.json` from the active workspace. Kin writes a
 /// cwd-free global fallback and, when setup runs in a Kin repo, a repo-scoped
-/// workspace entry. This avoids a global last-writer-wins repository pin.
+/// workspace entry. A pre-existing global cwd is preserved as user policy.
 /// Existing retired Gemini CLI settings remain a compatibility target but are
 /// never created for a new install.
 fn configure_antigravity_at(home: &Path, repo_root: Option<&Path>) -> AssistantConfigOutcome {
@@ -1230,8 +1366,10 @@ fn configure_antigravity_at(home: &Path, repo_root: Option<&Path>) -> AssistantC
     outcome.attempt("antigravity", primary, |path| merge_mcp_config(path));
 
     if let Some(repo_root) = repo_root {
-        let workspace = repo_root.join(".agents").join("mcp_config.json");
+        let workspace = repo_root.join(kin_index::REPO_LOCAL_MCP_CONFIG_PATH);
         outcome.attempt("antigravity_workspace", workspace, |path| {
+            validate_workspace_mcp_destination(repo_root, path)?;
+            ensure_workspace_mcp_git_excluded(repo_root)?;
             merge_mcp_config_with_cwd(path, repo_root)
         });
     }
@@ -1552,9 +1690,9 @@ fn remerge_mcp_config_paths(
     let mut repaired = Vec::new();
     for (id, _label, path) in configs {
         // Detected clients with no config are real missing setup artifacts.
-        // Global Codex/Antigravity entries are cwd-free and safe to create from
-        // any directory. The workspace Antigravity target additionally needs a
-        // discovered Kin repository.
+        // New global Codex/Antigravity entries are cwd-free and safe to create
+        // from any directory; existing cwd policy is preserved. The workspace
+        // Antigravity target additionally needs a discovered Kin repository.
         let detected_client = (matches!(id, "antigravity" | "antigravity_workspace")
             && antigravity_detected)
             || (id == "codex" && codex_detected);
@@ -1652,7 +1790,9 @@ fn auto_configure_repo_clients_for_init_with_state(
     let repo_root = absolute_repo_root
         .canonicalize()
         .unwrap_or(absolute_repo_root);
-    let path = repo_root.join(".agents").join("mcp_config.json");
+    let path = repo_root.join(kin_index::REPO_LOCAL_MCP_CONFIG_PATH);
+    validate_workspace_mcp_destination(&repo_root, &path)?;
+    ensure_workspace_mcp_git_excluded(&repo_root)?;
     merge_mcp_config_with_cwd(&path, &repo_root)?;
     if let Err(error) = record_mcp_targets_in_ledger(&[("antigravity_workspace", path.clone())]) {
         tracing::warn!(%error, "repo-scoped MCP config succeeded but ledger update failed");
@@ -1661,6 +1801,135 @@ fn auto_configure_repo_clients_for_init_with_state(
         );
     }
     Ok(vec![path])
+}
+
+const WORKSPACE_MCP_GIT_EXCLUDE_PATTERNS: &[&str] =
+    &["/.agents/mcp_config.json", "/.agents/.kin-mcp-config-*"];
+
+fn validate_workspace_mcp_destination(repo_root: &Path, path: &Path) -> Result<()> {
+    let canonical_repo = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+
+    if let Some(parent) = path.parent() {
+        if let Ok(canonical_parent) = parent.canonicalize() {
+            if let Ok(relative_parent) = canonical_parent.strip_prefix(&canonical_repo) {
+                if relative_parent != Path::new(".agents") {
+                    anyhow::bail!(
+                        "workspace MCP config parent {} resolves to graph-admissible repo path {}; replace the in-repo symlink before setup",
+                        parent.display(),
+                        relative_parent.display()
+                    );
+                }
+            }
+        }
+    }
+
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        let target = path.canonicalize().with_context(|| {
+            format!(
+                "workspace MCP config symlink {} does not resolve",
+                path.display()
+            )
+        })?;
+        if let Ok(relative_target) = target.strip_prefix(&canonical_repo) {
+            if kin_index::should_index_repo_relative_path(relative_target) {
+                anyhow::bail!(
+                    "workspace MCP config {} resolves to graph-admissible repo path {}; use a checkout-local or external target",
+                    path.display(),
+                    relative_target.display()
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_workspace_mcp_git_excluded(repo_root: &Path) -> Result<Option<PathBuf>> {
+    let dot_git = repo_root.join(".git");
+    let metadata = match fs::metadata(&dot_git) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", dot_git.display()))
+        }
+    };
+
+    let git_dir = if metadata.is_dir() {
+        dot_git
+    } else if metadata.is_file() {
+        let pointer = fs::read_to_string(&dot_git).with_context(|| {
+            format!("failed to read Git directory pointer {}", dot_git.display())
+        })?;
+        let target = pointer
+            .trim()
+            .strip_prefix("gitdir:")
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+            .with_context(|| format!("invalid Git directory pointer {}", dot_git.display()))?;
+        let target = PathBuf::from(target);
+        if target.is_absolute() {
+            target
+        } else {
+            repo_root.join(target)
+        }
+    } else {
+        return Ok(None);
+    };
+
+    let common_dir_pointer = git_dir.join("commondir");
+    let common_dir = match fs::read_to_string(&common_dir_pointer) {
+        Ok(pointer) => {
+            let target = PathBuf::from(pointer.trim());
+            if target.is_absolute() {
+                target
+            } else {
+                git_dir.join(target)
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => git_dir,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read Git common-directory pointer {}",
+                    common_dir_pointer.display()
+                )
+            })
+        }
+    };
+
+    let exclude = common_dir.join("info").join("exclude");
+    let content = match fs::read_to_string(&exclude) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read Git exclude {}", exclude.display()))
+        }
+    };
+    // Git applies the last matching rule. Remove only Kin's exact positive
+    // rules, preserve every user-authored byte, then append ours at EOF so a
+    // preceding negation cannot expose checkout-local state.
+    let mut updated: String = content
+        .split_inclusive('\n')
+        .filter(|line| {
+            let trimmed = line.trim();
+            !WORKSPACE_MCP_GIT_EXCLUDE_PATTERNS.contains(&trimmed)
+                && trimmed != kin_index::REPO_LOCAL_MCP_CONFIG_PATH
+        })
+        .collect();
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    for pattern in WORKSPACE_MCP_GIT_EXCLUDE_PATTERNS {
+        updated.push_str(pattern);
+        updated.push('\n');
+    }
+    if updated != content {
+        write_config_atomically(&exclude, updated.as_bytes())?;
+    }
+    Ok(Some(exclude))
 }
 
 // ---------------------------------------------------------------------------
@@ -2740,6 +3009,82 @@ mod tests {
         }
     }
 
+    fn write_executable(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"launcher").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[test]
+    fn mcp_launcher_prefers_managed_path_over_versioned_current_exe() {
+        let dir = tempfile::tempdir().unwrap();
+        let managed = dir.path().join("home/.kin/bin/kin");
+        let path_launcher = dir.path().join("opt/homebrew/bin/kin");
+        let cellar_current = dir.path().join("opt/homebrew/Cellar/kin/0.2.21/bin/kin");
+        for path in [&managed, &path_launcher, &cellar_current] {
+            write_executable(path);
+        }
+
+        let command = select_kin_mcp_launcher(
+            Some(managed.clone()),
+            Some(path_launcher),
+            Some(cellar_current.clone()),
+        );
+        let entry = kin_mcp_entry_for_command(command, None);
+
+        assert_eq!(entry["command"], managed.to_string_lossy().as_ref());
+        assert_ne!(entry["command"], cellar_current.to_string_lossy().as_ref());
+        assert!(Path::new(entry["command"].as_str().unwrap()).is_absolute());
+    }
+
+    #[test]
+    fn mcp_launcher_prefers_path_launcher_over_target_current_exe() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_managed = dir.path().join("home/.kin/bin/kin");
+        let path_launcher = dir.path().join("opt/homebrew/bin/kin");
+        let target_current = dir.path().join("checkout/target/release/kin");
+        for path in [&path_launcher, &target_current] {
+            write_executable(path);
+        }
+
+        let command = select_kin_mcp_launcher(
+            Some(missing_managed),
+            Some(path_launcher.clone()),
+            Some(target_current.clone()),
+        );
+        let entry = kin_mcp_entry_for_command(command, None);
+
+        assert_eq!(entry["command"], path_launcher.to_string_lossy().as_ref());
+        assert_ne!(entry["command"], target_current.to_string_lossy().as_ref());
+        assert!(Path::new(entry["command"].as_str().unwrap()).is_absolute());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_launcher_keeps_stable_symlink_instead_of_cellar_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cellar_target = dir.path().join("opt/homebrew/Cellar/kin/0.2.21/bin/kin");
+        let stable_launcher = dir.path().join("opt/homebrew/bin/kin");
+        write_executable(&cellar_target);
+        fs::create_dir_all(stable_launcher.parent().unwrap()).unwrap();
+        symlink(&cellar_target, &stable_launcher).unwrap();
+
+        let command = select_kin_mcp_launcher(
+            None,
+            Some(stable_launcher.clone()),
+            Some(cellar_target.clone()),
+        );
+
+        assert_eq!(command, stable_launcher.to_string_lossy());
+        assert_ne!(command, cellar_target.to_string_lossy());
+    }
+
     #[test]
     fn is_usable_shim_requires_a_nonempty_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3117,7 +3462,7 @@ mod tests {
         );
         assert_eq!(kin["args"], serde_json::json!(["mcp", "start"]));
         assert_eq!(kin["env"]["KIN_MCP_TOOL_PROFILE"], "agent-default");
-        assert!(kin.get("cwd").is_none());
+        assert_eq!(kin["cwd"], "/stale/repo");
         assert_eq!(kin["disabled"], true);
         assert_eq!(kin["disabledTools"], serde_json::json!(["semantic_locate"]));
         assert_eq!(kin["futurePolicy"], "keep");
@@ -3155,6 +3500,108 @@ mod tests {
         assert!(root["mcpServers"]["kin"].get("cwd").is_none());
         assert!(!home.join(".gemini").join("settings.json").exists());
         assert!(!repo.join(".agents").join("mcp_config.json").exists());
+    }
+
+    #[test]
+    fn workspace_mcp_git_exclude_uses_common_dir_and_is_idempotent() {
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        let linked = tmp.path().join("linked");
+
+        let run_git = |cwd: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        fs::create_dir_all(&main).unwrap();
+        run_git(&main, &["init"]);
+        run_git(&main, &["config", "user.email", "kin-tests@example.com"]);
+        run_git(&main, &["config", "user.name", "Kin Tests"]);
+        fs::write(main.join("README.md"), "seed\n").unwrap();
+        run_git(&main, &["add", "README.md"]);
+        run_git(&main, &["commit", "-m", "seed"]);
+
+        let output = Command::new("git")
+            .args(["worktree", "add", "--detach"])
+            .arg(&linked)
+            .current_dir(&main)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let common_exclude = main.join(".git/info/exclude");
+        let mut original = fs::read_to_string(&common_exclude).unwrap_or_default();
+        original.push_str("\nkeep.local\n!/.agents/mcp_config.json\n!/.agents/*\n");
+        fs::write(&common_exclude, &original).unwrap();
+
+        let first = ensure_workspace_mcp_git_excluded(&linked)
+            .unwrap()
+            .expect("linked worktree should resolve a Git exclude");
+        let second = ensure_workspace_mcp_git_excluded(&linked).unwrap().unwrap();
+        assert_eq!(first, second);
+
+        fs::create_dir_all(linked.join(".agents")).unwrap();
+        fs::write(linked.join(kin_index::REPO_LOCAL_MCP_CONFIG_PATH), "{}").unwrap();
+        let check = Command::new("git")
+            .args(["check-ignore", "-q", "--"])
+            .arg(kin_index::REPO_LOCAL_MCP_CONFIG_PATH)
+            .current_dir(&linked)
+            .status()
+            .unwrap();
+        assert!(check.success(), "workspace MCP config is not Git-ignored");
+
+        let content = fs::read_to_string(common_exclude).unwrap();
+        assert!(content.contains("keep.local"));
+        for pattern in WORKSPACE_MCP_GIT_EXCLUDE_PATTERNS {
+            assert_eq!(
+                content
+                    .lines()
+                    .filter(|line| line.trim() == *pattern)
+                    .count(),
+                1
+            );
+        }
+        assert!(
+            content.rfind("/.agents/mcp_config.json").unwrap()
+                > content.rfind("!/.agents/mcp_config.json").unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_mcp_rejects_graph_admissible_in_repo_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(repo.join(".agents")).unwrap();
+        fs::create_dir_all(repo.join("config")).unwrap();
+        let target = repo.join("config/local-mcp.json");
+        fs::write(&target, "keep\n").unwrap();
+        symlink(&target, repo.join(kin_index::REPO_LOCAL_MCP_CONFIG_PATH)).unwrap();
+
+        let outcome = configure_antigravity_at(&home, Some(&repo));
+
+        assert!(outcome
+            .errors
+            .iter()
+            .any(|error| error.contains("graph-admissible repo path")));
+        assert_eq!(fs::read_to_string(target).unwrap(), "keep\n");
     }
 
     #[test]
@@ -3252,7 +3699,7 @@ mod tests {
     }
 
     #[test]
-    fn doctor_remerge_removes_static_repo_cwd_from_existing_codex_config() {
+    fn doctor_remerge_preserves_user_owned_cwd_in_existing_codex_config() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(".codex").join("config.toml");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -3274,7 +3721,10 @@ mod tests {
         assert_eq!(repaired, vec![path.clone()]);
         let root: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(root["model"].as_str(), Some("o3"));
-        assert!(root["mcp_servers"]["kin"].get("cwd").is_none());
+        assert_eq!(
+            root["mcp_servers"]["kin"]["cwd"].as_str(),
+            Some("/stale/repo")
+        );
     }
 
     #[test]
@@ -3333,6 +3783,49 @@ mod tests {
     }
 
     #[test]
+    fn atomic_config_failure_leaves_original_bytes_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let original = b"{\"keep\":true}\n";
+        fs::write(&path, original).unwrap();
+
+        let error = write_config_atomically_with(&path, b"replacement", |_temp, _destination| {
+            Err(io::Error::other("forced persist failure"))
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("atomically replace"));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let sibling_names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(sibling_names, vec![OsString::from("config.json")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn json_config_atomic_replace_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        fs::write(&path, r#"{"existingKey":true}"#).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        merge_mcp_config(&path).unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let root: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(root["mcpServers"]["kin"].is_object());
+    }
+
+    #[test]
     fn merge_mcp_config_toml_refuses_to_overwrite_corrupt_toml() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -3357,8 +3850,39 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn configure_codex_inherits_workspace_and_preserves_existing_config() {
+    fn toml_config_atomic_replace_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "model = \"o3\"\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        merge_mcp_config_toml(&path, None).unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let root: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(root["mcp_servers"]["kin"].is_table());
+        assert!(root["mcp_servers"]["kin"].get("cwd").is_none());
+    }
+
+    #[test]
+    fn new_global_codex_entry_omits_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let path = configure_codex_at(&home).unwrap();
+
+        let root: toml::Value = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert!(root["mcp_servers"]["kin"].get("cwd").is_none());
+    }
+
+    #[test]
+    fn configure_codex_preserves_existing_cwd_and_other_user_policy() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let path = home.join(".codex").join("config.toml");
@@ -3394,10 +3918,7 @@ mod tests {
             Some(2),
             "kin args must be [mcp, start]"
         );
-        assert!(
-            kin.get("cwd").is_none(),
-            "global Codex config must inherit the active workspace"
-        );
+        assert_eq!(kin["cwd"].as_str(), Some("/stale/repo"));
         assert_eq!(kin["disabled"].as_bool(), Some(true));
         assert_eq!(kin["future_policy"].as_str(), Some("keep"));
         assert_eq!(kin["env"]["KEEP_ME"].as_str(), Some("yes"));
@@ -3442,7 +3963,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_mcp_config_toml_preserves_inline_policy_while_removing_global_cwd() {
+    fn merge_mcp_config_toml_preserves_inline_cwd_and_other_user_policy() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(
@@ -3455,7 +3976,7 @@ mod tests {
 
         let root: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         let kin = &root["mcp_servers"]["kin"];
-        assert!(kin.get("cwd").is_none());
+        assert_eq!(kin["cwd"].as_str(), Some("/stale/repo"));
         assert_eq!(kin["disabled"].as_bool(), Some(true));
         assert_eq!(kin["future_policy"].as_str(), Some("keep"));
         assert_eq!(kin["env"]["KEEP_ME"].as_str(), Some("yes"));

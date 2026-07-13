@@ -12,8 +12,6 @@ use serde::Deserialize;
 
 use crate::commands::remote;
 
-const IGNORED_WORKTREE_DIRS: &[&str] = &[".git", ".git-export", ".kin"];
-
 #[derive(Debug, Clone)]
 pub(crate) struct NativeRepoSnapshot {
     pub default_branch: String,
@@ -160,13 +158,11 @@ fn collect_workspace_files_recursive(
         let file_type = entry.file_type()?;
         let relative = path.strip_prefix(workspace_root).unwrap_or(&path);
 
+        if !kin_index::should_index_repo_relative_path(relative) {
+            continue;
+        }
+
         if file_type.is_dir() {
-            if relative.components().count() == 1 {
-                let name = relative.to_string_lossy();
-                if IGNORED_WORKTREE_DIRS.contains(&name.as_ref()) {
-                    continue;
-                }
-            }
             collect_workspace_files_recursive(workspace_root, &path, collected)?;
             continue;
         }
@@ -457,4 +453,29 @@ pub(crate) fn apply_delta_to_working_tree(
     }
 
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_collection_excludes_local_mcp_config_but_keeps_agent_docs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".agents")).unwrap();
+        fs::write(root.join(".agents/mcp_config.json"), "{}").unwrap();
+        fs::write(root.join(".agents/instructions.md"), "# Keep\n").unwrap();
+        fs::write(root.join("src.rs"), "fn keep() {}\n").unwrap();
+
+        let files = collect_workspace_files(root).unwrap();
+        let relative: HashSet<_> = files
+            .iter()
+            .map(|path| path.strip_prefix(root).unwrap().to_path_buf())
+            .collect();
+
+        assert!(!relative.contains(Path::new(".agents/mcp_config.json")));
+        assert!(relative.contains(Path::new(".agents/instructions.md")));
+        assert!(relative.contains(Path::new("src.rs")));
+    }
 }

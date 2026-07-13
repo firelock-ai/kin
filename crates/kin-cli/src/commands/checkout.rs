@@ -188,27 +188,7 @@ fn collect_non_tree_files(
 }
 
 fn should_skip_checkout_clean(rel: &std::path::Path) -> bool {
-    const SKIP_DIRS: &[&str] = &[
-        ".kin",
-        ".git",
-        "node_modules",
-        "target",
-        "__pycache__",
-        ".next",
-        "dist",
-        "build",
-        "vendor",
-    ];
-
-    rel.components().any(|component| {
-        if let std::path::Component::Normal(name) = component {
-            SKIP_DIRS
-                .iter()
-                .any(|skip| name == std::ffi::OsStr::new(skip))
-        } else {
-            false
-        }
-    })
+    !kin_index::should_index_repo_relative_path(rel)
 }
 
 fn clean_empty_dirs(root: &std::path::Path, current: &std::path::Path) -> Result<bool> {
@@ -291,6 +271,12 @@ mod tests {
         assert!(!should_skip_checkout_clean(std::path::Path::new(
             "src/lib.rs"
         )));
+        assert!(should_skip_checkout_clean(std::path::Path::new(
+            ".agents/mcp_config.json"
+        )));
+        assert!(!should_skip_checkout_clean(std::path::Path::new(
+            ".agents/instructions.md"
+        )));
     }
 
     #[test]
@@ -300,10 +286,13 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join(".kin")).unwrap();
         std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::create_dir_all(root.join(".agents")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "tracked").unwrap();
         std::fs::write(root.join("src/old.rs"), "delete").unwrap();
         std::fs::write(root.join(".kin/state"), "keep").unwrap();
         std::fs::write(root.join("target/debug/app"), "keep").unwrap();
+        std::fs::write(root.join(".agents/mcp_config.json"), "keep").unwrap();
+        std::fs::write(root.join(".agents/instructions.md"), "delete").unwrap();
 
         let mut tree = std::collections::HashMap::new();
         tree.insert(
@@ -313,12 +302,19 @@ mod tests {
 
         let mut files = Vec::new();
         collect_non_tree_files(root, root, &tree, &mut files).unwrap();
-        let rels: Vec<_> = files
+        let mut rels: Vec<_> = files
             .iter()
             .map(|path| path.strip_prefix(root).unwrap().to_path_buf())
             .collect();
+        rels.sort();
 
-        assert_eq!(rels, vec![std::path::PathBuf::from("src/old.rs")]);
+        assert_eq!(
+            rels,
+            vec![
+                std::path::PathBuf::from(".agents/instructions.md"),
+                std::path::PathBuf::from("src/old.rs")
+            ]
+        );
     }
 
     #[test]

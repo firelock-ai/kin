@@ -269,11 +269,12 @@ kin locate "users can't reset their password" --explain
 
 If you chose the **AI agents** intent in step 2, `kin setup` wrote Kin's MCP server entry
 for every detected client that could be configured before repository initialization and
-added a Kin-first discovery reminder to your agent instruction files. When step 3 runs,
+added a Kin-first discovery reminder to your agent instruction files. When step 3 succeeds,
 `kin init` automatically completes Google Antigravity's repo-scoped
-`.agents/mcp_config.json` entry. No one-time doctor repair is required. Global Codex and
-Antigravity entries remain cwd-free so they inherit whichever workspace launched the
-client instead of pinning every future session to the last repository that ran setup.
+`.agents/mcp_config.json` entry. No one-time doctor repair is required. Newly
+created global entries omit `cwd` and inherit the client launch directory. Setup preserves a
+pre-existing `cwd` as user-owned policy, including an intentional Codex binding used by tasks
+launched from an umbrella directory.
 
 Open your agent in the Kin repository and ask it to use the semantic tools:
 
@@ -397,7 +398,7 @@ Config file locations the wizard targets (and `kin setup status` inspects):
 | Claude Code | `~/.claude.json` (falls back to `~/.claude/config.json`) |
 | Cursor | `~/.cursor/mcp.json` |
 | Codex CLI | `~/.codex/config.toml` (TOML — see below) |
-| Google Antigravity | `~/.gemini/config/mcp_config.json` (cwd-free global fallback) and `<repo>/.agents/mcp_config.json` (repo-scoped workspace entry) |
+| Google Antigravity | `~/.gemini/config/mcp_config.json` (new entries are cwd-free) and `<repo>/.agents/mcp_config.json` (repo-scoped workspace entry) |
 | Gemini CLI (legacy compatibility) | `~/.gemini/settings.json` (only refreshed when already present) |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` |
 
@@ -411,22 +412,27 @@ args = ["mcp", "start"]
 env = { KIN_MCP_TOOL_PROFILE = "agent-default" }
 ```
 
-The global Codex table deliberately has no `cwd`. Codex launches the stdio server from the
-active workspace, so one global entry works across repositories. Launching it from an
-umbrella directory that is not itself a Kin repository fails loudly instead of silently
-querying another repository; use `KIN_MCP_REPO` or `kin mcp start --repo <path>` when an
-explicit repository is required.
+Kin omits `cwd` when it creates the global Codex table, so Codex normally launches the stdio
+server from the active workspace. If a Kin entry already has `cwd`, setup and doctor preserve
+it as user-owned policy; this supports clients whose tasks launch from an umbrella directory.
+You can also bind explicitly with `KIN_MCP_REPO` or `kin mcp start --repo <path>`.
 
 Google Antigravity IDE and CLI share the canonical global MCP file
-at `~/.gemini/config/mcp_config.json`; Kin keeps that fallback cwd-free. Antigravity also
-supports the official workspace-local `.agents/mcp_config.json`, where Kin records the
+at `~/.gemini/config/mcp_config.json`; Kin creates that fallback without `cwd` and preserves
+an existing explicit `cwd`. Antigravity also supports the official workspace-local
+`.agents/mcp_config.json`, where Kin records the
 initialized repository root as `cwd`. `kin setup` writes both when run inside a repository,
-and an installer-first `kin init` creates the workspace entry automatically. Setup and doctor
-repairs merge only Kin-owned launcher fields, preserving client-owned fields such as
+and an installer-first `kin init` creates the workspace entry only after initialization
+succeeds. Setup and doctor repairs merge only Kin-owned launcher fields, preserving
+client-owned fields such as
 `disabled`, `disabledTools`, approval policy, and additional environment variables. Kin
 continues to inspect, repair, and ledger an existing retired Gemini CLI `settings.json`, but
 new setup runs do not create that legacy file. The generated workspace `cwd` is absolute and
-therefore checkout-local; rerun `kin setup` or `kin doctor --fix` after moving the repository.
+therefore checkout-local; Kin excludes this exact config from graph indexing. Rerun
+`kin setup` or `kin doctor --fix` after moving the repository. Config replacement is atomic,
+retains existing file permissions, and adds the generated file to Git's local exclude for that
+checkout. Health checks flag stale Cellar, build-directory, or bare launchers when a stable
+managed/PATH path is available, so `kin doctor --fix` can repair them after upgrades.
 
 `kin mcp start` launches the MCP **stdio** server. You normally do not run this by hand —
 your AI client launches it as a subprocess via the config above. The server binds

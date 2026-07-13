@@ -879,7 +879,9 @@ fn collect_recursive(dir: &Path, root: &Path, files: &mut Vec<PathBuf>) -> Resul
             collect_recursive(&path, root, files)?;
         } else if path.is_file() {
             if let Ok(rel) = path.strip_prefix(root) {
-                files.push(rel.to_path_buf());
+                if kin_index::should_index_repo_relative_path(rel) {
+                    files.push(rel.to_path_buf());
+                }
             }
         }
     }
@@ -1330,6 +1332,20 @@ mod tests {
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0], PathBuf::from("src.rs"));
+    }
+
+    #[test]
+    fn collect_relative_files_excludes_local_mcp_config_but_keeps_agent_docs() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".agents")).unwrap();
+        fs::write(root.join(".agents/mcp_config.json"), "{}").unwrap();
+        fs::write(root.join(".agents/instructions.md"), "# Keep\n").unwrap();
+
+        let files = collect_relative_files(root).unwrap();
+
+        assert!(!files.contains(&PathBuf::from(".agents/mcp_config.json")));
+        assert!(files.contains(&PathBuf::from(".agents/instructions.md")));
     }
 
     // --- diff_directories tests ---

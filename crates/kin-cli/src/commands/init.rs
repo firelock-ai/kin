@@ -160,7 +160,10 @@ impl KinIgnore {
 /// trees (`node_modules`, `target`, …) are all pruned — not just the ones at the
 /// repo root.
 fn snapshot_entry_ignored(name: &str, rel: &Path, ignore: &KinIgnore) -> bool {
-    if kin_index::should_skip_dir(name) || name.starts_with(".kin") {
+    if kin_index::should_skip_dir(name)
+        || name.starts_with(".kin")
+        || !kin_index::should_index_repo_relative_path(rel)
+    {
         return true;
     }
     ignore.matches(rel, name)
@@ -931,22 +934,6 @@ pub async fn run(
     } else {
         false
     };
-    let auto_configured_mcp = match super::setup::auto_configure_repo_clients_for_init(&dir) {
-        Ok(paths) => paths,
-        Err(error) => {
-            warn!(error = %error, "failed to complete repo-scoped MCP setup during init");
-            eprintln!(
-                    "  warning: could not complete repo-scoped MCP setup: {error}\n  hint: run `kin setup doctor --fix` from this repository after init"
-                );
-            Vec::new()
-        }
-    };
-    for path in &auto_configured_mcp {
-        eprintln!(
-            "  Auto-configured repo-scoped MCP client ({})",
-            path.display()
-        );
-    }
     if is_git_repo && !json && !force {
         eprintln!(
             "Detected Git repository. Bootstrapping current state as semantic truth.\n\
@@ -1482,7 +1469,7 @@ pub async fn run(
             .to_string();
         registry.upsert(
             repo_id,
-            dir.canonicalize().unwrap_or(dir),
+            dir.canonicalize().unwrap_or_else(|_| dir.clone()),
             init_summary.total_entity_count,
         );
         let _ = registry.save();
@@ -1504,6 +1491,26 @@ pub async fn run(
         );
     } else if fresh_native_init {
         print_fresh_native_next_steps(&layout, agent_doc_bootstrapped);
+    }
+
+    // This is deliberately the last operation in a successful init. Writing
+    // checkout-local client state earlier could leave a workspace config after
+    // an init error or let its absolute cwd enter the frozen source snapshot.
+    let auto_configured_mcp = match super::setup::auto_configure_repo_clients_for_init(&dir) {
+        Ok(paths) => paths,
+        Err(error) => {
+            warn!(error = %error, "failed to complete repo-scoped MCP setup after init");
+            eprintln!(
+                    "  warning: could not complete repo-scoped MCP setup: {error}\n  hint: run `kin setup doctor --fix` from this repository"
+                );
+            Vec::new()
+        }
+    };
+    for path in &auto_configured_mcp {
+        eprintln!(
+            "  Auto-configured repo-scoped MCP client ({})",
+            path.display()
+        );
     }
 
     Ok(())
@@ -4921,7 +4928,10 @@ fn collect_source_files_recursive(root: &Path, dir: &Path, files: &mut Vec<PathB
             // VCS/internal skip to file entries so that pointer file — and any
             // other internal-named file (`.kin`, `.git-export`) — can never
             // become an indexed entity and leak a machine path into graph truth.
-            if kin_index::should_skip_dir(name_str.as_ref()) {
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            if kin_index::should_skip_dir(name_str.as_ref())
+                || !kin_index::should_index_repo_relative_path(rel)
+            {
                 continue;
             }
             files.push(path);
@@ -8277,6 +8287,14 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             }
             fs::write(path, content).unwrap();
         }
+        // Generated workspace MCP state is present on disk but intentionally
+        // absent from the expected repository-truth set below.
+        fs::create_dir_all(root.join(".agents")).unwrap();
+        fs::write(
+            root.join(".agents/mcp_config.json"),
+            r#"{"mcpServers":{"kin":{"cwd":"/machine/local/repo"}}}"#,
+        )
+        .unwrap();
 
         files
             .iter()
@@ -8503,6 +8521,34 @@ func prCheckout(cmd *cobra.Command, args []string) error {
     }
 
     #[test]
+    fn snapshot_excludes_checkout_local_mcp_config_but_keeps_agent_docs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".agents")).unwrap();
+        fs::write(
+            root.join(".agents/mcp_config.json"),
+            r#"{"mcpServers":{"kin":{"cwd":"/machine/local/repo"}}}"#,
+        )
+        .unwrap();
+        fs::write(root.join(".agents/instructions.md"), "# Agent rules\n").unwrap();
+        fs::write(root.join("src.rs"), "pub fn keep() {}\n").unwrap();
+
+        let (snapshot, manifest) = snapshot_repo(root, false).unwrap();
+
+        assert!(!snapshot.join(".agents/mcp_config.json").exists());
+        assert!(snapshot.join(".agents/instructions.md").exists());
+        assert!(snapshot.join("src.rs").exists());
+        assert_eq!(manifest["file_count"], 2);
+        let collected = collect_source_files(root).unwrap();
+        assert!(!collected
+            .iter()
+            .any(|path| path.ends_with(".agents/mcp_config.json")));
+        assert!(collected
+            .iter()
+            .any(|path| path.ends_with(".agents/instructions.md")));
+    }
+
+    #[test]
     fn snapshot_prunes_nested_vendored_git_and_kin_dirs() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -8652,6 +8698,11 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 "should keep {name}"
             );
         }
+        assert!(snapshot_entry_ignored(
+            "mcp_config.json",
+            Path::new(".agents/mcp_config.json"),
+            &ignore
+        ));
     }
 
     #[test]
@@ -10134,6 +10185,12 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             }
             fs::write(path, content).unwrap();
         }
+        fs::create_dir_all(root.join(".agents")).unwrap();
+        fs::write(
+            root.join(".agents/mcp_config.json"),
+            r#"{"mcpServers":{"kin":{"cwd":"/machine/local/repo"}}}"#,
+        )
+        .unwrap();
 
         let expected_paths: BTreeSet<String> =
             files.iter().map(|(p, _)| (*p).to_string()).collect();
@@ -10159,6 +10216,11 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         assert!(
             !rel_paths.contains("manifest.json"),
             "collect_source_files must not return manifest.json; got: {:?}",
+            rel_paths
+        );
+        assert!(
+            !rel_paths.contains(".agents/mcp_config.json"),
+            "checkout-local MCP config must not enter collection; got: {:?}",
             rel_paths
         );
         for path in &rel_paths {

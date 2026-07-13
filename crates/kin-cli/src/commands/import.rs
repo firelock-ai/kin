@@ -12,20 +12,6 @@ use kin_model::EntityStore;
 use kin_model::{AuthorId, FilePathId, Hash256, SemanticChange, SemanticChangeId, Timestamp};
 use sha2::{Digest, Sha256};
 
-/// Directories to skip during file collection.
-const SKIP_DIRS: &[&str] = &[
-    ".kin",
-    ".git",
-    ".git-export",
-    "node_modules",
-    "target",
-    "__pycache__",
-    ".next",
-    "dist",
-    "build",
-    "vendor",
-];
-
 /// Determine if the source is a remote URL (http/https/git@) or a local path.
 fn is_remote_url(source: &str) -> bool {
     source.starts_with("http://")
@@ -312,11 +298,11 @@ fn parse_and_index(
 /// Collect all source files, skipping common artifact directories.
 fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    collect_source_files_recursive(root, &mut files)?;
+    collect_source_files_recursive(root, root, &mut files)?;
     Ok(files)
 }
 
-fn collect_source_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_source_files_recursive(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return Ok(()),
@@ -325,14 +311,14 @@ fn collect_source_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Resul
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
+        let relative = path.strip_prefix(root).unwrap_or(&path);
+
+        if !kin_index::should_index_repo_relative_path(relative) {
+            continue;
+        }
 
         if path.is_dir() {
-            if SKIP_DIRS.contains(&name_str.as_ref()) {
-                continue;
-            }
-            collect_source_files_recursive(&path, files)?;
+            collect_source_files_recursive(root, &path, files)?;
         } else if path.is_file() {
             files.push(path);
         }
@@ -397,5 +383,23 @@ mod tests {
     fn derives_repo_name_from_local_path() {
         assert_eq!(derive_repo_name("/home/user/my-project"), "my-project");
         assert_eq!(derive_repo_name("./my-project"), "my-project");
+    }
+
+    #[test]
+    fn source_collection_excludes_local_mcp_config_but_keeps_agent_docs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".agents")).unwrap();
+        fs::write(root.join(".agents/mcp_config.json"), "{}").unwrap();
+        fs::write(root.join(".agents/instructions.md"), "# Keep\n").unwrap();
+
+        let files = collect_source_files(root).unwrap();
+        let relative: std::collections::HashSet<_> = files
+            .iter()
+            .map(|path| path.strip_prefix(root).unwrap().to_path_buf())
+            .collect();
+
+        assert!(!relative.contains(Path::new(".agents/mcp_config.json")));
+        assert!(relative.contains(Path::new(".agents/instructions.md")));
     }
 }

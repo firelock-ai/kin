@@ -664,19 +664,31 @@ pub(crate) fn mcp_client_config_paths() -> Vec<(&'static str, &'static str, Path
 /// JSON so the same checks apply.
 #[cfg(test)]
 pub(crate) fn evaluate_mcp_client(path: &PathBuf) -> (HealthStatus, String) {
-    evaluate_mcp_client_with_policy(path, McpCwdPolicy::Any)
+    evaluate_mcp_client_with_policy_and_launcher(path, McpCwdPolicy::Any, None)
 }
 
 #[derive(Debug, Clone)]
 enum McpCwdPolicy {
     Any,
-    InheritWorkspace,
     ExactRepo(PathBuf),
 }
 
 fn evaluate_mcp_client_with_policy(
     path: &PathBuf,
     cwd_policy: McpCwdPolicy,
+) -> (HealthStatus, String) {
+    let preferred_launcher = crate::commands::setup::preferred_kin_mcp_launcher();
+    evaluate_mcp_client_with_policy_and_launcher(
+        path,
+        cwd_policy,
+        Some(Path::new(&preferred_launcher)),
+    )
+}
+
+fn evaluate_mcp_client_with_policy_and_launcher(
+    path: &PathBuf,
+    cwd_policy: McpCwdPolicy,
+    preferred_launcher: Option<&Path>,
 ) -> (HealthStatus, String) {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
@@ -719,6 +731,76 @@ fn evaluate_mcp_client_with_policy(
             format!("no {servers_key}.kin entry in {}", path.display()),
         ),
         Some(entry) => {
+            let Some(command) = entry
+                .get("command")
+                .and_then(|value| value.as_str())
+                .filter(|command| !command.trim().is_empty())
+            else {
+                return (
+                    HealthStatus::Misconfigured,
+                    format!(
+                        "{servers_key}.kin has no launcher command in {}",
+                        path.display()
+                    ),
+                );
+            };
+            let command_path = Path::new(command);
+            if command_path.is_absolute() && !is_usable_mcp_launcher(command_path) {
+                return (
+                    HealthStatus::Misconfigured,
+                    format!(
+                        "{servers_key}.kin launcher {} is missing or not executable in {}",
+                        command_path.display(),
+                        path.display()
+                    ),
+                );
+            }
+            if !command_path.is_absolute() {
+                if let Some(preferred) = preferred_launcher {
+                    // The shared selector already tried the managed launcher
+                    // and the process PATH. A distinct absolute result proves
+                    // this relative command can be replaced with a stable path.
+                    if preferred.is_absolute() && is_usable_mcp_launcher(preferred) {
+                        return (
+                            HealthStatus::Misconfigured,
+                            format!(
+                                "{servers_key}.kin uses relative launcher {command}; stable launcher {} is available in {}",
+                                preferred.display(),
+                                path.display()
+                            ),
+                        );
+                    }
+                    if preferred != command_path {
+                        return (
+                            HealthStatus::Misconfigured,
+                            format!(
+                                "{servers_key}.kin relative launcher {command} does not resolve to the selected Kin launcher in {}",
+                                path.display()
+                            ),
+                        );
+                    }
+                }
+            }
+            if command_path.is_absolute()
+                && is_upgrade_fragile_mcp_launcher(command_path)
+                && preferred_launcher.is_some_and(|preferred| {
+                    preferred.is_absolute()
+                        && preferred != command_path
+                        && is_usable_mcp_launcher(preferred)
+                })
+            {
+                let preferred = preferred_launcher.expect("preferred launcher was checked above");
+                return (
+                    HealthStatus::Misconfigured,
+                    format!(
+                        "{servers_key}.kin pins upgrade-fragile launcher {}; stable launcher {} is available in {}",
+                        command_path.display(),
+                        preferred.display(),
+                        path.display()
+                    ),
+                );
+            }
+
             // Entries written by older releases pass `--global`, which the MCP
             // server refuses at startup — the agent sees a dead kin server.
             let has_retired_global_flag = entry
@@ -734,6 +816,25 @@ fn evaluate_mcp_client_with_policy(
                     ),
                 );
             }
+
+            let args_are_current = entry
+                .get("args")
+                .and_then(|args| args.as_array())
+                .is_some_and(|args| {
+                    args.len() == 2
+                        && args[0].as_str() == Some("mcp")
+                        && args[1].as_str() == Some("start")
+                });
+            if !args_are_current {
+                return (
+                    HealthStatus::Misconfigured,
+                    format!(
+                        "{servers_key}.kin launcher args are not `mcp start` in {}",
+                        path.display()
+                    ),
+                );
+            }
+
             let profile = entry
                 .get("env")
                 .and_then(|e| e.get("KIN_MCP_TOOL_PROFILE"))
@@ -741,17 +842,6 @@ fn evaluate_mcp_client_with_policy(
             if profile == Some("agent-default") {
                 match cwd_policy {
                     McpCwdPolicy::Any => {}
-                    McpCwdPolicy::InheritWorkspace => {
-                        if let Some(cwd) = entry.get("cwd").and_then(|value| value.as_str()) {
-                            return (
-                                HealthStatus::Misconfigured,
-                                format!(
-                                    "{servers_key}.kin globally pins cwd {cwd} in {}; global MCP entries must resolve from the active workspace",
-                                    path.display()
-                                ),
-                            );
-                        }
-                    }
                     McpCwdPolicy::ExactRepo(expected_repo) => {
                         let Some(cwd) = entry.get("cwd").and_then(|value| value.as_str()) else {
                             return (
@@ -799,6 +889,40 @@ fn evaluate_mcp_client_with_policy(
     }
 }
 
+fn is_usable_mcp_launcher(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn is_upgrade_fragile_mcp_launcher(path: &Path) -> bool {
+    let components: Vec<_> = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => {
+                Some(value.to_string_lossy().to_ascii_lowercase())
+            }
+            _ => None,
+        })
+        .collect();
+    components.iter().any(|component| component == "cellar")
+        || components
+            .windows(2)
+            .any(|pair| pair[0] == "target" && matches!(pair[1].as_str(), "debug" | "release"))
+}
+
 fn select_mcp_clients(
     configs: Vec<(&'static str, &'static str, PathBuf)>,
     antigravity_detected: bool,
@@ -842,10 +966,11 @@ fn check_mcp_clients() -> Vec<HealthCheck> {
                     .map(Path::to_path_buf)
                     .map(McpCwdPolicy::ExactRepo)
                     .unwrap_or(McpCwdPolicy::Any),
-                // Every other path above is a global client config. Static cwd
-                // there would make the last repository to run setup win for
-                // every future workspace.
-                _ => McpCwdPolicy::InheritWorkspace,
+                // Global cwd is legitimate user-owned launch policy (for
+                // example, a Codex client opened from an umbrella directory).
+                // Setup omits it only on newly created entries and preserves it
+                // when already present.
+                _ => McpCwdPolicy::Any,
             };
             let (status, detail) = evaluate_mcp_client_with_policy(&client.path, cwd_policy);
             let mut check = HealthCheck::new(
@@ -1162,6 +1287,16 @@ mod tests {
             .unwrap();
     }
 
+    fn write_executable(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_file(path, b"launcher");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
     /// The magic bytes a valid shim carries on the current platform.
     fn platform_object_magic() -> &'static [u8] {
         if cfg!(target_os = "macos") {
@@ -1475,7 +1610,7 @@ mod tests {
     }
 
     #[test]
-    fn global_antigravity_config_inherits_the_active_workspace() {
+    fn global_antigravity_config_without_cwd_is_healthy() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp_config.json");
         std::fs::write(
@@ -1494,12 +1629,88 @@ mod tests {
         .unwrap();
 
         let (status, detail) =
-            evaluate_mcp_client_with_policy(&path, McpCwdPolicy::InheritWorkspace);
+            evaluate_mcp_client_with_policy_and_launcher(&path, McpCwdPolicy::Any, None);
         assert!(matches!(status, HealthStatus::Healthy), "got: {detail}");
     }
 
     #[test]
-    fn global_antigravity_config_rejects_a_static_repo_cwd() {
+    fn json_mcp_config_with_cellar_launcher_is_repairable_when_stable_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join("Cellar/kin/0.2.21/bin/kin");
+        let stable = dir.path().join("bin/kin");
+        write_executable(&stale);
+        write_executable(&stable);
+        let path = dir.path().join("mcp_config.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "kin": {
+                        "command": stale,
+                        "args": ["mcp", "start"],
+                        "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (status, detail) =
+            evaluate_mcp_client_with_policy_and_launcher(&path, McpCwdPolicy::Any, Some(&stable));
+
+        assert!(matches!(status, HealthStatus::Misconfigured));
+        assert!(detail.contains("upgrade-fragile"), "got: {detail}");
+        assert!(detail.contains(&stable.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn bare_mcp_launcher_is_repairable_when_selector_found_stable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let stable = dir.path().join("bin/kin");
+        write_executable(&stable);
+        let path = dir.path().join("mcp_config.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"kin":{"command":"kin","args":["mcp","start"],"env":{"KIN_MCP_TOOL_PROFILE":"agent-default"}}}}"#,
+        )
+        .unwrap();
+
+        let (status, detail) =
+            evaluate_mcp_client_with_policy_and_launcher(&path, McpCwdPolicy::Any, Some(&stable));
+
+        assert!(matches!(status, HealthStatus::Misconfigured));
+        assert!(detail.contains("relative launcher"), "got: {detail}");
+        assert!(detail.contains(&stable.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn toml_mcp_config_with_target_launcher_is_repairable_when_stable_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join("checkout/target/release/kin");
+        let stable = dir.path().join("bin/kin");
+        write_executable(&stale);
+        write_executable(&stable);
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[mcp_servers.kin]\ncommand = {:?}\nargs = [\"mcp\", \"start\"]\nenv = {{ KIN_MCP_TOOL_PROFILE = \"agent-default\" }}\n",
+                stale.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let (status, detail) =
+            evaluate_mcp_client_with_policy_and_launcher(&path, McpCwdPolicy::Any, Some(&stable));
+
+        assert!(matches!(status, HealthStatus::Misconfigured));
+        assert!(detail.contains("upgrade-fragile"), "got: {detail}");
+        assert!(detail.contains(&stable.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn global_antigravity_config_accepts_user_owned_cwd() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(repo.join(".kin")).unwrap();
@@ -1521,9 +1732,8 @@ mod tests {
         .unwrap();
 
         let (status, detail) =
-            evaluate_mcp_client_with_policy(&path, McpCwdPolicy::InheritWorkspace);
-        assert!(matches!(status, HealthStatus::Misconfigured));
-        assert!(detail.contains("globally pins cwd"));
+            evaluate_mcp_client_with_policy_and_launcher(&path, McpCwdPolicy::Any, None);
+        assert!(matches!(status, HealthStatus::Healthy), "got: {detail}");
     }
 
     #[test]
@@ -1551,8 +1761,11 @@ mod tests {
         )
         .unwrap();
 
-        let (status, detail) =
-            evaluate_mcp_client_with_policy(&path, McpCwdPolicy::ExactRepo(expected_repo.clone()));
+        let (status, detail) = evaluate_mcp_client_with_policy_and_launcher(
+            &path,
+            McpCwdPolicy::ExactRepo(expected_repo.clone()),
+            None,
+        );
         assert!(matches!(status, HealthStatus::Misconfigured));
         assert!(detail.contains("does not match workspace Kin root"));
 
@@ -1562,8 +1775,11 @@ mod tests {
             serde_json::Value::String(expected_repo.to_string_lossy().into_owned());
         std::fs::write(&path, serde_json::to_string_pretty(&root).unwrap()).unwrap();
 
-        let (status, detail) =
-            evaluate_mcp_client_with_policy(&path, McpCwdPolicy::ExactRepo(expected_repo));
+        let (status, detail) = evaluate_mcp_client_with_policy_and_launcher(
+            &path,
+            McpCwdPolicy::ExactRepo(expected_repo),
+            None,
+        );
         assert!(matches!(status, HealthStatus::Healthy), "got: {detail}");
     }
 
@@ -1657,13 +1873,13 @@ mod tests {
         .unwrap();
 
         let (status, detail) =
-            evaluate_mcp_client_with_policy(&path, McpCwdPolicy::InheritWorkspace);
+            evaluate_mcp_client_with_policy_and_launcher(&path, McpCwdPolicy::Any, None);
         assert!(matches!(status, HealthStatus::Healthy), "got: {detail}");
         assert!(detail.contains("mcp_servers.kin"));
     }
 
     #[test]
-    fn global_codex_mcp_config_with_static_cwd_is_misconfigured() {
+    fn global_codex_mcp_config_with_user_owned_cwd_is_healthy() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(
@@ -1673,9 +1889,8 @@ mod tests {
         .unwrap();
 
         let (status, detail) =
-            evaluate_mcp_client_with_policy(&path, McpCwdPolicy::InheritWorkspace);
-        assert!(matches!(status, HealthStatus::Misconfigured));
-        assert!(detail.contains("globally pins cwd"));
+            evaluate_mcp_client_with_policy_and_launcher(&path, McpCwdPolicy::Any, None);
+        assert!(matches!(status, HealthStatus::Healthy), "got: {detail}");
     }
 
     #[test]

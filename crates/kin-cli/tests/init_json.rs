@@ -79,6 +79,37 @@ fn git_head(path: &Path) -> String {
         .to_string()
 }
 
+fn fake_antigravity_path(root: &Path) -> std::ffi::OsString {
+    let bin = root.join("fake-bin");
+    fs::create_dir_all(&bin).expect("create fake bin");
+    let executable = bin.join(if cfg!(target_os = "windows") {
+        "agy.exe"
+    } else {
+        "agy"
+    });
+    fs::write(&executable, b"fake antigravity launcher").expect("write fake agy");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("make fake agy executable");
+    }
+    let mut paths = vec![bin];
+    if let Some(current) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&current));
+    }
+    std::env::join_paths(paths).expect("join PATH")
+}
+
+fn enable_repo_client_autoconfig(kin_home: &Path) {
+    fs::create_dir_all(kin_home.join("config")).expect("create Kin config dir");
+    fs::write(
+        kin_home.join("config/setup.toml"),
+        "[daemon]\nauto_start = false\n\n[mcp]\nauto_configure_repo_clients = true\n",
+    )
+    .expect("write setup marker");
+}
+
 #[cfg(feature = "vector")]
 fn seed_cached_vectors(cache_graph_path: &Path) {
     let snapshot = kin_db::SnapshotManager::open(cache_graph_path).expect("open cache graph");
@@ -319,6 +350,91 @@ fn fresh_native_init_json_stays_machine_readable_and_bootstraps_docs() {
     assert!(!stdout.contains("kin with --session codex"));
     assert!(repo.join("AGENTS.md").exists());
     assert!(repo.join(".kin/assistant-sync.toml").exists());
+}
+
+#[test]
+fn successful_init_writes_workspace_mcp_only_after_graph_snapshot() {
+    let root = tempdir().expect("temp root");
+    let home_dir = root.path().join("home");
+    let kin_home = root.path().join("kin-home");
+    let repo = root.path().join("native-mcp");
+    fs::create_dir_all(&home_dir).expect("create home");
+    enable_repo_client_autoconfig(&kin_home);
+    let path = fake_antigravity_path(root.path());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kin"))
+        .arg("init")
+        .arg(&repo)
+        .args(["--git-history", "off"])
+        .env("HOME", &home_dir)
+        .env("KIN_HOME", &kin_home)
+        .env("PATH", path)
+        .output()
+        .expect("run init with MCP autoconfig");
+    assert!(
+        output.status.success(),
+        "init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let workspace_config = repo.join(".agents/mcp_config.json");
+    let config: Value = serde_json::from_slice(
+        &fs::read(&workspace_config).expect("post-init workspace MCP config"),
+    )
+    .expect("decode workspace MCP config");
+    assert_eq!(
+        config["mcpServers"]["kin"]["cwd"],
+        repo.canonicalize()
+            .expect("canonical repo")
+            .to_string_lossy()
+            .as_ref()
+    );
+
+    let layout = kin_core::KinLayout::discover(&repo).expect("discover initialized layout");
+    let snapshot =
+        kin_db::SnapshotManager::open(layout.kindb_snapshot_path()).expect("open graph snapshot");
+    let tracked = snapshot.graph().indexed_file_paths();
+    assert!(
+        !tracked.iter().any(|path| path == ".agents/mcp_config.json"),
+        "checkout-local config entered graph truth: {tracked:?}"
+    );
+}
+
+#[test]
+fn failed_init_does_not_leave_workspace_mcp_config() {
+    let root = tempdir().expect("temp root");
+    let home_dir = root.path().join("home");
+    let kin_home = root.path().join("kin-home");
+    let repo = root.path().join("oversized");
+    fs::create_dir_all(&home_dir).expect("create home");
+    fs::create_dir_all(&repo).expect("create repo");
+    fs::write(repo.join("one.rs"), "fn one() {}\n").expect("write first file");
+    fs::write(repo.join("two.rs"), "fn two() {}\n").expect("write second file");
+    enable_repo_client_autoconfig(&kin_home);
+    let path = fake_antigravity_path(root.path());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kin"))
+        .arg("init")
+        .arg(&repo)
+        .args(["--git-history", "off"])
+        .env("HOME", &home_dir)
+        .env("KIN_HOME", &kin_home)
+        .env("KIN_INIT_MAX_FILES", "1")
+        .env("PATH", path)
+        .output()
+        .expect("run intentionally failing init");
+
+    assert!(
+        !output.status.success(),
+        "oversized init unexpectedly succeeded: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !repo.join(".agents/mcp_config.json").exists(),
+        "failed init must not leave checkout-local MCP state"
+    );
 }
 
 #[test]

@@ -82,10 +82,10 @@ rustc-hash = "1.1"
 sysinfo = "0.39"
 toml = { workspace = true }
 toml_edit = "0.25"
+tempfile = { workspace = true }
 kin-spine = { version = "0.2.0", path = "../kin-spine" }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
 serial_test = { workspace = true }
 
