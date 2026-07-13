@@ -1,7 +1,7 @@
 {
   "name": "@kinlab/kin-mcp",
   "version": "0.2.21",
-  "description": "Start Kin's MCP server — the system of record for AI-written software — through an npm-friendly wrapper.",
+  "description": "Start Kin's MCP server, the system of record for AI-written software, through an npm-friendly wrapper.",
   "type": "module",
   "bin": {
     "kin-mcp": "./bin/kin-mcp.js"

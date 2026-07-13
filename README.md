@@ -10,8 +10,8 @@
 AI agents now generate code faster than teams can review it. The hard part is no longer
 writing a change. It is trusting one: knowing what it actually touches, whether it silently
 reverts an earlier fix, and how far its blast radius reaches before it merges. Git tracks
-lines and files, so it can't answer those questions directly. Kin is **the system of record
-for AI-written software**: it represents your codebase as a graph of entities and
+lines and files, so it can't answer those questions directly. Kin is **the semantic system of
+record for AI-written software**: it represents your codebase as a graph of entities and
 relations and reasons over that graph instead of over text diffs.
 
 ---
@@ -84,7 +84,7 @@ With `kin` on your PATH:
 
 ```sh
 kin setup                            # wire Kin's MCP tools into your AI agents
-                                     #   (detects Claude Code, Cursor, Codex, Gemini, Windsurf)
+                                     #   (detects Claude Code, Cursor, Codex, and Windsurf)
 kin init                             # new no-Git folders become Kin-native by default;
                                      # existing Git repos import recent history by default
 kin status                           # confirm the repo and graph are ready
@@ -92,46 +92,59 @@ kin overview                         # inspect indexed languages, entities, and 
 kin setup status                     # verify the local install and integrations
 ```
 
-Then use names and questions from your own repository. Replace the uppercase
-placeholders with an entity and base branch that exist in that repository:
+On the branch you want to review, run the flagship gate. Kin resolves refs against its imported
+graph, not live Git, so run `kin init` while that branch is checked out (which imports both the
+base and head commits into history), then pass explicit commit SHAs so the range always resolves:
 
 ```sh
-kin locate "where are webhook retries handled"  # find entities/files behind an issue
-kin refs ENTITY_NAME                            # show callers, imports, and references
-kin review shadow BASE_BRANCH..HEAD             # emit a report-only review verdict:
-                                     #   blast radius, repair context, audit evidence
+kin review shadow "$(git rev-parse main)..$(git rev-parse HEAD)"
 ```
 
-`kin init` builds the graph instantly without embeddings; `kin locate` and `kin search` still
-work over lexical and graph signals and tell you when the semantic signal is only partial. Run
-`kin embed` once to add the local vector index that powers full semantic search. `kin setup
-status` (or `kin doctor --fix`) verifies your setup end to end.
+This prints a report-only verdict (`PASS`, `NEEDS ATTENTION`, or `WOULD BLOCK`) with blast radius,
+repair context, and audit evidence. It never blocks a merge; it surfaces what a plain diff review
+misses, such as an AI-authored change that silently reverts an earlier fix.
+
+`kin setup` already exposed the same graph to your AI agents as MCP tools, so they pull typed,
+graph-native context directly. You can query it from the CLI too (replace the placeholder with a
+name from your own repository):
+
+```sh
+kin refs ENTITY_NAME                            # callers, imports, and references of an entity
+kin locate "where are webhook retries handled"  # graph-native, typed retrieval over the graph
+```
+
+`kin init` builds the graph without embeddings; `kin locate` and `kin search` run over lexical and
+graph signals and tell you when the semantic signal is only partial. Run `kin embed` once to add
+the local vector index that powers full semantic search. `kin setup status` (or `kin doctor
+--fix`) verifies your setup end to end.
 
 ---
 
 ## What you get
 
 **Report-only review: the shadow merge gate.** `kin review shadow <base>..<head>` evaluates a
-PR-shaped change and emits a report-only verdict: blast radius, repair context, and audit
-evidence. It never blocks and never mutates graph state, so you can run it in CI or locally as
-evidence. Because Kin tracks entities over time, the report surfaces what a text diff misses,
-for example, a change that silently reverts an earlier fix shows up as evidence instead of
-slipping through.
+PR-shaped change and emits a report-only verdict (`PASS`, `NEEDS ATTENTION`, or `WOULD BLOCK`) with
+blast radius, repair context, and audit evidence. It never blocks a merge and never mutates graph
+state, so you can run it in CI or locally as evidence. Because Kin tracks entities over time, the
+report surfaces what a text diff misses: a change that silently reverts an earlier fix shows up as
+evidence instead of slipping through.
+
+**MCP tools for agents.** Kin ships a built-in MCP server that hands your AI agent the same
+graph-native context (locate, refs, trace, and the review gate) as typed tools instead of raw file
+reads. `kin setup` auto-detects and configures Claude Code, Cursor, Codex, and Windsurf; other
+MCP-capable agents can be wired up manually. `kin mcp start` runs as a stdio server that the MCP
+client launches as a subprocess; for manual configuration use the canonical npm package (`npx -y
+@kinlab/kin`, which provisions the Kin CLI and daemon; `@kinlab/kin-mcp` remains as a compatibility
+wrapper), or read the [Advanced configuration](docs/quickstart.md#9-advanced-configuration) section
+of the quickstart. For the full tool surface, see [docs/mcp-tools.md](docs/mcp-tools.md).
 
 **Semantic locate, refs, and trace.** Ask for the entities behind an issue (`kin locate`), the
-upstream callers/importers/references of an entity (`kin refs`), or an entire call and
-data-flow chain in a single call (`kin trace`, `kin trace-data-flow`) instead of looping over
-file reads. Add embeddings (`kin embed`) for vector similarity in `kin locate` and
+upstream callers, importers, and references of an entity (`kin refs`), or an entire call and
+data-flow chain in a single call (`kin trace`, `kin trace-data-flow`) instead of looping over file
+reads. On our preregistered benchmark, retrieval quality is comparable to a lexical baseline at
+cost parity; the payoff is that results come back graph-native and typed (entities and relations,
+not line hits). Add embeddings (`kin embed`) for vector similarity in `kin locate` and
 `kin search --semantic`.
-
-**MCP tools for agents.** Kin ships a built-in MCP server that exposes these same operations as
-tools to any MCP-capable assistant (Claude Code, Cursor, Codex, Gemini, Windsurf). `kin setup`
-configures every detected client automatically. `kin mcp start` runs as a stdio server that the
-MCP client launches as a subprocess; for manual configuration use the canonical npm package
-(`npx -y @kinlab/kin`, which provisions the Kin CLI and daemon; `@kinlab/kin-mcp` remains as a
-compatibility wrapper), or read the
-[Advanced configuration](docs/quickstart.md#9-advanced-configuration) section of the
-quickstart. For the full tool surface, see [docs/mcp-tools.md](docs/mcp-tools.md).
 
 **Transparent filesystem projection.** `kin-vfs` serves graph-backed files to any tool as
 ordinary files, so your editor, compiler, and scripts operate over graph truth without
@@ -159,11 +172,12 @@ interop boundary.
 ## Proof posture
 
 We keep benchmark claims narrow and reproducible. On the current citable, preregistered
-evaluation of 26 Multi-SWE-Bench retrieval tasks, Kin replayed bit-identically on **26 of 26**
-tasks versus **3 of 26** for the lexical baseline. Symbol F1 was **.318 versus .289**, and line
-F1 was **.307 versus .266**. File F1 was a statistical tie, and cost was at parity
-(1.00x tokens, 0.95x tool calls). We are not claiming a broad retrieval, speed, or token-savings
-win. Full methodology, tasks, and artifacts live in the
+Multi-SWE-Bench Go retrieval suite (n=26), Kin replayed bit-identically on **26 of 26** tasks
+versus **3 of 26** for the lexical baseline. Symbol F1 was **.318 versus .289** and line F1 was
+**.307 versus .266**; file F1 was a statistical tie, and cost was at parity (1.00x tokens, 0.95x
+tool calls). These numbers come from a build pinned to an older commit, not the current release
+binary. We are not claiming a broad retrieval, speed, or token-savings win. Full methodology,
+tasks, and artifacts live in the
 [public preregistered v2 proof package](https://firelock.ai/labs/kin-proof).
 
 ---
@@ -192,8 +206,9 @@ the [public proof package](https://firelock.ai/labs/kin-proof).
 
 ## Status & roadmap
 
-Kin is **0.2.x**, pre-1.0 and under active development. Expect rough edges and breaking
-changes between releases. Being precise about what is and isn't ready today:
+Kin is **0.2.x**: a single-founder public alpha, pre-1.0 and under active development. Expect
+rough edges and breaking changes between releases. Being precise about what is and isn't ready
+today:
 
 - **Install surface.** Native binaries ship on GitHub Releases and via the install script; the canonical `@kinlab/kin` npm package (`npm i -g @kinlab/kin`, or `npx -y @kinlab/kin`) provisions the same managed `kin` + `kin-daemon` release for npm-based workflows. `@kinlab/kin-mcp` remains published as a compatibility wrapper.
 - **Windows.** The native Windows binary is a supported vector-free build for graph, lexical, daemon, setup, and MCP workflows; vector similarity and filesystem projection are unsupported. Use WSL2 for the complete experience.

@@ -6,7 +6,7 @@ name = "kin-git"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Legacy Git adapter for Kin — import/export/sync"
+description = "Legacy Git adapter for Kin: import/export/sync"
 
 [dependencies]
 kin-model = { workspace = true }
