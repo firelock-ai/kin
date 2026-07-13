@@ -7,11 +7,12 @@
 //! registered repos. Provides name-based resolution with fingerprint
 //! disambiguation for common names like Config, Error, init.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use hashbrown::HashMap;
 use kin_model::{Entity, EntityId, EntityKind, EntityRole, Relation, SemanticFingerprint};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
+use sha2::{Digest, Sha256};
 
 /// A repo identifier (matches registry.toml entries).
 pub type RepoId = String;
@@ -34,7 +35,7 @@ pub struct EntityEntry {
 }
 
 /// Cross-repo edge linking two entities across repo boundaries.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CrossRepoEdge {
     pub src_repo: RepoId,
     pub src_entity: EntityId,
@@ -45,12 +46,46 @@ pub struct CrossRepoEdge {
     pub confidence: f32,
 }
 
+/// One atomic, graph-authoritative view of every cross-repo edge in the spine.
+///
+/// `roots` is the graph-root watermark for the exact registered repo set and
+/// `revision` is a deterministic SHA-256 digest over those roots plus the
+/// canonical edge set. `complete` says whether every registered authority root
+/// and every returned edge endpoint is covered by a completed graph-native
+/// refresh. Durable-store hydration alone never establishes that authority.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CrossRepoEdgesSnapshot {
+    pub complete: bool,
+    pub revision: String,
+    pub repos: Vec<RepoId>,
+    pub roots: BTreeMap<RepoId, String>,
+    pub edges: Vec<CrossRepoEdge>,
+}
+
+impl Default for CrossRepoEdgesSnapshot {
+    fn default() -> Self {
+        let roots = BTreeMap::new();
+        let edges = Vec::new();
+        Self {
+            complete: false,
+            revision: cross_repo_snapshot_revision(&roots, &edges),
+            repos: Vec::new(),
+            roots,
+            edges,
+        }
+    }
+}
+
 /// The spine's in-memory cross-repo metadata index.
 ///
 /// Thread-safe via RwLock — multiple readers, exclusive writer.
 /// Rebuilt from daemon queries on startup. Updated via SSE events.
 pub struct SpineIndex {
     inner: RwLock<SpineInner>,
+    /// Serialize the full replace operation for outgoing edge sets. Authority
+    /// registration deliberately does not take this lock: it must be able to
+    /// invalidate an in-flight refresh, which the epoch CAS below detects.
+    edge_refresh_serialization: Mutex<()>,
 }
 
 struct SpineInner {
@@ -66,6 +101,45 @@ struct SpineInner {
 
     /// Graph root hash per repo (for cache coherence).
     root_hashes: HashMap<RepoId, String>,
+
+    /// Repos whose registered entity/root authority has changed since their
+    /// outgoing cross-repo edges were last fully materialized.
+    dirty_edge_repos: HashSet<RepoId>,
+
+    /// Monotonic generation for the registered repo/entity/root authority.
+    /// A refresh may clear its dirty bit only when this value is unchanged
+    /// from the start of that refresh.
+    authority_epoch: u64,
+
+    /// Number of edge refreshes currently replacing a repo's outgoing set.
+    /// A snapshot taken while this is non-zero is atomic but not complete.
+    active_edge_refreshes: usize,
+}
+
+struct EdgeRefreshGuard<'a> {
+    index: &'a SpineIndex,
+    repo_id: RepoId,
+    authority_epoch: u64,
+    succeeded: bool,
+}
+
+impl EdgeRefreshGuard<'_> {
+    fn mark_succeeded(&mut self) {
+        self.succeeded = true;
+    }
+}
+
+impl Drop for EdgeRefreshGuard<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.index.inner.write();
+        if self.succeeded && inner.authority_epoch == self.authority_epoch {
+            inner.dirty_edge_repos.remove(&self.repo_id);
+        }
+        inner.active_edge_refreshes = inner
+            .active_edge_refreshes
+            .checked_sub(1)
+            .expect("edge refresh guard count underflow");
+    }
 }
 
 impl Default for SpineIndex {
@@ -82,7 +156,11 @@ impl SpineIndex {
                 by_id: HashMap::new(),
                 cross_repo_edges: Vec::new(),
                 root_hashes: HashMap::new(),
+                dirty_edge_repos: HashSet::new(),
+                authority_epoch: 0,
+                active_edge_refreshes: 0,
             }),
+            edge_refresh_serialization: Mutex::new(()),
         }
     }
 
@@ -90,6 +168,15 @@ impl SpineIndex {
     pub fn register_repo(&self, repo_id: &str, entities: Vec<EntityEntry>, root_hash: &str) {
         let mut inner = self.inner.write();
 
+        Self::register_repo_locked(&mut inner, repo_id, entities, root_hash);
+    }
+
+    fn register_repo_locked(
+        inner: &mut SpineInner,
+        repo_id: &str,
+        entities: Vec<EntityEntry>,
+        root_hash: &str,
+    ) {
         // Remove existing entries for this repo (full refresh)
         inner.by_name.values_mut().for_each(|entries| {
             entries.retain(|e| e.repo_id != repo_id);
@@ -108,6 +195,15 @@ impl SpineIndex {
         inner
             .root_hashes
             .insert(repo_id.to_string(), root_hash.to_string());
+        inner.authority_epoch = inner
+            .authority_epoch
+            .checked_add(1)
+            .expect("spine authority epoch exhausted");
+
+        // Any registered repo can be the target of any source repo's outgoing
+        // resolution. Adding or changing one target therefore invalidates every
+        // registered source, not just the repo whose metadata changed.
+        inner.dirty_edge_repos = inner.root_hashes.keys().cloned().collect();
     }
 
     /// Resolve an entity by name and kind across all repos.
@@ -180,6 +276,57 @@ impl SpineIndex {
             .collect()
     }
 
+    /// Capture every registered root and cross-repo edge under one read lock.
+    ///
+    /// The returned edge set is sorted and deduplicated by topology (keeping
+    /// the highest-confidence copy), so repeated reads of unchanged graph
+    /// authority serialize to identical bytes. No projection or filesystem
+    /// surface participates in this read.
+    pub fn cross_repo_edges_snapshot(&self) -> CrossRepoEdgesSnapshot {
+        let (complete, roots, mut edges) = {
+            let inner = self.inner.read();
+            let roots = inner
+                .root_hashes
+                .iter()
+                .map(|(repo, root)| (repo.clone(), root.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let edge_authority_is_closed = inner.cross_repo_edges.iter().all(|edge| {
+                inner.root_hashes.contains_key(&edge.src_repo)
+                    && inner.root_hashes.contains_key(&edge.dst_repo)
+                    && inner
+                        .by_id
+                        .contains_key(&(edge.src_repo.clone(), edge.src_entity))
+                    && inner
+                        .by_id
+                        .contains_key(&(edge.dst_repo.clone(), edge.dst_entity))
+            });
+            (
+                inner.active_edge_refreshes == 0
+                    && inner.dirty_edge_repos.is_empty()
+                    && !roots.is_empty()
+                    && roots
+                        .values()
+                        .all(|root| !root.is_empty() && root.trim() == root)
+                    && edge_authority_is_closed,
+                roots,
+                inner.cross_repo_edges.clone(),
+            )
+        };
+
+        edges.sort_by(cross_repo_edge_order);
+        edges.dedup_by(|a, b| cross_repo_edge_identity_order(a, b).is_eq());
+
+        let repos = roots.keys().cloned().collect::<Vec<_>>();
+        let revision = cross_repo_snapshot_revision(&roots, &edges);
+        CrossRepoEdgesSnapshot {
+            complete,
+            revision,
+            repos,
+            roots,
+            edges,
+        }
+    }
+
     /// Add a cross-repo edge to the index.
     ///
     /// Returns `false` when the candidate does not cross a repository
@@ -242,37 +389,110 @@ impl SpineIndex {
         relations: &[Relation],
         registry_repo_ids: &[String],
     ) {
-        use crate::xref::{collect_unresolved_imports, materialize_edges, resolve_imports};
-
-        // Register this repo's own entities as resolution targets first, so a
-        // downstream repo importing THIS repo's symbols can resolve them — the
-        // basis for transitive (2-hop) and multi-consumer cross-repo edges. A
-        // repo that only ever has its edges refreshed (the direct/store path)
-        // would otherwise index as an impact node but never as a name-resolution
-        // target. Idempotent with the ingest-time register_repo: re-registration
-        // replaces this repo's rows and preserves its existing root hash.
-        let root_hash = self.root_hash(repo_id).unwrap_or_default();
-        self.register_repo(
+        self.refresh_cross_repo_edges_with_hook(
             repo_id,
-            entries_from_entities(repo_id, entities),
-            &root_hash,
+            entities,
+            relations,
+            registry_repo_ids,
+            || {},
         );
+    }
 
-        // Remove existing edges from this repo
-        {
-            let mut inner = self.inner.write();
-            inner.cross_repo_edges.retain(|e| e.src_repo != repo_id);
-        }
+    fn refresh_cross_repo_edges_with_hook<F>(
+        &self,
+        repo_id: &str,
+        entities: &[Entity],
+        relations: &[Relation],
+        registry_repo_ids: &[String],
+        after_start: F,
+    ) where
+        F: FnOnce(),
+    {
+        use crate::xref::{collect_unresolved_imports, materialized_edges, resolve_imports};
 
-        // Collect, resolve, materialize
+        let _serialized = self.edge_refresh_serialization.lock();
+        let mut refresh = self.begin_edge_refresh(repo_id, entities);
+        after_start();
+
+        // Resolve into a detached replacement before taking the mutation lock.
+        // Installing the full outgoing set in one write prevents readers from
+        // seeing a partial or interleaved union.
         let unresolved =
             collect_unresolved_imports(entities, relations, repo_id, registry_repo_ids);
-        if unresolved.is_empty() {
-            return;
-        }
-        let resolutions = resolve_imports(self, &unresolved);
-        materialize_edges(self, &unresolved, &resolutions);
+        let replacement = if unresolved.is_empty() {
+            Vec::new()
+        } else {
+            let resolutions = resolve_imports(self, &unresolved);
+            materialized_edges(&unresolved, &resolutions)
+        };
+        let mut inner = self.inner.write();
+        inner.cross_repo_edges.retain(|e| e.src_repo != repo_id);
+        inner.cross_repo_edges.extend(replacement);
+        drop(inner);
+        refresh.mark_succeeded();
     }
+
+    fn begin_edge_refresh(&self, repo_id: &str, entities: &[Entity]) -> EdgeRefreshGuard<'_> {
+        let mut inner = self.inner.write();
+        // Normal production callers register graph authority before refreshing.
+        // Preserve the direct-refresh compatibility path only for a genuinely
+        // absent repo; re-registering every normal refresh would globally dirty
+        // all repos and make a complete multi-repo pass impossible.
+        if !inner.root_hashes.contains_key(repo_id) {
+            Self::register_repo_locked(
+                &mut inner,
+                repo_id,
+                entries_from_entities(repo_id, entities),
+                "",
+            );
+        }
+        inner.active_edge_refreshes += 1;
+        EdgeRefreshGuard {
+            index: self,
+            repo_id: repo_id.to_string(),
+            authority_epoch: inner.authority_epoch,
+            succeeded: false,
+        }
+    }
+}
+
+fn cross_repo_edge_order(a: &CrossRepoEdge, b: &CrossRepoEdge) -> std::cmp::Ordering {
+    cross_repo_edge_identity_order(a, b).then_with(|| b.confidence.total_cmp(&a.confidence))
+}
+
+fn cross_repo_edge_identity_order(a: &CrossRepoEdge, b: &CrossRepoEdge) -> std::cmp::Ordering {
+    a.src_repo
+        .cmp(&b.src_repo)
+        .then_with(|| a.src_entity.cmp(&b.src_entity))
+        .then_with(|| a.dst_repo.cmp(&b.dst_repo))
+        .then_with(|| a.dst_entity.cmp(&b.dst_entity))
+}
+
+fn cross_repo_snapshot_revision(
+    roots: &BTreeMap<RepoId, String>,
+    edges: &[CrossRepoEdge],
+) -> String {
+    fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"kin-spine-cross-repo-edges-v1\0");
+    hasher.update((roots.len() as u64).to_be_bytes());
+    for (repo, root) in roots {
+        hash_bytes(&mut hasher, repo.as_bytes());
+        hash_bytes(&mut hasher, root.as_bytes());
+    }
+    hasher.update((edges.len() as u64).to_be_bytes());
+    for edge in edges {
+        hash_bytes(&mut hasher, edge.src_repo.as_bytes());
+        hasher.update(edge.src_entity.0.as_bytes());
+        hash_bytes(&mut hasher, edge.dst_repo.as_bytes());
+        hasher.update(edge.dst_entity.0.as_bytes());
+        hasher.update(edge.confidence.to_bits().to_be_bytes());
+    }
+    format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 /// Project a repo's graph entities into the metadata-only [`EntityEntry`] rows
@@ -313,7 +533,13 @@ pub fn fingerprint_match_score(a: &SemanticFingerprint, b: &SemanticFingerprint)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kin_model::{FingerprintAlgorithm, Hash256};
+    use kin_model::{
+        EntityMetadata, FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, RelationEvidence,
+        RelationId, RelationKind, RelationOrigin, Visibility,
+    };
+    use std::sync::{mpsc, Arc};
+    use std::thread;
+    use std::time::Duration;
 
     fn test_fp() -> SemanticFingerprint {
         SemanticFingerprint {
@@ -336,6 +562,49 @@ mod tests {
             fingerprint: test_fp(),
             file_path: Some("src/lib.rs".to_string()),
             role: Some(EntityRole::Source),
+        }
+    }
+
+    fn test_entry_with_id(repo: &str, id: EntityId, name: &str) -> EntityEntry {
+        let mut entry = test_entry(repo, name, EntityKind::Function);
+        entry.entity_id = id;
+        entry
+    }
+
+    fn test_entity(id: EntityId, name: &str) -> Entity {
+        Entity {
+            id,
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: test_fp(),
+            file_origin: None,
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn external_call(src: EntityId, import_source: &str, token: &str) -> Relation {
+        Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(EntityId::new()),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: Some(import_source.to_string()),
+            evidence: vec![RelationEvidence {
+                token: Some(token.to_string()),
+                ..RelationEvidence::default()
+            }],
         }
     }
 
@@ -464,5 +733,399 @@ mod tests {
         assert!(index
             .cross_repo_edges_for("repo-a", &caller.entity_id)
             .is_empty());
+    }
+
+    #[test]
+    fn edge_snapshot_is_complete_canonical_and_revisioned() {
+        let a = EntityId::from_content("src/a.rs", "a", "function", 1);
+        let b = EntityId::from_content("src/b.rs", "b", "function", 1);
+        let c = EntityId::from_content("src/c.rs", "c", "function", 1);
+        let edge_ab = CrossRepoEdge {
+            src_repo: "alpha".to_string(),
+            src_entity: a,
+            dst_repo: "beta".to_string(),
+            dst_entity: b,
+            confidence: 0.9,
+        };
+        let edge_bc = CrossRepoEdge {
+            src_repo: "beta".to_string(),
+            src_entity: b,
+            dst_repo: "gamma".to_string(),
+            dst_entity: c,
+            confidence: 0.8,
+        };
+
+        let first = SpineIndex::new();
+        first.register_repo(
+            "gamma",
+            vec![test_entry_with_id("gamma", c, "gamma")],
+            "root-c",
+        );
+        first.register_repo(
+            "alpha",
+            vec![test_entry_with_id("alpha", a, "alpha")],
+            "root-a",
+        );
+        first.register_repo(
+            "beta",
+            vec![test_entry_with_id("beta", b, "beta")],
+            "root-b",
+        );
+        let repos = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+        for repo in &repos {
+            first.refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+        first.add_cross_repo_edge(edge_bc.clone());
+        first.add_cross_repo_edge(edge_ab.clone());
+        first.add_cross_repo_edge(edge_ab.clone());
+        first.add_cross_repo_edge(CrossRepoEdge {
+            confidence: 0.4,
+            ..edge_ab.clone()
+        });
+
+        let second = SpineIndex::new();
+        second.register_repo(
+            "beta",
+            vec![test_entry_with_id("beta", b, "beta")],
+            "root-b",
+        );
+        second.register_repo(
+            "gamma",
+            vec![test_entry_with_id("gamma", c, "gamma")],
+            "root-c",
+        );
+        second.register_repo(
+            "alpha",
+            vec![test_entry_with_id("alpha", a, "alpha")],
+            "root-a",
+        );
+        for repo in &repos {
+            second.refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+        second.add_cross_repo_edge(edge_ab.clone());
+        second.add_cross_repo_edge(edge_bc.clone());
+
+        let first_snapshot = first.cross_repo_edges_snapshot();
+        let second_snapshot = second.cross_repo_edges_snapshot();
+        assert!(first_snapshot.complete);
+        assert_eq!(
+            first_snapshot.repos,
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+        );
+        assert_eq!(first_snapshot.edges, vec![edge_ab, edge_bc]);
+        assert_eq!(first_snapshot, second_snapshot);
+        assert_eq!(
+            serde_json::to_vec(&first_snapshot).unwrap(),
+            serde_json::to_vec(&second_snapshot).unwrap(),
+            "equivalent authority must produce stable snapshot bytes"
+        );
+        assert!(first_snapshot.revision.starts_with("sha256:"));
+        assert_eq!(first_snapshot.revision.len(), 71);
+
+        second.register_repo(
+            "gamma",
+            vec![test_entry_with_id("gamma", c, "gamma")],
+            "root-c-next",
+        );
+        assert_ne!(
+            first_snapshot.revision,
+            second.cross_repo_edges_snapshot().revision,
+            "changing a graph root must advance the deterministic watermark"
+        );
+    }
+
+    #[test]
+    fn edge_snapshot_fails_closed_while_refresh_is_in_flight() {
+        let index = SpineIndex::new();
+        index.register_repo("alpha", vec![], "root-a");
+        index.refresh_cross_repo_edges("alpha", &[], &[], &["alpha".to_string()]);
+        let before = index.cross_repo_edges_snapshot();
+        assert!(before.complete);
+
+        let refresh = index.begin_edge_refresh("alpha", &[]);
+        let during = index.cross_repo_edges_snapshot();
+        assert!(!during.complete);
+        assert_eq!(during.revision, before.revision);
+
+        drop(refresh);
+        assert!(index.cross_repo_edges_snapshot().complete);
+    }
+
+    #[test]
+    fn edge_snapshot_stays_incomplete_until_every_registered_repo_is_refreshed() {
+        let index = SpineIndex::new();
+        let repos = vec!["alpha".to_string(), "beta".to_string()];
+
+        index.register_repo("alpha", vec![], "root-a");
+        assert!(
+            !index.cross_repo_edges_snapshot().complete,
+            "registering authority must dirty that repo's edge set"
+        );
+        index.register_repo("beta", vec![], "root-b");
+
+        index.refresh_cross_repo_edges("alpha", &[], &[], &repos);
+        assert!(
+            !index.cross_repo_edges_snapshot().complete,
+            "refreshing one repo must not clear another repo's dirty state"
+        );
+
+        index.refresh_cross_repo_edges("beta", &[], &[], &repos);
+        assert!(
+            index.cross_repo_edges_snapshot().complete,
+            "the snapshot becomes complete only after every dirty repo refreshes"
+        );
+    }
+
+    #[test]
+    fn edge_snapshot_requires_nonempty_canonical_root_watermarks() {
+        assert!(
+            !SpineIndex::new().cross_repo_edges_snapshot().complete,
+            "an empty authority root set cannot be proof-complete"
+        );
+
+        let index = SpineIndex::new();
+        let repos = vec!["alpha".to_string(), "beta".to_string()];
+        index.register_repo("alpha", vec![], "root-a");
+        index.register_repo("beta", vec![], "");
+        for repo in &repos {
+            index.refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+        assert!(
+            !index.cross_repo_edges_snapshot().complete,
+            "a refreshed repo set with an empty root cannot be proof-complete"
+        );
+
+        index.register_repo("beta", vec![], "root-b");
+        assert!(
+            !index.cross_repo_edges_snapshot().complete,
+            "replacing one target must dirty every source until all edges refresh"
+        );
+        for repo in &repos {
+            index.refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+        assert!(index.cross_repo_edges_snapshot().complete);
+
+        index.register_repo("beta", vec![], " root-b ");
+        for repo in &repos {
+            index.refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+        assert!(
+            !index.cross_repo_edges_snapshot().complete,
+            "a non-canonical whitespace-padded root must fail closed"
+        );
+    }
+
+    #[test]
+    fn registering_a_new_repo_invalidates_every_existing_source_repo() {
+        let index = SpineIndex::new();
+        let mut repos = vec!["alpha".to_string(), "beta".to_string()];
+        index.register_repo("alpha", vec![], "root-a");
+        index.register_repo("beta", vec![], "root-b");
+        for repo in &repos {
+            index.refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+        assert!(index.cross_repo_edges_snapshot().complete);
+
+        index.register_repo("gamma", vec![], "root-c");
+        repos.push("gamma".to_string());
+        index.refresh_cross_repo_edges("gamma", &[], &[], &repos);
+        assert!(
+            !index.cross_repo_edges_snapshot().complete,
+            "a new target may change every existing source repo's resolution"
+        );
+
+        index.refresh_cross_repo_edges("alpha", &[], &[], &repos);
+        assert!(!index.cross_repo_edges_snapshot().complete);
+        index.refresh_cross_repo_edges("beta", &[], &[], &repos);
+        assert!(index.cross_repo_edges_snapshot().complete);
+    }
+
+    #[test]
+    fn changing_one_repo_requires_every_other_source_to_refresh() {
+        let index = SpineIndex::new();
+        let repos = vec!["alpha".to_string(), "beta".to_string()];
+        index.register_repo("alpha", vec![], "root-a");
+        index.register_repo("beta", vec![], "root-b");
+        for repo in &repos {
+            index.refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+        assert!(index.cross_repo_edges_snapshot().complete);
+
+        index.register_repo("alpha", vec![], "root-a-next");
+        index.refresh_cross_repo_edges("alpha", &[], &[], &repos);
+        assert!(
+            !index.cross_repo_edges_snapshot().complete,
+            "beta's prior outgoing resolution predates alpha's new authority"
+        );
+        index.refresh_cross_repo_edges("beta", &[], &[], &repos);
+        assert!(index.cross_repo_edges_snapshot().complete);
+    }
+
+    #[test]
+    fn register_during_refresh_cannot_clear_newer_global_invalidation() {
+        let index = Arc::new(SpineIndex::new());
+        let repos = vec!["alpha".to_string(), "beta".to_string()];
+        index.register_repo("alpha", vec![], "root-a");
+        index.register_repo("beta", vec![], "root-b");
+        for repo in &repos {
+            index.refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+        assert!(index.cross_repo_edges_snapshot().complete);
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker_index = Arc::clone(&index);
+        let worker_repos = repos.clone();
+        let worker = thread::spawn(move || {
+            worker_index.refresh_cross_repo_edges_with_hook(
+                "alpha",
+                &[],
+                &[],
+                &worker_repos,
+                || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            );
+        });
+
+        started_rx.recv().unwrap();
+        index.register_repo("beta", vec![], "root-b-next");
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+
+        assert!(
+            !index.cross_repo_edges_snapshot().complete,
+            "the old alpha refresh epoch must not clear beta's newer invalidation"
+        );
+        index.refresh_cross_repo_edges("beta", &[], &[], &repos);
+        assert!(
+            !index.cross_repo_edges_snapshot().complete,
+            "alpha must remain dirty after its stale refresh loses the epoch CAS"
+        );
+        index.refresh_cross_repo_edges("alpha", &[], &[], &repos);
+        assert!(index.cross_repo_edges_snapshot().complete);
+    }
+
+    #[test]
+    fn concurrent_same_repo_refreshes_are_serialized_and_replace_not_union() {
+        let index = Arc::new(SpineIndex::new());
+        let source_id = EntityId::from_content("src/a.rs", "source", "function", 1);
+        let beta_id = EntityId::from_content("src/b.rs", "beta_target", "function", 1);
+        let gamma_id = EntityId::from_content("src/c.rs", "gamma_target", "function", 1);
+        let source = test_entity(source_id, "source");
+        let repos = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+
+        index.register_repo(
+            "alpha",
+            vec![test_entry_with_id("alpha", source_id, "source")],
+            "root-a",
+        );
+        index.register_repo(
+            "beta",
+            vec![test_entry_with_id("beta", beta_id, "beta_target")],
+            "root-b",
+        );
+        index.register_repo(
+            "gamma",
+            vec![test_entry_with_id("gamma", gamma_id, "gamma_target")],
+            "root-c",
+        );
+        index.refresh_cross_repo_edges("beta", &[], &[], &repos);
+        index.refresh_cross_repo_edges("gamma", &[], &[], &repos);
+
+        let (first_started_tx, first_started_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let first_index = Arc::clone(&index);
+        let first_repos = repos.clone();
+        let first_source = source.clone();
+        let first = thread::spawn(move || {
+            let relation = external_call(source_id, "beta", "beta_target");
+            first_index.refresh_cross_repo_edges_with_hook(
+                "alpha",
+                &[first_source],
+                &[relation],
+                &first_repos,
+                || {
+                    first_started_tx.send(()).unwrap();
+                    release_first_rx.recv().unwrap();
+                },
+            );
+        });
+        first_started_rx.recv().unwrap();
+
+        let (second_attempt_tx, second_attempt_rx) = mpsc::channel();
+        let (second_done_tx, second_done_rx) = mpsc::channel();
+        let second_index = Arc::clone(&index);
+        let second_repos = repos.clone();
+        let second = thread::spawn(move || {
+            second_attempt_tx.send(()).unwrap();
+            let relation = external_call(source_id, "gamma", "gamma_target");
+            second_index.refresh_cross_repo_edges("alpha", &[source], &[relation], &second_repos);
+            second_done_tx.send(()).unwrap();
+        });
+        second_attempt_rx.recv().unwrap();
+        assert!(
+            second_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "a second refresh must block while the first owns the global serializer"
+        );
+
+        release_first_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        second_done_rx.recv().unwrap();
+
+        let outgoing = index.cross_repo_edges_from("alpha");
+        assert_eq!(outgoing.len(), 1, "refreshes must replace, never union");
+        assert_eq!(outgoing[0].dst_repo, "gamma");
+        assert_eq!(outgoing[0].dst_entity, gamma_id);
+        assert!(index.cross_repo_edges_snapshot().complete);
+    }
+
+    #[test]
+    fn edge_snapshot_rejects_orphan_repos_and_entities() {
+        let source_id = EntityId::from_content("src/a.rs", "source", "function", 1);
+        let target_id = EntityId::from_content("src/b.rs", "target", "function", 1);
+        let repos = vec!["alpha".to_string(), "beta".to_string()];
+
+        let build_index = || {
+            let index = SpineIndex::new();
+            index.register_repo(
+                "alpha",
+                vec![test_entry_with_id("alpha", source_id, "source")],
+                "root-a",
+            );
+            index.register_repo(
+                "beta",
+                vec![test_entry_with_id("beta", target_id, "target")],
+                "root-b",
+            );
+            for repo in &repos {
+                index.refresh_cross_repo_edges(repo, &[], &[], &repos);
+            }
+            index
+        };
+
+        let orphan_repo = build_index();
+        orphan_repo.add_cross_repo_edge(CrossRepoEdge {
+            src_repo: "alpha".to_string(),
+            src_entity: source_id,
+            dst_repo: "missing".to_string(),
+            dst_entity: EntityId::new(),
+            confidence: 0.9,
+        });
+        assert!(!orphan_repo.cross_repo_edges_snapshot().complete);
+
+        let orphan_entity = build_index();
+        orphan_entity.add_cross_repo_edge(CrossRepoEdge {
+            src_repo: "alpha".to_string(),
+            src_entity: source_id,
+            dst_repo: "beta".to_string(),
+            dst_entity: EntityId::new(),
+            confidence: 0.9,
+        });
+        assert!(!orphan_entity.cross_repo_edges_snapshot().complete);
     }
 }

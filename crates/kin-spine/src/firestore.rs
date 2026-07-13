@@ -5,9 +5,10 @@
 //!
 //! [`FirestoreSpineBackend`] keeps every read on a fast in-memory cache and
 //! mirrors writes through to a durable [`SpineStore`]. On startup it hydrates
-//! the cache from the store so a freshly started (stateless) daemon pod rebuilds
-//! the full cross-repo index. The store seam is the only component that talks to
-//! an external system, which keeps the backend's hydrate and write-through logic
+//! that cache as a warm-start hint. Persisted rows are not proof authority: an
+//! edge snapshot stays incomplete until graph-authoritative registration and
+//! refresh covers every hydrated repo. The store seam is the only component
+//! that talks to an external system, which keeps hydrate and write-through logic
 //! testable against an in-memory fake.
 //!
 //! The production store is [`FirestoreStore`] (behind the `firestore` feature),
@@ -32,11 +33,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use kin_model::{Entity, EntityId, EntityKind, Relation, SemanticFingerprint};
+use parking_lot::Mutex as ParkingMutex;
 use tracing::{debug, error, info, warn};
 
 use crate::backend::{InMemorySpineBackend, SpineBackend, SpineError};
 use crate::federation::FederatedImpact;
-use crate::index::{CrossRepoEdge, EntityEntry};
+use crate::index::{CrossRepoEdge, CrossRepoEdgesSnapshot, EntityEntry};
 use crate::store::SpineStore;
 
 /// Spine backend that reads from an in-memory cache and writes through to a
@@ -51,6 +53,10 @@ pub struct FirestoreSpineBackend {
     cache: InMemorySpineBackend,
     /// Whether the initial hydration from the store has completed.
     hydrated: AtomicBool,
+    /// Keep cache replacement and its durable mirror in one serialized refresh
+    /// lane. The cache has its own serializer as well; this outer lock extends
+    /// the guarantee through Firestore delete-and-rewrite persistence.
+    refresh_write_lock: ParkingMutex<()>,
     /// Durable backing store; the only seam that touches an external system.
     store: Arc<dyn SpineStore>,
 }
@@ -73,6 +79,7 @@ impl FirestoreSpineBackend {
         Self {
             cache: InMemorySpineBackend::new(),
             hydrated: AtomicBool::new(false),
+            refresh_write_lock: ParkingMutex::new(()),
             store,
         }
     }
@@ -171,6 +178,12 @@ impl SpineBackend for FirestoreSpineBackend {
         self.cache.cross_repo_edges_for(repo_id, entity_id)
     }
 
+    fn cross_repo_edges_snapshot(&self) -> CrossRepoEdgesSnapshot {
+        // Hydration is cache warm-start only. Completeness comes exclusively
+        // from the cache's graph-authoritative dirty/epoch/endpoint checks.
+        self.cache.cross_repo_edges_snapshot()
+    }
+
     fn add_cross_repo_edge(&self, edge: CrossRepoEdge) {
         // Write-through: local cache + durable store.
         if !self.cache.index().add_cross_repo_edge(edge.clone()) {
@@ -209,6 +222,7 @@ impl SpineBackend for FirestoreSpineBackend {
         relations: &[Relation],
         registry_repo_ids: &[String],
     ) {
+        let _refresh = self.refresh_write_lock.lock();
         // Recompute the repo's outgoing edges in the cache (this replaces the
         // repo's prior edges by source repo).
         self.cache
@@ -438,12 +452,24 @@ impl FirestoreStore {
                     .and_then(|n| n.as_str())
                 {
                     let delete_url = format!("https://firestore.googleapis.com/v1/{doc_name}");
-                    let _ = self
+                    let resp = self
                         .client
                         .delete(&delete_url)
                         .bearer_auth(&token)
                         .send()
-                        .await;
+                        .await
+                        .map_err(|e| {
+                            SpineError::Http(format!(
+                                "delete {collection} document {doc_name} failed: {e}"
+                            ))
+                        })?;
+                    if !resp.status().is_success() {
+                        let status = resp.status();
+                        let body = resp.text().await.unwrap_or_default();
+                        return Err(SpineError::Http(format!(
+                            "delete {collection} document {doc_name} failed ({status}): {body}"
+                        )));
+                    }
                 }
             }
             Ok(())
@@ -467,36 +493,56 @@ fn doc_payload<T: serde::de::DeserializeOwned>(
 }
 
 #[cfg(feature = "firestore")]
+fn loaded_repos_from_documents(
+    docs: &[serde_json::Value],
+) -> Result<Vec<crate::store::LoadedRepo>, SpineError> {
+    use std::collections::hash_map::Entry;
+    use std::collections::HashMap;
+
+    let mut by_repo: HashMap<String, (String, Vec<EntityEntry>)> = HashMap::new();
+    for doc in docs {
+        let entry: EntityEntry = doc_payload(doc, "entity")?;
+        let root_hash = doc
+            .get("fields")
+            .and_then(|f| f.get("root_hash"))
+            .and_then(|h| h.get("stringValue"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        match by_repo.entry(entry.repo_id.clone()) {
+            Entry::Vacant(vacant) => {
+                vacant.insert((root_hash, vec![entry]));
+            }
+            Entry::Occupied(mut occupied) => {
+                if occupied.get().0 != root_hash {
+                    return Err(SpineError::Serialization(format!(
+                        "mixed root hashes for repo {} in spine_entities",
+                        occupied.key()
+                    )));
+                }
+                occupied.get_mut().1.push(entry);
+            }
+        }
+    }
+
+    let mut repos = by_repo
+        .into_iter()
+        .map(|(repo_id, (root_hash, entries))| crate::store::LoadedRepo {
+            repo_id,
+            root_hash,
+            entries,
+        })
+        .collect::<Vec<_>>();
+    repos.sort_by(|a, b| a.repo_id.cmp(&b.repo_id));
+    Ok(repos)
+}
+
+#[cfg(feature = "firestore")]
 impl SpineStore for FirestoreStore {
     fn load_repos(&self) -> Result<Vec<crate::store::LoadedRepo>, SpineError> {
-        use std::collections::HashMap;
-
         let docs = self.list_all_documents("spine_entities")?;
-        let mut by_repo: HashMap<String, (String, Vec<EntityEntry>)> = HashMap::new();
-
-        for doc in &docs {
-            let entry: EntityEntry = doc_payload(doc, "entity")?;
-            let root_hash = doc
-                .get("fields")
-                .and_then(|f| f.get("root_hash"))
-                .and_then(|h| h.get("stringValue"))
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let bucket = by_repo
-                .entry(entry.repo_id.clone())
-                .or_insert_with(|| (root_hash, Vec::new()));
-            bucket.1.push(entry);
-        }
-
-        Ok(by_repo
-            .into_iter()
-            .map(|(repo_id, (root_hash, entries))| crate::store::LoadedRepo {
-                repo_id,
-                root_hash,
-                entries,
-            })
-            .collect())
+        loaded_repos_from_documents(&docs)
     }
 
     fn load_edges(&self) -> Result<Vec<CrossRepoEdge>, SpineError> {
@@ -617,6 +663,7 @@ mod tests {
         // (root_hash, entries) keyed by repo_id.
         repos: Mutex<HashMap<String, (String, Vec<EntityEntry>)>>,
         edges: Mutex<Vec<CrossRepoEdge>>,
+        fail_next_load_edges: AtomicBool,
     }
 
     impl SpineStore for FakeSpineStore {
@@ -635,6 +682,11 @@ mod tests {
         }
 
         fn load_edges(&self) -> Result<Vec<CrossRepoEdge>, SpineError> {
+            if self.fail_next_load_edges.swap(false, Ordering::SeqCst) {
+                return Err(SpineError::Backend(
+                    "injected load_edges failure".to_string(),
+                ));
+            }
             Ok(self.edges.lock().unwrap().clone())
         }
 
@@ -770,6 +822,126 @@ mod tests {
     }
 
     #[test]
+    fn valid_hydration_stays_incomplete_until_graph_authoritative_full_refresh() {
+        let store = Arc::new(FakeSpineStore::default());
+        let writer = FirestoreSpineBackend::with_store(store.clone());
+        let provider = test_entry("provider", "provide", EntityKind::Function);
+        let consumer = test_entry("consumer", "consume", EntityKind::Function);
+        writer.register_repo("provider", vec![provider.clone()], "provider-root");
+        writer.register_repo("consumer", vec![consumer.clone()], "consumer-root");
+        writer.add_cross_repo_edge(CrossRepoEdge {
+            src_repo: "consumer".to_string(),
+            src_entity: consumer.entity_id,
+            dst_repo: "provider".to_string(),
+            dst_entity: provider.entity_id,
+            confidence: 0.95,
+        });
+
+        assert!(
+            !writer.cross_repo_edges_snapshot().complete,
+            "write-through cache alone cannot claim a complete durable snapshot"
+        );
+
+        let reader = FirestoreSpineBackend::with_store(store);
+        assert!(!reader.cross_repo_edges_snapshot().complete);
+        reader.hydrate().expect("hydrate durable cache warm-start");
+        let hydrated = reader.cross_repo_edges_snapshot();
+        assert!(
+            !hydrated.complete,
+            "persisted rows are cache input, not graph proof authority"
+        );
+        assert_eq!(hydrated.edges.len(), 1);
+
+        reader.register_repo("provider", vec![provider.clone()], "provider-root");
+        reader.register_repo("consumer", vec![consumer.clone()], "consumer-root");
+        let registry = vec!["consumer".to_string(), "provider".to_string()];
+        let provider_entity = local_entity(provider.entity_id, "provide");
+        let consumer_entity = local_entity(consumer.entity_id, "consume");
+        reader.refresh_cross_repo_edges("provider", &[provider_entity], &[], &registry);
+        reader.refresh_cross_repo_edges(
+            "consumer",
+            &[consumer_entity],
+            &[external_call(
+                consumer.entity_id,
+                EntityId::new(),
+                "provider",
+                "provide",
+            )],
+            &registry,
+        );
+
+        let snapshot = reader.cross_repo_edges_snapshot();
+        assert!(snapshot.complete);
+        assert_eq!(snapshot.repos, vec!["consumer", "provider"]);
+        assert_eq!(snapshot.edges.len(), 1);
+        assert!(snapshot.revision.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn torn_hydration_stays_incomplete_until_authoritative_refresh_removes_orphan() {
+        let store = Arc::new(FakeSpineStore::default());
+        let writer = FirestoreSpineBackend::with_store(store.clone());
+        let provider = test_entry("provider", "provide", EntityKind::Function);
+        let consumer = test_entry("consumer", "consume", EntityKind::Function);
+        writer.register_repo("provider", vec![provider.clone()], "provider-root");
+        writer.register_repo("consumer", vec![consumer.clone()], "consumer-root");
+        writer.add_cross_repo_edge(CrossRepoEdge {
+            src_repo: "consumer".to_string(),
+            src_entity: consumer.entity_id,
+            dst_repo: "provider".to_string(),
+            dst_entity: EntityId::new(),
+            confidence: 0.95,
+        });
+
+        let reader = FirestoreSpineBackend::with_store(store);
+        reader.hydrate().expect("hydrate torn cache rows");
+        let hydrated = reader.cross_repo_edges_snapshot();
+        assert!(!hydrated.complete);
+        assert_eq!(
+            hydrated.edges.len(),
+            1,
+            "torn row remains visible but unsafe"
+        );
+
+        reader.register_repo("provider", vec![provider], "provider-root");
+        reader.register_repo("consumer", vec![consumer], "consumer-root");
+        let registry = vec!["consumer".to_string(), "provider".to_string()];
+        for repo in &registry {
+            reader.refresh_cross_repo_edges(repo, &[], &[], &registry);
+        }
+        let rebuilt = reader.cross_repo_edges_snapshot();
+        assert!(rebuilt.complete);
+        assert!(
+            rebuilt.edges.is_empty(),
+            "authoritative refresh removes torn edge"
+        );
+    }
+
+    #[test]
+    fn failed_hydration_does_not_block_later_authoritative_rebuild() {
+        let store = Arc::new(FakeSpineStore::default());
+        let writer = FirestoreSpineBackend::with_store(store.clone());
+        let alpha = test_entry("alpha", "alpha", EntityKind::Function);
+        let beta = test_entry("beta", "beta", EntityKind::Function);
+        writer.register_repo("alpha", vec![alpha.clone()], "root-a");
+        writer.register_repo("beta", vec![beta.clone()], "root-b");
+        store.fail_next_load_edges.store(true, Ordering::SeqCst);
+
+        let reader = FirestoreSpineBackend::with_store(store);
+        assert!(reader.hydrate().is_err());
+        reader.register_repo("alpha", vec![alpha], "root-a");
+        reader.register_repo("beta", vec![beta], "root-b");
+        let registry = vec!["alpha".to_string(), "beta".to_string()];
+        for repo in &registry {
+            reader.refresh_cross_repo_edges(repo, &[], &[], &registry);
+        }
+        assert!(
+            reader.cross_repo_edges_snapshot().complete,
+            "hydration status must not veto a complete graph-authoritative rebuild"
+        );
+    }
+
+    #[test]
     fn hydrate_rejects_legacy_same_repo_edges_from_store() {
         let store = Arc::new(FakeSpineStore::default());
         store
@@ -840,6 +1012,38 @@ mod tests {
         assert_eq!(repo.root_hash, "h2");
         assert_eq!(repo.entries.len(), 1, "re-register replaces, not appends");
         assert_eq!(repo.entries[0].name, "new_fn");
+    }
+
+    #[cfg(feature = "firestore")]
+    #[test]
+    fn firestore_repo_load_rejects_mixed_roots_for_one_repo() {
+        fn document(entry: &EntityEntry, root_hash: &str) -> serde_json::Value {
+            serde_json::json!({
+                "fields": {
+                    "root_hash": { "stringValue": root_hash },
+                    "payload": {
+                        "stringValue": serde_json::to_string(entry).unwrap()
+                    }
+                }
+            })
+        }
+
+        let first = test_entry("repo-a", "first", EntityKind::Function);
+        let second = test_entry("repo-a", "second", EntityKind::Function);
+        let valid =
+            loaded_repos_from_documents(&[document(&first, "root-a"), document(&second, "root-a")])
+                .expect("one consistent root per repo");
+        assert_eq!(valid.len(), 1);
+        assert_eq!(valid[0].entries.len(), 2);
+
+        let error = loaded_repos_from_documents(&[
+            document(&first, "root-a"),
+            document(&second, "root-a-torn"),
+        ])
+        .expect_err("mixed root rows are a torn cache snapshot");
+        assert!(error
+            .to_string()
+            .contains("mixed root hashes for repo repo-a"));
     }
 
     #[test]
