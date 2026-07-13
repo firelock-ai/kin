@@ -94,7 +94,7 @@ impl FirestoreSpineBackend {
 
         let repo_count = repos.len();
         let entity_count: usize = repos.iter().map(|r| r.entries.len()).sum();
-        let edge_count = edges.len();
+        let loaded_edge_count = edges.len();
 
         // Populate the inner cache directly (not via `self`) so hydration does
         // not write the loaded data straight back to the store.
@@ -102,8 +102,11 @@ impl FirestoreSpineBackend {
             self.cache
                 .register_repo(&repo.repo_id, repo.entries, &repo.root_hash);
         }
+        let mut edge_count = 0;
         for edge in edges {
-            self.cache.add_cross_repo_edge(edge);
+            if self.cache.index().add_cross_repo_edge(edge) {
+                edge_count += 1;
+            }
         }
 
         self.hydrated.store(true, Ordering::Release);
@@ -111,6 +114,7 @@ impl FirestoreSpineBackend {
             repos = repo_count,
             entities = entity_count,
             edges = edge_count,
+            rejected_edges = loaded_edge_count - edge_count,
             "spine cache hydration complete"
         );
         Ok(())
@@ -169,7 +173,9 @@ impl SpineBackend for FirestoreSpineBackend {
 
     fn add_cross_repo_edge(&self, edge: CrossRepoEdge) {
         // Write-through: local cache + durable store.
-        self.cache.add_cross_repo_edge(edge.clone());
+        if !self.cache.index().add_cross_repo_edge(edge.clone()) {
+            return;
+        }
 
         if let Err(e) = self.store.write_edge(&edge) {
             error!(error = %e, "failed to write edge to store");
@@ -764,6 +770,25 @@ mod tests {
     }
 
     #[test]
+    fn hydrate_rejects_legacy_same_repo_edges_from_store() {
+        let store = Arc::new(FakeSpineStore::default());
+        store
+            .write_edge(&CrossRepoEdge {
+                src_repo: "kin".to_string(),
+                src_entity: EntityId::new(),
+                dst_repo: "kin".to_string(),
+                dst_entity: EntityId::new(),
+                confidence: 0.5,
+            })
+            .expect("seed legacy invalid edge");
+
+        let reader = FirestoreSpineBackend::with_store(store);
+        reader.hydrate().expect("hydrate");
+
+        assert_eq!(reader.edge_count(), 0);
+    }
+
+    #[test]
     fn hydrate_is_idempotent_and_guards_against_reload() {
         let store = Arc::new(FakeSpineStore::default());
         let writer = FirestoreSpineBackend::with_store(store.clone());
@@ -836,6 +861,23 @@ mod tests {
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].src_repo, "repo-a");
         assert_eq!(edges[0].dst_repo, "repo-b");
+    }
+
+    #[test]
+    fn add_cross_repo_edge_rejects_same_repo_before_persistence() {
+        let store = Arc::new(FakeSpineStore::default());
+        let backend = FirestoreSpineBackend::with_store(store.clone());
+
+        backend.add_cross_repo_edge(CrossRepoEdge {
+            src_repo: "repo-a".to_string(),
+            src_entity: EntityId::new(),
+            dst_repo: "repo-a".to_string(),
+            dst_entity: EntityId::new(),
+            confidence: 0.5,
+        });
+
+        assert_eq!(backend.edge_count(), 0);
+        assert!(store.load_edges().unwrap().is_empty());
     }
 
     #[test]
