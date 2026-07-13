@@ -16,7 +16,7 @@ graph on top of content-addressable storage.
 
 ## What is Kin?
 
-Kin is the semantic system of record for AI-native software — your code as a graph of
+Kin is the system of record for AI-written software: your code as a graph of
 entities, relations, and intents, not a pile of files and diffs. AI agents and humans
 navigate it semantically, with provenance, review, and governance built in. It coexists
 with Git and projects graph truth back to a normal filesystem, so any tool works unchanged.
@@ -53,10 +53,10 @@ println!("{h}");
 
 ## Key types
 
-- `BlobStore` — filesystem-backed store: `write`, `read`, `exists`, `delete`,
+- `BlobStore`: filesystem-backed store with `write`, `read`, `exists`, `delete`,
   `list_hashes`, and garbage collection (`gc`) against a live set.
-- `Hash256` — 256-bit content hash (SHA-256), with hex parsing/formatting.
-- `digest()` / `digest_bytes()` — content-hash computation helpers.
+- `Hash256`: 256-bit content hash (SHA-256), with hex parsing and formatting.
+- `digest()` / `digest_bytes()`: content-hash computation helpers.
 
 ## License
 
