@@ -7,7 +7,7 @@ version = "0.1.6"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Troy Fortin <troy@firelock.ai>"]
-description = "Pure-Rust HNSW approximate nearest-neighbor search — no C++ FFI, no platform-specific build scripts"
+description = "Pure-Rust HNSW approximate nearest-neighbor search. No C++ FFI, no platform-specific build scripts"
 repository = "https://github.com/firelock-ai/kin-vector"
 
 [lib]
