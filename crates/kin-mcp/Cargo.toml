@@ -6,7 +6,7 @@ name = "kin-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "MCP server for Kin — assistant-neutral integration"
+description = "MCP server for Kin: assistant-neutral integration"
 
 [dependencies]
 kin-core = { workspace = true }

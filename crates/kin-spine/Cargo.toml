@@ -6,7 +6,7 @@ name = "kin-spine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Federation spine — cross-repo metadata index and query routing"
+description = "Federation spine: cross-repo metadata index and query routing"
 
 [lib]
 doctest = false
