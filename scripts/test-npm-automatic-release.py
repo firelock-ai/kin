@@ -16,9 +16,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"
 PUBLISHER = SCRIPTS / "publish-npm-release.sh"
-VERSION = "0.2.19"
-OLD_VERSION = "0.2.18"
-NEWER_VERSION = "0.2.20"
+VERSION = "0.2.20"
+OLD_VERSION = "0.2.19"
+NEWER_VERSION = "0.2.21"
 REF = f"refs/tags/v{VERSION}"
 PACKAGE = "@kinlab/kin"
 OTHER_PACKAGE = "@kinlab/kin-mcp"
@@ -417,7 +417,7 @@ def test_symlinked_checkout_runs_channel_and_rollback_preflight() -> None:
     assert result.returncode == 0, result.stderr
     assert snapshot.get("channel_reads") == 1
     assert snapshot.get("rollback_checks") == 1
-    assert "latest=0.2.18" in result.stdout
+    assert "latest=0.2.19" in result.stdout
     assert "no registry mutation performed" in result.stdout
     assert not any(command[:1] == ["publish"] for command in snapshot["commands"])
     print("PASS: symlinked checkout executes channel and rollback preflight")
@@ -504,7 +504,7 @@ def test_newer_channel_during_publish_blocks_finalization() -> None:
     actual = json.loads(snapshot["state.json"])
     assert VERSION in actual["public"][PACKAGE]
     assert actual["tags"][PACKAGE]["latest"] == NEWER_VERSION
-    assert "resolves to 0.2.20" in result.stderr
+    assert "resolves to 0.2.21" in result.stderr
     assert "GitHub Latest remains blocked" in result.stderr
     assert "verify.json" in snapshot
     print("PASS: concurrent channel advancement leaves GitHub Latest blocked")

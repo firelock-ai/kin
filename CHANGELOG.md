@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.20] - 2026-07-13
+
+This patch makes cross-repository spine evidence fail closed when a resolver or
+legacy durable record describes an impossible same-repository relationship.
+
+### Fixed
+
+- Cross-repository import resolution no longer resolves an import back into its
+  source repository, and materialization counts only edges accepted by the spine.
+- The spine index and Firestore persistence boundary reject same-repository
+  cross-repo edges. Legacy invalid rows are ignored during hydration instead of
+  being restored as public cross-repository evidence.
+
 ## [0.2.19] - 2026-07-13
 
 This patch restores legacy graph snapshot reopening, makes Python rename review
@@ -535,7 +548,8 @@ Historical note: this snapshot predates the public GitHub prerelease series and 
 - Daemon mode for background file watching (`kin-daemon`)
 - 19-crate workspace architecture
 
-[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.19...HEAD
+[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.20...HEAD
+[0.2.20]: https://github.com/firelock-ai/kin/compare/v0.2.19...v0.2.20
 [0.2.19]: https://github.com/firelock-ai/kin/compare/v0.2.18...v0.2.19
 [0.2.18]: https://github.com/firelock-ai/kin/compare/v0.2.17...v0.2.18
 [0.2.17]: https://github.com/firelock-ai/kin/compare/v0.2.16...v0.2.17
