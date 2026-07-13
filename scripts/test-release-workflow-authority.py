@@ -28,7 +28,6 @@ def main() -> None:
     retired = (
         "auto-tag-release.yml",
         "daemon-image.yml",
-        "kin-dependency-wave.yml",
         "publish-install-scripts.yml",
     )
     for name in retired:
@@ -660,10 +659,38 @@ def main() -> None:
                 f"{workflow.name} exposes branch-selectable dispatch with a release-capable secret"
             )
 
+    dependency_wave = (WORKFLOWS / "kin-dependency-wave.yml").read_text(
+        encoding="utf-8"
+    )
+    dependency_pin = "d06908b534ad5a70bb0f39a1b2b8d6228acf70a4"
+    for policy in (
+        "types: [kin-registry-release]",
+        'cron: "17 * * * *"',
+        "contents: read",
+        "cancel-in-progress: false",
+        "environment: release-followups",
+        "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
+        "secrets.KIN_RELEASE_APP_ID",
+        "secrets.KIN_RELEASE_APP_PRIVATE_KEY",
+        "repositories: kin",
+        "permission-contents: write",
+        "permission-pull-requests: write",
+        "skip-token-revoke: true",
+        "needs: app-token",
+        f"cargo-dependency-wave.yml@{dependency_pin}",
+        f"kin-actions-ref: {dependency_pin}",
+        "KIN_CI_BOT_TOKEN: ${{ needs.app-token.outputs.token }}",
+    ):
+        require(dependency_wave, policy, "dependency-wave recovery workflow")
+    if "workflow_dispatch" in dependency_wave:
+        raise AssertionError(
+            "dependency wave must not expose branch-selectable workflow_dispatch"
+        )
+
     print(
         "release workflow authority is tag-only, protected, pinned, GCP-free, "
         "cross-platform byte-canonical, and npm automatic through short-lived "
-        "OIDC with post-public proof"
+        "OIDC with post-public proof; dependency-wave recovery is active"
     )
 
 

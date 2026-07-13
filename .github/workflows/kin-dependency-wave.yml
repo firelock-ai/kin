@@ -1,0 +1,54 @@
+name: Kin Dependency Wave
+
+on:
+  repository_dispatch:
+    types: [kin-registry-release]
+  schedule:
+    # Recover any missed registry callback by resolving every watched crate.
+    - cron: "17 * * * *"
+
+# The reusable workflow receives the dedicated PR token below. Keep the
+# per-run GITHUB_TOKEN read-only so a caller-controlled token cannot become a
+# second write path.
+permissions:
+  contents: read
+
+concurrency:
+  group: kin-registry-dependency-wave
+  cancel-in-progress: false
+
+jobs:
+  app-token:
+    # The private key stays behind a main-only environment. The minted token is
+    # scoped to this repository and expires automatically after one hour.
+    runs-on: ubuntu-latest
+    environment: release-followups
+    outputs:
+      token: ${{ steps.app-token.outputs.token }}
+    steps:
+      - name: Mint dependency-wave GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.KIN_RELEASE_APP_ID }}
+          private-key: ${{ secrets.KIN_RELEASE_APP_PRIVATE_KEY }}
+          owner: firelock-ai
+          repositories: kin
+          permission-contents: write
+          permission-pull-requests: write
+          # The reusable workflow runs in the next job. The token remains
+          # short-lived and cannot outlive GitHub App installation policy.
+          skip-token-revoke: true
+
+  dependency-wave:
+    # Keep both the reusable workflow and its helper checkout pinned to the
+    # same reviewed kin-actions commit. Do not add a manual trigger: it could
+    # select branch-controlled caller code while carrying the PR token.
+    needs: app-token
+    uses: firelock-ai/kin-actions/.github/workflows/cargo-dependency-wave.yml@d06908b534ad5a70bb0f39a1b2b8d6228acf70a4 # v0.1.9
+    with:
+      manifests: Cargo.toml
+      test-command: cargo check -p kin-core -p kin-cli -p kin-daemon -p kin-mcp
+      kin-actions-ref: d06908b534ad5a70bb0f39a1b2b8d6228acf70a4
+    secrets:
+      KIN_CI_BOT_TOKEN: ${{ needs.app-token.outputs.token }}
