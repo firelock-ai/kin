@@ -3,7 +3,7 @@
 
 [package]
 name = "kin-model"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 license = "Apache-2.0"
 description = "Canonical types for Kin semantic VCS"
@@ -24,3 +24,4 @@ schemars = { version = "0.8", features = ["chrono", "uuid1"] }
 
 [dev-dependencies]
 pretty_assertions = "1"
+rmp-serde = "1"
