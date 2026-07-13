@@ -8,7 +8,7 @@ tokenization and no external search-engine dependency. It splits identifiers
 write them.
 
 It is a low-level retrieval primitive in the open Kin local substrate. Higher
-layers — notably `kin-db` — compose it with vector retrieval and graph
+layers, notably `kin-db`, compose it with vector retrieval and graph
 structure; Kin's ranking and proof-weighting policy lives above this crate, not
 inside it.
 
@@ -17,7 +17,7 @@ inside it.
 
 ## What is Kin?
 
-Kin is the system of record for AI-written software — your code as a graph of
+Kin is the system of record for AI-written software: your code as a graph of
 entities, relations, and intents, not a pile of files and diffs. AI agents and humans
 navigate it semantically, with provenance, review, and governance built in. It coexists
 with Git and projects graph truth back to a normal filesystem, so any tool works unchanged.
@@ -39,7 +39,7 @@ use kin_search::TextIndex;
 // Build an in-memory BM25 index over any key type.
 let index: TextIndex<u64> = TextIndex::new();
 
-// Index documents by weighted text fields (name, signature, path, …).
+// Index documents by weighted text fields (name, signature, path, and so on).
 index.upsert(1, &[("render_frame", 5.0), ("graphics pipeline step", 2.0)])?;
 index.upsert(2, &[("parse_tokens", 5.0), ("lexer token stream", 2.0)])?;
 
@@ -52,10 +52,10 @@ for (id, score) in hits {
 
 ## Key types
 
-- `TextIndex<Id>` — the index, generic over a document-key type.
-- `DocId` — blanket trait for usable key types (`Copy + Eq + Hash + Send + Sync + Debug`).
-- `Searchable` — implement to auto-extract searchable fields from your own types.
-- `tokenize()` — the public code-aware tokenizer.
+- `TextIndex<Id>`: the index, generic over a document-key type.
+- `DocId`: blanket trait for usable key types (`Copy + Eq + Hash + Send + Sync + Debug + 'static`).
+- `Searchable`: implement to auto-extract searchable fields from your own types.
+- `tokenize()`: the public code-aware tokenizer.
 
 ## License
 
