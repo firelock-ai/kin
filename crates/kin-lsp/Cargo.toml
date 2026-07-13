@@ -6,7 +6,7 @@ name = "kin-lsp"
 version = "0.2.2"
 edition = "2021"
 license = "Apache-2.0"
-description = "LSP client for graph enrichment — type-resolved relations via language servers"
+description = "LSP client for graph enrichment: type-resolved relations via language servers"
 repository = "https://github.com/firelock-ai/kin-lsp"
 authors = ["Troy Fortin <troy@firelock.ai>"]
 
