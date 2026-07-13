@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.21] - 2026-07-13
+
+This patch gives hosted clients one bounded, graph-authoritative read of the
+cross-repository edge universe while keeping completeness fail closed during
+authority changes and durable-cache recovery.
+
+### Added
+
+- The protected `GET /v1/spine/edges` route returns a deterministic snapshot
+  with an explicit completeness marker, revision, repo and root watermark, and
+  sorted, deduplicated cross-repository edges.
+
+### Fixed
+
+- Repository authority changes now invalidate global edge completeness, and
+  per-source refreshes are serialized, computed separately, and installed
+  atomically before dirty state can clear.
+- Firestore hydration is treated as a warm-start cache rather than proof
+  authority. Mixed roots, orphan endpoints, empty roots, and partial refreshes
+  keep the snapshot incomplete until graph-authoritative rebuilding succeeds.
+
 ## [0.2.20] - 2026-07-13
 
 This patch makes cross-repository spine evidence fail closed when a resolver or
@@ -548,7 +569,8 @@ Historical note: this snapshot predates the public GitHub prerelease series and 
 - Daemon mode for background file watching (`kin-daemon`)
 - 19-crate workspace architecture
 
-[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.20...HEAD
+[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.21...HEAD
+[0.2.21]: https://github.com/firelock-ai/kin/compare/v0.2.20...v0.2.21
 [0.2.20]: https://github.com/firelock-ai/kin/compare/v0.2.19...v0.2.20
 [0.2.19]: https://github.com/firelock-ai/kin/compare/v0.2.18...v0.2.19
 [0.2.18]: https://github.com/firelock-ai/kin/compare/v0.2.17...v0.2.18
