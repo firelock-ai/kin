@@ -23,6 +23,5 @@ thiserror = "2"
 schemars = { version = "0.8", features = ["chrono", "uuid1"] }
 
 [dev-dependencies]
-bincode = "1"
 pretty_assertions = "1"
 rmp-serde = "1"

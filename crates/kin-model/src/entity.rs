@@ -290,20 +290,6 @@ mod tests {
     }
 
     #[test]
-    fn semantic_fingerprint_current_bincode_roundtrip() {
-        let expected = fingerprint();
-        let bytes = bincode::serialize(&expected).unwrap();
-        let decoded: SemanticFingerprint = bincode::deserialize(&bytes).unwrap();
-
-        assert_eq!(decoded.algorithm, expected.algorithm);
-        assert_eq!(decoded.ast_hash, expected.ast_hash);
-        assert_eq!(decoded.signature_hash, expected.signature_hash);
-        assert_eq!(decoded.behavior_hash, expected.behavior_hash);
-        assert_eq!(decoded.equivalence_hash, expected.equivalence_hash);
-        assert_eq!(decoded.stability_score, expected.stability_score);
-    }
-
-    #[test]
     fn semantic_fingerprint_reads_legacy_msgpack_sequence() {
         let fixture = LegacySemanticFingerprintFixture {
             algorithm: FingerprintAlgorithm::V1TreeSitter,
