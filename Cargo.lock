@@ -3203,9 +3203,9 @@ dependencies = [
 
 [[package]]
 name = "kin-db"
-version = "0.2.35"
+version = "0.2.37"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "575441e5874da45a01d89bf45e35c5729875ba12d4a062d1bc3443e811163c0d"
+checksum = "2950735f6cc9d43efd579d2a1d34f9f7c36cc5c4b48b64e2e026ad7298fa6e87"
 dependencies = [
  "bincode",
  "bytes",
@@ -3403,9 +3403,9 @@ dependencies = [
 
 [[package]]
 name = "kin-model"
-version = "0.2.4"
+version = "0.2.5"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "3e21480583d921a38f4c1d781a76ab6e058e55e5944ca47000089f9a4236fd00"
+checksum = "f0fb9f21abc67a9f9c1374e6d8f304ca496fba96d98586fa3a8ff0ca2d5a91bd"
 dependencies = [
  "chrono",
  "hex",

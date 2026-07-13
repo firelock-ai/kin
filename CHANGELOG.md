@@ -9,9 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.19] - 2026-07-12
 
-This patch makes Python rename review fail closed on incomplete evidence, hardens
-the post-release follow-up boundary, and aligns the public OSS surface with the
-behavior and proof that Kin actually ships.
+This patch restores legacy graph snapshot reopening, makes Python rename review
+fail closed on incomplete evidence, hardens the post-release follow-up boundary,
+and aligns the public OSS surface with the behavior and proof that Kin actually
+ships.
 
 ### Changed
 
@@ -26,6 +27,10 @@ behavior and proof that Kin actually ships.
 
 ### Fixed
 
+- Daemon reopen now reads persisted graph snapshots whose positional
+  `SemanticFingerprint` records predate `equivalence_hash`; the missing field uses
+  the zero not-computed sentinel, while current six-field fingerprints preserve
+  their recorded value.
 - Python parameter rename review now preserves declaration defaults and every
   call-site shape. Default changes, incomplete call coverage, ambiguous receiver
   resolution, and otherwise unproven calls remain blocking.
