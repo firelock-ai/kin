@@ -7,7 +7,7 @@ version = "0.2.40"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Troy Fortin <troy@firelock.ai>"]
-description = "Universal transformer inference engine — pure Rust, GPU-accelerated (Metal, CUDA)"
+description = "Universal transformer inference engine, pure Rust, GPU-accelerated (Metal, CUDA)"
 repository = "https://github.com/firelock-ai/kin-infer"
 
 [lib]
