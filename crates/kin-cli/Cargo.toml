@@ -92,6 +92,7 @@ serial_test = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+rustix = { workspace = true }
 
 # macOS-only: re-enable the Metal embedding backend (kin-db/metal -> kin-infer/metal).
 # Feature unification is additive, so on macOS kin-db is built with metal; on Linux this

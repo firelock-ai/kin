@@ -1708,6 +1708,23 @@ pub(crate) fn reinstall_vfs_shim() -> Result<Option<PathBuf>> {
 /// Used by `kin doctor --fix` to repair `mcp_client_*` checks. Returns the
 /// paths that were re-merged.
 pub(crate) fn remerge_existing_mcp_configs() -> Vec<PathBuf> {
+    let outcome = remerge_existing_mcp_configs_detailed();
+    for error in outcome.errors {
+        eprintln!("WARNING: could not refresh a Kin MCP entry: {error}");
+    }
+    outcome.repaired
+}
+
+/// Strict updater-facing MCP repair result. Unlike the historical convenience
+/// wrapper, this preserves every per-client failure so the self-updater can
+/// retain its durable repair marker until all intended merges succeed.
+#[derive(Debug, Default)]
+pub(crate) struct McpRemergeOutcome {
+    pub(crate) repaired: Vec<PathBuf>,
+    pub(crate) errors: Vec<String>,
+}
+
+pub(crate) fn remerge_existing_mcp_configs_detailed() -> McpRemergeOutcome {
     let repo_root = discover_setup_repo_root().ok();
     remerge_mcp_config_paths(
         crate::commands::health::mcp_client_config_paths(),
@@ -1722,8 +1739,8 @@ fn remerge_mcp_config_paths(
     antigravity_detected: bool,
     codex_detected: bool,
     repo_root: Option<&Path>,
-) -> Vec<PathBuf> {
-    let mut repaired = Vec::new();
+) -> McpRemergeOutcome {
+    let mut outcome = McpRemergeOutcome::default();
     for (id, label, path) in configs {
         // Detected clients with no config are real missing setup artifacts.
         // New global Codex/Antigravity entries are cwd-free and safe to create
@@ -1751,14 +1768,13 @@ fn remerge_mcp_config_paths(
             merge_mcp_config(&path)
         };
         match merged {
-            Ok(()) => repaired.push(path),
-            Err(error) => eprintln!(
-                "WARNING: could not refresh the {label} Kin MCP entry at {}: {error:#}",
-                path.display()
-            ),
+            Ok(()) => outcome.repaired.push(path),
+            Err(error) => outcome
+                .errors
+                .push(format!("{label} at {}: {error:#}", path.display())),
         }
     }
-    repaired
+    outcome
 }
 
 // ---------------------------------------------------------------------------
@@ -3741,7 +3757,7 @@ mod tests {
             Some(&repo),
         );
 
-        assert_eq!(repaired, vec![primary.clone()]);
+        assert_eq!(repaired.repaired, vec![primary.clone()]);
         assert!(has_kin_mcp_config(&primary));
         let root: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&primary).unwrap()).unwrap();
@@ -3768,7 +3784,7 @@ mod tests {
             Some(&repo),
         );
 
-        assert_eq!(repaired, vec![path.clone()]);
+        assert_eq!(repaired.repaired, vec![path.clone()]);
         let root: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(root["model"].as_str(), Some("o3"));
         assert_eq!(

@@ -845,6 +845,14 @@ enum Command {
         /// Emit the check-only result as JSON
         #[arg(long, requires = "check_only")]
         json: bool,
+        /// Acknowledge that daemon, MCP, and VFS sessions were restarted after
+        /// the installed update. This clears the durable acknowledgement marker
+        /// only when the running CLI exactly matches the recorded release.
+        #[arg(
+            long,
+            conflicts_with_all = ["skip_verify", "channel", "check_only", "json"]
+        )]
+        ack_restart: bool,
     },
     /// Show or manage the global Kin repository registry
     Registry {
@@ -2755,7 +2763,10 @@ fn main() -> Result<()> {
                     channel,
                     check_only,
                     json,
-                } => commands::update::run(skip_verify, channel, check_only, json).await,
+                    ack_restart,
+                } => {
+                    commands::update::run(skip_verify, channel, check_only, json, ack_restart).await
+                }
                 Command::Registry { action } => match action {
                     Some(RegistryAction::Daemons { json }) => {
                         commands::registry::daemons(json).await
