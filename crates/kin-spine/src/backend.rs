@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use kin_model::{Entity, EntityId, EntityKind, Relation, SemanticFingerprint};
 
 use crate::federation::{self, FederatedImpact};
-use crate::index::{CrossRepoEdge, EntityEntry, SpineIndex};
+use crate::index::{CrossRepoEdge, CrossRepoEdgesSnapshot, EntityEntry, SpineIndex};
 
 /// Error type for spine backend operations.
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +56,15 @@ pub trait SpineBackend: Send + Sync {
 
     /// Get cross-repo edges involving a specific entity.
     fn cross_repo_edges_for(&self, repo_id: &str, entity_id: &EntityId) -> Vec<CrossRepoEdge>;
+
+    /// Atomically capture the complete graph-authoritative cross-repo edge set.
+    ///
+    /// The fail-closed default preserves source compatibility for external
+    /// patch-release implementers of this trait. Backends must override it only
+    /// when they can provide one atomic authority capture.
+    fn cross_repo_edges_snapshot(&self) -> CrossRepoEdgesSnapshot {
+        CrossRepoEdgesSnapshot::default()
+    }
 
     /// Add a cross-repo edge.
     fn add_cross_repo_edge(&self, edge: CrossRepoEdge);
@@ -143,6 +152,10 @@ impl SpineBackend for InMemorySpineBackend {
         self.index.cross_repo_edges_for(repo_id, entity_id)
     }
 
+    fn cross_repo_edges_snapshot(&self) -> CrossRepoEdgesSnapshot {
+        self.index.cross_repo_edges_snapshot()
+    }
+
     fn add_cross_repo_edge(&self, edge: CrossRepoEdge) {
         self.index.add_cross_repo_edge(edge);
     }
@@ -193,6 +206,57 @@ mod tests {
     use super::*;
     use kin_model::{FingerprintAlgorithm, Hash256, SemanticFingerprint};
 
+    struct PatchCompatibleBackend;
+
+    impl SpineBackend for PatchCompatibleBackend {
+        fn register_repo(&self, _: &str, _: Vec<EntityEntry>, _: &str) {}
+
+        fn resolve(
+            &self,
+            _: &str,
+            _: Option<EntityKind>,
+            _: Option<&SemanticFingerprint>,
+        ) -> Vec<EntityEntry> {
+            Vec::new()
+        }
+
+        fn lookup_by_id(&self, _: &str, _: &EntityId) -> Option<EntityEntry> {
+            None
+        }
+
+        fn cross_repo_edges_for(&self, _: &str, _: &EntityId) -> Vec<CrossRepoEdge> {
+            Vec::new()
+        }
+
+        fn add_cross_repo_edge(&self, _: CrossRepoEdge) {}
+
+        fn root_hash(&self, _: &str) -> Option<String> {
+            None
+        }
+
+        fn entity_count(&self) -> usize {
+            0
+        }
+
+        fn repo_count(&self) -> usize {
+            0
+        }
+
+        fn edge_count(&self) -> usize {
+            0
+        }
+
+        fn registered_repo_ids(&self) -> HashSet<String> {
+            HashSet::new()
+        }
+
+        fn refresh_cross_repo_edges(&self, _: &str, _: &[Entity], _: &[Relation], _: &[String]) {}
+
+        fn federated_impact(&self, _: &str, _: &EntityId, _: u32) -> FederatedImpact {
+            panic!("not used by compatibility test")
+        }
+    }
+
     fn test_fp() -> SemanticFingerprint {
         SemanticFingerprint {
             ast_hash: Hash256::from_bytes([1; 32]),
@@ -202,6 +266,16 @@ mod tests {
             equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
             stability_score: 1.0,
         }
+    }
+
+    #[test]
+    fn snapshot_method_default_is_patch_compatible_and_fail_closed() {
+        let snapshot = PatchCompatibleBackend.cross_repo_edges_snapshot();
+        assert!(!snapshot.complete);
+        assert!(snapshot.repos.is_empty());
+        assert!(snapshot.roots.is_empty());
+        assert!(snapshot.edges.is_empty());
+        assert!(snapshot.revision.starts_with("sha256:"));
     }
 
     fn test_entry(repo: &str, name: &str, kind: EntityKind) -> EntityEntry {

@@ -270,6 +270,23 @@ pub fn materialize_edges(
     resolutions: &[(usize, ResolveResult)],
 ) -> usize {
     let mut count = 0;
+    for edge in materialized_edges(imports, resolutions) {
+        if index.add_cross_repo_edge(edge) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Build the cross-repo edges represented by a resolved import batch without
+/// mutating the index. The refresh path uses this to replace one source repo's
+/// entire outgoing set under a single write lock, so concurrent readers can
+/// never observe a union assembled by interleaved per-edge writes.
+pub(crate) fn materialized_edges(
+    imports: &[UnresolvedImport],
+    resolutions: &[(usize, ResolveResult)],
+) -> Vec<CrossRepoEdge> {
+    let mut edges = Vec::new();
 
     for (i, result) in resolutions {
         let import = &imports[*i];
@@ -280,27 +297,29 @@ pub fn materialize_edges(
                 target_entity,
                 confidence,
             } => {
-                if index.add_cross_repo_edge(CrossRepoEdge {
+                let edge = CrossRepoEdge {
                     src_repo: import.source_repo.clone(),
                     src_entity: import.source_entity,
                     dst_repo: target_repo.clone(),
                     dst_entity: *target_entity,
                     confidence: *confidence,
-                }) {
-                    count += 1;
+                };
+                if edge.src_repo != edge.dst_repo {
+                    edges.push(edge);
                 }
             }
             ResolveResult::Ambiguous { candidates } => {
                 // Add edges for all candidates with their confidence scores
                 for (repo, entity_id, confidence) in candidates {
-                    if index.add_cross_repo_edge(CrossRepoEdge {
+                    let edge = CrossRepoEdge {
                         src_repo: import.source_repo.clone(),
                         src_entity: import.source_entity,
                         dst_repo: repo.clone(),
                         dst_entity: *entity_id,
                         confidence: *confidence,
-                    }) {
-                        count += 1;
+                    };
+                    if edge.src_repo != edge.dst_repo {
+                        edges.push(edge);
                     }
                 }
             }
@@ -308,7 +327,7 @@ pub fn materialize_edges(
         }
     }
 
-    count
+    edges
 }
 
 /// Derive the real imported symbol name for a cross-repo reference from the

@@ -833,6 +833,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/spine/resolve", get(spine_resolve))
         .route("/spine/impact", get(spine_impact))
         .route("/spine/xref", get(spine_xref))
+        .route("/spine/edges", get(spine_edges))
         .route("/spine/repos/{repo_id}/ingest", post(spine_ingest_repo))
         .route(
             "/spine/refresh-cross-repo-edges",
@@ -7588,6 +7589,19 @@ struct SpineXrefParams {
     entity: String,
 }
 
+/// Stable wire response for the canonical `GET /v1/spine/edges` bulk read.
+/// Field order plus the snapshot's canonical collections make identical graph
+/// authority serialize to identical response bytes.
+#[derive(Debug, Serialize)]
+struct SpineEdgesResponse {
+    version: u32,
+    complete: bool,
+    revision: String,
+    repos: Vec<String>,
+    roots: std::collections::BTreeMap<String, String>,
+    edges: Vec<kin_spine::CrossRepoEdge>,
+}
+
 /// GET /spine/health — spine liveness check.
 async fn spine_health(
     State(state): State<Arc<DaemonState>>,
@@ -7688,6 +7702,33 @@ async fn spine_xref(
     Ok(Json(
         json!({ "version": kin_spine::SPINE_PAYLOAD_VERSION, "edges": edges }),
     ))
+}
+
+/// `GET /v1/spine/edges` — one atomic graph-authoritative cross-repo snapshot.
+///
+/// This is a read-only protected daemon route. It returns the complete edge
+/// universe held by the spine in deterministic order, rather than sampling
+/// per-entity `/spine/xref` responses. The backend supplies the root watermark
+/// and only marks the result complete when its authority view is complete.
+async fn spine_edges(
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let spine = state.ensure_spine().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "spine disabled via KIN_DISABLE_SPINE".to_string(),
+        )
+    })?;
+    let snapshot = spine.cross_repo_edges_snapshot();
+
+    Ok(Json(SpineEdgesResponse {
+        version: kin_spine::SPINE_PAYLOAD_VERSION,
+        complete: snapshot.complete,
+        revision: snapshot.revision,
+        repos: snapshot.repos,
+        roots: snapshot.roots,
+        edges: snapshot.edges,
+    }))
 }
 
 /// Body for `POST /spine/repos/{repo_id}/ingest`.
@@ -12211,6 +12252,36 @@ mod tests {
         }
     }
 
+    fn spine_test_entry(repo_id: &str, entity: &kin_model::Entity) -> kin_spine::EntityEntry {
+        kin_spine::EntityEntry {
+            repo_id: repo_id.to_string(),
+            entity_id: entity.id,
+            name: entity.name.clone(),
+            kind: entity.kind,
+            signature: entity.signature.clone(),
+            fingerprint: entity.fingerprint.clone(),
+            file_path: entity.file_origin.as_ref().map(|path| path.0.clone()),
+            role: Some(entity.role),
+        }
+    }
+
+    fn spine_test_entry_with_id(
+        repo_id: &str,
+        entity_id: EntityId,
+        name: &str,
+    ) -> kin_spine::EntityEntry {
+        kin_spine::EntityEntry {
+            repo_id: repo_id.to_string(),
+            entity_id,
+            name: name.to_string(),
+            kind: kin_model::EntityKind::Function,
+            signature: format!("fn {name}()"),
+            fingerprint: spine_test_fingerprint(),
+            file_path: Some(format!("src/{name}.rs")),
+            role: Some(kin_model::EntityRole::Source),
+        }
+    }
+
     fn parse_consumer_source(file_path: &str, source: &str) -> kin_index::FileParseData {
         let registry = kin_parser::AdapterRegistry::new();
         let ext = std::path::Path::new(file_path)
@@ -12243,17 +12314,9 @@ mod tests {
     /// path, and fail loud rather than return an empty impact.
     #[tokio::test]
     async fn spine_impact_and_xref_serve_real_cross_repo_fixture() {
-        let do_work_id = EntityId::new();
-        let provider_entry = kin_spine::EntityEntry {
-            repo_id: "provider".to_string(),
-            entity_id: do_work_id,
-            name: "do_work".to_string(),
-            kind: kin_model::EntityKind::Function,
-            signature: "fn do_work()".to_string(),
-            fingerprint: spine_test_fingerprint(),
-            file_path: Some("src/lib.rs".to_string()),
-            role: Some(kin_model::EntityRole::Source),
-        };
+        let provider_entity = test_entity("do_work", "src/lib.py");
+        let do_work_id = provider_entity.id;
+        let provider_entry = spine_test_entry("provider", &provider_entity);
 
         let consumer = parse_consumer_source(
             "src/app.rs",
@@ -12269,13 +12332,34 @@ mod tests {
 
         let state = test_state();
         let spine = state.ensure_spine().expect("spine enabled in test");
-        spine.register_repo("provider", vec![provider_entry], "");
-        spine.refresh_cross_repo_edges(
+        spine.register_repo("provider", vec![provider_entry], "provider-root");
+        spine.register_repo(
             "consumer",
-            &consumer_entities,
-            &consumer_relations,
-            &["provider".to_string()],
+            consumer_entities
+                .iter()
+                .map(|entity| spine_test_entry("consumer", entity))
+                .collect(),
+            "consumer-root",
         );
+        let mut registry = spine.registered_repo_ids().into_iter().collect::<Vec<_>>();
+        registry.sort();
+        for repo in &registry {
+            match repo.as_str() {
+                "provider" => spine.refresh_cross_repo_edges(
+                    repo,
+                    std::slice::from_ref(&provider_entity),
+                    &[],
+                    &registry,
+                ),
+                "consumer" => spine.refresh_cross_repo_edges(
+                    repo,
+                    &consumer_entities,
+                    &consumer_relations,
+                    &registry,
+                ),
+                _ => spine.refresh_cross_repo_edges(repo, &[], &[], &registry),
+            }
+        }
         assert!(
             spine.edge_count() >= 1,
             "fixture must materialize a cross-repo edge (parse -> link -> spine)"
@@ -12316,6 +12400,30 @@ mod tests {
             "/spine/xref payload must carry the spine wire-format version"
         );
 
+        let snapshot = app
+            .clone()
+            .oneshot(Request::get("/v1/spine/edges").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(snapshot.status(), StatusCode::OK);
+        let snapshot_body = axum::body::to_bytes(snapshot.into_body(), 65536)
+            .await
+            .unwrap();
+        let snapshot_json: serde_json::Value = serde_json::from_slice(&snapshot_body).unwrap();
+        assert_eq!(
+            snapshot_json["version"],
+            serde_json::json!(kin_spine::SPINE_PAYLOAD_VERSION)
+        );
+        assert_eq!(snapshot_json["complete"], true);
+        assert!(snapshot_json["revision"]
+            .as_str()
+            .is_some_and(|revision| revision.starts_with("sha256:") && revision.len() == 71));
+        assert!(snapshot_json["edges"]
+            .as_array()
+            .expect("bulk snapshot edges")
+            .iter()
+            .any(|edge| edge["src_repo"] == "consumer" && edge["dst_repo"] == "provider"));
+
         let impact = app
             .oneshot(
                 Request::get(format!(
@@ -12348,6 +12456,101 @@ mod tests {
             ibody["version"],
             serde_json::json!(kin_spine::SPINE_PAYLOAD_VERSION),
             "/spine/impact payload must carry the spine wire-format version"
+        );
+    }
+
+    #[tokio::test]
+    async fn spine_edges_snapshot_is_stable_deduped_and_never_reads_source_files() {
+        let state = test_state();
+        let spine = state.ensure_spine().expect("spine enabled in test");
+        let alpha = EntityId::from_content("src/a.rs", "alpha", "function", 1);
+        let beta = EntityId::from_content("src/b.rs", "beta", "function", 1);
+        let gamma = EntityId::from_content("src/c.rs", "gamma", "function", 1);
+        spine.register_repo(
+            "alpha",
+            vec![spine_test_entry_with_id("alpha", alpha, "alpha")],
+            "root-a",
+        );
+        spine.register_repo(
+            "beta",
+            vec![spine_test_entry_with_id("beta", beta, "beta")],
+            "root-b",
+        );
+        spine.register_repo(
+            "gamma",
+            vec![spine_test_entry_with_id("gamma", gamma, "gamma")],
+            "root-c",
+        );
+        let mut registry = spine.registered_repo_ids().into_iter().collect::<Vec<_>>();
+        registry.sort();
+        for repo in &registry {
+            spine.refresh_cross_repo_edges(repo, &[], &[], &registry);
+        }
+
+        let first_edge = kin_spine::CrossRepoEdge {
+            src_repo: "alpha".to_string(),
+            src_entity: alpha,
+            dst_repo: "beta".to_string(),
+            dst_entity: beta,
+            confidence: 0.9,
+        };
+        let second_edge = kin_spine::CrossRepoEdge {
+            src_repo: "beta".to_string(),
+            src_entity: beta,
+            dst_repo: "gamma".to_string(),
+            dst_entity: gamma,
+            confidence: 0.8,
+        };
+        spine.add_cross_repo_edge(second_edge);
+        spine.add_cross_repo_edge(first_edge.clone());
+        spine.add_cross_repo_edge(kin_spine::CrossRepoEdge {
+            confidence: 0.2,
+            ..first_edge.clone()
+        });
+        spine.add_cross_repo_edge(first_edge);
+
+        let workspace = state.layout.working_dir().to_path_buf();
+        let app = router(state);
+        let read_snapshot = |app: Router| async move {
+            let response = app
+                .oneshot(Request::get("/v1/spine/edges").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap()
+        };
+
+        let before = read_snapshot(app.clone()).await;
+        let repeated = read_snapshot(app.clone()).await;
+        assert_eq!(
+            before, repeated,
+            "unchanged authority must return stable bytes"
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        let edges = json["edges"].as_array().expect("snapshot edges");
+        assert_eq!(edges.len(), 2, "topology-duplicate edges must collapse");
+        assert_eq!(edges[0]["src_repo"], "alpha");
+        assert_eq!(edges[0]["confidence"], 0.9);
+        assert_eq!(edges[1]["src_repo"], "beta");
+        assert_eq!(json["complete"], true);
+
+        // A raw source file that names another repo must not affect this graph
+        // authority read. If the route walked/searched files as a fallback,
+        // either its bytes or revision would change here.
+        let source_dir = workspace.join("src");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(
+            source_dir.join("decoy.rs"),
+            "use unregistered::phantom; pub fn decoy() { phantom(); }\n",
+        )
+        .unwrap();
+        let after_decoy = read_snapshot(app).await;
+        assert_eq!(
+            before, after_decoy,
+            "bulk spine snapshot must never fall back to raw file search"
         );
     }
 
@@ -13063,6 +13266,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(accepted.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn spine_edges_snapshot_is_authenticated_and_read_only() {
+        let state = test_state();
+        let app = router_with_auth(state, Some("secret-token".to_string()));
+
+        let rejected = app
+            .clone()
+            .oneshot(Request::get("/v1/spine/edges").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+        let accepted = app
+            .oneshot(
+                Request::get("/v1/spine/edges")
+                    .header("authorization", "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        assert_eq!(accepted.headers()["X-Kin-API-Version"], "1");
     }
 
     #[tokio::test]

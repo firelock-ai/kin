@@ -26,6 +26,8 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 hashbrown = { version = "0.15", features = ["serde"] }
 parking_lot = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 # Optional: Firestore REST API support
 reqwest = { workspace = true, optional = true }
