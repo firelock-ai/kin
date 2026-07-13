@@ -7,12 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.19] - 2026-07-13
+
+This patch restores legacy graph snapshot reopening, makes Python rename review
+fail closed on incomplete evidence, hardens the post-release follow-up boundary,
+and aligns the public OSS surface with the behavior and proof that Kin actually
+ships.
+
 ### Changed
 
+- Post-release Homebrew and installer follow-ups are consolidated behind a
+  main-only protected environment and short-lived GitHub App authority. The
+  workflow remains dormant until its credentials are installed and
+  `RELEASE_FOLLOWUP_READY` is explicitly enabled.
 - Public positioning now separates citable retrieval evidence from report-only
   review behavior and links the artifact-backed public proof package.
 - External contributions now use the documented DCO sign-off only; the
   nonfunctional base-branch CLA allowlist gate has been removed.
+
+### Fixed
+
+- Daemon reopen now reads persisted graph snapshots whose positional
+  `SemanticFingerprint` records predate `equivalence_hash`; the missing field uses
+  the zero not-computed sentinel, while current six-field fingerprints preserve
+  their recorded value.
+- Python parameter rename review now preserves declaration defaults and every
+  call-site shape. Default changes, incomplete call coverage, ambiguous receiver
+  resolution, and otherwise unproven calls remain blocking.
 
 ## [0.2.18] - 2026-07-11
 
@@ -514,7 +535,8 @@ Historical note: this snapshot predates the public GitHub prerelease series and 
 - Daemon mode for background file watching (`kin-daemon`)
 - 19-crate workspace architecture
 
-[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.18...HEAD
+[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.19...HEAD
+[0.2.19]: https://github.com/firelock-ai/kin/compare/v0.2.18...v0.2.19
 [0.2.18]: https://github.com/firelock-ai/kin/compare/v0.2.17...v0.2.18
 [0.2.17]: https://github.com/firelock-ai/kin/compare/v0.2.16...v0.2.17
 [0.2.16]: https://github.com/firelock-ai/kin/compare/v0.2.15...v0.2.16
