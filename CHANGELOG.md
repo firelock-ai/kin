@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.19] - 2026-07-12
+## [0.2.19] - 2026-07-13
 
 This patch restores legacy graph snapshot reopening, makes Python rename review
 fail closed on incomplete evidence, hardens the post-release follow-up boundary,
