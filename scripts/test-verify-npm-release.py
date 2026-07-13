@@ -17,7 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 VERIFIER = ROOT / "scripts" / "verify-npm-release.sh"
 PACKAGE = "@kinlab/kin"
-VERSION = "0.2.20"
+VERSION = "0.2.21"
 REF = f"refs/tags/v{VERSION}"
 COMMIT = "a" * 40
 INTEGRITY_BYTES = bytes([7]) * 64
