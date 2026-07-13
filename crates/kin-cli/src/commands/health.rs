@@ -286,8 +286,7 @@ fn check_vfs_projection() -> HealthCheck {
 /// The durable step that repairs a missing or corrupt shim when `kin doctor
 /// --fix` cannot source one locally. It must NEVER name `kin doctor --fix`
 /// itself: this text is reprinted in the post-`--fix` "still needs manual steps"
-/// list, where pointing back at the command that just ran is a dead loop
-/// (FIR-1409).
+/// list, where pointing back at the command that just ran is a dead loop.
 const SHIM_REINSTALL_HINT: &str =
     "reinstall kin to restore the shim: curl -fsSL https://get.kinlab.dev/install | sh";
 
@@ -1103,7 +1102,7 @@ mod tests {
 
     #[test]
     fn vfs_remediation_never_points_back_at_the_failed_fix() {
-        // FIR-1409: the repair text for a broken shim must name a real working
+        // The repair text for a broken shim must name a real working
         // step, never `kin doctor --fix` (the command that just failed).
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing");
