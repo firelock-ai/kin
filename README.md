@@ -71,7 +71,9 @@ complete vector-enabled/projection experience, install under WSL2; see
 **For AI agents.** `kin setup --intent agent` wires Kin's built-in MCP server into every
 detected assistant with the curated `agent-default` tool profile. npm users can install the
 canonical launcher with `npm install -g @kinlab/kin@latest` and run the same setup
-command; the older `@kinlab/kin-mcp` package remains as a compatibility wrapper.
+command; the older `@kinlab/kin-mcp` package remains as a compatibility wrapper. Global
+Codex and Antigravity entries inherit the active workspace, and `kin init` automatically
+finishes Antigravity's repo-scoped `.agents/mcp_config.json` entry after installer-first setup.
 
 See [docs/quickstart.md](docs/quickstart.md) for installer environment variables
 (`KIN_VERSION`, `KIN_HOME`, `KIN_DIR`, `KIN_NO_SETUP`, `KIN_BASE_URL`) and daemon/runtime configuration.

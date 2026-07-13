@@ -9,11 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `kin setup` now pins Codex and Google Antigravity MCP launchers to the
-  discovered Kin repository root via `cwd`, detects Antigravity, and writes its
-  shared global config at `~/.gemini/config/mcp_config.json`. Existing retired
-  Gemini CLI settings remain supported by setup status, doctor repair, and the
-  install ledger.
+- `kin setup` now detects Google Antigravity and writes a cwd-free global
+  fallback at `~/.gemini/config/mcp_config.json`; inside a Kin repository it
+  also writes Antigravity's official `.agents/mcp_config.json` workspace entry.
+  `kin init` completes that workspace entry automatically when agent setup ran
+  before repository initialization. Codex's global MCP entry now inherits the
+  active workspace instead of pinning the last repository that ran setup.
+  Setup and doctor repairs preserve client-owned MCP policy fields, and the
+  install ledger records only config targets that were written successfully.
+  Existing retired Gemini CLI settings remain supported.
 
 ## [0.2.21] - 2026-07-13
 

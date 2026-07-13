@@ -17,8 +17,9 @@ daemon; `semantic_locate` returns an explicit error in offline/no-daemon mode.
 The recommended way to expose these tools is the guided wizard: run `kin setup` and choose
 the **AI agents** intent. It writes Kin's MCP server entry into every detected client
 (Claude Code, Cursor, Codex CLI, Google Antigravity, Windsurf) with the curated tool profile, and
-adds a Kin-first discovery reminder to your agent instruction files. `kin setup status`
-then verifies each client config.
+adds a Kin-first discovery reminder to your agent instruction files. Global entries inherit
+the active workspace; `kin init` automatically completes Antigravity's repo-scoped workspace
+entry when setup ran before initialization. `kin setup status` then verifies each client config.
 
 The wizard writes this entry (and `KIN_MCP_TOOL_PROFILE=agent-default` is what selects the
 small curated surface below instead of the full internal one):

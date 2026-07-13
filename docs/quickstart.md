@@ -269,17 +269,13 @@ kin locate "users can't reset their password" --explain
 
 If you chose the **AI agents** intent in step 2, `kin setup` wrote Kin's MCP server entry
 for every detected client that could be configured before repository initialization and
-added a Kin-first discovery reminder to your agent instruction files. From the initialized
-repository created in step 3, run this idempotent repair once:
+added a Kin-first discovery reminder to your agent instruction files. When step 3 runs,
+`kin init` automatically completes Google Antigravity's repo-scoped
+`.agents/mcp_config.json` entry. No one-time doctor repair is required. Global Codex and
+Antigravity entries remain cwd-free so they inherit whichever workspace launched the
+client instead of pinning every future session to the last repository that ran setup.
 
-```sh
-kin setup doctor --fix
-```
-
-That gives the global Codex CLI and Google Antigravity launchers the initialized Kin
-repository root they need as `cwd`; Claude Code, Cursor, and Windsurf continue to bind from
-their active workspace. Then open your agent in the Kin repository and ask it to use the
-semantic tools:
+Open your agent in the Kin repository and ask it to use the semantic tools:
 
 ```
 Use Kin to explore this codebase: run semantic_locate to find the
@@ -401,7 +397,7 @@ Config file locations the wizard targets (and `kin setup status` inspects):
 | Claude Code | `~/.claude.json` (falls back to `~/.claude/config.json`) |
 | Cursor | `~/.cursor/mcp.json` |
 | Codex CLI | `~/.codex/config.toml` (TOML — see below) |
-| Google Antigravity | `~/.gemini/config/mcp_config.json` |
+| Google Antigravity | `~/.gemini/config/mcp_config.json` (cwd-free global fallback) and `<repo>/.agents/mcp_config.json` (repo-scoped workspace entry) |
 | Gemini CLI (legacy compatibility) | `~/.gemini/settings.json` (only refreshed when already present) |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` |
 
@@ -412,18 +408,25 @@ merges this table into `~/.codex/config.toml`, leaving the rest of the file unto
 [mcp_servers.kin]
 command = "kin"
 args = ["mcp", "start"]
-cwd = "/absolute/path/to/initialized/kin/repository"
 env = { KIN_MCP_TOOL_PROFILE = "agent-default" }
 ```
 
-Kin discovers the initialized repository containing the `kin setup` invocation and records
-that absolute root as Codex's `cwd`, so the global launcher binds to a real repo daemon.
+The global Codex table deliberately has no `cwd`. Codex launches the stdio server from the
+active workspace, so one global entry works across repositories. Launching it from an
+umbrella directory that is not itself a Kin repository fails loudly instead of silently
+querying another repository; use `KIN_MCP_REPO` or `kin mcp start --repo <path>` when an
+explicit repository is required.
 
 Google Antigravity IDE and CLI share the canonical global MCP file
-at `~/.gemini/config/mcp_config.json`. When setup runs inside an initialized Kin repository,
-its Antigravity entry also records that repository root as `cwd`, which Antigravity needs to
-launch a usable repo daemon-backed server. Kin continues to inspect, repair, and ledger an
-existing retired Gemini CLI `settings.json`, but new setup runs do not create that legacy file.
+at `~/.gemini/config/mcp_config.json`; Kin keeps that fallback cwd-free. Antigravity also
+supports the official workspace-local `.agents/mcp_config.json`, where Kin records the
+initialized repository root as `cwd`. `kin setup` writes both when run inside a repository,
+and an installer-first `kin init` creates the workspace entry automatically. Setup and doctor
+repairs merge only Kin-owned launcher fields, preserving client-owned fields such as
+`disabled`, `disabledTools`, approval policy, and additional environment variables. Kin
+continues to inspect, repair, and ledger an existing retired Gemini CLI `settings.json`, but
+new setup runs do not create that legacy file. The generated workspace `cwd` is absolute and
+therefore checkout-local; rerun `kin setup` or `kin doctor --fix` after moving the repository.
 
 `kin mcp start` launches the MCP **stdio** server. You normally do not run this by hand —
 your AI client launches it as a subprocess via the config above. The server binds

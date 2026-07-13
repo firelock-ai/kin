@@ -592,8 +592,11 @@ struct McpClient {
     path: PathBuf,
 }
 
-fn mcp_client_config_paths_for_home(home: &Path) -> Vec<(&'static str, &'static str, PathBuf)> {
-    vec![
+fn mcp_client_config_paths_for_context(
+    home: &Path,
+    repo_root: Option<&Path>,
+) -> Vec<(&'static str, &'static str, PathBuf)> {
+    let mut paths = vec![
         (
             "claude",
             "Claude Code",
@@ -617,7 +620,7 @@ fn mcp_client_config_paths_for_home(home: &Path) -> Vec<(&'static str, &'static 
         ),
         (
             "antigravity",
-            "Google Antigravity",
+            "Google Antigravity (global fallback)",
             home.join(".gemini").join("config").join("mcp_config.json"),
         ),
         (
@@ -632,12 +635,24 @@ fn mcp_client_config_paths_for_home(home: &Path) -> Vec<(&'static str, &'static 
                 .join("windsurf")
                 .join("mcp_config.json"),
         ),
-    ]
+    ];
+    if let Some(repo_root) = repo_root {
+        paths.push((
+            "antigravity_workspace",
+            "Google Antigravity (workspace)",
+            repo_root.join(".agents").join("mcp_config.json"),
+        ));
+    }
+    paths
 }
 
 pub(crate) fn mcp_client_config_paths() -> Vec<(&'static str, &'static str, PathBuf)> {
+    let repo_root = env::current_dir().ok().and_then(|cwd| {
+        kin_core::KinLayout::discover_with_daemon_url(&cwd, None)
+            .map(|layout| layout.working_dir().to_path_buf())
+    });
     directories::BaseDirs::new()
-        .map(|d| mcp_client_config_paths_for_home(d.home_dir()))
+        .map(|d| mcp_client_config_paths_for_context(d.home_dir(), repo_root.as_deref()))
         .unwrap_or_default()
 }
 
@@ -649,12 +664,19 @@ pub(crate) fn mcp_client_config_paths() -> Vec<(&'static str, &'static str, Path
 /// JSON so the same checks apply.
 #[cfg(test)]
 pub(crate) fn evaluate_mcp_client(path: &PathBuf) -> (HealthStatus, String) {
-    evaluate_mcp_client_with_requirements(path, false)
+    evaluate_mcp_client_with_policy(path, McpCwdPolicy::Any)
 }
 
-fn evaluate_mcp_client_with_requirements(
+#[derive(Debug, Clone)]
+enum McpCwdPolicy {
+    Any,
+    InheritWorkspace,
+    ExactRepo(PathBuf),
+}
+
+fn evaluate_mcp_client_with_policy(
     path: &PathBuf,
-    require_repo_cwd: bool,
+    cwd_policy: McpCwdPolicy,
 ) -> (HealthStatus, String) {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
@@ -717,26 +739,43 @@ fn evaluate_mcp_client_with_requirements(
                 .and_then(|e| e.get("KIN_MCP_TOOL_PROFILE"))
                 .and_then(|p| p.as_str());
             if profile == Some("agent-default") {
-                if require_repo_cwd {
-                    let Some(cwd) = entry.get("cwd").and_then(|value| value.as_str()) else {
-                        return (
-                            HealthStatus::Misconfigured,
-                            format!(
-                                "{servers_key}.kin has no repo-scoped cwd in {} (required by this client)",
-                                path.display()
-                            ),
-                        );
-                    };
-                    let cwd = Path::new(cwd);
-                    if !cwd.is_absolute() || !cwd.join(".kin").is_dir() {
-                        return (
-                            HealthStatus::Misconfigured,
-                            format!(
-                                "{servers_key}.kin cwd {} is not an available Kin repository root in {}",
-                                cwd.display(),
-                                path.display()
-                            ),
-                        );
+                match cwd_policy {
+                    McpCwdPolicy::Any => {}
+                    McpCwdPolicy::InheritWorkspace => {
+                        if let Some(cwd) = entry.get("cwd").and_then(|value| value.as_str()) {
+                            return (
+                                HealthStatus::Misconfigured,
+                                format!(
+                                    "{servers_key}.kin globally pins cwd {cwd} in {}; global MCP entries must resolve from the active workspace",
+                                    path.display()
+                                ),
+                            );
+                        }
+                    }
+                    McpCwdPolicy::ExactRepo(expected_repo) => {
+                        let Some(cwd) = entry.get("cwd").and_then(|value| value.as_str()) else {
+                            return (
+                                HealthStatus::Misconfigured,
+                                format!(
+                                    "{servers_key}.kin has no repo-scoped cwd in {}",
+                                    path.display()
+                                ),
+                            );
+                        };
+                        let cwd = Path::new(cwd);
+                        let actual = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+                        let expected = expected_repo.canonicalize().unwrap_or(expected_repo);
+                        if !cwd.is_absolute() || !cwd.join(".kin").is_dir() || actual != expected {
+                            return (
+                                HealthStatus::Misconfigured,
+                                format!(
+                                    "{servers_key}.kin cwd {} does not match workspace Kin root {} in {}",
+                                    cwd.display(),
+                                    expected.display(),
+                                    path.display()
+                                ),
+                            );
+                        }
                     }
                 }
                 (
@@ -770,7 +809,7 @@ fn select_mcp_clients(
         .map(|(id, label, path)| McpClient { id, label, path })
         .filter(|c| {
             c.path.exists()
-                || (c.id == "antigravity" && antigravity_detected)
+                || (matches!(c.id, "antigravity" | "antigravity_workspace") && antigravity_detected)
                 || (c.id == "codex" && codex_detected)
         })
         .collect()
@@ -795,9 +834,20 @@ fn check_mcp_clients() -> Vec<HealthCheck> {
     clients
         .into_iter()
         .map(|client| {
-            let requires_repo_cwd = matches!(client.id, "antigravity" | "codex");
-            let (status, detail) =
-                evaluate_mcp_client_with_requirements(&client.path, requires_repo_cwd);
+            let cwd_policy = match client.id {
+                "antigravity_workspace" => client
+                    .path
+                    .parent()
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf)
+                    .map(McpCwdPolicy::ExactRepo)
+                    .unwrap_or(McpCwdPolicy::Any),
+                // Every other path above is a global client config. Static cwd
+                // there would make the last repository to run setup win for
+                // every future workspace.
+                _ => McpCwdPolicy::InheritWorkspace,
+            };
+            let (status, detail) = evaluate_mcp_client_with_policy(&client.path, cwd_policy);
             let mut check = HealthCheck::new(
                 &format!("mcp_client_{}", client.id),
                 &format!("MCP: {}", client.label),
@@ -805,8 +855,8 @@ fn check_mcp_clients() -> Vec<HealthCheck> {
                 detail,
             );
             if is_failing(&check.status) {
-                let fix = if requires_repo_cwd {
-                    "run `kin setup` (or `kin doctor --fix`) from the initialized Kin repository this client should use"
+                let fix = if client.id == "antigravity_workspace" {
+                    "run `kin setup` (or `kin doctor --fix`) from this initialized Kin repository"
                 } else {
                     "run `kin setup` (or `kin doctor --fix`) to re-merge the kin MCP server entry"
                 };
@@ -1353,12 +1403,12 @@ mod tests {
     #[test]
     fn antigravity_health_uses_official_global_config_and_keeps_legacy_visible() {
         let dir = tempfile::tempdir().unwrap();
-        let configs = mcp_client_config_paths_for_home(dir.path());
+        let configs = mcp_client_config_paths_for_context(dir.path(), None);
         let antigravity = configs
             .iter()
             .find(|(id, _, _)| *id == "antigravity")
             .expect("Antigravity health target");
-        assert_eq!(antigravity.1, "Google Antigravity");
+        assert_eq!(antigravity.1, "Google Antigravity (global fallback)");
         assert_eq!(
             antigravity.2,
             dir.path()
@@ -1378,7 +1428,11 @@ mod tests {
     #[test]
     fn detected_antigravity_is_reported_when_its_global_config_is_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let clients = select_mcp_clients(mcp_client_config_paths_for_home(dir.path()), true, false);
+        let clients = select_mcp_clients(
+            mcp_client_config_paths_for_context(dir.path(), None),
+            true,
+            false,
+        );
 
         assert_eq!(clients.len(), 1);
         assert_eq!(clients[0].id, "antigravity");
@@ -1394,8 +1448,11 @@ mod tests {
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         std::fs::write(&legacy, "{}").unwrap();
 
-        let clients =
-            select_mcp_clients(mcp_client_config_paths_for_home(dir.path()), false, false);
+        let clients = select_mcp_clients(
+            mcp_client_config_paths_for_context(dir.path(), None),
+            false,
+            false,
+        );
         assert_eq!(clients.len(), 1);
         assert_eq!(clients[0].id, "gemini");
         assert_eq!(clients[0].path, legacy);
@@ -1404,7 +1461,11 @@ mod tests {
     #[test]
     fn detected_codex_is_reported_when_its_global_config_is_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let clients = select_mcp_clients(mcp_client_config_paths_for_home(dir.path()), false, true);
+        let clients = select_mcp_clients(
+            mcp_client_config_paths_for_context(dir.path(), None),
+            false,
+            true,
+        );
 
         assert_eq!(clients.len(), 1);
         assert_eq!(clients[0].id, "codex");
@@ -1414,7 +1475,7 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_config_requires_a_repo_scoped_cwd() {
+    fn global_antigravity_config_inherits_the_active_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp_config.json");
         std::fs::write(
@@ -1432,13 +1493,13 @@ mod tests {
         )
         .unwrap();
 
-        let (status, detail) = evaluate_mcp_client_with_requirements(&path, true);
-        assert!(matches!(status, HealthStatus::Misconfigured));
-        assert!(detail.contains("repo-scoped cwd"));
+        let (status, detail) =
+            evaluate_mcp_client_with_policy(&path, McpCwdPolicy::InheritWorkspace);
+        assert!(matches!(status, HealthStatus::Healthy), "got: {detail}");
     }
 
     #[test]
-    fn antigravity_config_accepts_an_available_kin_repo_cwd() {
+    fn global_antigravity_config_rejects_a_static_repo_cwd() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(repo.join(".kin")).unwrap();
@@ -1459,7 +1520,50 @@ mod tests {
         )
         .unwrap();
 
-        let (status, detail) = evaluate_mcp_client_with_requirements(&path, true);
+        let (status, detail) =
+            evaluate_mcp_client_with_policy(&path, McpCwdPolicy::InheritWorkspace);
+        assert!(matches!(status, HealthStatus::Misconfigured));
+        assert!(detail.contains("globally pins cwd"));
+    }
+
+    #[test]
+    fn workspace_antigravity_config_requires_the_exact_kin_repo_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected_repo = dir.path().join("expected");
+        let other_repo = dir.path().join("other");
+        std::fs::create_dir_all(expected_repo.join(".kin")).unwrap();
+        std::fs::create_dir_all(other_repo.join(".kin")).unwrap();
+        let path = expected_repo.join(".agents").join("mcp_config.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "kin": {
+                        "command": "kin",
+                        "args": ["mcp", "start"],
+                        "cwd": other_repo,
+                        "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (status, detail) =
+            evaluate_mcp_client_with_policy(&path, McpCwdPolicy::ExactRepo(expected_repo.clone()));
+        assert!(matches!(status, HealthStatus::Misconfigured));
+        assert!(detail.contains("does not match workspace Kin root"));
+
+        let mut root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        root["mcpServers"]["kin"]["cwd"] =
+            serde_json::Value::String(expected_repo.to_string_lossy().into_owned());
+        std::fs::write(&path, serde_json::to_string_pretty(&root).unwrap()).unwrap();
+
+        let (status, detail) =
+            evaluate_mcp_client_with_policy(&path, McpCwdPolicy::ExactRepo(expected_repo));
         assert!(matches!(status, HealthStatus::Healthy), "got: {detail}");
     }
 
@@ -1542,28 +1646,8 @@ mod tests {
     }
 
     #[test]
-    fn mcp_config_toml_with_agent_default_profile_is_healthy() {
+    fn global_codex_mcp_config_without_cwd_is_healthy() {
         // Codex registers MCP servers in ~/.codex/config.toml, not mcp.json.
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        std::fs::create_dir_all(repo.join(".kin")).unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            format!(
-                "[mcp_servers.kin]\ncommand = \"kin\"\nargs = [\"mcp\", \"start\"]\ncwd = \"{}\"\nenv = {{ KIN_MCP_TOOL_PROFILE = \"agent-default\" }}\n",
-                repo.display()
-            ),
-        )
-        .unwrap();
-
-        let (status, detail) = evaluate_mcp_client_with_requirements(&path, true);
-        assert!(matches!(status, HealthStatus::Healthy), "got: {detail}");
-        assert!(detail.contains("mcp_servers.kin"));
-    }
-
-    #[test]
-    fn codex_mcp_config_without_repo_cwd_is_misconfigured() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(
@@ -1572,9 +1656,26 @@ mod tests {
         )
         .unwrap();
 
-        let (status, detail) = evaluate_mcp_client_with_requirements(&path, true);
+        let (status, detail) =
+            evaluate_mcp_client_with_policy(&path, McpCwdPolicy::InheritWorkspace);
+        assert!(matches!(status, HealthStatus::Healthy), "got: {detail}");
+        assert!(detail.contains("mcp_servers.kin"));
+    }
+
+    #[test]
+    fn global_codex_mcp_config_with_static_cwd_is_misconfigured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[mcp_servers.kin]\ncommand = \"kin\"\nargs = [\"mcp\", \"start\"]\ncwd = \"/tmp/one-repo\"\nenv = { KIN_MCP_TOOL_PROFILE = \"agent-default\" }\n",
+        )
+        .unwrap();
+
+        let (status, detail) =
+            evaluate_mcp_client_with_policy(&path, McpCwdPolicy::InheritWorkspace);
         assert!(matches!(status, HealthStatus::Misconfigured));
-        assert!(detail.contains("repo-scoped cwd"));
+        assert!(detail.contains("globally pins cwd"));
     }
 
     #[test]

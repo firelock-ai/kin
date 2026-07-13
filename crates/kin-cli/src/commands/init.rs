@@ -931,6 +931,22 @@ pub async fn run(
     } else {
         false
     };
+    let auto_configured_mcp = match super::setup::auto_configure_repo_clients_for_init(&dir) {
+        Ok(paths) => paths,
+        Err(error) => {
+            warn!(error = %error, "failed to complete repo-scoped MCP setup during init");
+            eprintln!(
+                    "  warning: could not complete repo-scoped MCP setup: {error}\n  hint: run `kin setup doctor --fix` from this repository after init"
+                );
+            Vec::new()
+        }
+    };
+    for path in &auto_configured_mcp {
+        eprintln!(
+            "  Auto-configured repo-scoped MCP client ({})",
+            path.display()
+        );
+    }
     if is_git_repo && !json && !force {
         eprintln!(
             "Detected Git repository. Bootstrapping current state as semantic truth.\n\
