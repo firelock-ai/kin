@@ -759,11 +759,16 @@ fn prompt_yn(prompt: &str, default_yes: bool, interactive: bool) -> bool {
 /// executable) so the entry works in agent processes that do not inherit the
 /// user's PATH.
 ///
-/// The entry starts the MCP server in single-repo mode: `kin mcp start`
-/// resolves the repo from the agent's working directory (or from
-/// `KIN_DAEMON_URL` when a session launch pinned one), so each agent session
-/// binds to the daemon of the repository it is actually working in.
+/// The entry starts the MCP server in single-repo mode. Most clients launch it
+/// from the active workspace, so `kin mcp start` resolves that working
+/// directory (or `KIN_DAEMON_URL` when a session pinned one). Codex and
+/// Antigravity are exceptions: their global launchers need an explicit
+/// repo-scoped `cwd`.
 fn kin_mcp_entry() -> serde_json::Value {
+    kin_mcp_entry_with_cwd(None)
+}
+
+fn kin_mcp_entry_with_cwd(cwd: Option<&Path>) -> serde_json::Value {
     // Try to resolve an absolute path from the running executable.  The
     // installed binary lives alongside the other kin-* binaries, so
     // current_exe() gives us the right directory.
@@ -774,11 +779,15 @@ fn kin_mcp_entry() -> serde_json::Value {
         // Fallback: bare name relying on PATH (previous behaviour).
         "kin".to_string()
     };
-    serde_json::json!({
+    let mut entry = serde_json::json!({
         "command": command,
         "args": ["mcp", "start"],
         "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
-    })
+    });
+    if let Some(cwd) = cwd {
+        entry["cwd"] = serde_json::Value::String(cwd.to_string_lossy().into_owned());
+    }
+    entry
 }
 
 /// Describes an AI assistant we can auto-configure.
@@ -792,7 +801,7 @@ struct AiAssistant {
 const IDX_CLAUDE_CODE: usize = 0;
 const IDX_CURSOR: usize = 1;
 const IDX_CODEX: usize = 2;
-const IDX_GEMINI: usize = 3;
+const IDX_ANTIGRAVITY: usize = 3;
 const IDX_WINDSURF: usize = 4;
 
 /// Detect installed AI assistants eligible for MCP auto-configuration.
@@ -801,17 +810,15 @@ const IDX_WINDSURF: usize = 4;
 /// - Claude Code: `claude` binary on PATH
 /// - Cursor: `cursor` binary on PATH, or `/Applications/Cursor.app`
 /// - Codex CLI: `codex` binary on PATH
-/// - Gemini CLI: `gemini` binary on PATH, or `~/.gemini` directory
+/// - Google Antigravity: `agy`/`agy-ide` on PATH, their default install
+///   locations, or the Antigravity/Antigravity IDE macOS applications
 /// - Windsurf: `windsurf` binary on PATH, or `/Applications/Windsurf.app`
 fn detect_ai_assistants() -> Vec<AiAssistant> {
     let claude_detected = check_binary_in_path("claude").is_some();
     let cursor_detected = check_binary_in_path("cursor").is_some()
         || PathBuf::from("/Applications/Cursor.app").exists();
-    let codex_detected = check_binary_in_path("codex").is_some();
-    let gemini_detected = check_binary_in_path("gemini").is_some()
-        || home_dir()
-            .map(|h| h.join(".gemini").exists())
-            .unwrap_or(false);
+    let codex_detected = is_codex_detected();
+    let antigravity_detected = is_antigravity_detected();
     let windsurf_detected = check_binary_in_path("windsurf").is_some()
         || PathBuf::from("/Applications/Windsurf.app").exists();
 
@@ -832,9 +839,9 @@ fn detect_ai_assistants() -> Vec<AiAssistant> {
             install_hint: "install from github.com/openai/codex",
         },
         AiAssistant {
-            name: "Gemini CLI",
-            detected: gemini_detected,
-            install_hint: "install via: npm install -g @google/gemini-cli",
+            name: "Google Antigravity",
+            detected: antigravity_detected,
+            install_hint: "install from antigravity.google/download",
         },
         AiAssistant {
             name: "Windsurf",
@@ -844,9 +851,61 @@ fn detect_ai_assistants() -> Vec<AiAssistant> {
     ]
 }
 
+/// Detect Google Antigravity without treating the retired Gemini CLI or a
+/// generic `~/.gemini` directory as an installed current client.
+///
+/// The CLI installer places `agy` at `~/.local/bin/agy` by default, which may
+/// not be on PATH until the user opens a new shell. The IDE can expose
+/// `agy-ide`, and the two macOS application bundles are also valid installed
+/// surfaces even when neither launcher is on PATH.
+fn antigravity_detected_at(
+    home: Option<&Path>,
+    applications_dir: &Path,
+    binary_on_path: impl Fn(&str) -> bool,
+) -> bool {
+    if binary_on_path("agy") || binary_on_path("agy-ide") {
+        return true;
+    }
+
+    if home.is_some_and(|home| {
+        home.join(".local").join("bin").join("agy").exists()
+            || home
+                .join(".antigravity-ide")
+                .join("antigravity-ide")
+                .join("bin")
+                .join("agy-ide")
+                .exists()
+    }) {
+        return true;
+    }
+
+    ["Antigravity.app", "Antigravity IDE.app"]
+        .iter()
+        .any(|name| applications_dir.join(name).exists())
+}
+
+pub(crate) fn is_antigravity_detected() -> bool {
+    let home = home_dir().ok();
+    antigravity_detected_at(home.as_deref(), Path::new("/Applications"), |name| {
+        check_binary_in_path(name).is_some()
+    })
+}
+
+pub(crate) fn is_codex_detected() -> bool {
+    check_binary_in_path("codex").is_some()
+}
+
 /// Merge the "kin" MCP server entry into an existing JSON config file.
 /// Creates the file if it doesn't exist.
 fn merge_mcp_config(path: &PathBuf) -> Result<()> {
+    merge_mcp_config_entry(path, kin_mcp_entry())
+}
+
+fn merge_mcp_config_with_cwd(path: &PathBuf, cwd: &Path) -> Result<()> {
+    merge_mcp_config_entry(path, kin_mcp_entry_with_cwd(Some(cwd)))
+}
+
+fn merge_mcp_config_entry(path: &PathBuf, kin_entry: serde_json::Value) -> Result<()> {
     let mut root: serde_json::Value = if path.exists() {
         let content = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
@@ -872,7 +931,7 @@ fn merge_mcp_config(path: &PathBuf) -> Result<()> {
     }
 
     // Insert/overwrite the "kin" entry
-    root["mcpServers"]["kin"] = kin_mcp_entry();
+    root["mcpServers"]["kin"] = kin_entry;
 
     // Write back with pretty formatting
     if let Some(parent) = path.parent() {
@@ -919,7 +978,7 @@ fn configure_cursor() -> Result<PathBuf> {
 /// `config.toml` — it does not read an `mcp.json`. Uses a format-preserving
 /// TOML edit so unrelated keys, tables, and comments in the user's config are
 /// left untouched.
-fn merge_mcp_config_toml(path: &PathBuf) -> Result<()> {
+fn merge_mcp_config_toml(path: &PathBuf, cwd: Option<&Path>) -> Result<()> {
     use toml_edit::{value, Array, DocumentMut, InlineTable, Item, Table};
 
     let mut doc: DocumentMut = if path.exists() {
@@ -968,6 +1027,9 @@ fn merge_mcp_config_toml(path: &PathBuf) -> Result<()> {
     args.push("mcp");
     args.push("start");
     kin.insert("args", value(args));
+    if let Some(cwd) = cwd {
+        kin.insert("cwd", value(cwd.to_string_lossy().into_owned()));
+    }
     let mut env = InlineTable::new();
     env.insert("KIN_MCP_TOOL_PROFILE", "agent-default".into());
     kin.insert("env", value(env));
@@ -987,23 +1049,69 @@ fn merge_mcp_config_toml(path: &PathBuf) -> Result<()> {
 /// Configure MCP for Codex CLI.
 ///
 /// Codex reads MCP servers from `~/.codex/config.toml` (`[mcp_servers.<name>]`
-/// tables with `command`/`args`/`env`), not from an `mcp.json` file.
+/// tables with `command`/`args`/`cwd`/`env`), not from an `mcp.json` file. Its
+/// global entry is pinned to the Kin repository where setup ran; re-running
+/// setup in another Kin repo replaces only the Kin table with that repo cwd.
 fn configure_codex() -> Result<PathBuf> {
     let home = home_dir()?;
+    let repo_root = discover_setup_repo_root()?;
+    configure_codex_at(&home, &repo_root)
+}
+
+fn configure_codex_at(home: &Path, repo_root: &Path) -> Result<PathBuf> {
     let target = home.join(".codex").join("config.toml");
-    merge_mcp_config_toml(&target)?;
+    merge_mcp_config_toml(&target, Some(repo_root))?;
     Ok(target)
 }
 
-/// Configure MCP for Gemini CLI.
+/// Configure MCP for Google Antigravity.
 ///
-/// Gemini CLI persists MCP servers in `~/.gemini/settings.json` under the
-/// top-level `mcpServers` key (same shape as other agents: `command` + `args`).
-fn configure_gemini_cli() -> Result<PathBuf> {
+/// Google Antigravity IDE and CLI share the official
+/// global MCP file at `~/.gemini/config/mcp_config.json`. If the retired Gemini
+/// CLI's `~/.gemini/settings.json` already exists, keep its Kin entry current as
+/// a compatibility target; never create that legacy file for a new install.
+/// The Antigravity file is global but its Kin server is necessarily pinned to
+/// the Kin repository where setup ran; re-running setup in another Kin repo
+/// intentionally replaces only the `mcpServers.kin` entry with that repo cwd.
+fn configure_antigravity_at(home: &Path, repo_root: &Path) -> Result<Vec<PathBuf>> {
+    let primary = home.join(".gemini").join("config").join("mcp_config.json");
+    merge_mcp_config_with_cwd(&primary, repo_root)?;
+
+    let mut configured = vec![primary];
+    let legacy = home.join(".gemini").join("settings.json");
+    if legacy.exists() {
+        merge_mcp_config(&legacy)?;
+        configured.push(legacy);
+    }
+    Ok(configured)
+}
+
+fn configure_antigravity() -> Result<PathBuf> {
     let home = home_dir()?;
-    let target = home.join(".gemini").join("settings.json");
-    merge_mcp_config(&target)?;
-    Ok(target)
+    let repo_root = discover_setup_repo_root()?;
+    let configured = configure_antigravity_at(&home, &repo_root)?;
+    Ok(configured
+        .into_iter()
+        .next()
+        .expect("Antigravity configuration always has a primary target"))
+}
+
+fn discover_setup_repo_root_from(start: &Path) -> Option<PathBuf> {
+    // Setup needs a durable filesystem root for a global client config. Ignore
+    // a session-scoped KIN_DAEMON_URL so it cannot turn an arbitrary cwd into
+    // a synthetic layout that will be stale in the next client process.
+    kin_core::KinLayout::discover_with_daemon_url(start, None)
+        .map(|layout| layout.working_dir().to_path_buf())
+}
+
+fn discover_setup_repo_root() -> Result<PathBuf> {
+    let current_dir = env::current_dir().context("could not determine the current directory")?;
+    discover_setup_repo_root_from(&current_dir).with_context(|| {
+        format!(
+            "Codex and Google Antigravity MCP setup need a Kin repository cwd, but none was found from {}. Run `kin init` in the target repository, then re-run `kin setup` there.",
+            current_dir.display()
+        )
+    })
 }
 
 /// Configure MCP for Windsurf.
@@ -1270,14 +1378,50 @@ pub(crate) fn reinstall_vfs_shim() -> Result<Option<PathBuf>> {
 /// Used by `kin doctor --fix` to repair `mcp_client_*` checks. Returns the
 /// paths that were re-merged.
 pub(crate) fn remerge_existing_mcp_configs() -> Vec<PathBuf> {
+    let repo_root = discover_setup_repo_root().ok();
+    remerge_mcp_config_paths(
+        crate::commands::health::mcp_client_config_paths(),
+        is_antigravity_detected(),
+        is_codex_detected(),
+        repo_root.as_deref(),
+    )
+}
+
+fn remerge_mcp_config_paths(
+    configs: Vec<(&'static str, &'static str, PathBuf)>,
+    antigravity_detected: bool,
+    codex_detected: bool,
+    repo_root: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut repaired = Vec::new();
-    for (_id, _label, path) in crate::commands::health::mcp_client_config_paths() {
-        if !path.exists() {
+    for (id, _label, path) in configs {
+        // A detected repo-scoped client with no config yet is a real missing
+        // setup artifact, so doctor --fix must create its official global file
+        // once a Kin repository root is available. Other clients retain the
+        // existing conservative behavior: only touch a config file the user or
+        // client already created.
+        let detected_repo_client =
+            (id == "antigravity" && antigravity_detected) || (id == "codex" && codex_detected);
+        let should_merge = path.exists() || detected_repo_client && repo_root.is_some();
+        if !should_merge {
             continue;
         }
         // Codex's config.toml is TOML; every other client config is JSON.
-        let merged = if path.extension().and_then(|e| e.to_str()) == Some("toml") {
-            merge_mcp_config_toml(&path)
+        let merged = if id == "antigravity" {
+            let Some(repo_root) = repo_root else {
+                // Doctor cannot manufacture the repo-scoped cwd required by
+                // Antigravity when it is run outside a Kin repository.
+                continue;
+            };
+            merge_mcp_config_with_cwd(&path, repo_root)
+        } else if id == "codex" {
+            let Some(repo_root) = repo_root else {
+                // Codex also needs an explicit Kin cwd in its global config.
+                continue;
+            };
+            merge_mcp_config_toml(&path, Some(repo_root))
+        } else if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+            merge_mcp_config_toml(&path, None)
         } else {
             merge_mcp_config(&path)
         };
@@ -1651,17 +1795,53 @@ async fn apply_plan(
     Ok(configured_assistants)
 }
 
-/// Stable ledger id for an AI-client index, matching the ids used by
-/// [`crate::commands::health::mcp_client_config_paths`].
-fn client_id_for_index(idx: usize) -> &'static str {
+/// MCP config targets written for one selected assistant.
+///
+/// Antigravity always writes its official shared global config and also
+/// refreshes an already-present retired Gemini CLI settings file. The legacy
+/// target keeps its historical `gemini` ledger id so existing setup ledgers
+/// continue to upsert rather than gaining a duplicate entry.
+fn mcp_config_targets_for_index_at(idx: usize, home: &Path) -> Vec<(&'static str, PathBuf)> {
     match idx {
-        IDX_CLAUDE_CODE => "claude",
-        IDX_CURSOR => "cursor",
-        IDX_CODEX => "codex",
-        IDX_GEMINI => "gemini",
-        IDX_WINDSURF => "windsurf",
-        _ => "unknown",
+        IDX_CLAUDE_CODE => {
+            let primary = home.join(".claude.json");
+            let alt = home.join(".claude").join("config.json");
+            vec![(
+                "claude",
+                if alt.exists() && !primary.exists() {
+                    alt
+                } else {
+                    primary
+                },
+            )]
+        }
+        IDX_CURSOR => vec![("cursor", home.join(".cursor").join("mcp.json"))],
+        IDX_CODEX => vec![("codex", home.join(".codex").join("config.toml"))],
+        IDX_ANTIGRAVITY => {
+            let mut targets = vec![(
+                "antigravity",
+                home.join(".gemini").join("config").join("mcp_config.json"),
+            )];
+            let legacy = home.join(".gemini").join("settings.json");
+            if legacy.exists() {
+                targets.push(("gemini", legacy));
+            }
+            targets
+        }
+        IDX_WINDSURF => vec![(
+            "windsurf",
+            home.join(".codeium")
+                .join("windsurf")
+                .join("mcp_config.json"),
+        )],
+        _ => Vec::new(),
     }
+}
+
+fn mcp_config_targets_for_index(idx: usize) -> Vec<(&'static str, PathBuf)> {
+    home_dir()
+        .map(|home| mcp_config_targets_for_index_at(idx, &home))
+        .unwrap_or_default()
 }
 
 /// Read the kin MCP server sub-value from a client config, if present.
@@ -1754,15 +1934,10 @@ fn record_setup_ledger(plan: &SetupPlan, shell_name: &str) {
 
     if plan.configure_mcp {
         for idx in &plan.mcp_assistant_indices {
-            let Some(path) = mcp_config_path_for_index(*idx) else {
-                continue;
-            };
-            if let Some(kin_entry) = read_kin_mcp_entry(&path) {
-                ledger.record(LedgerEntry::mcp(
-                    client_id_for_index(*idx),
-                    path,
-                    &kin_entry,
-                ));
+            for (target, path) in mcp_config_targets_for_index(*idx) {
+                if let Some(kin_entry) = read_kin_mcp_entry(&path) {
+                    ledger.record(LedgerEntry::mcp(target, path, &kin_entry));
+                }
             }
         }
     }
@@ -1824,7 +1999,7 @@ fn mcp_config_path_for_index(idx: usize) -> Option<PathBuf> {
         }
         IDX_CURSOR => Some(home.join(".cursor").join("mcp.json")),
         IDX_CODEX => Some(home.join(".codex").join("config.toml")),
-        IDX_GEMINI => Some(home.join(".gemini").join("settings.json")),
+        IDX_ANTIGRAVITY => Some(home.join(".gemini").join("config").join("mcp_config.json")),
         IDX_WINDSURF => Some(
             home.join(".codeium")
                 .join("windsurf")
@@ -1840,7 +2015,7 @@ fn configure_assistant_by_index(idx: usize) -> Option<Result<PathBuf>> {
         IDX_CLAUDE_CODE => Some(configure_claude_code()),
         IDX_CURSOR => Some(configure_cursor()),
         IDX_CODEX => Some(configure_codex()),
-        IDX_GEMINI => Some(configure_gemini_cli()),
+        IDX_ANTIGRAVITY => Some(configure_antigravity()),
         IDX_WINDSURF => Some(configure_windsurf()),
         _ => None,
     }
@@ -2644,6 +2819,175 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_detection_recognizes_current_cli_names_only() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        assert!(antigravity_detected_at(
+            Some(tmp.path()),
+            tmp.path(),
+            |name| name == "agy"
+        ));
+        assert!(antigravity_detected_at(
+            Some(tmp.path()),
+            tmp.path(),
+            |name| name == "agy-ide"
+        ));
+        assert!(
+            !antigravity_detected_at(Some(tmp.path()), tmp.path(), |name| name == "gemini"),
+            "the retired Gemini CLI must not masquerade as Antigravity"
+        );
+    }
+
+    #[test]
+    fn antigravity_detection_recognizes_default_cli_and_macos_app_locations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let applications = tmp.path().join("Applications");
+        fs::create_dir_all(home.join(".local").join("bin")).unwrap();
+        fs::write(home.join(".local").join("bin").join("agy"), b"binary").unwrap();
+
+        assert!(antigravity_detected_at(Some(&home), &applications, |_| {
+            false
+        }));
+
+        fs::remove_file(home.join(".local").join("bin").join("agy")).unwrap();
+        fs::create_dir_all(applications.join("Antigravity IDE.app")).unwrap();
+        assert!(antigravity_detected_at(Some(&home), &applications, |_| {
+            false
+        }));
+    }
+
+    #[test]
+    fn configure_antigravity_writes_official_global_config_and_refreshes_legacy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join(".kin")).unwrap();
+        let legacy = home.join(".gemini").join("settings.json");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(
+            &legacy,
+            r#"{"theme":"dark","mcpServers":{"other":{"command":"other"}}}"#,
+        )
+        .unwrap();
+
+        let primary = home.join(".gemini").join("config").join("mcp_config.json");
+        fs::create_dir_all(primary.parent().unwrap()).unwrap();
+        fs::write(
+            &primary,
+            r#"{"userSetting":true,"mcpServers":{"other":{"command":"other"}}}"#,
+        )
+        .unwrap();
+
+        let configured = configure_antigravity_at(&home, &repo).unwrap();
+        assert_eq!(configured, vec![primary.clone(), legacy.clone()]);
+
+        let primary_json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&primary).unwrap()).unwrap();
+        let kin = &primary_json["mcpServers"]["kin"];
+        assert!(
+            kin["command"]
+                .as_str()
+                .is_some_and(|command| !command.is_empty()),
+            "Antigravity stdio config must name a Kin executable"
+        );
+        assert_eq!(kin["args"], serde_json::json!(["mcp", "start"]));
+        assert_eq!(kin["env"]["KIN_MCP_TOOL_PROFILE"], "agent-default");
+        assert_eq!(kin["cwd"], repo.to_string_lossy().as_ref());
+        assert_eq!(primary_json["userSetting"], true);
+        assert_eq!(primary_json["mcpServers"]["other"]["command"], "other");
+
+        let legacy_json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&legacy).unwrap()).unwrap();
+        assert_eq!(legacy_json["theme"], "dark");
+        assert_eq!(legacy_json["mcpServers"]["other"]["command"], "other");
+        assert!(legacy_json["mcpServers"]["kin"].is_object());
+        assert!(legacy_json["mcpServers"]["kin"].get("cwd").is_none());
+
+        let ledger_targets = mcp_config_targets_for_index_at(IDX_ANTIGRAVITY, &home);
+        assert_eq!(
+            ledger_targets,
+            vec![("antigravity", primary), ("gemini", legacy)]
+        );
+    }
+
+    #[test]
+    fn configure_antigravity_does_not_create_legacy_settings_for_new_installs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join(".kin")).unwrap();
+        let configured = configure_antigravity_at(&home, &repo).unwrap();
+        let primary = home.join(".gemini").join("config").join("mcp_config.json");
+
+        assert_eq!(configured, vec![primary]);
+        assert!(!home.join(".gemini").join("settings.json").exists());
+    }
+
+    #[test]
+    fn antigravity_cwd_is_discovered_from_the_kin_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let nested = repo.join("src").join("nested");
+        fs::create_dir_all(repo.join(".kin")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(discover_setup_repo_root_from(&nested), Some(repo));
+    }
+
+    #[test]
+    fn doctor_remerge_creates_missing_config_for_detected_antigravity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp
+            .path()
+            .join(".gemini")
+            .join("config")
+            .join("mcp_config.json");
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join(".kin")).unwrap();
+        let repaired = remerge_mcp_config_paths(
+            vec![("antigravity", "Google Antigravity", primary.clone())],
+            true,
+            false,
+            Some(&repo),
+        );
+
+        assert_eq!(repaired, vec![primary.clone()]);
+        assert!(has_kin_mcp_config(&primary));
+        let root: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&primary).unwrap()).unwrap();
+        assert_eq!(
+            root["mcpServers"]["kin"]["cwd"],
+            repo.to_string_lossy().as_ref()
+        );
+    }
+
+    #[test]
+    fn doctor_remerge_adds_repo_cwd_to_existing_codex_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".codex").join("config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "model = \"o3\"\n").unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join(".kin")).unwrap();
+
+        let repaired = remerge_mcp_config_paths(
+            vec![("codex", "Codex CLI", path.clone())],
+            false,
+            true,
+            Some(&repo),
+        );
+
+        assert_eq!(repaired, vec![path.clone()]);
+        let root: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["model"].as_str(), Some("o3"));
+        assert_eq!(
+            root["mcp_servers"]["kin"]["cwd"].as_str(),
+            Some(repo.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
     fn merge_mcp_config_refuses_to_overwrite_corrupt_json() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
@@ -2692,7 +3036,7 @@ mod tests {
         std::fs::write(&path, b"this is not toml [[[").unwrap();
 
         let original = std::fs::read(&path).unwrap();
-        let err = merge_mcp_config_toml(&path).unwrap_err();
+        let err = merge_mcp_config_toml(&path, None).unwrap_err();
         let msg = err.to_string();
 
         assert!(
@@ -2711,16 +3055,20 @@ mod tests {
     }
 
     #[test]
-    fn merge_mcp_config_toml_preserves_existing_codex_config() {
+    fn configure_codex_writes_repo_cwd_and_preserves_existing_config() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
+        let home = dir.path().join("home");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".kin")).unwrap();
+        let path = home.join(".codex").join("config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
             "# user settings\nmodel = \"o3\"\n\n[mcp_servers.other]\ncommand = \"other-server\"\n",
         )
         .unwrap();
 
-        merge_mcp_config_toml(&path).unwrap();
+        assert_eq!(configure_codex_at(&home, &repo).unwrap(), path);
 
         let content = std::fs::read_to_string(&path).unwrap();
         let root: toml::Value = toml::from_str(&content).unwrap();
@@ -2746,6 +3094,11 @@ mod tests {
             "kin args must be [mcp, start]"
         );
         assert_eq!(
+            kin["cwd"].as_str(),
+            Some(repo.to_string_lossy().as_ref()),
+            "Codex must launch Kin from the discovered repository root"
+        );
+        assert_eq!(
             kin["env"]["KIN_MCP_TOOL_PROFILE"].as_str(),
             Some("agent-default"),
             "agent-default profile must be set"
@@ -2756,9 +3109,11 @@ mod tests {
     fn merge_mcp_config_toml_creates_missing_file_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".codex").join("config.toml");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".kin")).unwrap();
 
-        merge_mcp_config_toml(&path).unwrap();
-        merge_mcp_config_toml(&path).unwrap();
+        merge_mcp_config_toml(&path, Some(&repo)).unwrap();
+        merge_mcp_config_toml(&path, Some(&repo)).unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         let root: toml::Value = toml::from_str(&content).unwrap();
@@ -2780,5 +3135,6 @@ mod tests {
             ledger_entry["env"]["KIN_MCP_TOOL_PROFILE"], "agent-default",
             "ledger entry must normalize the TOML entry to JSON"
         );
+        assert_eq!(ledger_entry["cwd"], repo.to_string_lossy().as_ref());
     }
 }

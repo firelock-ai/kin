@@ -84,7 +84,7 @@ With `kin` on your PATH:
 
 ```sh
 kin setup                            # wire Kin's MCP tools into your AI agents
-                                     #   (detects Claude Code, Cursor, Codex, Gemini, Windsurf)
+                                     #   (detects Claude Code, Cursor, Codex, Antigravity, Windsurf)
 kin init                             # new no-Git folders become Kin-native by default;
                                      # existing Git repos import recent history by default
 kin status                           # confirm the repo and graph are ready
@@ -125,7 +125,8 @@ file reads. Add embeddings (`kin embed`) for vector similarity in `kin locate` a
 `kin search --semantic`.
 
 **MCP tools for agents.** Kin ships a built-in MCP server that exposes these same operations as
-tools to any MCP-capable assistant (Claude Code, Cursor, Codex, Gemini, Windsurf). `kin setup`
+tools to any MCP-capable assistant (Claude Code, Cursor, Codex, Google Antigravity, Windsurf).
+`kin setup`
 configures every detected client automatically. `kin mcp start` runs as a stdio server that the
 MCP client launches as a subprocess; for manual configuration use the canonical npm package
 (`npx -y @kinlab/kin`, which provisions the Kin CLI and daemon; `@kinlab/kin-mcp` remains as a

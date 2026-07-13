@@ -1,6 +1,6 @@
 # Model Context Protocol (MCP) Tool Surface Reference
 
-The Kin MCP server exposes 60 semantic tools to AI assistants (Claude, Cursor, Gemini,
+The Kin MCP server exposes 60 semantic tools to AI assistants (Claude, Cursor, Antigravity,
 Codex, etc.). These tools bridge the gap between traditional file-first navigation and
 Kin's graph-first semantic substrate: instead of issuing raw shell commands or reading raw
 files, an assistant interacts with the codebase through entity-level primitives.
@@ -16,7 +16,7 @@ daemon; `semantic_locate` returns an explicit error in offline/no-daemon mode.
 
 The recommended way to expose these tools is the guided wizard: run `kin setup` and choose
 the **AI agents** intent. It writes Kin's MCP server entry into every detected client
-(Claude Code, Cursor, Codex CLI, Gemini CLI, Windsurf) with the curated tool profile, and
+(Claude Code, Cursor, Codex CLI, Google Antigravity, Windsurf) with the curated tool profile, and
 adds a Kin-first discovery reminder to your agent instruction files. `kin setup status`
 then verifies each client config.
 

@@ -267,11 +267,19 @@ kin locate "users can't reset their password" --explain
 
 ## 7. Using Kin from an AI agent (MCP)
 
-If you chose the **AI agents** intent in step 2, `kin setup` already wrote Kin's MCP
-server entry into every detected AI client (Claude Code, Cursor, Codex CLI, Gemini CLI,
-Windsurf) and added a Kin-first discovery reminder to your agent instruction files. There
-is **nothing else to configure** — open your agent in a Kin repository and ask it to use
-the semantic tools:
+If you chose the **AI agents** intent in step 2, `kin setup` wrote Kin's MCP server entry
+for every detected client that could be configured before repository initialization and
+added a Kin-first discovery reminder to your agent instruction files. From the initialized
+repository created in step 3, run this idempotent repair once:
+
+```sh
+kin setup doctor --fix
+```
+
+That gives the global Codex CLI and Google Antigravity launchers the initialized Kin
+repository root they need as `cwd`; Claude Code, Cursor, and Windsurf continue to bind from
+their active workspace. Then open your agent in the Kin repository and ask it to use the
+semantic tools:
 
 ```
 Use Kin to explore this codebase: run semantic_locate to find the
@@ -393,7 +401,8 @@ Config file locations the wizard targets (and `kin setup status` inspects):
 | Claude Code | `~/.claude.json` (falls back to `~/.claude/config.json`) |
 | Cursor | `~/.cursor/mcp.json` |
 | Codex CLI | `~/.codex/config.toml` (TOML — see below) |
-| Gemini CLI | `~/.gemini/settings.json` |
+| Google Antigravity | `~/.gemini/config/mcp_config.json` |
+| Gemini CLI (legacy compatibility) | `~/.gemini/settings.json` (only refreshed when already present) |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` |
 
 Codex is the exception: it reads TOML (`[mcp_servers.<name>]` tables), not JSON. The wizard
@@ -403,8 +412,18 @@ merges this table into `~/.codex/config.toml`, leaving the rest of the file unto
 [mcp_servers.kin]
 command = "kin"
 args = ["mcp", "start"]
+cwd = "/absolute/path/to/initialized/kin/repository"
 env = { KIN_MCP_TOOL_PROFILE = "agent-default" }
 ```
+
+Kin discovers the initialized repository containing the `kin setup` invocation and records
+that absolute root as Codex's `cwd`, so the global launcher binds to a real repo daemon.
+
+Google Antigravity IDE and CLI share the canonical global MCP file
+at `~/.gemini/config/mcp_config.json`. When setup runs inside an initialized Kin repository,
+its Antigravity entry also records that repository root as `cwd`, which Antigravity needs to
+launch a usable repo daemon-backed server. Kin continues to inspect, repair, and ledger an
+existing retired Gemini CLI `settings.json`, but new setup runs do not create that legacy file.
 
 `kin mcp start` launches the MCP **stdio** server. You normally do not run this by hand —
 your AI client launches it as a subprocess via the config above. The server binds

@@ -231,7 +231,7 @@
         "kin"
       ],
       "status": "active",
-      "note": "MCP server surface exposing Kin semantic tools to AI agents (Claude, Cursor, Codex, Gemini). Bundled inside the kin repo as the kin-mcp crate (crates/kin-mcp) plus a published npm wrapper (packages/kin-mcp); not a standalone repo."
+      "note": "MCP server surface exposing Kin semantic tools to AI agents (Claude, Cursor, Codex, Google Antigravity). Bundled inside the kin repo as the kin-mcp crate (crates/kin-mcp) plus a published npm wrapper (packages/kin-mcp); not a standalone repo."
     }
   ],
   "links": [

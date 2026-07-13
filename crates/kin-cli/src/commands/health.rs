@@ -14,7 +14,8 @@ use serde_json::Value;
 
 use crate::commands::auth::default_base_url_for_health;
 use crate::commands::setup::{
-    check_binary_in_path, detect_shell, hook_filename, kin_dir, shell_rc, shim_filename,
+    check_binary_in_path, detect_shell, hook_filename, is_antigravity_detected, is_codex_detected,
+    kin_dir, shell_rc, shim_filename,
 };
 
 /// Outcome of a single probed health check.
@@ -591,12 +592,7 @@ struct McpClient {
     path: PathBuf,
 }
 
-pub(crate) fn mcp_client_config_paths() -> Vec<(&'static str, &'static str, PathBuf)> {
-    let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
-    let home = match home {
-        Some(h) => h,
-        None => return Vec::new(),
-    };
+fn mcp_client_config_paths_for_home(home: &Path) -> Vec<(&'static str, &'static str, PathBuf)> {
     vec![
         (
             "claude",
@@ -620,8 +616,13 @@ pub(crate) fn mcp_client_config_paths() -> Vec<(&'static str, &'static str, Path
             home.join(".codex").join("config.toml"),
         ),
         (
+            "antigravity",
+            "Google Antigravity",
+            home.join(".gemini").join("config").join("mcp_config.json"),
+        ),
+        (
             "gemini",
-            "Gemini CLI",
+            "Gemini CLI (legacy)",
             home.join(".gemini").join("settings.json"),
         ),
         (
@@ -634,13 +635,27 @@ pub(crate) fn mcp_client_config_paths() -> Vec<(&'static str, &'static str, Path
     ]
 }
 
+pub(crate) fn mcp_client_config_paths() -> Vec<(&'static str, &'static str, PathBuf)> {
+    directories::BaseDirs::new()
+        .map(|d| mcp_client_config_paths_for_home(d.home_dir()))
+        .unwrap_or_default()
+}
+
 /// Inspect a single MCP config file for a `kin` server entry carrying the
 /// agent-default tool profile.
 ///
 /// Handles both JSON configs (`mcpServers.kin`) and TOML configs such as
 /// Codex's `~/.codex/config.toml` (`mcp_servers.kin`); TOML is normalized to
 /// JSON so the same checks apply.
+#[cfg(test)]
 pub(crate) fn evaluate_mcp_client(path: &PathBuf) -> (HealthStatus, String) {
+    evaluate_mcp_client_with_requirements(path, false)
+}
+
+fn evaluate_mcp_client_with_requirements(
+    path: &PathBuf,
+    require_repo_cwd: bool,
+) -> (HealthStatus, String) {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => {
@@ -702,6 +717,28 @@ pub(crate) fn evaluate_mcp_client(path: &PathBuf) -> (HealthStatus, String) {
                 .and_then(|e| e.get("KIN_MCP_TOOL_PROFILE"))
                 .and_then(|p| p.as_str());
             if profile == Some("agent-default") {
+                if require_repo_cwd {
+                    let Some(cwd) = entry.get("cwd").and_then(|value| value.as_str()) else {
+                        return (
+                            HealthStatus::Misconfigured,
+                            format!(
+                                "{servers_key}.kin has no repo-scoped cwd in {} (required by this client)",
+                                path.display()
+                            ),
+                        );
+                    };
+                    let cwd = Path::new(cwd);
+                    if !cwd.is_absolute() || !cwd.join(".kin").is_dir() {
+                        return (
+                            HealthStatus::Misconfigured,
+                            format!(
+                                "{servers_key}.kin cwd {} is not an available Kin repository root in {}",
+                                cwd.display(),
+                                path.display()
+                            ),
+                        );
+                    }
+                }
                 (
                     HealthStatus::Healthy,
                     format!(
@@ -723,12 +760,28 @@ pub(crate) fn evaluate_mcp_client(path: &PathBuf) -> (HealthStatus, String) {
     }
 }
 
-fn check_mcp_clients() -> Vec<HealthCheck> {
-    let clients: Vec<McpClient> = mcp_client_config_paths()
+fn select_mcp_clients(
+    configs: Vec<(&'static str, &'static str, PathBuf)>,
+    antigravity_detected: bool,
+    codex_detected: bool,
+) -> Vec<McpClient> {
+    configs
         .into_iter()
         .map(|(id, label, path)| McpClient { id, label, path })
-        .filter(|c| c.path.exists())
-        .collect();
+        .filter(|c| {
+            c.path.exists()
+                || (c.id == "antigravity" && antigravity_detected)
+                || (c.id == "codex" && codex_detected)
+        })
+        .collect()
+}
+
+fn check_mcp_clients() -> Vec<HealthCheck> {
+    let clients = select_mcp_clients(
+        mcp_client_config_paths(),
+        is_antigravity_detected(),
+        is_codex_detected(),
+    );
 
     if clients.is_empty() {
         return vec![HealthCheck::new(
@@ -742,7 +795,9 @@ fn check_mcp_clients() -> Vec<HealthCheck> {
     clients
         .into_iter()
         .map(|client| {
-            let (status, detail) = evaluate_mcp_client(&client.path);
+            let requires_repo_cwd = matches!(client.id, "antigravity" | "codex");
+            let (status, detail) =
+                evaluate_mcp_client_with_requirements(&client.path, requires_repo_cwd);
             let mut check = HealthCheck::new(
                 &format!("mcp_client_{}", client.id),
                 &format!("MCP: {}", client.label),
@@ -750,9 +805,12 @@ fn check_mcp_clients() -> Vec<HealthCheck> {
                 detail,
             );
             if is_failing(&check.status) {
-                check = check.fixable().with_manual_fix(
-                    "run `kin setup` (or `kin doctor --fix`) to re-merge the kin MCP server entry",
-                );
+                let fix = if requires_repo_cwd {
+                    "run `kin setup` (or `kin doctor --fix`) from the initialized Kin repository this client should use"
+                } else {
+                    "run `kin setup` (or `kin doctor --fix`) to re-merge the kin MCP server entry"
+                };
+                check = check.fixable().with_manual_fix(fix);
             }
             check
         })
@@ -1293,6 +1351,119 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_health_uses_official_global_config_and_keeps_legacy_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let configs = mcp_client_config_paths_for_home(dir.path());
+        let antigravity = configs
+            .iter()
+            .find(|(id, _, _)| *id == "antigravity")
+            .expect("Antigravity health target");
+        assert_eq!(antigravity.1, "Google Antigravity");
+        assert_eq!(
+            antigravity.2,
+            dir.path()
+                .join(".gemini")
+                .join("config")
+                .join("mcp_config.json")
+        );
+
+        let legacy = configs
+            .iter()
+            .find(|(id, _, _)| *id == "gemini")
+            .expect("legacy Gemini health target");
+        assert_eq!(legacy.1, "Gemini CLI (legacy)");
+        assert_eq!(legacy.2, dir.path().join(".gemini").join("settings.json"));
+    }
+
+    #[test]
+    fn detected_antigravity_is_reported_when_its_global_config_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let clients = select_mcp_clients(mcp_client_config_paths_for_home(dir.path()), true, false);
+
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].id, "antigravity");
+        let (status, detail) = evaluate_mcp_client(&clients[0].path);
+        assert!(matches!(status, HealthStatus::Missing));
+        assert!(detail.contains(".gemini/config/mcp_config.json"));
+    }
+
+    #[test]
+    fn existing_legacy_gemini_settings_remain_a_health_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join(".gemini").join("settings.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "{}").unwrap();
+
+        let clients =
+            select_mcp_clients(mcp_client_config_paths_for_home(dir.path()), false, false);
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].id, "gemini");
+        assert_eq!(clients[0].path, legacy);
+    }
+
+    #[test]
+    fn detected_codex_is_reported_when_its_global_config_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let clients = select_mcp_clients(mcp_client_config_paths_for_home(dir.path()), false, true);
+
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].id, "codex");
+        let (status, detail) = evaluate_mcp_client(&clients[0].path);
+        assert!(matches!(status, HealthStatus::Missing));
+        assert!(detail.contains(".codex/config.toml"));
+    }
+
+    #[test]
+    fn antigravity_config_requires_a_repo_scoped_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_config.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "kin": {
+                        "command": "kin",
+                        "args": ["mcp", "start"],
+                        "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (status, detail) = evaluate_mcp_client_with_requirements(&path, true);
+        assert!(matches!(status, HealthStatus::Misconfigured));
+        assert!(detail.contains("repo-scoped cwd"));
+    }
+
+    #[test]
+    fn antigravity_config_accepts_an_available_kin_repo_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".kin")).unwrap();
+        let path = dir.path().join("mcp_config.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "kin": {
+                        "command": "kin",
+                        "args": ["mcp", "start"],
+                        "cwd": repo,
+                        "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (status, detail) = evaluate_mcp_client_with_requirements(&path, true);
+        assert!(matches!(status, HealthStatus::Healthy), "got: {detail}");
+    }
+
+    #[test]
     fn mcp_config_without_agent_default_profile_is_misconfigured() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("claude.json");
@@ -1374,6 +1545,26 @@ mod tests {
     fn mcp_config_toml_with_agent_default_profile_is_healthy() {
         // Codex registers MCP servers in ~/.codex/config.toml, not mcp.json.
         let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".kin")).unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[mcp_servers.kin]\ncommand = \"kin\"\nargs = [\"mcp\", \"start\"]\ncwd = \"{}\"\nenv = {{ KIN_MCP_TOOL_PROFILE = \"agent-default\" }}\n",
+                repo.display()
+            ),
+        )
+        .unwrap();
+
+        let (status, detail) = evaluate_mcp_client_with_requirements(&path, true);
+        assert!(matches!(status, HealthStatus::Healthy), "got: {detail}");
+        assert!(detail.contains("mcp_servers.kin"));
+    }
+
+    #[test]
+    fn codex_mcp_config_without_repo_cwd_is_misconfigured() {
+        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
@@ -1381,9 +1572,9 @@ mod tests {
         )
         .unwrap();
 
-        let (status, detail) = evaluate_mcp_client(&path);
-        assert!(matches!(status, HealthStatus::Healthy), "got: {detail}");
-        assert!(detail.contains("mcp_servers.kin"));
+        let (status, detail) = evaluate_mcp_client_with_requirements(&path, true);
+        assert!(matches!(status, HealthStatus::Misconfigured));
+        assert!(detail.contains("repo-scoped cwd"));
     }
 
     #[test]
