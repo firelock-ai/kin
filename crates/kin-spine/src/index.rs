@@ -181,9 +181,18 @@ impl SpineIndex {
     }
 
     /// Add a cross-repo edge to the index.
-    pub fn add_cross_repo_edge(&self, edge: CrossRepoEdge) {
+    ///
+    /// Returns `false` when the candidate does not cross a repository
+    /// boundary. Keeping this invariant at the storage boundary prevents a
+    /// resolver bug or stale durable row from making an intra-repo reference
+    /// look like hosted cross-repo proof.
+    pub fn add_cross_repo_edge(&self, edge: CrossRepoEdge) -> bool {
+        if edge.src_repo == edge.dst_repo {
+            return false;
+        }
         let mut inner = self.inner.write();
         inner.cross_repo_edges.push(edge);
+        true
     }
 
     /// Look up an entity by (repo_id, entity_id).
@@ -436,5 +445,24 @@ mod tests {
         assert_eq!(edges[0].dst_repo, "repo-b");
 
         assert_eq!(index.edge_count(), 1);
+    }
+
+    #[test]
+    fn rejects_intra_repo_edges_at_the_index_boundary() {
+        let index = SpineIndex::new();
+        let caller = test_entry("repo-a", "caller", EntityKind::Function);
+        let callee = test_entry("repo-a", "callee", EntityKind::Function);
+
+        assert!(!index.add_cross_repo_edge(CrossRepoEdge {
+            src_repo: "repo-a".to_string(),
+            src_entity: caller.entity_id,
+            dst_repo: "repo-a".to_string(),
+            dst_entity: callee.entity_id,
+            confidence: 0.95,
+        }));
+        assert_eq!(index.edge_count(), 0);
+        assert!(index
+            .cross_repo_edges_for("repo-a", &caller.entity_id)
+            .is_empty());
     }
 }

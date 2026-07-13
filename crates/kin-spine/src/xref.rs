@@ -112,6 +112,15 @@ fn resolve_single(
     if let Some(ref source) = import.import_source {
         let normalized_source = normalize_repo_token(import_source_root(source));
 
+        // A relation whose module root names its own repository is not a
+        // cross-repo import. Parser/linker gaps can still represent a local
+        // target as an external placeholder, but that must remain unresolved
+        // here instead of becoming a same-repo "cross-repo" proof edge (or
+        // falling through to a similarly named sibling repo).
+        if normalize_repo_token(&import.source_repo) == normalized_source {
+            return ResolveResult::NotFound;
+        }
+
         // Tier 1: the import's crate/package root names a registered repo.
         if let Some(matched_repo) = registered_repos
             .iter()
@@ -271,26 +280,28 @@ pub fn materialize_edges(
                 target_entity,
                 confidence,
             } => {
-                index.add_cross_repo_edge(CrossRepoEdge {
+                if index.add_cross_repo_edge(CrossRepoEdge {
                     src_repo: import.source_repo.clone(),
                     src_entity: import.source_entity,
                     dst_repo: target_repo.clone(),
                     dst_entity: *target_entity,
                     confidence: *confidence,
-                });
-                count += 1;
+                }) {
+                    count += 1;
+                }
             }
             ResolveResult::Ambiguous { candidates } => {
                 // Add edges for all candidates with their confidence scores
                 for (repo, entity_id, confidence) in candidates {
-                    index.add_cross_repo_edge(CrossRepoEdge {
+                    if index.add_cross_repo_edge(CrossRepoEdge {
                         src_repo: import.source_repo.clone(),
                         src_entity: import.source_entity,
                         dst_repo: repo.clone(),
                         dst_entity: *entity_id,
                         confidence: *confidence,
-                    });
-                    count += 1;
+                    }) {
+                        count += 1;
+                    }
                 }
             }
             ResolveResult::NotFound => {}
@@ -633,6 +644,59 @@ mod tests {
             }
             other => panic!("expected Resolved to requests repo, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn import_source_naming_the_source_repo_never_materializes_cross_repo_proof() {
+        let index = SpineIndex::new();
+        let local = test_entry("kin", "platform", EntityKind::Function);
+        let collision = test_entry("kin-vfs", "platform", EntityKind::Function);
+        index.register_repo("kin", vec![local], "hash-kin");
+        index.register_repo("kin-vfs", vec![collision], "hash-vfs");
+
+        let imports = vec![UnresolvedImport {
+            source_repo: "kin".to_string(),
+            source_entity: EntityId::new(),
+            imported_name: "platform".to_string(),
+            imported_kind: Some(EntityKind::Function),
+            candidate_repos: vec!["kin-vfs".to_string()],
+            language: Some("rust".to_string()),
+            reference_fingerprint: None,
+            import_source: Some("kin::platform".to_string()),
+        }];
+
+        let results = resolve_imports(&index, &imports);
+        assert!(matches!(results[0].1, ResolveResult::NotFound));
+        assert_eq!(materialize_edges(&index, &imports, &results), 0);
+        assert_eq!(index.edge_count(), 0);
+    }
+
+    #[test]
+    fn materialization_defensively_discards_a_forged_same_repo_resolution() {
+        let index = SpineIndex::new();
+        let source_entity = EntityId::new();
+        let target_entity = EntityId::new();
+        let imports = vec![UnresolvedImport {
+            source_repo: "kin".to_string(),
+            source_entity,
+            imported_name: "platform".to_string(),
+            imported_kind: Some(EntityKind::Function),
+            candidate_repos: vec![],
+            language: Some("rust".to_string()),
+            reference_fingerprint: None,
+            import_source: None,
+        }];
+        let forged = vec![(
+            0,
+            ResolveResult::Resolved {
+                target_repo: "kin".to_string(),
+                target_entity,
+                confidence: 0.5,
+            },
+        )];
+
+        assert_eq!(materialize_edges(&index, &imports, &forged), 0);
+        assert_eq!(index.edge_count(), 0);
     }
 
     #[test]
