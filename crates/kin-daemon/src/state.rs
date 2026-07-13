@@ -4226,7 +4226,12 @@ mod tests {
         let scoped_graph = make_scoped_graph_with_entity("scoped_fn", "src/scoped.rs");
         let session_id = kin_model::SessionId::new();
         let head = kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([5; 32]));
-        // Plant a scope with a short TTL whose deadline is close.
+        // Plant a live scope whose original expiry is well clear of ordinary
+        // test and coverage-instrumentation latency. The refresh contract is
+        // proven from the timestamps themselves instead of racing a tiny TTL.
+        let ttl = Duration::from_secs(60 * 60);
+        let original_created_at = Instant::now() - Duration::from_secs(60);
+        let original_expires_at = original_created_at + ttl;
         {
             let mut scopes = state.session_scopes.write().await;
             scopes.insert(
@@ -4235,21 +4240,37 @@ mod tests {
                     ref_string: "git:abc123".to_string(),
                     head,
                     cached_graph: Arc::clone(&scoped_graph),
-                    created_at: Instant::now() - Duration::from_millis(80),
-                    ttl: Duration::from_millis(100),
+                    created_at: original_created_at,
+                    ttl,
                 },
             );
         }
 
-        // First write succeeds AND slides the TTL window (created_at reset).
-        assert!(state.scoped_graph_for_write(&session_id).await.is_some());
+        // The write must return the private graph and reset created_at during
+        // this call, which moves the absolute expiry beyond its old deadline.
+        let before_refresh = Instant::now();
+        let resolved = state
+            .scoped_graph_for_write(&session_id)
+            .await
+            .expect("live scope should yield a write graph");
+        let after_refresh = Instant::now();
+        assert!(Arc::ptr_eq(&resolved, &scoped_graph));
 
-        // Sleep past the ORIGINAL deadline. Without the TTL slide the scope
-        // would now be expired; with it, the scope is still live.
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        let (refreshed_created_at, refreshed_ttl) = {
+            let scopes = state.session_scopes.read().await;
+            let scope = scopes
+                .get(&session_id)
+                .expect("write refresh must retain the live scope");
+            (scope.created_at, scope.ttl)
+        };
         assert!(
-            state.scoped_graph_for_write(&session_id).await.is_some(),
-            "in-use scope must not expire mid-task; TTL should slide on each write"
+            (before_refresh..=after_refresh).contains(&refreshed_created_at),
+            "write must reset created_at inside the call boundary: before={before_refresh:?} refreshed={refreshed_created_at:?} after={after_refresh:?}"
+        );
+        assert_eq!(refreshed_ttl, ttl, "refresh must preserve the scope TTL");
+        assert!(
+            refreshed_created_at + refreshed_ttl > original_expires_at,
+            "write must slide the scope's expiry beyond its original deadline"
         );
     }
 
