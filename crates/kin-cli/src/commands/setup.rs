@@ -588,11 +588,38 @@ enum ShimCopy {
 /// file onto itself zeroes it out — the root cause of the "0-byte shim" that
 /// crashes every injected process. Both the setup flow and the doctor repair go
 /// through this guard so neither can truncate the shim.
-fn copy_shim(src: &Path, dest: &Path) -> Result<ShimCopy> {
+fn copy_shim(
+    install_lock: &crate::commands::update::InstallRootLock,
+    src: &Path,
+    dest: &Path,
+) -> Result<ShimCopy> {
+    let expected_parent = install_lock.root().join("lib");
+    let actual_parent = dest
+        .parent()
+        .context("VFS shim destination has no parent")?
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", dest.display()))?;
+    if actual_parent != expected_parent {
+        anyhow::bail!(
+            "refusing VFS shim write outside managed lib directory {}: {}",
+            expected_parent.display(),
+            dest.display()
+        );
+    }
+    if let Ok(metadata) = fs::symlink_metadata(dest) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            anyhow::bail!(
+                "refusing non-regular VFS shim destination {}",
+                dest.display()
+            );
+        }
+    }
     if same_file(src, dest) {
         return Ok(ShimCopy::Skipped);
     }
-    fs::copy(src, dest).with_context(|| format!("failed to copy shim to {}", dest.display()))?;
+    let bytes = fs::read(src).with_context(|| format!("failed to read shim {}", src.display()))?;
+    crate::commands::update::write_managed_component_atomically(install_lock, dest, &bytes)
+        .with_context(|| format!("failed to copy shim to {}", dest.display()))?;
     Ok(ShimCopy::Copied)
 }
 
@@ -644,10 +671,14 @@ fn find_shim() -> Option<PathBuf> {
 /// a source was copied, or `None` when no usable local source exists — the
 /// caller then escalates (download) or prints a manual step. Explicit sources
 /// keep the copy logic unit-testable without a real `$HOME`.
-fn restore_shim_from_sources(dest: &Path, sources: &[PathBuf]) -> Result<Option<PathBuf>> {
+fn restore_shim_from_sources(
+    install_lock: &crate::commands::update::InstallRootLock,
+    dest: &Path,
+    sources: &[PathBuf],
+) -> Result<Option<PathBuf>> {
     for src in sources {
         if is_usable_shim(src) {
-            copy_shim(src, dest)?;
+            copy_shim(install_lock, src, dest)?;
             return Ok(Some(dest.to_path_buf()));
         }
     }
@@ -1551,7 +1582,11 @@ fn rc_declares_kin_bin(content: &str, bin_dir: &Path) -> bool {
 }
 
 fn install_shell_hook(shell_name: &str) -> Result<(PathBuf, String)> {
-    let kin_home = kin_dir()?;
+    let requested_home = kin_dir()?;
+    let install_lock = crate::commands::update::InstallRootLock::acquire(&requested_home)?;
+    // Preserve the configured spelling in shell snippets (notably macOS
+    // /var -> /private/var aliases) while the lock validates the canonical root.
+    let kin_home = &requested_home;
     let bin_dir = kin_home.join("bin");
     let shell_dir = kin_home.join("shell");
     let lib_dir = kin_home.join("lib");
@@ -1570,7 +1605,7 @@ fn install_shell_hook(shell_name: &str) -> Result<(PathBuf, String)> {
         // and `find_shim` resolves the source via ~/.kin/bin/../lib — i.e. the
         // source and destination are the SAME FILE. `copy_shim` no-ops that case
         // so the shim is never truncated onto itself.
-        match copy_shim(&shim_path, &dest)? {
+        match copy_shim(&install_lock, &shim_path, &dest)? {
             ShimCopy::Skipped => {
                 println!("  VFS shim already in place: {}", dest.display());
             }
@@ -1654,8 +1689,9 @@ pub(crate) fn reinstall_shell_hook() -> Result<PathBuf> {
 /// source shim exists anywhere — in that case the bytes cannot be reconstructed
 /// locally and the caller directs the user to reinstall.
 pub(crate) fn reinstall_vfs_shim() -> Result<Option<PathBuf>> {
-    let lib_dir = kin_dir()?.join("lib");
-    fs::create_dir_all(&lib_dir).context("failed to create ~/.kin/lib/")?;
+    let requested_home = kin_dir()?;
+    let install_lock = crate::commands::update::InstallRootLock::acquire(&requested_home)?;
+    let lib_dir = install_lock.root().join("lib");
     let dest = lib_dir.join(shim_filename());
 
     // `find_shim` only returns non-empty candidates, so a truncated shim is
@@ -1663,7 +1699,7 @@ pub(crate) fn reinstall_vfs_shim() -> Result<Option<PathBuf>> {
     // first usable one and `copy_shim` no-ops if that source already is the
     // destination.
     let sources: Vec<PathBuf> = find_shim().into_iter().collect();
-    restore_shim_from_sources(&dest, &sources)
+    restore_shim_from_sources(&install_lock, &dest, &sources)
 }
 
 /// Re-merge the kin MCP server entry (with the agent-default profile) into the
@@ -1688,7 +1724,7 @@ fn remerge_mcp_config_paths(
     repo_root: Option<&Path>,
 ) -> Vec<PathBuf> {
     let mut repaired = Vec::new();
-    for (id, _label, path) in configs {
+    for (id, label, path) in configs {
         // Detected clients with no config are real missing setup artifacts.
         // New global Codex/Antigravity entries are cwd-free and safe to create
         // from any directory; existing cwd policy is preserved. The workspace
@@ -1714,8 +1750,12 @@ fn remerge_mcp_config_paths(
         } else {
             merge_mcp_config(&path)
         };
-        if merged.is_ok() {
-            repaired.push(path);
+        match merged {
+            Ok(()) => repaired.push(path),
+            Err(error) => eprintln!(
+                "WARNING: could not refresh the {label} Kin MCP entry at {}: {error:#}",
+                path.display()
+            ),
         }
     }
     repaired
@@ -2704,13 +2744,12 @@ pub async fn doctor(fix: bool, json: bool) -> Result<()> {
             )),
             Ok(None) => {
                 // No local shim source. Fetch the shim from the matching release.
-                let dest = kin_dir()?.join("lib").join(shim_filename());
                 println!(
                     "  No local VFS shim found; fetching it from the v{} release...",
                     env!("CARGO_PKG_VERSION")
                 );
-                match crate::commands::update::download_shim_for_current_version(&dest).await {
-                    Ok(()) => applied.push(format!(
+                match crate::commands::update::download_shim_for_current_version().await {
+                    Ok(dest) => applied.push(format!(
                         "downloaded the VFS shim from the v{} release ({})",
                         env!("CARGO_PKG_VERSION"),
                         dest.display()
@@ -3104,13 +3143,15 @@ mod tests {
         // FIR-1409 repair path: a deliberately-zeroed shim + a usable source is
         // restored to the real bytes.
         let tmp = tempfile::tempdir().unwrap();
+        let install_lock = crate::commands::update::InstallRootLock::acquire(tmp.path()).unwrap();
         let source = tmp.path().join("source-shim");
         fs::write(&source, b"\xCF\xFA\xED\xFEreal-shim-bytes").unwrap();
         let dest = tmp.path().join("lib").join(shim_filename());
         fs::create_dir_all(dest.parent().unwrap()).unwrap();
         fs::write(&dest, b"").unwrap(); // the 0-byte crash hazard
 
-        let restored = restore_shim_from_sources(&dest, std::slice::from_ref(&source)).unwrap();
+        let restored =
+            restore_shim_from_sources(&install_lock, &dest, std::slice::from_ref(&source)).unwrap();
         assert_eq!(restored.as_deref(), Some(dest.as_path()));
         assert_eq!(
             fs::read(&dest).unwrap(),
@@ -3125,13 +3166,14 @@ mod tests {
         // (so the caller escalates / prints a manual step) and never fabricates
         // content over the zeroed shim.
         let tmp = tempfile::tempdir().unwrap();
+        let install_lock = crate::commands::update::InstallRootLock::acquire(tmp.path()).unwrap();
         let empty = tmp.path().join("empty-source");
         fs::write(&empty, b"").unwrap();
         let missing = tmp.path().join("missing-source");
-        let dest = tmp.path().join("dest-shim");
+        let dest = tmp.path().join("lib").join(shim_filename());
         fs::write(&dest, b"").unwrap();
 
-        let restored = restore_shim_from_sources(&dest, &[empty, missing]).unwrap();
+        let restored = restore_shim_from_sources(&install_lock, &dest, &[empty, missing]).unwrap();
         assert!(restored.is_none(), "no usable source must yield None");
         assert_eq!(
             fs::metadata(&dest).unwrap().len(),
@@ -3165,6 +3207,7 @@ mod tests {
         // lib) and fs::copy truncated it to 0 bytes. The guard must no-op and
         // leave the bytes intact.
         let tmp = tempfile::tempdir().unwrap();
+        let install_lock = crate::commands::update::InstallRootLock::acquire(tmp.path()).unwrap();
         let lib = tmp.path().join("lib");
         let bin = tmp.path().join("bin");
         fs::create_dir_all(&lib).unwrap();
@@ -3173,19 +3216,26 @@ mod tests {
         fs::write(&dest, b"REAL_SHIM_BYTES").unwrap();
         let aliased_src = bin.join("..").join("lib").join(shim_filename());
 
-        assert_eq!(copy_shim(&aliased_src, &dest).unwrap(), ShimCopy::Skipped);
+        assert_eq!(
+            copy_shim(&install_lock, &aliased_src, &dest).unwrap(),
+            ShimCopy::Skipped
+        );
         assert_eq!(fs::read(&dest).unwrap(), b"REAL_SHIM_BYTES");
     }
 
     #[test]
     fn copy_shim_copies_a_distinct_source() {
         let tmp = tempfile::tempdir().unwrap();
+        let install_lock = crate::commands::update::InstallRootLock::acquire(tmp.path()).unwrap();
         let src = tmp.path().join("source.dylib");
         fs::write(&src, b"SOURCE_BYTES").unwrap();
         let dest = tmp.path().join("lib").join(shim_filename());
         fs::create_dir_all(dest.parent().unwrap()).unwrap();
 
-        assert_eq!(copy_shim(&src, &dest).unwrap(), ShimCopy::Copied);
+        assert_eq!(
+            copy_shim(&install_lock, &src, &dest).unwrap(),
+            ShimCopy::Copied
+        );
         assert_eq!(fs::read(&dest).unwrap(), b"SOURCE_BYTES");
     }
 

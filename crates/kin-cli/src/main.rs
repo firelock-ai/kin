@@ -832,13 +832,19 @@ enum Command {
     },
     /// Update Kin to the latest release
     Update {
-        /// Skip signature and checksum verification (NOT recommended)
-        #[arg(long)]
+        /// Skip SHA-256 checksum verification (NOT recommended)
+        #[arg(long, conflicts_with = "check_only")]
         skip_verify: bool,
         /// Release channel: `stable` (default) or `alpha` (latest pre-release,
-        /// unstable). The chosen channel is saved as the default for future updates.
+        /// unstable). A mutating update saves the choice; check-only never writes it.
         #[arg(long, value_enum)]
         channel: Option<commands::update::Channel>,
+        /// Check whether an update is available without downloading or installing it
+        #[arg(long)]
+        check_only: bool,
+        /// Emit the check-only result as JSON
+        #[arg(long, requires = "check_only")]
+        json: bool,
     },
     /// Show or manage the global Kin repository registry
     Registry {
@@ -2747,7 +2753,9 @@ fn main() -> Result<()> {
                 Command::Update {
                     skip_verify,
                     channel,
-                } => commands::update::run(skip_verify, channel).await,
+                    check_only,
+                    json,
+                } => commands::update::run(skip_verify, channel, check_only, json).await,
                 Command::Registry { action } => match action {
                     Some(RegistryAction::Daemons { json }) => {
                         commands::registry::daemons(json).await
