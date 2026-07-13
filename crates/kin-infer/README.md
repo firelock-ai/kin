@@ -7,15 +7,15 @@ GPU acceleration and no external ML framework dependency (no PyTorch, no ONNX,
 no TensorFlow). Custom compute shaders and kernels drive the GPU backends.
 
 It is the inference primitive in the open Kin local substrate. `kin-db`
-consumes it to embed source entities on-device. Kin uses it to power
-deterministic, citable embedding inference over local code corpora.
+consumes it to embed source entities on-device. Kin runs it with a deterministic
+pure-Rust CPU path for bit-reproducible embedding over local code corpora.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/firelock-ai/kin)
 
 ## What is Kin?
 
-Kin is the system of record for AI-written software — your code as a graph of
+Kin is the system of record for AI-written software: your code as a graph of
 entities, relations, and intents, not a pile of files and diffs. AI agents and humans
 navigate it semantically, with provenance, review, and governance built in. It coexists
 with Git and projects graph truth back to a normal filesystem, so any tool works unchanged.
@@ -35,6 +35,7 @@ Feature flags of note:
 |------|---------|---------|
 | `metal` | off | Apple Metal GPU backend (M1/M2/M3) |
 | `cuda` | off | CUDA GPU backend (Linux/Windows) |
+| `accelerate` | off | Apple Accelerate BLAS on the CPU path (macOS) |
 
 With no GPU feature flag, the engine runs on CPU with SIMD acceleration.
 
@@ -56,13 +57,13 @@ With no GPU feature flag, the engine runs on CPU with SIMD acceleration.
 
 ## Key types
 
-- `InferError` — typed error enum for model load, inference, and I/O failures.
-- `gpu` module — GPU resource management and backend selection.
-- `metal_backend` (macOS) — Apple Metal compute shaders for GPU inference.
-- `cuda_backend` (Linux/Windows) — CUDA kernels for GPU inference.
-- `resource` module — `ResourcePlan` for GPU/CPU resource inspection and
+- `InferError`: typed error enum for model load, inference, and I/O failures.
+- `gpu` module: GPU resource management and backend selection.
+- `metal_backend` (macOS): Apple Metal compute shaders for GPU inference.
+- `cuda_backend` (Linux/Windows): CUDA kernels for GPU inference.
+- `resource` module: `ResourcePlan` for GPU/CPU resource inspection and
   scheduling.
-- `watchdog` module — inference process health monitoring.
+- `watchdog` module: inference process health monitoring.
 
 ## License
 
