@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.23] - 2026-07-14
+
+This patch republishes the reviewed v0.2.22 payload through the corrected
+cross-platform public install proof. The runtime product code is unchanged;
+the delta is release workflow and test plumbing plus version metadata.
+
+### Fixed
+
+- The Unix graph-backed VFS acceptance helper now uses an external-tool
+  basename so the shipped shim exercises interposition instead of its
+  intentional Kin control-plane bypass.
+- Normal VFS proof teardown now treats a disappeared daemon PID as a
+  successful stop and prevents EXIT cleanup from re-entering, while preserving
+  fail-closed cleanup errors and signal handling.
+
 ## [0.2.22] - 2026-07-14
 
 This patch restores Linux AArch64 VFS passthrough and makes the public install
@@ -584,7 +599,8 @@ Historical note: this snapshot predates the public GitHub prerelease series and 
 - Daemon mode for background file watching (`kin-daemon`)
 - 19-crate workspace architecture
 
-[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.22...HEAD
+[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.23...HEAD
+[0.2.23]: https://github.com/firelock-ai/kin/compare/v0.2.22...v0.2.23
 [0.2.22]: https://github.com/firelock-ai/kin/compare/v0.2.21...v0.2.22
 [0.2.21]: https://github.com/firelock-ai/kin/compare/v0.2.20...v0.2.21
 [0.2.20]: https://github.com/firelock-ai/kin/compare/v0.2.19...v0.2.20
