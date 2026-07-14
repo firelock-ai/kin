@@ -111,6 +111,7 @@ def main() -> None:
 
     for policy in (
         "Graph-backed VFS projection proof",
+        'probe_bin="$RUNNER_TEMP/vfs-open-probe"',
         "fstat(STDOUT_FILENO, &stdout_stat)",
         "chmod 000 probe.py",
         "KIN_VFS_STRICT=1 kin-vfs exec --workspace .",
@@ -127,6 +128,11 @@ def main() -> None:
         "trap 'on_vfs_signal 143' TERM",
     ):
         require(install_proof, policy, "public VFS and installed-artifact proof")
+    if "kin-vfs-open-probe" in install_proof:
+        raise AssertionError(
+            "public VFS probe must not use a Kin-family basename; the shipped "
+            "shim intentionally bypasses basenames beginning with 'kin-'"
+        )
     proof_upload = install_proof[install_proof.index("- name: Preserve proof reports") :]
     for report in (
         "release-provenance.json",

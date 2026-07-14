@@ -496,7 +496,10 @@ jobs:
         working-directory: kin-install-proof
         run: |
           set -euo pipefail
-          probe_bin="$RUNNER_TEMP/kin-vfs-open-probe"
+          # The shipped shim deliberately bypasses Kin-family control-plane
+          # processes (basenames beginning with `kin-`). Keep this external
+          # probe outside that namespace so the proof exercises interposition.
+          probe_bin="$RUNNER_TEMP/vfs-open-probe"
           cc -O2 -Wall -Wextra -Werror -x c -o "$probe_bin" - <<'C'
           #include <errno.h>
           #include <fcntl.h>
@@ -506,7 +509,7 @@ jobs:
 
           int main(int argc, char **argv) {
               if (argc != 2) {
-                  fputs("usage: kin-vfs-open-probe <path>\n", stderr);
+                  fputs("usage: vfs-open-probe <path>\n", stderr);
                   return 2;
               }
 
