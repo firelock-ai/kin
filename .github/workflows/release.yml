@@ -1764,6 +1764,376 @@ jobs:
             fi
           fi
 
+  # Move GHCR's mutable convenience tag only after every stable release proof
+  # has succeeded and GitHub Latest names this exact tag. The commit and
+  # version tags remain the immutable authority; `latest` is a verified alias
+  # to that already-attested digest and is never rebuilt here.
+  promote_ghcr_latest:
+    name: Promote stable ghcr latest
+    needs: [config, finalize_release, version_tag_image, build_daemon_image, attest_daemon_image]
+    if: >-
+      ${{
+        always() &&
+        needs.config.result == 'success' &&
+        needs.finalize_release.result == 'success' &&
+        needs.version_tag_image.result == 'success' &&
+        needs.build_daemon_image.result == 'success' &&
+        needs.attest_daemon_image.result == 'success' &&
+        needs.config.outputs.release_channel == 'latest' &&
+        startsWith(github.ref, 'refs/tags/v') &&
+        !contains(github.ref_name, '-')
+      }}
+    runs-on: ubuntu-latest
+    environment: release
+    # Least privilege for one registry-side tag move plus readback of the
+    # existing OCI attestation. This job cannot create releases or attestations.
+    permissions:
+      contents: read
+      packages: write
+      attestations: read
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Promote the proven stable digest to ghcr latest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ghcr.io/firelock-ai/kin
+          EXPECTED_COMMIT: ${{ needs.build_daemon_image.outputs.commit }}
+          EXPECTED_SOURCE_DIGEST: ${{ needs.build_daemon_image.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          if ! printf '%s\n' "$GITHUB_REF_NAME" \
+            | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "::error::$GITHUB_REF_NAME is not an exact stable release tag"
+            exit 1
+          fi
+          if [ "$GITHUB_REF" != "refs/tags/${GITHUB_REF_NAME}" ]; then
+            echo "::error::release ref $GITHUB_REF does not match tag $GITHUB_REF_NAME"
+            exit 1
+          fi
+          channel="$(node scripts/release-order.mjs channel "$VERSION")"
+          if [ "$channel" != "latest" ]; then
+            echo "::error::$GITHUB_REF_NAME resolved to release channel $channel, not latest"
+            exit 1
+          fi
+
+          COMMIT="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
+          checkout_commit="$(git rev-parse HEAD)"
+          if [ "$COMMIT" != "$checkout_commit" ]; then
+            echo "::error::release tag peels to $COMMIT, checkout resolved to $checkout_commit"
+            exit 1
+          fi
+          if [ "$COMMIT" != "$EXPECTED_COMMIT" ]; then
+            echo "::error::release tag peels to $COMMIT, image job resolved to $EXPECTED_COMMIT"
+            exit 1
+          fi
+          if ! printf '%s\n' "$COMMIT" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::release tag did not resolve to a full commit id"
+            exit 1
+          fi
+          if ! printf '%s\n' "$EXPECTED_SOURCE_DIGEST" \
+            | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::image job did not provide an exact sha256 digest"
+            exit 1
+          fi
+
+          SRC="${IMAGE}:${COMMIT}"
+          VERSION_TAG="${IMAGE}:${VERSION}"
+          V_VERSION_TAG="${IMAGE}:${GITHUB_REF_NAME}"
+          LATEST="${IMAGE}:latest"
+
+          inspect_digest() {
+            local reference="$1"
+            local output
+            for attempt in 1 2 3 4 5; do
+              if output="$(docker buildx imagetools inspect "$reference" \
+                --format '{{.Manifest.Digest}}' 2>&1)"; then
+                printf '%s\n' "$output"
+                return 0
+              fi
+              if [ "$output" = "ERROR: ${reference}: not found" ]; then
+                return 44
+              fi
+              if [ "$attempt" -eq 5 ]; then
+                printf '%s\n' "$output" >&2
+                echo "::error::could not establish registry state for $reference" >&2
+                return 1
+              fi
+              sleep $(( attempt * 2 ))
+            done
+          }
+
+          resolve_required_digest() {
+            local reference="$1"
+            local label="$2"
+            local digest
+            local status
+            if digest="$(inspect_digest "$reference")"; then
+              :
+            else
+              status=$?
+              if [ "$status" -eq 44 ]; then
+                echo "::error::$label $reference does not exist" >&2
+              fi
+              return "$status"
+            fi
+            if ! printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+              echo "::error::$label $reference did not resolve to an exact sha256 digest" >&2
+              return 1
+            fi
+            printf '%s\n' "$digest"
+          }
+
+          wait_for_expected_digest() {
+            local reference="$1"
+            local expected="$2"
+            local label="$3"
+            local digest="<missing>"
+            local status
+            local matching_reads=0
+            for attempt in $(seq 1 12); do
+              if digest="$(inspect_digest "$reference")"; then
+                if ! printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+                  echo "::error::$label $reference did not resolve to an exact sha256 digest" >&2
+                  return 1
+                fi
+                if [ "$digest" = "$expected" ]; then
+                  matching_reads=$((matching_reads + 1))
+                  if [ "$matching_reads" -eq 2 ]; then
+                    printf '%s\n' "$digest"
+                    return 0
+                  fi
+                else
+                  matching_reads=0
+                fi
+              else
+                status=$?
+                if [ "$status" -ne 44 ]; then
+                  return "$status"
+                fi
+                digest="<missing>"
+                matching_reads=0
+              fi
+              if [ "$attempt" -lt 12 ]; then
+                sleep 2
+              fi
+            done
+            echo "::error::$label $reference did not converge to $expected; last observed $digest" >&2
+            return 1
+          }
+
+          verify_stable_release_authority() {
+            local latest_tag
+            local prerelease
+            latest_tag="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name')"
+            if [ "$latest_tag" != "$GITHUB_REF_NAME" ]; then
+              echo "::error::GitHub Latest moved to $latest_tag; expected $GITHUB_REF_NAME"
+              return 1
+            fi
+            prerelease="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" \
+              --jq '.prerelease')"
+            if [ "$prerelease" != "false" ]; then
+              echo "::error::$GITHUB_REF_NAME is prerelease=$prerelease, expected false"
+              return 1
+            fi
+          }
+
+          verify_attestation() {
+            local digest="$1"
+            local verified=false
+            for attempt in 1 2 3 4 5; do
+              if gh attestation verify \
+                "oci://${IMAGE}@${digest}" \
+                --repo "$GITHUB_REPOSITORY" \
+                --bundle-from-oci \
+                --predicate-type https://slsa.dev/provenance/v1 \
+                --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+                --signer-digest "$COMMIT" \
+                --source-digest "$COMMIT" \
+                --source-ref "$GITHUB_REF" \
+                --deny-self-hosted-runners; then
+                verified=true
+                break
+              fi
+              sleep $(( attempt * 2 ))
+            done
+            if [ "$verified" != true ]; then
+              echo "::error::could not verify the exact daemon image attestation"
+              return 1
+            fi
+          }
+
+          verify_immutable_authority() {
+            local phase="$1"
+            local actual_source
+            local actual_version
+            local actual_v_version
+            actual_source="$(resolve_required_digest "$SRC" "$phase source")"
+            if [ "$actual_source" != "$EXPECTED_SOURCE_DIGEST" ]; then
+              echo "::error::$phase $SRC resolved to $actual_source, expected $EXPECTED_SOURCE_DIGEST"
+              return 1
+            fi
+            actual_version="$(resolve_required_digest "$VERSION_TAG" "$phase version tag")"
+            actual_v_version="$(resolve_required_digest "$V_VERSION_TAG" "$phase v-version tag")"
+            if [ "$actual_version" != "$EXPECTED_SOURCE_DIGEST" ] || \
+              [ "$actual_v_version" != "$EXPECTED_SOURCE_DIGEST" ]; then
+              echo "::error::$phase version tags do not resolve to $EXPECTED_SOURCE_DIGEST"
+              return 1
+            fi
+            bash scripts/verify-container-build-info.sh \
+              "${IMAGE}@${actual_source}" "$COMMIT"
+            verify_attestation "$actual_source"
+          }
+
+          # Initial fail-closed admission. Finalization must already have made
+          # this exact stable tag GitHub Latest, and every immutable image
+          # identity must still resolve to the build job's attested digest.
+          verify_stable_release_authority
+          verify_immutable_authority "initial"
+
+          initial_latest_state=missing
+          initial_latest_digest=""
+          if initial_latest_digest="$(inspect_digest "$LATEST")"; then
+            initial_latest_state=present
+            if ! printf '%s\n' "$initial_latest_digest" \
+              | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+              echo "::error::$LATEST did not resolve to an exact sha256 digest"
+              exit 1
+            fi
+          else
+            inspect_status=$?
+            if [ "$inspect_status" -ne 44 ]; then
+              exit "$inspect_status"
+            fi
+          fi
+
+          action="Verified existing"
+          mutation_required=true
+          if [ "$initial_latest_digest" = "$EXPECTED_SOURCE_DIGEST" ]; then
+            mutation_required=false
+          fi
+
+          if [ "$mutation_required" = true ]; then
+            # Recheck every authority immediately before the sole mutable write.
+            # A concurrent correct promotion is idempotently accepted. Changes
+            # observed before the write fail closed; GHCR offers no atomic
+            # compare-and-swap, so bounded post-write convergence checks guard
+            # the remaining read/write race window.
+            verify_stable_release_authority
+            verify_immutable_authority "pre-write"
+
+            prewrite_latest_state=missing
+            prewrite_latest_digest=""
+            if prewrite_latest_digest="$(inspect_digest "$LATEST")"; then
+              prewrite_latest_state=present
+              if ! printf '%s\n' "$prewrite_latest_digest" \
+                | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+                echo "::error::pre-write $LATEST did not resolve to an exact sha256 digest"
+                exit 1
+              fi
+            else
+              inspect_status=$?
+              if [ "$inspect_status" -ne 44 ]; then
+                exit "$inspect_status"
+              fi
+            fi
+
+            if [ "$prewrite_latest_digest" = "$EXPECTED_SOURCE_DIGEST" ]; then
+              mutation_required=false
+              action="Verified concurrent"
+            elif [ "$prewrite_latest_state" != "$initial_latest_state" ] || \
+              [ "$prewrite_latest_digest" != "$initial_latest_digest" ]; then
+              echo "::error::$LATEST changed from ${initial_latest_state}:${initial_latest_digest:-<missing>} to ${prewrite_latest_state}:${prewrite_latest_digest:-<missing>} during admission"
+              exit 1
+            fi
+
+            if [ "$mutation_required" = true ]; then
+              # Last-moment rollback and source checks bound the remaining race
+              # window before the one registry mutation in this job.
+              verify_stable_release_authority
+              prewrite_source_digest="$(resolve_required_digest "$SRC" "pre-write source recheck")"
+              if [ "$prewrite_source_digest" != "$EXPECTED_SOURCE_DIGEST" ]; then
+                echo "::error::pre-write source moved to $prewrite_source_digest"
+                exit 1
+              fi
+
+              final_prewrite_latest_state=missing
+              final_prewrite_latest_digest=""
+              if final_prewrite_latest_digest="$(inspect_digest "$LATEST")"; then
+                final_prewrite_latest_state=present
+                if ! printf '%s\n' "$final_prewrite_latest_digest" \
+                  | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+                  echo "::error::final pre-write $LATEST did not resolve to an exact sha256 digest"
+                  exit 1
+                fi
+              else
+                inspect_status=$?
+                if [ "$inspect_status" -ne 44 ]; then
+                  exit "$inspect_status"
+                fi
+              fi
+
+              if [ "$final_prewrite_latest_digest" = "$EXPECTED_SOURCE_DIGEST" ]; then
+                mutation_required=false
+                action="Verified concurrent"
+              elif [ "$final_prewrite_latest_state" != "$prewrite_latest_state" ] || \
+                [ "$final_prewrite_latest_digest" != "$prewrite_latest_digest" ]; then
+                echo "::error::$LATEST changed from ${prewrite_latest_state}:${prewrite_latest_digest:-<missing>} to ${final_prewrite_latest_state}:${final_prewrite_latest_digest:-<missing>} during final admission"
+                exit 1
+              fi
+
+              if [ "$mutation_required" = true ]; then
+                docker buildx imagetools create \
+                  --prefer-index=false \
+                  --tag "$LATEST" \
+                  "${IMAGE}@${EXPECTED_SOURCE_DIGEST}"
+                action="Promoted"
+              fi
+            fi
+          fi
+
+          # Post-write verification is mandatory on both the mutation and
+          # idempotent rerun paths. Resolve through :latest itself, then verify
+          # its embedded build identity and the immutable digest's attestation.
+          verify_stable_release_authority
+          verify_immutable_authority "post-write"
+          actual_latest_digest="$(wait_for_expected_digest \
+            "$LATEST" "$EXPECTED_SOURCE_DIGEST" "post-write latest")"
+          bash scripts/verify-container-build-info.sh "$LATEST" "$COMMIT"
+          verify_attestation "$actual_latest_digest"
+          wait_for_expected_digest \
+            "$LATEST" "$EXPECTED_SOURCE_DIGEST" "final latest readback" \
+            >/dev/null
+
+          {
+            echo "${action} stable daemon image alias:"
+            echo ""
+            echo "- GitHub Latest: \`${GITHUB_REF_NAME}\`"
+            echo "- source: \`${SRC}\`"
+            echo "- destination: \`${LATEST}\`"
+            echo "- digest: \`${EXPECTED_SOURCE_DIGEST}\`"
+            echo "- no image was rebuilt"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   publish_boundary_contracts:
     name: Post-release boundary contracts publish
     needs: [publish, install_proof, finalize_release]
