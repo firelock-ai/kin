@@ -124,10 +124,26 @@ def main() -> None:
         'if [ "$negative_status" -ne 4 ]',
         "negative control did not fail with the expected raw-disk permission error",
         "installed kin-vfs socket remained after shutdown",
+        'process_state="$(ps -o stat= -p "$vfs_pid" 2>/dev/null || true)"',
+        'process_state="$(printf \'%s\' "$process_state" | tr -d \'[:space:]\')"',
         "trap 'on_vfs_signal 130' INT",
         "trap 'on_vfs_signal 143' TERM",
     ):
         require(install_proof, policy, "public VFS and installed-artifact proof")
+    cleanup_start = install_proof.index("          cleanup_vfs() {")
+    signal_start = install_proof.index("          on_vfs_signal() {", cleanup_start)
+    cleanup_vfs = install_proof[cleanup_start:signal_start]
+    require(cleanup_vfs, 'vfs_pid=""', "idempotent public VFS cleanup")
+    if "ps -o stat= -p \"$vfs_pid\" 2>/dev/null | tr" in cleanup_vfs:
+        raise AssertionError(
+            "public VFS cleanup must treat a disappeared daemon PID as the "
+            "expected successful-stop state under set -euo pipefail"
+        )
+    require(
+        install_proof,
+        "          trap - EXIT\n          cleanup_vfs\n          trap - INT TERM",
+        "non-reentrant public VFS normal cleanup",
+    )
     if "kin-vfs-open-probe" in install_proof:
         raise AssertionError(
             "public VFS probe must not use a Kin-family basename; the shipped "
