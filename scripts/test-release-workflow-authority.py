@@ -110,6 +110,76 @@ def main() -> None:
         require(install_proof, policy, "actionable install-proof health failure")
 
     for policy in (
+        "Graph-backed VFS projection proof",
+        "fstat(STDOUT_FILENO, &stdout_stat)",
+        "chmod 000 probe.py",
+        "KIN_VFS_STRICT=1 kin-vfs exec --workspace .",
+        "cmp -s vfs-expected.txt vfs-graph-read.txt",
+        "installed VFS did not return the exact graph-owned probe.py bytes",
+        "release-provenance-attestation.json",
+        "installed-vfs-provenance.json",
+        "installed ${component.name} differs from the attested public archive",
+        '--signer-digest "$expected_commit"',
+        'if [ "$negative_status" -ne 4 ]',
+        "negative control did not fail with the expected raw-disk permission error",
+        "installed kin-vfs socket remained after shutdown",
+        "trap 'on_vfs_signal 130' INT",
+        "trap 'on_vfs_signal 143' TERM",
+    ):
+        require(install_proof, policy, "public VFS and installed-artifact proof")
+    proof_upload = install_proof[install_proof.index("- name: Preserve proof reports") :]
+    for report in (
+        "release-provenance.json",
+        "release-provenance.json.sha256",
+        "release-provenance-attestation.json",
+        "installed-vfs-provenance.json",
+    ):
+        require(proof_upload, report, "preserved installed-artifact proof report")
+
+    vfs_checkout_count = len(
+        re.findall(r"repository:\s*firelock-ai/kin-vfs\s*$", release, re.MULTILINE)
+    )
+    vfs_checkout_refs = re.findall(
+        r"repository:\s*firelock-ai/kin-vfs\s*$"
+        r"(?:(?!^\s+- name:).)*?^\s+ref:\s*([^\s#]+)",
+        release,
+        re.MULTILINE | re.DOTALL,
+    )
+    if len(vfs_checkout_refs) != vfs_checkout_count or any(
+        re.fullmatch(r"[0-9a-f]{40}", ref) is None for ref in vfs_checkout_refs
+    ):
+        raise AssertionError(
+            "every kin-vfs release checkout must declare a full immutable commit; "
+            f"checkouts={vfs_checkout_count}, refs={vfs_checkout_refs}"
+        )
+    vfs_refs = set(vfs_checkout_refs)
+    vfs_expected = set(
+        re.findall(r"EXPECTED_VFS_COMMIT:\s*([0-9a-f]{40})", release)
+    )
+    install_proof_vfs_expected = set(
+        re.findall(r"expected_vfs_commit:\s*([0-9a-f]{40})", release)
+    )
+    if len(vfs_refs) != 1 or vfs_expected != vfs_refs:
+        raise AssertionError(
+            "release workflow must use one immutable kin-vfs commit for build "
+            f"and provenance verification; refs={sorted(vfs_refs)}, "
+            f"expected={sorted(vfs_expected)}"
+        )
+    if install_proof_vfs_expected != vfs_refs:
+        raise AssertionError(
+            "install proof must bind the same immutable kin-vfs commit as the "
+            f"release workflow; release={sorted(vfs_refs)}, "
+            f"install-proof={sorted(install_proof_vfs_expected)}"
+        )
+    for policy in (
+        "Verified Kin/kin-vfs release compatibility at kin-vfs-core",
+        'pkg.name === "kin-vfs-core" && pkg.source?.startsWith("sparse+")',
+        'pkg.name === "kin-vfs-core" && pkg.source === null',
+        "update the immutable kin-vfs pin",
+    ):
+        require(release, policy, "Kin and pinned kin-vfs release compatibility gate")
+
+    for policy in (
         "Reopen a fresh Windows graph through the daemon",
         "kin.exe status --json > kin-status.json",
         "test -s .kin/kindb/head-generation",
@@ -466,6 +536,7 @@ def main() -> None:
         "always()",
         "needs.publish.result == 'success'",
         "uses: ./.github/workflows/install-proof.yml",
+        "expected_vfs_commit: 1c531216c65b734fb5e7c996094e01e030b8eec7",
     ):
         require(install_proof_job, policy, "mandatory public install proof")
 

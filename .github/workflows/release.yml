@@ -454,7 +454,7 @@ jobs:
           repository: firelock-ai/kin-vfs
           path: kin-vfs
           # Release inputs must never move under an unchanged Kin tag.
-          ref: 64d94af54cd049a54c999e20857f5eec4bcde45c
+          ref: 1c531216c65b734fb5e7c996094e01e030b8eec7
           persist-credentials: false
 
       - name: Verify canonical release input bytes
@@ -484,6 +484,32 @@ jobs:
             }
             console.log(`Verified canonical ${label} Cargo.lock bytes: ${sha256(tracked)}`);
           }
+
+          const lockPackages = (lockPath) => fs.readFileSync(lockPath, "utf8")
+            .split("[[package]]")
+            .slice(1)
+            .map((block) => ({
+              name: block.match(/^name = "([^"]+)"/m)?.[1],
+              version: block.match(/^version = "([^"]+)"/m)?.[1],
+              source: block.match(/^source = "([^"]+)"/m)?.[1] ?? null,
+            }));
+          const kinVfsCore = lockPackages(path.join(process.cwd(), "Cargo.lock"))
+            .filter((pkg) => pkg.name === "kin-vfs-core" && pkg.source?.startsWith("sparse+"));
+          const pinnedVfsCore = lockPackages(path.join(process.cwd(), "kin-vfs", "Cargo.lock"))
+            .filter((pkg) => pkg.name === "kin-vfs-core" && pkg.source === null);
+          if (kinVfsCore.length !== 1 || pinnedVfsCore.length !== 1) {
+            throw new Error(
+              `expected one registry Kin kin-vfs-core and one pinned local kin-vfs-core; ` +
+              `found ${kinVfsCore.length} and ${pinnedVfsCore.length}`
+            );
+          }
+          if (kinVfsCore[0].version !== pinnedVfsCore[0].version) {
+            throw new Error(
+              `Kin resolves kin-vfs-core ${kinVfsCore[0].version}, but the pinned release ` +
+              `checkout builds ${pinnedVfsCore[0].version}; update the immutable kin-vfs pin`
+            );
+          }
+          console.log(`Verified Kin/kin-vfs release compatibility at kin-vfs-core ${kinVfsCore[0].version}`);
           NODE
 
       - name: Cache Cargo registry and build artifacts
@@ -845,7 +871,7 @@ jobs:
           ARTIFACT: ${{ matrix.artifact }}
           TARGET: ${{ matrix.target }}
           VFS_TARGET: ${{ matrix.vfs_target || matrix.target }}
-          EXPECTED_VFS_COMMIT: 64d94af54cd049a54c999e20857f5eec4bcde45c
+          EXPECTED_VFS_COMMIT: 1c531216c65b734fb5e7c996094e01e030b8eec7
         run: |
           set -euo pipefail
           node <<'NODE'
@@ -1077,7 +1103,7 @@ jobs:
         with:
           repository: firelock-ai/kin-vfs
           path: release-inputs/kin-vfs
-          ref: 64d94af54cd049a54c999e20857f5eec4bcde45c
+          ref: 1c531216c65b734fb5e7c996094e01e030b8eec7
           persist-credentials: false
 
       - name: Download all artifacts
@@ -1135,7 +1161,7 @@ jobs:
 
       - name: Verify and aggregate release provenance
         env:
-          EXPECTED_VFS_COMMIT: 64d94af54cd049a54c999e20857f5eec4bcde45c
+          EXPECTED_VFS_COMMIT: 1c531216c65b734fb5e7c996094e01e030b8eec7
         run: |
           set -euo pipefail
           node <<'NODE'
@@ -1383,6 +1409,7 @@ jobs:
     uses: ./.github/workflows/install-proof.yml
     with:
       release_tag: ${{ github.ref_name }}
+      expected_vfs_commit: 1c531216c65b734fb5e7c996094e01e030b8eec7
     permissions:
       contents: read
       attestations: read
