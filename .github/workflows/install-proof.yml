@@ -569,7 +569,10 @@ jobs:
               kin-vfs stop --workspace . >> kin-vfs-daemon.log 2>&1 || cleanup_status=1
               stopped=false
               for _ in $(seq 1 150); do
-                process_state="$(ps -o stat= -p "$vfs_pid" 2>/dev/null | tr -d '[:space:]')"
+                # A missing PID is the expected successful-stop state. Keep
+                # that `ps` miss from tripping `set -euo pipefail`.
+                process_state="$(ps -o stat= -p "$vfs_pid" 2>/dev/null || true)"
+                process_state="$(printf '%s' "$process_state" | tr -d '[:space:]')"
                 if [ -z "$process_state" ] || printf '%s\n' "$process_state" | grep -q 'Z'; then
                   stopped=true
                   break
@@ -595,6 +598,7 @@ jobs:
                     ;;
                 esac
               fi
+              vfs_pid=""
             fi
             if [ -S .kin/vfs.sock ]; then
               echo "installed kin-vfs socket remained after shutdown" >&2
@@ -660,8 +664,11 @@ jobs:
             exit 1
           fi
 
+          # Prevent a cleanup failure from re-entering cleanup through EXIT;
+          # keep the signal handlers until normal cleanup has completed.
+          trap - EXIT
           cleanup_vfs
-          trap - EXIT INT TERM
+          trap - INT TERM
 
       - name: Unix embedding and semantic retrieval proof
         if: runner.os != 'Windows'
