@@ -110,6 +110,76 @@ def main() -> None:
         require(install_proof, policy, "actionable install-proof health failure")
 
     for policy in (
+        "Graph-backed VFS projection proof",
+        "fstat(STDOUT_FILENO, &stdout_stat)",
+        "chmod 000 probe.py",
+        "KIN_VFS_STRICT=1 kin-vfs exec --workspace .",
+        "cmp -s vfs-expected.txt vfs-graph-read.txt",
+        "installed VFS did not return the exact graph-owned probe.py bytes",
+        "release-provenance-attestation.json",
+        "installed-vfs-provenance.json",
+        "installed ${component.name} differs from the attested public archive",
+        '--signer-digest "$expected_commit"',
+        'if [ "$negative_status" -ne 4 ]',
+        "negative control did not fail with the expected raw-disk permission error",
+        "installed kin-vfs socket remained after shutdown",
+        "trap 'on_vfs_signal 130' INT",
+        "trap 'on_vfs_signal 143' TERM",
+    ):
+        require(install_proof, policy, "public VFS and installed-artifact proof")
+    proof_upload = install_proof[install_proof.index("- name: Preserve proof reports") :]
+    for report in (
+        "release-provenance.json",
+        "release-provenance.json.sha256",
+        "release-provenance-attestation.json",
+        "installed-vfs-provenance.json",
+    ):
+        require(proof_upload, report, "preserved installed-artifact proof report")
+
+    vfs_checkout_count = len(
+        re.findall(r"repository:\s*firelock-ai/kin-vfs\s*$", release, re.MULTILINE)
+    )
+    vfs_checkout_refs = re.findall(
+        r"repository:\s*firelock-ai/kin-vfs\s*$"
+        r"(?:(?!^\s+- name:).)*?^\s+ref:\s*([^\s#]+)",
+        release,
+        re.MULTILINE | re.DOTALL,
+    )
+    if len(vfs_checkout_refs) != vfs_checkout_count or any(
+        re.fullmatch(r"[0-9a-f]{40}", ref) is None for ref in vfs_checkout_refs
+    ):
+        raise AssertionError(
+            "every kin-vfs release checkout must declare a full immutable commit; "
+            f"checkouts={vfs_checkout_count}, refs={vfs_checkout_refs}"
+        )
+    vfs_refs = set(vfs_checkout_refs)
+    vfs_expected = set(
+        re.findall(r"EXPECTED_VFS_COMMIT:\s*([0-9a-f]{40})", release)
+    )
+    install_proof_vfs_expected = set(
+        re.findall(r"expected_vfs_commit:\s*([0-9a-f]{40})", release)
+    )
+    if len(vfs_refs) != 1 or vfs_expected != vfs_refs:
+        raise AssertionError(
+            "release workflow must use one immutable kin-vfs commit for build "
+            f"and provenance verification; refs={sorted(vfs_refs)}, "
+            f"expected={sorted(vfs_expected)}"
+        )
+    if install_proof_vfs_expected != vfs_refs:
+        raise AssertionError(
+            "install proof must bind the same immutable kin-vfs commit as the "
+            f"release workflow; release={sorted(vfs_refs)}, "
+            f"install-proof={sorted(install_proof_vfs_expected)}"
+        )
+    for policy in (
+        "Verified Kin/kin-vfs release compatibility at kin-vfs-core",
+        'pkg.name === "kin-vfs-core" && pkg.source?.startsWith("sparse+")',
+        'pkg.name === "kin-vfs-core" && pkg.source === null',
+        "update the immutable kin-vfs pin",
+    ):
+        require(release, policy, "Kin and pinned kin-vfs release compatibility gate")
+
+    for policy in (
         "Reopen a fresh Windows graph through the daemon",
         "kin.exe status --json > kin-status.json",
         "test -s .kin/kindb/head-generation",
@@ -307,6 +377,121 @@ def main() -> None:
             "release daemon path must contain exactly one image build command"
         )
 
+    finalize_start = release.index("  finalize_release:")
+    latest_promotion_start = release.index("  promote_ghcr_latest:")
+    boundary_publish_start = release.index("  publish_boundary_contracts:")
+    if not finalize_start < latest_promotion_start < boundary_publish_start:
+        raise AssertionError(
+            "GHCR latest promotion must be a separate job after release finalization"
+        )
+    latest_promotion_job = release[
+        latest_promotion_start:boundary_publish_start
+    ]
+    for policy in (
+        "needs: [config, finalize_release, version_tag_image, build_daemon_image, attest_daemon_image]",
+        "always()",
+        "needs.config.result == 'success'",
+        "needs.finalize_release.result == 'success'",
+        "needs.version_tag_image.result == 'success'",
+        "needs.build_daemon_image.result == 'success'",
+        "needs.attest_daemon_image.result == 'success'",
+        "needs.config.outputs.release_channel == 'latest'",
+        "startsWith(github.ref, 'refs/tags/v')",
+        "!contains(github.ref_name, '-')",
+        "environment: release",
+        "contents: read",
+        "packages: write",
+        "attestations: read",
+        "persist-credentials: false",
+        "fetch-depth: 0",
+        "docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0",
+        "docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f",
+        "EXPECTED_COMMIT: ${{ needs.build_daemon_image.outputs.commit }}",
+        "EXPECTED_SOURCE_DIGEST: ${{ needs.build_daemon_image.outputs.digest }}",
+        "is not an exact stable release tag",
+        'if [ "$GITHUB_REF" != "refs/tags/${GITHUB_REF_NAME}" ]',
+        'channel="$(node scripts/release-order.mjs channel "$VERSION")"',
+        'git rev-parse "${GITHUB_REF_NAME}^{commit}"',
+        'if [ "$COMMIT" != "$EXPECTED_COMMIT" ]',
+        'SRC="${IMAGE}:${COMMIT}"',
+        'VERSION_TAG="${IMAGE}:${VERSION}"',
+        'V_VERSION_TAG="${IMAGE}:${GITHUB_REF_NAME}"',
+        'LATEST="${IMAGE}:latest"',
+        "inspect_digest()",
+        "resolve_required_digest()",
+        "wait_for_expected_digest()",
+        "for attempt in $(seq 1 12)",
+        "matching_reads=$((matching_reads + 1))",
+        'if [ "$matching_reads" -eq 2 ]',
+        "did not converge to $expected",
+        "verify_stable_release_authority()",
+        '"repos/${GITHUB_REPOSITORY}/releases/latest"',
+        '"repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}"',
+        "GitHub Latest moved to",
+        "verify_immutable_authority()",
+        "scripts/verify-container-build-info.sh",
+        "verify_attestation()",
+        '"oci://${IMAGE}@${digest}"',
+        "--bundle-from-oci",
+        "--predicate-type https://slsa.dev/provenance/v1",
+        '--signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"',
+        '--signer-digest "$COMMIT"',
+        '--source-digest "$COMMIT"',
+        '--source-ref "$GITHUB_REF"',
+        "--deny-self-hosted-runners",
+        "initial_latest_state=missing",
+        "mutation_required=true",
+        'if [ "$initial_latest_digest" = "$EXPECTED_SOURCE_DIGEST" ]',
+        "GHCR offers no atomic",
+        'verify_immutable_authority "pre-write"',
+        "prewrite_latest_state=missing",
+        'if [ "$prewrite_latest_digest" = "$EXPECTED_SOURCE_DIGEST" ]',
+        'action="Verified concurrent"',
+        'changed from ${initial_latest_state}:${initial_latest_digest:-<missing>}',
+        'prewrite_source_digest="$(resolve_required_digest "$SRC" "pre-write source recheck")"',
+        "final_prewrite_latest_state=missing",
+        'if [ "$final_prewrite_latest_digest" = "$EXPECTED_SOURCE_DIGEST" ]',
+        "during final admission",
+        "docker buildx imagetools create",
+        "--prefer-index=false",
+        '--tag "$LATEST"',
+        '"${IMAGE}@${EXPECTED_SOURCE_DIGEST}"',
+        'verify_immutable_authority "post-write"',
+        'actual_latest_digest="$(wait_for_expected_digest',
+        '"$LATEST" "$EXPECTED_SOURCE_DIGEST" "post-write latest")"',
+        'scripts/verify-container-build-info.sh "$LATEST" "$COMMIT"',
+        'verify_attestation "$actual_latest_digest"',
+        '"$LATEST" "$EXPECTED_SOURCE_DIGEST" "final latest readback"',
+    ):
+        require(latest_promotion_job, policy, "stable GHCR latest promotion")
+
+    if latest_promotion_job.count("docker buildx imagetools create") != 1:
+        raise AssertionError(
+            "stable GHCR latest promotion must contain exactly one registry mutation"
+        )
+    for forbidden in (
+        "contents: write",
+        "id-token: write",
+        "attestations: write",
+        "artifact-metadata: write",
+        "actions/attest@",
+        "docker buildx build",
+        "docker push",
+        "gh release edit",
+        "continue-on-error",
+        "!failure()",
+        "!cancelled()",
+        "|| true",
+        "WIF_PROVIDER",
+        "WIF_SERVICE_ACCOUNT",
+        "us-central1-docker.pkg.dev",
+    ):
+        if forbidden in latest_promotion_job:
+            raise AssertionError(
+                "stable GHCR latest promotion contains forbidden authority or "
+                f"fail-open behavior: {forbidden}"
+            )
+
     publish_start = release.index("  publish:")
     publish_end = release.index("\n  install_proof:", publish_start)
     publish_job = release[publish_start:publish_end]
@@ -466,6 +651,7 @@ def main() -> None:
         "always()",
         "needs.publish.result == 'success'",
         "uses: ./.github/workflows/install-proof.yml",
+        "expected_vfs_commit: 1c531216c65b734fb5e7c996094e01e030b8eec7",
     ):
         require(install_proof_job, policy, "mandatory public install proof")
 
@@ -483,6 +669,13 @@ def main() -> None:
             "needs.install_proof.result == 'success'",
             "needs.version_tag_image.result == 'success'",
             "needs.smoke_npm_published.result == 'success'",
+        ),
+        "promote_ghcr_latest": (
+            "needs.config.result == 'success'",
+            "needs.finalize_release.result == 'success'",
+            "needs.version_tag_image.result == 'success'",
+            "needs.build_daemon_image.result == 'success'",
+            "needs.attest_daemon_image.result == 'success'",
         ),
         "publish_boundary_contracts": (
             "needs.publish.result == 'success'",

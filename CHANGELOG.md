@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.22] - 2026-07-14
+
+This patch restores Linux AArch64 VFS passthrough and makes the public install
+gate exercise the shipped graph-backed projection instead of setup metadata
+alone.
+
+### Fixed
+
+- Release archives now build Kin VFS from the reviewed 0.1.5 source containing
+  the Linux AArch64 `fstat(stdout)` passthrough repair, with an immutable source
+  pin and a lock-version compatibility check against Kin's registry dependency.
+- Public install proof now makes a tracked source file unreadable on raw disk,
+  then requires the installed shim and real daemon to return the exact
+  graph-owned bytes while exercising the stdout `fstat` regression path.
+
 ## [0.2.21] - 2026-07-13
 
 This patch gives hosted clients one bounded, graph-authoritative read of the
@@ -569,7 +584,8 @@ Historical note: this snapshot predates the public GitHub prerelease series and 
 - Daemon mode for background file watching (`kin-daemon`)
 - 19-crate workspace architecture
 
-[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.21...HEAD
+[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.22...HEAD
+[0.2.22]: https://github.com/firelock-ai/kin/compare/v0.2.21...v0.2.22
 [0.2.21]: https://github.com/firelock-ai/kin/compare/v0.2.20...v0.2.21
 [0.2.20]: https://github.com/firelock-ai/kin/compare/v0.2.19...v0.2.20
 [0.2.19]: https://github.com/firelock-ai/kin/compare/v0.2.18...v0.2.19

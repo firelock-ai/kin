@@ -15,6 +15,10 @@ on:
         description: Exact public release tag to install and verify.
         required: true
         type: string
+      expected_vfs_commit:
+        description: Reviewed kin-vfs commit pinned by the calling release workflow.
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       release_tag:
@@ -86,6 +90,7 @@ jobs:
         shell: bash
         env:
           RELEASE_EVENT_TAG: ${{ inputs.release_tag || github.event.release.tag_name || '' }}
+          REVIEWED_VFS_COMMIT: ${{ inputs.expected_vfs_commit || '' }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -176,6 +181,7 @@ jobs:
             if gh attestation verify "attested-$release_asset" \
               --repo firelock-ai/kin \
               --signer-workflow firelock-ai/kin/.github/workflows/release.yml \
+              --signer-digest "$expected_commit" \
               --source-ref "refs/tags/$expected_tag" \
               --source-digest "$expected_commit" \
               --deny-self-hosted-runners \
@@ -190,6 +196,151 @@ jobs:
             sleep 10
           done
           test "$verified" = true
+
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
+            "https://github.com/firelock-ai/kin/releases/download/$expected_tag/release-provenance.json" \
+            -o release-provenance.json
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
+            "https://github.com/firelock-ai/kin/releases/download/$expected_tag/release-provenance.json.sha256" \
+            -o release-provenance.json.sha256
+
+          expected_vfs_commit="$REVIEWED_VFS_COMMIT"
+          if [ -z "$expected_vfs_commit" ]; then
+            expected_vfs_commit="$(node -e \
+              'process.stdout.write(JSON.parse(require("fs").readFileSync("release-provenance.json", "utf8")).kin_vfs?.commit || "")')"
+          fi
+          if ! printf '%s\n' "$expected_vfs_commit" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "could not resolve the reviewed kin-vfs commit for $expected_tag" >&2
+            exit 1
+          fi
+
+          RELEASE_ASSET="$release_asset" EXPECTED_TAG="$expected_tag" \
+          EXPECTED_COMMIT="$expected_commit" \
+          EXPECTED_VFS_COMMIT="$expected_vfs_commit" node <<'NODE'
+          const crypto = require("crypto");
+          const fs = require("fs");
+
+          const fail = (condition, message) => {
+            if (!condition) throw new Error(message);
+          };
+          const sha256 = (file) =>
+            crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+          const sidecar = fs.readFileSync("release-provenance.json.sha256", "utf8").trim();
+          const sidecarMatch = sidecar.match(/^([0-9a-f]{64})\s+\*?release-provenance\.json$/);
+          fail(sidecarMatch, "release provenance checksum sidecar is malformed");
+          fail(sidecarMatch[1] === sha256("release-provenance.json"),
+            "release provenance checksum does not match its public sidecar");
+
+          const manifest = JSON.parse(fs.readFileSync("release-provenance.json", "utf8"));
+          fail(manifest.schema_version === 1, "release provenance schema is unsupported");
+          fail(manifest.release_tag === process.env.EXPECTED_TAG,
+            "release provenance tag does not match the installed release");
+          fail(manifest.kin?.commit === process.env.EXPECTED_COMMIT,
+            "release provenance Kin commit does not match the installed release tag");
+          fail(manifest.kin_vfs?.commit === process.env.EXPECTED_VFS_COMMIT,
+            "release provenance does not bind the reviewed kin-vfs commit");
+          fail(manifest.kin_vfs?.dirty === false,
+            "release provenance does not certify a clean kin-vfs checkout");
+          const platform = manifest.artifacts?.find(
+            (artifact) => artifact.archive?.name === process.env.RELEASE_ASSET
+          );
+          fail(platform, `release provenance omits ${process.env.RELEASE_ASSET}`);
+          fail(platform.release_tag === process.env.EXPECTED_TAG,
+            "platform provenance tag does not match the installed release");
+          fail(platform.kin?.commit === process.env.EXPECTED_COMMIT,
+            "platform provenance Kin commit does not match the installed release");
+          fail(platform.kin_vfs?.commit === process.env.EXPECTED_VFS_COMMIT,
+            "platform provenance does not bind the reviewed kin-vfs commit");
+          fail(platform.archive?.sha256 === sha256(`attested-${process.env.RELEASE_ASSET}`),
+            "attested archive bytes do not match aggregate release provenance");
+          NODE
+
+          aggregate_verified=false
+          for attempt in $(seq 1 18); do
+            if gh attestation verify release-provenance.json \
+              --repo firelock-ai/kin \
+              --signer-workflow firelock-ai/kin/.github/workflows/release.yml \
+              --signer-digest "$expected_commit" \
+              --source-ref "refs/tags/$expected_tag" \
+              --source-digest "$expected_commit" \
+              --deny-self-hosted-runners \
+              --format json > release-provenance-attestation.json; then
+              aggregate_verified=true
+              break
+            fi
+            if [ "$attempt" -eq 18 ]; then
+              echo "aggregate release provenance attestation did not become verifiable" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          test "$aggregate_verified" = true
+
+          content_root=""
+          shim_name=""
+          if [ "$RUNNER_OS" != "Windows" ]; then
+            extract_root="$RUNNER_TEMP/attested-release"
+            rm -rf "$extract_root"
+            mkdir -p "$extract_root"
+            tar -xzf "attested-$release_asset" -C "$extract_root"
+            artifact_name="${release_asset%.tar.gz}"
+            content_root="$extract_root/$artifact_name"
+            test -d "$content_root"
+            case "$RUNNER_OS" in
+              Linux) shim_name="libkin_vfs_shim.so" ;;
+              macOS) shim_name="libkin_vfs_shim.dylib" ;;
+              *) echo "unsupported Unix runner $RUNNER_OS" >&2; exit 1 ;;
+            esac
+          fi
+
+          RUN_COMPONENT_COMPARE="$([ "$RUNNER_OS" != "Windows" ] && printf true || printf false)" \
+          RELEASE_ASSET="$release_asset" EXPECTED_TAG="$expected_tag" \
+          EXPECTED_COMMIT="$expected_commit" CONTENT_ROOT="$content_root" \
+          EXPECTED_VFS_COMMIT="$expected_vfs_commit" \
+          INSTALLED_VFS="$HOME/.kin/bin/kin-vfs" \
+          INSTALLED_SHIM="$HOME/.kin/lib/$shim_name" \
+          SHIM_NAME="$shim_name" node <<'NODE'
+          if (process.env.RUN_COMPONENT_COMPARE !== "true") process.exit(0);
+          const crypto = require("crypto");
+          const fs = require("fs");
+          const path = require("path");
+
+          const fail = (condition, message) => {
+            if (!condition) throw new Error(message);
+          };
+          const sha256Bytes = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
+          const manifest = JSON.parse(fs.readFileSync("release-provenance.json", "utf8"));
+          const platform = manifest.artifacts.find(
+            (artifact) => artifact.archive?.name === process.env.RELEASE_ASSET
+          );
+          const records = new Map(platform.archive_contents.map((entry) => [entry.name, entry]));
+          const components = [
+            { name: "kin-vfs", installed: process.env.INSTALLED_VFS },
+            { name: process.env.SHIM_NAME, installed: process.env.INSTALLED_SHIM },
+          ].map((component) => {
+            const archived = path.join(process.env.CONTENT_ROOT, component.name);
+            const installedBytes = fs.readFileSync(component.installed);
+            const archivedBytes = fs.readFileSync(archived);
+            fail(installedBytes.equals(archivedBytes),
+              `installed ${component.name} differs from the attested public archive`);
+            const digest = sha256Bytes(installedBytes);
+            fail(records.get(component.name)?.sha256 === digest,
+              `installed ${component.name} hash differs from aggregate release provenance`);
+            return {
+              name: component.name,
+              installed_path: component.installed,
+              sha256: digest,
+            };
+          });
+          fs.writeFileSync("installed-vfs-provenance.json", `${JSON.stringify({
+            schema_version: 1,
+            release_tag: process.env.EXPECTED_TAG,
+            kin_commit: process.env.EXPECTED_COMMIT,
+            kin_vfs_commit: process.env.EXPECTED_VFS_COMMIT,
+            archive: process.env.RELEASE_ASSET,
+            components,
+          }, null, 2)}\n`);
+          NODE
 
       - name: First-run repository, daemon, and setup proof
         shell: bash
@@ -338,6 +489,176 @@ jobs:
           });
           child.stdin.end(`${requests.map((request) => JSON.stringify(request)).join("\n")}\n`);
           NODE
+
+      - name: Graph-backed VFS projection proof
+        if: runner.os != 'Windows'
+        shell: bash
+        working-directory: kin-install-proof
+        run: |
+          set -euo pipefail
+          probe_bin="$RUNNER_TEMP/kin-vfs-open-probe"
+          cc -O2 -Wall -Wextra -Werror -x c -o "$probe_bin" - <<'C'
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <stdio.h>
+          #include <sys/stat.h>
+          #include <unistd.h>
+
+          int main(int argc, char **argv) {
+              if (argc != 2) {
+                  fputs("usage: kin-vfs-open-probe <path>\n", stderr);
+                  return 2;
+              }
+
+              struct stat stdout_stat;
+              if (fstat(STDOUT_FILENO, &stdout_stat) != 0) {
+                  perror("fstat(stdout)");
+                  return 3;
+              }
+
+              int fd = open(argv[1], O_RDONLY);
+              if (fd < 0) {
+                  perror("open");
+                  return 4;
+              }
+
+              char buffer[4096];
+              for (;;) {
+                  ssize_t count = read(fd, buffer, sizeof(buffer));
+                  if (count == 0) {
+                      break;
+                  }
+                  if (count < 0) {
+                      if (errno == EINTR) {
+                          continue;
+                      }
+                      perror("read");
+                      close(fd);
+                      return 5;
+                  }
+                  for (ssize_t written = 0; written < count;) {
+                      ssize_t step = write(STDOUT_FILENO, buffer + written, (size_t)(count - written));
+                      if (step < 0 && errno == EINTR) {
+                          continue;
+                      }
+                      if (step <= 0) {
+                          perror("write");
+                          close(fd);
+                          return 6;
+                      }
+                      written += step;
+                  }
+              }
+
+              if (close(fd) != 0) {
+                  perror("close");
+                  return 7;
+              }
+              return 0;
+          }
+          C
+
+          vfs_pid=""
+          cleanup_vfs() {
+            cleanup_status=0
+            chmod u+rw probe.py || cleanup_status=1
+            if [ -n "$vfs_pid" ]; then
+              kin-vfs stop --workspace . >> kin-vfs-daemon.log 2>&1 || cleanup_status=1
+              stopped=false
+              for _ in $(seq 1 150); do
+                process_state="$(ps -o stat= -p "$vfs_pid" 2>/dev/null | tr -d '[:space:]')"
+                if [ -z "$process_state" ] || printf '%s\n' "$process_state" | grep -q 'Z'; then
+                  stopped=true
+                  break
+                fi
+                sleep 0.1
+              done
+              if [ "$stopped" != true ]; then
+                cat kin-vfs-daemon.log >&2
+                echo "installed kin-vfs daemon did not stop cleanly" >&2
+                kill "$vfs_pid" 2>/dev/null || true
+                sleep 1
+                kill -9 "$vfs_pid" 2>/dev/null || true
+                wait "$vfs_pid" 2>/dev/null || true
+                cleanup_status=1
+              else
+                wait_status=0
+                wait "$vfs_pid" || wait_status=$?
+                case "$wait_status" in
+                  0|143) ;;
+                  *)
+                    echo "installed kin-vfs daemon exited with unexpected status $wait_status" >&2
+                    cleanup_status=1
+                    ;;
+                esac
+              fi
+            fi
+            if [ -S .kin/vfs.sock ]; then
+              echo "installed kin-vfs socket remained after shutdown" >&2
+              cleanup_status=1
+            fi
+            test -r probe.py || cleanup_status=1
+            return "$cleanup_status"
+          }
+          on_vfs_signal() {
+            signal_status="$1"
+            trap - EXIT INT TERM
+            cleanup_vfs || true
+            exit "$signal_status"
+          }
+          trap 'cleanup_vfs || true' EXIT
+          trap 'on_vfs_signal 130' INT
+          trap 'on_vfs_signal 143' TERM
+
+          kin-vfs start --workspace . > kin-vfs-daemon.log 2>&1 &
+          vfs_pid=$!
+          socket_ready=false
+          for _ in $(seq 1 150); do
+            if [ -S .kin/vfs.sock ]; then
+              socket_ready=true
+              break
+            fi
+            if ! kill -0 "$vfs_pid" 2>/dev/null; then
+              break
+            fi
+            sleep 0.1
+          done
+          if [ "$socket_ready" != true ]; then
+            cat kin-vfs-daemon.log >&2
+            echo "installed kin-vfs daemon did not bind its socket" >&2
+            exit 1
+          fi
+
+          # The direct read is the negative control. With raw disk unreadable,
+          # only the installed shim and real Kin daemon can return probe.py.
+          chmod 000 probe.py
+          set +e
+          "$probe_bin" "$PWD/probe.py" > vfs-negative.txt 2>&1
+          negative_status=$?
+          set -e
+          if [ "$negative_status" -ne 4 ]; then
+            cat vfs-negative.txt >&2
+            echo "negative control failed before the expected raw-disk open denial (status $negative_status)" >&2
+            exit 1
+          fi
+          if ! grep -Eq '^open: (Permission denied|Operation not permitted)$' vfs-negative.txt; then
+            cat vfs-negative.txt >&2
+            echo "negative control did not fail with the expected raw-disk permission error" >&2
+            exit 1
+          fi
+
+          KIN_VFS_STRICT=1 kin-vfs exec --workspace . -- \
+            "$probe_bin" "$PWD/probe.py" \
+            > vfs-graph-read.txt 2> vfs-graph-read.stderr.txt
+          printf 'def hello():\n    return 42\n' > vfs-expected.txt
+          if ! cmp -s vfs-expected.txt vfs-graph-read.txt; then
+            cmp -l vfs-expected.txt vfs-graph-read.txt >&2 || true
+            echo "installed VFS did not return the exact graph-owned probe.py bytes" >&2
+            exit 1
+          fi
+
+          cleanup_vfs
+          trap - EXIT INT TERM
 
       - name: Unix embedding and semantic retrieval proof
         if: runner.os != 'Windows'
@@ -560,6 +881,11 @@ jobs:
             expected-commit.txt
             expected-lock-sha.txt
             attestation-verification.json
+            release-provenance.json
+            release-provenance.json.sha256
+            release-provenance-attestation.json
+            installed-vfs-provenance.json
             latest-release-url.txt
             kin-install-proof/*.txt
             kin-install-proof/*.json
+            kin-install-proof/*.log

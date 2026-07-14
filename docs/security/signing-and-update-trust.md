@@ -45,11 +45,15 @@ proof installs all five archives (Linux x86_64/aarch64, macOS x86_64/aarch64,
 and Windows x86_64), verifies the GitHub attestation plus exact tag/commit/lock
 provenance, and exercises a fresh repository, graph search/locate, MCP
 initialize/list/call, and all supported agent configuration writers. The four
-Unix legs additionally build embeddings and prove semantic search/locate at
-complete coverage. Both npm packages are then published under their final
-channel through protected npm Trusted Publishing with short-lived OIDC.
-Anonymous exact-byte, provenance, and install proof runs after publication.
-GitHub Latest is promoted only after both packages pass every gate.
+Unix legs additionally make the source file unreadable on raw disk, then require
+the installed VFS shim and real Kin daemon to return the exact graph-owned bytes.
+That probe also calls `fstat` on stdout before opening the workspace path, which
+guards the Linux AArch64 passthrough ABI. The same legs build embeddings and
+prove semantic search/locate at complete coverage. Both npm packages are then
+published under their final channel through protected npm Trusted Publishing
+with short-lived OIDC. Anonymous exact-byte, provenance, and install proof runs
+after publication. GitHub Latest is promoted only after both packages pass
+every gate.
 
 The protected `release` environment intentionally has no required reviewer.
 After the release captain creates an authorized version tag on reviewed `main`,
