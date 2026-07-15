@@ -9,6 +9,9 @@
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+#[cfg(unix)]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -42,11 +45,7 @@ impl KinRegistry {
             return Ok(Self::default());
         }
         let lock_path = path.with_extension("lock");
-        let lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)?;
+        let lock_file = open_private_lock_file(&lock_path)?;
         lock_file.lock_shared()?;
         let content = std::fs::read_to_string(path)?;
         // Lock released on drop
@@ -69,17 +68,12 @@ impl KinRegistry {
             std::fs::create_dir_all(parent)?;
         }
         let lock_path = path.with_extension("lock");
-        let lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)?;
+        let lock_file = open_private_lock_file(&lock_path)?;
         lock_file.lock_exclusive()?;
 
         // Atomic write: write to tmp, then rename into place.
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, toml::to_string_pretty(self)?)?;
-        std::fs::rename(&tmp, path)?;
+        let contents = toml::to_string_pretty(self)?;
+        write_registry_atomically(path, contents.as_bytes())?;
 
         // Lock released on drop
         Ok(())
@@ -195,6 +189,83 @@ impl KinRegistry {
     }
 }
 
+fn open_private_lock_file(path: &Path) -> Result<File, Box<dyn std::error::Error>> {
+    let mut options = OpenOptions::new();
+    options.create(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    tighten_private_permissions(&file)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn tighten_private_permissions(file: &File) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = file.metadata()?.permissions();
+    if permissions.mode() & 0o777 != 0o600 {
+        permissions.set_mode(0o600);
+        file.set_permissions(permissions)?;
+    }
+    Ok(())
+}
+
+fn write_registry_atomically(
+    path: &Path,
+    contents: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "registry path has no parent directory",
+            )
+        })?;
+        let file_name = path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "registry path has no filename",
+            )
+        })?;
+        let mut tmp_name = std::ffi::OsString::from(".");
+        tmp_name.push(file_name);
+        tmp_name.push(format!(".tmp-{}", uuid::Uuid::new_v4()));
+        let tmp = parent.join(tmp_name);
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            file.write_all(contents)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp, path)?;
+            File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
+    }
+    #[cfg(not(unix))]
+    {
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, contents)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+}
+
 /// `~/.kin/registry.toml` path (cross-platform).
 pub fn registry_path() -> PathBuf {
     if let Some(path) = std::env::var_os("KIN_REGISTRY_PATH") {
@@ -212,6 +283,13 @@ pub fn registry_path() -> PathBuf {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
     #[test]
     fn round_trip_load_save() {
         let dir = tempfile::tempdir().unwrap();
@@ -228,6 +306,52 @@ mod tests {
         assert_eq!(loaded.repos[0].path, PathBuf::from("/tmp/my-repo"));
         assert_eq!(loaded.repos[0].entities, 42);
         assert!(!loaded.repos[0].last_commit.is_empty());
+        #[cfg(unix)]
+        {
+            assert_eq!(mode(&reg_path), 0o600);
+            assert_eq!(mode(&reg_path.with_extension("lock")), 0o600);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_and_lock_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let reg_path = dir.path().join("registry.toml");
+        let lock_path = reg_path.with_extension("lock");
+        std::fs::write(&reg_path, "repos = []\n").unwrap();
+        std::fs::write(&lock_path, b"").unwrap();
+        std::fs::set_permissions(&reg_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        KinRegistry::default().save_to(&reg_path).unwrap();
+
+        assert_eq!(mode(&reg_path), 0o600);
+        assert_eq!(mode(&lock_path), 0o600);
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".tmp-")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loading_tightens_an_existing_registry_lock() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let reg_path = dir.path().join("registry.toml");
+        let lock_path = reg_path.with_extension("lock");
+        std::fs::write(&reg_path, "repos = []\n").unwrap();
+        std::fs::write(&lock_path, b"").unwrap();
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        KinRegistry::load_from(&reg_path).unwrap();
+
+        assert_eq!(mode(&lock_path), 0o600);
     }
 
     #[test]
