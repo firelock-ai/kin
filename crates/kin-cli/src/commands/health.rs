@@ -128,6 +128,7 @@ pub async fn run_health_checks() -> HealthReport {
         check_repo_init(),
         check_session_runtime(),
         check_shell_path(),
+        check_registry_authority(),
     ];
     checks.extend(check_mcp_clients());
     checks.push(check_setup_ledger());
@@ -142,6 +143,66 @@ pub async fn run_health_checks() -> HealthReport {
         platform: env::consts::OS.to_string(),
         checks,
         healthy,
+    }
+}
+
+fn check_registry_authority() -> HealthCheck {
+    use kin_core::registry::RegistryAuthorityState;
+
+    let report = kin_core::registry::inspect_registry_authority();
+    if report
+        .checks
+        .iter()
+        .all(|check| check.state == RegistryAuthorityState::Unsupported)
+    {
+        return HealthCheck::new(
+            "registry_authority",
+            "Registry authority",
+            HealthStatus::Unsupported,
+            "Unix ownership and mode checks do not apply on this platform",
+        );
+    }
+    if report.is_secure() {
+        let secure = report
+            .checks
+            .iter()
+            .filter(|check| check.state == RegistryAuthorityState::Secure)
+            .count();
+        let absent = report
+            .checks
+            .iter()
+            .filter(|check| check.state == RegistryAuthorityState::Absent)
+            .count();
+        return HealthCheck::new(
+            "registry_authority",
+            "Registry authority",
+            HealthStatus::Healthy,
+            format!(
+                "{secure} private authority file(s); {absent} not created yet; no contents read"
+            ),
+        );
+    }
+
+    let detail = report.failure_summary();
+    if report.has_unsafe_object() {
+        HealthCheck::new(
+            "registry_authority",
+            "Registry authority",
+            HealthStatus::Misconfigured,
+            detail,
+        )
+        .with_manual_fix(
+            "inspect and move the unsafe object aside; Kin will not follow, overwrite, or auto-repair it",
+        )
+    } else {
+        HealthCheck::new(
+            "registry_authority",
+            "Registry authority",
+            HealthStatus::Misconfigured,
+            detail,
+        )
+        .fixable()
+        .with_manual_fix("run `kin doctor --fix` to authorize a permission-only 0600 repair")
     }
 }
 
@@ -1135,10 +1196,45 @@ mod tests {
         assert!(json.contains("\"daemon_running\""));
         assert!(json.contains("\"vfs_projection\""));
         assert!(json.contains("\"shell_path\""));
+        assert!(json.contains("\"registry_authority\""));
         assert!(json.contains("\"setup_ledger\""));
         assert!(json.contains("\"platform\""));
         assert!(json.contains("\"healthy\""));
         assert!(json.contains("\"retrieval_profile\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn registry_authority_health_is_read_only_and_explicitly_fixable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = tmp.path().join("registry.toml");
+        let lock = tmp.path().join("registry.lock");
+        std::fs::write(&registry, "repos = []\n").unwrap();
+        std::fs::write(&lock, b"").unwrap();
+        for path in [&registry, &lock] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let _registry_path = EnvGuard::set("KIN_REGISTRY_PATH", &registry);
+
+        let check = check_registry_authority();
+        assert!(matches!(check.status, HealthStatus::Misconfigured));
+        assert!(check.fixable);
+        assert!(check.detail.contains("expected 0600"));
+        assert_eq!(
+            std::fs::metadata(&registry).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        kin_core::registry::repair_registry_authority_permissions().unwrap();
+        let check = check_registry_authority();
+        assert!(matches!(check.status, HealthStatus::Healthy));
     }
 
     #[test]

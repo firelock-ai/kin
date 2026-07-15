@@ -37,7 +37,10 @@ RUN if [ -n "$KIN_BUILD_GIT_SHA" ] || [ -n "$KIN_BUILD_DIRTY" ] || [ -n "$KIN_BU
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get upgrade -y && apt-get install -y ca-certificates curl libssl3 && rm -rf /var/lib/apt/lists/*
-RUN groupadd -r kin && useradd -r -g kin kin
+RUN groupadd -r kin \
+    && useradd -r -g kin -d /home/kin -m kin \
+    && chmod 0700 /home/kin
+ENV HOME=/home/kin
 WORKDIR /app
 COPY --from=builder /build/kin/target/release/kin-daemon /usr/local/bin/kin-daemon
 COPY --from=builder /build/kin/target/release/kin /usr/local/bin/kin

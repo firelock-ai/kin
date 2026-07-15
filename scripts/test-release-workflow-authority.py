@@ -17,6 +17,8 @@ RELEASE = WORKFLOWS / "release.yml"
 INSTALL_PROOF = WORKFLOWS / "install-proof.yml"
 INSTALLER_CALLBACK = WORKFLOWS / "publish-release-installers.yml"
 UPDATE_TRUST = ROOT / "docs" / "security" / "signing-and-update-trust.md"
+INSTALL_SH = ROOT / "scripts" / "install.sh"
+INSTALL_PS1 = ROOT / "scripts" / "install.ps1"
 
 
 def require(content: str, needle: str, context: str) -> None:
@@ -43,7 +45,26 @@ def main() -> None:
     ci_workflow = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
     installer_callback = INSTALLER_CALLBACK.read_text(encoding="utf-8")
     update_trust = UPDATE_TRUST.read_text(encoding="utf-8")
+    install_sh = INSTALL_SH.read_text(encoding="utf-8")
+    install_ps1 = INSTALL_PS1.read_text(encoding="utf-8")
     docker_workflow = (WORKFLOWS / "docker.yml").read_text(encoding="utf-8")
+    require(
+        install_sh,
+        '"$EXTRACT_DIR/kin" registry authority --initialize',
+        "content-free Unix installer registry-authority initialization",
+    )
+    require(
+        install_sh,
+        "No installed binary or registry authority file was replaced.",
+        "fail-closed Unix installer registry-authority preflight",
+    )
+    require(
+        install_ps1,
+        '@("registry", "authority", "--json")',
+        "honest Windows registry-authority capability report",
+    )
+    if "KIN_REGISTRY_REPAIR" in install_ps1:
+        raise AssertionError("Windows installer must not imply Unix mode repair support")
     if "KIN_CI_BOT_TOKEN" in release or "bump_homebrew:" in release:
         raise AssertionError(
             "release.yml must not use a long-lived PAT or wait on cross-repo "
@@ -673,7 +694,7 @@ def main() -> None:
         "always()",
         "needs.publish.result == 'success'",
         "uses: ./.github/workflows/install-proof.yml",
-        "expected_vfs_commit: 1c531216c65b734fb5e7c996094e01e030b8eec7",
+        "expected_vfs_commit: c782905f39500a7a107aba5a91e85119c77726fa",
     ):
         require(install_proof_job, policy, "mandatory public install proof")
 

@@ -224,6 +224,18 @@ if (-not (Test-Path (Join-Path $TmpDir "kin-daemon.exe"))) {
     exit 1
 }
 
+# Report the downloaded binary's registry-authority capability before replacing
+# an installed binary. Windows currently reports the Unix ownership/mode
+# contract as not applicable; it does not claim to repair Windows ACLs.
+$RegistryArgs = @("registry", "authority", "--json")
+$RegistryCheck = Start-Process -FilePath (Join-Path $TmpDir "kin.exe") `
+    -ArgumentList $RegistryArgs -Wait -NoNewWindow -PassThru
+if ($RegistryCheck.ExitCode -ne 0) {
+    Write-Err "Registry authority capability check failed."
+    Write-Err "No installed binary was replaced."
+    exit 1
+}
+
 # Move binaries. kin-daemon.exe is mandatory (asserted above); kin-vfs.exe ships
 # only when the archive includes the (Unix-only) projection client.
 $HaveVfs = $false

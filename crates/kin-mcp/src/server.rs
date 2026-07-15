@@ -274,22 +274,75 @@ fn parse_workspace_roots(value: &serde_json::Value) -> Vec<PathBuf> {
 /// `file://` URIs (decoding `%XX` escapes) and the bare absolute path some
 /// clients (e.g. Cursor) send instead. Returns `None` for remote/non-file URIs.
 fn root_uri_to_path(uri: &str) -> Option<PathBuf> {
-    if let Some(rest) = uri.strip_prefix("file://") {
-        // `file:///abs/path` -> `/abs/path`; `file://host/abs/path` -> `/abs/path`.
-        let path = match rest.as_bytes().first() {
-            Some(b'/') => rest.to_string(),
-            _ => {
-                let slash = rest.find('/')?;
-                rest[slash..].to_string()
-            }
-        };
-        return Some(PathBuf::from(percent_decode(&path)));
+    if uri
+        .get(.."file://".len())
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file://"))
+    {
+        let rest = &uri["file://".len()..];
+
+        // Empty authority: `file:///abs/path` or `file:///C:/Users/me/repo`.
+        if rest.starts_with('/') {
+            return Some(file_uri_path(percent_decode(rest)));
+        }
+
+        let slash = rest.find('/')?;
+        let authority = &rest[..slash];
+        let path = percent_decode(&rest[slash..]);
+
+        // `localhost` is the local machine, so only its path component matters.
+        if authority.eq_ignore_ascii_case("localhost") {
+            return Some(file_uri_path(path));
+        }
+
+        // A few Windows clients emit the non-canonical but common
+        // `file://C:/Users/...` spelling, treating the drive as an authority.
+        if is_windows_drive_authority(authority) {
+            return Some(PathBuf::from(format!("{authority}{path}")));
+        }
+
+        // A non-local file authority is a Windows UNC share. Do not reinterpret
+        // it as a local POSIX path on Unix hosts.
+        #[cfg(windows)]
+        {
+            return Some(PathBuf::from(format!(
+                r"\\{authority}{}",
+                path.replace('/', "\\")
+            )));
+        }
+        #[cfg(not(windows))]
+        {
+            return None;
+        }
     }
     // Some clients (Cursor) send a bare absolute path rather than a file URI.
-    if uri.starts_with('/') {
+    if uri.starts_with('/') || is_windows_drive_path(uri) || uri.starts_with(r"\\") {
         return Some(PathBuf::from(uri));
     }
     None
+}
+
+/// Normalize the path component of a file URI. RFC 8089 spells a Windows drive
+/// URI as `file:///C:/...`; the leading slash is URI syntax, not part of the
+/// native Windows path.
+fn file_uri_path(path: String) -> PathBuf {
+    if path.starts_with('/') && is_windows_drive_path(&path[1..]) {
+        PathBuf::from(&path[1..])
+    } else {
+        PathBuf::from(path)
+    }
+}
+
+fn is_windows_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+}
+
+fn is_windows_drive_authority(authority: &str) -> bool {
+    let bytes = authority.as_bytes();
+    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 /// Minimal percent-decoding for `file://` URI paths (handles `%20`, etc.).
@@ -1120,11 +1173,41 @@ mod tests {
             root_uri_to_path("file:///Users/me/My%20Repo"),
             Some(PathBuf::from("/Users/me/My Repo"))
         );
+        // RFC 8089 Windows drive URIs drop the URI-only leading slash.
+        assert_eq!(
+            root_uri_to_path("file:///C:/Users/me/My%20Repo"),
+            Some(PathBuf::from("C:/Users/me/My Repo"))
+        );
+        assert_eq!(
+            root_uri_to_path("file://localhost/C:/Users/me/kin"),
+            Some(PathBuf::from("C:/Users/me/kin"))
+        );
+        // Accept the non-canonical spelling emitted by some Windows clients.
+        assert_eq!(
+            root_uri_to_path("file://C:/Users/me/kin"),
+            Some(PathBuf::from("C:/Users/me/kin"))
+        );
         // Some clients (Cursor) send a bare absolute path, not a file:// URI.
         assert_eq!(
             root_uri_to_path("/Users/me/kin"),
             Some(PathBuf::from("/Users/me/kin"))
         );
+        assert_eq!(
+            root_uri_to_path(r"C:\Users\me\kin"),
+            Some(PathBuf::from(r"C:\Users\me\kin"))
+        );
+        assert_eq!(
+            root_uri_to_path("C:/Users/me/kin"),
+            Some(PathBuf::from("C:/Users/me/kin"))
+        );
+        assert_eq!(root_uri_to_path("C:relative\\kin"), None);
+        #[cfg(windows)]
+        assert_eq!(
+            root_uri_to_path("file://server/share/kin"),
+            Some(PathBuf::from(r"\\server\share\kin"))
+        );
+        #[cfg(not(windows))]
+        assert_eq!(root_uri_to_path("file://server/share/kin"), None);
         // Non-file schemes (e.g. remote workspaces) are skipped.
         assert_eq!(root_uri_to_path("vscode-remote://host/x"), None);
         assert_eq!(root_uri_to_path("https://example.com/x"), None);

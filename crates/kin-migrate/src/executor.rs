@@ -464,7 +464,7 @@ pub fn execute_migration_persisted(plan: &MigrationPlan) -> Result<MigrationResu
         .entered();
         crate::finalize::ensure_eject_snapshot(&plan.target, &init_result.layout.root())?;
     }
-    crate::finalize::update_registry(&plan.target, entities_extracted);
+    crate::finalize::update_registry(&plan.target, entities_extracted)?;
 
     let elapsed = start.elapsed();
     Ok(MigrationResult {

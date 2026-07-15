@@ -15,6 +15,56 @@ struct RegisteredRepoDaemonsOutput {
     daemons: Vec<RegisteredRepoDaemon>,
 }
 
+/// Verify registry authority without reading or printing file contents.
+pub async fn authority(json: bool, fix: bool, initialize: bool) -> Result<()> {
+    let repaired = if fix {
+        kin_core::registry::repair_registry_authority_permissions()
+            .map_err(|e| anyhow::anyhow!("registry permission repair refused: {e}"))?
+    } else {
+        Vec::new()
+    };
+    let initialized = if initialize {
+        kin_core::registry::initialize_registry_authority()
+            .map_err(|e| anyhow::anyhow!("registry authority initialization refused: {e}"))?
+    } else {
+        Vec::new()
+    };
+    let report = kin_core::registry::inspect_registry_authority();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        for path in repaired {
+            println!("Repaired mode to 0600: {}", path.display());
+        }
+        for path in initialized {
+            println!("Initialized private authority: {}", path.display());
+        }
+        println!("Local registry authority:");
+        for check in &report.checks {
+            println!(
+                "  {:<28} {:<24} {}",
+                check.label,
+                authority_state_label(check.state),
+                check.path.display()
+            );
+            println!("    {}", check.detail);
+        }
+    }
+    kin_core::registry::require_registry_authority_secure()
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
+}
+
+fn authority_state_label(state: kin_core::registry::RegistryAuthorityState) -> &'static str {
+    use kin_core::registry::RegistryAuthorityState;
+    match state {
+        RegistryAuthorityState::Secure => "secure",
+        RegistryAuthorityState::Absent => "absent",
+        RegistryAuthorityState::RepairablePermissions => "repairable-permissions",
+        RegistryAuthorityState::Unsafe => "unsafe",
+        RegistryAuthorityState::Unsupported => "not-applicable",
+    }
+}
+
 /// List all registered Kin repositories.
 pub async fn list() -> Result<()> {
     let registry =
@@ -95,14 +145,8 @@ pub async fn daemons(json: bool) -> Result<()> {
 
 /// Remove stale entries (paths that no longer contain .kin/).
 pub async fn clean() -> Result<()> {
-    let mut registry =
-        KinRegistry::load().map_err(|e| anyhow::anyhow!("failed to load registry: {}", e))?;
-
-    let removed = registry.clean();
-
-    registry
-        .save()
-        .map_err(|e| anyhow::anyhow!("failed to save registry: {}", e))?;
+    let removed = KinRegistry::update(KinRegistry::clean)
+        .map_err(|e| anyhow::anyhow!("failed to update registry: {}", e))?;
 
     println!("Removed {} stale entries.", removed);
     Ok(())

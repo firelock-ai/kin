@@ -117,6 +117,7 @@ struct GithubAsset {
 }
 
 pub async fn run(skip_verify: bool, channel_flag: Option<Channel>) -> Result<()> {
+    registry_authority_preflight()?;
     println!("Current version: v{CURRENT_VERSION}");
 
     let channel = resolve_channel(channel_flag);
@@ -189,6 +190,14 @@ pub async fn run(skip_verify: bool, channel_flag: Option<Channel>) -> Result<()>
 
     println!("Updated to v{latest} successfully.");
     Ok(())
+}
+
+fn registry_authority_preflight() -> Result<()> {
+    kin_core::registry::require_registry_authority_secure().map_err(|error| {
+        anyhow::anyhow!(
+            "update preflight refused unsafe local registry authority; no release bytes were downloaded: {error}"
+        )
+    })
 }
 
 /// Fetch the release to install for the requested channel.
@@ -712,6 +721,8 @@ fn is_lib(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use serial_test::serial;
 
     /// Build an in-memory `.tar.gz` with the given (name, bytes) entries.
     fn make_tar_gz(entries: &[(&str, &[u8])]) -> Vec<u8> {
@@ -927,6 +938,37 @@ mod tests {
         assert!(is_newer("1.0.0", "0.9.9"));
         assert!(!is_newer("0.1.0", "0.1.0"));
         assert!(!is_newer("0.1.0", "0.2.0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn update_preflight_refuses_unsafe_registry_without_repairing_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("registry.toml");
+        let lock = dir.path().join("registry.lock");
+        std::fs::write(&registry, "repos = []\n").unwrap();
+        std::fs::write(&lock, b"").unwrap();
+        std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let previous = std::env::var_os("KIN_REGISTRY_PATH");
+        std::env::set_var("KIN_REGISTRY_PATH", &registry);
+
+        let error = registry_authority_preflight().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("no release bytes were downloaded"));
+        assert_eq!(
+            std::fs::metadata(&registry).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("KIN_REGISTRY_PATH", value),
+            None => std::env::remove_var("KIN_REGISTRY_PATH"),
+        }
     }
 
     #[test]

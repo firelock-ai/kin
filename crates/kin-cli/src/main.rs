@@ -1671,6 +1671,18 @@ enum SetupAction {
 
 #[derive(Subcommand)]
 enum RegistryAction {
+    /// Verify local registry authority without reading its contents
+    Authority {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+        /// Explicitly repair mode bits on structurally safe authority files
+        #[arg(long)]
+        fix: bool,
+        /// Create missing private authority files without replacing existing data
+        #[arg(long)]
+        initialize: bool,
+    },
     /// Show repo daemons registered with the central local supervisor
     Daemons {
         /// Emit machine-readable JSON
@@ -2749,6 +2761,11 @@ fn main() -> Result<()> {
                     channel,
                 } => commands::update::run(skip_verify, channel).await,
                 Command::Registry { action } => match action {
+                    Some(RegistryAction::Authority {
+                        json,
+                        fix,
+                        initialize,
+                    }) => commands::registry::authority(json, fix, initialize).await,
                     Some(RegistryAction::Daemons { json }) => {
                         commands::registry::daemons(json).await
                     }

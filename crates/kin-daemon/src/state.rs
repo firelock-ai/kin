@@ -15,7 +15,7 @@ use kin_model::{
 use kin_projection::ProjectionState;
 use kin_reconcile::Reconciler;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::error::{DaemonError, Result};
 use crate::session_registry::SessionCoordinator;
@@ -1041,7 +1041,14 @@ impl DaemonState {
             }
 
             // Register sibling repos from the global registry.
-            if let Ok(registry) = kin_core::registry::KinRegistry::load() {
+            let registry = kin_core::registry::KinRegistry::load();
+            if let Err(load_error) = &registry {
+                error!(
+                    error = %load_error,
+                    "registry authority refused; sibling repos were not loaded into the spine"
+                );
+            }
+            if let Ok(registry) = registry {
                 let cwd_canonical = self
                     .layout
                     .root()
