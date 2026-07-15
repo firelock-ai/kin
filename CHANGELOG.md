@@ -33,6 +33,9 @@ VFS support, and easier to follow from install through graph-backed proof.
   skipped instead of falsely claiming that a shim was installed.
 - Workspace-root binding now normalizes Windows drive `file://` URIs and bare
   drive paths, while preserving local POSIX roots and Windows UNC shares.
+- On Unix, the global registry now keeps `registry.toml` and `registry.lock`
+  private at mode 0600, rejects unsafe link/type/ownership state, and serializes
+  atomic read-modify-write updates so concurrent writers cannot lose entries.
 
 ## [0.2.23] - 2026-07-14
 
