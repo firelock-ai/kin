@@ -119,7 +119,7 @@ pub async fn run(url: String) -> Result<()> {
     if kin_dir.exists() {
         println!("Kin already initialized at {}", local_path.display());
         // Still register it
-        register_in_registry(&repo_name, &local_path, 0);
+        register_in_registry(&repo_name, &local_path, 0)?;
         println!("Imported {}: already initialized", repo_name);
         return Ok(());
     }
@@ -185,7 +185,7 @@ pub async fn run(url: String) -> Result<()> {
     }
 
     // Register in global registry
-    register_in_registry(&repo_name, &local_path, total_entity_count);
+    register_in_registry(&repo_name, &local_path, total_entity_count)?;
 
     println!(
         "Imported {}: {} entities, {} relations",
@@ -199,10 +199,12 @@ pub async fn run(url: String) -> Result<()> {
     Ok(())
 }
 
-fn register_in_registry(repo_name: &str, path: &Path, entity_count: usize) {
-    let _ = kin_core::registry::KinRegistry::update(|registry| {
+fn register_in_registry(repo_name: &str, path: &Path, entity_count: usize) -> Result<()> {
+    kin_core::registry::KinRegistry::update(|registry| {
         registry.upsert(repo_name.to_string(), path.to_path_buf(), entity_count);
-    });
+    })
+    .map_err(|e| anyhow::anyhow!("failed to update local registry authority: {e}"))?;
+    Ok(())
 }
 
 /// Parse all source files, extract entities, store blobs, link cross-file relations.

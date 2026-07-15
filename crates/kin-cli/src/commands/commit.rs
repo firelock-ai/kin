@@ -601,9 +601,14 @@ async fn run_local_commit_pipeline_for_tests(
     // Returns empty if no remote configured or unreachable (3-second timeout).
     let remote_ids = fetch_remote_catalog();
     let canonical_cwd = cwd.canonicalize().unwrap_or(cwd);
-    let _ = kin_core::registry::KinRegistry::update(|registry| {
+    kin_core::registry::KinRegistry::update(|registry| {
         registry.upsert_with_remote(repo_id, canonical_cwd, total_entity_count, &remote_ids);
-    });
+    })
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "semantic change landed, but the local registry authority update failed: {error}"
+        )
+    })?;
 
     Ok(())
 }

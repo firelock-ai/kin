@@ -17,6 +17,8 @@ RELEASE = WORKFLOWS / "release.yml"
 INSTALL_PROOF = WORKFLOWS / "install-proof.yml"
 INSTALLER_CALLBACK = WORKFLOWS / "publish-release-installers.yml"
 UPDATE_TRUST = ROOT / "docs" / "security" / "signing-and-update-trust.md"
+INSTALL_SH = ROOT / "scripts" / "install.sh"
+INSTALL_PS1 = ROOT / "scripts" / "install.ps1"
 
 
 def require(content: str, needle: str, context: str) -> None:
@@ -43,7 +45,19 @@ def main() -> None:
     ci_workflow = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
     installer_callback = INSTALLER_CALLBACK.read_text(encoding="utf-8")
     update_trust = UPDATE_TRUST.read_text(encoding="utf-8")
+    install_sh = INSTALL_SH.read_text(encoding="utf-8")
+    install_ps1 = INSTALL_PS1.read_text(encoding="utf-8")
     docker_workflow = (WORKFLOWS / "docker.yml").read_text(encoding="utf-8")
+    for installer, command in (
+        (install_sh, '"$EXTRACT_DIR/kin" registry authority'),
+        (install_ps1, '@("registry", "authority")'),
+    ):
+        require(installer, command, "content-free installer registry-authority preflight")
+        require(
+            installer,
+            "No installed binary or registry authority file was replaced.",
+            "fail-closed installer registry-authority preflight",
+        )
     if "KIN_CI_BOT_TOKEN" in release or "bump_homebrew:" in release:
         raise AssertionError(
             "release.yml must not use a long-lived PAT or wait on cross-repo "

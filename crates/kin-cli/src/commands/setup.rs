@@ -2001,6 +2001,28 @@ pub async fn doctor(fix: bool, json: bool) -> Result<()> {
     println!();
     let mut applied: Vec<String> = Vec::new();
 
+    let registry_needs_fix = report.checks.iter().any(|c| {
+        c.id == "registry_authority"
+            && c.fixable
+            && !matches!(c.status, crate::commands::health::HealthStatus::Healthy)
+    });
+    if registry_needs_fix {
+        match kin_core::registry::repair_registry_authority_permissions() {
+            Ok(paths) => {
+                for path in paths {
+                    applied.push(format!(
+                        "repaired registry authority permissions to 0600 ({})",
+                        path.display()
+                    ));
+                }
+            }
+            Err(e) => println!(
+                "  {} registry permission repair refused: {e}",
+                style("✗").red()
+            ),
+        }
+    }
+
     let shell_needs_fix = report.checks.iter().any(|c| {
         c.id == "shell_path"
             && c.fixable
@@ -2095,9 +2117,15 @@ pub async fn doctor(fix: bool, json: bool) -> Result<()> {
     }
 
     // Clean orphaned daemon PID/port files across registered repos.
-    let cleaned = cleanup_stale_daemons();
-    if cleaned > 0 {
-        applied.push(format!("cleaned {cleaned} stale daemon(s)"));
+    match cleanup_stale_daemons() {
+        Ok(cleaned) if cleaned > 0 => {
+            applied.push(format!("cleaned {cleaned} stale daemon(s)"));
+        }
+        Ok(_) => {}
+        Err(e) => println!(
+            "  {} stale-daemon cleanup refused registry authority: {e}",
+            style("✗").red()
+        ),
     }
 
     if applied.is_empty() {
@@ -2156,26 +2184,26 @@ async fn start_repo_daemon() -> Result<Option<String>> {
 
 /// Scan all registered repos for stale daemon PID/port files and clean them up.
 /// Returns the number of stale daemons cleaned.
-fn cleanup_stale_daemons() -> usize {
+fn cleanup_stale_daemons() -> Result<usize> {
     let mut cleaned = 0;
-    if let Ok(registry) = kin_core::registry::KinRegistry::load() {
-        for repo in &registry.repos {
-            let kin_root = repo.path.join(".kin");
-            if !kin_root.exists() {
-                continue;
-            }
-            // daemon_is_up() cleans stale files as a side effect
-            let _ = crate::daemon_client::daemon_is_up(&kin_root);
-            // Also check for orphaned port files without a PID file
-            let has_port = kin_root.join("daemon.port").exists();
-            let has_pid = kin_root.join("daemon.pid").exists();
-            if has_port && !has_pid {
-                let _ = std::fs::remove_file(kin_root.join("daemon.port"));
-                cleaned += 1;
-            }
+    let registry = kin_core::registry::KinRegistry::load()
+        .map_err(|e| anyhow::anyhow!("failed to load registry: {e}"))?;
+    for repo in &registry.repos {
+        let kin_root = repo.path.join(".kin");
+        if !kin_root.exists() {
+            continue;
+        }
+        // daemon_is_up() cleans stale files as a side effect
+        let _ = crate::daemon_client::daemon_is_up(&kin_root);
+        // Also check for orphaned port files without a PID file
+        let has_port = kin_root.join("daemon.port").exists();
+        let has_pid = kin_root.join("daemon.pid").exists();
+        if has_port && !has_pid {
+            let _ = std::fs::remove_file(kin_root.join("daemon.port"));
+            cleaned += 1;
         }
     }
-    cleaned
+    Ok(cleaned)
 }
 
 // ---------------------------------------------------------------------------

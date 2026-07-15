@@ -16,6 +16,77 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+/// Read-only classification of one local registry-authority path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistryAuthorityState {
+    /// A regular, single-link, current-user-owned file with mode 0600.
+    Secure,
+    /// The path does not exist yet. Kin will create it privately when needed.
+    Absent,
+    /// The object is structurally safe, but its mode is not exactly 0600.
+    RepairablePermissions,
+    /// The object or its parent cannot be trusted or repaired automatically.
+    Unsafe,
+    /// Unix ownership and mode checks do not apply on this platform.
+    Unsupported,
+}
+
+/// One content-free registry-authority check.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RegistryAuthorityCheck {
+    pub label: String,
+    pub path: PathBuf,
+    pub state: RegistryAuthorityState,
+    pub detail: String,
+}
+
+/// Content-free authority report shared by doctor, setup/install, and update.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RegistryAuthorityReport {
+    pub checks: Vec<RegistryAuthorityCheck>,
+}
+
+impl RegistryAuthorityReport {
+    /// Missing authority files are safe: Kin creates them at 0600 on first use.
+    pub fn is_secure(&self) -> bool {
+        self.checks.iter().all(|check| {
+            matches!(
+                check.state,
+                RegistryAuthorityState::Secure
+                    | RegistryAuthorityState::Absent
+                    | RegistryAuthorityState::Unsupported
+            )
+        })
+    }
+
+    pub fn has_repairable_permissions(&self) -> bool {
+        self.checks
+            .iter()
+            .any(|check| check.state == RegistryAuthorityState::RepairablePermissions)
+    }
+
+    pub fn has_unsafe_object(&self) -> bool {
+        self.checks
+            .iter()
+            .any(|check| check.state == RegistryAuthorityState::Unsafe)
+    }
+
+    pub fn failure_summary(&self) -> String {
+        self.checks
+            .iter()
+            .filter(|check| {
+                matches!(
+                    check.state,
+                    RegistryAuthorityState::RepairablePermissions | RegistryAuthorityState::Unsafe
+                )
+            })
+            .map(|check| format!("{}: {}", check.path.display(), check.detail))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct KinRegistry {
     pub repos: Vec<RegisteredRepo>,
@@ -244,6 +315,76 @@ impl KinRegistry {
     }
 }
 
+/// Inspect the default local registry authority without reading file contents.
+pub fn inspect_registry_authority() -> RegistryAuthorityReport {
+    inspect_registry_authority_at(&registry_path())
+}
+
+/// Inspect a registry authority path without following links or reading contents.
+pub fn inspect_registry_authority_at(path: &Path) -> RegistryAuthorityReport {
+    #[cfg(unix)]
+    {
+        return inspect_registry_authority_at_unix(path);
+    }
+    #[cfg(not(unix))]
+    {
+        RegistryAuthorityReport {
+            checks: vec![RegistryAuthorityCheck {
+                label: "registry authority".to_string(),
+                path: path.to_path_buf(),
+                state: RegistryAuthorityState::Unsupported,
+                detail: "Unix ownership and mode checks do not apply on this platform".to_string(),
+            }],
+        }
+    }
+}
+
+/// Refuse an operation when existing registry authority is not trustworthy.
+pub fn require_registry_authority_secure() -> Result<(), Box<dyn std::error::Error>> {
+    require_registry_authority_secure_at(&registry_path())
+}
+
+pub fn require_registry_authority_secure_at(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let report = inspect_registry_authority_at(path);
+    if report.is_secure() {
+        return Ok(());
+    }
+    let remediation = if report.has_unsafe_object() {
+        "Refusing to trust or replace it. Move the unsafe object aside after inspecting it, then retry."
+    } else {
+        "Run `kin doctor --fix` to authorize a local permission-only repair, then retry."
+    };
+    Err(Box::new(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "unsafe local registry authority: {} {remediation}",
+            report.failure_summary()
+        ),
+    )))
+}
+
+/// Explicitly repair mode bits on structurally safe registry-authority files.
+///
+/// This never reads or replaces contents and refuses symlinks, non-regular
+/// files, wrong ownership, hard links, unsafe parents, and path collisions.
+pub fn repair_registry_authority_permissions() -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    repair_registry_authority_permissions_at(&registry_path())
+}
+
+pub fn repair_registry_authority_permissions_at(
+    path: &Path,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    {
+        return repair_registry_authority_permissions_at_unix(path);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(Vec::new())
+    }
+}
+
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FileIdentity {
@@ -297,6 +438,16 @@ impl RegistryAnchor {
             })?
             .to_os_string();
 
+        if registry_name == lock_name
+            || registry_name == legacy_tmp_name
+            || lock_name == legacy_tmp_name
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "registry path collides with its reserved .lock or .tmp authority path",
+            ));
+        }
+
         let parent_c =
             std::ffi::CString::new(parent_path.as_os_str().as_bytes()).map_err(|_| {
                 std::io::Error::new(
@@ -337,9 +488,194 @@ fn normalized_parent(path: &Path) -> PathBuf {
 
 #[cfg(unix)]
 fn prepare_anchor(path: &Path) -> Result<RegistryAnchor, Box<dyn std::error::Error>> {
+    use std::os::unix::fs::DirBuilderExt;
+
     let parent = normalized_parent(path);
-    std::fs::create_dir_all(&parent)?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(&parent)?;
     Ok(RegistryAnchor::open(path)?)
+}
+
+#[cfg(unix)]
+fn absent_authority_report(path: &Path) -> RegistryAuthorityReport {
+    RegistryAuthorityReport {
+        checks: vec![
+            authority_check(
+                "registry file",
+                path.to_path_buf(),
+                RegistryAuthorityState::Absent,
+                "not created yet; Kin will create it with mode 0600",
+            ),
+            authority_check(
+                "registry lock",
+                path.with_extension("lock"),
+                RegistryAuthorityState::Absent,
+                "not created yet; Kin will create it with mode 0600",
+            ),
+        ],
+    }
+}
+
+#[cfg(unix)]
+fn authority_check(
+    label: &str,
+    path: PathBuf,
+    state: RegistryAuthorityState,
+    detail: impl Into<String>,
+) -> RegistryAuthorityCheck {
+    RegistryAuthorityCheck {
+        label: label.to_string(),
+        path,
+        state,
+        detail: detail.into(),
+    }
+}
+
+#[cfg(unix)]
+fn inspect_registry_authority_at_unix(path: &Path) -> RegistryAuthorityReport {
+    let anchor = match RegistryAnchor::open(path) {
+        Ok(anchor) => anchor,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return absent_authority_report(path);
+        }
+        Err(err) => {
+            return RegistryAuthorityReport {
+                checks: vec![authority_check(
+                    "registry authority",
+                    path.to_path_buf(),
+                    RegistryAuthorityState::Unsafe,
+                    err.to_string(),
+                )],
+            };
+        }
+    };
+
+    let mut checks = vec![
+        inspect_named_authority(
+            &anchor,
+            &anchor.registry_name,
+            "registry file",
+            path.to_path_buf(),
+        ),
+        inspect_named_authority(
+            &anchor,
+            &anchor.lock_name,
+            "registry lock",
+            path.with_extension("lock"),
+        ),
+    ];
+    let legacy_tmp = inspect_named_authority(
+        &anchor,
+        &anchor.legacy_tmp_name,
+        "legacy registry temp file",
+        path.with_extension("tmp"),
+    );
+    if legacy_tmp.state != RegistryAuthorityState::Absent {
+        checks.push(legacy_tmp);
+    }
+    RegistryAuthorityReport { checks }
+}
+
+#[cfg(unix)]
+fn inspect_named_authority(
+    anchor: &RegistryAnchor,
+    name: &std::ffi::OsStr,
+    label: &str,
+    path: PathBuf,
+) -> RegistryAuthorityCheck {
+    let stat = match stat_at(anchor, name) {
+        Ok(stat) => stat,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return authority_check(
+                label,
+                path,
+                RegistryAuthorityState::Absent,
+                "not created yet; Kin will create it with mode 0600",
+            );
+        }
+        Err(err) => {
+            return authority_check(
+                label,
+                path,
+                RegistryAuthorityState::Unsafe,
+                format!("could not inspect without following links: {err}"),
+            );
+        }
+    };
+    if let Err(err) = validate_regular_stat(&stat, label) {
+        return authority_check(label, path, RegistryAuthorityState::Unsafe, err.to_string());
+    }
+    let mode = stat.st_mode & 0o7777;
+    if mode != 0o600 {
+        return authority_check(
+            label,
+            path,
+            RegistryAuthorityState::RepairablePermissions,
+            format!(
+                "mode {mode:04o}; expected 0600. Contents were not read. Run `kin doctor --fix` to authorize repair"
+            ),
+        );
+    }
+    authority_check(
+        label,
+        path,
+        RegistryAuthorityState::Secure,
+        "regular, single-link, current-user-owned, mode 0600",
+    )
+}
+
+#[cfg(unix)]
+fn repair_registry_authority_permissions_at_unix(
+    path: &Path,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let anchor = match RegistryAnchor::open(path) {
+        Ok(anchor) => anchor,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(Box::new(err)),
+    };
+    let report = inspect_registry_authority_at_unix(path);
+    if report.has_unsafe_object() {
+        return Err(Box::new(registry_security_error(format!(
+            "permission repair refused: {}",
+            report.failure_summary()
+        ))));
+    }
+
+    let candidates = [
+        (&anchor.registry_name, "registry file", path.to_path_buf()),
+        (
+            &anchor.lock_name,
+            "registry lock",
+            path.with_extension("lock"),
+        ),
+        (
+            &anchor.legacy_tmp_name,
+            "legacy registry temp file",
+            path.with_extension("tmp"),
+        ),
+    ];
+    let mut opened = Vec::new();
+    for (name, label, candidate_path) in candidates {
+        let file = match open_at(&anchor, name, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(Box::new(err)),
+        };
+        let identity = validate_regular_file(&file, label)?;
+        verify_named_structural_identity(&anchor, name, identity, label)?;
+        opened.push((name.to_os_string(), label, candidate_path, file, identity));
+    }
+
+    let mut repaired = Vec::new();
+    for (name, label, candidate_path, file, identity) in opened {
+        if stat_file(&file)?.st_mode & 0o7777 != 0o600 {
+            set_private_mode(&file)?;
+            verify_named_identity(&anchor, &name, identity, label)?;
+            repaired.push(candidate_path);
+        }
+    }
+    Ok(repaired)
 }
 
 #[cfg(unix)]
@@ -354,7 +690,7 @@ fn load_from_unix(path: &Path) -> Result<KinRegistry, Box<dyn std::error::Error>
     let lock_file = open_private_lock_at(&anchor)?;
     lock_file.lock_shared()?;
     verify_named_file(&anchor, &anchor.lock_name, &lock_file, "registry lock")?;
-    tighten_legacy_tmp_at(&anchor)?;
+    validate_legacy_tmp_at(&anchor)?;
     read_registry_at(&anchor)
 }
 
@@ -389,7 +725,7 @@ fn update_at_unix<T>(
             format!("failed to revalidate locked registry lock: {err}"),
         )
     })?;
-    tighten_legacy_tmp_at(&anchor).map_err(|err| {
+    validate_legacy_tmp_at(&anchor).map_err(|err| {
         std::io::Error::new(
             err.kind(),
             format!("failed to validate legacy registry temp: {err}"),
@@ -406,8 +742,7 @@ fn update_at_unix<T>(
 
 #[cfg(unix)]
 fn read_registry_at(anchor: &RegistryAnchor) -> Result<KinRegistry, Box<dyn std::error::Error>> {
-    let Some(mut file) =
-        open_existing_regular_at(anchor, &anchor.registry_name, "registry file", true)?
+    let Some(mut file) = open_existing_regular_at(anchor, &anchor.registry_name, "registry file")?
     else {
         return Ok(KinRegistry::default());
     };
@@ -423,22 +758,22 @@ fn save_registry_at(
     anchor: &RegistryAnchor,
     contents: &[u8],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    tighten_legacy_tmp_at(anchor)?;
-    let _ = open_existing_regular_at(anchor, &anchor.registry_name, "registry file", true)?;
+    validate_legacy_tmp_at(anchor)?;
+    let _ = open_existing_regular_at(anchor, &anchor.registry_name, "registry file")?;
     write_registry_atomically_at(anchor, contents)
 }
 
 #[cfg(unix)]
 fn open_private_lock_at(anchor: &RegistryAnchor) -> std::io::Result<File> {
-    let file = match open_at(
+    let (file, created) = match open_at(
         anchor,
         &anchor.lock_name,
         libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
         0o600,
     ) {
-        Ok(file) => Ok(file),
+        Ok(file) => Ok((file, true)),
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            open_lock_after_create_race(anchor)
+            open_lock_after_create_race(anchor).map(|file| (file, false))
         }
         Err(err) => Err(err),
     }
@@ -451,9 +786,13 @@ fn open_private_lock_at(anchor: &RegistryAnchor) -> std::io::Result<File> {
     validate_regular_file(&file, "registry lock").map_err(|err| {
         std::io::Error::new(err.kind(), format!("registry lock fd invalid: {err}"))
     })?;
-    set_private_mode(&file).map_err(|err| {
-        std::io::Error::new(err.kind(), format!("registry lock fchmod failed: {err}"))
-    })?;
+    if created {
+        set_private_mode(&file).map_err(|err| {
+            std::io::Error::new(err.kind(), format!("registry lock fchmod failed: {err}"))
+        })?;
+    } else {
+        validate_private_file(&file, "registry lock")?;
+    }
     verify_named_file(anchor, &anchor.lock_name, &file, "registry lock").map_err(|err| {
         std::io::Error::new(err.kind(), format!("registry lock pathname invalid: {err}"))
     })?;
@@ -464,7 +803,12 @@ fn open_private_lock_at(anchor: &RegistryAnchor) -> std::io::Result<File> {
 fn open_lock_after_create_race(anchor: &RegistryAnchor) -> std::io::Result<File> {
     let mut last_error = None;
     for _ in 0..50 {
-        match open_at(anchor, &anchor.lock_name, libc::O_RDWR, 0) {
+        match open_at(
+            anchor,
+            &anchor.lock_name,
+            libc::O_RDWR | libc::O_NONBLOCK,
+            0,
+        ) {
             Ok(file) => return Ok(file),
             Err(err)
                 if matches!(
@@ -487,29 +831,20 @@ fn open_existing_regular_at(
     anchor: &RegistryAnchor,
     name: &std::ffi::OsStr,
     label: &str,
-    tighten: bool,
 ) -> std::io::Result<Option<File>> {
-    let file = match open_at(anchor, name, libc::O_RDONLY, 0) {
+    let file = match open_at(anchor, name, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
     };
-    validate_regular_file(&file, label)?;
-    if tighten {
-        set_private_mode(&file)?;
-    }
+    validate_private_file(&file, label)?;
     verify_named_file(anchor, name, &file, label)?;
     Ok(Some(file))
 }
 
 #[cfg(unix)]
-fn tighten_legacy_tmp_at(anchor: &RegistryAnchor) -> std::io::Result<()> {
-    let _ = open_existing_regular_at(
-        anchor,
-        &anchor.legacy_tmp_name,
-        "legacy registry temp file",
-        true,
-    )?;
+fn validate_legacy_tmp_at(anchor: &RegistryAnchor) -> std::io::Result<()> {
+    let _ = open_existing_regular_at(anchor, &anchor.legacy_tmp_name, "legacy registry temp file")?;
     Ok(())
 }
 
@@ -565,12 +900,23 @@ fn validate_parent(parent: &File) -> std::io::Result<()> {
             "registry parent must be owned by the current user",
         ));
     }
+    if stat.st_mode & 0o022 != 0 {
+        return Err(registry_security_error(format!(
+            "registry parent must not be group/world writable (found mode {:04o})",
+            stat.st_mode & 0o7777
+        )));
+    }
     Ok(())
 }
 
 #[cfg(unix)]
 fn validate_regular_file(file: &File, label: &str) -> std::io::Result<FileIdentity> {
     validate_regular_stat(&stat_file(file)?, label)
+}
+
+#[cfg(unix)]
+fn validate_private_file(file: &File, label: &str) -> std::io::Result<FileIdentity> {
+    validate_private_stat(&stat_file(file)?, label)
 }
 
 #[cfg(unix)]
@@ -596,6 +942,18 @@ fn validate_regular_stat(stat: &libc::stat, label: &str) -> std::io::Result<File
         device: stat.st_dev as u64,
         inode: stat.st_ino as u64,
     })
+}
+
+#[cfg(unix)]
+fn validate_private_stat(stat: &libc::stat, label: &str) -> std::io::Result<FileIdentity> {
+    let identity = validate_regular_stat(stat, label)?;
+    let mode = stat.st_mode & 0o7777;
+    if mode != 0o600 {
+        return Err(registry_security_error(format!(
+            "{label} has mode {mode:04o}; expected 0600. Refusing to trust or replace it. Run `kin doctor --fix` to authorize a permission-only repair"
+        )));
+    }
+    Ok(identity)
 }
 
 #[cfg(unix)]
@@ -644,7 +1002,7 @@ fn set_private_mode(file: &File) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     let stat = stat_file(file)?;
-    if stat.st_mode & 0o777 != 0o600 {
+    if stat.st_mode & 0o7777 != 0o600 {
         return Err(registry_security_error(
             "registry authority file did not reach mode 0600",
         ));
@@ -659,12 +1017,28 @@ fn verify_named_file(
     file: &File,
     label: &str,
 ) -> std::io::Result<()> {
-    let identity = validate_regular_file(file, label)?;
+    let identity = validate_private_file(file, label)?;
     verify_named_identity(anchor, name, identity, label)
 }
 
 #[cfg(unix)]
 fn verify_named_identity(
+    anchor: &RegistryAnchor,
+    name: &std::ffi::OsStr,
+    expected: FileIdentity,
+    label: &str,
+) -> std::io::Result<()> {
+    let actual = validate_private_stat(&stat_at(anchor, name)?, label)?;
+    if actual != expected {
+        return Err(registry_security_error(format!(
+            "{label} changed identity during the registry operation"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_named_structural_identity(
     anchor: &RegistryAnchor,
     name: &std::ffi::OsStr,
     expected: FileIdentity,
@@ -771,8 +1145,11 @@ fn cleanup_temp_if_same(
         return Ok(());
     }
     let name_c = name_cstring(name)?;
-    // SAFETY: the retained dirfd and relative name are valid; identity was
-    // revalidated immediately before unlinking.
+    // SAFETY: the retained dirfd and relative name are valid. The containing
+    // directory is owned by the current user and is not group/world writable;
+    // same-UID pathname replacement is outside this file-permission boundary
+    // because that actor can already modify the 0600 authority files. The
+    // identity check still prevents unlinking an observed replacement.
     if unsafe { libc::unlinkat(anchor.parent.as_raw_fd(), name_c.as_ptr(), 0) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -852,7 +1229,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn registry_and_lock_files_are_private() {
+    fn unsafe_permissions_are_rejected_without_mutation_until_explicit_repair() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -863,10 +1240,27 @@ mod tests {
         std::fs::set_permissions(&reg_path, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        KinRegistry::default().save_to(&reg_path).unwrap();
+        let registry_before = std::fs::read(&reg_path).unwrap();
+        let lock_before = std::fs::read(&lock_path).unwrap();
+
+        let error = KinRegistry::default().save_to(&reg_path).unwrap_err();
+        assert!(error.to_string().contains("expected 0600"));
+        assert_eq!(std::fs::read(&reg_path).unwrap(), registry_before);
+        assert_eq!(std::fs::read(&lock_path).unwrap(), lock_before);
+        assert_eq!(mode(&reg_path), 0o644);
+        assert_eq!(mode(&lock_path), 0o644);
+
+        let report = inspect_registry_authority_at(&reg_path);
+        assert!(report.has_repairable_permissions());
+        assert!(!report.has_unsafe_object());
+        assert!(require_registry_authority_secure_at(&reg_path).is_err());
+
+        let repaired = repair_registry_authority_permissions_at(&reg_path).unwrap();
+        assert_eq!(repaired.len(), 2);
 
         assert_eq!(mode(&reg_path), 0o600);
         assert_eq!(mode(&lock_path), 0o600);
+        KinRegistry::default().save_to(&reg_path).unwrap();
         assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
             .unwrap()
             .file_name()
@@ -876,7 +1270,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn loading_tightens_an_existing_registry_lock() {
+    fn loading_never_tightens_existing_permissions_implicitly() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -887,10 +1281,11 @@ mod tests {
         std::fs::set_permissions(&reg_path, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        KinRegistry::load_from(&reg_path).unwrap();
+        let error = KinRegistry::load_from(&reg_path).unwrap_err();
+        assert!(error.to_string().contains("expected 0600"));
 
-        assert_eq!(mode(&reg_path), 0o600);
-        assert_eq!(mode(&lock_path), 0o600);
+        assert_eq!(mode(&reg_path), 0o644);
+        assert_eq!(mode(&lock_path), 0o644);
     }
 
     #[test]
@@ -985,7 +1380,7 @@ mod tests {
         for directory in [&home, &kin_home, &tmp, &work] {
             std::fs::create_dir_all(directory).unwrap();
         }
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("registry_security_subprocess")
             .arg("--nocapture")
             .arg("--test-threads=1")
@@ -995,8 +1390,27 @@ mod tests {
             .env("KIN_HOME", &kin_home)
             .env("KIN_REGISTRY_PATH", kin_home.join("registry.toml"))
             .env("TMPDIR", &tmp)
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "registry security subprocess {case} exceeded 5 seconds\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
         assert!(
             output.status.success(),
             "registry security subprocess {case} failed\nstdout:\n{}\nstderr:\n{}",
@@ -1033,6 +1447,31 @@ mod tests {
     #[test]
     fn authority_identity_checks_are_isolated() {
         run_registry_security_subprocess("identity-checks");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_authority_paths_fail_within_a_bounded_time() {
+        run_registry_security_subprocess("fifo-paths");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_registry_parent_is_rejected() {
+        run_registry_security_subprocess("writable-parent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reserved_registry_path_collisions_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        for filename in ["registry.lock", "registry.tmp"] {
+            let path = dir.path().join(filename);
+            let error = KinRegistry::default().save_to(&path).unwrap_err();
+            assert!(error.to_string().contains("collides"), "{error}");
+            let report = inspect_registry_authority_at(&path);
+            assert!(report.has_unsafe_object());
+        }
     }
 
     #[cfg(unix)]
@@ -1122,11 +1561,65 @@ mod tests {
                 for path in [&registry_path, &lock_path, &legacy_tmp_path] {
                     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
                 }
+                assert!(KinRegistry::load_from(&registry_path).is_err());
+                assert_eq!(mode(&registry_path), 0o644);
+                assert_eq!(mode(&lock_path), 0o644);
+                assert_eq!(mode(&legacy_tmp_path), 0o644);
+                let repaired = repair_registry_authority_permissions_at(&registry_path).unwrap();
+                assert_eq!(repaired.len(), 3);
                 KinRegistry::load_from(&registry_path).unwrap();
                 assert_eq!(mode(&registry_path), 0o600);
                 assert_eq!(mode(&lock_path), 0o600);
                 assert_eq!(mode(&legacy_tmp_path), 0o600);
                 assert_eq!(std::fs::read(&legacy_tmp_path).unwrap(), b"legacy");
+            }
+            "fifo-paths" => {
+                let make_fifo = |path: &Path| {
+                    let path = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(
+                        path.as_os_str(),
+                    ))
+                    .unwrap();
+                    // SAFETY: path is a valid NUL-terminated string and mode is valid.
+                    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                };
+
+                make_fifo(&registry_path);
+                let started = std::time::Instant::now();
+                let error = KinRegistry::load_from(&registry_path).unwrap_err();
+                assert!(started.elapsed() < std::time::Duration::from_secs(1));
+                assert!(error.to_string().contains("regular file"), "{error}");
+                std::fs::remove_file(&registry_path).unwrap();
+                std::fs::remove_file(&lock_path).unwrap();
+
+                std::fs::write(&registry_path, "repos = []\n").unwrap();
+                std::fs::set_permissions(&registry_path, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+                make_fifo(&lock_path);
+                let started = std::time::Instant::now();
+                let error = KinRegistry::load_from(&registry_path).unwrap_err();
+                assert!(started.elapsed() < std::time::Duration::from_secs(1));
+                assert!(error.to_string().contains("regular file"), "{error}");
+                std::fs::remove_file(&lock_path).unwrap();
+
+                std::fs::write(&lock_path, b"").unwrap();
+                std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+                make_fifo(&legacy_tmp_path);
+                let started = std::time::Instant::now();
+                let error = KinRegistry::load_from(&registry_path).unwrap_err();
+                assert!(started.elapsed() < std::time::Duration::from_secs(1));
+                assert!(error.to_string().contains("regular file"), "{error}");
+            }
+            "writable-parent" => {
+                std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o777)).unwrap();
+                let error = KinRegistry::default().save_to(&registry_path).unwrap_err();
+                assert!(
+                    error.to_string().contains("group/world writable"),
+                    "{error}"
+                );
+                assert!(!registry_path.exists());
+                assert!(!lock_path.exists());
+                std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700)).unwrap();
             }
             "failure-cleanup" => {
                 KinRegistry::default().save_to(&registry_path).unwrap();

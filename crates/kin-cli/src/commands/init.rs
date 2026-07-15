@@ -1464,9 +1464,10 @@ pub async fn run(
         .unwrap_or("unknown")
         .to_string();
     let canonical_dir = dir.canonicalize().unwrap_or(dir);
-    let _ = kin_core::registry::KinRegistry::update(|registry| {
+    kin_core::registry::KinRegistry::update(|registry| {
         registry.upsert(repo_id, canonical_dir, init_summary.total_entity_count);
-    });
+    })
+    .map_err(|e| anyhow!("graph initialized, but local registry authority update failed: {e}"))?;
 
     if json {
         println!(

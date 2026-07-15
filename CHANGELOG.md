@@ -17,6 +17,8 @@ VFS support, and easier to follow from install through graph-backed proof.
 - The MCP server now accepts standard client workspace roots, binds the first
   initialized Kin repository without a hardcoded `--repo`, and keeps semantic
   answers fail closed on graph authority.
+- `kin registry authority` exposes a content-free, machine-readable check of
+  the local registry trust boundary used by setup, doctor, update, and installers.
 
 ### Changed
 
@@ -33,9 +35,12 @@ VFS support, and easier to follow from install through graph-backed proof.
   skipped instead of falsely claiming that a shim was installed.
 - Workspace-root binding now normalizes Windows drive `file://` URIs and bare
   drive paths, while preserving local POSIX roots and Windows UNC shares.
-- On Unix, the global registry now keeps `registry.toml` and `registry.lock`
-  private at mode 0600, rejects unsafe link/type/ownership state, and serializes
-  atomic read-modify-write updates so concurrent writers cannot lose entries.
+- On Unix, the global registry now creates `registry.toml` and `registry.lock`
+  at mode 0600, refuses permissive modes, links, special files, wrong ownership,
+  hard links, unsafe parents, and reserved-path collisions without reading or
+  replacing their contents, and requires explicit `kin doctor --fix` permission
+  repair. Install and update preflights enforce the same contract, while locked
+  atomic updates prevent concurrent writers from losing entries.
 
 ## [0.2.23] - 2026-07-14
 

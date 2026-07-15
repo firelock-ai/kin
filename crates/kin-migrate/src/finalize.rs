@@ -15,7 +15,7 @@
 use std::fs;
 use std::path::Path;
 
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::error::{MigrateError, Result};
 
@@ -96,7 +96,7 @@ pub fn ensure_eject_snapshot(repo_root: &Path, kin_root: &Path) -> Result<()> {
 }
 
 /// Register the repo in `~/.kin/registry.toml` with its entity count.
-pub fn update_registry(repo_root: &Path, entity_count: usize) {
+pub fn update_registry(repo_root: &Path, entity_count: usize) -> Result<()> {
     let repo_id = repo_root
         .file_name()
         .and_then(|n| n.to_str())
@@ -105,11 +105,11 @@ pub fn update_registry(repo_root: &Path, entity_count: usize) {
     let canonical = repo_root
         .canonicalize()
         .unwrap_or_else(|_| repo_root.to_path_buf());
-    if let Err(e) = kin_core::registry::KinRegistry::update(|registry| {
+    kin_core::registry::KinRegistry::update(|registry| {
         registry.upsert(repo_id, canonical, entity_count);
-    }) {
-        warn!(error = %e, "failed to update global registry");
-    }
+    })
+    .map_err(|e| MigrateError::Other(format!("failed to update local registry authority: {e}")))?;
+    Ok(())
 }
 
 /// Best-effort trigger of the daemon LSP cold sweep.
@@ -225,6 +225,6 @@ mod tests {
     fn update_registry_does_not_panic_on_missing_home() {
         let tmp = tempfile::tempdir().unwrap();
         // Should not panic even if ~/.kin doesn't exist.
-        update_registry(tmp.path(), 42);
+        update_registry(tmp.path(), 42).unwrap();
     }
 }

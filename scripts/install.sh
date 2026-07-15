@@ -12,6 +12,7 @@
 #   KIN_HOME=~/.kin       Install directory (preferred; default: ~/.kin)
 #   KIN_DIR=~/.kin        Install directory compatibility alias
 #   KIN_NO_SETUP=1        Skip interactive setup after install
+#   KIN_REGISTRY_REPAIR=1 Explicitly repair safe registry modes to 0600
 
 set -eu
 
@@ -187,6 +188,25 @@ fi
 if [ ! -f "$EXTRACT_DIR/kin-daemon" ]; then
     err "kin-daemon missing from the downloaded archive."
     err "kin status/search and the MCP server require it. Refusing a daemon-less install. Aborting."
+    exit 1
+fi
+
+# The freshly downloaded binary owns the registry-authority contract used by
+# `kin doctor` and `kin update`. Run its content-free check before replacing
+# any installed binary. Unsafe existing state is never silently chmodded or
+# overwritten; the operator must explicitly repair it and rerun the installer.
+chmod +x "$EXTRACT_DIR/kin"
+if [ "${KIN_REGISTRY_REPAIR:-}" = "1" ]; then
+    REGISTRY_AUTHORITY_STATUS=0
+    "$EXTRACT_DIR/kin" registry authority --fix || REGISTRY_AUTHORITY_STATUS=$?
+else
+    REGISTRY_AUTHORITY_STATUS=0
+    "$EXTRACT_DIR/kin" registry authority || REGISTRY_AUTHORITY_STATUS=$?
+fi
+if [ "$REGISTRY_AUTHORITY_STATUS" -ne 0 ]; then
+    err "Unsafe local registry authority blocks installation."
+    err "No installed binary or registry authority file was replaced."
+    err "Inspect the paths above. For permission-only drift, rerun with KIN_REGISTRY_REPAIR=1."
     exit 1
 fi
 

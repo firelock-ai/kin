@@ -15,6 +15,47 @@ struct RegisteredRepoDaemonsOutput {
     daemons: Vec<RegisteredRepoDaemon>,
 }
 
+/// Verify registry authority without reading or printing file contents.
+pub async fn authority(json: bool, fix: bool) -> Result<()> {
+    let repaired = if fix {
+        kin_core::registry::repair_registry_authority_permissions()
+            .map_err(|e| anyhow::anyhow!("registry permission repair refused: {e}"))?
+    } else {
+        Vec::new()
+    };
+    let report = kin_core::registry::inspect_registry_authority();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        for path in repaired {
+            println!("Repaired mode to 0600: {}", path.display());
+        }
+        println!("Local registry authority:");
+        for check in &report.checks {
+            println!(
+                "  {:<28} {:<24} {}",
+                check.label,
+                authority_state_label(check.state),
+                check.path.display()
+            );
+            println!("    {}", check.detail);
+        }
+    }
+    kin_core::registry::require_registry_authority_secure()
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
+}
+
+fn authority_state_label(state: kin_core::registry::RegistryAuthorityState) -> &'static str {
+    use kin_core::registry::RegistryAuthorityState;
+    match state {
+        RegistryAuthorityState::Secure => "secure",
+        RegistryAuthorityState::Absent => "absent",
+        RegistryAuthorityState::RepairablePermissions => "repairable-permissions",
+        RegistryAuthorityState::Unsafe => "unsafe",
+        RegistryAuthorityState::Unsupported => "not-applicable",
+    }
+}
+
 /// List all registered Kin repositories.
 pub async fn list() -> Result<()> {
     let registry =
