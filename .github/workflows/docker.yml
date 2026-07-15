@@ -63,6 +63,16 @@ jobs:
 
           dump() { echo "---- docker logs $1 ----"; docker logs "$1" 2>&1 || true; }
 
+          # The non-root runtime must own a private home before Kin can create
+          # its fail-closed registry authority files there. Keep this explicit
+          # so a base-image/useradd change cannot silently regress first boot.
+          docker run --rm --entrypoint sh "$IMAGE" -c '
+            test "$HOME" = /home/kin
+            test -d "$HOME"
+            test "$(stat -c %a "$HOME")" = 700
+            test "$(stat -c %u "$HOME")" = "$(id -u)"
+          '
+
           echo "::group::Local mode — no /workspace mount, default workspace"
           docker rm -f kin-local >/dev/null 2>&1 || true
           docker run -d --name kin-local "$IMAGE" >/dev/null
