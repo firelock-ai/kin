@@ -1,0 +1,10 @@
+# Public onboarding documentation link-check policy.
+timeout = 30
+max_retries = 3
+max_concurrency = 8
+
+# Badge images are decorative and frequently rate-limited. Their destination
+# links remain checked because only the image host is excluded.
+exclude = [
+  "^https://img\\.shields\\.io/"
+]

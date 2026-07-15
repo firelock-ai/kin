@@ -27,6 +27,22 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
+For changes to public onboarding documentation, install
+[`lychee`](https://lychee.cli.rs/) and run the same bounded link check as CI:
+
+```sh
+lychee --config lychee.toml \
+  ./README.md \
+  ./CONTRIBUTING.md \
+  ./SECURITY.md \
+  ./docs/quickstart.md
+```
+
+The scheduled workflow also catches external links that rot without a source
+change. Keep additions to the checked public-document set aligned between
+`.github/workflows/link-check.yml` and this command, and keep any exclusions
+bounded in `lychee.toml`.
+
 CI treats clippy warnings as errors (`-D warnings`), so a clean clippy run
 locally avoids surprises.
 
