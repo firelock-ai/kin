@@ -19,7 +19,7 @@ pub use error::{McpError, Result};
 pub use negative::NEGATIVE_KEY;
 pub use server::{
     process_daemon_message, process_message, run_stdio, run_stdio_daemon, McpServerConfig,
-    SessionAuthorityMode,
+    RepoBinder, SessionAuthorityMode,
 };
 pub use session::{
     AssistantSession, McpMutationOperation, McpMutationPayload, McpTransaction, SessionRegistry,

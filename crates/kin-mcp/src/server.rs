@@ -7,7 +7,9 @@ use tokio::io::{
 
 use kin_model::graph::GraphStore;
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use crate::daemon_delegate;
 use crate::envelope::{self, Envelope};
@@ -126,13 +128,39 @@ pub async fn run_stdio<G: PersistableMcpStore + 'static>(
     Ok(())
 }
 
+/// Binds the repo daemon from the MCP client's advertised workspace roots.
+///
+/// Receives the filesystem paths of the client's roots, binds the daemon for the
+/// first one that is a Kin repository (setting `KIN_DAEMON_URL` as a side
+/// effect), and returns the bound daemon URL — or `None` if none of the roots is
+/// a Kin repository. Supplied by the kin-cli MCP command; when `None`, roots
+/// binding is disabled (a repository was already bound at startup, or the client
+/// cannot serve roots).
+pub type RepoBinder =
+    Box<dyn Fn(Vec<PathBuf>) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync>;
+
+/// The JSON-RPC id the server uses for its own `roots/list` request so it can
+/// recognize the matching response coming back from the client.
+const ROOTS_REQUEST_ID: &str = "kin-mcp-roots-list";
+
 /// Run the daemon-required MCP server over stdio.
 ///
 /// This mode is intentionally graphless: every `tools/call` request is
 /// forwarded to the repo daemon, which executes against its live graph and
 /// session coordinator. The stdio process only handles JSON-RPC framing,
 /// initialization, tool listing, allow-list checks, and transport errors.
-pub async fn run_stdio_daemon(config: McpServerConfig) -> Result<()> {
+///
+/// When no repository was bound at startup (no `--repo`/`KIN_MCP_REPO` and the
+/// launch cwd is not inside a Kin repo — the common case for editors that spawn
+/// MCP servers from `$HOME`) and the client advertises the MCP `roots`
+/// capability, the server requests `roots/list` after initialization and binds
+/// the daemon to the open workspace via `repo_binder`. That is what lets Cursor,
+/// Windsurf, and other editors reach whatever repository the user has open
+/// without a hardcoded path in the MCP config.
+pub async fn run_stdio_daemon(
+    config: McpServerConfig,
+    repo_binder: Option<RepoBinder>,
+) -> Result<()> {
     if !config.session_authority_mode.requires_daemon() {
         return Err(McpError::Other(
             "daemon stdio mode requires daemon session authority".to_string(),
@@ -146,7 +174,69 @@ pub async fn run_stdio_daemon(config: McpServerConfig) -> Result<()> {
 
     tracing::info!("kin-mcp daemon-proxy stdio server starting");
 
+    // MCP `roots` binding state. We only reach out for workspace roots when we
+    // could not bind a repository at startup and the client says it can serve
+    // them; `roots_requested` guards against asking more than once.
+    let mut client_supports_roots = false;
+    let mut roots_requested = false;
+
     while let Some((message, framed)) = read_stdio_message(&mut reader).await? {
+        // Peek at the raw JSON so we can distinguish the client's requests and
+        // notifications from the `roots/list` response we may have sent: a
+        // response carries no `method`, which the strongly-typed
+        // `JsonRpcRequest` requires.
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&message) {
+            let method = value.get("method").and_then(|m| m.as_str());
+
+            if method == Some("initialize") {
+                client_supports_roots = value.pointer("/params/capabilities/roots").is_some();
+            }
+
+            // Our own `roots/list` response returning from the client: bind the
+            // daemon and swallow it (a response is never itself answered).
+            if method.is_none()
+                && value.get("id").and_then(|id| id.as_str()) == Some(ROOTS_REQUEST_ID)
+            {
+                if let Some(binder) = repo_binder.as_ref() {
+                    let roots = parse_workspace_roots(&value);
+                    if roots.is_empty() {
+                        tracing::info!(
+                            "kin-mcp: client returned no workspace roots; repository stays unbound"
+                        );
+                    } else if binder(roots).await.is_none() {
+                        tracing::info!(
+                            "kin-mcp: no Kin repository among the client's workspace roots"
+                        );
+                    }
+                }
+                continue;
+            }
+
+            // Once the client finishes initializing (or asks for the tool list)
+            // and we still have no bound daemon, ask it for its workspace roots.
+            let post_init = matches!(
+                method,
+                Some("initialized") | Some("notifications/initialized") | Some("tools/list")
+            );
+            if post_init
+                && !roots_requested
+                && client_supports_roots
+                && repo_binder.is_some()
+                && daemon_is_unbound()
+            {
+                roots_requested = true;
+                let request = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": ROOTS_REQUEST_ID,
+                    "method": "roots/list",
+                });
+                let request_json = serde_json::to_string(&request).map_err(McpError::Json)?;
+                write_stdio_message(&mut stdout, &request_json, framed).await?;
+                // Fall through: `initialized` has no response, and `tools/list`
+                // is still answered normally below.
+            }
+        }
+
         if let Some(response) = process_daemon_message(&message, &config).await {
             let response_json = serde_json::to_string(&response).map_err(McpError::Json)?;
             write_stdio_message(&mut stdout, &response_json, framed).await?;
@@ -155,6 +245,70 @@ pub async fn run_stdio_daemon(config: McpServerConfig) -> Result<()> {
 
     tracing::info!("kin-mcp daemon-proxy stdio server shutting down");
     Ok(())
+}
+
+/// True when no repo daemon has been bound yet (`KIN_DAEMON_URL` unset/empty).
+fn daemon_is_unbound() -> bool {
+    std::env::var("KIN_DAEMON_URL")
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true)
+}
+
+/// Extract filesystem paths from an MCP `roots/list` response
+/// (`result.roots[].uri`), accepting both `file://` URIs and bare paths.
+fn parse_workspace_roots(value: &serde_json::Value) -> Vec<PathBuf> {
+    value
+        .pointer("/result/roots")
+        .and_then(|roots| roots.as_array())
+        .map(|roots| {
+            roots
+                .iter()
+                .filter_map(|root| root.get("uri").and_then(|uri| uri.as_str()))
+                .filter_map(root_uri_to_path)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Convert an MCP root's `uri` into a filesystem path. Accepts spec-compliant
+/// `file://` URIs (decoding `%XX` escapes) and the bare absolute path some
+/// clients (e.g. Cursor) send instead. Returns `None` for remote/non-file URIs.
+fn root_uri_to_path(uri: &str) -> Option<PathBuf> {
+    if let Some(rest) = uri.strip_prefix("file://") {
+        // `file:///abs/path` -> `/abs/path`; `file://host/abs/path` -> `/abs/path`.
+        let path = match rest.as_bytes().first() {
+            Some(b'/') => rest.to_string(),
+            _ => {
+                let slash = rest.find('/')?;
+                rest[slash..].to_string()
+            }
+        };
+        return Some(PathBuf::from(percent_decode(&path)));
+    }
+    // Some clients (Cursor) send a bare absolute path rather than a file URI.
+    if uri.starts_with('/') {
+        return Some(PathBuf::from(uri));
+    }
+    None
+}
+
+/// Minimal percent-decoding for `file://` URI paths (handles `%20`, etc.).
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(decoded) = u8::from_str_radix(&input[i + 1..i + 3], 16) {
+                out.push(decoded);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 async fn read_stdio_message<R: AsyncBufRead + Unpin>(
@@ -948,5 +1102,57 @@ mod tests {
         assert_eq!(parse_content_length("content-length: 7\n"), Some(7));
         assert_eq!(parse_content_length("X-Test: 1"), None);
         assert_eq!(parse_content_length("Content-Length: nope"), None);
+    }
+
+    #[test]
+    fn root_uri_to_path_handles_file_uris_and_bare_paths() {
+        assert_eq!(
+            root_uri_to_path("file:///Users/me/proj"),
+            Some(PathBuf::from("/Users/me/proj"))
+        );
+        // `file://host/path` drops the authority, leaving the absolute path.
+        assert_eq!(
+            root_uri_to_path("file://localhost/Users/me/proj"),
+            Some(PathBuf::from("/Users/me/proj"))
+        );
+        // Percent-escaped characters (e.g. spaces) decode.
+        assert_eq!(
+            root_uri_to_path("file:///Users/me/My%20Repo"),
+            Some(PathBuf::from("/Users/me/My Repo"))
+        );
+        // Some clients (Cursor) send a bare absolute path, not a file:// URI.
+        assert_eq!(
+            root_uri_to_path("/Users/me/kin"),
+            Some(PathBuf::from("/Users/me/kin"))
+        );
+        // Non-file schemes (e.g. remote workspaces) are skipped.
+        assert_eq!(root_uri_to_path("vscode-remote://host/x"), None);
+        assert_eq!(root_uri_to_path("https://example.com/x"), None);
+    }
+
+    #[test]
+    fn parse_workspace_roots_extracts_local_paths() {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": ROOTS_REQUEST_ID,
+            "result": {
+                "roots": [
+                    {"uri": "file:///Users/me/kin", "name": "kin"},
+                    {"uri": "vscode-remote://host/y"},
+                    {"uri": "/Users/me/bare", "name": "bare"},
+                    {"uri": "file:///Users/me/other"}
+                ]
+            }
+        });
+        assert_eq!(
+            parse_workspace_roots(&response),
+            vec![
+                PathBuf::from("/Users/me/kin"),
+                PathBuf::from("/Users/me/bare"),
+                PathBuf::from("/Users/me/other"),
+            ]
+        );
+        // A response carrying no roots yields an empty list, never a panic.
+        assert!(parse_workspace_roots(&serde_json::json!({ "result": {} })).is_empty());
     }
 }
