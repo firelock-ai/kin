@@ -346,15 +346,18 @@ pub fn require_registry_authority_secure() -> Result<(), Box<dyn std::error::Err
 
 pub fn require_registry_authority_secure_at(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut report = inspect_registry_authority_at(path);
-    // A newly-created lock is requested at 0600 but a restrictive process
-    // umask can make its public mode 0000 for the few instructions before the
-    // creator's descriptor-anchored fchmod. Never repair or trust that state:
-    // only wait briefly for an otherwise-secure authority snapshot to converge.
+    // A newly-created lock is requested at 0600 but the process umask can make
+    // its public mode temporarily differ before the creator's descriptor-
+    // anchored fchmod. A sibling initializer can likewise observe a new parent
+    // before its descriptor-anchored chmod. Never repair or trust either state:
+    // only wait briefly and re-inspect for convergence.
     for _ in 0..50 {
         if report.is_secure() {
             return Ok(());
         }
-        if !report.is_transient_lock_creation_window() {
+        if !report.is_lock_creation_window_candidate()
+            && !report.is_parent_creation_window_candidate(path)
+        {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -379,13 +382,11 @@ pub fn require_registry_authority_secure_at(path: &Path) -> Result<(), Box<dyn s
 
 impl RegistryAuthorityReport {
     #[cfg(unix)]
-    fn is_transient_lock_creation_window(&self) -> bool {
+    fn is_lock_creation_window_candidate(&self) -> bool {
         let mut saw_lock = false;
         self.checks.iter().all(|check| match check.state {
             RegistryAuthorityState::Secure | RegistryAuthorityState::Absent => true,
-            RegistryAuthorityState::RepairablePermissions
-                if check.label == "registry lock" && check.detail.starts_with("mode 0000;") =>
-            {
+            RegistryAuthorityState::RepairablePermissions if check.label == "registry lock" => {
                 saw_lock = true;
                 true
             }
@@ -394,7 +395,29 @@ impl RegistryAuthorityReport {
     }
 
     #[cfg(not(unix))]
-    fn is_transient_lock_creation_window(&self) -> bool {
+    fn is_lock_creation_window_candidate(&self) -> bool {
+        false
+    }
+
+    #[cfg(unix)]
+    fn is_parent_creation_window_candidate(&self, path: &Path) -> bool {
+        if self.checks.len() != 1
+            || self.checks[0].label != "registry authority"
+            || self.checks[0].state != RegistryAuthorityState::Unsafe
+        {
+            return false;
+        }
+        match RegistryAnchor::open(path) {
+            Ok(_) => true,
+            Err(err) => matches!(
+                err.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+            ),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn is_parent_creation_window_candidate(&self, _path: &Path) -> bool {
         false
     }
 }
@@ -469,6 +492,29 @@ impl RegistryAnchor {
         use std::os::unix::ffi::OsStrExt;
 
         let parent_path = normalized_parent(path);
+        let parent_c =
+            std::ffi::CString::new(parent_path.as_os_str().as_bytes()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "registry parent path contains a NUL byte",
+                )
+            })?;
+        // SAFETY: `parent_c` is NUL-terminated and remains alive for the call.
+        let fd = unsafe {
+            libc::open(
+                parent_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was returned by `open` and ownership transfers to `File`.
+        let parent = unsafe { File::from_raw_fd(fd) };
+        Self::from_parent(path, parent)
+    }
+
+    fn from_parent(path: &Path, parent: File) -> std::io::Result<Self> {
         let registry_name = path
             .file_name()
             .filter(|name| !name.is_empty())
@@ -509,26 +555,6 @@ impl RegistryAnchor {
                 "registry path collides with its reserved .lock or .tmp authority path",
             ));
         }
-
-        let parent_c =
-            std::ffi::CString::new(parent_path.as_os_str().as_bytes()).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "registry parent path contains a NUL byte",
-                )
-            })?;
-        // SAFETY: `parent_c` is NUL-terminated and remains alive for the call.
-        let fd = unsafe {
-            libc::open(
-                parent_c.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: `fd` was returned by `open` and ownership transfers to `File`.
-        let parent = unsafe { File::from_raw_fd(fd) };
         validate_parent(&parent)?;
 
         Ok(Self {
@@ -559,24 +585,49 @@ fn normalized_parent(path: &Path) -> PathBuf {
 
 #[cfg(unix)]
 fn prepare_anchor(path: &Path) -> Result<RegistryAnchor, Box<dyn std::error::Error>> {
-    let parent = normalized_parent(path);
-    create_private_dir_all(&parent)?;
-    Ok(RegistryAnchor::open(path)?)
+    let mut last_permission_error = None;
+    for _ in 0..50 {
+        match RegistryAnchor::open(path) {
+            Ok(anchor) => return Ok(anchor),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let parent = create_private_dir_all(&normalized_parent(path))?;
+                return Ok(RegistryAnchor::from_parent(path, parent)?);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                last_permission_error = Some(err);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(err) => return Err(Box::new(err)),
+        }
+    }
+    Err(Box::new(last_permission_error.unwrap_or_else(|| {
+        std::io::Error::other("registry parent create race did not converge")
+    })))
 }
 
 #[cfg(unix)]
-fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
-    use std::os::fd::{AsRawFd, FromRawFd};
+fn create_private_dir_all(path: &Path) -> std::io::Result<File> {
+    use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
 
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => return Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err),
-    }
-
-    let mut ancestor = path.to_path_buf();
-    let mut missing = Vec::new();
+    // Always resolve the final requested component through the retained
+    // ancestor fd. If another process creates it after our caller observed
+    // ENOENT, this avoids re-resolving the mutable path or following a link.
+    let mut ancestor = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let mut missing = vec![path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "registry parent has no creatable directory component",
+            )
+        })?
+        .to_os_string()];
     loop {
         match std::fs::symlink_metadata(&ancestor) {
             Ok(_) => break,
@@ -648,20 +699,7 @@ fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
             }
         }
 
-        // SAFETY: the retained parent fd/name are valid. O_NOFOLLOW prevents a
-        // raced symlink from becoming the next creation anchor.
-        let fd = unsafe {
-            libc::openat(
-                current.as_raw_fd(),
-                name_c.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: fd was returned by openat and ownership transfers to File.
-        let next = unsafe { File::from_raw_fd(fd) };
+        let next = open_directory_after_create_race(&current, &name_c)?;
         validate_parent(&next)?;
         if created && stat_file(&next)?.st_mode & 0o7777 != 0o700 {
             return Err(registry_security_error(
@@ -670,7 +708,42 @@ fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
         }
         current = next;
     }
-    Ok(())
+    Ok(current)
+}
+
+#[cfg(unix)]
+fn open_directory_after_create_race(parent: &File, name: &std::ffi::CStr) -> std::io::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let mut last_error = None;
+    for _ in 0..50 {
+        // SAFETY: the retained parent fd and NUL-terminated name are valid.
+        // O_NOFOLLOW prevents a raced symlink from becoming a creation anchor.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: fd was returned by openat and ownership transfers to File.
+            return Ok(unsafe { File::from_raw_fd(fd) });
+        }
+        let err = std::io::Error::last_os_error();
+        if matches!(
+            err.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+        ) {
+            last_error = Some(err);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
+        }
+        return Err(err);
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::other("registry directory create race did not converge")
+    }))
 }
 
 #[cfg(unix)]
@@ -1525,21 +1598,29 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn genuine_zero_mode_lock_is_refused_without_implicit_repair() {
+    fn genuine_non_private_lock_modes_are_refused_without_implicit_repair() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
-        let reg_path = dir.path().join("registry.toml");
-        let lock_path = reg_path.with_extension("lock");
-        std::fs::write(&reg_path, "repos = []\n").unwrap();
-        std::fs::write(&lock_path, b"").unwrap();
-        std::fs::set_permissions(&reg_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        for unsafe_mode in [0o000, 0o200, 0o400, 0o644] {
+            let dir = tempfile::tempdir().unwrap();
+            let reg_path = dir.path().join("registry.toml");
+            let lock_path = reg_path.with_extension("lock");
+            std::fs::write(&reg_path, "repos = []\n").unwrap();
+            std::fs::write(&lock_path, b"").unwrap();
+            std::fs::set_permissions(&reg_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(unsafe_mode))
+                .unwrap();
 
-        let error = KinRegistry::load_from(&reg_path).unwrap_err();
-        assert!(error.to_string().contains("mode 0000"), "{error}");
-        assert_eq!(mode(&lock_path), 0o000);
-        assert_eq!(std::fs::read(&reg_path).unwrap(), b"repos = []\n");
+            let error = KinRegistry::load_from(&reg_path).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("mode {unsafe_mode:04o}")),
+                "{error}"
+            );
+            assert_eq!(mode(&lock_path), unsafe_mode);
+            assert_eq!(std::fs::read(&reg_path).unwrap(), b"repos = []\n");
+        }
     }
 
     #[cfg(unix)]
@@ -1778,6 +1859,33 @@ mod tests {
                 let previous = unsafe { libc::umask(0o777) };
                 let fresh_path = work.join("new-parent/nested/registry.toml");
                 let initialized = initialize_registry_authority_at(&fresh_path).unwrap();
+
+                let concurrent_path =
+                    std::sync::Arc::new(work.join("concurrent-parent/nested/registry.toml"));
+                let concurrent_barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+                let mut concurrent_handles = Vec::new();
+                for index in 0..8 {
+                    let path = std::sync::Arc::clone(&concurrent_path);
+                    let barrier = std::sync::Arc::clone(&concurrent_barrier);
+                    let repo_path = work.clone();
+                    concurrent_handles.push(std::thread::spawn(move || {
+                        barrier.wait();
+                        KinRegistry::update_at(&path, |registry| {
+                            registry.repos.push(RegisteredRepo {
+                                id: format!("concurrent-parent-{index}"),
+                                path: repo_path,
+                                entities: index,
+                                last_commit: "2026-07-13T00:00:00Z".to_string(),
+                                dependencies: Vec::new(),
+                            });
+                        })
+                        .unwrap();
+                    }));
+                }
+                for handle in concurrent_handles {
+                    handle.join().unwrap();
+                }
+
                 let mut handles = Vec::new();
                 for index in 0..8 {
                     let repo_path = work.clone();
@@ -1804,6 +1912,17 @@ mod tests {
                 assert_eq!(mode(&work.join("new-parent/nested")), 0o700);
                 assert_eq!(mode(&fresh_path), 0o600);
                 assert_eq!(mode(&fresh_path.with_extension("lock")), 0o600);
+                assert_eq!(mode(&work.join("concurrent-parent")), 0o700);
+                assert_eq!(mode(&work.join("concurrent-parent/nested")), 0o700);
+                assert_eq!(mode(&*concurrent_path), 0o600);
+                assert_eq!(mode(&concurrent_path.with_extension("lock")), 0o600);
+                assert_eq!(
+                    KinRegistry::load_from(&concurrent_path)
+                        .unwrap()
+                        .repos
+                        .len(),
+                    8
+                );
                 assert_eq!(mode(Path::new("registry.toml")), 0o600);
                 assert_eq!(mode(Path::new("registry.lock")), 0o600);
                 assert_eq!(
