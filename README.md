@@ -36,7 +36,7 @@ Supporting repositories provide graph storage, retrieval, embeddings, blobs,
 language enrichment, and reproducible proof. They are implementation layers,
 not separate products a new user needs to assemble.
 
-## Five-minute graph-backed path
+## Shortest graph-backed path
 
 ### 1. Install and configure Kin
 
