@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.24] - 2026-07-15
+
+This patch makes Kin's first-use path workspace-aware, truthful about optional
+VFS support, and easier to follow from install through graph-backed proof.
+
+### Added
+
+- The MCP server now accepts standard client workspace roots, binds the first
+  initialized Kin repository without a hardcoded `--repo`, and keeps semantic
+  answers fail closed on graph authority.
+
+### Changed
+
+- Public onboarding now leads with the semantic system-of-record workflow,
+  distinguishes graph-backed runtime proof from setup metadata, and links each
+  supported install path from one concise entry point.
+- Release builds now pin the reviewed `kin-vfs` source at
+  `c782905f39500a7a107aba5a91e85119c77726fa`; its local `kin-vfs-core` remains
+  version 0.1.5, matching Kin's registry-resolved dependency.
+
+### Fixed
+
+- The installer now reports unsupported or unavailable optional VFS targets as
+  skipped instead of falsely claiming that a shim was installed.
+
 ## [0.2.23] - 2026-07-14
 
 This patch republishes the reviewed v0.2.22 payload through the corrected
@@ -599,7 +624,8 @@ Historical note: this snapshot predates the public GitHub prerelease series and 
 - Daemon mode for background file watching (`kin-daemon`)
 - 19-crate workspace architecture
 
-[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.23...HEAD
+[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.24...HEAD
+[0.2.24]: https://github.com/firelock-ai/kin/compare/v0.2.23...v0.2.24
 [0.2.23]: https://github.com/firelock-ai/kin/compare/v0.2.22...v0.2.23
 [0.2.22]: https://github.com/firelock-ai/kin/compare/v0.2.21...v0.2.22
 [0.2.21]: https://github.com/firelock-ai/kin/compare/v0.2.20...v0.2.21

@@ -673,7 +673,7 @@ def main() -> None:
         "always()",
         "needs.publish.result == 'success'",
         "uses: ./.github/workflows/install-proof.yml",
-        "expected_vfs_commit: 1c531216c65b734fb5e7c996094e01e030b8eec7",
+        "expected_vfs_commit: c782905f39500a7a107aba5a91e85119c77726fa",
     ):
         require(install_proof_job, policy, "mandatory public install proof")
 
