@@ -1914,7 +1914,7 @@ mod tests {
                 assert_eq!(mode(&fresh_path.with_extension("lock")), 0o600);
                 assert_eq!(mode(&work.join("concurrent-parent")), 0o700);
                 assert_eq!(mode(&work.join("concurrent-parent/nested")), 0o700);
-                assert_eq!(mode(&*concurrent_path), 0o600);
+                assert_eq!(mode(&concurrent_path), 0o600);
                 assert_eq!(mode(&concurrent_path.with_extension("lock")), 0o600);
                 assert_eq!(
                     KinRegistry::load_from(&concurrent_path)
