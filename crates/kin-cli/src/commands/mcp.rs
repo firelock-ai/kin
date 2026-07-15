@@ -3,7 +3,9 @@
 
 use anyhow::Result;
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 /// `kin mcp start` — Start the MCP stdio server.
 ///
@@ -37,20 +39,22 @@ pub async fn start(global: bool, repo: Option<PathBuf>) -> Result<()> {
     }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    match bind_daemon_for_repo_dir(&cwd).await {
+    let bound_at_start = match bind_daemon_for_repo_dir(&cwd).await {
         Ok(daemon_url) => {
             eprintln!("{}", session_authority_notice());
             eprintln!("Kin MCP: forwarding graph tools to repo daemon at {daemon_url}");
+            true
         }
         Err(reason) => {
             eprintln!(
-                "Kin MCP: starting without a bound Kin repository ({reason}). Tool calls will \
-                 return a structured error until a repository is bound: run `kin init .`, \
-                 relaunch this MCP server with its working directory inside a Kin repository, or \
-                 pass --repo <path> (or set KIN_MCP_REPO=<path>)."
+                "Kin MCP: no repository bound at startup ({reason}). If the MCP client advertises \
+                 workspace roots, Kin binds to the open repository after initialization; otherwise \
+                 run `kin init .`, relaunch inside a Kin repository, or pass --repo <path> (or set \
+                 KIN_MCP_REPO=<path>)."
             );
+            false
         }
-    }
+    };
 
     let mut config = build_mcp_start_config();
     let profile_tools: Option<&'static [&'static str]> =
@@ -72,11 +76,53 @@ pub async fn start(global: bool, repo: Option<PathBuf>) -> Result<()> {
         );
     }
 
-    kin_mcp::run_stdio_daemon(config)
+    // When nothing bound from --repo/KIN_MCP_REPO/cwd, let the stdio server bind
+    // late from the MCP client's advertised workspace roots — how editors that
+    // launch MCP servers from $HOME (Cursor, Windsurf, ...) reach the open repo.
+    let repo_binder: Option<kin_mcp::RepoBinder> = if bound_at_start {
+        None
+    } else {
+        Some(Box::new(
+            |roots: Vec<PathBuf>| -> Pin<Box<dyn Future<Output = Option<String>> + Send>> {
+                Box::pin(bind_first_kin_repo(roots))
+            },
+        ))
+    };
+
+    kin_mcp::run_stdio_daemon(config, repo_binder)
         .await
         .map_err(|e| anyhow::anyhow!("MCP server error: {}", e))?;
 
     Ok(())
+}
+
+/// Bind the repo daemon for the first workspace root that is a Kin repository.
+/// Returns the daemon URL (and sets `KIN_DAEMON_URL`) on success, or `None` when
+/// none of the client's workspace roots is a Kin repository.
+async fn bind_first_kin_repo(roots: Vec<PathBuf>) -> Option<String> {
+    for root in roots {
+        if let Ok(url) = bind_daemon_for_repo_dir(&root).await {
+            // Point the process at the bound repo so the daemon delegate resolves
+            // the per-install loopback auth token from <root>/.kin/daemon.token,
+            // exactly as the --repo startup path does (it set_current_dir's first).
+            // Without this, tool-call forwarding sends no bearer token and the
+            // daemon replies 401 even though the repo bound correctly.
+            if let Err(err) = std::env::set_current_dir(&root) {
+                eprintln!(
+                    "Kin MCP: bound {url} but could not switch cwd to {} ({err}); \
+                     tool auth will fall back to KIN_DAEMON_AUTH_TOKEN if set.",
+                    root.display()
+                );
+            }
+            eprintln!("{}", session_authority_notice());
+            eprintln!(
+                "Kin MCP: bound repo daemon at {url} from workspace root {}",
+                root.display()
+            );
+            return Some(url);
+        }
+    }
+    None
 }
 
 fn session_authority_notice() -> &'static str {
