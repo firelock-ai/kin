@@ -214,7 +214,19 @@ done
 ok "Binaries installed (kin, kin-daemon)"
 
 if [ "$HAVE_VFS" = "1" ] && [ "$HAVE_SHIM" = "1" ]; then
-    ok "Filesystem projection installed (kin-vfs + shim)"
+    # The release archive can contain a projection built for a different libc
+    # than the host. In particular, the static-musl Kin core runs on Alpine,
+    # while today's kin-vfs and shim are glibc-linked. Test the installed CLI
+    # before claiming the optional projection is usable, and do not leave a
+    # command behind that the host loader cannot execute.
+    if "$KIN_BIN/kin-vfs" --help >/dev/null 2>&1; then
+        ok "Filesystem projection installed (kin-vfs + shim)"
+    else
+        rm -f "$KIN_BIN/kin-vfs" \
+            "$KIN_LIB/libkin_vfs_shim.so" \
+            "$KIN_LIB/libkin_vfs_shim.dylib"
+        info "Filesystem projection is unavailable on this platform; core CLI and daemon are fully functional without it."
+    fi
 else
     info "Filesystem projection (kin-vfs) not bundled in this archive — core CLI and daemon are fully functional without it."
 fi
