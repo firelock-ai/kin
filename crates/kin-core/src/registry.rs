@@ -345,7 +345,21 @@ pub fn require_registry_authority_secure() -> Result<(), Box<dyn std::error::Err
 }
 
 pub fn require_registry_authority_secure_at(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let report = inspect_registry_authority_at(path);
+    let mut report = inspect_registry_authority_at(path);
+    // A newly-created lock is requested at 0600 but a restrictive process
+    // umask can make its public mode 0000 for the few instructions before the
+    // creator's descriptor-anchored fchmod. Never repair or trust that state:
+    // only wait briefly for an otherwise-secure authority snapshot to converge.
+    for _ in 0..50 {
+        if report.is_secure() {
+            return Ok(());
+        }
+        if !report.is_transient_lock_creation_window() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        report = inspect_registry_authority_at(path);
+    }
     if report.is_secure() {
         return Ok(());
     }
@@ -361,6 +375,28 @@ pub fn require_registry_authority_secure_at(path: &Path) -> Result<(), Box<dyn s
             report.failure_summary()
         ),
     )))
+}
+
+impl RegistryAuthorityReport {
+    #[cfg(unix)]
+    fn is_transient_lock_creation_window(&self) -> bool {
+        let mut saw_lock = false;
+        self.checks.iter().all(|check| match check.state {
+            RegistryAuthorityState::Secure | RegistryAuthorityState::Absent => true,
+            RegistryAuthorityState::RepairablePermissions
+                if check.label == "registry lock" && check.detail.starts_with("mode 0000;") =>
+            {
+                saw_lock = true;
+                true
+            }
+            _ => false,
+        }) && saw_lock
+    }
+
+    #[cfg(not(unix))]
+    fn is_transient_lock_creation_window(&self) -> bool {
+        false
+    }
 }
 
 /// Explicitly repair mode bits on structurally safe registry-authority files.
@@ -523,13 +559,118 @@ fn normalized_parent(path: &Path) -> PathBuf {
 
 #[cfg(unix)]
 fn prepare_anchor(path: &Path) -> Result<RegistryAnchor, Box<dyn std::error::Error>> {
-    use std::os::unix::fs::DirBuilderExt;
-
     let parent = normalized_parent(path);
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true).mode(0o700);
-    builder.create(&parent)?;
+    create_private_dir_all(&parent)?;
     Ok(RegistryAnchor::open(path)?)
+}
+
+#[cfg(unix)]
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+
+    let mut ancestor = path.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&ancestor) {
+            Ok(_) => break,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let name = ancestor.file_name().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "registry parent has no creatable directory component",
+                    )
+                })?;
+                missing.push(name.to_os_string());
+                ancestor = ancestor
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf();
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    let canonical_ancestor = ancestor.canonicalize()?;
+    let mut current = File::open(&canonical_ancestor)?;
+    validate_parent(&current).map_err(|err| {
+        std::io::Error::new(
+            err.kind(),
+            format!(
+                "refusing to create registry directories below {}: {err}",
+                canonical_ancestor.display()
+            ),
+        )
+    })?;
+
+    for name in missing.into_iter().rev() {
+        let name_c = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "registry directory component contains a NUL byte",
+            )
+        })?;
+        // SAFETY: the retained parent fd and NUL-terminated component are valid.
+        let created = if unsafe { libc::mkdirat(current.as_raw_fd(), name_c.as_ptr(), 0o700) } == 0
+        {
+            true
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                false
+            } else {
+                return Err(err);
+            }
+        };
+
+        if created {
+            // The retained parent is current-user-owned and not writable by
+            // other users. AT_SYMLINK_NOFOLLOW keeps the chmod anchored to the
+            // directory entry this operation created even under umask 0777.
+            // SAFETY: the dirfd/name are valid and mode has no invalid bits.
+            if unsafe {
+                libc::fchmodat(
+                    current.as_raw_fd(),
+                    name_c.as_ptr(),
+                    0o700,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+
+        // SAFETY: the retained parent fd/name are valid. O_NOFOLLOW prevents a
+        // raced symlink from becoming the next creation anchor.
+        let fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                name_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fd was returned by openat and ownership transfers to File.
+        let next = unsafe { File::from_raw_fd(fd) };
+        validate_parent(&next)?;
+        if created && stat_file(&next)?.st_mode & 0o7777 != 0o700 {
+            return Err(registry_security_error(
+                "new registry directory did not reach mode 0700",
+            ));
+        }
+        current = next;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1384,6 +1525,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn genuine_zero_mode_lock_is_refused_without_implicit_repair() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let reg_path = dir.path().join("registry.toml");
+        let lock_path = reg_path.with_extension("lock");
+        std::fs::write(&reg_path, "repos = []\n").unwrap();
+        std::fs::write(&lock_path, b"").unwrap();
+        std::fs::set_permissions(&reg_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let error = KinRegistry::load_from(&reg_path).unwrap_err();
+        assert!(error.to_string().contains("mode 0000"), "{error}");
+        assert_eq!(mode(&lock_path), 0o000);
+        assert_eq!(std::fs::read(&reg_path).unwrap(), b"repos = []\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn installer_initialization_creates_missing_authority_without_rewriting_existing_bytes() {
         let fresh = tempfile::tempdir().unwrap();
         let fresh_path = fresh.path().join("registry.toml");
@@ -1616,6 +1776,8 @@ mod tests {
                 // SAFETY: this isolated subprocess sets the umask before spawning
                 // workers and restores it after every worker has joined.
                 let previous = unsafe { libc::umask(0o777) };
+                let fresh_path = work.join("new-parent/nested/registry.toml");
+                let initialized = initialize_registry_authority_at(&fresh_path).unwrap();
                 let mut handles = Vec::new();
                 for index in 0..8 {
                     let repo_path = work.clone();
@@ -1637,6 +1799,11 @@ mod tests {
                 }
                 // SAFETY: restore the process umask before any assertion can panic.
                 unsafe { libc::umask(previous) };
+                assert_eq!(initialized.len(), 2);
+                assert_eq!(mode(&work.join("new-parent")), 0o700);
+                assert_eq!(mode(&work.join("new-parent/nested")), 0o700);
+                assert_eq!(mode(&fresh_path), 0o600);
+                assert_eq!(mode(&fresh_path.with_extension("lock")), 0o600);
                 assert_eq!(mode(Path::new("registry.toml")), 0o600);
                 assert_eq!(mode(Path::new("registry.lock")), 0o600);
                 assert_eq!(
@@ -1741,6 +1908,13 @@ mod tests {
                 );
                 assert!(!registry_path.exists());
                 assert!(!lock_path.exists());
+                let nested_registry = work.join("nested/private/registry.toml");
+                let error = initialize_registry_authority_at(&nested_registry).unwrap_err();
+                assert!(
+                    error.to_string().contains("group/world writable"),
+                    "{error}"
+                );
+                assert!(!work.join("nested").exists());
                 std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700)).unwrap();
             }
             "failure-cleanup" => {
