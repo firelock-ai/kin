@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Link Check
+
+on:
+  pull_request:
+    paths:
+      - "README.md"
+      - "CONTRIBUTING.md"
+      - "SECURITY.md"
+      - "docs/quickstart.md"
+      - "lychee.toml"
+      - ".github/workflows/link-check.yml"
+  push:
+    branches: [main]
+    paths:
+      - "README.md"
+      - "CONTRIBUTING.md"
+      - "SECURITY.md"
+      - "docs/quickstart.md"
+      - "lychee.toml"
+      - ".github/workflows/link-check.yml"
+  schedule:
+    - cron: "17 13 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  link-check:
+    name: Check public documentation links
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Check links
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: >-
+            --config lychee.toml
+            ./README.md
+            ./CONTRIBUTING.md
+            ./SECURITY.md
+            ./docs/quickstart.md
+          fail: true
+          lycheeVersion: v0.24.2
