@@ -1458,19 +1458,15 @@ pub async fn run(
     }
 
     // Register in the global ~/.kin/registry.toml with the current-tree count.
-    if let Ok(mut registry) = kin_core::registry::KinRegistry::load() {
-        let repo_id = dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-        registry.upsert(
-            repo_id,
-            dir.canonicalize().unwrap_or(dir),
-            init_summary.total_entity_count,
-        );
-        let _ = registry.save();
-    }
+    let repo_id = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let canonical_dir = dir.canonicalize().unwrap_or(dir);
+    let _ = kin_core::registry::KinRegistry::update(|registry| {
+        registry.upsert(repo_id, canonical_dir, init_summary.total_entity_count);
+    });
 
     if json {
         println!(

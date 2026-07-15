@@ -593,22 +593,17 @@ async fn run_local_commit_pipeline_for_tests(
         }
     }
 
-    // Update the global ~/.kin/registry.toml with current entity count
-    if let Ok(mut registry) = kin_core::registry::KinRegistry::load() {
-        let cwd = layout.working_dir().to_path_buf();
-        let repo_id = crate::commands::remote::resolve_repo_id(&layout)?;
-        // Fetch remote repo catalog for cross-repo dependency matching.
-        // Checks KIN_REMOTE_URL env var or ~/.kin/remote.toml for a remote spine URL.
-        // Returns empty if no remote configured or unreachable (3-second timeout).
-        let remote_ids = fetch_remote_catalog();
-        registry.upsert_with_remote(
-            repo_id,
-            cwd.canonicalize().unwrap_or(cwd),
-            total_entity_count,
-            &remote_ids,
-        );
-        let _ = registry.save();
-    }
+    // Update the global ~/.kin/registry.toml with current entity count.
+    let cwd = layout.working_dir().to_path_buf();
+    let repo_id = crate::commands::remote::resolve_repo_id(&layout)?;
+    // Fetch remote repo catalog for cross-repo dependency matching.
+    // Checks KIN_REMOTE_URL env var or ~/.kin/remote.toml for a remote spine URL.
+    // Returns empty if no remote configured or unreachable (3-second timeout).
+    let remote_ids = fetch_remote_catalog();
+    let canonical_cwd = cwd.canonicalize().unwrap_or(cwd);
+    let _ = kin_core::registry::KinRegistry::update(|registry| {
+        registry.upsert_with_remote(repo_id, canonical_cwd, total_entity_count, &remote_ids);
+    });
 
     Ok(())
 }

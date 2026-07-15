@@ -97,19 +97,18 @@ pub fn ensure_eject_snapshot(repo_root: &Path, kin_root: &Path) -> Result<()> {
 
 /// Register the repo in `~/.kin/registry.toml` with its entity count.
 pub fn update_registry(repo_root: &Path, entity_count: usize) {
-    if let Ok(mut registry) = kin_core::registry::KinRegistry::load() {
-        let repo_id = repo_root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-        let canonical = repo_root
-            .canonicalize()
-            .unwrap_or_else(|_| repo_root.to_path_buf());
+    let repo_id = repo_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let canonical = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    if let Err(e) = kin_core::registry::KinRegistry::update(|registry| {
         registry.upsert(repo_id, canonical, entity_count);
-        if let Err(e) = registry.save() {
-            warn!(error = %e, "failed to update global registry");
-        }
+    }) {
+        warn!(error = %e, "failed to update global registry");
     }
 }
 

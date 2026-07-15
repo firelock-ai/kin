@@ -95,14 +95,8 @@ pub async fn daemons(json: bool) -> Result<()> {
 
 /// Remove stale entries (paths that no longer contain .kin/).
 pub async fn clean() -> Result<()> {
-    let mut registry =
-        KinRegistry::load().map_err(|e| anyhow::anyhow!("failed to load registry: {}", e))?;
-
-    let removed = registry.clean();
-
-    registry
-        .save()
-        .map_err(|e| anyhow::anyhow!("failed to save registry: {}", e))?;
+    let removed = KinRegistry::update(KinRegistry::clean)
+        .map_err(|e| anyhow::anyhow!("failed to update registry: {}", e))?;
 
     println!("Removed {} stale entries.", removed);
     Ok(())

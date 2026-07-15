@@ -200,10 +200,9 @@ pub async fn run(url: String) -> Result<()> {
 }
 
 fn register_in_registry(repo_name: &str, path: &Path, entity_count: usize) {
-    if let Ok(mut registry) = kin_core::registry::KinRegistry::load() {
+    let _ = kin_core::registry::KinRegistry::update(|registry| {
         registry.upsert(repo_name.to_string(), path.to_path_buf(), entity_count);
-        let _ = registry.save();
-    }
+    });
 }
 
 /// Parse all source files, extract entities, store blobs, link cross-file relations.

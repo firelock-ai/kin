@@ -3141,6 +3141,7 @@ dependencies = [
  "kin-index",
  "kin-model",
  "kin-parser",
+ "libc",
  "pretty_assertions",
  "serde",
  "serde_json",
