@@ -31,6 +31,8 @@ VFS support, and easier to follow from install through graph-backed proof.
 
 - The installer now reports unsupported or unavailable optional VFS targets as
   skipped instead of falsely claiming that a shim was installed.
+- Workspace-root binding now normalizes Windows drive `file://` URIs and bare
+  drive paths, while preserving local POSIX roots and Windows UNC shares.
 
 ## [0.2.23] - 2026-07-14
 
