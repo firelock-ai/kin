@@ -16,10 +16,16 @@ struct RegisteredRepoDaemonsOutput {
 }
 
 /// Verify registry authority without reading or printing file contents.
-pub async fn authority(json: bool, fix: bool) -> Result<()> {
+pub async fn authority(json: bool, fix: bool, initialize: bool) -> Result<()> {
     let repaired = if fix {
         kin_core::registry::repair_registry_authority_permissions()
             .map_err(|e| anyhow::anyhow!("registry permission repair refused: {e}"))?
+    } else {
+        Vec::new()
+    };
+    let initialized = if initialize {
+        kin_core::registry::initialize_registry_authority()
+            .map_err(|e| anyhow::anyhow!("registry authority initialization refused: {e}"))?
     } else {
         Vec::new()
     };
@@ -29,6 +35,9 @@ pub async fn authority(json: bool, fix: bool) -> Result<()> {
     } else {
         for path in repaired {
             println!("Repaired mode to 0600: {}", path.display());
+        }
+        for path in initialized {
+            println!("Initialized private authority: {}", path.display());
         }
         println!("Local registry authority:");
         for check in &report.checks {

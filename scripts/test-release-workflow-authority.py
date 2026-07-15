@@ -48,16 +48,23 @@ def main() -> None:
     install_sh = INSTALL_SH.read_text(encoding="utf-8")
     install_ps1 = INSTALL_PS1.read_text(encoding="utf-8")
     docker_workflow = (WORKFLOWS / "docker.yml").read_text(encoding="utf-8")
-    for installer, command in (
-        (install_sh, '"$EXTRACT_DIR/kin" registry authority'),
-        (install_ps1, '@("registry", "authority")'),
-    ):
-        require(installer, command, "content-free installer registry-authority preflight")
-        require(
-            installer,
-            "No installed binary or registry authority file was replaced.",
-            "fail-closed installer registry-authority preflight",
-        )
+    require(
+        install_sh,
+        '"$EXTRACT_DIR/kin" registry authority --initialize',
+        "content-free Unix installer registry-authority initialization",
+    )
+    require(
+        install_sh,
+        "No installed binary or registry authority file was replaced.",
+        "fail-closed Unix installer registry-authority preflight",
+    )
+    require(
+        install_ps1,
+        '@("registry", "authority", "--json")',
+        "honest Windows registry-authority capability report",
+    )
+    if "KIN_REGISTRY_REPAIR" in install_ps1:
+        raise AssertionError("Windows installer must not imply Unix mode repair support")
     if "KIN_CI_BOT_TOKEN" in release or "bump_homebrew:" in release:
         raise AssertionError(
             "release.yml must not use a long-lived PAT or wait on cross-repo "

@@ -198,10 +198,10 @@ fi
 chmod +x "$EXTRACT_DIR/kin"
 if [ "${KIN_REGISTRY_REPAIR:-}" = "1" ]; then
     REGISTRY_AUTHORITY_STATUS=0
-    "$EXTRACT_DIR/kin" registry authority --fix || REGISTRY_AUTHORITY_STATUS=$?
+    "$EXTRACT_DIR/kin" registry authority --fix --initialize || REGISTRY_AUTHORITY_STATUS=$?
 else
     REGISTRY_AUTHORITY_STATUS=0
-    "$EXTRACT_DIR/kin" registry authority || REGISTRY_AUTHORITY_STATUS=$?
+    "$EXTRACT_DIR/kin" registry authority --initialize || REGISTRY_AUTHORITY_STATUS=$?
 fi
 if [ "$REGISTRY_AUTHORITY_STATUS" -ne 0 ]; then
     err "Unsafe local registry authority blocks installation."

@@ -39,8 +39,10 @@ VFS support, and easier to follow from install through graph-backed proof.
   at mode 0600, refuses permissive modes, links, special files, wrong ownership,
   hard links, unsafe parents, and reserved-path collisions without reading or
   replacing their contents, and requires explicit `kin doctor --fix` permission
-  repair. Install and update preflights enforce the same contract, while locked
-  atomic updates prevent concurrent writers from losing entries.
+  repair. The Unix installer initializes both missing authority files without
+  rewriting existing data, install and update preflights enforce the same
+  contract, and locked atomic updates prevent concurrent writers from losing
+  entries. Native Windows reports this Unix permission contract as unsupported.
 
 ## [0.2.23] - 2026-07-14
 

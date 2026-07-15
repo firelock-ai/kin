@@ -145,11 +145,20 @@ jobs:
           "$bin_dir/kin.exe" --version
           "$bin_dir/kin-daemon.exe" --version
           "$bin_dir/kin.exe" bench-meta --json > "$RUNNER_TEMP/kin-build-meta.json"
+          "$bin_dir/kin.exe" registry authority --json > "$RUNNER_TEMP/kin-registry-authority.json"
+          if "$bin_dir/kin.exe" registry authority --fix > /dev/null 2>&1; then
+            echo "::error::Windows registry authority --fix must fail as unsupported"
+            exit 1
+          fi
           EXPECTED_SHA="$(git rev-parse HEAD)" node <<'NODE'
           const childProcess = require("child_process");
           const crypto = require("crypto");
           const fs = require("fs");
           const meta = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/kin-build-meta.json`, "utf8"));
+          const authority = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/kin-registry-authority.json`, "utf8"));
+          if (authority.checks?.length !== 1 || authority.checks[0]?.state !== "unsupported") {
+            throw new Error("Windows registry authority must report exactly one unsupported capability check");
+          }
           if (meta.kin_commit !== process.env.EXPECTED_SHA || meta.kin_dirty !== false || meta.kin_source_known !== true) {
             throw new Error("Windows release build did not prove a clean, known checkout");
           }

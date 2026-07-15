@@ -774,6 +774,7 @@ jobs:
             ["repo_init", "healthy"],
             ["shell_path", "healthy"],
             ["setup_ledger", "healthy"],
+            ["registry_authority", runnerOs === "Windows" ? "unsupported" : "healthy"],
             ["vfs_projection", runnerOs === "Windows" ? "unsupported" : "healthy"],
             ["mcp_client_claude", "healthy"],
             ["mcp_client_cursor", "healthy"],

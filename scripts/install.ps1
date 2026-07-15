@@ -224,19 +224,15 @@ if (-not (Test-Path (Join-Path $TmpDir "kin-daemon.exe"))) {
     exit 1
 }
 
-# Use the downloaded binary's content-free registry-authority contract before
-# replacing an installed binary. On Windows the Unix ownership/mode portion is
-# reported as not applicable; unsafe supported states still fail closed.
-$RegistryArgs = @("registry", "authority")
-if ($env:KIN_REGISTRY_REPAIR -eq "1") {
-    $RegistryArgs += "--fix"
-}
+# Report the downloaded binary's registry-authority capability before replacing
+# an installed binary. Windows currently reports the Unix ownership/mode
+# contract as not applicable; it does not claim to repair Windows ACLs.
+$RegistryArgs = @("registry", "authority", "--json")
 $RegistryCheck = Start-Process -FilePath (Join-Path $TmpDir "kin.exe") `
     -ArgumentList $RegistryArgs -Wait -NoNewWindow -PassThru
 if ($RegistryCheck.ExitCode -ne 0) {
-    Write-Err "Unsafe local registry authority blocks installation."
-    Write-Err "No installed binary or registry authority file was replaced."
-    Write-Err "Inspect the paths above. For permission-only drift, rerun with KIN_REGISTRY_REPAIR=1."
+    Write-Err "Registry authority capability check failed."
+    Write-Err "No installed binary was replaced."
     exit 1
 }
 

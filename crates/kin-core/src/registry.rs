@@ -381,6 +381,32 @@ pub fn repair_registry_authority_permissions_at(
     #[cfg(not(unix))]
     {
         let _ = path;
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "registry permission repair is only supported on Unix",
+        )))
+    }
+}
+
+/// Create missing Unix registry authority files without replacing existing data.
+///
+/// This is intended for fresh/upgrade installers. Existing authority must
+/// already be secure (or explicitly repaired first); existing registry bytes
+/// are never rewritten merely to create a missing companion file.
+pub fn initialize_registry_authority() -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    initialize_registry_authority_at(&registry_path())
+}
+
+pub fn initialize_registry_authority_at(
+    path: &Path,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    {
+        return initialize_registry_authority_at_unix(path);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
         Ok(Vec::new())
     }
 }
@@ -438,9 +464,9 @@ impl RegistryAnchor {
             })?
             .to_os_string();
 
-        if registry_name == lock_name
-            || registry_name == legacy_tmp_name
-            || lock_name == legacy_tmp_name
+        if authority_names_collide(&registry_name, &lock_name)
+            || authority_names_collide(&registry_name, &legacy_tmp_name)
+            || authority_names_collide(&lock_name, &legacy_tmp_name)
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -476,6 +502,15 @@ impl RegistryAnchor {
             legacy_tmp_name,
         })
     }
+}
+
+#[cfg(unix)]
+fn authority_names_collide(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    // Conservatively reject ASCII case variants on every Unix platform so a
+    // case-insensitive filesystem cannot alias registry data with lock/temp.
+    a.as_bytes().eq_ignore_ascii_case(b.as_bytes())
 }
 
 #[cfg(unix)]
@@ -679,7 +714,40 @@ fn repair_registry_authority_permissions_at_unix(
 }
 
 #[cfg(unix)]
+fn initialize_registry_authority_at_unix(
+    path: &Path,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    // This preflight is deliberately before directory or lock creation: an
+    // unsafe existing registry must not cause any companion-path mutation.
+    require_registry_authority_secure_at(path)?;
+    let anchor = prepare_anchor(path)?;
+    let lock_was_absent = match stat_at(&anchor, &anchor.lock_name) {
+        Ok(_) => false,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(err) => return Err(Box::new(err)),
+    };
+    let lock_file = open_private_lock_at(&anchor)?;
+    lock_file.lock_exclusive()?;
+    verify_named_file(&anchor, &anchor.lock_name, &lock_file, "registry lock")?;
+    validate_legacy_tmp_at(&anchor)?;
+
+    let mut initialized = Vec::new();
+    if lock_was_absent {
+        initialized.push(path.with_extension("lock"));
+    }
+    if open_existing_regular_at(&anchor, &anchor.registry_name, "registry file")?.is_none() {
+        let contents = toml::to_string_pretty(&KinRegistry::default())?;
+        write_registry_atomically_at(&anchor, contents.as_bytes())?;
+        initialized.push(path.to_path_buf());
+    }
+    Ok(initialized)
+}
+
+#[cfg(unix)]
 fn load_from_unix(path: &Path) -> Result<KinRegistry, Box<dyn std::error::Error>> {
+    // Reject the complete authority snapshot before a missing lock can be
+    // created. Descriptor-anchored checks below then revalidate under lock.
+    require_registry_authority_secure_at(path)?;
     let anchor = match RegistryAnchor::open(path) {
         Ok(anchor) => anchor,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -696,6 +764,7 @@ fn load_from_unix(path: &Path) -> Result<KinRegistry, Box<dyn std::error::Error>
 
 #[cfg(unix)]
 fn save_to_unix(registry: &KinRegistry, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    require_registry_authority_secure_at(path)?;
     let contents = toml::to_string_pretty(registry)?;
     let anchor = prepare_anchor(path)?;
     let lock_file = open_private_lock_at(&anchor)?;
@@ -709,6 +778,7 @@ fn update_at_unix<T>(
     path: &Path,
     mutate: impl FnOnce(&mut KinRegistry) -> T,
 ) -> Result<T, Box<dyn std::error::Error>> {
+    require_registry_authority_secure_at(path)?;
     let anchor = prepare_anchor(path)?;
     let lock_file = open_private_lock_at(&anchor).map_err(|err| {
         std::io::Error::new(err.kind(), format!("failed to open registry lock: {err}"))
@@ -1288,6 +1358,53 @@ mod tests {
         assert_eq!(mode(&lock_path), 0o644);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_registry_never_creates_a_missing_companion_lock() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for operation in ["load", "save", "update"] {
+            let dir = tempfile::tempdir().unwrap();
+            let reg_path = dir.path().join("registry.toml");
+            let lock_path = reg_path.with_extension("lock");
+            std::fs::write(&reg_path, "repos = []\n").unwrap();
+            std::fs::set_permissions(&reg_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+            let result = match operation {
+                "load" => KinRegistry::load_from(&reg_path).map(|_| ()),
+                "save" => KinRegistry::default().save_to(&reg_path),
+                "update" => KinRegistry::update_at(&reg_path, |_| {}),
+                _ => unreachable!(),
+            };
+            assert!(result.is_err(), "{operation} unexpectedly trusted 0644");
+            assert!(!lock_path.exists(), "{operation} created a companion lock");
+            assert_eq!(mode(&reg_path), 0o644);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_initialization_creates_missing_authority_without_rewriting_existing_bytes() {
+        let fresh = tempfile::tempdir().unwrap();
+        let fresh_path = fresh.path().join("registry.toml");
+        let initialized = initialize_registry_authority_at(&fresh_path).unwrap();
+        assert_eq!(initialized.len(), 2);
+        assert_eq!(mode(&fresh_path), 0o600);
+        assert_eq!(mode(&fresh_path.with_extension("lock")), 0o600);
+        assert!(KinRegistry::load_from(&fresh_path).is_ok());
+
+        let upgrade = tempfile::tempdir().unwrap();
+        let upgrade_path = upgrade.path().join("registry.toml");
+        let existing = b"# retained comment\nrepos = []\n";
+        std::fs::write(&upgrade_path, existing).unwrap();
+        set_private_mode(&File::open(&upgrade_path).unwrap()).unwrap();
+        let initialized = initialize_registry_authority_at(&upgrade_path).unwrap();
+        assert_eq!(initialized, vec![upgrade_path.with_extension("lock")]);
+        assert_eq!(std::fs::read(&upgrade_path).unwrap(), existing);
+        assert_eq!(mode(&upgrade_path), 0o600);
+        assert_eq!(mode(&upgrade_path.with_extension("lock")), 0o600);
+    }
+
     #[test]
     fn locked_updates_preserve_concurrent_writers() {
         use std::sync::{Arc, Barrier};
@@ -1465,7 +1582,12 @@ mod tests {
     #[test]
     fn reserved_registry_path_collisions_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        for filename in ["registry.lock", "registry.tmp"] {
+        for filename in [
+            "registry.lock",
+            "registry.tmp",
+            "registry.LOCK",
+            "registry.TMP",
+        ] {
             let path = dir.path().join(filename);
             let error = KinRegistry::default().save_to(&path).unwrap_err();
             assert!(error.to_string().contains("collides"), "{error}");
@@ -1537,7 +1659,7 @@ mod tests {
                 assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
                 assert_eq!(mode(&victim), victim_mode);
                 std::fs::remove_file(&registry_path).unwrap();
-                std::fs::remove_file(&lock_path).unwrap();
+                assert!(!lock_path.exists());
 
                 std::fs::write(&registry_path, "repos = []\n").unwrap();
                 std::fs::set_permissions(&registry_path, std::fs::Permissions::from_mode(0o600))
@@ -1589,7 +1711,7 @@ mod tests {
                 assert!(started.elapsed() < std::time::Duration::from_secs(1));
                 assert!(error.to_string().contains("regular file"), "{error}");
                 std::fs::remove_file(&registry_path).unwrap();
-                std::fs::remove_file(&lock_path).unwrap();
+                assert!(!lock_path.exists());
 
                 std::fs::write(&registry_path, "repos = []\n").unwrap();
                 std::fs::set_permissions(&registry_path, std::fs::Permissions::from_mode(0o600))
@@ -1664,7 +1786,7 @@ mod tests {
                 std::fs::create_dir(&registry_path).unwrap();
                 assert!(KinRegistry::load_from(&registry_path).is_err());
                 std::fs::remove_dir(&registry_path).unwrap();
-                std::fs::remove_file(&lock_path).unwrap();
+                assert!(!lock_path.exists());
 
                 std::fs::create_dir(&lock_path).unwrap();
                 assert!(KinRegistry::default().save_to(&registry_path).is_err());

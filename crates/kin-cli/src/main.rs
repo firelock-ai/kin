@@ -1679,6 +1679,9 @@ enum RegistryAction {
         /// Explicitly repair mode bits on structurally safe authority files
         #[arg(long)]
         fix: bool,
+        /// Create missing private authority files without replacing existing data
+        #[arg(long)]
+        initialize: bool,
     },
     /// Show repo daemons registered with the central local supervisor
     Daemons {
@@ -2758,9 +2761,11 @@ fn main() -> Result<()> {
                     channel,
                 } => commands::update::run(skip_verify, channel).await,
                 Command::Registry { action } => match action {
-                    Some(RegistryAction::Authority { json, fix }) => {
-                        commands::registry::authority(json, fix).await
-                    }
+                    Some(RegistryAction::Authority {
+                        json,
+                        fix,
+                        initialize,
+                    }) => commands::registry::authority(json, fix, initialize).await,
                     Some(RegistryAction::Daemons { json }) => {
                         commands::registry::daemons(json).await
                     }
