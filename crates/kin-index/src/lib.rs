@@ -37,6 +37,7 @@ pub use linker::{
     CALL_SHAPE_PARSE_COVERAGE_FULL_V1, CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1,
     INCREMENTAL_LINKER_CHECKPOINT_VERSION, KIN_INDEX_CRATE_VERSION,
 };
+pub use linker::{is_external_import_placeholder, EXTERNAL_IMPORT_REFERENCE_RULE};
 pub use overlay::{apply_file_removal, apply_to_graph, ApplyResult};
 pub use pipeline::{
     classify_file_role, entity_semantics_changed, normalize_file_path_id, IndexPipeline,

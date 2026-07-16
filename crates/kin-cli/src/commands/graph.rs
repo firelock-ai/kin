@@ -369,9 +369,22 @@ fn build_graph_validate_response(
     graph: &kin_db::InMemoryGraph,
 ) -> Result<GraphCommandResponse> {
     let health = inspect_graph(layout, graph)?;
-    let stats = graph.graph_stats();
 
-    let entities = graph.list_all_entities()?;
+    // Validation needs the complete relation table, including corrupt edges
+    // whose source and destination are both absent. Entity-rooted traversal
+    // cannot discover those edges. A live snapshot is a coherent, graph-owned
+    // view of both tables; relation IDs are still deduplicated defensively
+    // below before endpoint accounting.
+    let snapshot = graph.to_snapshot();
+    let entities: Vec<_> = snapshot
+        .entities
+        .into_iter()
+        .map(|(_id, entity)| entity)
+        .collect();
+    let relations = snapshot
+        .relations
+        .into_iter()
+        .map(|(_id, relation)| relation);
     let mut issues = Vec::new();
 
     // Check for duplicate entities (same name + file + kind + byte position).
@@ -415,27 +428,39 @@ fn build_graph_validate_response(
         ));
     }
 
-    // Check relation integrity (src/dst entity IDs exist)
+    // Check relation integrity (src/dst entity IDs exist). Cross-repo Calls and
+    // References intentionally point at a deterministic external placeholder
+    // that is absent from this repo's entity set. The linker marks that exact
+    // contract with a non-empty import source and external_import_reference
+    // evidence; every other missing endpoint remains a validation failure.
     let entity_ids: std::collections::HashSet<_> = entities.iter().map(|e| e.id).collect();
-    let mut broken_relations = 0usize;
-    for e in &entities {
-        for rel in graph.get_all_relations_for_entity(&e.id)? {
-            if let kin_model::GraphNodeId::Entity(id) = rel.src {
-                if !entity_ids.contains(&id) {
-                    broken_relations += 1;
-                }
+    let mut seen_relation_ids = HashSet::new();
+    let mut broken_relation_endpoints = 0usize;
+    for rel in relations {
+        if !seen_relation_ids.insert(rel.id) {
+            continue;
+        }
+        if let kin_model::GraphNodeId::Entity(id) = rel.src {
+            if !entity_ids.contains(&id) {
+                broken_relation_endpoints += 1;
             }
-            if let kin_model::GraphNodeId::Entity(id) = rel.dst {
-                if !entity_ids.contains(&id) {
-                    broken_relations += 1;
-                }
+        }
+        if let kin_model::GraphNodeId::Entity(id) = rel.dst {
+            if !entity_ids.contains(&id) && !kin_index::is_external_import_placeholder(&rel) {
+                broken_relation_endpoints += 1;
             }
         }
     }
-    if broken_relations > 0 {
+    let inspected_relation_count = seen_relation_ids.len();
+    if broken_relation_endpoints > 0 {
+        let (endpoint_label, verb) = if broken_relation_endpoints == 1 {
+            ("relation endpoint", "references")
+        } else {
+            ("relation endpoints", "reference")
+        };
         issues.push(format!(
-            "{} relations reference non-existent entities",
-            broken_relations
+            "{} {} {} non-existent entities",
+            broken_relation_endpoints, endpoint_label, verb
         ));
     }
 
@@ -444,10 +469,16 @@ fn build_graph_validate_response(
     let mut lines = Vec::new();
     lines.push("=== Graph Validation ===".to_string());
     lines.push(String::new());
+    let relation_label = if inspected_relation_count == 1 {
+        "relation"
+    } else {
+        "relations"
+    };
     lines.push(format!(
-        "Checked {} entities, {} relations",
+        "Checked {} entities, {} {}",
         entities.len(),
-        stats.total_relations
+        inspected_relation_count,
+        relation_label
     ));
 
     if issues.is_empty() {
@@ -845,8 +876,9 @@ mod tests {
     use super::*;
     use kin_model::{
         ArtifactDelta, ArtifactDeltaKind, AuthorId, Branch, BranchName, ChangeStore, Entity,
-        EntityMetadata, FingerprintAlgorithm, Hash256, LanguageId, SemanticChange,
-        SemanticChangeId, SemanticFingerprint, SourceSpan, Timestamp, Visibility,
+        EntityMetadata, FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, Relation,
+        RelationId, RelationOrigin, SemanticChange, SemanticChangeId, SemanticFingerprint,
+        SourceSpan, Timestamp, Visibility,
     };
     use std::fs;
 
@@ -893,6 +925,148 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    fn test_relation(kind: RelationKind, src: EntityId, dst: EntityId) -> Relation {
+        Relation {
+            id: RelationId::new(),
+            kind,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    fn external_placeholder_relation(kind: RelationKind) -> (Entity, Relation) {
+        let mut caller = test_entity("run_task");
+        let file_id = FilePathId::new("src/app.rs");
+        caller.file_origin = Some(file_id.clone());
+        caller.span = Some(SourceSpan {
+            file: file_id,
+            start_byte: 0,
+            end_byte: 10,
+            start_line: 1,
+            start_col: 0,
+            end_line: 1,
+            end_col: 10,
+        });
+        let relations = kin_index::link_cross_file(&[kin_index::FileParseData {
+            file_path: "src/app.rs".to_string(),
+            entities: vec![caller.clone()],
+            relations: vec![kin_parser::ExtractedRelation {
+                call_shape: None,
+                kind,
+                src_name: caller.name.clone(),
+                dst_name: "InMemoryGraph".to_string(),
+                import_source: Some("kin_db".to_string()),
+            }],
+            imports: Vec::new(),
+        }]);
+        assert_eq!(relations.len(), 1);
+        let relation = relations.into_iter().next().unwrap();
+        assert!(kin_index::is_external_import_placeholder(&relation));
+        // The validator fixture has no source file; remove file metadata after
+        // the real linker has used it so this test isolates relation integrity
+        // rather than also triggering the orphaned-entity check.
+        caller.file_origin = None;
+        caller.span = None;
+        (caller, relation)
+    }
+
+    fn graph_validation_fixture() -> (
+        tempfile::TempDir,
+        kin_core::KinLayout,
+        kin_db::InMemoryGraph,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let kin_root = temp.path().join(".kin");
+        fs::create_dir_all(&kin_root).unwrap();
+        (
+            temp,
+            kin_core::KinLayout::new(kin_root),
+            kin_db::InMemoryGraph::new(),
+        )
+    }
+
+    #[test]
+    fn graph_validate_accepts_external_import_placeholder_destination() {
+        let (_temp, layout, graph) = graph_validation_fixture();
+        let (caller, relation) = external_placeholder_relation(RelationKind::Calls);
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_relation(&relation).unwrap();
+
+        let response = build_graph_validate_response(&layout, &graph).unwrap();
+
+        assert!(response.error.is_none(), "{:?}", response.lines);
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line == "✓ All checks passed."));
+    }
+
+    #[test]
+    fn graph_validate_rejects_unmarked_dangling_destination() {
+        let (_temp, layout, graph) = graph_validation_fixture();
+        let caller = test_entity("run_task");
+        graph.upsert_entity(&caller).unwrap();
+        graph
+            .upsert_relation(&test_relation(
+                RelationKind::Calls,
+                caller.id,
+                EntityId::new(),
+            ))
+            .unwrap();
+
+        let response = build_graph_validate_response(&layout, &graph).unwrap();
+
+        assert!(response.error.is_some(), "{:?}", response.lines);
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line == "✗ 1 relation endpoint references non-existent entities"));
+    }
+
+    #[test]
+    fn graph_validate_rejects_relation_with_both_endpoints_absent() {
+        let (_temp, layout, graph) = graph_validation_fixture();
+        graph
+            .upsert_relation(&test_relation(
+                RelationKind::References,
+                EntityId::new(),
+                EntityId::new(),
+            ))
+            .unwrap();
+
+        let response = build_graph_validate_response(&layout, &graph).unwrap();
+
+        assert!(response.error.is_some(), "{:?}", response.lines);
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line == "Checked 0 entities, 1 relation"));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line == "✗ 2 relation endpoints reference non-existent entities"));
+    }
+
+    #[test]
+    fn graph_validate_rejects_missing_source_on_canonical_external_placeholder() {
+        let (_temp, layout, graph) = graph_validation_fixture();
+        let (_caller, relation) = external_placeholder_relation(RelationKind::References);
+        graph.upsert_relation(&relation).unwrap();
+
+        let response = build_graph_validate_response(&layout, &graph).unwrap();
+
+        assert!(response.error.is_some(), "{:?}", response.lines);
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line == "✗ 1 relation endpoint references non-existent entities"));
     }
 
     #[test]

@@ -2529,6 +2529,63 @@ const EXTERNAL_REFERENCE_CONFIDENCE: f32 = 0.2;
 /// derived id can never collide with a locally indexed entity.
 const EXTERNAL_REFERENCE_KIND_TAG: &str = "ExternalReference";
 
+/// Linker evidence rule that identifies an intentional cross-repo placeholder
+/// destination. Consumers may accept a missing destination only when a
+/// Calls/References relation also has a non-empty import source and this rule.
+pub const EXTERNAL_IMPORT_REFERENCE_RULE: &str = "external_import_reference";
+
+/// Returns whether a relation exactly matches the linker's external-import
+/// placeholder contract. This does not inspect graph membership; callers must
+/// separately establish that the destination is absent from the local entity
+/// set. `created_in` is deliberately not part of this predicate because commit
+/// provenance may stamp it after the linker produces the relation.
+pub fn is_external_import_placeholder(relation: &Relation) -> bool {
+    if !matches!(
+        relation.kind,
+        RelationKind::Calls | RelationKind::References
+    ) || relation.origin != RelationOrigin::Inferred
+        || relation.confidence.to_bits() != EXTERNAL_REFERENCE_CONFIDENCE.to_bits()
+    {
+        return false;
+    }
+
+    let Some(src) = relation.src.as_entity() else {
+        return false;
+    };
+    let Some(dst) = relation.dst.as_entity() else {
+        return false;
+    };
+    let Some(import_source) = relation.import_source.as_deref() else {
+        return false;
+    };
+    if import_source.is_empty() || import_source != import_source.trim() {
+        return false;
+    }
+
+    let [evidence] = relation.evidence.as_slice() else {
+        return false;
+    };
+    let Some(symbol) = evidence.token.as_deref() else {
+        return false;
+    };
+    if symbol.is_empty() || symbol != symbol.trim() {
+        return false;
+    }
+    if evidence.parser_rule.as_deref() != Some(EXTERNAL_IMPORT_REFERENCE_RULE)
+        || evidence.source_path.as_deref() != Some(import_source)
+        || evidence.source_span.is_some()
+        || evidence.resolved_path.is_some()
+        || evidence.call_shape.is_some()
+        || evidence.occurrence_count == 0
+    {
+        return false;
+    }
+
+    let expected_dst =
+        EntityId::from_content(import_source, symbol, EXTERNAL_REFERENCE_KIND_TAG, 0);
+    dst == expected_dst && relation.id == stable_relation_id(&src, &expected_dst, &relation.kind)
+}
+
 /// Emit a cross-repo reference edge for a Calls/References relation that could
 /// not be resolved to any local entity but carries a parser-provided import
 /// source from a module that lives outside this repo.
@@ -2585,7 +2642,7 @@ where
         import_source: Some(import_source.to_string()),
         evidence: vec![RelationEvidence {
             token: Some(symbol.to_string()),
-            parser_rule: Some("external_import_reference".to_string()),
+            parser_rule: Some(EXTERNAL_IMPORT_REFERENCE_RULE.to_string()),
             source_path: Some(import_source.to_string()),
             ..RelationEvidence::default()
         }],
@@ -6263,6 +6320,24 @@ void f();
         assert_eq!(result[0].dst, GraphNodeId::Entity(e2.id));
     }
 
+    fn external_reference_fixture(kind: RelationKind) -> (Entity, Relation) {
+        let caller = make_entity("run_task", "src/app.rs");
+        let mut result = link_cross_file(&[FileParseData {
+            file_path: "src/app.rs".to_string(),
+            entities: vec![caller.clone()],
+            relations: vec![ExtractedRelation {
+                call_shape: None,
+                kind,
+                src_name: "run_task".to_string(),
+                dst_name: "InMemoryGraph".to_string(),
+                import_source: Some("kin_db".to_string()),
+            }],
+            imports: vec![],
+        }]);
+        assert_eq!(result.len(), 1, "one cross-repo reference edge expected");
+        (caller, result.pop().unwrap())
+    }
+
     #[test]
     fn external_reference_carries_symbol_and_import_source() {
         // A call to a symbol that lives in another repo: the target is absent
@@ -6270,36 +6345,123 @@ void f();
         // was imported from. The linker must preserve it as a cross-repo edge
         // carrying the lexical symbol (evidence.token) and the module hint
         // (import_source) — exactly what the spine resolver keys on.
-        let caller = make_entity("run_task", "src/app.rs");
-
-        let files = vec![FileParseData {
-            file_path: "src/app.rs".to_string(),
-            entities: vec![caller.clone()],
-            relations: vec![ExtractedRelation {
-                call_shape: None,
-                kind: RelationKind::Calls,
-                src_name: "run_task".to_string(),
-                dst_name: "InMemoryGraph".to_string(),
-                import_source: Some("kin_db".to_string()),
-            }],
-            imports: vec![],
-        }];
-
-        let result = link_cross_file(&files);
-        assert_eq!(result.len(), 1, "one cross-repo reference edge expected");
-        let edge = &result[0];
+        let (caller, edge) = external_reference_fixture(RelationKind::Calls);
         assert_eq!(edge.kind, RelationKind::Calls);
         assert_eq!(edge.src, GraphNodeId::Entity(caller.id));
         // The destination is an external placeholder, never a local entity.
         assert_ne!(edge.dst, GraphNodeId::Entity(caller.id));
         assert_eq!(edge.import_source.as_deref(), Some("kin_db"));
         assert_eq!(edge.origin, RelationOrigin::Inferred);
+        assert!(is_external_import_placeholder(&edge));
+        assert!(edge.evidence.iter().any(|evidence| {
+            evidence.parser_rule.as_deref() == Some(EXTERNAL_IMPORT_REFERENCE_RULE)
+        }));
         let token = edge
             .evidence
             .iter()
             .find_map(|ev| ev.token.as_deref())
             .expect("evidence token present");
         assert_eq!(token, "InMemoryGraph");
+    }
+
+    #[test]
+    fn external_import_placeholder_contract_rejects_mutations() {
+        let (_caller, canonical) = external_reference_fixture(RelationKind::Calls);
+        assert!(is_external_import_placeholder(&canonical));
+        let rejects = |relation: &Relation, mutation: &str| {
+            assert!(
+                !is_external_import_placeholder(relation),
+                "accepted non-canonical mutation: {mutation}"
+            );
+        };
+
+        let mut relation = canonical.clone();
+        relation.dst = GraphNodeId::Entity(EntityId::new());
+        rejects(&relation, "arbitrary destination");
+
+        let mut relation = canonical.clone();
+        relation.src = GraphNodeId::Entity(EntityId::new());
+        rejects(&relation, "arbitrary source");
+
+        let mut relation = canonical.clone();
+        relation.id = RelationId::new();
+        rejects(&relation, "arbitrary relation id");
+
+        let mut relation = canonical.clone();
+        relation.evidence[0].token = None;
+        rejects(&relation, "missing symbol token");
+
+        let mut relation = canonical.clone();
+        relation.evidence[0].token = Some("  ".to_string());
+        rejects(&relation, "blank symbol token");
+
+        let mut relation = canonical.clone();
+        relation.evidence[0].token = Some(" InMemoryGraph".to_string());
+        rejects(&relation, "untrimmed symbol token");
+
+        let mut relation = canonical.clone();
+        relation.evidence[0].source_path = Some("kin_model".to_string());
+        rejects(&relation, "source path mismatch");
+
+        let mut relation = canonical.clone();
+        relation.origin = RelationOrigin::Parsed;
+        rejects(&relation, "wrong origin");
+
+        let mut relation = canonical.clone();
+        relation.confidence = 0.3;
+        rejects(&relation, "wrong confidence");
+
+        let mut relation = canonical.clone();
+        relation.import_source = Some(" kin_db".to_string());
+        rejects(&relation, "untrimmed import source");
+
+        let mut relation = canonical.clone();
+        relation.import_source = None;
+        rejects(&relation, "missing import source");
+
+        let mut relation = canonical.clone();
+        relation.import_source = Some("  ".to_string());
+        rejects(&relation, "blank import source");
+
+        let mut relation = canonical.clone();
+        relation.evidence[0].source_path = None;
+        rejects(&relation, "missing evidence source path");
+
+        let mut relation = canonical.clone();
+        relation.evidence[0].parser_rule = Some("call_expression".to_string());
+        rejects(&relation, "wrong parser rule");
+
+        let mut relation = canonical.clone();
+        relation.kind = RelationKind::Imports;
+        rejects(&relation, "wrong relation kind");
+
+        let mut relation = canonical.clone();
+        relation.evidence[0].resolved_path = Some("src/lib.rs".to_string());
+        rejects(&relation, "resolved local path");
+
+        let mut relation = canonical.clone();
+        relation.evidence[0].source_span = Some(SourceSpan {
+            file: FilePathId::new("src/app.rs"),
+            start_byte: 0,
+            end_byte: 1,
+            start_line: 1,
+            start_col: 1,
+            end_line: 1,
+            end_col: 2,
+        });
+        rejects(&relation, "unexpected source span");
+
+        let mut relation = canonical.clone();
+        relation.evidence[0].call_shape = Some(kin_model::CallArgShape::default());
+        rejects(&relation, "unexpected call shape");
+
+        let mut relation = canonical.clone();
+        relation.evidence[0].occurrence_count = 0;
+        rejects(&relation, "zero evidence occurrences");
+
+        let mut relation = canonical;
+        relation.evidence.push(RelationEvidence::default());
+        rejects(&relation, "extra evidence record");
     }
 
     #[test]
@@ -6349,6 +6511,13 @@ void f();
                 ExtractedRelation {
                     call_shape: None,
                     kind: RelationKind::Calls,
+                    src_name: "run_task".to_string(),
+                    dst_name: "InMemoryGraph".to_string(),
+                    import_source: Some("kin_db".to_string()),
+                },
+                ExtractedRelation {
+                    call_shape: None,
+                    kind: RelationKind::Calls,
                     src_name: "run_again".to_string(),
                     dst_name: "InMemoryGraph".to_string(),
                     import_source: Some("kin_db".to_string()),
@@ -6363,6 +6532,13 @@ void f();
         let dst_a = first[0].dst;
         let dst_b = first[1].dst;
         assert_eq!(dst_a, dst_b, "same symbol/source → same external target id");
+        let repeated = first
+            .iter()
+            .find(|relation| relation.src == GraphNodeId::Entity(caller.id))
+            .unwrap();
+        assert_eq!(repeated.evidence.len(), 1);
+        assert_eq!(repeated.evidence[0].occurrence_count, 2);
+        assert!(is_external_import_placeholder(repeated));
 
         let second = link_cross_file(&[build(vec![caller, other])]);
         assert_eq!(second.len(), 2);
