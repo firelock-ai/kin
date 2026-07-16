@@ -79,8 +79,10 @@ jobs:
           python3 ./scripts/test-npm-automatic-release.py
           python3 ./scripts/test-verify-npm-release.py
           node --test \
+            ./scripts/read-update-build-identity.test.cjs \
             ./scripts/release-order.test.mjs \
             ./scripts/verify-npm-attestation.test.mjs
+          node --check ./scripts/read-update-build-identity.cjs
           node --check ./scripts/release-order.mjs
           node --check ./scripts/verify-npm-attestation.mjs
           bash -n ./scripts/publish-npm-release.sh

@@ -592,6 +592,40 @@ def main() -> None:
     ):
         require(build_job, policy, "cross-platform release lockfile authority")
 
+    for policy in (
+        'require("./scripts/read-update-build-identity.cjs")',
+        "record.build_identity = readUpdateBuildIdentity(file)",
+        "schema_version: 2",
+        "static build identity does not match the tagged release source",
+        "CLI and daemon graph snapshot identities disagree",
+    ):
+        require(build_job, policy, "static release build identity generation")
+
+    for policy in (
+        "manifest.schema_version === 2",
+        "const identity = readUpdateBuildIdentity(file)",
+        "record?.build_identity === undefined",
+        "static build source is not clean and known",
+        "static dependency provenance mismatch",
+    ):
+        require(publish_job, policy, "static release build identity aggregation")
+    require(
+        ci_workflow,
+        "./scripts/read-update-build-identity.test.cjs",
+        "static release build identity parser regression",
+    )
+    parser = (ROOT / "scripts" / "read-update-build-identity.cjs").read_text(
+        encoding="utf-8"
+    )
+    for policy in (
+        "MAX_COMPONENT_BYTES = 256 * 1024 * 1024",
+        "bytes.length > MAX_COMPONENT_BYTES",
+        "expected exactly one",
+        "static build identity end marker is invalid",
+        "graph snapshot version must be nonzero",
+    ):
+        require(parser, policy, "bounded static build identity parser")
+
     aggregate_start = publish_job.index(
         "      - name: Aggregate per-artifact checksums"
     )
