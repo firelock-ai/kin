@@ -376,15 +376,8 @@ fn build_graph_validate_response(
     // view of both tables; relation IDs are still deduplicated defensively
     // below before endpoint accounting.
     let snapshot = graph.to_snapshot();
-    let entities: Vec<_> = snapshot
-        .entities
-        .into_iter()
-        .map(|(_id, entity)| entity)
-        .collect();
-    let relations = snapshot
-        .relations
-        .into_iter()
-        .map(|(_id, relation)| relation);
+    let entities: Vec<_> = snapshot.entities.into_values().collect();
+    let relations = snapshot.relations.into_values();
     let mut issues = Vec::new();
 
     // Check for duplicate entities (same name + file + kind + byte position).
