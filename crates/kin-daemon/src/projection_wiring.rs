@@ -124,6 +124,8 @@ pub async fn project_after_mcp_commit(
     ),
     McpProjectionError,
 > {
+    let filesystem_reconcile_disabled = state.filesystem_reconcile_disabled();
+
     // Build a GraphOverlay with entity_mods for every entity that has a source
     // span (placement in a working-directory file). Span-less entities are new
     // graph-only nodes with no file home yet — skip them gracefully.
@@ -178,6 +180,16 @@ pub async fn project_after_mcp_commit(
             }
             if !primed.insert(span.file.clone()) {
                 continue;
+            }
+            if filesystem_reconcile_disabled {
+                return Err(McpProjectionError {
+                    file: entity.file_origin.clone(),
+                    entity_id: entity.id,
+                    reason: format!(
+                        "cold projection cannot be primed from filesystem bytes while {} is enabled; graph commit remains authoritative and no filesystem reparse was attempted",
+                        crate::loop_runner::DISABLE_FILESYSTEM_RECONCILE_ENV
+                    ),
+                });
             }
             let path = state.layout.working_dir().join(span.file.0.as_str());
             if !path.exists() {
@@ -414,7 +426,7 @@ pub async fn project_after_mcp_commit(
     // Metadata-only edits carry no body and are skipped here: their projection is
     // byte-identical, so the LKG baseline already matches and no resync is needed.
     // -----------------------------------------------------------------------
-    if !clean_overlay.entity_bodies.is_empty() {
+    if !clean_overlay.entity_bodies.is_empty() && !filesystem_reconcile_disabled {
         let body_files: HashSet<FilePathId> = clean_overlay
             .entity_mods
             .values()
@@ -444,6 +456,11 @@ pub async fn project_after_mcp_commit(
                 }
             })?;
         }
+    } else if !clean_overlay.entity_bodies.is_empty() {
+        tracing::debug!(
+            env = crate::loop_runner::DISABLE_FILESYSTEM_RECONCILE_ENV,
+            "skipping post-projection filesystem reparse; graph remains authoritative"
+        );
     }
 
     Ok((modified_files, collision_warnings, conflicts))
@@ -796,6 +813,145 @@ mod tests {
         // reconcile sees no delta — the agent's edit is NOT clobbered.
         let mut reconciler2 = state.reconciler.write().await;
         assert_no_clobber(&mut reconciler2, &state, &file_path);
+    }
+
+    #[tokio::test]
+    async fn graph_only_projection_writes_derived_file_without_reingesting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = make_test_state(dir.path());
+        let file_path = dir.path().join("src/lib.rs");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        let original = b"pub fn foo() -> i32 { 1 }\npub fn bar() -> i32 { 2 }\n";
+        std::fs::write(&file_path, original).unwrap();
+
+        let blob_store = BlobStore::new(state.layout.objects_dir()).unwrap();
+        let mut reconciler = state.reconciler.write().await;
+        let mut overlay = GraphOverlay::default();
+        reconciler
+            .reconcile_file_change(
+                &FileEvent::Changed(file_path.clone()),
+                &blob_store,
+                state.graph.as_ref(),
+                &mut overlay,
+            )
+            .unwrap();
+        let pre_commit_entity = overlay
+            .entity_adds
+            .values()
+            .find(|entity| entity.name == "foo")
+            .cloned()
+            .unwrap();
+        let span = pre_commit_entity.span.clone().unwrap();
+        apply_overlay_to_graph(state.graph.as_ref(), &mut overlay).unwrap();
+        drop(reconciler);
+
+        let mut committed = pre_commit_entity.clone();
+        committed.fingerprint.ast_hash = Hash256::from_bytes([0xee; 32]);
+        state.graph.upsert_entity(&committed).unwrap();
+        state
+            .filesystem_reconcile_disabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let new_body = String::from_utf8_lossy(&original[span.start_byte..span.end_byte])
+            .replace("{ 1 }", "{ 42 }")
+            .into_bytes();
+        let mut bodies = HashMap::new();
+        bodies.insert(pre_commit_entity.id, new_body);
+        let root_before = state.graph.compute_root_hash();
+
+        let (modified_files, warnings, conflicts) =
+            project_after_mcp_commit(&state, std::slice::from_ref(&pre_commit_entity), &bodies)
+                .await
+                .unwrap();
+
+        assert_eq!(modified_files.len(), 1);
+        assert!(warnings.is_empty());
+        assert!(conflicts.is_empty());
+        assert!(std::fs::read_to_string(&file_path)
+            .unwrap()
+            .contains("{ 42 }"));
+        assert_eq!(
+            state.graph.compute_root_hash(),
+            root_before,
+            "graph-only projection must not feed projected bytes back into graph authority"
+        );
+        assert_eq!(
+            state
+                .graph
+                .get_entity(&pre_commit_entity.id)
+                .unwrap()
+                .unwrap()
+                .fingerprint
+                .ast_hash,
+            Hash256::from_bytes([0xee; 32]),
+            "the graph-side commit fingerprint must remain authoritative"
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_only_cold_projection_fails_without_filesystem_priming() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = make_test_state(dir.path());
+        let file_path = dir.path().join("src/lib.rs");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        let original = b"pub fn foo() -> i32 { 1 }\npub fn bar() -> i32 { 2 }\n";
+        std::fs::write(&file_path, original).unwrap();
+
+        // Seed graph truth with a separate reconciler so the daemon projection
+        // remains cold and would have taken the compatibility prime path.
+        let blob_store = BlobStore::new(state.layout.objects_dir()).unwrap();
+        let mut discover = Reconciler::new(dir.path().to_path_buf());
+        let mut overlay = GraphOverlay::default();
+        discover
+            .reconcile_file_change(
+                &FileEvent::Changed(file_path.clone()),
+                &blob_store,
+                state.graph.as_ref(),
+                &mut overlay,
+            )
+            .unwrap();
+        let pre_commit_entity = overlay
+            .entity_adds
+            .values()
+            .find(|entity| entity.name == "foo")
+            .cloned()
+            .unwrap();
+        let span = pre_commit_entity.span.clone().unwrap();
+        apply_overlay_to_graph(state.graph.as_ref(), &mut overlay).unwrap();
+
+        let mut committed = pre_commit_entity.clone();
+        committed.fingerprint.ast_hash = Hash256::from_bytes([0xef; 32]);
+        state.graph.upsert_entity(&committed).unwrap();
+        state
+            .filesystem_reconcile_disabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let new_body = String::from_utf8_lossy(&original[span.start_byte..span.end_byte])
+            .replace("{ 1 }", "{ 42 }")
+            .into_bytes();
+        let mut bodies = HashMap::new();
+        bodies.insert(pre_commit_entity.id, new_body);
+        let root_before = state.graph.compute_root_hash();
+
+        let error =
+            project_after_mcp_commit(&state, std::slice::from_ref(&pre_commit_entity), &bodies)
+                .await
+                .expect_err("graph-only cold projection must fail before filesystem priming");
+
+        assert!(error.reason.contains("cold projection"), "{error}");
+        assert!(
+            error
+                .reason
+                .contains(crate::loop_runner::DISABLE_FILESYSTEM_RECONCILE_ENV),
+            "{error}"
+        );
+        assert_eq!(state.graph.compute_root_hash(), root_before);
+        assert_eq!(std::fs::read(&file_path).unwrap(), original);
+        let reconciler = state.reconciler.read().await;
+        assert!(
+            reconciler.projection().get_content(&span.file).is_none(),
+            "fail-closed graph-only projection must not prime from filesystem bytes"
+        );
     }
 
     // ------------------------------------------------------------------

@@ -158,6 +158,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "bypass the embedding-coverage correctness gate" },
     EnvVarSpec { name: "KIN_STRICT_BUILD_MATCH", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "require a strict historical build match when resolving a ref view" },
     EnvVarSpec { name: "KIN_ALLOW_MASS_DELETION", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "permit reconcile to apply mass deletions (data-destructive)" },
+    EnvVarSpec { name: "KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "disable daemon filesystem watching and reconcile/sync ingestion so remote graph authority cannot be overwritten by a checkout" },
     EnvVarSpec { name: "KIN_WRITE_VETO", kind: Kind::OneOf(&["warn", "enforce", "off"]), default: "warn", sensitivity: Sensitivity::Correctness, summary: "write-veto mode: 'warn' (default) annotates would-be vetoes into foreign-held scopes, 'enforce' rejects them with a 409, 'off' disables" },
     EnvVarSpec { name: "KIN_DAEMON_LOCATE_ONLY", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "daemon serves locate-only from a snapshot, changing what it answers" },
     EnvVarSpec { name: "KIN_DAEMON_DISABLE_LSP", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "disable LSP enrichment in the daemon, reducing relation coverage" },
@@ -949,6 +950,7 @@ mod tests {
     fn known_hazard_vars_are_present_and_correctness_relevant() {
         for name in [
             "KIN_INIT_WARM_CACHE",
+            "KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE",
             "KIN_LOCATE_MULTIHOP_TIMEOUT_MS",
             "KIN_LOCATE_RERANK_LATENCY_BUDGET_MS",
             "KIN_LOCATE_TOTAL_TIMEOUT_SECS",

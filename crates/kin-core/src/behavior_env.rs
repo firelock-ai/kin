@@ -44,6 +44,7 @@ pub const BEHAVIOR_ENV_VARS: &[&str] = &[
     "KIN_EMBED_CACHE_DIR",
     "KIN_EMBED_BACKEND",
     "KIN_INIT_WARM_CACHE",
+    "KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE",
     "KIN_DAEMON_LOCATE_ONLY",
     "KIN_COCHANGE_MAX_FAN_OUT",
     "EMBED_MAX_SEQ_LEN",
@@ -174,7 +175,11 @@ mod tests {
 
     #[test]
     fn resume_identity_knobs_are_reported() {
-        for name in ["KIN_DAEMON_LOCATE_ONLY", "KIN_COCHANGE_MAX_FAN_OUT"] {
+        for name in [
+            "KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE",
+            "KIN_DAEMON_LOCATE_ONLY",
+            "KIN_COCHANGE_MAX_FAN_OUT",
+        ] {
             assert!(
                 BEHAVIOR_ENV_VARS.contains(&name),
                 "daemon health must report resume-identity knob {name}"

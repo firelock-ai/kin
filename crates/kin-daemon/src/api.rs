@@ -98,6 +98,17 @@ pub struct HealthResponse {
     /// until restart. A true value drives `status: "attention"`.
     #[serde(default)]
     pub embed_worker_failed: bool,
+    /// Whether this daemon's storage backend lacks a durable persistence
+    /// contract for embedding/vector sidecars. This is distinct from a worker
+    /// crash: the worker is intentionally disabled and `/embed` fails closed.
+    /// A true value drives `status: "attention"`.
+    #[serde(default)]
+    pub embed_persistence_unavailable: bool,
+    /// Effective filesystem-to-graph admission policy. This reports the frozen
+    /// daemon state, including intrinsic storage-backend graph authority, not
+    /// merely whether the opt-in environment variable was present.
+    #[serde(default)]
+    pub filesystem_reconcile_disabled: bool,
     /// Monotonic authority-head marker (`.kin/kindb/head-generation`), bumped
     /// when the daemon commits a newer graph snapshot. A freshness token that
     /// lets clients and the MCP envelope express `graph_as_of` and detect stale
@@ -306,6 +317,10 @@ pub struct RepoHealthResponse {
     pub mass_deletion_blocked: bool,
     #[serde(default)]
     pub embed_worker_failed: bool,
+    #[serde(default)]
+    pub embed_persistence_unavailable: bool,
+    #[serde(default)]
+    pub filesystem_reconcile_disabled: bool,
 }
 
 /// Repo entities search response.
@@ -1347,12 +1362,14 @@ async fn health(
     let embed_worker_failed = state
         .embed_worker_failed
         .load(std::sync::atomic::Ordering::Relaxed);
+    let embed_persistence_unavailable = !state.can_persist_embed_progress_locally();
     // Surface graph-safety + derived-index health in the top-level status so an
     // operator or client polling /health sees a non-"ok" signal when the daemon
     // is withholding a suspected mass-deletion wipe OR the embedding worker has
-    // permanently stopped (embed-degraded). The graph itself stays intact and
-    // served in both cases.
-    let status = if mass_deletion_blocked || embed_worker_failed {
+    // permanently stopped (embed-degraded), OR the configured storage backend
+    // cannot durably persist vector progress. The graph itself stays intact and
+    // served in all cases.
+    let status = if mass_deletion_blocked || embed_worker_failed || embed_persistence_unavailable {
         "attention"
     } else {
         "ok"
@@ -1381,6 +1398,8 @@ async fn health(
         initialized,
         mass_deletion_blocked,
         embed_worker_failed,
+        embed_persistence_unavailable,
+        filesystem_reconcile_disabled: state.filesystem_reconcile_disabled(),
         graph_generation: DaemonState::read_generation_marker(&state.layout),
         behavior_env: kin_core::behavior_env::snapshot_from_process(),
         build: current_build_response(),
@@ -2570,6 +2589,13 @@ async fn command_commit(
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<CommandCommitRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if state.filesystem_reconcile_disabled() {
+        return Err(filesystem_ingest_disabled_response(
+            "/commands/commit",
+            &state.layout.working_dir().display().to_string(),
+        ));
+    }
+
     // Force a filesystem sync to guarantee the daemon has reconciled all offline changes
     // before building the commit deltas.
     let _ = crate::loop_runner::sync_filesystem_with_graph(&state).await;
@@ -3839,6 +3865,13 @@ async fn embed(
             ));
         }
 
+        if !state.can_persist_embed_progress_locally() {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "embedding unavailable: storage-backend graph authority has no durable vector-sidecar persistence contract; refusing a local derived-index checkpoint while graph serving remains available".to_string(),
+            ));
+        }
+
         let state_for_embed = Arc::clone(&state);
         let result = tokio::task::spawn_blocking(move || {
             let bounded_request = req.max_seconds.is_some_and(|seconds| seconds > 0);
@@ -4131,6 +4164,16 @@ async fn reconcile(
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    if state.filesystem_reconcile_disabled() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "filesystem reconcile is disabled by {}; remote graph authority cannot ingest a session checkout",
+                crate::loop_runner::DISABLE_FILESYSTEM_RECONCILE_ENV
+            ),
         ));
     }
 
@@ -5750,6 +5793,8 @@ async fn repo_health(
         embed_worker_failed: state
             .embed_worker_failed
             .load(std::sync::atomic::Ordering::Relaxed),
+        embed_persistence_unavailable: !state.can_persist_embed_progress_locally(),
+        filesystem_reconcile_disabled: state.filesystem_reconcile_disabled(),
     }))
 }
 
@@ -7145,6 +7190,26 @@ fn attach_veto_warning(
     body
 }
 
+/// Build the fail-closed response used by filesystem notification endpoints
+/// when this daemon is running with graph-only authority. Keep this check ahead
+/// of write-veto and reconciler acquisition: these routes must not even begin a
+/// filesystem-to-graph attempt in this mode.
+fn filesystem_ingest_disabled_response(endpoint: &str, path: &str) -> (StatusCode, String) {
+    (
+        StatusCode::CONFLICT,
+        json!({
+            "error": "filesystem_reconcile_disabled",
+            "endpoint": endpoint,
+            "path": path,
+            "reindexed": false,
+            "mutation_applied": false,
+            "authority": "graph",
+            "configuration": crate::loop_runner::DISABLE_FILESYSTEM_RECONCILE_ENV,
+        })
+        .to_string(),
+    )
+}
+
 /// POST /vfs/file-changed — notify the daemon that a file was modified on disk.
 ///
 /// Triggers reconciliation for the specified path. Used by the VFS write-back
@@ -7153,6 +7218,13 @@ async fn vfs_file_changed(
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<FileChangedRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if state.filesystem_reconcile_disabled() {
+        return Err(filesystem_ingest_disabled_response(
+            "/vfs/file-changed",
+            &request.path,
+        ));
+    }
+
     let file_path = std::path::PathBuf::from(&request.path);
     tracing::info!(path = %request.path, "VFS file-changed notification received");
 
@@ -7336,6 +7408,13 @@ async fn vfs_write_notify(
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<WriteNotifyRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if state.filesystem_reconcile_disabled() {
+        return Err(filesystem_ingest_disabled_response(
+            "/vfs/write-notify",
+            &request.file_path,
+        ));
+    }
+
     let file_path = std::path::PathBuf::from(&request.file_path);
     tracing::info!(path = %request.file_path, "VFS write-notify received");
 
@@ -7818,9 +7897,17 @@ async fn spine_refresh_cross_repo_edges(
 }
 
 /// POST /lsp/sweep — trigger a full LSP cold sweep of all entities.
-async fn lsp_sweep(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+async fn lsp_sweep(
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if state.filesystem_reconcile_disabled() {
+        return Err(filesystem_ingest_disabled_response(
+            "/lsp/sweep",
+            &state.layout.working_dir().display().to_string(),
+        ));
+    }
     state.queue_lsp_sweep();
-    Json(json!({"status": "sweep_queued"}))
+    Ok(Json(json!({"status": "sweep_queued"})))
 }
 
 /// Parse an entity kind string into an EntityKind enum value.
@@ -9167,8 +9254,130 @@ mod tests {
         assert_eq!(json.build.sha, kin_buildinfo::get().sha);
         assert_eq!(json.build.dirty, kin_buildinfo::get().dirty);
         assert!(!json.build.built_at.is_empty());
+        assert!(
+            !json.embed_persistence_unavailable,
+            "local SnapshotManager authority must retain embedding persistence"
+        );
+        assert!(
+            !json.filesystem_reconcile_disabled,
+            "local authority remains file-compatible unless explicitly disabled"
+        );
         // Additive freshness marker present; 0 before any snapshot is committed.
         assert_eq!(json.graph_generation, 0);
+    }
+
+    #[tokio::test]
+    async fn hosted_health_surfaces_embed_persistence_unavailable_attention() {
+        let dir = std::env::temp_dir().join(format!("kin-daemon-hosted-health-{}", Uuid::new_v4()));
+        let kin_dir = dir.join(".kin");
+        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
+        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
+        let layout = kin_core::KinLayout::new(kin_dir);
+        kin_core::manifest::KinManifest::new()
+            .save(&layout.manifest_path())
+            .unwrap();
+        let backend_dir = dir.join("backend");
+        std::fs::create_dir_all(&backend_dir).unwrap();
+        let state = Arc::new(
+            DaemonState::open_with_backend(
+                layout,
+                Box::new(kin_db::LocalFileBackend::new(&backend_dir)),
+                "hosted-health",
+                None,
+            )
+            .unwrap(),
+        );
+
+        let response = router(state)
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: HealthResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.status, "attention");
+        assert!(json.embed_persistence_unavailable);
+        assert!(
+            json.filesystem_reconcile_disabled,
+            "StorageBackend authority must intrinsically disable filesystem ingestion"
+        );
+        assert!(
+            !json.embed_worker_failed,
+            "unsupported persistence is a capability degradation, not a worker crash"
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_only_command_commit_fails_before_filesystem_delta_computation() {
+        let state = test_state();
+        state
+            .graph
+            .upsert_entity(&test_entity("remote_authority", "src/remote.rs"))
+            .unwrap();
+        state
+            .filesystem_reconcile_disabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let root_before = state.graph.compute_root_hash();
+        let snapshot_before = state.graph.to_snapshot().to_bytes().unwrap();
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "message": "must not infer emptyDir removals" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "filesystem_reconcile_disabled");
+        assert_eq!(json["endpoint"], "/commands/commit");
+        assert_eq!(json["mutation_applied"], false);
+        assert_eq!(state.graph.compute_root_hash(), root_before);
+        assert_eq!(
+            state.graph.to_snapshot().to_bytes().unwrap(),
+            snapshot_before
+        );
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::Relaxed),
+            generation_before
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_only_lsp_sweep_fails_closed() {
+        let state = test_state();
+        state
+            .filesystem_reconcile_disabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let root_before = state.graph.compute_root_hash();
+
+        let response = router(Arc::clone(&state))
+            .oneshot(Request::post("/lsp/sweep").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "filesystem_reconcile_disabled");
+        assert_eq!(json["endpoint"], "/lsp/sweep");
+        assert_eq!(json["mutation_applied"], false);
+        assert_eq!(state.graph.compute_root_hash(), root_before);
     }
 
     #[tokio::test]
@@ -14567,6 +14776,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn graph_only_write_notify_fails_before_reindex_or_graph_mutation() {
+        let state = test_state();
+        state
+            .filesystem_reconcile_disabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let (_, abs) = veto_file_target(&state, "src/graph_only.rs");
+        write_disk_file(
+            &state,
+            "src/graph_only.rs",
+            "pub fn must_not_enter_graph() -> u8 { 7 }\n",
+        );
+        let root_before = state.graph.compute_root_hash();
+        let entities_before = state.graph.entity_count();
+        let version_before = state.vfs_version.load(std::sync::atomic::Ordering::Relaxed);
+
+        let (status, json) = write_notify(
+            router(Arc::clone(&state)),
+            serde_json::json!({ "file_path": abs }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(json["error"], "filesystem_reconcile_disabled");
+        assert_eq!(json["reindexed"], false);
+        assert_eq!(state.graph.compute_root_hash(), root_before);
+        assert_eq!(state.graph.entity_count(), entities_before);
+        assert_eq!(
+            state.vfs_version.load(std::sync::atomic::Ordering::Relaxed),
+            version_before
+        );
+    }
+
+    #[tokio::test]
     async fn write_notify_enforce_foreign_hard_intent_returns_409() {
         let _lock = VETO_ENV_LOCK.lock().await;
         let state = test_state();
@@ -14782,6 +15024,39 @@ mod tests {
             .unwrap();
         let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         (status, json)
+    }
+
+    #[tokio::test]
+    async fn graph_only_file_changed_fails_before_reconcile_or_graph_mutation() {
+        let state = test_state();
+        state
+            .filesystem_reconcile_disabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let (_, abs) = veto_file_target(&state, "src/graph_only_changed.rs");
+        write_disk_file(
+            &state,
+            "src/graph_only_changed.rs",
+            "pub fn must_not_reconcile() -> u8 { 9 }\n",
+        );
+        let root_before = state.graph.compute_root_hash();
+        let entities_before = state.graph.entity_count();
+        let version_before = state.vfs_version.load(std::sync::atomic::Ordering::Relaxed);
+
+        let (status, json) = file_changed(
+            router(Arc::clone(&state)),
+            serde_json::json!({ "path": abs }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(json["error"], "filesystem_reconcile_disabled");
+        assert_eq!(json["reindexed"], false);
+        assert_eq!(state.graph.compute_root_hash(), root_before);
+        assert_eq!(state.graph.entity_count(), entities_before);
+        assert_eq!(
+            state.vfs_version.load(std::sync::atomic::Ordering::Relaxed),
+            version_before
+        );
     }
 
     #[tokio::test]

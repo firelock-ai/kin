@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (403 total, 301 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (404 total, 302 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -78,6 +78,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_DAEMON_BIND_HOST` | string | *(unset)* | operational | host/interface the daemon binds its HTTP endpoint to |
 | `KIN_DAEMON_BOOTSTRAP_EXPORT_CONCURRENCY` | usize | *(unset)* | operational | concurrency for the daemon bootstrap export |
 | `KIN_DAEMON_BOOTSTRAP_TIMEOUT_SECS` | seconds>=0 | *(unset)* | operational | timeout for daemon bootstrap-as-admin |
+| `KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE` | bool | false | correctness | disable daemon filesystem watching and reconcile/sync ingestion so remote graph authority cannot be overwritten by a checkout |
 | `KIN_DAEMON_DISABLE_LSP` | bool | false | correctness | disable LSP enrichment in the daemon, reducing relation coverage |
 | `KIN_DAEMON_EMBED_BATCH_SIZE` | usize | *(unset)* | operational | embedding batch size for daemon-side embed passes |
 | `KIN_DAEMON_EXISTING_READY_TIMEOUT_SECS` | seconds>=0 | 3 | operational | readiness wait for an already-running daemon |
