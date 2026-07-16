@@ -46,6 +46,29 @@ pub struct SnapshotManager {
     generation: AtomicU64,
 }
 
+/// One exact legacy journal artifact admitted to an authority-recovery
+/// transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalAuthorityRecoveryDeltaEvidence {
+    pub generation: Generation,
+    pub sha256: [u8; 32],
+}
+
+/// Operator-supplied evidence for recovering a pre-authority local graph.
+///
+/// Every field is validated while KinDB holds the same exclusive `graph.lock`
+/// used for the authority CAS. The caller's atomically captured graph must
+/// match every serialized domain reconstructed from the exact base snapshot
+/// and journal bytes. Authority is committed from that internal reconstruction,
+/// never from mutable caller state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalAuthorityRecoveryEvidence {
+    pub expected_head_generation: Generation,
+    pub snapshot_sha256: [u8; 32],
+    pub expected_root_hash: [u8; 32],
+    pub deltas: Vec<LocalAuthorityRecoveryDeltaEvidence>,
+}
+
 /// Owns one acquired snapshot lock and releases it explicitly on every exit path.
 ///
 /// Relying only on `File` close makes unlock timing depend on descriptor lifetime
@@ -112,6 +135,32 @@ impl Drop for PersistenceAttempt<'_> {
     }
 }
 
+struct CapturedGraphPersistence<'a> {
+    bytes: Vec<u8>,
+    root_hash: [u8; 32],
+    epoch: PersistenceEpoch,
+    serialize_elapsed: std::time::Duration,
+    attempt: PersistenceAttempt<'a>,
+}
+
+impl<'a> CapturedGraphPersistence<'a> {
+    fn capture(
+        graph: &'a InMemoryGraph,
+        precomputed_hash: Option<[u8; 32]>,
+    ) -> Result<Self, KinDbError> {
+        let started = std::time::Instant::now();
+        let precomputed_hash = precomputed_hash.or_else(|| graph.snapshot_root_hash_hint());
+        let (bytes, root_hash, epoch) = graph.begin_snapshot_persistence(precomputed_hash)?;
+        Ok(Self {
+            bytes,
+            root_hash,
+            epoch,
+            serialize_elapsed: started.elapsed(),
+            attempt: PersistenceAttempt::new(graph, epoch),
+        })
+    }
+}
+
 /// Derive the text index directory as a sibling of the snapshot file.
 /// e.g. `.kin/kindb/graph.kndb` → `.kin/kindb/text-index/`
 fn text_index_dir_for(snapshot_path: &Path) -> Option<PathBuf> {
@@ -163,6 +212,12 @@ struct LocalSnapshotAuthority {
     /// retried for cleanup; a replacement must remain on disk and fail closed.
     #[serde(default)]
     retired_deltas: Vec<LocalSnapshotDeltaIdentity>,
+    /// Exact operator evidence that created this authority, when it was
+    /// installed by the explicit recovery transaction. This remains in the
+    /// authority after the transient recovery marker is removed so a retry
+    /// cannot mistake an unrelated same-root authority for its own commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_evidence: Option<LocalAuthorityRecoveryMarker>,
 }
 
 #[cfg(test)]
@@ -268,6 +323,7 @@ fn run_local_full_save_after_authority_before_projection_hook() {
 fn run_local_full_save_after_authority_before_projection_hook() {}
 
 const LOCAL_LEGACY_REBUILD_VERSION: u32 = 1;
+const LOCAL_AUTHORITY_RECOVERY_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct LocalLegacyRebuildMarker {
@@ -275,6 +331,16 @@ struct LocalLegacyRebuildMarker {
     expected_generation: Generation,
     committed_generation: Generation,
     captured_deltas: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct LocalAuthorityRecoveryMarker {
+    version: u32,
+    expected_head_generation: Generation,
+    committed_generation: Generation,
+    snapshot_sha256: String,
+    expected_root_hash: String,
+    deltas: Vec<LocalSnapshotDeltaIdentity>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -292,6 +358,95 @@ fn local_authority_path(snapshot_path: &Path) -> PathBuf {
 
 fn local_legacy_rebuild_marker_path(snapshot_path: &Path) -> PathBuf {
     append_suffix(snapshot_path, ".legacy-journal-rebuild.json")
+}
+
+fn local_authority_recovery_marker_path(snapshot_path: &Path) -> PathBuf {
+    append_suffix(snapshot_path, ".authority-recovery.json")
+}
+
+fn authority_recovery_marker_for(
+    evidence: &LocalAuthorityRecoveryEvidence,
+) -> Result<LocalAuthorityRecoveryMarker, KinDbError> {
+    let committed_generation = evidence
+        .expected_head_generation
+        .checked_add(1)
+        .ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "local authority recovery generation exhausted at {}",
+                evidence.expected_head_generation
+            ))
+        })?;
+    let mut previous = None;
+    for delta in &evidence.deltas {
+        if delta.generation == GENERATION_INIT {
+            return Err(KinDbError::StorageError(
+                "local authority recovery delta generation 0 is reserved".to_string(),
+            ));
+        }
+        if let Some(previous) = previous {
+            if delta.generation != previous + 1 {
+                return Err(KinDbError::StorageError(format!(
+                    "local authority recovery evidence is not contiguous: generation {} follows {previous}",
+                    delta.generation
+                )));
+            }
+        }
+        previous = Some(delta.generation);
+    }
+    if let Some(last) = previous {
+        if last != evidence.expected_head_generation {
+            return Err(KinDbError::StorageError(format!(
+                "local authority recovery evidence ends at generation {last}, expected head is {}",
+                evidence.expected_head_generation
+            )));
+        }
+    }
+    Ok(LocalAuthorityRecoveryMarker {
+        version: LOCAL_AUTHORITY_RECOVERY_VERSION,
+        expected_head_generation: evidence.expected_head_generation,
+        committed_generation,
+        snapshot_sha256: hex::encode(evidence.snapshot_sha256),
+        expected_root_hash: hex::encode(evidence.expected_root_hash),
+        deltas: evidence
+            .deltas
+            .iter()
+            .map(|delta| LocalSnapshotDeltaIdentity {
+                generation: delta.generation,
+                sha256: hex::encode(delta.sha256),
+            })
+            .collect(),
+    })
+}
+
+fn read_local_authority_recovery_marker(
+    snapshot_path: &Path,
+) -> Result<Option<(LocalAuthorityRecoveryMarker, Vec<u8>)>, KinDbError> {
+    let path = local_authority_recovery_marker_path(snapshot_path);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(KinDbError::StorageError(format!(
+                "failed to inspect local authority recovery marker {}: {error}",
+                path.display()
+            )))
+        }
+    }
+    let bytes = mmap::read_regular_bounded(&path, "local authority recovery marker", 1024 * 1024)?;
+    let marker: LocalAuthorityRecoveryMarker = serde_json::from_slice(&bytes).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "invalid local authority recovery marker {}: {error}",
+            path.display()
+        ))
+    })?;
+    if marker.version != LOCAL_AUTHORITY_RECOVERY_VERSION {
+        return Err(KinDbError::StorageError(format!(
+            "unsupported local authority recovery marker version {} in {}",
+            marker.version,
+            path.display()
+        )));
+    }
+    Ok(Some((marker, bytes)))
 }
 
 fn local_file_sha256_bytes(path: &Path) -> Result<[u8; 32], KinDbError> {
@@ -907,6 +1062,14 @@ fn reject_unbound_staged_local_deltas(
 fn read_local_authority_manifest(
     snapshot_path: &Path,
 ) -> Result<Option<LocalSnapshotAuthority>, KinDbError> {
+    if read_local_authority_recovery_marker(snapshot_path)?.is_some() {
+        let marker = local_authority_recovery_marker_path(snapshot_path);
+        return Err(KinDbError::StorageError(format!(
+            "local snapshot {} has a pending evidence-bound authority recovery marker {}; retry the explicit recovery after quiescing legacy writers",
+            snapshot_path.display(),
+            marker.display()
+        )));
+    }
     let authority = read_local_authority_manifest_raw(snapshot_path)?;
     if let Some(authority) = authority.as_ref() {
         let marker = local_legacy_rebuild_marker_path(snapshot_path);
@@ -1369,6 +1532,7 @@ fn write_local_delta(
                 snapshot_sha256: hex::encode(Sha256::digest(&authoritative_snapshot_bytes)),
                 acknowledged_deltas: Vec::new(),
                 retired_deltas: Vec::new(),
+                recovery_evidence: None,
             };
             write_local_authority(snapshot_path, &authority)?;
             authority
@@ -1578,6 +1742,373 @@ fn clear_exact_captured_local_deltas(
             false
         }
     }
+}
+
+struct ValidatedAuthorityRecoveryInputs {
+    projection: LocalLegacyProjectionIdentity,
+    journal: Vec<(Generation, PathBuf, Vec<u8>)>,
+    recovered: crate::storage::GraphSnapshot,
+}
+
+fn unordered_snapshot_items_equal(
+    left: Vec<serde_json::Value>,
+    right: Vec<serde_json::Value>,
+) -> Result<bool, KinDbError> {
+    fn canonical_items(items: Vec<serde_json::Value>) -> Result<Vec<Vec<u8>>, KinDbError> {
+        let mut encoded = items
+            .into_iter()
+            .map(|item| {
+                serde_json::to_vec(&item).map_err(|error| {
+                    KinDbError::StorageError(format!(
+                        "failed to canonicalize unordered graph domain for authority recovery comparison: {error}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        encoded.sort_unstable();
+        Ok(encoded)
+    }
+
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    Ok(canonical_items(left)? == canonical_items(right)?)
+}
+
+/// Compare every serialized graph domain while treating only collections
+/// materialized from internal identity maps as order-independent. All other
+/// vectors retain their serialized order as part of the recovery contract.
+fn authority_recovery_snapshot_domains_match(
+    expected: &crate::storage::GraphSnapshot,
+    actual: &crate::storage::GraphSnapshot,
+) -> Result<bool, KinDbError> {
+    fn encode(snapshot: &crate::storage::GraphSnapshot) -> Result<serde_json::Value, KinDbError> {
+        serde_json::to_value(snapshot).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to encode graph domains for authority recovery comparison: {error}"
+            ))
+        })
+    }
+
+    fn take_array(
+        value: &mut serde_json::Value,
+        domain: &str,
+    ) -> Result<Vec<serde_json::Value>, KinDbError> {
+        value
+            .as_object_mut()
+            .and_then(|object| object.get_mut(domain))
+            .and_then(serde_json::Value::as_array_mut)
+            .map(std::mem::take)
+            .ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "graph authority recovery comparison is missing array domain {domain}"
+                ))
+            })
+    }
+
+    fn normalize_adjacency(value: &mut serde_json::Value, domain: &str) -> Result<(), KinDbError> {
+        let adjacency = value
+            .as_object_mut()
+            .and_then(|object| object.get_mut(domain))
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "graph authority recovery comparison is missing adjacency domain {domain}"
+                ))
+            })?;
+        for relation_ids in adjacency.values_mut() {
+            let relation_ids = relation_ids.as_array_mut().ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "graph authority recovery adjacency domain {domain} contains a non-array value"
+                ))
+            })?;
+            let mut keyed = relation_ids
+                .drain(..)
+                .map(|relation_id| {
+                    serde_json::to_vec(&relation_id)
+                        .map(|key| (key, relation_id))
+                        .map_err(|error| {
+                            KinDbError::StorageError(format!(
+                                "failed to canonicalize graph adjacency for authority recovery comparison: {error}"
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            keyed.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            relation_ids.extend(keyed.into_iter().map(|(_, relation_id)| relation_id));
+        }
+        Ok(())
+    }
+
+    let mut expected = encode(expected)?;
+    let mut actual = encode(actual)?;
+    for domain in ["outgoing", "incoming"] {
+        normalize_adjacency(&mut expected, domain)?;
+        normalize_adjacency(&mut actual, domain)?;
+    }
+    for domain in [
+        "review_notes",
+        "review_discussions",
+        "shallow_files",
+        "file_layouts",
+        "structured_artifacts",
+        "opaque_artifacts",
+    ] {
+        let expected_items = take_array(&mut expected, domain)?;
+        let actual_items = take_array(&mut actual, domain)?;
+        if !unordered_snapshot_items_equal(expected_items, actual_items)? {
+            return Ok(false);
+        }
+    }
+    Ok(expected == actual)
+}
+
+fn capture_and_validate_authority_recovery_inputs(
+    snapshot_path: &Path,
+    evidence: &LocalAuthorityRecoveryEvidence,
+) -> Result<ValidatedAuthorityRecoveryInputs, KinDbError> {
+    let projection = capture_local_legacy_projection(snapshot_path)?;
+    let snapshot_bytes = projection.snapshot_bytes.as_ref().ok_or_else(|| {
+        KinDbError::StorageError(format!(
+            "local authority recovery base snapshot {} is missing",
+            snapshot_path.display()
+        ))
+    })?;
+    let snapshot_sha256: [u8; 32] = Sha256::digest(snapshot_bytes).into();
+    if snapshot_sha256 != evidence.snapshot_sha256 {
+        return Err(KinDbError::StorageError(format!(
+            "local authority recovery snapshot digest mismatch for {}: expected {}, found {}",
+            snapshot_path.display(),
+            hex::encode(evidence.snapshot_sha256),
+            hex::encode(snapshot_sha256)
+        )));
+    }
+    if projection.legacy_generation != evidence.expected_head_generation {
+        return Err(KinDbError::StorageError(format!(
+            "local authority recovery generation mismatch for {}: expected {}, found {}",
+            snapshot_path.display(),
+            evidence.expected_head_generation,
+            projection.legacy_generation
+        )));
+    }
+    if projection
+        .projection_generation
+        .is_some_and(|generation| generation > evidence.expected_head_generation)
+    {
+        return Err(KinDbError::StorageError(format!(
+            "local authority recovery projection marker for {} is ahead of expected head {}",
+            snapshot_path.display(),
+            evidence.expected_head_generation
+        )));
+    }
+
+    let captured = capture_local_deltas(snapshot_path)?;
+    if captured.len() != evidence.deltas.len() {
+        return Err(KinDbError::StorageError(format!(
+            "local authority recovery journal count mismatch: expected {}, found {}",
+            evidence.deltas.len(),
+            captured.len()
+        )));
+    }
+    let mut recovered = crate::storage::GraphSnapshot::from_bytes(snapshot_bytes)?;
+    for ((generation, path, bytes), expected) in captured.iter().zip(&evidence.deltas) {
+        let sha256: [u8; 32] = Sha256::digest(bytes).into();
+        if *generation != expected.generation || sha256 != expected.sha256 {
+            return Err(KinDbError::StorageError(format!(
+                "local authority recovery journal identity mismatch at {}: expected generation {} digest {}, found generation {} digest {}",
+                path.display(),
+                expected.generation,
+                hex::encode(expected.sha256),
+                generation,
+                hex::encode(sha256)
+            )));
+        }
+        let delta = GraphSnapshotDelta::from_bytes(bytes)?;
+        let declared_generation = delta.base_generation.checked_add(1).ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "local authority recovery delta {} has an exhausted base generation",
+                path.display()
+            ))
+        })?;
+        if declared_generation != *generation {
+            return Err(KinDbError::StorageError(format!(
+                "local authority recovery delta {} declares base {}, expected {}",
+                path.display(),
+                delta.base_generation,
+                generation - 1
+            )));
+        }
+        apply_graph_delta(&mut recovered, &delta);
+    }
+    Ok(ValidatedAuthorityRecoveryInputs {
+        projection,
+        journal: captured,
+        recovered,
+    })
+}
+
+fn validate_evidence_bound_recovery_authority(
+    authority: &LocalSnapshotAuthority,
+    marker: &LocalAuthorityRecoveryMarker,
+) -> Result<(), KinDbError> {
+    if authority.version != LOCAL_SNAPSHOT_AUTHORITY_VERSION
+        || authority.snapshot_generation != marker.committed_generation
+        || authority.head_generation != marker.committed_generation
+        || authority.snapshot_root_hash != marker.expected_root_hash
+        || !authority.acknowledged_deltas.is_empty()
+        || authority.retired_deltas != marker.deltas
+        || authority.recovery_evidence.as_ref() != Some(marker)
+    {
+        return Err(KinDbError::StorageError(
+            "installed local authority does not match the exact evidence-bound recovery"
+                .to_string(),
+        ));
+    }
+    verify_local_authoritative_snapshot_payload_path_fields(authority)?;
+    Ok(())
+}
+
+fn verify_local_authoritative_snapshot_payload_path_fields(
+    authority: &LocalSnapshotAuthority,
+) -> Result<(), KinDbError> {
+    let expected_file = local_snapshot_file_name(authority.snapshot_generation);
+    if authority.snapshot_file != expected_file {
+        return Err(KinDbError::StorageError(format!(
+            "evidence-bound authority references noncanonical snapshot file {}",
+            authority.snapshot_file
+        )));
+    }
+    if authority.snapshot_sha256.len() != 64 || hex::decode(&authority.snapshot_sha256).is_err() {
+        return Err(KinDbError::StorageError(
+            "evidence-bound authority has an invalid snapshot digest".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn finish_evidence_bound_authority_recovery(
+    snapshot_path: &Path,
+    evidence: &LocalAuthorityRecoveryEvidence,
+    expected_marker: &LocalAuthorityRecoveryMarker,
+) -> Result<(crate::storage::merkle::MerkleHash, Generation), KinDbError> {
+    let authority = read_local_authority_manifest_raw(snapshot_path)?.ok_or_else(|| {
+        KinDbError::StorageError(format!(
+            "local authority recovery for {} did not install authority",
+            snapshot_path.display()
+        ))
+    })?;
+    validate_evidence_bound_recovery_authority(&authority, expected_marker)?;
+    verify_local_authoritative_snapshot_payload(snapshot_path, &authority)?;
+    validate_or_finalize_local_quarantines(snapshot_path, Some(&authority))?;
+
+    let authoritative_path =
+        local_snapshot_versions_dir(snapshot_path).join(&authority.snapshot_file);
+    let authoritative_bytes = mmap::read_regular_file(
+        &authoritative_path,
+        "evidence-bound authoritative snapshot projection source",
+    )?;
+    let current_projection = capture_local_legacy_projection(snapshot_path)?;
+    if let Some(current_bytes) = current_projection.snapshot_bytes.as_ref() {
+        let current_sha256 = hex::encode(Sha256::digest(current_bytes));
+        if current_sha256 != expected_marker.snapshot_sha256
+            && current_sha256 != authority.snapshot_sha256
+        {
+            return Err(KinDbError::StorageError(format!(
+                "legacy projection {} changed after evidence capture; preserved digest {current_sha256}",
+                snapshot_path.display()
+            )));
+        }
+    }
+    if current_projection.legacy_generation > evidence.expected_head_generation {
+        return Err(KinDbError::StorageError(format!(
+            "legacy generation marker advanced to {} after evidence capture at {}; recovery is fail-closed",
+            current_projection.legacy_generation,
+            evidence.expected_head_generation
+        )));
+    }
+    if current_projection
+        .projection_generation
+        .is_some_and(|generation| {
+            generation > evidence.expected_head_generation
+                && generation != expected_marker.committed_generation
+        })
+    {
+        return Err(KinDbError::StorageError(
+            "compatibility projection generation changed after evidence capture; recovery is fail-closed"
+                .to_string(),
+        ));
+    }
+    refresh_local_compatibility_projection(
+        snapshot_path,
+        &authoritative_bytes,
+        expected_marker.committed_generation,
+        &current_projection,
+    );
+    let projected = capture_local_legacy_projection(snapshot_path)?;
+    if projected.snapshot_bytes.as_deref() != Some(authoritative_bytes.as_slice())
+        || projected.projection_generation != Some(expected_marker.committed_generation)
+    {
+        return Err(KinDbError::StorageError(format!(
+            "authority for {} is committed, but its compatibility projection did not converge; recovery marker retained",
+            snapshot_path.display()
+        )));
+    }
+
+    let remaining = capture_local_deltas(snapshot_path)?;
+    for (generation, path, bytes) in &remaining {
+        let sha256 = hex::encode(Sha256::digest(bytes));
+        let expected = expected_marker
+            .deltas
+            .iter()
+            .find(|expected| expected.generation == *generation);
+        if expected.is_none_or(|expected| expected.sha256 != sha256) {
+            return Err(KinDbError::StorageError(format!(
+                "journal artifact {} appeared or changed after evidence capture; preserved for explicit reconciliation",
+                path.display()
+            )));
+        }
+    }
+    if !clear_exact_captured_local_deltas(snapshot_path, &remaining) {
+        return Err(KinDbError::StorageError(format!(
+            "authority for {} is committed, but exact journal cleanup is incomplete; recovery marker retained",
+            snapshot_path.display()
+        )));
+    }
+    validate_or_finalize_local_quarantines(snapshot_path, Some(&authority))?;
+    if !load_quarantined_deltas(&local_delta_dir_for(snapshot_path))?.is_empty()
+        || !local_delta_files(snapshot_path)?.is_empty()
+    {
+        return Err(KinDbError::StorageError(format!(
+            "authority for {} is committed with residual journal artifacts; recovery marker retained",
+            snapshot_path.display()
+        )));
+    }
+
+    if let Some((installed_marker, marker_bytes)) =
+        read_local_authority_recovery_marker(snapshot_path)?
+    {
+        if installed_marker != *expected_marker {
+            return Err(KinDbError::StorageError(
+                "local authority recovery marker changed before finalization".to_string(),
+            ));
+        }
+        mmap::claim_exact_path(
+            &local_authority_recovery_marker_path(snapshot_path),
+            Some(&marker_bytes),
+            "local authority recovery marker finalization",
+        )?
+        .release()?;
+        if read_local_authority_recovery_marker(snapshot_path)?.is_some() {
+            return Err(KinDbError::StorageError(
+                "a racing local authority recovery marker was preserved".to_string(),
+            ));
+        }
+    }
+    mmap::sync_parent_dir(&local_authority_path(snapshot_path))?;
+    Ok((
+        local_authority_root_hash(&authority)?,
+        authority.head_generation,
+    ))
 }
 
 fn clear_superseded_local_snapshots(
@@ -3207,6 +3738,149 @@ impl SnapshotManager {
         Self::save_graph_with_hash_and_generation(path, graph, None)
     }
 
+    /// Recover atomic local authority from exact pre-authority graph evidence.
+    ///
+    /// Unlike the older generation-only promotion APIs, this transaction takes
+    /// `graph.lock` before reading the base snapshot or journal and validates
+    /// every caller-supplied SHA-256 under that same lock. It reconstructs and
+    /// atomically captures the candidate internally, verifies every serialized
+    /// graph domain against one atomic caller capture, and commits those exact
+    /// internal bytes. A durable recovery marker is installed before authority
+    /// mutation and its evidence remains bound into the authority record. If the process stops
+    /// after the authority commit, a later call finishes the compatibility
+    /// projection and exact journal cleanup directly from the already-
+    /// authoritative snapshot bytes; it never depends on reserializing a
+    /// freshly reconstructed hash map in the same byte order.
+    pub fn recover_local_authority_with_evidence(
+        path: impl Into<PathBuf>,
+        graph: &InMemoryGraph,
+        evidence: &LocalAuthorityRecoveryEvidence,
+    ) -> Result<(crate::storage::merkle::MerkleHash, Generation), KinDbError> {
+        let path = normalize_snapshot_path(path.into());
+        // Explicit recovery must never queue behind or disturb a live graph
+        // holder. Acquire the same exclusive lock as normal writers, but fail
+        // immediately so the operator can re-establish quiescence.
+        let _lock_file = Self::acquire_lock(&path, false)?;
+        let expected_marker = authority_recovery_marker_for(evidence)?;
+        if read_local_legacy_rebuild_marker(&path)?.is_some() {
+            return Err(KinDbError::StorageError(format!(
+                "local snapshot {} has a pending generation-only legacy rebuild; finish or remove that ambiguity before evidence-bound recovery",
+                path.display()
+            )));
+        }
+
+        let installed_marker = read_local_authority_recovery_marker(&path)?;
+        if let Some((installed, _)) = installed_marker.as_ref() {
+            if installed != &expected_marker {
+                return Err(KinDbError::StorageError(format!(
+                    "local authority recovery evidence does not match durable marker {}",
+                    local_authority_recovery_marker_path(&path).display()
+                )));
+            }
+        }
+        let authority = read_local_authority_manifest_raw(&path)?;
+        if authority.is_some() {
+            let result =
+                finish_evidence_bound_authority_recovery(&path, evidence, &expected_marker)?;
+            Self::cleanup_superseded_versions_under_exclusive_lock(&path);
+            return Ok(result);
+        }
+
+        validate_or_finalize_local_quarantines(&path, None)?;
+        let validated = capture_and_validate_authority_recovery_inputs(&path, evidence)?;
+        // Build the authority candidate only from the exact graph artifacts
+        // just captured under graph.lock. The caller graph is an independently
+        // captured assertion: it must match every serialized domain, but it is
+        // never the object committed, so a caller mutation after this point
+        // cannot alter recovered authority.
+        let evidence_graph = InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
+            validated.recovered,
+            evidence.expected_root_hash,
+        );
+        let captured_graph =
+            CapturedGraphPersistence::capture(&evidence_graph, Some(evidence.expected_root_hash))?;
+        if captured_graph.root_hash != evidence.expected_root_hash {
+            return Err(KinDbError::StorageError(format!(
+                "local authority recovery evidence graph root mismatch: expected {}, found {}",
+                hex::encode(evidence.expected_root_hash),
+                hex::encode(captured_graph.root_hash)
+            )));
+        }
+        let evidence_snapshot = crate::storage::GraphSnapshot::from_bytes(&captured_graph.bytes)?;
+        let (caller_bytes, caller_root) = graph.serialize_snapshot_borrowed()?;
+        if caller_root != evidence.expected_root_hash {
+            return Err(KinDbError::StorageError(format!(
+                "local authority recovery caller graph root mismatch: expected {}, found {}",
+                hex::encode(evidence.expected_root_hash),
+                hex::encode(caller_root)
+            )));
+        }
+        let caller_snapshot = crate::storage::GraphSnapshot::from_bytes(&caller_bytes)?;
+        if !authority_recovery_snapshot_domains_match(&evidence_snapshot, &caller_snapshot)? {
+            return Err(KinDbError::StorageError(
+                "local authority recovery caller graph differs from the exact recovered snapshot in one or more serialized domains"
+                    .to_string(),
+            ));
+        }
+        let marker_bytes = serde_json::to_vec(&expected_marker).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to encode local authority recovery marker: {error}"
+            ))
+        })?;
+        if installed_marker.is_none()
+            && !mmap::publish_new_file_no_clobber(
+                &local_authority_recovery_marker_path(&path),
+                &marker_bytes,
+                "local authority recovery marker",
+            )?
+        {
+            let (raced, _) = read_local_authority_recovery_marker(&path)?.ok_or_else(|| {
+                KinDbError::StorageError(
+                    "local authority recovery marker raced but disappeared".to_string(),
+                )
+            })?;
+            if raced != expected_marker {
+                return Err(KinDbError::StorageError(format!(
+                    "a different local authority recovery claimed {}",
+                    path.display()
+                )));
+            }
+        }
+        let (durable_marker, _) =
+            read_local_authority_recovery_marker(&path)?.ok_or_else(|| {
+                KinDbError::StorageError(
+                    "local authority recovery marker was not durable before promotion".to_string(),
+                )
+            })?;
+        if durable_marker != expected_marker {
+            return Err(KinDbError::StorageError(
+                "durable local authority recovery marker changed before promotion".to_string(),
+            ));
+        }
+
+        let (root, generation) = Self::save_captured_graph_with_generation_under_exclusive_lock(
+            &path,
+            &evidence_graph,
+            captured_graph,
+            Some(evidence.expected_head_generation),
+            Some(&validated.journal),
+            Some(&validated.projection),
+            Some(&expected_marker),
+        )?;
+        if root != evidence.expected_root_hash || generation != expected_marker.committed_generation
+        {
+            return Err(KinDbError::StorageError(format!(
+                "evidence-bound authority promotion returned generation {generation}, root {}; expected generation {}, root {}",
+                hex::encode(root),
+                expected_marker.committed_generation,
+                expected_marker.expected_root_hash
+            )));
+        }
+        let result = finish_evidence_bound_authority_recovery(&path, evidence, &expected_marker)?;
+        Self::cleanup_superseded_versions_under_exclusive_lock(&path);
+        Ok(result)
+    }
+
     /// Persist a full snapshot only if `expected_generation` is still the
     /// acknowledged local head. The OS lock covers the authority read through
     /// commit, so this is the one-shot static CAS entry point for callers that
@@ -3268,10 +3942,30 @@ impl SnapshotManager {
         captured_legacy_journal: Option<&[(Generation, PathBuf, Vec<u8>)]>,
         expected_legacy_projection: Option<&LocalLegacyProjectionIdentity>,
     ) -> Result<(crate::storage::merkle::MerkleHash, Generation), KinDbError> {
+        let captured = CapturedGraphPersistence::capture(graph, precomputed_hash)?;
+        Self::save_captured_graph_with_generation_under_exclusive_lock(
+            path,
+            graph,
+            captured,
+            expected_generation,
+            captured_legacy_journal,
+            expected_legacy_projection,
+            None,
+        )
+    }
+
+    fn save_captured_graph_with_generation_under_exclusive_lock(
+        path: &Path,
+        graph: &InMemoryGraph,
+        captured_graph: CapturedGraphPersistence<'_>,
+        expected_generation: Option<Generation>,
+        captured_legacy_journal: Option<&[(Generation, PathBuf, Vec<u8>)]>,
+        expected_legacy_projection: Option<&LocalLegacyProjectionIdentity>,
+        recovery_evidence: Option<&LocalAuthorityRecoveryMarker>,
+    ) -> Result<(crate::storage::merkle::MerkleHash, Generation), KinDbError> {
         let _span = tracing::info_span!(
-            "kindb.snapshot.save_graph_with_hash",
-            path = %path.display(),
-            precomputed_hash = precomputed_hash.is_some()
+            "kindb.snapshot.save_captured_graph",
+            path = %path.display()
         )
         .entered();
 
@@ -3336,11 +4030,13 @@ impl SnapshotManager {
         };
 
         let t0 = std::time::Instant::now();
-        let precomputed_hash = precomputed_hash.or_else(|| graph.snapshot_root_hash_hint());
-        let (bytes, graph_root_hash, persistence_epoch) =
-            graph.begin_snapshot_persistence(precomputed_hash)?;
-        let persistence_attempt = PersistenceAttempt::new(graph, persistence_epoch);
-        let t_ser = t0.elapsed();
+        let CapturedGraphPersistence {
+            bytes,
+            root_hash: graph_root_hash,
+            epoch: persistence_epoch,
+            serialize_elapsed: t_ser,
+            attempt: persistence_attempt,
+        } = captured_graph;
         let snapshot_sha256 = hex::encode(Sha256::digest(&bytes));
 
         if let Some(expected) = expected_generation {
@@ -3478,6 +4174,7 @@ impl SnapshotManager {
                     sha256: hex::encode(Sha256::digest(bytes)),
                 })
                 .collect(),
+            recovery_evidence: recovery_evidence.cloned(),
         };
         write_local_authority(path, &authority)?;
         persistence_attempt.complete();
@@ -4033,6 +4730,26 @@ mod tests {
         entity
     }
 
+    fn recovery_evidence(
+        snapshot_bytes: &[u8],
+        expected_head_generation: Generation,
+        expected_root_hash: [u8; 32],
+        deltas: &[(Generation, Vec<u8>)],
+    ) -> LocalAuthorityRecoveryEvidence {
+        LocalAuthorityRecoveryEvidence {
+            expected_head_generation,
+            snapshot_sha256: Sha256::digest(snapshot_bytes).into(),
+            expected_root_hash,
+            deltas: deltas
+                .iter()
+                .map(|(generation, bytes)| LocalAuthorityRecoveryDeltaEvidence {
+                    generation: *generation,
+                    sha256: Sha256::digest(bytes).into(),
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn save_and_reload() {
         let dir = TempDir::new().unwrap();
@@ -4304,6 +5021,420 @@ mod tests {
     }
 
     #[test]
+    fn evidence_bound_recovery_promotes_exact_snapshot_without_a_journal() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot
+            .file_hashes
+            .insert("snapshot-only.rs".to_string(), [9; 32]);
+        let snapshot_bytes = snapshot.to_bytes().unwrap();
+        std::fs::write(&path, &snapshot_bytes).unwrap();
+        let graph = InMemoryGraph::from_snapshot(snapshot);
+        let root = graph.recompute_root_hash();
+        let evidence = recovery_evidence(&snapshot_bytes, GENERATION_INIT, root, &[]);
+
+        let (committed_root, generation) =
+            SnapshotManager::recover_local_authority_with_evidence(&path, &graph, &evidence)
+                .unwrap();
+
+        assert_eq!(committed_root, root);
+        assert_eq!(generation, 1);
+        assert!(local_authority_path(&path).is_file());
+        assert!(!local_authority_recovery_marker_path(&path).exists());
+        let reopened = SnapshotManager::open_without_text_index(&path).unwrap();
+        assert_eq!(reopened.generation(), 1);
+        assert_eq!(
+            reopened.graph().get_file_hash("snapshot-only.rs"),
+            Some([9; 32])
+        );
+        drop(reopened);
+        let (retry_root, retry_generation) =
+            SnapshotManager::recover_local_authority_with_evidence(&path, &graph, &evidence)
+                .unwrap();
+        assert_eq!(retry_root, root);
+        assert_eq!(retry_generation, generation);
+        assert!(!local_versioned_snapshot_path(&path, generation + 1).exists());
+        let authority = read_local_authority_manifest_raw(&path).unwrap().unwrap();
+        assert_eq!(
+            authority.recovery_evidence,
+            Some(authority_recovery_marker_for(&evidence).unwrap())
+        );
+    }
+
+    #[test]
+    fn evidence_bound_recovery_promotes_exact_contiguous_journal() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let mut base = GraphSnapshot::empty();
+        base.file_hashes.insert("base.rs".to_string(), [2; 32]);
+        let snapshot_bytes = base.to_bytes().unwrap();
+        std::fs::write(&path, &snapshot_bytes).unwrap();
+        std::fs::write(dir.path().join("generation"), b"6").unwrap();
+        std::fs::create_dir_all(local_delta_dir_for(&path)).unwrap();
+
+        let mut previous = base;
+        let mut deltas = Vec::new();
+        for generation in 3..=6 {
+            let mut next = previous.clone();
+            next.file_hashes
+                .insert(format!("journal-{generation}.rs"), [generation as u8; 32]);
+            let delta = crate::storage::compute_graph_delta(&previous, &next, generation - 1);
+            let bytes = delta.to_bytes().unwrap();
+            std::fs::write(local_delta_path(&path, generation), &bytes).unwrap();
+            deltas.push((generation, bytes));
+            previous = next;
+        }
+        let graph = InMemoryGraph::from_snapshot(previous);
+        let root = graph.recompute_root_hash();
+        let evidence = recovery_evidence(&snapshot_bytes, 6, root, &deltas);
+
+        let (committed_root, generation) =
+            SnapshotManager::recover_local_authority_with_evidence(&path, &graph, &evidence)
+                .unwrap();
+
+        assert_eq!(committed_root, root);
+        assert_eq!(generation, 7);
+        assert!(local_delta_files(&path).unwrap().is_empty());
+        assert!(!local_authority_recovery_marker_path(&path).exists());
+        let authority = read_local_authority_manifest_raw(&path).unwrap().unwrap();
+        assert_eq!(authority.retired_deltas.len(), 4);
+        let reopened = SnapshotManager::open_without_text_index(&path).unwrap();
+        assert_eq!(reopened.generation(), 7);
+        assert_eq!(
+            reopened.graph().get_file_hash("journal-6.rs"),
+            Some([6; 32])
+        );
+    }
+
+    #[test]
+    fn evidence_bound_recovery_rejects_stale_evidence_before_authority_mutation() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.file_hashes.insert("truth.rs".to_string(), [3; 32]);
+        let snapshot_bytes = snapshot.to_bytes().unwrap();
+        std::fs::write(&path, &snapshot_bytes).unwrap();
+        let graph = InMemoryGraph::from_snapshot(snapshot);
+        let root = graph.recompute_root_hash();
+        let mut evidence = recovery_evidence(&snapshot_bytes, GENERATION_INIT, root, &[]);
+        evidence.snapshot_sha256 = [0; 32];
+
+        let error =
+            SnapshotManager::recover_local_authority_with_evidence(&path, &graph, &evidence)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("snapshot digest mismatch"));
+        assert!(!local_authority_path(&path).exists());
+        assert!(!local_authority_recovery_marker_path(&path).exists());
+        assert_eq!(std::fs::read(&path).unwrap(), snapshot_bytes);
+    }
+
+    #[test]
+    fn evidence_bound_recovery_rejects_non_merkle_caller_graph_drift() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.file_hashes.insert("truth.rs".to_string(), [3; 32]);
+        let snapshot_bytes = snapshot.to_bytes().unwrap();
+        std::fs::write(&path, &snapshot_bytes).unwrap();
+        let caller = InMemoryGraph::from_snapshot(snapshot.clone());
+        let root = compute_graph_root_hash(&snapshot);
+        caller.set_file_hash("truth.rs", [4; 32]);
+        assert_eq!(
+            caller.recompute_root_hash(),
+            root,
+            "file hashes are intentionally outside the current Merkle root"
+        );
+        let evidence = recovery_evidence(&snapshot_bytes, GENERATION_INIT, root, &[]);
+
+        let error =
+            SnapshotManager::recover_local_authority_with_evidence(&path, &caller, &evidence)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("serialized domains"));
+        assert!(!local_authority_path(&path).exists());
+        assert!(!local_authority_recovery_marker_path(&path).exists());
+        assert_eq!(std::fs::read(&path).unwrap(), snapshot_bytes);
+    }
+
+    #[test]
+    fn evidence_bound_recovery_commits_captured_evidence_not_a_racing_caller() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot
+            .file_hashes
+            .insert("captured.rs".to_string(), [5; 32]);
+        let snapshot_bytes = snapshot.to_bytes().unwrap();
+        std::fs::write(&path, &snapshot_bytes).unwrap();
+        let caller = Arc::new(InMemoryGraph::from_snapshot(snapshot.clone()));
+        let root = caller.recompute_root_hash();
+        let evidence = recovery_evidence(&snapshot_bytes, GENERATION_INIT, root, &[]);
+        let racing_caller = Arc::clone(&caller);
+        set_local_full_save_before_authority_commit_hook(move || {
+            racing_caller.set_file_hash("raced.rs", [8; 32]);
+        });
+
+        SnapshotManager::recover_local_authority_with_evidence(&path, &caller, &evidence).unwrap();
+
+        assert_eq!(caller.get_file_hash("raced.rs"), Some([8; 32]));
+        let reopened = SnapshotManager::open_without_text_index(&path).unwrap();
+        assert_eq!(reopened.graph().get_file_hash("captured.rs"), Some([5; 32]));
+        assert_eq!(reopened.graph().get_file_hash("raced.rs"), None);
+    }
+
+    #[test]
+    fn evidence_bound_recovery_normalizes_rebuilt_adjacency_order() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let source = test_entity("adjacency_source");
+        let target = test_entity("adjacency_target");
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.entities.insert(source.id, source.clone());
+        snapshot.entities.insert(target.id, target.clone());
+        for _ in 0..8 {
+            let relation = Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Calls,
+                src: GraphNodeId::Entity(source.id),
+                dst: GraphNodeId::Entity(target.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Inferred,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            };
+            snapshot.relations.insert(relation.id, relation);
+        }
+        // Empty persisted adjacency is stale for this relation set, forcing
+        // each reconstruction to rebuild vectors from an independently seeded
+        // relation map.
+        snapshot.outgoing.clear();
+        snapshot.incoming.clear();
+        let snapshot_bytes = snapshot.to_bytes().unwrap();
+        std::fs::write(&path, &snapshot_bytes).unwrap();
+        let caller = InMemoryGraph::from_snapshot(snapshot.clone());
+        let other = InMemoryGraph::from_snapshot(snapshot.clone());
+        let caller_snapshot =
+            GraphSnapshot::from_bytes(&caller.serialize_snapshot_borrowed().unwrap().0).unwrap();
+        let mut other_snapshot =
+            GraphSnapshot::from_bytes(&other.serialize_snapshot_borrowed().unwrap().0).unwrap();
+        assert!(
+            authority_recovery_snapshot_domains_match(&caller_snapshot, &other_snapshot).unwrap()
+        );
+        for relation_ids in other_snapshot.outgoing.values_mut() {
+            relation_ids.reverse();
+        }
+        for relation_ids in other_snapshot.incoming.values_mut() {
+            relation_ids.reverse();
+        }
+        assert!(
+            authority_recovery_snapshot_domains_match(&caller_snapshot, &other_snapshot).unwrap()
+        );
+
+        let root = caller.recompute_root_hash();
+        let evidence = recovery_evidence(&snapshot_bytes, GENERATION_INIT, root, &[]);
+        SnapshotManager::recover_local_authority_with_evidence(&path, &caller, &evidence).unwrap();
+        assert!(local_authority_path(&path).is_file());
+    }
+
+    #[test]
+    fn evidence_bound_recovery_rejects_unattributed_same_root_authority() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let snapshot = GraphSnapshot::empty();
+        let snapshot_bytes = snapshot.to_bytes().unwrap();
+        std::fs::write(&path, &snapshot_bytes).unwrap();
+        let graph = InMemoryGraph::from_snapshot(snapshot);
+        let root = graph.recompute_root_hash();
+        let evidence = recovery_evidence(&snapshot_bytes, GENERATION_INIT, root, &[]);
+        let (_, generation) = SnapshotManager::save_graph_with_generation(&path, &graph).unwrap();
+        assert_eq!(generation, 1);
+        let unrelated = read_local_authority_manifest_raw(&path).unwrap().unwrap();
+        assert!(unrelated.recovery_evidence.is_none());
+
+        let error =
+            SnapshotManager::recover_local_authority_with_evidence(&path, &graph, &evidence)
+                .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("does not match the exact evidence-bound recovery"));
+        assert_eq!(
+            read_local_authority_manifest_raw(&path).unwrap().unwrap(),
+            unrelated
+        );
+    }
+
+    #[test]
+    fn evidence_bound_recovery_refuses_a_live_graph_lock_without_writing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let snapshot = GraphSnapshot::empty();
+        let snapshot_bytes = snapshot.to_bytes().unwrap();
+        std::fs::write(&path, &snapshot_bytes).unwrap();
+        let graph = InMemoryGraph::from_snapshot(snapshot);
+        let evidence = recovery_evidence(
+            &snapshot_bytes,
+            GENERATION_INIT,
+            graph.recompute_root_hash(),
+            &[],
+        );
+        let _holder = SnapshotManager::acquire_lock(&path, false).unwrap();
+
+        let error =
+            SnapshotManager::recover_local_authority_with_evidence(&path, &graph, &evidence)
+                .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("failed to acquire exclusive lock"));
+        assert!(!local_authority_path(&path).exists());
+        assert!(!local_authority_recovery_marker_path(&path).exists());
+    }
+
+    #[test]
+    fn evidence_bound_recovery_detects_under_lock_journal_replacement_before_commit() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let base = GraphSnapshot::empty();
+        let snapshot_bytes = base.to_bytes().unwrap();
+        std::fs::write(&path, &snapshot_bytes).unwrap();
+        std::fs::write(dir.path().join("generation"), b"1").unwrap();
+        std::fs::create_dir_all(local_delta_dir_for(&path)).unwrap();
+        let expected_delta = GraphSnapshotDelta::empty(0).to_bytes().unwrap();
+        std::fs::write(local_delta_path(&path, 1), &expected_delta).unwrap();
+        let graph = InMemoryGraph::from_snapshot(base);
+        let root = graph.recompute_root_hash();
+        let evidence = recovery_evidence(&snapshot_bytes, 1, root, &[(1, expected_delta.clone())]);
+        let replacement = {
+            let mut delta = GraphSnapshotDelta::empty(0);
+            delta
+                .file_hashes
+                .added
+                .push(("raced.rs".to_string(), [7; 32]));
+            delta.to_bytes().unwrap()
+        };
+        let delta_path = local_delta_path(&path, 1);
+        let raced_bytes = replacement.clone();
+        set_local_full_save_before_authority_commit_hook(move || {
+            std::fs::write(&delta_path, &raced_bytes).unwrap();
+        });
+
+        let error =
+            SnapshotManager::recover_local_authority_with_evidence(&path, &graph, &evidence)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("changed while promoting"));
+        assert!(!local_authority_path(&path).exists());
+        assert_eq!(
+            std::fs::read(local_delta_path(&path, 1)).unwrap(),
+            replacement
+        );
+        assert!(local_authority_recovery_marker_path(&path).exists());
+    }
+
+    #[test]
+    fn evidence_bound_recovery_resumes_from_authoritative_bytes_after_process_crash() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let mut snapshot = GraphSnapshot::empty();
+        let graph = InMemoryGraph::new();
+        for index in 0..64 {
+            let entity = test_entity(&format!("resume_entity_{index}"));
+            graph.upsert_entity(&entity).unwrap();
+            snapshot.entities.insert(entity.id, entity);
+        }
+        snapshot
+            .file_hashes
+            .insert("resume.rs".to_string(), [11; 32]);
+        graph.set_file_hash("resume.rs", [11; 32]);
+        let snapshot_bytes = snapshot.to_bytes().unwrap();
+        std::fs::write(&path, &snapshot_bytes).unwrap();
+        let root = graph.recompute_root_hash();
+        assert_eq!(compute_graph_root_hash(&snapshot), root);
+        let evidence = recovery_evidence(&snapshot_bytes, GENERATION_INIT, root, &[]);
+        set_local_full_save_after_authority_before_projection_hook(|| {
+            panic!("simulated process stop after authority commit")
+        });
+
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            SnapshotManager::recover_local_authority_with_evidence(&path, &graph, &evidence)
+                .unwrap();
+        }));
+        assert!(crashed.is_err());
+        assert!(local_authority_path(&path).exists());
+        assert!(local_authority_recovery_marker_path(&path).exists());
+        assert_eq!(std::fs::read(&path).unwrap(), snapshot_bytes);
+        let gated = match SnapshotManager::open_without_text_index(&path) {
+            Ok(_) => panic!("normal opens must fail while explicit recovery is pending"),
+            Err(error) => error,
+        };
+        assert!(gated
+            .to_string()
+            .contains("evidence-bound authority recovery"));
+
+        // A real retry reconstructs a fresh randomly seeded hash map. Recovery
+        // must project the already-authoritative bytes rather than requiring
+        // this graph to serialize byte-identically to the previous process.
+        let authority = read_local_authority_manifest_raw(&path).unwrap().unwrap();
+        let authoritative_path = local_snapshot_versions_dir(&path).join(&authority.snapshot_file);
+        let reloaded = InMemoryGraph::from_snapshot(
+            GraphSnapshot::from_bytes(&std::fs::read(&authoritative_path).unwrap()).unwrap(),
+        );
+        let (retried_root, generation) =
+            SnapshotManager::recover_local_authority_with_evidence(&path, &reloaded, &evidence)
+                .unwrap();
+
+        assert_eq!(retried_root, root);
+        assert_eq!(generation, 1);
+        assert!(!local_authority_recovery_marker_path(&path).exists());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            std::fs::read(authoritative_path).unwrap()
+        );
+    }
+
+    #[test]
+    fn evidence_bound_recovery_preserves_journal_that_appears_after_authority_commit() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let base = GraphSnapshot::empty();
+        let snapshot_bytes = base.to_bytes().unwrap();
+        std::fs::write(&path, &snapshot_bytes).unwrap();
+        std::fs::write(dir.path().join("generation"), b"1").unwrap();
+        std::fs::create_dir_all(local_delta_dir_for(&path)).unwrap();
+        let expected_delta = GraphSnapshotDelta::empty(0).to_bytes().unwrap();
+        std::fs::write(local_delta_path(&path, 1), &expected_delta).unwrap();
+        let graph = InMemoryGraph::from_snapshot(base);
+        let root = graph.recompute_root_hash();
+        let evidence = recovery_evidence(&snapshot_bytes, 1, root, &[(1, expected_delta.clone())]);
+        let unexpected_delta = GraphSnapshotDelta::empty(1).to_bytes().unwrap();
+        let unexpected_path = local_delta_path(&path, 2);
+        let raced_bytes = unexpected_delta.clone();
+        set_local_full_save_after_authority_before_projection_hook(move || {
+            std::fs::write(&unexpected_path, &raced_bytes).unwrap();
+        });
+
+        let error =
+            SnapshotManager::recover_local_authority_with_evidence(&path, &graph, &evidence)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("appeared or changed"));
+        assert!(local_authority_path(&path).exists());
+        assert!(local_authority_recovery_marker_path(&path).exists());
+        assert_eq!(
+            std::fs::read(local_delta_path(&path, 1)).unwrap(),
+            expected_delta
+        );
+        assert_eq!(
+            std::fs::read(local_delta_path(&path, 2)).unwrap(),
+            unexpected_delta
+        );
+    }
+
+    #[test]
     fn explicit_snapshot_manager_legacy_rebuild_promotes_caller_reconciled_graph() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");
@@ -4453,6 +5584,7 @@ mod tests {
             snapshot_sha256: hex::encode(Sha256::digest(&snapshot_bytes)),
             acknowledged_deltas: Vec::new(),
             retired_deltas: Vec::new(),
+            recovery_evidence: None,
         };
         mmap::fail_parent_sync_after(2);
 
@@ -5410,6 +6542,7 @@ mod tests {
                 snapshot_sha256: hex::encode(Sha256::digest(&captured_bytes)),
                 acknowledged_deltas: Vec::new(),
                 retired_deltas: Vec::new(),
+                recovery_evidence: None,
             },
         )
         .unwrap();
