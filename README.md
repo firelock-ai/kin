@@ -1,6 +1,6 @@
 # Kin
 
-> **AI writes code. Kin proves it safe to ship.**
+> **AI writes code. Kin proves the change.**
 >
 > The **system of record for AI-written software**.
 
