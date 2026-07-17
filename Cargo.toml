@@ -102,7 +102,7 @@ console = "0.15"
 # Archive generation
 tar = "0.4"
 flate2 = "1"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 # Parallelism
 rayon = "1"
