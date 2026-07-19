@@ -435,8 +435,10 @@ fn detect_external_tool(command: &str) -> Option<ExternalToolKind> {
 mod tests {
     use super::{
         close_exec_session, detect_external_tool, plan_materialization_scope,
-        resolve_materialization_scope, run_command_in_session, session_env, ExternalToolKind,
+        resolve_materialization_scope, session_env, ExternalToolKind,
     };
+    #[cfg(unix)]
+    use super::run_command_in_session;
     use kin_core::{ExternalToolExecutionPolicy, KinConfig, WorldPreset};
     use kin_model::{
         Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
@@ -481,6 +483,7 @@ mod tests {
 
     /// Write an executable stub script into `bin_dir` and return an env set
     /// that resolves it first on PATH.
+    #[cfg(unix)]
     fn stub_tool(bin_dir: &Path, name: &str, script_body: &str) -> Vec<(String, String)> {
         std::fs::create_dir_all(bin_dir).unwrap();
         let path = bin_dir.join(name);

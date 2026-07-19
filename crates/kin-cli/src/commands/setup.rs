@@ -1962,7 +1962,7 @@ pub(crate) fn config_transaction_acquire_count() -> usize {
     CONFIG_TRANSACTION_ACQUIRE_COUNT.with(std::cell::Cell::get)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn inject_config_directory_sync_failure_under(root: Option<&Path>) {
     FAIL_CONFIG_DIRECTORY_SYNC_UNDER.with(|configured| {
         *configured.borrow_mut() =
@@ -8802,7 +8802,7 @@ pub(crate) fn remerge_existing_mcp_configs_detailed() -> McpRemergeOutcome {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(all(test, unix))]
 pub(crate) fn mcp_repair_targets_ledger_verified(targets: &[McpRepairTarget]) -> Result<bool> {
     let mut targets = normalize_mcp_repair_targets(targets.iter().cloned())?;
     if targets.is_empty() {
@@ -10621,15 +10621,20 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let output = Command::new(std::env::current_exe().unwrap())
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
             .args([
                 "--exact",
                 "commands::setup::tests::private_directory_chain_repairs_only_new_entries_under_restrictive_umask",
                 "--nocapture",
             ])
-            .env(WORKER_PATH, dir.path())
-            .output()
-            .unwrap();
+            .env(WORKER_PATH, dir.path());
+        let output = crate::commands::test_subprocess::output_with_timeout(
+            &mut command,
+            "restrictive private-directory chain worker",
+            crate::commands::test_subprocess::DEFAULT_TEST_SUBPROCESS_TIMEOUT,
+        )
+        .unwrap();
         assert!(
             output.status.success(),
             "restrictive-umask worker output: {}{}",
@@ -10690,16 +10695,21 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let output = Command::new(std::env::current_exe().unwrap())
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
             .args([
                 "--exact",
                 "commands::setup::tests::restrictive_umask_keeps_transaction_root_vault_and_guard_private",
                 "--nocapture",
             ])
             .env(WORKER_ROOT, dir.path())
-            .env("TMPDIR", dir.path())
-            .output()
-            .unwrap();
+            .env("TMPDIR", dir.path());
+        let output = crate::commands::test_subprocess::output_with_timeout(
+            &mut command,
+            "restrictive transaction-directory worker",
+            crate::commands::test_subprocess::DEFAULT_TEST_SUBPROCESS_TIMEOUT,
+        )
+        .unwrap();
         assert!(
             output.status.success(),
             "restrictive transaction worker output: {}{}",

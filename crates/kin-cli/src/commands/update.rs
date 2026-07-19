@@ -1446,7 +1446,7 @@ fn attempt_pending_mcp_repair(lock: &InstallRootLock) -> Result<bool> {
     Ok(true)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(all(test, unix))]
 pub(crate) fn enqueue_mcp_repair_targets(
     targets: &[crate::commands::setup::McpRepairTarget],
 ) -> Result<bool> {
@@ -3582,30 +3582,25 @@ impl ExecutingProcessAuthority {
         anyhow::bail!("durable executing-process identity is unsupported on this platform")
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn capture_test_file(path: &Path) -> Result<Self> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt as _;
-            let file = File::open(path)
-                .with_context(|| format!("failed to open test executable {}", path.display()))?;
-            let metadata = file.metadata()?;
-            let identity = file_identity_from_open_file(&file, "test executing Kin image")?;
-            return Ok(Self {
-                path: path.to_path_buf(),
-                generation: ManagedComponentGeneration {
-                    identity,
-                    binding: PlatformObjectIdentity {
-                        namespace: metadata.dev(),
-                        file: metadata.ino(),
-                    },
+        use std::os::unix::fs::MetadataExt as _;
+        let file = File::open(path)
+            .with_context(|| format!("failed to open test executable {}", path.display()))?;
+        let metadata = file.metadata()?;
+        let identity = file_identity_from_open_file(&file, "test executing Kin image")?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            generation: ManagedComponentGeneration {
+                identity,
+                binding: PlatformObjectIdentity {
+                    namespace: metadata.dev(),
+                    file: metadata.ino(),
                 },
-                build: EmbeddedBuildIdentity::current()?,
-                file,
-            });
-        }
-        #[cfg(not(unix))]
-        anyhow::bail!("test executing-file capture is only implemented on Unix")
+            },
+            build: EmbeddedBuildIdentity::current()?,
+            file,
+        })
     }
 
     fn verify_durable_identity(&self) -> Result<()> {
@@ -3666,7 +3661,7 @@ impl UpdaterStartAuthority {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn capture_test_file(
         requested_home: &Path,
         spec: &[ComponentSpec],
@@ -4613,7 +4608,7 @@ fn verify_managed_bundle_generation_locked(
     anyhow::bail!("managed bundle generation verification is unsupported on this platform")
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(not(windows))]
 fn component_is_recovery_cli(component: ComponentSpec) -> bool {
     matches!(component.name, "kin" | "kin.exe")
 }
@@ -9908,7 +9903,7 @@ fn validate_shim_repair_start_authority(authority: &UpdaterStartAuthority) -> Re
         .require_published_release_identity()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn install_preflighted_shim_if_generation_matches(
     requested_home: &Path,
     shim_name: &str,
@@ -10060,11 +10055,11 @@ fn is_newer(latest: &str, current: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::test_subprocess::{
+        output_with_timeout, DEFAULT_TEST_SUBPROCESS_TIMEOUT,
+    };
     use serial_test::serial;
     use std::ffi::{OsStr, OsString};
-    use std::process::{Output, Stdio};
-
-    const TEST_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 
     struct EnvGuard {
         key: &'static str,
@@ -10088,120 +10083,8 @@ mod tests {
         }
     }
 
-    fn join_test_child_pipe(
-        reader: std::thread::JoinHandle<io::Result<Vec<u8>>>,
-        label: &str,
-    ) -> Result<Vec<u8>> {
-        reader
-            .join()
-            .map_err(|_| anyhow::anyhow!("{label} output reader panicked"))?
-            .with_context(|| format!("failed to read {label} output"))
-    }
-
-    fn test_subprocess_output_with_timeout(
-        command: &mut Command,
-        label: &str,
-        timeout: Duration,
-    ) -> Result<Output> {
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("failed to spawn {label}"))?;
-        let mut stdout = child
-            .stdout
-            .take()
-            .context("bounded test child has no stdout pipe")?;
-        let mut stderr = child
-            .stderr
-            .take()
-            .context("bounded test child has no stderr pipe")?;
-        let stdout_reader = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stdout.read_to_end(&mut bytes)?;
-            Ok(bytes)
-        });
-        let stderr_reader = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stderr.read_to_end(&mut bytes)?;
-            Ok(bytes)
-        });
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if let Some(status) = child
-                .try_wait()
-                .with_context(|| format!("failed to poll {label}"))?
-            {
-                return Ok(Output {
-                    status,
-                    stdout: join_test_child_pipe(stdout_reader, "test child stdout")?,
-                    stderr: join_test_child_pipe(stderr_reader, "test child stderr")?,
-                });
-            }
-            if std::time::Instant::now() >= deadline {
-                let kill_error = child.kill().err();
-                let status = child.wait().ok();
-                let stdout = join_test_child_pipe(stdout_reader, "timed-out test child stdout")?;
-                let stderr = join_test_child_pipe(stderr_reader, "timed-out test child stderr")?;
-                anyhow::bail!(
-                    "{label} timed out after {timeout:?}; kill_error={kill_error:?}; status={status:?}; stdout={} stderr={}",
-                    String::from_utf8_lossy(&stdout),
-                    String::from_utf8_lossy(&stderr)
-                );
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    fn test_subprocess_output(command: &mut Command, label: &str) -> Result<Output> {
-        test_subprocess_output_with_timeout(command, label, TEST_SUBPROCESS_TIMEOUT)
-    }
-
-    #[test]
-    fn bounded_test_subprocess_worker() {
-        let Some(marker) = std::env::var_os("KIN_TEST_BOUNDED_CHILD_MARKER") else {
-            return;
-        };
-        println!("bounded child stdout");
-        io::stdout().flush().unwrap();
-        eprintln!("bounded child stderr");
-        fs::write(PathBuf::from(&marker).with_extension("started"), b"started").unwrap();
-        std::thread::sleep(Duration::from_secs(30));
-        fs::write(
-            PathBuf::from(marker).with_extension("finished"),
-            b"finished",
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn bounded_test_subprocess_kills_and_reaps_a_stalled_child_with_output() {
-        let temp = tempfile::tempdir().unwrap();
-        let marker = temp.path().join("bounded-child");
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command
-            .args([
-                "--exact",
-                "commands::update::tests::bounded_test_subprocess_worker",
-                "--nocapture",
-            ])
-            .env("KIN_TEST_BOUNDED_CHILD_MARKER", &marker);
-
-        let error = test_subprocess_output_with_timeout(
-            &mut command,
-            "bounded sleep-worker fixture",
-            Duration::from_secs(5),
-        )
-        .expect_err("the bounded helper must terminate the sleeping worker");
-
-        let message = format!("{error:#}");
-        assert!(message.contains("timed out"), "{message}");
-        assert!(message.contains("bounded child stdout"), "{message}");
-        assert!(message.contains("bounded child stderr"), "{message}");
-        assert!(marker.with_extension("started").is_file());
-        assert!(!marker.with_extension("finished").exists());
+    fn test_subprocess_output(command: &mut Command, label: &str) -> Result<std::process::Output> {
+        output_with_timeout(command, label, DEFAULT_TEST_SUBPROCESS_TIMEOUT)
     }
 
     #[cfg(windows)]
@@ -10237,8 +10120,10 @@ mod tests {
         assert_eq!(fs::read(replacement).unwrap(), b"hostile replacement");
     }
 
+    #[cfg(unix)]
     struct ConfigDirectorySyncFailureGuard;
 
+    #[cfg(unix)]
     impl ConfigDirectorySyncFailureGuard {
         fn enable(root: &Path) -> Self {
             crate::commands::setup::inject_config_directory_sync_failure_under(Some(root));
@@ -10246,6 +10131,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for ConfigDirectorySyncFailureGuard {
         fn drop(&mut self) {
             crate::commands::setup::inject_config_directory_sync_failure_under(None);
@@ -10845,6 +10731,7 @@ mod tests {
         assert!(transaction_dirs(lock.root()).unwrap().is_empty());
     }
 
+    #[cfg(unix)]
     struct CrashedUpdate {
         _tmp: tempfile::TempDir,
         kin_home: PathBuf,
@@ -10854,18 +10741,22 @@ mod tests {
         mcp_repo: Option<PathBuf>,
     }
 
+    #[cfg(unix)]
     fn crash_update(point: &str, fail_install_index: Option<usize>) -> CrashedUpdate {
         crash_update_inner(point, fail_install_index, false, None)
     }
 
+    #[cfg(unix)]
     fn crash_update_with_mcp(point: &str, fail_install_index: Option<usize>) -> CrashedUpdate {
         crash_update_inner(point, fail_install_index, true, None)
     }
 
+    #[cfg(unix)]
     fn crash_update_with_umask(point: &str, umask: &str) -> CrashedUpdate {
         crash_update_inner(point, None, false, Some(umask))
     }
 
+    #[cfg(unix)]
     fn crash_update_inner(
         point: &str,
         fail_install_index: Option<usize>,
@@ -11873,6 +11764,7 @@ cwd = {:?}
         }
     }
 
+    #[cfg(unix)]
     fn only_transaction(kin_home: &Path) -> PathBuf {
         let transactions = transaction_dirs(kin_home).unwrap();
         assert_eq!(transactions.len(), 1);
