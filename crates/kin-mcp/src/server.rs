@@ -265,19 +265,17 @@ fn should_request_workspace_roots(
     has_repo_binder: bool,
     daemon_unbound: bool,
 ) -> bool {
-    let refresh_trigger = matches!(
-        method,
-        Some("initialized")
-            | Some("notifications/initialized")
-            | Some("notifications/roots/list_changed")
-            | Some("tools/list")
-    );
-
-    refresh_trigger
-        && client_supports_roots
+    client_supports_roots
         && !request_in_flight
         && has_repo_binder
         && daemon_unbound
+        && matches!(
+            method,
+            Some("initialized")
+                | Some("notifications/initialized")
+                | Some("notifications/roots/list_changed")
+                | Some("tools/list")
+        )
 }
 
 /// Extract filesystem paths from an MCP `roots/list` response
