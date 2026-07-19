@@ -1084,6 +1084,33 @@ enum GraphAction {
     Status,
     /// Structural integrity validation
     Validate,
+    /// Recover missing atomic graph authority from explicitly verified graph artifacts
+    RecoverAuthority {
+        /// Explicit repository root containing `.kin/`
+        #[arg(long, value_name = "PATH")]
+        repo: PathBuf,
+        /// Exact legacy head generation expected before recovery
+        #[arg(long)]
+        expected_head_generation: u64,
+        /// Exact SHA-256 of the legacy `graph.kndb` input
+        #[arg(long, value_name = "SHA256")]
+        expected_snapshot_sha256: String,
+        /// Exact recovered graph Merkle root expected after replay
+        #[arg(long, value_name = "HEX")]
+        expected_root: String,
+        /// Expected legacy delta identity, repeated as `GENERATION=SHA256`
+        #[arg(long, value_name = "GENERATION=SHA256")]
+        expected_delta: Vec<String>,
+        /// Canonical repository UUID; always required and checked against any manifest
+        #[arg(long, value_name = "UUID")]
+        repo_id: String,
+        /// Confirm every daemon, VFS, and legacy graph writer for this repo is quiesced
+        #[arg(long, default_value_t = false)]
+        confirm_quiesced: bool,
+        /// Output machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Look up an entity by name and show its relations
     Inspect {
         /// Entity name or UUID to inspect
@@ -2679,6 +2706,30 @@ fn main() -> Result<()> {
                 Command::Graph { action } => match action {
                     GraphAction::Status => commands::graph::status().await,
                     GraphAction::Validate => commands::graph::validate().await,
+                    GraphAction::RecoverAuthority {
+                        repo,
+                        expected_head_generation,
+                        expected_snapshot_sha256,
+                        expected_root,
+                        expected_delta,
+                        repo_id,
+                        confirm_quiesced,
+                        json,
+                    } => {
+                        commands::graph_recover::recover_authority(
+                            commands::graph_recover::RecoverAuthorityOptions {
+                                repo,
+                                expected_head_generation,
+                                expected_snapshot_sha256,
+                                expected_root,
+                                expected_deltas: expected_delta,
+                                repo_id,
+                                confirm_quiesced,
+                                json,
+                            },
+                        )
+                        .await
+                    }
                     GraphAction::Inspect { name, json } => {
                         commands::graph::inspect(name, json).await
                     }

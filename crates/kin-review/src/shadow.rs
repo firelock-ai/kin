@@ -48,7 +48,7 @@ pub const SHADOW_ENFORCEMENT_REPORT_ONLY: &str = "report_only";
 /// A review whose base..head range spans this many committed changes reaches
 /// far enough back that the persisted graph substrate it reads at the head ref
 /// — replayed faithfully, but built long ago — drifts further from what a live
-/// re-index would produce than a nearby range does (FIR-1267): the deeper the
+/// re-index would produce than a nearby range does: the deeper the
 /// range, the more the persisted relation closure and entity roles diverge.
 /// When such a range ALSO
 /// yields an empty blast radius, that emptiness is more plausibly a ceiling of
@@ -274,7 +274,7 @@ pub struct ShadowAuditEvidence {
 
 /// Provenance for how deep the reviewed `base..head` range reaches, stamped on
 /// every report so downstream scoring can attribute an accepted historical-
-/// substrate ceiling (FIR-1267) instead of scoring a deep-history row as clean.
+/// substrate ceiling instead of scoring a deep-history row as clean.
 ///
 /// The raw count is ALWAYS present and independent of any threshold; the
 /// threshold gates only the non-demoting `deep_history_impact_ceiling` evidence
@@ -866,7 +866,7 @@ fn is_blocking(kind: InlineCommentKind) -> bool {
 ///   never double-counted.
 /// - `deep_history_impact_ceiling` is reported but never demotes: it is a
 ///   range-depth PROXY attributing an empty blast radius on a deep range to a
-///   historical-substrate ceiling (FIR-1267). Absence of evidence is not
+///   historical-substrate ceiling. Absence of evidence is not
 ///   evidence of risk, so it makes the ceiling attributable without changing
 ///   the verdict.
 /// - Structural v1 limits (cross-repo not evaluated, attribution
@@ -1526,7 +1526,7 @@ fn collect_evidence_gaps<G: GraphStore>(
 
         // A deep base..head range reaches far enough back that the persisted
         // graph substrate the review replays at head drifts further from a live
-        // re-index than a nearby range does (FIR-1267). When such a range ALSO
+        // re-index than a nearby range does. When such a range ALSO
         // yields an empty blast radius (the condition above), attribute that
         // emptiness explicitly to the range-depth ceiling instead of leaving it
         // folded into the generic impact_signal_absent gap. This is a
@@ -1540,8 +1540,8 @@ fn collect_evidence_gaps<G: GraphStore>(
                 subject: "blast_radius".to_string(),
                 detail: format!(
                     "reviewed range spans {} committed changes (over the {} deep-history \
-                     threshold). This is a RANGE-DEPTH PROXY for historical-substrate fidelity \
-                     (FIR-1267): across a range this deep the graph state materialized at the \
+                     threshold). This is a RANGE-DEPTH PROXY for historical-substrate fidelity: \
+                     across a range this deep the graph state materialized at the \
                      head ref is a less faithful representation than a live re-index, so an empty \
                      blast radius is more plausibly a substrate ceiling than proof the change is \
                      isolated. Reported as an accepted ceiling and NON-DEMOTING; the raw range \
@@ -3625,7 +3625,7 @@ mod tests {
 
     #[test]
     fn shadow_downstream_risk_demotes_runtime_neutral_positional_rename() {
-        // FIR-1440: the shadow `downstream_risk` channel is a SEPARATE gate from
+        // The shadow `downstream_risk` channel is a SEPARATE gate from
         // the inline signature-change channel. An arity-preserving rename whose
         // graph-known call sites all pass positionally is runtime-neutral, yet
         // pre-fix this channel still emitted a BLOCKING downstream_risk (verdict
@@ -3645,7 +3645,7 @@ mod tests {
             .find(|f| f.kind == "downstream_risk")
             .expect("a renamed contract surface with 3 consumers carries a downstream risk");
         // GREEN (post-fix): demoted to attention. Pre-fix this was blocking/error
-        // with a WouldBlock verdict — the shipped FIR-1440 bug.
+        // with a WouldBlock verdict — the previously shipped bug.
         assert!(
             !finding.blocking,
             "a positional-safe rename must not block the shadow gate"
