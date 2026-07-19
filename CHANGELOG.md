@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.25] - 2026-07-19
+
+This patch strengthens graph authority across local, hosted, and recovery paths,
+and makes self-update convergence durable and fail closed on Unix and Windows.
+
+### Added
+
+- `kin graph recover-authority` can promote explicitly verified legacy graph
+  artifacts into atomic graph authority only after checking repository identity,
+  snapshot and delta hashes, continuity, expected root, compatibility, and
+  operator-confirmed quiescence. Interrupted projection finalization is
+  idempotent.
+- `kin update --check-only` reports update availability without mutation, while
+  automation can pin the complete expected version, commit, and archive digest
+  tuple before installation.
+
+### Changed
+
+- Storage-backed daemons are intrinsically graph-authoritative. Filesystem
+  reconcile, thin commit, VFS notification, LSP enrichment, and projection
+  reparsing cannot feed projection bytes back into graph truth.
+- MCP workspace discovery retries after an initially empty roots response and
+  handles later root-change notifications, allowing a shared client process to
+  bind after a repository opens without weakening daemon authority.
+
+### Fixed
+
+- Graph validation now inspects the complete coherent relation snapshot,
+  reports missing endpoints precisely, and exempts only canonical external
+  import placeholders.
+- The updater now converges the CLI, daemon, VFS binary, and shim as one durable
+  transaction with all-or-rollback recovery, exact object and metadata binding,
+  restart fencing, durable MCP repair obligations, and native Windows authority
+  tests. Unsupported authority fails closed instead of degrading silently.
+- Updater filesystem-authority tests that share process-global test state are
+  serialized so the default parallel suite remains deterministic.
+
 ## [0.2.24] - 2026-07-15
 
 This patch makes Kin's first-use path workspace-aware, truthful about optional
@@ -636,7 +673,8 @@ Historical note: this snapshot predates the public GitHub prerelease series and 
 - Daemon mode for background file watching (`kin-daemon`)
 - 19-crate workspace architecture
 
-[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.24...HEAD
+[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.25...HEAD
+[0.2.25]: https://github.com/firelock-ai/kin/compare/v0.2.24...v0.2.25
 [0.2.24]: https://github.com/firelock-ai/kin/compare/v0.2.23...v0.2.24
 [0.2.23]: https://github.com/firelock-ai/kin/compare/v0.2.22...v0.2.23
 [0.2.22]: https://github.com/firelock-ai/kin/compare/v0.2.21...v0.2.22
