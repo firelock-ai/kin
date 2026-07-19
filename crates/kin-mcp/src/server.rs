@@ -179,7 +179,7 @@ pub async fn run_stdio_daemon(
     // them. An editor may initialize the shared MCP process before opening a
     // workspace, so only suppress a request while one is actually in flight.
     let mut client_supports_roots = false;
-    let mut roots_request_in_flight = false;
+    let mut roots_request_state = WorkspaceRootsRequestState::default();
 
     while let Some((message, framed)) = read_stdio_message(&mut reader).await? {
         // Peek at the raw JSON so we can distinguish the client's requests and
@@ -198,7 +198,7 @@ pub async fn run_stdio_daemon(
             if method.is_none()
                 && value.get("id").and_then(|id| id.as_str()) == Some(ROOTS_REQUEST_ID)
             {
-                roots_request_in_flight = false;
+                roots_request_state.complete();
                 if let Some(binder) = repo_binder.as_ref() {
                     let roots = parse_workspace_roots(&value);
                     if roots.is_empty() {
@@ -218,14 +218,12 @@ pub async fn run_stdio_daemon(
             // and we still have no bound daemon, ask it for its workspace roots.
             // Retry after an earlier empty response, and honor the MCP roots
             // change notification used when an editor opens or changes folders.
-            if should_request_workspace_roots(
+            if roots_request_state.begin_if_allowed(
                 method,
                 client_supports_roots,
-                roots_request_in_flight,
                 repo_binder.is_some(),
                 daemon_is_unbound(),
             ) {
-                roots_request_in_flight = true;
                 let request = serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": ROOTS_REQUEST_ID,
@@ -253,6 +251,37 @@ fn daemon_is_unbound() -> bool {
     std::env::var("KIN_DAEMON_URL")
         .map(|value| value.trim().is_empty())
         .unwrap_or(true)
+}
+
+#[derive(Default)]
+struct WorkspaceRootsRequestState {
+    in_flight: bool,
+}
+
+impl WorkspaceRootsRequestState {
+    fn complete(&mut self) {
+        self.in_flight = false;
+    }
+
+    fn begin_if_allowed(
+        &mut self,
+        method: Option<&str>,
+        client_supports_roots: bool,
+        has_repo_binder: bool,
+        daemon_unbound: bool,
+    ) -> bool {
+        let should_begin = should_request_workspace_roots(
+            method,
+            client_supports_roots,
+            self.in_flight,
+            has_repo_binder,
+            daemon_unbound,
+        );
+        if should_begin {
+            self.in_flight = true;
+        }
+        should_begin
+    }
 }
 
 /// Decide whether an inbound client message should trigger a workspace-roots
@@ -1297,6 +1326,21 @@ mod tests {
             true,
             true,
         ));
+    }
+
+    #[test]
+    fn workspace_roots_request_state_reopens_after_completion() {
+        let mut state = WorkspaceRootsRequestState::default();
+        assert!(state.begin_if_allowed(Some("initialized"), true, true, true));
+        assert!(!state.begin_if_allowed(
+            Some("notifications/roots/list_changed"),
+            true,
+            true,
+            true,
+        ));
+
+        state.complete();
+        assert!(state.begin_if_allowed(Some("notifications/roots/list_changed"), true, true, true,));
     }
 
     #[test]
