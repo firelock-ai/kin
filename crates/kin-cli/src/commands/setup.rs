@@ -4,9 +4,10 @@
 use anyhow::{Context, Result};
 use console::style;
 use dialoguer::MultiSelect;
+use fs2::FileExt;
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Write as _};
+use std::io::{self, BufRead, IsTerminal, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -846,11 +847,11 @@ fn detect_ai_assistants() -> Vec<AiAssistant> {
 
 /// Merge the "kin" MCP server entry into an existing JSON config file.
 /// Creates the file if it doesn't exist.
-fn merge_mcp_config(path: &PathBuf) -> Result<()> {
-    let mut root: serde_json::Value = if path.exists() {
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        serde_json::from_str(&content).with_context(|| {
+fn merge_mcp_config(path: &PathBuf, target_id: &str) -> Result<()> {
+    let lock = ConfigLock::acquire(path)?;
+    let original = lock.original_bytes(path)?;
+    let mut root: serde_json::Value = if let Some(content) = original.as_deref() {
+        serde_json::from_slice(content).with_context(|| {
             format!(
                 "existing file {} is not valid JSON — refusing to overwrite it. \
                  Fix or remove the file and try again.",
@@ -861,29 +862,90 @@ fn merge_mcp_config(path: &PathBuf) -> Result<()> {
         serde_json::json!({})
     };
 
-    // Ensure root is an object
     if !root.is_object() {
-        root = serde_json::json!({});
+        anyhow::bail!(
+            "existing file {} has a non-object JSON root — refusing to overwrite it",
+            path.display()
+        );
     }
-
-    // Ensure mcpServers key exists as an object
-    if !root.get("mcpServers").is_some_and(|v| v.is_object()) {
+    if root
+        .get("mcpServers")
+        .is_some_and(|value| !value.is_object())
+    {
+        anyhow::bail!(
+            "existing file {} has a non-object mcpServers value — refusing to overwrite it",
+            path.display()
+        );
+    }
+    if root.get("mcpServers").is_none() {
         root["mcpServers"] = serde_json::json!({});
     }
 
-    // Insert/overwrite the "kin" entry
-    root["mcpServers"]["kin"] = kin_mcp_entry();
-
-    // Write back with pretty formatting
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    let desired = kin_mcp_entry();
+    let desired = desired
+        .as_object()
+        .context("generated Kin MCP entry is not an object")?;
+    let servers = root["mcpServers"]
+        .as_object_mut()
+        .expect("mcpServers was validated as an object");
+    if servers.get("kin").is_some_and(|value| !value.is_object()) {
+        anyhow::bail!(
+            "existing file {} has a non-object mcpServers.kin value — refusing to overwrite it",
+            path.display()
+        );
     }
-    let formatted =
-        serde_json::to_string_pretty(&root).context("failed to serialize MCP config")?;
-    fs::write(path, formatted).with_context(|| format!("failed to write {}", path.display()))?;
+    let entry_preexisted = servers.contains_key("kin");
+    let entry = servers
+        .entry("kin".to_string())
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .expect("Kin MCP entry was validated as an object");
+    for key in ["command", "args"] {
+        if let Some(value) = desired.get(key) {
+            entry.insert(key.to_string(), value.clone());
+        }
+    }
+    if !entry_preexisted {
+        entry.remove("cwd");
+    }
+    if entry.get("env").is_some_and(|value| !value.is_object()) {
+        anyhow::bail!(
+            "existing file {} has a non-object mcpServers.kin.env value — refusing to overwrite it",
+            path.display()
+        );
+    }
+    let env = entry
+        .entry("env".to_string())
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .expect("Kin MCP env was validated as an object");
+    if let Some(desired_env) = desired.get("env").and_then(serde_json::Value::as_object) {
+        for (key, value) in desired_env {
+            env.insert(key.clone(), value.clone());
+        }
+    }
+    let owned_entry = root["mcpServers"]["kin"].clone();
+    let formatted = serde_json::to_vec_pretty(&root).context("failed to serialize MCP config")?;
+    lock.write_guarded(path, &formatted, original.as_deref())?;
+    record_mcp_entry_in_ledger(target_id, path, &owned_entry)
+}
 
-    Ok(())
+fn record_mcp_entry_in_ledger(
+    target_id: &str,
+    path: &Path,
+    entry: &serde_json::Value,
+) -> Result<()> {
+    use crate::commands::setup_ledger::{ledger_path, LedgerEntry, SetupLedger};
+
+    let ledger_path = ledger_path()?;
+    SetupLedger::update(&ledger_path, |ledger| {
+        ledger.record(LedgerEntry::mcp(
+            target_id.to_string(),
+            path.to_path_buf(),
+            entry,
+        ));
+        Ok(())
+    })
 }
 
 /// Configure MCP for Claude Code.
@@ -900,7 +962,7 @@ fn configure_claude_code() -> Result<PathBuf> {
         primary
     };
 
-    merge_mcp_config(&target)?;
+    merge_mcp_config(&target, "claude")?;
     Ok(target)
 }
 
@@ -908,7 +970,7 @@ fn configure_claude_code() -> Result<PathBuf> {
 fn configure_cursor() -> Result<PathBuf> {
     let home = home_dir()?;
     let target = home.join(".cursor").join("mcp.json");
-    merge_mcp_config(&target)?;
+    merge_mcp_config(&target, "cursor")?;
     Ok(target)
 }
 
@@ -919,19 +981,43 @@ fn configure_cursor() -> Result<PathBuf> {
 /// `config.toml` — it does not read an `mcp.json`. Uses a format-preserving
 /// TOML edit so unrelated keys, tables, and comments in the user's config are
 /// left untouched.
-fn merge_mcp_config_toml(path: &PathBuf) -> Result<()> {
+fn merge_mcp_config_toml(path: &PathBuf, repo_root: &Path) -> Result<()> {
+    let lock = ConfigLock::acquire(path)?;
+    let entry = kin_mcp_entry();
+    let command = entry
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("kin");
+    merge_mcp_config_toml_locked(path, repo_root, &lock, "codex", command)
+}
+
+fn merge_mcp_config_toml_locked(
+    path: &PathBuf,
+    repo_root: &Path,
+    lock: &ConfigLock,
+    target_id: &str,
+    command: &str,
+) -> Result<()> {
     use toml_edit::{value, Array, DocumentMut, InlineTable, Item, Table};
 
-    let mut doc: DocumentMut = if path.exists() {
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        content.parse().with_context(|| {
-            format!(
-                "existing file {} is not valid TOML — refusing to overwrite it. \
+    let repo_root = canonical_initialized_repo(repo_root).with_context(|| {
+        format!(
+            "Codex MCP binding requires an initialized Kin repository: {}",
+            repo_root.display()
+        )
+    })?;
+    let original = lock.original_bytes(path)?;
+    let mut doc: DocumentMut = if let Some(content) = original.as_deref() {
+        std::str::from_utf8(content)
+            .with_context(|| format!("existing file {} is not UTF-8", path.display()))?
+            .parse()
+            .with_context(|| {
+                format!(
+                    "existing file {} is not valid TOML — refusing to overwrite it. \
                  Fix or remove the file and try again.",
-                path.display()
-            )
-        })?
+                    path.display()
+                )
+            })?
     } else {
         DocumentMut::new()
     };
@@ -945,7 +1031,10 @@ fn merge_mcp_config_toml(path: &PathBuf) -> Result<()> {
                 Ok(table) => table,
                 Err(item) => match item.into_value() {
                     Ok(toml_edit::Value::InlineTable(inline)) => inline.into_table(),
-                    _ => Table::new(),
+                    _ => anyhow::bail!(
+                        "existing file {} has an incompatible mcp_servers value — refusing to overwrite it",
+                        path.display()
+                    ),
                 },
             },
             None => Table::new(),
@@ -954,34 +1043,61 @@ fn merge_mcp_config_toml(path: &PathBuf) -> Result<()> {
         doc.insert("mcp_servers", Item::Table(servers));
     }
 
-    // Build the kin entry from the same source of truth as the JSON configs.
-    let entry = kin_mcp_entry();
-    let command = entry
-        .get("command")
-        .and_then(|c| c.as_str())
-        .unwrap_or("kin")
-        .to_string();
-
-    let mut kin = Table::new();
+    let servers = doc["mcp_servers"]
+        .as_table_mut()
+        .expect("mcp_servers was normalized to a table");
+    let existing = servers.remove("kin");
+    let entry_preexisted = existing.is_some();
+    let kin = match existing {
+        Some(item) => match item.into_table() {
+            Ok(table) => table,
+            Err(item) => match item.into_value() {
+                Ok(toml_edit::Value::InlineTable(inline)) => inline.into_table(),
+                _ => anyhow::bail!(
+                    "existing file {} has an incompatible mcp_servers.kin value — refusing to overwrite it",
+                    path.display()
+                ),
+            },
+        },
+        None => Table::new(),
+    };
+    servers.insert("kin", Item::Table(kin));
+    let kin = doc["mcp_servers"]["kin"]
+        .as_table_mut()
+        .expect("Kin MCP entry was validated as a table");
     kin.insert("command", value(command));
     let mut args = Array::new();
     args.push("mcp");
     args.push("start");
+    args.push("--repo");
+    args.push(repo_root.to_string_lossy().into_owned());
     kin.insert("args", value(args));
-    let mut env = InlineTable::new();
-    env.insert("KIN_MCP_TOOL_PROFILE", "agent-default".into());
-    kin.insert("env", value(env));
-
-    doc["mcp_servers"]["kin"] = Item::Table(kin);
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    if !entry_preexisted {
+        kin.remove("cwd");
     }
-    fs::write(path, doc.to_string())
-        .with_context(|| format!("failed to write {}", path.display()))?;
+    match kin.get_mut("env") {
+        Some(Item::Value(toml_edit::Value::InlineTable(env))) => {
+            env.insert("KIN_MCP_TOOL_PROFILE", "agent-default".into());
+        }
+        Some(Item::Table(env)) => {
+            env.insert("KIN_MCP_TOOL_PROFILE", value("agent-default"));
+        }
+        None => {
+            let mut env = InlineTable::new();
+            env.insert("KIN_MCP_TOOL_PROFILE", "agent-default".into());
+            kin.insert("env", value(env));
+        }
+        Some(_) => anyhow::bail!(
+            "existing file {} has an incompatible mcp_servers.kin.env value — refusing to overwrite it",
+            path.display()
+        ),
+    }
 
-    Ok(())
+    let formatted = doc.to_string();
+    lock.write_guarded(path, formatted.as_bytes(), original.as_deref())?;
+    let owned_entry = read_kin_mcp_entry_from_bytes(path, formatted.as_bytes())
+        .context("generated Codex MCP entry is missing")?;
+    record_mcp_entry_in_ledger(target_id, path, &owned_entry)
 }
 
 /// Configure MCP for Codex CLI.
@@ -991,7 +1107,16 @@ fn merge_mcp_config_toml(path: &PathBuf) -> Result<()> {
 fn configure_codex() -> Result<PathBuf> {
     let home = home_dir()?;
     let target = home.join(".codex").join("config.toml");
-    merge_mcp_config_toml(&target)?;
+    let cwd = env::current_dir().context("could not determine the current directory")?;
+    let repo_root = kin_core::KinLayout::discover_with_daemon_url(&cwd, None)
+        .and_then(|layout| layout.working_dir().canonicalize().ok())
+        .with_context(|| {
+            format!(
+                "Codex MCP setup requires an initialized Kin repository; run `kin init` in the target repository and re-run `kin setup` from it (current directory: {})",
+                cwd.display()
+            )
+        })?;
+    merge_mcp_config_toml(&target, &repo_root)?;
     Ok(target)
 }
 
@@ -1002,7 +1127,7 @@ fn configure_codex() -> Result<PathBuf> {
 fn configure_gemini_cli() -> Result<PathBuf> {
     let home = home_dir()?;
     let target = home.join(".gemini").join("settings.json");
-    merge_mcp_config(&target)?;
+    merge_mcp_config(&target, "gemini")?;
     Ok(target)
 }
 
@@ -1015,7 +1140,7 @@ fn configure_windsurf() -> Result<PathBuf> {
         .join(".codeium")
         .join("windsurf")
         .join("mcp_config.json");
-    merge_mcp_config(&target)?;
+    merge_mcp_config(&target, "windsurf")?;
     Ok(target)
 }
 
@@ -1270,22 +1395,1020 @@ pub(crate) fn reinstall_vfs_shim() -> Result<Option<PathBuf>> {
 /// Used by `kin doctor --fix` to repair `mcp_client_*` checks. Returns the
 /// paths that were re-merged.
 pub(crate) fn remerge_existing_mcp_configs() -> Vec<PathBuf> {
-    let mut repaired = Vec::new();
-    for (_id, _label, path) in crate::commands::health::mcp_client_config_paths() {
-        if !path.exists() {
-            continue;
+    let outcome = remerge_existing_mcp_configs_detailed();
+    for error in outcome.errors {
+        eprintln!("WARNING: could not refresh a Kin MCP entry: {error}");
+    }
+    outcome.repaired
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct McpRemergeOutcome {
+    pub(crate) repaired: Vec<PathBuf>,
+    pub(crate) errors: Vec<String>,
+}
+
+/// One exact MCP repair obligation captured before an updater transaction.
+/// Paths are absolute so a later retry never derives authority from its cwd.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct McpRepairTarget {
+    pub(crate) id: String,
+    pub(crate) path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) repo_root: Option<PathBuf>,
+}
+
+fn mcp_target_supported(id: &str) -> bool {
+    matches!(
+        id,
+        "claude"
+            | "cursor"
+            | "codex"
+            | "antigravity"
+            | "antigravity_workspace"
+            | "gemini"
+            | "windsurf"
+    )
+}
+
+fn workspace_root_for_mcp_path(path: &Path) -> Option<PathBuf> {
+    let agents = path.parent()?;
+    (agents.file_name().and_then(|name| name.to_str()) == Some(".agents")
+        && path.file_name().and_then(|name| name.to_str()) == Some("mcp_config.json"))
+    .then(|| agents.parent().map(Path::to_path_buf))
+    .flatten()
+}
+
+const WORKSPACE_MCP_GIT_EXCLUDE_PATTERNS: [&str; 2] = [
+    "/.agents/mcp_config.json",
+    "/.agents/.mcp_config.json.kin-update.lock",
+];
+
+/// Persist checkout-local Antigravity config and its permanent lock as local
+/// Git exclusions in the repository's common Git directory. Linked worktrees
+/// share this file, so resolving `commondir` is required for idempotency.
+fn ensure_workspace_mcp_git_excluded(repo_root: &Path) -> Result<Option<PathBuf>> {
+    let dot_git = repo_root.join(".git");
+    let metadata = match fs::metadata(&dot_git) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", dot_git.display()))
         }
-        // Codex's config.toml is TOML; every other client config is JSON.
-        let merged = if path.extension().and_then(|e| e.to_str()) == Some("toml") {
-            merge_mcp_config_toml(&path)
+    };
+    let git_dir = if metadata.is_dir() {
+        dot_git
+    } else if metadata.is_file() {
+        let pointer = fs::read_to_string(&dot_git)
+            .with_context(|| format!("failed to read Git pointer {}", dot_git.display()))?;
+        let target = pointer
+            .trim()
+            .strip_prefix("gitdir:")
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+            .with_context(|| format!("invalid Git pointer {}", dot_git.display()))?;
+        let target = PathBuf::from(target);
+        if target.is_absolute() {
+            target
         } else {
-            merge_mcp_config(&path)
-        };
-        if merged.is_ok() {
-            repaired.push(path);
+            repo_root.join(target)
+        }
+    } else {
+        return Ok(None);
+    };
+    let common_dir = match fs::read_to_string(git_dir.join("commondir")) {
+        Ok(pointer) => {
+            let target = PathBuf::from(pointer.trim());
+            if target.is_absolute() {
+                target
+            } else {
+                git_dir.join(target)
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => git_dir,
+        Err(error) => return Err(error).context("failed to read Git common-directory pointer"),
+    };
+    let exclude = common_dir.join("info").join("exclude");
+    let lock = ConfigLock::acquire(&exclude)?;
+    let original = lock.original_bytes(&exclude)?;
+    let content = match original.as_deref() {
+        Some(bytes) => std::str::from_utf8(bytes)
+            .with_context(|| format!("Git exclude {} is not UTF-8", exclude.display()))?,
+        None => "",
+    };
+    let mut updated: String = content
+        .split_inclusive('\n')
+        .filter(|line| {
+            let line = line.trim();
+            !WORKSPACE_MCP_GIT_EXCLUDE_PATTERNS.contains(&line)
+                && line != ".agents/mcp_config.json"
+                && line != ".agents/.mcp_config.json.kin-update.lock"
+        })
+        .collect();
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    for pattern in WORKSPACE_MCP_GIT_EXCLUDE_PATTERNS {
+        updated.push_str(pattern);
+        updated.push('\n');
+    }
+    lock.write_guarded(&exclude, updated.as_bytes(), original.as_deref())?;
+    Ok(Some(exclude))
+}
+
+fn canonical_initialized_repo(path: &Path) -> Option<PathBuf> {
+    let canonical = path.canonicalize().ok()?;
+    canonical.join(".kin").is_dir().then_some(canonical)
+}
+
+pub(crate) fn normalize_mcp_repair_targets(
+    targets: impl IntoIterator<Item = McpRepairTarget>,
+) -> Result<Vec<McpRepairTarget>> {
+    let mut dedup = std::collections::BTreeMap::new();
+    for mut target in targets {
+        if !mcp_target_supported(&target.id) {
+            anyhow::bail!("unsupported managed MCP target '{}'", target.id);
+        }
+        if !target.path.is_absolute() {
+            anyhow::bail!(
+                "managed MCP target path is not absolute: {}",
+                target.path.display()
+            );
+        }
+        if target.id == "antigravity_workspace" {
+            let root = target
+                .repo_root
+                .take()
+                .or_else(|| workspace_root_for_mcp_path(&target.path))
+                .context("workspace MCP target is missing its repository root")?;
+            let root = canonical_initialized_repo(&root)
+                .context("workspace MCP target repository is not an initialized Kin repository")?;
+            if target.path != root.join(".agents").join("mcp_config.json") {
+                anyhow::bail!(
+                    "workspace MCP target {} does not match repository {}",
+                    target.path.display(),
+                    root.display()
+                );
+            }
+            target.repo_root = Some(root);
+        } else if target.id == "codex" {
+            let repo_root = target
+                .repo_root
+                .as_deref()
+                .map(|root| {
+                    canonical_initialized_repo(root).with_context(|| {
+                        format!(
+                            "Codex MCP repository is not an initialized path: {}",
+                            root.display()
+                        )
+                    })
+                })
+                .transpose()?
+                .with_context(|| {
+                    format!(
+                        "Codex MCP target {} has no exact initialized repository binding; run `kin setup` from the intended initialized repository before updating",
+                        target.path.display()
+                    )
+                })?;
+            target.repo_root = Some(repo_root);
+        } else if target.repo_root.is_some() {
+            anyhow::bail!(
+                "non-workspace MCP target '{}' carried a repository root",
+                target.id
+            );
+        }
+
+        let key = (target.id.clone(), target.path.clone());
+        match dedup.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(target);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let existing: &mut McpRepairTarget = entry.get_mut();
+                if existing.repo_root.is_none() {
+                    existing.repo_root = target.repo_root;
+                } else if target.repo_root.is_some() && existing.repo_root != target.repo_root {
+                    anyhow::bail!(
+                        "conflicting duplicate MCP repair target at {}",
+                        target.path.display()
+                    );
+                }
+            }
         }
     }
-    repaired
+    Ok(dedup.into_values().collect())
+}
+
+fn codex_repo_from_entry(path: &Path) -> Option<PathBuf> {
+    let content = fs::read_to_string(path).ok()?;
+    let root: toml::Value = toml::from_str(&content).ok()?;
+    let entry = root.get("mcp_servers")?.get("kin")?;
+    let from_args = entry
+        .get("args")
+        .and_then(toml::Value::as_array)
+        .and_then(|args| {
+            args.windows(2).find_map(|window| {
+                (window[0].as_str() == Some("--repo"))
+                    .then(|| window[1].as_str())
+                    .flatten()
+            })
+        })
+        .map(PathBuf::from);
+    from_args
+        .or_else(|| {
+            entry
+                .get("cwd")
+                .and_then(toml::Value::as_str)
+                .map(PathBuf::from)
+        })
+        .as_deref()
+        .and_then(canonical_initialized_repo)
+}
+
+/// Capture only MCP configs Kin already owns, plus exact workspace targets
+/// persisted in the setup ledger. Update never creates a new client config.
+pub(crate) fn current_mcp_repair_targets() -> Result<Vec<McpRepairTarget>> {
+    use crate::commands::setup_ledger::{ArtifactKind, SetupLedger};
+
+    let mut targets = Vec::new();
+    let mut paths = crate::commands::health::mcp_client_config_paths();
+    if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
+        paths.push((
+            "antigravity",
+            "Google Antigravity",
+            home.join(".gemini").join("config").join("mcp_config.json"),
+        ));
+    }
+    for (id, _label, path) in paths {
+        if read_kin_mcp_entry(&path).is_some() {
+            targets.push(McpRepairTarget {
+                repo_root: (id == "codex")
+                    .then(|| codex_repo_from_entry(&path))
+                    .flatten(),
+                id: id.to_string(),
+                path,
+            });
+        }
+    }
+
+    let ledger = SetupLedger::load(&crate::commands::setup_ledger::ledger_path()?)?;
+    for entry in ledger
+        .entries
+        .into_iter()
+        .filter(|entry| entry.kind == ArtifactKind::McpConfig)
+    {
+        targets.push(McpRepairTarget {
+            repo_root: match entry.target.as_str() {
+                "antigravity_workspace" => workspace_root_for_mcp_path(&entry.path),
+                "codex" => codex_repo_from_entry(&entry.path),
+                _ => None,
+            },
+            id: entry.target,
+            path: entry.path,
+        });
+    }
+    normalize_mcp_repair_targets(targets)
+}
+
+fn managed_mcp_launcher() -> Result<String> {
+    let name = if cfg!(windows) { "kin.exe" } else { "kin" };
+    let path = kin_dir()?.join("bin").join(name);
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("managed Kin launcher is missing at {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!(
+            "managed Kin launcher must be a regular non-symlink file: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            anyhow::bail!("managed Kin launcher is not executable: {}", path.display());
+        }
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_CONFIG_DIRECTORY_SYNC_UNDER: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_config_directory_sync_failure_under(root: Option<&Path>) {
+    FAIL_CONFIG_DIRECTORY_SYNC_UNDER.with(|configured| {
+        *configured.borrow_mut() =
+            root.map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+    });
+}
+
+fn config_directory_sync_injected(path: &Path) -> bool {
+    #[cfg(test)]
+    {
+        let observed = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        return FAIL_CONFIG_DIRECTORY_SYNC_UNDER.with(|configured| {
+            configured
+                .borrow()
+                .as_ref()
+                .is_some_and(|root| observed.starts_with(root))
+        });
+    }
+    #[cfg(not(test))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+fn shared_config_lock_path(path: &Path) -> Result<PathBuf> {
+    let parent = path.parent().context("MCP config path has no parent")?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("MCP config path has no UTF-8 file name")?;
+    Ok(parent.join(format!(".{name}.kin-update.lock")))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConfigFileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    volume: u32,
+    #[cfg(windows)]
+    index: u64,
+}
+
+impl ConfigFileIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            Self {
+                volume: metadata.volume_serial_number().unwrap_or_default(),
+                index: metadata.file_index().unwrap_or_default(),
+            }
+        }
+        #[cfg(all(not(unix), not(windows)))]
+        {
+            let _ = metadata;
+            Self {}
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ObservedConfigFile {
+    bytes: Vec<u8>,
+    identity: ConfigFileIdentity,
+    #[cfg(unix)]
+    mode: u32,
+}
+
+fn validate_regular_config_file(
+    path: &Path,
+    file: &fs::File,
+    private: bool,
+) -> Result<fs::Metadata> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!("managed config is not a regular file: {}", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.nlink() != 1 {
+            anyhow::bail!("managed config has multiple hard links: {}", path.display());
+        }
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            anyhow::bail!(
+                "managed config is not owned by the current user: {}",
+                path.display()
+            );
+        }
+        if private && metadata.permissions().mode() & 0o777 != 0o600 {
+            anyhow::bail!(
+                "managed private file must have mode 0600: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(metadata)
+}
+
+fn read_config_file_nofollow(path: &Path, private: bool) -> Result<Option<ObservedConfigFile>> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to open managed config without following links: {}",
+                    path.display()
+                )
+            })
+        }
+    };
+    let metadata = validate_regular_config_file(path, &file, private)?;
+    let identity = ConfigFileIdentity::from_metadata(&metadata);
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let final_metadata = file.metadata()?;
+    if ConfigFileIdentity::from_metadata(&final_metadata) != identity
+        || final_metadata.len() != bytes.len() as u64
+    {
+        anyhow::bail!(
+            "managed config changed while it was read: {}",
+            path.display()
+        );
+    }
+    Ok(Some(ObservedConfigFile {
+        bytes,
+        identity,
+        #[cfg(unix)]
+        mode: metadata.permissions().mode() & 0o777,
+    }))
+}
+
+pub(crate) fn read_private_file_nofollow(path: &Path) -> Result<Option<Vec<u8>>> {
+    read_config_file_nofollow(path, true).map(|observed| observed.map(|observed| observed.bytes))
+}
+
+fn observed_config_matches(
+    left: Option<&ObservedConfigFile>,
+    right: Option<&ObservedConfigFile>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.identity == right.identity && left.bytes == right.bytes,
+        _ => false,
+    }
+}
+
+/// Persistent sidecar authority shared by setup, doctor repair, updater repair,
+/// and the setup ledger. The sidecar is deliberately retained: deleting a lock
+/// file would let a later writer lock a different inode while an earlier writer
+/// still holds the old one.
+pub(crate) struct ConfigLock {
+    file: fs::File,
+    path: PathBuf,
+    lock_path: PathBuf,
+    original: Option<ObservedConfigFile>,
+    private: bool,
+    lock_identity: ConfigFileIdentity,
+}
+
+impl ConfigLock {
+    pub(crate) fn acquire(path: &Path) -> Result<Self> {
+        Self::acquire_with_policy(path, false)
+    }
+
+    pub(crate) fn acquire_nofollow(path: &Path) -> Result<Self> {
+        Self::acquire_with_policy(path, true)
+    }
+
+    fn acquire_with_policy(path: &Path, private: bool) -> Result<Self> {
+        let parent = path.parent().context("managed config path has no parent")?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+        let parent = parent.canonicalize().with_context(|| {
+            format!(
+                "failed to canonicalize managed config parent {}",
+                parent.display()
+            )
+        })?;
+        let file_name = path
+            .file_name()
+            .context("managed config path has no file name")?;
+        let path = parent.join(file_name);
+        let lock_path = shared_config_lock_path(&path)?;
+        if fs::symlink_metadata(&lock_path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            anyhow::bail!("managed config lock is a symlink: {}", lock_path.display());
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let file = options.open(&lock_path).with_context(|| {
+            format!("failed to open managed config lock {}", lock_path.display())
+        })?;
+        let metadata = validate_regular_config_file(&lock_path, &file, false)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            file.sync_all()?;
+        }
+        let lock_identity = ConfigFileIdentity::from_metadata(&metadata);
+        file.lock_exclusive()
+            .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+        let named = fs::symlink_metadata(&lock_path)
+            .with_context(|| format!("managed config lock disappeared: {}", lock_path.display()))?;
+        if named.file_type().is_symlink()
+            || ConfigFileIdentity::from_metadata(&named) != lock_identity
+        {
+            anyhow::bail!(
+                "managed config lock changed while Kin waited: {}",
+                lock_path.display()
+            );
+        }
+        let original = read_config_file_nofollow(&path, private)?;
+        Ok(Self {
+            file,
+            path,
+            lock_path,
+            original,
+            private,
+            lock_identity,
+        })
+    }
+
+    fn revalidate_lock(&self) -> Result<()> {
+        let metadata = self.file.metadata()?;
+        let named = fs::symlink_metadata(&self.lock_path)?;
+        if named.file_type().is_symlink()
+            || ConfigFileIdentity::from_metadata(&metadata) != self.lock_identity
+            || ConfigFileIdentity::from_metadata(&named) != self.lock_identity
+        {
+            anyhow::bail!(
+                "managed config lock authority changed: {}",
+                self.lock_path.display()
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn original_bytes(&self, path: &Path) -> Result<Option<Vec<u8>>> {
+        self.ensure_path(path)?;
+        self.revalidate_lock()?;
+        Ok(self
+            .original
+            .as_ref()
+            .map(|observed| observed.bytes.clone()))
+    }
+
+    fn ensure_path(&self, path: &Path) -> Result<()> {
+        let requested_parent = path.parent().context("managed config path has no parent")?;
+        let requested_parent = requested_parent.canonicalize()?;
+        let requested = requested_parent.join(
+            path.file_name()
+                .context("managed config path has no file name")?,
+        );
+        if requested != self.path {
+            anyhow::bail!(
+                "managed config lock for {} cannot mutate {}",
+                self.path.display(),
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn write_guarded(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        expected: Option<&[u8]>,
+    ) -> Result<()> {
+        self.write_guarded_with_policy(path, bytes, expected, self.private)
+    }
+
+    pub(crate) fn write_private_guarded(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        expected: Option<&[u8]>,
+    ) -> Result<()> {
+        self.write_guarded_with_policy(path, bytes, expected, true)
+    }
+
+    fn write_guarded_with_policy(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        expected: Option<&[u8]>,
+        private: bool,
+    ) -> Result<()> {
+        self.ensure_path(path)?;
+        self.revalidate_lock()?;
+        if self
+            .original
+            .as_ref()
+            .map(|observed| observed.bytes.as_slice())
+            != expected
+        {
+            anyhow::bail!(
+                "managed config expectation does not match locked state: {}",
+                path.display()
+            );
+        }
+        let current = read_config_file_nofollow(&self.path, private)?;
+        if !observed_config_matches(current.as_ref(), self.original.as_ref()) {
+            anyhow::bail!(
+                "managed config changed during locked update: {}",
+                path.display()
+            );
+        }
+        if expected == Some(bytes) {
+            return Ok(());
+        }
+        let parent = self.path.parent().context("managed config has no parent")?;
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("managed config file name is not UTF-8")?;
+        let temp = parent.join(format!(
+            ".{file_name}.kin-update-{}.tmp",
+            uuid::Uuid::new_v4()
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mode = if private {
+                0o600
+            } else {
+                self.original
+                    .as_ref()
+                    .map_or(0o600, |observed| observed.mode)
+            };
+            options
+                .mode(mode)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let result = (|| -> Result<()> {
+            let mut staged = options
+                .open(&temp)
+                .with_context(|| format!("failed to create {}", temp.display()))?;
+            staged.write_all(bytes)?;
+            staged.sync_all()?;
+            self.revalidate_lock()?;
+            let final_current = read_config_file_nofollow(&self.path, private)?;
+            if !observed_config_matches(final_current.as_ref(), self.original.as_ref()) {
+                anyhow::bail!(
+                    "managed config changed before atomic replacement: {}",
+                    path.display()
+                );
+            }
+            if config_directory_sync_injected(parent) {
+                anyhow::bail!("injected client config directory sync failure");
+            }
+            replace_config_file(&temp, &self.path, final_current.is_some())?;
+            #[cfg(unix)]
+            fs::File::open(parent)?.sync_all()?;
+            let installed = read_config_file_nofollow(&self.path, private)?
+                .context("managed config disappeared after atomic replacement")?;
+            if installed.bytes != bytes {
+                anyhow::bail!(
+                    "managed config failed post-replacement readback: {}",
+                    path.display()
+                );
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        result
+    }
+
+    pub(crate) fn remove_guarded(&self, path: &Path, expected: Option<&[u8]>) -> Result<()> {
+        self.ensure_path(path)?;
+        self.revalidate_lock()?;
+        if self
+            .original
+            .as_ref()
+            .map(|observed| observed.bytes.as_slice())
+            != expected
+        {
+            anyhow::bail!(
+                "managed config expectation does not match locked state: {}",
+                path.display()
+            );
+        }
+        let current = read_config_file_nofollow(&self.path, self.private)?;
+        if !observed_config_matches(current.as_ref(), self.original.as_ref()) {
+            anyhow::bail!(
+                "managed config changed during locked removal: {}",
+                path.display()
+            );
+        }
+        if current.is_some() {
+            fs::remove_file(&self.path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+            #[cfg(unix)]
+            fs::File::open(self.path.parent().context("managed config has no parent")?)?
+                .sync_all()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_config_file(staged: &Path, destination: &Path, _destination_exists: bool) -> Result<()> {
+    fs::rename(staged, destination)
+        .with_context(|| format!("failed to atomically replace {}", destination.display()))
+}
+
+#[cfg(windows)]
+fn replace_config_file(staged: &Path, destination: &Path, destination_exists: bool) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, ReplaceFileW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        REPLACEFILE_WRITE_THROUGH,
+    };
+
+    let wide = |path: &Path| {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>()
+    };
+    let staged = wide(staged);
+    let destination = wide(destination);
+    let ok = unsafe {
+        if destination_exists {
+            ReplaceFileW(
+                destination.as_ptr(),
+                staged.as_ptr(),
+                std::ptr::null(),
+                REPLACEFILE_WRITE_THROUGH,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } else {
+            MoveFileExW(
+                staged.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| "failed to atomically replace managed config on Windows");
+    }
+    Ok(())
+}
+
+fn merge_json_mcp_target(target: &McpRepairTarget, command: &str) -> Result<()> {
+    if target.id == "antigravity_workspace" {
+        ensure_workspace_mcp_git_excluded(
+            target
+                .repo_root
+                .as_deref()
+                .context("workspace MCP repair target has no repository root")?,
+        )?;
+    }
+    let lock = ConfigLock::acquire(&target.path)?;
+    merge_json_mcp_target_locked(target, command, &lock)
+}
+
+fn merge_json_mcp_target_locked(
+    target: &McpRepairTarget,
+    command: &str,
+    lock: &ConfigLock,
+) -> Result<()> {
+    let original = lock.original_bytes(&target.path)?;
+    let mut root: serde_json::Value = match original.as_deref() {
+        Some(bytes) => serde_json::from_slice(bytes).with_context(|| {
+            format!(
+                "existing file {} is not valid JSON; refusing to overwrite it",
+                target.path.display()
+            )
+        })?,
+        None => serde_json::json!({}),
+    };
+    let root_object = root
+        .as_object_mut()
+        .context("existing MCP JSON config is not an object")?;
+    if root_object
+        .get("mcpServers")
+        .is_some_and(|value| !value.is_object())
+    {
+        anyhow::bail!("existing mcpServers value is not an object");
+    }
+    let servers = root_object
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .expect("mcpServers was validated as an object");
+    if servers.get("kin").is_some_and(|value| !value.is_object()) {
+        anyhow::bail!("existing mcpServers.kin value is not an object");
+    }
+    let entry = servers
+        .entry("kin")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .expect("Kin MCP entry was validated as an object");
+    entry.insert(
+        "command".to_string(),
+        serde_json::Value::String(command.to_string()),
+    );
+    entry.insert("args".to_string(), serde_json::json!(["mcp", "start"]));
+    if let Some(repo_root) = target.repo_root.as_deref() {
+        entry.insert(
+            "cwd".to_string(),
+            serde_json::Value::String(repo_root.to_string_lossy().into_owned()),
+        );
+    }
+    if entry.get("env").is_some_and(|value| !value.is_object()) {
+        anyhow::bail!("existing Kin MCP env value is not an object");
+    }
+    let env = entry
+        .entry("env")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .expect("Kin MCP env was validated as an object");
+    env.insert(
+        "KIN_MCP_TOOL_PROFILE".to_string(),
+        serde_json::Value::String("agent-default".to_string()),
+    );
+    let owned_entry = root["mcpServers"]["kin"].clone();
+    let formatted = serde_json::to_vec_pretty(&root)?;
+    lock.write_guarded(&target.path, &formatted, original.as_deref())?;
+    record_mcp_entry_in_ledger(&target.id, &target.path, &owned_entry)
+}
+
+fn merge_codex_mcp_target(target: &McpRepairTarget, command: &str) -> Result<()> {
+    let lock = ConfigLock::acquire(&target.path)?;
+    merge_codex_mcp_target_locked(target, command, &lock)
+}
+
+fn merge_codex_mcp_target_locked(
+    target: &McpRepairTarget,
+    command: &str,
+    lock: &ConfigLock,
+) -> Result<()> {
+    let repo_root = target
+        .repo_root
+        .as_deref()
+        .context("cannot determine an initialized Kin repository for the Codex MCP binding")?;
+    merge_mcp_config_toml_locked(&target.path, repo_root, lock, &target.id, command)
+}
+
+pub(crate) fn remerge_mcp_targets_exact(targets: &[McpRepairTarget]) -> McpRemergeOutcome {
+    let targets = match normalize_mcp_repair_targets(targets.iter().cloned()) {
+        Ok(targets) if !targets.is_empty() => targets,
+        Ok(_) => {
+            return McpRemergeOutcome {
+                errors: vec!["MCP repair manifest is empty".to_string()],
+                ..Default::default()
+            }
+        }
+        Err(error) => {
+            return McpRemergeOutcome {
+                errors: vec![format!("invalid MCP repair manifest: {error:#}")],
+                ..Default::default()
+            }
+        }
+    };
+    let command = match managed_mcp_launcher() {
+        Ok(command) => command,
+        Err(error) => {
+            return McpRemergeOutcome {
+                errors: vec![format!("managed launcher is unavailable: {error:#}")],
+                ..Default::default()
+            }
+        }
+    };
+
+    let mut outcome = McpRemergeOutcome::default();
+    for target in targets {
+        let result = if target.id == "codex" {
+            merge_codex_mcp_target(&target, &command)
+        } else {
+            merge_json_mcp_target(&target, &command)
+        };
+        match result {
+            Ok(()) => outcome.repaired.push(target.path),
+            Err(error) => outcome.errors.push(format!(
+                "{} at {}: {error:#}",
+                target.id,
+                target.path.display()
+            )),
+        }
+    }
+    outcome
+}
+
+/// Repair an updater's exact target manifest while retaining every target
+/// lock until the ledger fingerprints are verified and the caller atomically
+/// clears its durable marker. This closes the window where a normal setup
+/// writer could change a just-repaired config between verification and clear.
+pub(crate) fn remerge_mcp_targets_exact_with_finalizer(
+    targets: &[McpRepairTarget],
+    finalizer: impl FnOnce() -> Result<()>,
+) -> Result<Vec<PathBuf>> {
+    let mut targets = normalize_mcp_repair_targets(targets.iter().cloned())?;
+    if targets.is_empty() {
+        anyhow::bail!("MCP repair manifest is empty");
+    }
+    targets.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    if targets.windows(2).any(|pair| pair[0].path == pair[1].path) {
+        anyhow::bail!("MCP repair manifest assigns one config path to multiple clients");
+    }
+    for target in &targets {
+        if target.id == "antigravity_workspace" {
+            ensure_workspace_mcp_git_excluded(
+                target
+                    .repo_root
+                    .as_deref()
+                    .context("workspace MCP repair target has no repository root")?,
+            )?;
+        }
+    }
+    let locks = targets
+        .iter()
+        .map(|target| ConfigLock::acquire(&target.path))
+        .collect::<Result<Vec<_>>>()?;
+    let command = managed_mcp_launcher()?;
+    let mut repaired = Vec::with_capacity(targets.len());
+    for (target, lock) in targets.iter().zip(&locks) {
+        if target.id == "codex" {
+            merge_codex_mcp_target_locked(target, &command, lock)?;
+        } else {
+            merge_json_mcp_target_locked(target, &command, lock)?;
+        }
+        repaired.push(target.path.clone());
+    }
+    if !mcp_repair_targets_ledger_verified(&targets)? {
+        anyhow::bail!("MCP config repair completed but setup-ledger fingerprints are not verified");
+    }
+    finalizer()?;
+    Ok(repaired)
+}
+
+pub(crate) fn remerge_existing_mcp_configs_detailed() -> McpRemergeOutcome {
+    match current_mcp_repair_targets() {
+        Ok(targets) if !targets.is_empty() => remerge_mcp_targets_exact(&targets),
+        Ok(_) => McpRemergeOutcome::default(),
+        Err(error) => McpRemergeOutcome {
+            errors: vec![format!("could not capture MCP targets: {error:#}")],
+            ..Default::default()
+        },
+    }
+}
+
+pub(crate) fn mcp_repair_targets_ledger_verified(targets: &[McpRepairTarget]) -> Result<bool> {
+    use crate::commands::setup_ledger::{verify_entry, ArtifactKind, EntryState, SetupLedger};
+
+    let targets = normalize_mcp_repair_targets(targets.iter().cloned())?;
+    if targets.is_empty() {
+        return Ok(false);
+    }
+    let ledger = SetupLedger::load(&crate::commands::setup_ledger::ledger_path()?)?;
+    for target in targets {
+        let Some(entry) = ledger.entries.iter().find(|entry| {
+            entry.kind == ArtifactKind::McpConfig
+                && entry.target == target.id
+                && entry.path == target.path
+        }) else {
+            return Ok(false);
+        };
+        if verify_entry(entry).state != EntryState::Verified {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -1651,32 +2774,23 @@ async fn apply_plan(
     Ok(configured_assistants)
 }
 
-/// Stable ledger id for an AI-client index, matching the ids used by
-/// [`crate::commands::health::mcp_client_config_paths`].
-fn client_id_for_index(idx: usize) -> &'static str {
-    match idx {
-        IDX_CLAUDE_CODE => "claude",
-        IDX_CURSOR => "cursor",
-        IDX_CODEX => "codex",
-        IDX_GEMINI => "gemini",
-        IDX_WINDSURF => "windsurf",
-        _ => "unknown",
-    }
-}
-
 /// Read the kin MCP server sub-value from a client config, if present.
 ///
 /// Handles both JSON configs (`mcpServers.kin`) and TOML configs such as
 /// Codex's `config.toml` (`mcp_servers.kin`), normalizing the entry to JSON
 /// for the install ledger.
 fn read_kin_mcp_entry(path: &Path) -> Option<serde_json::Value> {
-    let content = fs::read_to_string(path).ok()?;
+    let content = fs::read(path).ok()?;
+    read_kin_mcp_entry_from_bytes(path, &content)
+}
+
+fn read_kin_mcp_entry_from_bytes(path: &Path, content: &[u8]) -> Option<serde_json::Value> {
     if path.extension().and_then(|e| e.to_str()) == Some("toml") {
-        let root: toml::Value = toml::from_str(&content).ok()?;
+        let root: toml::Value = toml::from_str(std::str::from_utf8(content).ok()?).ok()?;
         let entry = root.get("mcp_servers")?.get("kin")?;
         return serde_json::to_value(entry).ok();
     }
-    let root: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let root: serde_json::Value = serde_json::from_slice(content).ok()?;
     root.get("mcpServers")?.get("kin").cloned()
 }
 
@@ -1692,116 +2806,102 @@ fn record_setup_ledger(plan: &SetupPlan, shell_name: &str) {
     let Ok(ledger_path) = crate::commands::setup_ledger::ledger_path() else {
         return;
     };
-    let mut ledger = SetupLedger::load(&ledger_path).unwrap_or_default();
+    let update = SetupLedger::update(&ledger_path, |ledger| {
+        if plan.install_shell_hook {
+            if let Ok(kin_home) = kin_dir() {
+                // Shell hook file — a whole file Kin owns.
+                let hook_file = kin_home.join("shell").join(hook_filename(shell_name));
+                ledger.record(LedgerEntry::whole_file(
+                    ArtifactKind::ShellHook,
+                    shell_name,
+                    hook_file.clone(),
+                    hook_content(shell_name).as_bytes(),
+                ));
 
-    if plan.install_shell_hook {
-        if let Ok(kin_home) = kin_dir() {
-            // Shell hook file — a whole file Kin owns.
-            let hook_file = kin_home.join("shell").join(hook_filename(shell_name));
-            ledger.record(LedgerEntry::whole_file(
-                ArtifactKind::ShellHook,
-                shell_name,
-                hook_file.clone(),
-                hook_content(shell_name).as_bytes(),
-            ));
-
-            // VFS shim — a whole file, recorded only when a usable one landed.
-            let shim = kin_home.join("lib").join(shim_filename());
-            if let Ok(bytes) = fs::read(&shim) {
-                if !bytes.is_empty() {
-                    ledger.record(LedgerEntry::whole_file(
-                        ArtifactKind::VfsShim,
-                        "shim",
-                        shim,
-                        &bytes,
-                    ));
-                }
-            }
-
-            // rc source-line block — an appended marker, recorded only when it
-            // is actually present in the rc (i.e. we appended it this run or a
-            // prior one).
-            if let Ok(rc_path) = shell_rc(shell_name) {
-                let block = rc_integration_block(&rc_source_line(shell_name, &hook_file));
-                let present = fs::read_to_string(&rc_path)
-                    .map(|c| c.contains(&block))
-                    .unwrap_or(false);
-                if present {
-                    ledger.record(LedgerEntry::appended(
-                        ArtifactKind::ShellRcLine,
-                        shell_name,
-                        rc_path.clone(),
-                        block,
-                    ));
+                // VFS shim — a whole file, recorded only when a usable one landed.
+                let shim = kin_home.join("lib").join(shim_filename());
+                if let Ok(bytes) = fs::read(&shim) {
+                    if !bytes.is_empty() {
+                        ledger.record(LedgerEntry::whole_file(
+                            ArtifactKind::VfsShim,
+                            "shim",
+                            shim,
+                            &bytes,
+                        ));
+                    }
                 }
 
-                let bin_dir = kin_home.join("bin");
-                let path_block = rc_path_block(shell_name, &bin_dir);
-                let path_present = fs::read_to_string(&rc_path)
-                    .map(|c| c.contains(&path_block))
-                    .unwrap_or(false);
-                if path_present {
-                    ledger.record(LedgerEntry::appended(
-                        ArtifactKind::ShellPathLine,
-                        format!("{shell_name}-path"),
-                        rc_path,
-                        path_block,
-                    ));
+                // rc source-line block — an appended marker, recorded only when it
+                // is actually present in the rc (i.e. we appended it this run or a
+                // prior one).
+                if let Ok(rc_path) = shell_rc(shell_name) {
+                    let block = rc_integration_block(&rc_source_line(shell_name, &hook_file));
+                    let present = fs::read_to_string(&rc_path)
+                        .map(|c| c.contains(&block))
+                        .unwrap_or(false);
+                    if present {
+                        ledger.record(LedgerEntry::appended(
+                            ArtifactKind::ShellRcLine,
+                            shell_name,
+                            rc_path.clone(),
+                            block,
+                        ));
+                    }
+
+                    let bin_dir = kin_home.join("bin");
+                    let path_block = rc_path_block(shell_name, &bin_dir);
+                    let path_present = fs::read_to_string(&rc_path)
+                        .map(|c| c.contains(&path_block))
+                        .unwrap_or(false);
+                    if path_present {
+                        ledger.record(LedgerEntry::appended(
+                            ArtifactKind::ShellPathLine,
+                            format!("{shell_name}-path"),
+                            rc_path,
+                            path_block,
+                        ));
+                    }
                 }
             }
         }
-    }
 
-    if plan.configure_mcp {
-        for idx in &plan.mcp_assistant_indices {
-            let Some(path) = mcp_config_path_for_index(*idx) else {
-                continue;
-            };
-            if let Some(kin_entry) = read_kin_mcp_entry(&path) {
-                ledger.record(LedgerEntry::mcp(
-                    client_id_for_index(*idx),
-                    path,
-                    &kin_entry,
+        if plan.inject_discovery_reminders {
+            if let Ok(home) = home_dir() {
+                for (target, path) in [
+                    ("claude-md", home.join(".claude").join("CLAUDE.md")),
+                    ("codex-agents", home.join(".codex").join("AGENTS.md")),
+                ] {
+                    let present = fs::read_to_string(&path)
+                        .map(|c| c.contains(KIN_DISCOVERY_REMINDER))
+                        .unwrap_or(false);
+                    if present {
+                        ledger.record(LedgerEntry::appended(
+                            ArtifactKind::DiscoveryReminder,
+                            target,
+                            path,
+                            KIN_DISCOVERY_REMINDER,
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Daemon auto-start config — always written by apply_plan.
+        if let Ok(kin_home) = kin_dir() {
+            let cfg = kin_home.join("config").join("setup.toml");
+            if let Ok(bytes) = fs::read(&cfg) {
+                ledger.record(LedgerEntry::whole_file(
+                    ArtifactKind::DaemonConfig,
+                    "daemon",
+                    cfg,
+                    &bytes,
                 ));
             }
         }
-    }
 
-    if plan.inject_discovery_reminders {
-        if let Ok(home) = home_dir() {
-            for (target, path) in [
-                ("claude-md", home.join(".claude").join("CLAUDE.md")),
-                ("codex-agents", home.join(".codex").join("AGENTS.md")),
-            ] {
-                let present = fs::read_to_string(&path)
-                    .map(|c| c.contains(KIN_DISCOVERY_REMINDER))
-                    .unwrap_or(false);
-                if present {
-                    ledger.record(LedgerEntry::appended(
-                        ArtifactKind::DiscoveryReminder,
-                        target,
-                        path,
-                        KIN_DISCOVERY_REMINDER,
-                    ));
-                }
-            }
-        }
-    }
-
-    // Daemon auto-start config — always written by apply_plan.
-    if let Ok(kin_home) = kin_dir() {
-        let cfg = kin_home.join("config").join("setup.toml");
-        if let Ok(bytes) = fs::read(&cfg) {
-            ledger.record(LedgerEntry::whole_file(
-                ArtifactKind::DaemonConfig,
-                "daemon",
-                cfg,
-                &bytes,
-            ));
-        }
-    }
-
-    if let Err(e) = ledger.save(&ledger_path) {
+        Ok(())
+    });
+    if let Err(e) = update {
         println!(
             "  {} could not write install ledger: {e}",
             style("!").yellow()
@@ -2067,13 +3167,12 @@ pub async fn doctor(fix: bool, json: bool) -> Result<()> {
             )),
             Ok(None) => {
                 // No local shim source. Fetch the shim from the matching release.
-                let dest = kin_dir()?.join("lib").join(shim_filename());
                 println!(
                     "  No local VFS shim found; fetching it from the v{} release...",
                     env!("CARGO_PKG_VERSION")
                 );
-                match crate::commands::update::download_shim_for_current_version(&dest).await {
-                    Ok(()) => applied.push(format!(
+                match crate::commands::update::download_shim_for_current_version().await {
+                    Ok(dest) => applied.push(format!(
                         "downloaded the VFS shim from the v{} release ({})",
                         env!("CARGO_PKG_VERSION"),
                         dest.display()
@@ -2672,13 +3771,15 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_mcp_config_refuses_to_overwrite_corrupt_json() {
         let dir = tempfile::tempdir().unwrap();
+        let _kin_home = EnvGuard::set("KIN_HOME", dir.path().join("kin-home"));
         let path = dir.path().join("config.json");
         std::fs::write(&path, b"this is not json {{{").unwrap();
 
         let original = std::fs::read(&path).unwrap();
-        let err = merge_mcp_config(&path).unwrap_err();
+        let err = merge_mcp_config(&path, "cursor").unwrap_err();
         let msg = err.to_string();
 
         assert!(
@@ -2697,12 +3798,14 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_mcp_config_merges_into_valid_existing_file() {
         let dir = tempfile::tempdir().unwrap();
+        let _kin_home = EnvGuard::set("KIN_HOME", dir.path().join("kin-home"));
         let path = dir.path().join("config.json");
         std::fs::write(&path, r#"{"existingKey": true}"#).unwrap();
 
-        merge_mcp_config(&path).unwrap();
+        merge_mcp_config(&path, "cursor").unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         let val: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -2714,13 +3817,17 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_mcp_config_toml_refuses_to_overwrite_corrupt_toml() {
         let dir = tempfile::tempdir().unwrap();
+        let _kin_home = EnvGuard::set("KIN_HOME", dir.path().join("kin-home"));
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".kin")).unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, b"this is not toml [[[").unwrap();
 
         let original = std::fs::read(&path).unwrap();
-        let err = merge_mcp_config_toml(&path).unwrap_err();
+        let err = merge_mcp_config_toml(&path, &repo).unwrap_err();
         let msg = err.to_string();
 
         assert!(
@@ -2739,8 +3846,13 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_mcp_config_toml_preserves_existing_codex_config() {
         let dir = tempfile::tempdir().unwrap();
+        let _kin_home = EnvGuard::set("KIN_HOME", dir.path().join("kin-home"));
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".kin")).unwrap();
+        let repo = repo.canonicalize().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
@@ -2748,7 +3860,7 @@ mod tests {
         )
         .unwrap();
 
-        merge_mcp_config_toml(&path).unwrap();
+        merge_mcp_config_toml(&path, &repo).unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         let root: toml::Value = toml::from_str(&content).unwrap();
@@ -2770,9 +3882,10 @@ mod tests {
         assert!(kin.get("command").is_some(), "kin entry must be added");
         assert_eq!(
             kin["args"].as_array().map(|a| a.len()),
-            Some(2),
-            "kin args must be [mcp, start]"
+            Some(4),
+            "kin args must include an exact --repo binding"
         );
+        assert_eq!(kin["args"][3].as_str(), repo.to_str());
         assert_eq!(
             kin["env"]["KIN_MCP_TOOL_PROFILE"].as_str(),
             Some("agent-default"),
@@ -2781,12 +3894,17 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_mcp_config_toml_creates_missing_file_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
+        let _kin_home = EnvGuard::set("KIN_HOME", dir.path().join("kin-home"));
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".kin")).unwrap();
+        let repo = repo.canonicalize().unwrap();
         let path = dir.path().join(".codex").join("config.toml");
 
-        merge_mcp_config_toml(&path).unwrap();
-        merge_mcp_config_toml(&path).unwrap();
+        merge_mcp_config_toml(&path, &repo).unwrap();
+        merge_mcp_config_toml(&path, &repo).unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         let root: toml::Value = toml::from_str(&content).unwrap();
@@ -2807,6 +3925,114 @@ mod tests {
         assert_eq!(
             ledger_entry["env"]["KIN_MCP_TOOL_PROFILE"], "agent-default",
             "ledger entry must normalize the TOML entry to JSON"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn codex_merge_preserves_table_env_cwd_and_user_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let _kin_home = EnvGuard::set("KIN_HOME", dir.path().join("kin-home"));
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".kin")).unwrap();
+        let repo = repo.canonicalize().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "[mcp_servers.kin]\ncommand = \"old\"\nargs = [\"mcp\", \"start\"]\ncwd = {:?}\ndisabled = true\n\n[mcp_servers.kin.env]\nUSER_POLICY = \"keep\"\n",
+                repo.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        merge_mcp_config_toml(&path, &repo).unwrap();
+        let root: toml::Value = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        let kin = &root["mcp_servers"]["kin"];
+        assert_eq!(kin["cwd"].as_str(), repo.to_str());
+        assert_eq!(kin["disabled"].as_bool(), Some(true));
+        assert_eq!(kin["env"]["USER_POLICY"].as_str(), Some("keep"));
+        assert_eq!(
+            kin["env"]["KIN_MCP_TOOL_PROFILE"].as_str(),
+            Some("agent-default")
+        );
+        assert_eq!(kin["args"][3].as_str(), repo.to_str());
+    }
+
+    #[test]
+    #[serial]
+    fn structurally_incompatible_configs_fail_closed_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let _kin_home = EnvGuard::set("KIN_HOME", dir.path().join("kin-home"));
+        let json = dir.path().join("config.json");
+        let json_bytes = br#"{"mcpServers":{"kin":{"env":"user-owned"}}}"#;
+        fs::write(&json, json_bytes).unwrap();
+        assert!(merge_mcp_config(&json, "cursor").is_err());
+        assert_eq!(fs::read(json).unwrap(), json_bytes);
+
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".kin")).unwrap();
+        let toml = dir.path().join("config.toml");
+        let toml_bytes = b"mcp_servers = 7\n";
+        fs::write(&toml, toml_bytes).unwrap();
+        assert!(merge_mcp_config_toml(&toml, &repo).is_err());
+        assert_eq!(fs::read(toml).unwrap(), toml_bytes);
+    }
+
+    #[test]
+    fn workspace_mcp_excludes_are_idempotent_in_linked_worktrees() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        let linked = dir.path().join("linked");
+        fs::create_dir_all(&main).unwrap();
+        let git = |args: &[&str], cwd: &Path| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"], &main);
+        git(&["config", "user.email", "kin-test@example.invalid"], &main);
+        git(&["config", "user.name", "Kin Test"], &main);
+        fs::write(main.join("README.md"), "fixture\n").unwrap();
+        git(&["add", "README.md"], &main);
+        git(&["commit", "-qm", "fixture"], &main);
+        let linked_text = linked.to_string_lossy().into_owned();
+        git(
+            &["worktree", "add", "-q", "-b", "linked-test", &linked_text],
+            &main,
+        );
+
+        let first = ensure_workspace_mcp_git_excluded(&linked).unwrap().unwrap();
+        let second = ensure_workspace_mcp_git_excluded(&linked).unwrap().unwrap();
+        assert_eq!(first, second);
+        let config = linked.join(".agents/mcp_config.json");
+        drop(ConfigLock::acquire(&config).unwrap());
+        fs::write(&config, "{}\n").unwrap();
+
+        let exclude = fs::read_to_string(first).unwrap();
+        for pattern in WORKSPACE_MCP_GIT_EXCLUDE_PATTERNS {
+            assert_eq!(exclude.lines().filter(|line| *line == pattern).count(), 1);
+        }
+        let status = Command::new("git")
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .current_dir(&linked)
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert!(
+            status.stdout.is_empty(),
+            "workspace MCP config or lock leaked into Git status: {}",
+            String::from_utf8_lossy(&status.stdout)
         );
     }
 }

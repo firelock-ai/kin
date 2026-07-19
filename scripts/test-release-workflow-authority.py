@@ -614,6 +614,47 @@ def main() -> None:
         "./scripts/read-update-build-identity.test.cjs",
         "static release build identity parser regression",
     )
+    archive_attestation_start = publish_job.index(
+        "      - name: Attest final release archives and provenance"
+    )
+    release_creation_start = publish_job.index(
+        "      - name: Create GitHub Release", archive_attestation_start
+    )
+    if archive_attestation_start >= release_creation_start:
+        raise AssertionError(
+            "final release archives must be attested before the first GitHub Release write"
+        )
+    archive_attestation_step = publish_job[
+        archive_attestation_start:release_creation_start
+    ]
+    for policy in (
+        "actions/attest@a1948c3f048ba23858d222213b7c278aabede763",
+        "subject-path: |",
+        "kin-linux-x86_64.tar.gz",
+        "kin-linux-aarch64.tar.gz",
+        "kin-macos-x86_64.tar.gz",
+        "kin-macos-aarch64.tar.gz",
+        "kin-windows-x86_64.zip",
+        "release-provenance.json",
+        "Fail closed",
+    ):
+        require(
+            archive_attestation_step,
+            policy,
+            "final platform-archive attestation authority",
+        )
+    for policy in (
+        "--expect-version",
+        "--expect-sha",
+        "--expect-archive-sha256",
+        "gh attestation verify",
+        "firelock-ai/kin/.github/workflows/release.yml",
+        "sourceRepositoryDigest",
+        "opens the install lock or performs local mutation",
+        "selection and drift evidence only",
+        "does not authenticate archive bytes",
+    ):
+        require(update_trust, policy, "pinned updater external byte-authority contract")
     parser = (ROOT / "scripts" / "read-update-build-identity.cjs").read_text(
         encoding="utf-8"
     )

@@ -236,6 +236,32 @@ asserts `kin-daemon` is present in the archive before moving any files, so a
 daemon-less archive aborts cleanly instead of leaving a half-installed
 environment.
 
+### Unattended pinned updater contract
+
+An unattended mutating `kin update` requires the complete
+`--expect-version`, `--expect-sha`, and `--expect-archive-sha256` tuple. The
+version and peeled tag commit select one release, but they do not authenticate
+the platform archive bytes. External automation must first verify the exact
+platform archive with `gh attestation verify` against
+`firelock-ai/kin/.github/workflows/release.yml` and the expected tagged source
+commit, require the verified attestation's `sourceRepositoryDigest` to equal
+that commit, then hash those verified downloaded bytes and supply that SHA-256
+through `--expect-archive-sha256`.
+
+The updater downloads and owns a fresh copy of the platform archive. Before it
+opens the install lock or performs local mutation, it hashes those bytes and
+compares them with the independently supplied digest. It then validates the
+co-published checksum, schema-v2 provenance, and fixed-width static build
+identities as defense in depth. The updater has no runtime dependency on `gh`;
+attestation verification remains the responsibility of the external automation
+supplying the archive digest.
+
+`kin update --check-only` is read-only and does not fetch platform archive
+bytes. With the complete pin tuple, it compares the supplied archive digest to
+bounded published checksum metadata in addition to version and peeled tag
+commit selection. That comparison is selection and drift evidence only; it
+does not authenticate archive bytes that check-only never downloaded.
+
 On macOS, the second, independent layer is enforced by the OS at run time:
 because the binaries are signed with a Developer ID and notarized, Gatekeeper
 validates the signature and (online) the notarization ticket the first time each

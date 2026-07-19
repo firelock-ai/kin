@@ -196,12 +196,15 @@ impl SetupLedger {
     /// has not run yet); a present-but-unparseable file is an error rather than
     /// being silently discarded, so we never lose track of what to uninstall.
     pub fn load(path: &Path) -> Result<Self> {
-        if !path.exists() {
+        let bytes = super::setup::read_private_file_nofollow(path)?;
+        Self::from_locked_bytes(path, bytes.as_deref())
+    }
+
+    fn from_locked_bytes(path: &Path, bytes: Option<&[u8]>) -> Result<Self> {
+        let Some(bytes) = bytes else {
             return Ok(Self::default());
-        }
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let ledger: SetupLedger = serde_json::from_str(&content).with_context(|| {
+        };
+        let ledger: SetupLedger = serde_json::from_slice(bytes).with_context(|| {
             format!(
                 "install ledger {} is not valid JSON — fix or remove it and re-run `kin setup`",
                 path.display()
@@ -213,22 +216,37 @@ impl SetupLedger {
     /// Serialize the ledger to `path` (pretty), creating the parent directory.
     /// An empty ledger removes the file so a clean uninstall leaves no residue.
     pub fn save(&self, path: &Path) -> Result<()> {
+        let lock = super::setup::ConfigLock::acquire_nofollow(path)?;
+        let original = lock.original_bytes(path)?;
+        self.save_locked(path, &lock, original.as_deref())
+    }
+
+    fn save_locked(
+        &self,
+        path: &Path,
+        lock: &super::setup::ConfigLock,
+        original: Option<&[u8]>,
+    ) -> Result<()> {
         if self.entries.is_empty() {
-            if path.exists() {
-                fs::remove_file(path)
-                    .with_context(|| format!("failed to remove empty ledger {}", path.display()))?;
-            }
+            lock.remove_guarded(path, original)?;
             return Ok(());
-        }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create directory {}", parent.display()))?;
         }
         let formatted =
             serde_json::to_string_pretty(self).context("failed to serialize install ledger")?;
-        fs::write(path, formatted)
-            .with_context(|| format!("failed to write {}", path.display()))?;
+        lock.write_private_guarded(path, formatted.as_bytes(), original)?;
         Ok(())
+    }
+
+    /// Perform a locked load-modify-save transaction. Every ledger writer uses
+    /// this path so concurrent setup, doctor, updater repair, and uninstall
+    /// operations cannot overwrite one another's entries.
+    pub fn update<R>(path: &Path, mutate: impl FnOnce(&mut SetupLedger) -> Result<R>) -> Result<R> {
+        let lock = super::setup::ConfigLock::acquire_nofollow(path)?;
+        let original = lock.original_bytes(path)?;
+        let mut ledger = Self::from_locked_bytes(path, original.as_deref())?;
+        let result = mutate(&mut ledger)?;
+        ledger.save_locked(path, &lock, original.as_deref())?;
+        Ok(result)
     }
 
     /// Upsert `entry` by its `(kind, target, path)` identity. A re-record keeps
@@ -497,27 +515,32 @@ pub fn run_uninstall(
     dry_run: bool,
     force: bool,
 ) -> Result<Vec<RemovalOutcome>> {
-    let mut ledger = SetupLedger::load(ledger_path)?;
-    let outcomes: Vec<RemovalOutcome> = ledger
-        .entries
-        .iter()
-        .map(|entry| uninstall_entry(entry, dry_run, force))
-        .collect();
-
-    if !dry_run {
-        // Keep only entries that still need tracking (modified-and-skipped or
-        // failed removals); drop everything successfully cleared.
-        let keep: Vec<bool> = outcomes.iter().map(|o| !o.is_cleared()).collect();
-        let mut idx = 0;
-        ledger.entries.retain(|_| {
-            let k = keep[idx];
-            idx += 1;
-            k
-        });
-        ledger.save(ledger_path)?;
+    if dry_run {
+        let ledger = SetupLedger::load(ledger_path)?;
+        return Ok(ledger
+            .entries
+            .iter()
+            .map(|entry| uninstall_entry(entry, true, force))
+            .collect());
     }
-
-    Ok(outcomes)
+    SetupLedger::update(ledger_path, |ledger| {
+        let outcomes: Vec<RemovalOutcome> = ledger
+            .entries
+            .iter()
+            .map(|entry| uninstall_entry(entry, false, force))
+            .collect();
+        let keep: Vec<bool> = outcomes
+            .iter()
+            .map(|outcome| !outcome.is_cleared())
+            .collect();
+        let mut index = 0;
+        ledger.entries.retain(|_| {
+            let retain = keep[index];
+            index += 1;
+            retain
+        });
+        Ok(outcomes)
+    })
 }
 
 /// Verify every entry in the ledger at `ledger_path` against disk.
@@ -685,11 +708,62 @@ mod tests {
         assert!(SetupLedger::load(&path).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ledger_load_rejects_symlink_and_unsafe_mode() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.json");
+        write(&target, r#"{"schema_version":1,"entries":[]}"#);
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("linked-ledger.json");
+        symlink(&target, &link).unwrap();
+        assert!(SetupLedger::load(&link).is_err());
+
+        let unsafe_mode = dir.path().join("unsafe-ledger.json");
+        write(&unsafe_mode, r#"{"schema_version":1,"entries":[]}"#);
+        fs::set_permissions(&unsafe_mode, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(SetupLedger::load(&unsafe_mode).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ledger_and_persistent_lock_are_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("setup-ledger.json");
+        let mut ledger = SetupLedger::default();
+        ledger.record(LedgerEntry::whole_file(
+            ArtifactKind::DaemonConfig,
+            "daemon",
+            dir.path().join("setup.toml"),
+            b"[daemon]",
+        ));
+        ledger.save(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let lock = dir.path().join(".setup-ledger.json.kin-update.lock");
+        assert!(lock.is_file(), "ledger lock must remain persistent");
+        assert_eq!(
+            fs::metadata(lock).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
     #[test]
     fn save_empty_ledger_removes_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("setup-ledger.json");
         write(&path, "{}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
         SetupLedger::default().save(&path).unwrap();
         assert!(!path.exists(), "empty ledger leaves no residue on disk");
     }
