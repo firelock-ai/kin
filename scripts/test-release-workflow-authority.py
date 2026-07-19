@@ -342,7 +342,7 @@ def main() -> None:
 
     for policy in (
         "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
-        "docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f",
+        "docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c",
         "docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a",
         "Keep polling the bounded log authority even",
     ):
@@ -448,7 +448,7 @@ def main() -> None:
         "persist-credentials: false",
         "fetch-depth: 0",
         "docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0",
-        "docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f",
+        "docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c",
         "EXPECTED_COMMIT: ${{ needs.build_daemon_image.outputs.commit }}",
         "EXPECTED_SOURCE_DIGEST: ${{ needs.build_daemon_image.outputs.digest }}",
         "is not an exact stable release tag",
