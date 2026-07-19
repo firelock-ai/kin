@@ -1650,6 +1650,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&lock_path)
             .unwrap();
         holder.try_lock_exclusive().unwrap();
