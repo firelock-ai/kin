@@ -277,9 +277,8 @@ pub(crate) fn output_with_timeout(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                terminate_and_confirm_tree(&tree).with_context(|| {
-                    format!("failed to clean descendants after {label} exited")
-                })?;
+                terminate_and_confirm_tree(&tree)
+                    .with_context(|| format!("failed to clean descendants after {label} exited"))?;
                 return read_captured_output(stdout, stderr, status);
             }
             Ok(None) if Instant::now() < deadline => {
@@ -348,7 +347,10 @@ mod tests {
         eprintln!("bounded child stderr");
         fs_write(PathBuf::from(&marker).with_extension("started"), b"started");
         std::thread::sleep(Duration::from_secs(30));
-        fs_write(PathBuf::from(marker).with_extension("finished"), b"finished");
+        fs_write(
+            PathBuf::from(marker).with_extension("finished"),
+            b"finished",
+        );
     }
 
     #[test]
@@ -390,7 +392,10 @@ mod tests {
                 std::process::id().to_string().as_bytes(),
             );
             std::thread::sleep(Duration::from_secs(30));
-            fs_write(PathBuf::from(marker).with_extension("finished"), b"finished");
+            fs_write(
+                PathBuf::from(marker).with_extension("finished"),
+                b"finished",
+            );
             return;
         }
         let Some(marker) = std::env::var_os(DESCENDANT_PARENT) else {
@@ -437,9 +442,7 @@ mod tests {
         .unwrap();
         assert!(output.status.success(), "{output:?}");
         assert!(started.elapsed() < Duration::from_secs(10));
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("descendant inherited stdout")
-        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("descendant inherited stdout"));
         let pid = std::fs::read_to_string(marker.with_extension("pid"))
             .unwrap()
             .parse::<u32>()

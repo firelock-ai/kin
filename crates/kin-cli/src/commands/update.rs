@@ -10055,9 +10055,7 @@ fn is_newer(latest: &str, current: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_subprocess::{
-        output_with_timeout, DEFAULT_TEST_SUBPROCESS_TIMEOUT,
-    };
+    use crate::commands::test_subprocess::{output_with_timeout, DEFAULT_TEST_SUBPROCESS_TIMEOUT};
     use serial_test::serial;
     use std::ffi::{OsStr, OsString};
 

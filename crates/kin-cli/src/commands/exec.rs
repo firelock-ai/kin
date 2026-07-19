@@ -433,12 +433,12 @@ fn detect_external_tool(command: &str) -> Option<ExternalToolKind> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::run_command_in_session;
     use super::{
         close_exec_session, detect_external_tool, plan_materialization_scope,
         resolve_materialization_scope, session_env, ExternalToolKind,
     };
-    #[cfg(unix)]
-    use super::run_command_in_session;
     use kin_core::{ExternalToolExecutionPolicy, KinConfig, WorldPreset};
     use kin_model::{
         Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
