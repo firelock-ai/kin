@@ -176,9 +176,10 @@ pub async fn run_stdio_daemon(
 
     // MCP `roots` binding state. We only reach out for workspace roots when we
     // could not bind a repository at startup and the client says it can serve
-    // them; `roots_requested` guards against asking more than once.
+    // them. An editor may initialize the shared MCP process before opening a
+    // workspace, so only suppress a request while one is actually in flight.
     let mut client_supports_roots = false;
-    let mut roots_requested = false;
+    let mut roots_request_in_flight = false;
 
     while let Some((message, framed)) = read_stdio_message(&mut reader).await? {
         // Peek at the raw JSON so we can distinguish the client's requests and
@@ -197,6 +198,7 @@ pub async fn run_stdio_daemon(
             if method.is_none()
                 && value.get("id").and_then(|id| id.as_str()) == Some(ROOTS_REQUEST_ID)
             {
+                roots_request_in_flight = false;
                 if let Some(binder) = repo_binder.as_ref() {
                     let roots = parse_workspace_roots(&value);
                     if roots.is_empty() {
@@ -214,17 +216,16 @@ pub async fn run_stdio_daemon(
 
             // Once the client finishes initializing (or asks for the tool list)
             // and we still have no bound daemon, ask it for its workspace roots.
-            let post_init = matches!(
+            // Retry after an earlier empty response, and honor the MCP roots
+            // change notification used when an editor opens or changes folders.
+            if should_request_workspace_roots(
                 method,
-                Some("initialized") | Some("notifications/initialized") | Some("tools/list")
-            );
-            if post_init
-                && !roots_requested
-                && client_supports_roots
-                && repo_binder.is_some()
-                && daemon_is_unbound()
-            {
-                roots_requested = true;
+                client_supports_roots,
+                roots_request_in_flight,
+                repo_binder.is_some(),
+                daemon_is_unbound(),
+            ) {
+                roots_request_in_flight = true;
                 let request = serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": ROOTS_REQUEST_ID,
@@ -252,6 +253,31 @@ fn daemon_is_unbound() -> bool {
     std::env::var("KIN_DAEMON_URL")
         .map(|value| value.trim().is_empty())
         .unwrap_or(true)
+}
+
+/// Decide whether an inbound client message should trigger a workspace-roots
+/// request. Kept separate from the stdio loop so the retry semantics remain
+/// deterministic and testable without mutating process-global daemon state.
+fn should_request_workspace_roots(
+    method: Option<&str>,
+    client_supports_roots: bool,
+    request_in_flight: bool,
+    has_repo_binder: bool,
+    daemon_unbound: bool,
+) -> bool {
+    let refresh_trigger = matches!(
+        method,
+        Some("initialized")
+            | Some("notifications/initialized")
+            | Some("notifications/roots/list_changed")
+            | Some("tools/list")
+    );
+
+    refresh_trigger
+        && client_supports_roots
+        && !request_in_flight
+        && has_repo_binder
+        && daemon_unbound
 }
 
 /// Extract filesystem paths from an MCP `roots/list` response
@@ -1237,5 +1263,62 @@ mod tests {
         );
         // A response carrying no roots yields an empty list, never a panic.
         assert!(parse_workspace_roots(&serde_json::json!({ "result": {} })).is_empty());
+    }
+
+    #[test]
+    fn workspace_roots_retry_after_empty_response_or_root_change() {
+        for method in [
+            "initialized",
+            "notifications/initialized",
+            "notifications/roots/list_changed",
+            "tools/list",
+        ] {
+            assert!(should_request_workspace_roots(
+                Some(method),
+                true,
+                false,
+                true,
+                true,
+            ));
+        }
+    }
+
+    #[test]
+    fn workspace_roots_request_stays_serialized() {
+        assert!(!should_request_workspace_roots(
+            Some("notifications/roots/list_changed"),
+            true,
+            true,
+            true,
+            true,
+        ));
+        assert!(!should_request_workspace_roots(
+            Some("tools/list"),
+            true,
+            true,
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn workspace_roots_request_requires_capability_binder_and_unbound_daemon() {
+        let trigger = Some("tools/list");
+        assert!(!should_request_workspace_roots(
+            trigger, false, false, true, true,
+        ));
+        assert!(!should_request_workspace_roots(
+            trigger, true, false, false, true,
+        ));
+        assert!(!should_request_workspace_roots(
+            trigger, true, false, true, false,
+        ));
+        assert!(!should_request_workspace_roots(
+            Some("tools/call"),
+            true,
+            false,
+            true,
+            true,
+        ));
     }
 }
