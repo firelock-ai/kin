@@ -850,11 +850,6 @@ fn mark_newly_created_handle_for_cleanup(handle: HANDLE) -> Result<()> {
     Ok(())
 }
 
-/// Atomically create a current-user-only file. Existing paths are refused.
-pub(crate) fn create_current_user_private_file(path: &Path) -> Result<File> {
-    create_current_user_private_file_with_disposition(path, CREATE_NEW, FILE_SHARE_READ, DELETE)
-}
-
 /// Create one current-user-only marker with exact-object cleanup authority.
 /// DELETE is requested on the returned handle and FILE_SHARE_DELETE remains
 /// absent, so callers can dispose only this CREATE_NEW object by handle if a
@@ -1748,6 +1743,7 @@ impl WindowsPrivateTempDir {
         &self.path
     }
 
+    #[cfg(test)]
     pub(super) fn seal_directory(&mut self, path: &Path) -> Result<()> {
         self.tree
             .as_mut()

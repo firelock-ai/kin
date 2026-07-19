@@ -1912,9 +1912,26 @@ fn managed_mcp_launcher() -> Result<String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
+#[cfg(all(test, unix))]
+enum InjectedConfigObjectDrift {
+    Bytes(fs::File, Vec<u8>),
+    Mode(fs::File, u32),
+}
+
 #[cfg(test)]
 thread_local! {
     static FAIL_CONFIG_DIRECTORY_SYNC_UNDER: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+    #[cfg(unix)]
+    static INJECT_CONFIG_DIRECTORY_EEXIST_AT: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+    #[cfg(unix)]
+    static INJECT_CONFIG_AUTHORITY_DRIFT_AT_PHASE:
+        std::cell::RefCell<Option<(&'static str, PathBuf, u32)>> =
+        const { std::cell::RefCell::new(None) };
+    #[cfg(unix)]
+    static INJECT_CONFIG_OBJECT_DRIFT_AT_PHASE:
+        std::cell::RefCell<Option<(&'static str, InjectedConfigObjectDrift)>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -1936,6 +1953,95 @@ pub(crate) fn inject_config_directory_sync_failure_under(root: Option<&Path>) {
     });
 }
 
+#[cfg(all(test, unix))]
+fn inject_config_directory_eexist_at(path: Option<&Path>) {
+    INJECT_CONFIG_DIRECTORY_EEXIST_AT.with(|configured| {
+        *configured.borrow_mut() = path.map(Path::to_path_buf);
+    });
+}
+
+#[cfg(all(test, unix))]
+fn maybe_inject_config_directory_eexist(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let inject = INJECT_CONFIG_DIRECTORY_EEXIST_AT.with(|configured| {
+        if configured.borrow().as_deref() == Some(path) {
+            configured.borrow_mut().take();
+            true
+        } else {
+            false
+        }
+    });
+    if inject {
+        fs::create_dir(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o777))?;
+    }
+    Ok(())
+}
+
+#[cfg(all(not(test), unix))]
+fn maybe_inject_config_directory_eexist(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+fn inject_config_authority_drift_at_phase(phase: Option<(&'static str, &Path, u32)>) {
+    INJECT_CONFIG_AUTHORITY_DRIFT_AT_PHASE.with(|configured| {
+        *configured.borrow_mut() =
+            phase.map(|(phase, path, mode)| (phase, path.to_path_buf(), mode));
+    });
+}
+
+#[cfg(all(test, unix))]
+fn inject_config_object_drift_at_phase(phase: Option<(&'static str, InjectedConfigObjectDrift)>) {
+    INJECT_CONFIG_OBJECT_DRIFT_AT_PHASE.with(|configured| {
+        *configured.borrow_mut() = phase;
+    });
+}
+
+#[cfg(all(test, unix))]
+fn maybe_inject_config_authority_drift(phase: &'static str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let configured = INJECT_CONFIG_AUTHORITY_DRIFT_AT_PHASE.with(|configured| {
+        let matches = configured
+            .borrow()
+            .as_ref()
+            .is_some_and(|(configured_phase, _, _)| *configured_phase == phase);
+        matches.then(|| configured.borrow_mut().take()).flatten()
+    });
+    if let Some((_, path, mode)) = configured {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    }
+    let object_drift = INJECT_CONFIG_OBJECT_DRIFT_AT_PHASE.with(|configured| {
+        let matches = configured
+            .borrow()
+            .as_ref()
+            .is_some_and(|(configured_phase, _)| *configured_phase == phase);
+        matches.then(|| configured.borrow_mut().take()).flatten()
+    });
+    match object_drift {
+        Some((_, InjectedConfigObjectDrift::Bytes(mut file, bytes))) => {
+            file.set_len(0)?;
+            file.rewind()?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        Some((_, InjectedConfigObjectDrift::Mode(file, mode))) => {
+            rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(mode as _))?;
+            file.sync_all()?;
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+#[cfg(all(not(test), unix))]
+fn maybe_inject_config_authority_drift(_phase: &'static str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
 fn config_directory_sync_injected(path: &Path) -> bool {
     #[cfg(test)]
     {
@@ -3895,6 +4001,7 @@ fn create_config_directory_all_durable(
     }
     let mut final_created = false;
     for (index, component) in missing.iter().rev().enumerate() {
+        maybe_inject_config_directory_eexist(&display.join(component))?;
         let created = match rustix::fs::mkdirat(
             &parent,
             component.as_os_str(),
@@ -3932,8 +4039,8 @@ fn create_config_directory_all_durable(
             rustix::fs::Mode::empty(),
         )?;
         let child = fs::File::from(fd);
-        if created && private_chain {
-            validate_private_unix_directory(&display.join(component), &child, true)?;
+        if private_chain {
+            validate_private_unix_directory(&display.join(component), &child, created)?;
         }
         if created {
             sync_config_parent(&child)?;
@@ -4073,6 +4180,15 @@ fn ensure_config_binding_at(
         anyhow::bail!("{label} changed object identity");
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_config_absent_at(parent: &fs::File, name: &str, label: &str) -> Result<()> {
+    match rustix::fs::statat(parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+        Err(rustix::io::Errno::NOENT) => Ok(()),
+        Ok(_) => anyhow::bail!("{label} unexpectedly remains visible"),
+        Err(error) => Err(error).with_context(|| format!("failed to prove {label} absent")),
+    }
 }
 
 #[cfg(unix)]
@@ -6705,6 +6821,8 @@ impl ConfigLock {
         let mut staged_committed = false;
         #[cfg(any(unix, windows))]
         let mut namespace_phase_sync_failed = false;
+        #[cfg(unix)]
+        let mut unix_authority_boundary_failed = false;
         #[cfg(windows)]
         let mut windows_staged_location = WindowsStagedLocation::Staged;
         #[cfg(windows)]
@@ -6948,6 +7066,52 @@ impl ConfigLock {
                             file: staged_after_rollback.0,
                             observed: staged_after_rollback.1,
                         };
+                        let rollback_boundary = (|| -> Result<ObservedConfigFile> {
+                            maybe_inject_config_authority_drift("write-rollback-applied")?;
+                            self.revalidate_lock()?;
+                            ensure_config_parent_binding(parent, &parent_handle, &parent_identity)?;
+                            let (_, boundary_restored) = open_observed_config_at(
+                                &parent_handle,
+                                file_name,
+                                &self.path,
+                                private,
+                            )?
+                            .context(
+                                "restored raced managed config disappeared at durable rollback boundary",
+                            )?;
+                            if !observed_config_matches(Some(&boundary_restored), Some(&retained.1))
+                            {
+                                anyhow::bail!(
+                                    "restored raced managed config changed at durable rollback boundary"
+                                );
+                            }
+                            let boundary_staged = observe_open_config_file(
+                                &self.transaction.vault_path.join(&temp_name),
+                                &mut staged_after_rollback.file,
+                                private,
+                            )?;
+                            if !replacement.matches(&boundary_staged) {
+                                anyhow::bail!(
+                                    "rolled-back managed config replacement changed at durable rollback boundary"
+                                );
+                            }
+                            ensure_config_binding_at(
+                                &self.transaction.vault,
+                                &temp_name,
+                                &boundary_staged.identity,
+                                "rolled-back managed config replacement",
+                            )?;
+                            Ok(boundary_restored)
+                        })();
+                        let boundary_restored = match rollback_boundary {
+                            Ok(observed) => observed,
+                            Err(error) => {
+                                unix_authority_boundary_failed = true;
+                                return Err(error.context(
+                                    "managed config authority changed before durable RollbackApplied",
+                                ));
+                            }
+                        };
                         transaction.phase = ConfigTransactionPhase::RollbackApplied;
                         write_config_transaction(&self.transaction.file, &transaction)?;
                         dispose_quarantined_config_at(
@@ -6955,7 +7119,38 @@ impl ConfigLock {
                             &mut staged_after_rollback,
                             private,
                         )?;
-                        ensure_config_parent_binding(parent, &parent_handle, &parent_identity)?;
+                        let terminal_boundary = (|| -> Result<()> {
+                            self.revalidate_lock()?;
+                            ensure_config_parent_binding(parent, &parent_handle, &parent_identity)?;
+                            let (_, terminal_restored) = open_observed_config_at(
+                                &parent_handle,
+                                file_name,
+                                &self.path,
+                                private,
+                            )?
+                            .context(
+                                "restored raced managed config disappeared at terminal rollback boundary",
+                            )?;
+                            if !observed_config_matches(
+                                Some(&terminal_restored),
+                                Some(&boundary_restored),
+                            ) {
+                                anyhow::bail!(
+                                    "restored raced managed config changed at terminal rollback boundary"
+                                );
+                            }
+                            ensure_config_absent_at(
+                                &self.transaction.vault,
+                                &temp_name,
+                                "disposed rolled-back managed config replacement",
+                            )
+                        })();
+                        if let Err(error) = terminal_boundary {
+                            unix_authority_boundary_failed = true;
+                            return Err(error.context(
+                                "managed config authority changed before terminal rollback WAL",
+                            ));
+                        }
                         complete_config_transaction(
                             &self.transaction.file,
                             &mut transaction,
@@ -6970,6 +7165,47 @@ impl ConfigLock {
                         file: old_file,
                         observed: expected_old,
                     };
+                    let namespace_boundary = (|| -> Result<()> {
+                        maybe_inject_config_authority_drift("write-namespace-committed")?;
+                        self.revalidate_lock()?;
+                        ensure_config_parent_binding(parent, &parent_handle, &parent_identity)?;
+                        let (_, boundary_installed) = open_observed_config_at(
+                            &parent_handle,
+                            file_name,
+                            &self.path,
+                            private,
+                        )?
+                        .context(
+                            "installed managed config disappeared at durable commit boundary",
+                        )?;
+                        if !replacement.matches(&boundary_installed) {
+                            anyhow::bail!(
+                                "installed managed config changed at durable commit boundary"
+                            );
+                        }
+                        let boundary_old = observe_open_config_file(
+                            &self.transaction.vault_path.join(&temp_name),
+                            &mut old.file,
+                            private,
+                        )?;
+                        if !old_record.matches(&boundary_old) {
+                            anyhow::bail!(
+                                "retained managed config original changed at durable commit boundary"
+                            );
+                        }
+                        ensure_config_binding_at(
+                            &self.transaction.vault,
+                            &temp_name,
+                            &boundary_old.identity,
+                            "retained original at durable commit boundary",
+                        )
+                    })();
+                    if let Err(error) = namespace_boundary {
+                        unix_authority_boundary_failed = true;
+                        return Err(error.context(
+                            "managed config authority changed before durable NamespaceCommitted",
+                        ));
+                    }
                     transaction.phase = ConfigTransactionPhase::NamespaceCommitted;
                     if let Err(error) =
                         write_config_transaction(&self.transaction.file, &transaction)
@@ -6982,6 +7218,34 @@ impl ConfigLock {
                     dispose_quarantined_config_at(&self.transaction.vault, &mut old, private)?;
                     ensure_config_parent_binding(parent, &parent_handle, &parent_identity)?;
                 } else {
+                    let namespace_boundary = (|| -> Result<()> {
+                        maybe_inject_config_authority_drift("write-namespace-committed")?;
+                        self.revalidate_lock()?;
+                        ensure_config_parent_binding(parent, &parent_handle, &parent_identity)?;
+                        let (_, boundary_installed) = open_observed_config_at(
+                            &parent_handle,
+                            file_name,
+                            &self.path,
+                            private,
+                        )?
+                        .context("created managed config disappeared at durable commit boundary")?;
+                        if !replacement.matches(&boundary_installed) {
+                            anyhow::bail!(
+                                "created managed config changed at durable commit boundary"
+                            );
+                        }
+                        ensure_config_absent_at(
+                            &self.transaction.vault,
+                            &temp_name,
+                            "moved managed config staging file",
+                        )
+                    })();
+                    if let Err(error) = namespace_boundary {
+                        unix_authority_boundary_failed = true;
+                        return Err(error.context(
+                            "managed config authority changed before durable NamespaceCommitted",
+                        ));
+                    }
                     transaction.phase = ConfigTransactionPhase::NamespaceCommitted;
                     if let Err(error) =
                         write_config_transaction(&self.transaction.file, &transaction)
@@ -6991,6 +7255,30 @@ impl ConfigLock {
                             "managed config NamespaceCommitted WAL sync is ambiguous; exact recovery evidence retained for restart",
                         ));
                     }
+                }
+                let terminal_boundary = (|| -> Result<()> {
+                    self.revalidate_lock()?;
+                    ensure_config_parent_binding(parent, &parent_handle, &parent_identity)?;
+                    let (_, terminal_installed) =
+                        open_observed_config_at(&parent_handle, file_name, &self.path, private)?
+                            .context(
+                                "installed managed config disappeared at terminal commit boundary",
+                            )?;
+                    if !replacement.matches(&terminal_installed) {
+                        anyhow::bail!(
+                            "installed managed config changed at terminal commit boundary"
+                        );
+                    }
+                    ensure_config_absent_at(
+                        &self.transaction.vault,
+                        &temp_name,
+                        "disposed managed config original",
+                    )
+                })();
+                if let Err(error) = terminal_boundary {
+                    unix_authority_boundary_failed = true;
+                    return Err(error
+                        .context("managed config authority changed before terminal commit WAL"));
                 }
                 complete_config_transaction(
                     &self.transaction.file,
@@ -7279,8 +7567,13 @@ impl ConfigLock {
             }
             #[cfg(unix)]
             if staged_committed {
-                if namespace_phase_sync_failed {
+                if namespace_phase_sync_failed || unix_authority_boundary_failed {
                     return Err(error);
+                }
+                if let Err(authority) = self.revalidate_lock() {
+                    return Err(error.context(format!(
+                        "managed config write failed after authority drift; durable WAL and exact objects retained: {authority:#}"
+                    )));
                 }
                 let mut transaction = read_config_transaction(&self.transaction.file)?
                     .context("failed write lost durable recovery transaction")?;
@@ -7484,6 +7777,40 @@ impl ConfigLock {
                 );
             }
 
+            let namespace_boundary = (|| -> Result<()> {
+                maybe_inject_config_authority_drift("remove-namespace-committed")?;
+                self.revalidate_lock()?;
+                ensure_config_parent_binding(parent, &parent_handle, &parent_identity)?;
+                ensure_config_absent_at(
+                    &parent_handle,
+                    file_name,
+                    "quarantined managed config destination",
+                )?;
+                let boundary_quarantine = observe_open_config_file(
+                    &self.transaction.vault_path.join(&quarantine_name),
+                    &mut quarantined.file,
+                    self.private,
+                )?;
+                if !transaction
+                    .original
+                    .as_ref()
+                    .context("removal transaction lost original boundary authority")?
+                    .matches(&boundary_quarantine)
+                {
+                    anyhow::bail!("removal quarantine changed at durable commit boundary");
+                }
+                ensure_config_binding_at(
+                    &self.transaction.vault,
+                    &quarantine_name,
+                    &boundary_quarantine.identity,
+                    "removal quarantine at durable commit boundary",
+                )
+            })();
+            if let Err(error) = namespace_boundary {
+                return Err(error.context(
+                    "managed config authority changed before removal NamespaceCommitted",
+                ));
+            }
             transaction.phase = ConfigTransactionPhase::NamespaceCommitted;
             if let Err(error) = write_config_transaction(&self.transaction.file, &transaction) {
                 return Err(error.context(
@@ -7503,6 +7830,18 @@ impl ConfigLock {
                 );
             }
             ensure_config_parent_binding(parent, &parent_handle, &parent_identity)?;
+            self.revalidate_lock()?;
+            ensure_config_parent_binding(parent, &parent_handle, &parent_identity)?;
+            ensure_config_absent_at(
+                &parent_handle,
+                file_name,
+                "committed removed managed config destination",
+            )?;
+            ensure_config_absent_at(
+                &self.transaction.vault,
+                &quarantine_name,
+                "disposed managed config removal quarantine",
+            )?;
             if let Err(error) = complete_config_transaction(
                 &self.transaction.file,
                 &mut transaction,
@@ -9764,6 +10103,33 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn private_directory_chain_rejects_an_unsafe_eexist_race_before_deeper_mkdir() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let raced = parent.join("raced");
+        let nested = raced.join("deeper/final");
+        inject_config_directory_eexist_at(Some(&raced));
+
+        let error = create_config_directory_all_durable(&nested, true)
+            .expect_err("an unsafe EEXIST winner must not become Kin-home authority");
+        inject_config_directory_eexist_at(None);
+
+        assert!(format!("{error:#}").contains("mode 0700"));
+        assert_eq!(
+            fs::symlink_metadata(&raced).unwrap().permissions().mode() & 0o7777,
+            0o777,
+            "an existing raced directory must never be silently repaired"
+        );
+        assert!(
+            !raced.join("deeper").exists(),
+            "unsafe authority must be rejected before deeper descendants"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     #[serial]
     fn durable_config_directory_creation_propagates_sync_failure() {
         let dir = tempfile::tempdir().unwrap();
@@ -10479,6 +10845,143 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn write_namespace_phase_refuses_authority_drift_and_restart_rolls_back() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        fs::write(&config, b"original\n").unwrap();
+        let lock = ConfigLock::acquire(&config).unwrap();
+        let sidecar = lock.lock_path.clone();
+        inject_config_authority_drift_at_phase(Some((
+            "write-namespace-committed",
+            &sidecar,
+            0o644,
+        )));
+
+        let error = lock
+            .write_guarded(&config, b"replacement\n", Some(b"original\n"))
+            .expect_err("authority drift must stop before NamespaceCommitted");
+        inject_config_authority_drift_at_phase(None);
+
+        assert!(
+            format!("{error:#}").contains("mode 0600"),
+            "unexpected boundary error: {error:#}"
+        );
+        assert_eq!(
+            read_config_transaction(&lock.transaction.file)
+                .unwrap()
+                .unwrap()
+                .phase,
+            ConfigTransactionPhase::Prepared
+        );
+        assert_eq!(fs::read(&config).unwrap(), b"replacement\n");
+
+        fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(lock);
+        let recovered = ConfigLock::acquire(&config).unwrap();
+        assert_eq!(
+            recovered.original_bytes(&config).unwrap().unwrap(),
+            b"original\n"
+        );
+        assert_eq!(fs::read(&config).unwrap(), b"original\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_namespace_phase_reobserves_retained_bytes_before_advancing_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        fs::write(&config, b"original\n").unwrap();
+        let external = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&config)
+            .unwrap();
+        let lock = ConfigLock::acquire(&config).unwrap();
+        inject_config_object_drift_at_phase(Some((
+            "write-namespace-committed",
+            InjectedConfigObjectDrift::Bytes(external, b"external edit\n".to_vec()),
+        )));
+
+        let error = lock
+            .write_guarded(&config, b"Kin replacement\n", Some(b"original\n"))
+            .expect_err("retained-object content drift must stop before NamespaceCommitted");
+        inject_config_object_drift_at_phase(None);
+
+        assert!(format!("{error:#}").contains("retained managed config original changed"));
+        assert_eq!(
+            read_config_transaction(&lock.transaction.file)
+                .unwrap()
+                .unwrap()
+                .phase,
+            ConfigTransactionPhase::Prepared
+        );
+        assert_eq!(fs::read(&config).unwrap(), b"Kin replacement\n");
+
+        drop(lock);
+        let recovered = ConfigLock::acquire(&config).unwrap();
+        assert_eq!(
+            recovered.original_bytes(&config).unwrap().unwrap(),
+            b"external edit\n"
+        );
+        assert_eq!(fs::read(&config).unwrap(), b"external edit\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_rollback_phase_refuses_authority_drift_and_preserves_raced_object() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        fs::write(&config, b"original\n").unwrap();
+        let lock = ConfigLock::acquire(&config).unwrap();
+        let sidecar = lock.lock_path.clone();
+        inject_config_authority_drift_at_phase(Some(("write-rollback-applied", &sidecar, 0o644)));
+
+        let error = lock
+            .write_guarded_with_policy_and_hook(
+                &config,
+                b"Kin replacement\n",
+                Some(b"original\n"),
+                false,
+                || {
+                    fs::remove_file(&config)?;
+                    fs::write(&config, b"editor replacement\n")?;
+                    Ok(())
+                },
+            )
+            .expect_err("authority drift must stop before RollbackApplied");
+        inject_config_authority_drift_at_phase(None);
+
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("before durable RollbackApplied")
+                && diagnostic.contains("mode 0600"),
+            "unexpected boundary error: {diagnostic}"
+        );
+        assert_eq!(
+            read_config_transaction(&lock.transaction.file)
+                .unwrap()
+                .unwrap()
+                .phase,
+            ConfigTransactionPhase::Prepared
+        );
+        assert_eq!(fs::read(&config).unwrap(), b"editor replacement\n");
+
+        fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(lock);
+        let recovered = ConfigLock::acquire(&config).unwrap();
+        assert_eq!(
+            recovered.original_bytes(&config).unwrap().unwrap(),
+            b"editor replacement\n"
+        );
+        assert_eq!(fs::read(&config).unwrap(), b"editor replacement\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn guarded_config_remove_revalidates_authority_after_quarantine_hook() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -10498,6 +11001,94 @@ mod tests {
         assert!(format!("{error:#}").contains("mode 0600"));
         assert_eq!(fs::read(&config).unwrap(), b"original\n");
         fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_namespace_phase_refuses_authority_drift_and_restart_restores() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        fs::write(&config, b"original\n").unwrap();
+        let lock = ConfigLock::acquire(&config).unwrap();
+        let sidecar = lock.lock_path.clone();
+        inject_config_authority_drift_at_phase(Some((
+            "remove-namespace-committed",
+            &sidecar,
+            0o644,
+        )));
+
+        let error = lock
+            .remove_guarded(&config, Some(b"original\n"))
+            .expect_err("authority drift must stop before removal NamespaceCommitted");
+        inject_config_authority_drift_at_phase(None);
+
+        assert!(format!("{error:#}").contains("mode 0600"));
+        assert_eq!(
+            read_config_transaction(&lock.transaction.file)
+                .unwrap()
+                .unwrap()
+                .phase,
+            ConfigTransactionPhase::Prepared
+        );
+        assert!(!config.exists());
+
+        fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(lock);
+        let recovered = ConfigLock::acquire(&config).unwrap();
+        assert_eq!(
+            recovered.original_bytes(&config).unwrap().unwrap(),
+            b"original\n"
+        );
+        assert_eq!(fs::read(&config).unwrap(), b"original\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_namespace_phase_reobserves_retained_metadata_before_advancing_wal() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        fs::write(&config, b"original\n").unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+        let external = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&config)
+            .unwrap();
+        let lock = ConfigLock::acquire(&config).unwrap();
+        inject_config_object_drift_at_phase(Some((
+            "remove-namespace-committed",
+            InjectedConfigObjectDrift::Mode(external, 0o640),
+        )));
+
+        let error = lock
+            .remove_guarded(&config, Some(b"original\n"))
+            .expect_err("retained-object metadata drift must stop before NamespaceCommitted");
+        inject_config_object_drift_at_phase(None);
+
+        assert!(format!("{error:#}").contains("removal quarantine changed"));
+        assert_eq!(
+            read_config_transaction(&lock.transaction.file)
+                .unwrap()
+                .unwrap()
+                .phase,
+            ConfigTransactionPhase::Prepared
+        );
+        assert!(!config.exists());
+
+        drop(lock);
+        let recovered = ConfigLock::acquire(&config).unwrap();
+        assert_eq!(
+            recovered.original_bytes(&config).unwrap().unwrap(),
+            b"original\n"
+        );
+        assert_eq!(
+            fs::symlink_metadata(&config).unwrap().permissions().mode() & 0o7777,
+            0o640
+        );
     }
 
     #[cfg(unix)]

@@ -3981,14 +3981,6 @@ impl PrivateUpdaterTempDir {
     }
 
     #[cfg(windows)]
-    fn seal_directory(&mut self, path: &Path) -> Result<()> {
-        self.windows_root
-            .as_mut()
-            .context("private Windows updater root was released")?
-            .seal_directory(path)
-    }
-
-    #[cfg(windows)]
     fn seal_staged_bundle(&mut self, stage_root: &Path, spec: &[ComponentSpec]) -> Result<()> {
         self.windows_root
             .as_mut()
@@ -4377,6 +4369,7 @@ fn staged_identities_for_test(
     }
 }
 
+#[cfg(any(not(windows), test))]
 fn bytes_identity(bytes: &[u8]) -> FileIdentity {
     FileIdentity {
         sha256: hex::encode(Sha256::digest(bytes)),
@@ -4620,6 +4613,7 @@ fn verify_managed_bundle_generation_locked(
     anyhow::bail!("managed bundle generation verification is unsupported on this platform")
 }
 
+#[cfg(any(not(windows), test))]
 fn component_is_recovery_cli(component: ComponentSpec) -> bool {
     matches!(component.name, "kin" | "kin.exe")
 }
