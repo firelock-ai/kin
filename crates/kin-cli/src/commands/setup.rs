@@ -795,6 +795,7 @@ const IDX_CURSOR: usize = 1;
 const IDX_CODEX: usize = 2;
 const IDX_GEMINI: usize = 3;
 const IDX_WINDSURF: usize = 4;
+const IDX_ANTIGRAVITY: usize = 5;
 
 /// Detect installed AI assistants eligible for MCP auto-configuration.
 ///
@@ -815,6 +816,13 @@ fn detect_ai_assistants() -> Vec<AiAssistant> {
             .unwrap_or(false);
     let windsurf_detected = check_binary_in_path("windsurf").is_some()
         || PathBuf::from("/Applications/Windsurf.app").exists();
+    let antigravity_detected = check_binary_in_path("agy").is_some()
+        || check_binary_in_path("agy-ide").is_some()
+        || PathBuf::from("/Applications/Antigravity.app").exists()
+        || PathBuf::from("/Applications/Antigravity IDE.app").exists()
+        || home_dir()
+            .map(|home| home.join(".gemini").join("antigravity").exists())
+            .unwrap_or(false);
 
     vec![
         AiAssistant {
@@ -841,6 +849,11 @@ fn detect_ai_assistants() -> Vec<AiAssistant> {
             name: "Windsurf",
             detected: windsurf_detected,
             install_hint: "install from windsurf.com",
+        },
+        AiAssistant {
+            name: "Google Antigravity",
+            detected: antigravity_detected,
+            install_hint: "install Google Antigravity",
         },
     ]
 }
@@ -1160,6 +1173,75 @@ fn configure_windsurf() -> Result<PathBuf> {
         .join("mcp_config.json");
     merge_mcp_config(&target, "windsurf")?;
     Ok(target)
+}
+
+fn current_initialized_setup_repo(client: &str) -> Result<PathBuf> {
+    let cwd = env::current_dir().context("could not determine the current directory")?;
+    kin_core::KinLayout::discover_with_daemon_url(&cwd, None)
+        .and_then(|layout| layout.working_dir().canonicalize().ok())
+        .and_then(|root| canonical_initialized_repo(&root))
+        .with_context(|| {
+            format!(
+                "{client} MCP setup requires an initialized Kin repository; run `kin init` in the target repository and re-run `kin setup` from it (current directory: {})",
+                cwd.display()
+            )
+        })
+}
+
+/// Configure current Antigravity's global MCP authority and the exact
+/// checkout-local workspace binding in one topology transaction. The older
+/// antigravity-ide path is touched only when it already contains a Kin entry.
+fn configure_antigravity() -> Result<PathBuf> {
+    let home = home_dir()?;
+    let repo_root = current_initialized_setup_repo("Antigravity")?;
+    let global = home.join(".gemini").join("config").join("mcp_config.json");
+    let legacy = home
+        .join(".gemini")
+        .join("antigravity-ide")
+        .join("mcp_config.json");
+    let workspace = repo_root.join(".agents").join("mcp_config.json");
+    let topology = McpTopologyLock::acquire()?;
+    ensure_workspace_mcp_git_excluded(&repo_root)?.with_context(|| {
+        format!(
+            "Antigravity workspace binding requires trusted Git authority at {}",
+            repo_root.display()
+        )
+    })?;
+
+    let mut targets = vec![
+        McpRepairTarget {
+            id: "antigravity".to_string(),
+            path: global.clone(),
+            repo_root: Some(repo_root.clone()),
+            captured_config_sha256: "0".repeat(64),
+        },
+        McpRepairTarget {
+            id: "antigravity_workspace".to_string(),
+            path: workspace,
+            repo_root: Some(repo_root.clone()),
+            captured_config_sha256: "0".repeat(64),
+        },
+    ];
+    if legacy.exists() && has_kin_mcp_config(&legacy) {
+        targets.push(McpRepairTarget {
+            id: "antigravity".to_string(),
+            path: legacy,
+            repo_root: Some(repo_root),
+            captured_config_sha256: "0".repeat(64),
+        });
+    }
+    let paths = targets
+        .iter()
+        .map(|target| target.path.clone())
+        .collect::<Vec<_>>();
+    let mut locks = ConfigLock::acquire_many(&paths)?;
+    let command = managed_mcp_launcher()?;
+    for (target, lock) in targets.iter().zip(&mut locks) {
+        merge_json_mcp_target_locked(target, &command, lock)?;
+        lock.refresh_locked_state()?;
+    }
+    drop(topology);
+    Ok(global)
 }
 
 // ---------------------------------------------------------------------------
@@ -1502,49 +1584,288 @@ const WORKSPACE_MCP_GIT_EXCLUDE_PATTERNS: [&str; 2] = [
 /// Persist checkout-local Antigravity config and its permanent lock as local
 /// Git exclusions in the repository's common Git directory. Linked worktrees
 /// share this file, so resolving `commondir` is required for idempotency.
-fn ensure_workspace_mcp_git_excluded(repo_root: &Path) -> Result<Option<PathBuf>> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkspaceGitAuthority {
+    repo_root: PathBuf,
+    git_dir: PathBuf,
+    common_dir: PathBuf,
+    info_dir: PathBuf,
+    exclude: PathBuf,
+}
+
+fn read_single_git_pointer(path: &Path, label: &str) -> Result<String> {
+    const MAX_GIT_POINTER_BYTES: u64 = 4096;
+
+    let before = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
+    if before.file_type().is_symlink() || !before.is_file() || before.len() > MAX_GIT_POINTER_BYTES
+    {
+        anyhow::bail!(
+            "{label} must be a bounded regular non-symlink file: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if before.nlink() != 1 {
+            anyhow::bail!("{label} must not be hard linked: {}", path.display());
+        }
+    }
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("failed to open {label} {}", path.display()))?;
+    let _opened = file.metadata()?;
+    #[cfg(unix)]
+    if ConfigFileIdentity::from_metadata(&before) != ConfigFileIdentity::from_metadata(&_opened) {
+        anyhow::bail!("{label} changed while it was opened: {}", path.display());
+    }
+    #[cfg(windows)]
+    let opened_identity = ConfigFileIdentity::from_open_file(&file)?;
+    #[cfg(windows)]
+    if visible_config_file_identity_nofollow(path)? != opened_identity {
+        anyhow::bail!("{label} changed while it was opened: {}", path.display());
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_GIT_POINTER_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_GIT_POINTER_BYTES || bytes.contains(&0) {
+        anyhow::bail!("{label} is oversized or contains NUL: {}", path.display());
+    }
+    let after = fs::symlink_metadata(path)?;
+    if after.file_type().is_symlink() || !after.is_file() {
+        anyhow::bail!("{label} changed type while it was read: {}", path.display());
+    }
+    #[cfg(unix)]
+    if ConfigFileIdentity::from_metadata(&before) != ConfigFileIdentity::from_metadata(&after) {
+        anyhow::bail!("{label} changed while it was read: {}", path.display());
+    }
+    #[cfg(windows)]
+    if visible_config_file_identity_nofollow(path)? != opened_identity {
+        anyhow::bail!("{label} changed while it was read: {}", path.display());
+    }
+    let text = std::str::from_utf8(&bytes)
+        .with_context(|| format!("{label} is not UTF-8: {}", path.display()))?;
+    let value = text.trim_end_matches(['\r', '\n']);
+    if value.is_empty() || value.trim() != value || value.contains('\r') || value.contains('\n') {
+        anyhow::bail!(
+            "{label} must contain exactly one non-empty line: {}",
+            path.display()
+        );
+    }
+    Ok(value.to_string())
+}
+
+fn git_authority_output(repo_root: &Path, args: &[&str]) -> Result<String> {
+    let git = which::which("git").context("git is required to validate workspace MCP authority")?;
+    let output = std::process::Command::new(git)
+        .arg("-C")
+        .arg(repo_root)
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_CEILING_DIRECTORIES")
+        .env_remove("GIT_DISCOVERY_ACROSS_FILESYSTEM")
+        .output()
+        .with_context(|| format!("failed to run git {:?}", args))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {:?} rejected workspace authority: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8(output.stdout).context("git authority output is not UTF-8")
+}
+
+fn canonical_git_output_path(repo_root: &Path, output: &str, label: &str) -> Result<PathBuf> {
+    let value = output.trim();
+    if value.is_empty() || value.contains('\n') || value.contains('\r') {
+        anyhow::bail!("git returned invalid {label} authority");
+    }
+    let path = PathBuf::from(value);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        repo_root.join(path)
+    };
+    path.canonicalize()
+        .with_context(|| format!("failed to canonicalize git {label} {}", path.display()))
+}
+
+fn resolve_workspace_git_authority(repo_root: &Path) -> Result<Option<WorkspaceGitAuthority>> {
+    let repo_root = repo_root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize repository {}", repo_root.display()))?;
     let dot_git = repo_root.join(".git");
-    let metadata = match fs::metadata(&dot_git) {
+    let dot_git_metadata = match fs::symlink_metadata(&dot_git) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(error).with_context(|| format!("failed to inspect {}", dot_git.display()))
         }
     };
-    let git_dir = if metadata.is_dir() {
-        dot_git
-    } else if metadata.is_file() {
-        let pointer = fs::read_to_string(&dot_git)
-            .with_context(|| format!("failed to read Git pointer {}", dot_git.display()))?;
+    if dot_git_metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "repository .git authority must not be a symlink: {}",
+            dot_git.display()
+        );
+    }
+
+    let (git_dir, common_dir) = if dot_git_metadata.is_dir() {
+        let git_dir = dot_git.canonicalize()?;
+        if git_dir != repo_root.join(".git") {
+            anyhow::bail!("main-worktree .git authority escaped the canonical repository root");
+        }
+        (git_dir.clone(), git_dir)
+    } else if dot_git_metadata.is_file() {
+        let pointer = read_single_git_pointer(&dot_git, "linked-worktree .git pointer")?;
         let target = pointer
-            .trim()
             .strip_prefix("gitdir:")
             .map(str::trim)
             .filter(|target| !target.is_empty())
-            .with_context(|| format!("invalid Git pointer {}", dot_git.display()))?;
+            .context("linked-worktree .git pointer lacks gitdir authority")?;
         let target = PathBuf::from(target);
-        if target.is_absolute() {
+        let target = if target.is_absolute() {
             target
         } else {
             repo_root.join(target)
+        };
+        let target_metadata = fs::symlink_metadata(&target).with_context(|| {
+            format!(
+                "failed to inspect linked-worktree gitdir {}",
+                target.display()
+            )
+        })?;
+        if target_metadata.file_type().is_symlink() || !target_metadata.is_dir() {
+            anyhow::bail!("linked-worktree gitdir must be a non-symlink directory");
         }
+        let git_dir = target.canonicalize()?;
+        let commondir_pointer = git_dir.join("commondir");
+        let commondir =
+            read_single_git_pointer(&commondir_pointer, "linked-worktree commondir pointer")?;
+        let commondir = PathBuf::from(commondir);
+        if commondir.is_absolute() {
+            anyhow::bail!("linked-worktree commondir authority must be relative");
+        }
+        let common_target = git_dir.join(commondir);
+        let common_metadata = fs::symlink_metadata(&common_target)?;
+        if common_metadata.file_type().is_symlink() || !common_metadata.is_dir() {
+            anyhow::bail!("linked-worktree common Git directory must be a non-symlink directory");
+        }
+        let common_dir = common_target.canonicalize()?;
+        let worktrees = common_dir.join("worktrees");
+        let relative = git_dir.strip_prefix(&worktrees).with_context(|| {
+            format!(
+                "linked-worktree gitdir {} is outside trusted common worktrees {}",
+                git_dir.display(),
+                worktrees.display()
+            )
+        })?;
+        let mut components = relative.components();
+        if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+            || components.next().is_some()
+        {
+            anyhow::bail!("linked-worktree gitdir must occupy exactly one common worktree slot");
+        }
+        let reverse = git_dir.join("gitdir");
+        let reverse = read_single_git_pointer(&reverse, "linked-worktree gitdir backpointer")?;
+        let reverse = reverse
+            .strip_prefix("gitdir:")
+            .map(str::trim)
+            .unwrap_or(&reverse);
+        let reverse = PathBuf::from(reverse);
+        let reverse = if reverse.is_absolute() {
+            reverse
+        } else {
+            git_dir.join(reverse)
+        };
+        if reverse.canonicalize()? != dot_git.canonicalize()? {
+            anyhow::bail!("linked-worktree gitdir backpointer does not name repository .git");
+        }
+        (git_dir, common_dir)
     } else {
+        anyhow::bail!("repository .git authority is neither a directory nor regular pointer file");
+    };
+
+    for (name, directory) in [("objects", true), ("refs", true), ("HEAD", false)] {
+        let path = common_dir.join(name);
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("missing common Git authority marker {}", path.display()))?;
+        if metadata.file_type().is_symlink()
+            || (directory && !metadata.is_dir())
+            || (!directory && !metadata.is_file())
+        {
+            anyhow::bail!("common Git authority marker is unsafe: {}", path.display());
+        }
+    }
+
+    let shown_root = canonical_git_output_path(
+        &repo_root,
+        &git_authority_output(&repo_root, &["rev-parse", "--show-toplevel"])?,
+        "worktree root",
+    )?;
+    let shown_git_dir = canonical_git_output_path(
+        &repo_root,
+        &git_authority_output(&repo_root, &["rev-parse", "--absolute-git-dir"])?,
+        "gitdir",
+    )?;
+    let shown_common = canonical_git_output_path(
+        &repo_root,
+        &git_authority_output(&repo_root, &["rev-parse", "--git-common-dir"])?,
+        "common directory",
+    )?;
+    if shown_root != repo_root || shown_git_dir != git_dir || shown_common != common_dir {
+        anyhow::bail!("Git command authority disagrees with structurally validated worktree state");
+    }
+    let worktrees = git_authority_output(&repo_root, &["worktree", "list", "--porcelain"])?;
+    let listed = worktrees
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .filter_map(|path| Path::new(path).canonicalize().ok())
+        .any(|path| path == repo_root);
+    if !listed {
+        anyhow::bail!("Git worktree authority does not list the canonical repository root");
+    }
+
+    let info_dir = common_dir.join("info");
+    let info_metadata = fs::symlink_metadata(&info_dir)
+        .with_context(|| format!("missing common Git info directory {}", info_dir.display()))?;
+    if info_metadata.file_type().is_symlink() || !info_metadata.is_dir() {
+        anyhow::bail!("common Git info authority must be a non-symlink directory");
+    }
+    let info_dir = info_dir.canonicalize()?;
+    if info_dir.parent() != Some(common_dir.as_path()) {
+        anyhow::bail!("common Git info authority escaped its validated directory");
+    }
+    let exclude = info_dir.join("exclude");
+    if let Ok(metadata) = fs::symlink_metadata(&exclude) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            anyhow::bail!("common Git exclude authority must be a regular non-symlink file");
+        }
+    }
+    Ok(Some(WorkspaceGitAuthority {
+        repo_root,
+        git_dir,
+        common_dir,
+        info_dir,
+        exclude,
+    }))
+}
+
+fn ensure_workspace_mcp_git_excluded(repo_root: &Path) -> Result<Option<PathBuf>> {
+    let Some(authority) = resolve_workspace_git_authority(repo_root)? else {
         return Ok(None);
     };
-    let common_dir = match fs::read_to_string(git_dir.join("commondir")) {
-        Ok(pointer) => {
-            let target = PathBuf::from(pointer.trim());
-            if target.is_absolute() {
-                target
-            } else {
-                git_dir.join(target)
-            }
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => git_dir,
-        Err(error) => return Err(error).context("failed to read Git common-directory pointer"),
-    };
-    let exclude = common_dir.join("info").join("exclude");
-    let lock = ConfigLock::acquire(&exclude)?;
+    let lock = ConfigLock::acquire(&authority.exclude)?;
+    if resolve_workspace_git_authority(repo_root)?.as_ref() != Some(&authority) {
+        anyhow::bail!("workspace Git authority changed while Kin acquired its exclude lock");
+    }
+    let exclude = authority.exclude.clone();
     let original = lock.original_bytes(&exclude)?;
     let content = match original.as_deref() {
         Some(bytes) => std::str::from_utf8(bytes)
@@ -1568,6 +1889,9 @@ fn ensure_workspace_mcp_git_excluded(repo_root: &Path) -> Result<Option<PathBuf>
         updated.push('\n');
     }
     lock.write_guarded(&exclude, updated.as_bytes(), original.as_deref())?;
+    if resolve_workspace_git_authority(repo_root)?.as_ref() != Some(&authority) {
+        anyhow::bail!("workspace Git authority changed during exclude reconciliation");
+    }
     Ok(Some(exclude))
 }
 
@@ -1592,7 +1916,12 @@ fn allowed_static_mcp_target_paths(id: &str) -> Result<Vec<PathBuf>> {
             .join(".codeium")
             .join("windsurf")
             .join("mcp_config.json")],
-        "antigravity" => vec![home.join(".gemini").join("config").join("mcp_config.json")],
+        "antigravity" => vec![
+            home.join(".gemini").join("config").join("mcp_config.json"),
+            home.join(".gemini")
+                .join("antigravity-ide")
+                .join("mcp_config.json"),
+        ],
         "antigravity_workspace" => Vec::new(),
         _ => anyhow::bail!("unsupported managed MCP target '{id}'"),
     };
@@ -1679,14 +2008,15 @@ pub(crate) fn normalize_mcp_repair_targets(
             target.repo_root = Some(root);
         } else {
             validate_static_mcp_target_path(&target.id, &target.path)?;
-            if target.id == "codex" {
+            if target.id == "codex" || target.id == "antigravity" {
                 let repo_root = target
                     .repo_root
                     .as_deref()
                     .map(|root| {
                         canonical_initialized_repo(root).with_context(|| {
                             format!(
-                                "Codex MCP repository is not an initialized path: {}",
+                                "{} MCP repository is not an initialized path: {}",
+                                target.id,
                                 root.display()
                             )
                         })
@@ -1694,7 +2024,8 @@ pub(crate) fn normalize_mcp_repair_targets(
                     .transpose()?
                     .with_context(|| {
                         format!(
-                            "Codex MCP target {} has no exact initialized repository binding; run `kin setup` from the intended initialized repository before updating",
+                            "{} MCP target {} has no exact initialized repository binding; run `kin setup` from the intended initialized repository before updating",
+                            target.id,
                             target.path.display()
                         )
                     })?;
@@ -1805,6 +2136,68 @@ fn codex_repo_from_entry_bytes(content: &[u8]) -> Result<Option<PathBuf>> {
     Ok(canonical_initialized_repo(&candidate))
 }
 
+fn json_mcp_repo_from_entry_bytes(content: &[u8], client: &str) -> Result<Option<PathBuf>> {
+    let root: serde_json::Value = serde_json::from_slice(content)
+        .with_context(|| format!("{client} MCP config is invalid JSON"))?;
+    let Some(entry) = root
+        .get("mcpServers")
+        .and_then(|servers| servers.get("kin"))
+    else {
+        return Ok(None);
+    };
+    let cwd = match entry.get("cwd") {
+        Some(value) => {
+            let value = value
+                .as_str()
+                .with_context(|| format!("{client} MCP kin cwd must be a string"))?;
+            let path = PathBuf::from(value);
+            if !path.is_absolute() {
+                anyhow::bail!("{client} MCP kin cwd must be absolute");
+            }
+            Some(path)
+        }
+        None => None,
+    };
+    let mut repo_arg = None;
+    if let Some(args) = entry.get("args") {
+        let args = args
+            .as_array()
+            .with_context(|| format!("{client} MCP kin args must be an array"))?;
+        for (index, argument) in args.iter().enumerate() {
+            let Some(argument) = argument.as_str() else {
+                continue;
+            };
+            let candidate = if argument == "--repo" {
+                Some(
+                    args.get(index + 1)
+                        .and_then(serde_json::Value::as_str)
+                        .with_context(|| format!("{client} MCP kin --repo lacks a path"))?,
+                )
+            } else {
+                argument.strip_prefix("--repo=")
+            };
+            let Some(candidate) = candidate else {
+                continue;
+            };
+            if repo_arg.replace(PathBuf::from(candidate)).is_some() {
+                anyhow::bail!("{client} MCP kin entry contains duplicate --repo arguments");
+            }
+        }
+    }
+    let candidate = match repo_arg {
+        Some(repo) if repo.is_absolute() => repo,
+        Some(repo) => cwd
+            .as_ref()
+            .with_context(|| format!("relative {client} --repo requires an absolute cwd"))?
+            .join(repo),
+        None => match cwd {
+            Some(cwd) => cwd,
+            None => return Ok(None),
+        },
+    };
+    Ok(canonical_initialized_repo(&candidate))
+}
+
 /// Capture only MCP configs Kin already owns, plus exact workspace targets
 /// persisted in the setup ledger. Update never creates a new client config.
 pub(crate) fn current_mcp_repair_targets() -> Result<Vec<McpRepairTarget>> {
@@ -1829,8 +2222,10 @@ fn current_mcp_repair_targets_excluding_with_topology(
     if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
         paths.push((
             "antigravity",
-            "Google Antigravity",
-            home.join(".gemini").join("config").join("mcp_config.json"),
+            "Google Antigravity legacy",
+            home.join(".gemini")
+                .join("antigravity-ide")
+                .join("mcp_config.json"),
         ));
     }
     for (id, _label, path) in paths {
@@ -1880,6 +2275,7 @@ fn capture_mcp_repair_target_excluding(
     }
     let repo_root = match id {
         "antigravity_workspace" => workspace_root_for_mcp_path(&path),
+        "antigravity" => json_mcp_repo_from_entry_bytes(&bytes, "Antigravity")?,
         "codex" => codex_repo_from_entry_bytes(&bytes)?,
         _ => None,
     };
@@ -1918,6 +2314,14 @@ enum InjectedConfigObjectDrift {
     Mode(fs::File, u32),
 }
 
+#[cfg(all(test, windows))]
+#[derive(Clone, Copy)]
+enum InjectedWindowsStageDrift {
+    Dacl,
+    SupportedSacl,
+    UnsupportedSaclCrash,
+}
+
 #[cfg(all(test, unix))]
 enum InjectedPrivateDirectoryStage {
     FailAfterMkdir,
@@ -1940,6 +2344,10 @@ thread_local! {
     #[cfg(unix)]
     static INJECT_CONFIG_OBJECT_DRIFT_AT_PHASE:
         std::cell::RefCell<Option<(&'static str, InjectedConfigObjectDrift)>> =
+        const { std::cell::RefCell::new(None) };
+    #[cfg(windows)]
+    static INJECT_WINDOWS_STAGE_DRIFT_AT_PHASE:
+        std::cell::RefCell<Option<(&'static str, InjectedWindowsStageDrift)>> =
         const { std::cell::RefCell::new(None) };
     #[cfg(unix)]
     static INJECT_PRIVATE_DIRECTORY_STAGE_AT:
@@ -2130,6 +2538,65 @@ fn inject_config_object_drift_at_phase(phase: Option<(&'static str, InjectedConf
     });
 }
 
+#[cfg(all(test, windows))]
+fn inject_windows_stage_drift_at_phase(phase: Option<(&'static str, InjectedWindowsStageDrift)>) {
+    INJECT_WINDOWS_STAGE_DRIFT_AT_PHASE.with(|configured| {
+        *configured.borrow_mut() = phase;
+    });
+}
+
+#[cfg(all(test, windows))]
+fn maybe_inject_windows_stage_drift(phase: &'static str, staged: &fs::File) -> Result<()> {
+    let drift = INJECT_WINDOWS_STAGE_DRIFT_AT_PHASE.with(|configured| {
+        let matches = configured
+            .borrow()
+            .as_ref()
+            .is_some_and(|(configured_phase, _)| *configured_phase == phase);
+        matches.then(|| configured.borrow_mut().take()).flatten()
+    });
+    match drift {
+        Some((_, InjectedWindowsStageDrift::Dacl)) => {
+            super::update::windows_update::inject_test_managed_file_dacl_drift(staged)
+        }
+        Some((_, InjectedWindowsStageDrift::SupportedSacl)) => {
+            super::update::windows_update::inject_test_managed_file_supported_sacl_drift(staged)
+        }
+        Some((_, InjectedWindowsStageDrift::UnsupportedSaclCrash)) => anyhow::bail!(
+            "unsupported-SACL crash injection reached the ordinary live drift resolver"
+        ),
+        None => Ok(()),
+    }
+}
+
+#[cfg(all(not(test), windows))]
+fn maybe_inject_windows_stage_drift(_phase: &'static str, _staged: &fs::File) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+fn maybe_inject_windows_stage_crash(phase: &'static str, staged: &fs::File) -> Result<bool> {
+    let inject = INJECT_WINDOWS_STAGE_DRIFT_AT_PHASE.with(|configured| {
+        let matches = configured
+            .borrow()
+            .as_ref()
+            .is_some_and(|(configured_phase, drift)| {
+                *configured_phase == phase
+                    && matches!(drift, InjectedWindowsStageDrift::UnsupportedSaclCrash)
+            });
+        matches.then(|| configured.borrow_mut().take()).flatten()
+    });
+    if inject.is_none() {
+        return Ok(false);
+    }
+    super::update::windows_update::inject_test_managed_file_unsupported_sacl(staged)?;
+    Ok(true)
+}
+
+#[cfg(all(not(test), windows))]
+fn maybe_inject_windows_stage_crash(_phase: &'static str, _staged: &fs::File) -> Result<bool> {
+    Ok(false)
+}
+
 #[cfg(all(test, unix))]
 fn maybe_inject_config_authority_drift(phase: &'static str) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -2226,17 +2693,81 @@ thread_local! {
     };
 }
 
+#[cfg(test)]
+fn lexically_normalize_test_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if normalized.file_name().is_some() {
+                    normalized.pop();
+                }
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
+#[cfg(test)]
+fn canonicalize_nearest_existing_test_path(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    let normalized = lexically_normalize_test_path(&absolute);
+    let mut ancestor = normalized.clone();
+    let mut missing_suffix = Vec::new();
+    loop {
+        if let Ok(mut canonical) = ancestor.canonicalize() {
+            for component in missing_suffix.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+        let Some(name) = ancestor.file_name().map(ToOwned::to_owned) else {
+            return normalized;
+        };
+        missing_suffix.push(name);
+        if !ancestor.pop() {
+            return normalized;
+        }
+    }
+}
+
+#[cfg(test)]
+fn config_transaction_test_kin_home(subject_path: &Path) -> PathBuf {
+    let temp = env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| env::temp_dir());
+    let normalized = canonicalize_nearest_existing_test_path(subject_path);
+    let fixture_scope = normalized
+        .strip_prefix(&temp)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .unwrap_or_else(|| normalized.to_string_lossy().into_owned());
+    let digest = crate::commands::setup_ledger::sha256_hex(fixture_scope.as_bytes());
+    temp.join(format!("kin-config-transaction-tests-{}", &digest[..24]))
+}
+
 impl ConfigTransactionAuthority {
-    fn acquire(subject_identity: &ConfigFileIdentity) -> Result<Self> {
+    fn acquire(subject_identity: &ConfigFileIdentity, subject_path: &Path) -> Result<Self> {
         #[cfg(test)]
         CONFIG_TRANSACTION_ACQUIRE_COUNT.with(|count| count.set(count.get() + 1));
         #[cfg(not(test))]
         let kin_home = kin_dir()?;
+        #[cfg(not(test))]
+        let _ = subject_path;
         #[cfg(test)]
-        let kin_home = env::temp_dir().join(format!(
-            "kin-config-transaction-tests-{}",
-            std::process::id()
-        ));
+        let kin_home = config_transaction_test_kin_home(subject_path);
         #[cfg(unix)]
         let kin_home_authority = create_config_directory_all_durable(&kin_home, true)
             .with_context(|| format!("failed to create {}", kin_home.display()))?;
@@ -3653,6 +4184,8 @@ struct ObservedConfigFile {
     metadata: UnixConfigMetadata,
     #[cfg(windows)]
     security: String,
+    #[cfg(windows)]
+    full_sacl: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -3671,6 +4204,8 @@ struct RecordedConfigObject {
     metadata_sha256: String,
     #[cfg(windows)]
     security: String,
+    #[cfg(windows)]
+    full_sacl: Option<String>,
 }
 
 impl RecordedConfigObject {
@@ -3689,6 +4224,8 @@ impl RecordedConfigObject {
             metadata_sha256: observed.metadata.fingerprint(),
             #[cfg(windows)]
             security: observed.security.clone(),
+            #[cfg(windows)]
+            full_sacl: observed.full_sacl.clone(),
         }
     }
 
@@ -3708,7 +4245,7 @@ impl RecordedConfigObject {
                 {
                     #[cfg(windows)]
                     {
-                        self.security == observed.security
+                        self.security == observed.security && self.full_sacl == observed.full_sacl
                     }
                     #[cfg(not(windows))]
                     {
@@ -3718,6 +4255,7 @@ impl RecordedConfigObject {
             }
     }
 
+    #[cfg(unix)]
     fn same_identity(&self, observed: &ObservedConfigFile) -> bool {
         self.identity == observed.identity
     }
@@ -3792,7 +4330,7 @@ struct ConfigTransactionEnvelope {
     payload: ConfigTransactionRecord,
 }
 
-const CONFIG_TRANSACTION_SCHEMA_VERSION: u32 = 5;
+const CONFIG_TRANSACTION_SCHEMA_VERSION: u32 = 6;
 const CONFIG_TRANSACTION_WAL_MAGIC: &str = "KIN_CONFIG_TXN_WAL";
 const CONFIG_TRANSACTION_WAL_FRAME_SCHEMA: u32 = 1;
 const CONFIG_TRANSACTION_WAL_COMMIT_PREFIX: &str = "KIN_CONFIG_TXN_COMMIT";
@@ -4110,7 +4648,44 @@ fn observe_open_config_file(
         metadata: final_extended,
         #[cfg(windows)]
         security: final_security,
+        #[cfg(windows)]
+        full_sacl: None,
     })
+}
+
+#[cfg(windows)]
+fn observe_open_config_file_with_full_sacl(
+    path: &Path,
+    file: &mut fs::File,
+    private: bool,
+    strict_sacl: bool,
+) -> Result<ObservedConfigFile> {
+    if !strict_sacl {
+        return observe_open_config_file(path, file, private);
+    }
+    let initial = super::update::windows_update::managed_file_full_sacl_fingerprint(file)
+        .with_context(|| {
+            format!(
+                "failed to capture full SACL authority for {}",
+                path.display()
+            )
+        })?;
+    let mut observed = observe_open_config_file(path, file, private)?;
+    let final_fingerprint = super::update::windows_update::managed_file_full_sacl_fingerprint(file)
+        .with_context(|| {
+            format!(
+                "failed to recapture full SACL authority for {}",
+                path.display()
+            )
+        })?;
+    if final_fingerprint != initial {
+        anyhow::bail!(
+            "managed config full SACL changed while it was read: {}",
+            path.display()
+        );
+    }
+    observed.full_sacl = Some(final_fingerprint);
+    Ok(observed)
 }
 
 fn complete_wal_line(bytes: &[u8], offset: usize) -> Option<(&[u8], usize)> {
@@ -4919,6 +5494,13 @@ fn validate_config_transaction_record(
     private: bool,
     record: &ConfigTransactionRecord,
 ) -> Result<()> {
+    if record.schema_version != CONFIG_TRANSACTION_SCHEMA_VERSION {
+        anyhow::bail!(
+            "unsupported managed config recovery schema {} (expected {})",
+            record.schema_version,
+            CONFIG_TRANSACTION_SCHEMA_VERSION
+        );
+    }
     if record.private != private {
         anyhow::bail!(
             "managed config recovery policy mismatch: record private={}, lock private={private}",
@@ -4973,6 +5555,63 @@ fn validate_config_transaction_record(
             anyhow::bail!("managed config removal recovery record is inconsistent")
         }
         _ => {}
+    }
+    #[cfg(windows)]
+    validate_windows_config_transaction_full_sacl_authority(record)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(windows)]
+fn require_windows_recorded_full_sacl<'a>(
+    object: &'a RecordedConfigObject,
+    label: &str,
+) -> Result<&'a str> {
+    let fingerprint = object
+        .full_sacl
+        .as_deref()
+        .with_context(|| format!("schema-v6 Windows {label} lost full-SACL authority"))?;
+    if !is_lowercase_sha256(fingerprint) {
+        anyhow::bail!(
+            "schema-v6 Windows {label} full-SACL authority is not a lowercase SHA-256 fingerprint"
+        );
+    }
+    Ok(fingerprint)
+}
+
+#[cfg(windows)]
+fn validate_windows_config_transaction_full_sacl_authority(
+    record: &ConfigTransactionRecord,
+) -> Result<()> {
+    match record.operation {
+        ConfigTransactionOperation::Write => {
+            let replacement = record
+                .replacement
+                .as_ref()
+                .context("schema-v6 Windows write lost replacement authority")?;
+            if let Some(original) = record.original.as_ref() {
+                require_windows_recorded_full_sacl(original, "write original")?;
+                require_windows_recorded_full_sacl(replacement, "write replacement")?;
+            } else if replacement.full_sacl.is_some() {
+                anyhow::bail!(
+                    "schema-v6 Windows create replacement must not claim inherited full-SACL authority"
+                );
+            }
+        }
+        ConfigTransactionOperation::Remove => {
+            let original = record
+                .original
+                .as_ref()
+                .context("schema-v6 Windows removal lost original authority")?;
+            require_windows_recorded_full_sacl(original, "removal original")?;
+        }
     }
     Ok(())
 }
@@ -5582,9 +6221,38 @@ fn resolve_failed_unix_removal(
 }
 
 #[cfg(windows)]
+fn open_windows_recovery_handle(path: &Path, strict_sacl: bool) -> Result<Option<fs::File>> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
+        }
+    }
+    let file =
+        super::update::windows_update::open_managed_config_for_exact_inventory(path, strict_sacl)?;
+    Ok(Some(file))
+}
+
+#[cfg(windows)]
 fn open_windows_recovery_object(
     path: &Path,
     private: bool,
+    strict_sacl: bool,
+) -> Result<Option<(fs::File, ObservedConfigFile)>> {
+    let Some(mut file) = open_windows_recovery_handle(path, strict_sacl)? else {
+        return Ok(None);
+    };
+    let observed = observe_open_config_file_with_full_sacl(path, &mut file, private, strict_sacl)?;
+    super::update::windows_update::revalidate_managed_file_path(path, &file, private, strict_sacl)?;
+    Ok(Some((file, observed)))
+}
+
+#[cfg(windows)]
+fn open_windows_terminal_observation_object(
+    path: &Path,
+    private: bool,
+    strict_sacl: bool,
 ) -> Result<Option<(fs::File, ObservedConfigFile)>> {
     match fs::symlink_metadata(path) {
         Ok(_) => {}
@@ -5593,14 +6261,40 @@ fn open_windows_recovery_object(
             return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
         }
     }
-    let mut file = super::update::windows_update::open_managed_config_for_exact_quarantine(path)?;
-    let observed = observe_open_config_file(path, &mut file, private)?;
-    super::update::windows_update::revalidate_managed_file_path(path, &file, private)?;
+    let mut file = super::update::windows_update::open_managed_config_for_terminal_observation(
+        path,
+        strict_sacl,
+    )?;
+    let observed = observe_open_config_file_with_full_sacl(path, &mut file, private, strict_sacl)?;
+    super::update::windows_update::revalidate_managed_file_path(path, &file, private, strict_sacl)?;
     Ok(Some((file, observed)))
 }
 
 #[cfg(windows)]
-fn rename_windows_config_exact(file: &fs::File, destination: &Path, private: bool) -> Result<()> {
+fn strict_windows_full_sacl<'a>(
+    expected: &'a RecordedConfigObject,
+    label: &str,
+) -> Result<&'a str> {
+    expected
+        .full_sacl
+        .as_deref()
+        .with_context(|| format!("{label} lacks persisted schema-v6 full-SACL authority"))
+}
+
+#[cfg(windows)]
+fn rename_windows_config_exact(
+    file: &fs::File,
+    destination: &Path,
+    private: bool,
+    expected_full_sacl: Option<&str>,
+) -> Result<()> {
+    if let Some(expected_full_sacl) = expected_full_sacl {
+        super::update::windows_update::require_managed_file_full_sacl_fingerprint(
+            file,
+            expected_full_sacl,
+        )
+        .context("managed config full SACL changed immediately before exact rename")?;
+    }
     if private {
         super::update::windows_update::rename_private_file_handle_exact(file, destination, false)
     } else {
@@ -5629,12 +6323,20 @@ fn mark_windows_recorded_config_for_disposition(
     private: bool,
     label: &str,
     expected: &RecordedConfigObject,
+    strict_sacl: bool,
 ) -> Result<()> {
-    super::update::windows_update::revalidate_managed_file_path(path, &file, private)?;
+    super::update::windows_update::revalidate_managed_file_path(path, &file, private, strict_sacl)?;
     let mut reader = file.try_clone()?;
-    let observed = observe_open_config_file(path, &mut reader, private)?;
+    let observed =
+        observe_open_config_file_with_full_sacl(path, &mut reader, private, strict_sacl)?;
     if !expected.matches(&observed) {
         anyhow::bail!("{label} changed immediately before disposition; exact object retained");
+    }
+    if strict_sacl {
+        super::update::windows_update::require_managed_file_full_sacl_fingerprint(
+            file,
+            strict_windows_full_sacl(expected, label)?,
+        )?;
     }
     dispose_windows_config_exact(file, path, private, label)
 }
@@ -5668,8 +6370,16 @@ fn dispose_windows_recorded_config_owned(
     private: bool,
     label: &str,
     expected: &RecordedConfigObject,
+    strict_sacl: bool,
 ) -> Result<()> {
-    mark_windows_recorded_config_for_disposition(&file, path, private, label, expected)?;
+    mark_windows_recorded_config_for_disposition(
+        &file,
+        path,
+        private,
+        label,
+        expected,
+        strict_sacl,
+    )?;
     finish_windows_disposition(file, path, label)
 }
 
@@ -5680,8 +6390,9 @@ fn dispose_windows_terminal_residue(
     private: bool,
     label: &str,
     expected: &RecordedConfigObject,
+    strict_sacl: bool,
 ) -> Result<()> {
-    let Some((file, observed)) = open_windows_recovery_object(path, private)? else {
+    let Some((file, observed)) = open_windows_recovery_object(path, private, strict_sacl)? else {
         return Ok(());
     };
     if !expected.matches(&observed) {
@@ -5690,7 +6401,7 @@ fn dispose_windows_terminal_residue(
             path.display()
         );
     }
-    dispose_windows_recorded_config_owned(file, path, private, label, expected)?;
+    dispose_windows_recorded_config_owned(file, path, private, label, expected, strict_sacl)?;
     parent.revalidate_visible()
 }
 
@@ -5700,6 +6411,8 @@ fn recover_windows_terminal_config_transaction(
     private: bool,
     record: &ConfigTransactionRecord,
 ) -> Result<()> {
+    validate_config_transaction_record(path, private, record)?;
+    let strict_sacl = record.original.is_some();
     let parent_path = path.parent().context("managed config has no parent")?;
     let parent = super::update::windows_update::WindowsParentGuard::open(parent_path)?;
     let (namespace, file) = parent.identity();
@@ -5729,6 +6442,7 @@ fn recover_windows_terminal_config_transaction(
                         .replacement
                         .as_ref()
                         .context("completed Windows write lost replacement authority")?,
+                    strict_sacl,
                 )?;
             }
             if let (Some(retained_path), Some(original)) =
@@ -5740,6 +6454,7 @@ fn recover_windows_terminal_config_transaction(
                     private,
                     "completed managed config quarantine residue",
                     original,
+                    strict_sacl,
                 )?;
             }
         }
@@ -5754,10 +6469,11 @@ fn recover_windows_terminal_config_transaction(
                         .replacement
                         .as_ref()
                         .context("rolled-back Windows write lost replacement authority")?,
+                    strict_sacl,
                 )?;
             }
             if let Some(retained_path) = retained_path.as_deref() {
-                if open_windows_recovery_object(retained_path, private)?.is_some() {
+                if open_windows_recovery_object(retained_path, private, strict_sacl)?.is_some() {
                     anyhow::bail!(
                         "rolled-back Windows managed config write still has quarantine residue {}; preserved for manual reconciliation",
                         retained_path.display()
@@ -5776,12 +6492,13 @@ fn recover_windows_terminal_config_transaction(
                         .original
                         .as_ref()
                         .context("completed Windows removal lost original authority")?,
+                    strict_sacl,
                 )?;
             }
         }
         (ConfigTransactionPhase::RollbackComplete, ConfigTransactionOperation::Remove) => {
             if let Some(retained_path) = retained_path.as_deref() {
-                if open_windows_recovery_object(retained_path, private)?.is_some() {
+                if open_windows_recovery_object(retained_path, private, strict_sacl)?.is_some() {
                     anyhow::bail!(
                         "rolled-back Windows managed config removal still has quarantine residue {}; preserved for manual reconciliation",
                         retained_path.display()
@@ -5802,6 +6519,8 @@ fn terminalize_windows_durable_transition(
     private: bool,
     record: &ConfigTransactionRecord,
 ) -> Result<Option<ConfigTransactionOutcome>> {
+    validate_config_transaction_record(path, private, record)?;
+    let strict_sacl = record.original.is_some();
     let outcome = match record.phase {
         ConfigTransactionPhase::NamespaceCommitted => ConfigTransactionOutcome::Committed,
         ConfigTransactionPhase::RollbackApplied => ConfigTransactionOutcome::RolledBack,
@@ -5825,20 +6544,33 @@ fn terminalize_windows_durable_transition(
         .as_deref()
         .map(|name| path.with_file_name(name));
     let staged = match staged_path.as_deref() {
-        Some(path) => open_windows_recovery_object(path, private)?,
+        Some(path) => open_windows_recovery_object(path, private, strict_sacl)?,
         None => None,
     };
     let retained = if retained_path == staged_path {
         None
     } else {
         match retained_path.as_deref() {
-            Some(path) => open_windows_recovery_object(path, private)?,
+            Some(path) => open_windows_recovery_object(path, private, strict_sacl)?,
             None => None,
         }
     };
+    let canonical = open_windows_terminal_observation_object(path, private, strict_sacl)?;
 
     match (record.phase, record.operation) {
         (ConfigTransactionPhase::NamespaceCommitted, ConfigTransactionOperation::Write) => {
+            let replacement = record
+                .replacement
+                .as_ref()
+                .context("committed Windows write lost replacement authority")?;
+            if !matches!(
+                canonical.as_ref(),
+                Some((_, observed)) if replacement.matches(observed)
+            ) {
+                anyhow::bail!(
+                    "committed Windows managed config replacement changed before terminal WAL"
+                );
+            }
             if staged.is_some() {
                 anyhow::bail!(
                     "committed Windows managed config write has unexpected staging residue; preserved for manual reconciliation"
@@ -5854,6 +6586,7 @@ fn terminalize_windows_durable_transition(
                         private,
                         "committed Windows managed config quarantine",
                         expected,
+                        strict_sacl,
                     )?;
                 }
                 (Some(_), Some(_)) | (None, Some(_)) => anyhow::bail!(
@@ -5863,6 +6596,11 @@ fn terminalize_windows_durable_transition(
             }
         }
         (ConfigTransactionPhase::NamespaceCommitted, ConfigTransactionOperation::Remove) => {
+            if canonical.is_some() {
+                anyhow::bail!(
+                    "committed Windows managed config removal destination reappeared before terminal WAL"
+                );
+            }
             if staged.is_some() {
                 anyhow::bail!(
                     "committed Windows managed config removal has unexpected staging residue; preserved for manual reconciliation"
@@ -5887,12 +6625,20 @@ fn terminalize_windows_durable_transition(
                         private,
                         "committed Windows managed config removal quarantine",
                         expected,
+                        strict_sacl,
                     )?;
                 }
                 None => {}
             }
         }
         (ConfigTransactionPhase::RollbackApplied, ConfigTransactionOperation::Write) => {
+            match (record.original.as_ref(), canonical.as_ref()) {
+                (Some(original), Some((_, observed))) if original.matches(observed) => {}
+                (None, None) => {}
+                _ => anyhow::bail!(
+                    "rolled-back Windows managed config canonical authority changed before terminal WAL"
+                ),
+            }
             if retained.is_some() {
                 anyhow::bail!(
                     "rolled-back Windows managed config write has unexpected quarantine residue; preserved for manual reconciliation"
@@ -5916,10 +6662,23 @@ fn terminalize_windows_durable_transition(
                     private,
                     "rolled-back Windows managed config replacement",
                     expected,
+                    strict_sacl,
                 )?;
             }
         }
         (ConfigTransactionPhase::RollbackApplied, ConfigTransactionOperation::Remove) => {
+            let original = record
+                .original
+                .as_ref()
+                .context("rolled-back Windows removal lost original authority")?;
+            if !matches!(
+                canonical.as_ref(),
+                Some((_, observed)) if original.matches(observed)
+            ) {
+                anyhow::bail!(
+                    "rolled-back Windows managed config removal authority changed before terminal WAL"
+                );
+            }
             if staged.is_some() || retained.is_some() {
                 anyhow::bail!(
                     "rolled-back Windows managed config removal still has owned residue; preserved for manual reconciliation"
@@ -5928,6 +6687,7 @@ fn terminalize_windows_durable_transition(
         }
         _ => unreachable!("non-durable phases returned above"),
     }
+    validate_windows_terminal_authority(parent, path, private, record)?;
     parent.revalidate_visible()?;
     complete_recovered_config_transaction(lock_file, record, outcome)?;
     Ok(Some(outcome))
@@ -6024,13 +6784,14 @@ fn recover_windows_config_transaction(
             ),
         };
     }
-    let canonical = open_windows_recovery_object(path, private)?;
+    let strict_sacl = record.original.is_some();
+    let canonical = open_windows_recovery_object(path, private, strict_sacl)?;
     let retained_path = record
         .retained_name
         .as_deref()
         .map(|name| path.with_file_name(name));
     let retained = match retained_path.as_deref() {
-        Some(path) => open_windows_recovery_object(path, private)?,
+        Some(path) => open_windows_recovery_object(path, private, strict_sacl)?,
         None => None,
     };
 
@@ -6045,25 +6806,42 @@ fn recover_windows_config_transaction(
                 .context("Windows removal recovery lost original authority")?;
             debug_assert_eq!(record.phase, ConfigTransactionPhase::Prepared);
             match (canonical, retained) {
-                (None, Some((old_file, old))) if original.same_identity(&old) => {
-                    rename_windows_config_exact(&old_file, path, private)?;
+                (None, Some((old_file, old))) if original.matches(&old) => {
+                    rename_windows_config_exact(
+                        &old_file,
+                        path,
+                        private,
+                        Some(strict_windows_full_sacl(original, "removal original")?),
+                    )?;
+                    super::update::windows_update::revalidate_managed_file_path(
+                        path,
+                        &old_file,
+                        private,
+                        strict_sacl,
+                    )?;
                     parent.revalidate_visible()?;
                     let mut rollback = record.clone();
                     rollback.phase = ConfigTransactionPhase::RollbackApplied;
                     write_config_transaction(lock_file, &rollback)?;
-                    complete_config_transaction(
+                    complete_windows_config_transaction(
                         lock_file,
+                        &parent,
+                        path,
+                        private,
                         &mut rollback,
                         ConfigTransactionOutcome::RolledBack,
                     )
                 }
-                (Some((_, current)), None) if original.same_identity(&current) => {
+                (Some((_, current)), None) if original.matches(&current) => {
                     parent.revalidate_visible()?;
                     let mut rollback = record.clone();
                     rollback.phase = ConfigTransactionPhase::RollbackApplied;
                     write_config_transaction(lock_file, &rollback)?;
-                    complete_config_transaction(
+                    complete_windows_config_transaction(
                         lock_file,
+                        &parent,
+                        path,
+                        private,
                         &mut rollback,
                         ConfigTransactionOutcome::RolledBack,
                     )
@@ -6087,6 +6865,93 @@ fn require_windows_path_absent(path: &Path, label: &str) -> Result<()> {
 }
 
 #[cfg(windows)]
+fn validate_windows_terminal_authority(
+    parent: &super::update::windows_update::WindowsParentGuard,
+    path: &Path,
+    private: bool,
+    record: &ConfigTransactionRecord,
+) -> Result<()> {
+    let strict_sacl = record.original.is_some();
+    parent.revalidate_visible()?;
+    let canonical = open_windows_terminal_observation_object(path, private, strict_sacl)?;
+    match (record.phase, record.operation) {
+        (ConfigTransactionPhase::NamespaceCommitted, ConfigTransactionOperation::Write) => {
+            let replacement = record
+                .replacement
+                .as_ref()
+                .context("committed Windows write lost replacement authority")?;
+            if !matches!(
+                canonical.as_ref(),
+                Some((_, observed)) if replacement.matches(observed)
+            ) {
+                anyhow::bail!(
+                    "committed Windows replacement changed immediately before terminal WAL"
+                );
+            }
+        }
+        (ConfigTransactionPhase::NamespaceCommitted, ConfigTransactionOperation::Remove) => {
+            if canonical.is_some() {
+                anyhow::bail!(
+                    "removed Windows managed config reappeared immediately before terminal WAL"
+                );
+            }
+        }
+        (ConfigTransactionPhase::RollbackApplied, ConfigTransactionOperation::Write) => {
+            match (record.original.as_ref(), canonical.as_ref()) {
+                (Some(original), Some((_, observed))) if original.matches(observed) => {}
+                (None, None) => {}
+                _ => anyhow::bail!(
+                    "rolled-back Windows write changed immediately before terminal WAL"
+                ),
+            }
+        }
+        (ConfigTransactionPhase::RollbackApplied, ConfigTransactionOperation::Remove) => {
+            let original = record
+                .original
+                .as_ref()
+                .context("rolled-back Windows removal lost original authority")?;
+            if !matches!(
+                canonical.as_ref(),
+                Some((_, observed)) if original.matches(observed)
+            ) {
+                anyhow::bail!(
+                    "rolled-back Windows removal changed immediately before terminal WAL"
+                );
+            }
+        }
+        _ => anyhow::bail!("Windows terminal authority check received a non-durable phase"),
+    }
+    let mut residue_paths = Vec::new();
+    if let Some(name) = record.staged_name.as_deref() {
+        residue_paths.push(path.with_file_name(name));
+    }
+    if let Some(name) = record.retained_name.as_deref() {
+        let retained = path.with_file_name(name);
+        if !residue_paths.contains(&retained) {
+            residue_paths.push(retained);
+        }
+    }
+    for residue in residue_paths {
+        require_windows_path_absent(&residue, "owned Windows transaction residue")?;
+    }
+    parent.revalidate_visible()
+}
+
+#[cfg(windows)]
+fn complete_windows_config_transaction(
+    lock_file: &fs::File,
+    parent: &super::update::windows_update::WindowsParentGuard,
+    path: &Path,
+    private: bool,
+    record: &mut ConfigTransactionRecord,
+    outcome: ConfigTransactionOutcome,
+) -> Result<()> {
+    validate_config_transaction_record(path, private, record)?;
+    validate_windows_terminal_authority(parent, path, private, record)?;
+    complete_config_transaction(lock_file, record, outcome)
+}
+
+#[cfg(windows)]
 fn resolve_failed_windows_write_with_retained_handles(
     lock_file: &fs::File,
     parent: &super::update::windows_update::WindowsParentGuard,
@@ -6098,6 +6963,8 @@ fn resolve_failed_windows_write_with_retained_handles(
     staged_location: &mut WindowsStagedLocation,
     quarantine: &mut Option<QuarantinedConfig>,
 ) -> Result<FailedWriteResolution> {
+    validate_config_transaction_record(path, private, record)?;
+    let strict_sacl = record.original.is_some();
     let replacement = record
         .replacement
         .clone()
@@ -6109,30 +6976,50 @@ fn resolve_failed_windows_write_with_retained_handles(
 
     match record.phase {
         ConfigTransactionPhase::Prepared => {
+            if staged.is_none() {
+                // A crash or failure during the durable handoff closes the
+                // permanently armed file object and removes the stage. Use
+                // WAL plus fresh exact inventory to prove the untouched
+                // original (or prior absence) and terminalize rollback.
+                return rollback_failed_windows_write(lock_file, parent, path, private, record);
+            }
+            // Inventory retained-handle locations before touching either
+            // object. Stage policy is deliberately not consulted until the
+            // exact original has been restored to (or absence proven at) the
+            // canonical slot.
             let staged_file = staged
                 .as_mut()
                 .context("Windows exact-handle rollback lost staged replacement")?;
-            let staged_display = match staged_location {
-                WindowsStagedLocation::Staged => staged_path,
-                WindowsStagedLocation::Canonical => path,
-                WindowsStagedLocation::DispositionApplied => {
-                    anyhow::bail!("prepared Windows write already applied replacement disposition")
-                }
-            };
-            let staged_observed = observe_open_config_file(staged_display, staged_file, private)?;
-            if !replacement.matches(&staged_observed) {
-                anyhow::bail!(
-                    "prepared Windows replacement changed; retained exact handles and WAL"
-                );
+            if *staged_location == WindowsStagedLocation::DispositionApplied {
+                anyhow::bail!("prepared Windows write already applied replacement disposition");
             }
+            match (record.original.as_ref(), quarantine.as_ref()) {
+                (Some(_), Some(old))
+                    if old.name == record.destination_name
+                        || record.retained_name.as_deref() == Some(old.name.as_str()) => {}
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("prepared Windows original has unknown retained-handle location")
+                }
+                (Some(_), None) => {
+                    anyhow::bail!("prepared Windows rollback lost retained original handle")
+                }
+                (None, Some(_)) => {
+                    anyhow::bail!("prepared Windows create unexpectedly retained an old object")
+                }
+                (None, None) => {}
+            }
+
             if *staged_location == WindowsStagedLocation::Canonical {
-                rename_windows_config_exact(staged_file, staged_path, private)?;
-                *staged_location = WindowsStagedLocation::Staged;
-                super::update::windows_update::revalidate_managed_file_path(
-                    staged_path,
+                // This is a product-owned CREATE_NEW handle. Move that exact
+                // object out of canonical without reopening it and without a
+                // DACL/SACL policy check that could strand the original behind
+                // a drifted replacement.
+                super::update::windows_update::rename_managed_file_handle_exact(
                     staged_file,
-                    private,
+                    staged_path,
+                    false,
                 )?;
+                *staged_location = WindowsStagedLocation::Staged;
             }
 
             match record.original.as_ref() {
@@ -6141,47 +7028,77 @@ fn resolve_failed_windows_write_with_retained_handles(
                         .as_mut()
                         .context("prepared Windows rollback lost retained original handle")?;
                     let old_path = path.with_file_name(&old.name);
-                    let old_observed = observe_open_config_file(&old_path, &mut old.file, private)?;
-                    if !original.same_identity(&old_observed) {
+                    let old_observed = observe_open_config_file_with_full_sacl(
+                        &old_path,
+                        &mut old.file,
+                        private,
+                        strict_sacl,
+                    )?;
+                    if !original.matches(&old_observed) {
                         anyhow::bail!(
-                            "prepared Windows original changed object identity; retained exact handles and WAL"
+                            "prepared Windows original changed; retained exact handles and WAL"
                         );
                     }
                     if old.name != record.destination_name {
-                        let retained_name = record
-                            .retained_name
-                            .as_deref()
-                            .context("prepared Windows rollback lost quarantine name")?;
-                        if old.name != retained_name {
-                            anyhow::bail!(
-                                "prepared Windows original has unknown retained-handle location"
-                            );
-                        }
-                        rename_windows_config_exact(&old.file, path, private)?;
+                        rename_windows_config_exact(
+                            &old.file,
+                            path,
+                            private,
+                            Some(strict_windows_full_sacl(original, "replacement original")?),
+                        )?;
                         old.name = record.destination_name.clone();
                     }
                     super::update::windows_update::revalidate_managed_file_path(
-                        path, &old.file, private,
+                        path,
+                        &old.file,
+                        private,
+                        strict_sacl,
                     )?;
+                    let restored = observe_open_config_file_with_full_sacl(
+                        path,
+                        &mut old.file,
+                        private,
+                        strict_sacl,
+                    )?;
+                    if !original.matches(&restored) {
+                        anyhow::bail!(
+                            "prepared Windows original changed after exact restoration; retained handles and WAL"
+                        );
+                    }
                 }
-                None if quarantine.is_some() => {
-                    anyhow::bail!("prepared Windows create unexpectedly retained an old object")
-                }
-                None => {}
+                None => require_windows_path_absent(
+                    path,
+                    "prepared Windows create canonical slot after replacement relocation",
+                )?,
             }
             parent.revalidate_visible()?;
             record.phase = ConfigTransactionPhase::RollbackApplied;
             write_config_transaction(lock_file, record)?;
 
+            // RollbackApplied now protects the canonical original/absence.
+            // Only after that durable boundary may a drifted replacement be
+            // validated and, if still exact, disposed.
             let staged_file = staged
-                .as_ref()
-                .context("Windows rollback lost replacement before disposition")?;
+                .as_mut()
+                .context("Windows rollback lost replacement before validation")?;
+            let staged_observed = observe_open_config_file_with_full_sacl(
+                staged_path,
+                staged_file,
+                private,
+                strict_sacl,
+            )?;
+            if !replacement.matches(&staged_observed) {
+                anyhow::bail!(
+                    "rolled-back Windows replacement changed; original was restored and suspect residue plus WAL were retained"
+                );
+            }
             mark_windows_recorded_config_for_disposition(
                 staged_file,
                 staged_path,
                 private,
                 "rolled-back Windows managed config replacement",
                 &replacement,
+                strict_sacl,
             )?;
             *staged_location = WindowsStagedLocation::DispositionApplied;
             let staged_file = staged
@@ -6193,7 +7110,14 @@ fn resolve_failed_windows_write_with_retained_handles(
                 "rolled-back Windows managed config replacement",
             )?;
             parent.revalidate_visible()?;
-            complete_config_transaction(lock_file, record, ConfigTransactionOutcome::RolledBack)?;
+            complete_windows_config_transaction(
+                lock_file,
+                parent,
+                path,
+                private,
+                record,
+                ConfigTransactionOutcome::RolledBack,
+            )?;
             Ok(FailedWriteResolution::RolledBack)
         }
         ConfigTransactionPhase::NamespaceCommitted => {
@@ -6205,7 +7129,8 @@ fn resolve_failed_windows_write_with_retained_handles(
             let staged_file = staged
                 .as_mut()
                 .context("committed Windows write lost replacement handle")?;
-            let installed = observe_open_config_file(path, staged_file, private)?;
+            let installed =
+                observe_open_config_file_with_full_sacl(path, staged_file, private, strict_sacl)?;
             if !replacement.matches(&installed) {
                 anyhow::bail!(
                     "committed Windows replacement changed before terminalization; WAL retained"
@@ -6215,6 +7140,7 @@ fn resolve_failed_windows_write_with_retained_handles(
                 path,
                 staged_file,
                 private,
+                strict_sacl,
             )?;
 
             if let Some(original) = record.original.as_ref() {
@@ -6238,6 +7164,7 @@ fn resolve_failed_windows_write_with_retained_handles(
                         private,
                         "committed Windows managed config quarantine",
                         original,
+                        strict_sacl,
                     )?;
                     let old = quarantine
                         .take()
@@ -6255,7 +7182,14 @@ fn resolve_failed_windows_write_with_retained_handles(
                 }
             }
             parent.revalidate_visible()?;
-            complete_config_transaction(lock_file, record, ConfigTransactionOutcome::Committed)?;
+            complete_windows_config_transaction(
+                lock_file,
+                parent,
+                path,
+                private,
+                record,
+                ConfigTransactionOutcome::Committed,
+            )?;
             Ok(FailedWriteResolution::Committed)
         }
         ConfigTransactionPhase::RollbackApplied => {
@@ -6276,6 +7210,7 @@ fn resolve_failed_windows_write_with_retained_handles(
                     private,
                     "rolled-back Windows managed config replacement",
                     &replacement,
+                    strict_sacl,
                 )?;
                 *staged_location = WindowsStagedLocation::DispositionApplied;
                 let staged_file = staged
@@ -6293,7 +7228,14 @@ fn resolve_failed_windows_write_with_retained_handles(
                 )?;
             }
             parent.revalidate_visible()?;
-            complete_config_transaction(lock_file, record, ConfigTransactionOutcome::RolledBack)?;
+            complete_windows_config_transaction(
+                lock_file,
+                parent,
+                path,
+                private,
+                record,
+                ConfigTransactionOutcome::RolledBack,
+            )?;
             Ok(FailedWriteResolution::RolledBack)
         }
         ConfigTransactionPhase::CommitComplete => Ok(FailedWriteResolution::Committed),
@@ -6309,6 +7251,7 @@ fn rollback_failed_windows_write(
     private: bool,
     record: &mut ConfigTransactionRecord,
 ) -> Result<FailedWriteResolution> {
+    let strict_sacl = record.original.is_some();
     if let Some(outcome) =
         terminalize_windows_durable_transition(lock_file, parent, path, private, record)?
     {
@@ -6319,7 +7262,7 @@ fn rollback_failed_windows_write(
     }
     let replacement = record
         .replacement
-        .as_ref()
+        .clone()
         .context("Windows rollback lost replacement authority")?;
     let staged_path = record
         .staged_name
@@ -6330,96 +7273,226 @@ fn rollback_failed_windows_write(
         .retained_name
         .as_deref()
         .map(|name| path.with_file_name(name));
-    let canonical = open_windows_recovery_object(path, private)?;
-    let staged = open_windows_recovery_object(&staged_path, private)?;
+    // Inventory only exact-handle identities first. In particular, do not
+    // validate replacement DACL/SACL policy before relocating a canonical
+    // stage and restoring the original.
+    let canonical = open_windows_recovery_handle(path, strict_sacl)?;
+    let staged = open_windows_recovery_handle(&staged_path, strict_sacl)?;
     let retained = match retained_path.as_deref() {
-        Some(path) => open_windows_recovery_object(path, private)?,
+        Some(path) => open_windows_recovery_handle(path, strict_sacl)?,
         None => None,
     };
 
     if record.phase == ConfigTransactionPhase::Prepared && staged.is_none() && retained.is_none() {
         let transition_never_started = match (record.original.as_ref(), canonical.as_ref()) {
-            (Some(original), Some((_, current))) => original.same_identity(current),
+            (Some(original), Some(current)) => {
+                original.identity == ConfigFileIdentity::from_open_file(current)?
+            }
             (None, None) => true,
             _ => false,
         };
         if transition_never_started {
+            if let (Some(original), Some(mut current)) = (record.original.as_ref(), canonical) {
+                let observed = observe_open_config_file_with_full_sacl(
+                    path,
+                    &mut current,
+                    private,
+                    strict_sacl,
+                )?;
+                if !original.matches(&observed) {
+                    anyhow::bail!(
+                        "pre-transition Windows original changed; WAL retained without a rollback claim"
+                    );
+                }
+            }
             // A complete Prepared frame can remain readable after its sync
-            // reports failure, while the caller correctly removes the stage.
-            // Record that exact pre-transition inventory as rolled back so a
+            // reports failure, or after an armed pre-Prepared stage closes.
+            // Record the exact pre-transition inventory as rolled back so a
             // subsequent acquire is not permanently blocked by the journal.
             record.phase = ConfigTransactionPhase::RollbackApplied;
             write_config_transaction(lock_file, record)?;
             parent.revalidate_visible()?;
-            complete_config_transaction(lock_file, record, ConfigTransactionOutcome::RolledBack)?;
+            complete_windows_config_transaction(
+                lock_file,
+                parent,
+                path,
+                private,
+                record,
+                ConfigTransactionOutcome::RolledBack,
+            )?;
             return Ok(FailedWriteResolution::RolledBack);
         }
     }
 
-    let staged_authority = match record.original.as_ref() {
-        Some(original) => match (canonical, staged, retained) {
-            (Some((new_file, installed)), None, Some((old_file, old)))
-                if replacement.matches(&installed) && original.same_identity(&old) =>
-            {
-                rename_windows_config_exact(&new_file, &staged_path, private)?;
-                rename_windows_config_exact(&old_file, path, private)?;
-                super::update::windows_update::revalidate_managed_file_path(
-                    path, &old_file, private,
-                )?;
-                (new_file, installed)
-            }
-            (None, Some((new_file, new)), Some((old_file, old)))
-                if replacement.matches(&new) && original.same_identity(&old) =>
-            {
-                rename_windows_config_exact(&old_file, path, private)?;
-                super::update::windows_update::revalidate_managed_file_path(
-                    path, &old_file, private,
-                )?;
-                (new_file, new)
-            }
-            (Some((_, current)), Some((new_file, new)), None)
-                if original.same_identity(&current) && replacement.matches(&new) =>
-            {
-                (new_file, new)
-            }
-            (Some(_), Some((new_file, new)), None)
-                if record.phase == ConfigTransactionPhase::Prepared
-                    && replacement.matches(&new) =>
-            {
-                (new_file, new)
-            }
-            _ => anyhow::bail!(
-                "failed Windows managed config write has ambiguous rollback authority; WAL and objects retained"
-            ),
-        },
-        None => match (canonical, staged) {
-            (Some((new_file, installed)), None) if replacement.matches(&installed) => {
-                rename_windows_config_exact(&new_file, &staged_path, private)?;
-                super::update::windows_update::revalidate_managed_file_path(
-                    &staged_path,
-                    &new_file,
-                    private,
-                )?;
-                (new_file, installed)
-            }
-            (_, Some((new_file, new))) if replacement.matches(&new) => (new_file, new),
-            _ => anyhow::bail!(
-                "failed Windows managed config create has ambiguous rollback authority; WAL and objects retained"
-            ),
-        },
-    };
+    let canonical_is_replacement = canonical
+        .as_ref()
+        .map(|file| {
+            Ok::<bool, anyhow::Error>(
+                replacement.identity == ConfigFileIdentity::from_open_file(file)?,
+            )
+        })
+        .transpose()?
+        .unwrap_or(false);
+    let staged_is_replacement = staged
+        .as_ref()
+        .map(|file| {
+            Ok::<bool, anyhow::Error>(
+                replacement.identity == ConfigFileIdentity::from_open_file(file)?,
+            )
+        })
+        .transpose()?
+        .unwrap_or(false);
 
+    let mut staged_authority;
+    let original = record.original.clone();
+    if let Some(original) = original.as_ref() {
+        let canonical_is_original = canonical
+            .as_ref()
+            .map(|file| {
+                Ok::<bool, anyhow::Error>(
+                    original.identity == ConfigFileIdentity::from_open_file(file)?,
+                )
+            })
+            .transpose()?
+            .unwrap_or(false);
+        let retained_is_original = retained
+            .as_ref()
+            .map(|file| {
+                Ok::<bool, anyhow::Error>(
+                    original.identity == ConfigFileIdentity::from_open_file(file)?,
+                )
+            })
+            .transpose()?
+            .unwrap_or(false);
+
+        let (mut old_file, old_path, old_needs_restore) =
+            match (canonical, staged, retained) {
+                (Some(new_file), None, Some(old_file))
+                    if canonical_is_replacement && retained_is_original =>
+                {
+                    super::update::windows_update::rename_managed_file_handle_exact(
+                        &new_file,
+                        &staged_path,
+                        false,
+                    )?;
+                    staged_authority = new_file;
+                    (
+                        old_file,
+                        retained_path
+                            .clone()
+                            .context("Windows rollback lost retained original path")?,
+                        true,
+                    )
+                }
+                (None, Some(new_file), Some(old_file))
+                    if staged_is_replacement && retained_is_original =>
+                {
+                    staged_authority = new_file;
+                    (
+                        old_file,
+                        retained_path
+                            .clone()
+                            .context("Windows rollback lost retained original path")?,
+                        true,
+                    )
+                }
+                (Some(old_file), Some(new_file), None)
+                    if canonical_is_original && staged_is_replacement =>
+                {
+                    staged_authority = new_file;
+                    (old_file, path.to_path_buf(), false)
+                }
+                _ => anyhow::bail!(
+                    "failed Windows managed config write has ambiguous rollback identities; WAL and objects retained"
+                ),
+            };
+
+        let old_observed = observe_open_config_file_with_full_sacl(
+            &old_path,
+            &mut old_file,
+            private,
+            strict_sacl,
+        )?;
+        if !original.matches(&old_observed) {
+            anyhow::bail!(
+                "failed Windows managed config original changed before exact restoration; WAL and objects retained"
+            );
+        }
+        if old_needs_restore {
+            rename_windows_config_exact(
+                &old_file,
+                path,
+                private,
+                Some(strict_windows_full_sacl(original, "replacement original")?),
+            )?;
+        }
+        super::update::windows_update::revalidate_managed_file_path(
+            path,
+            &old_file,
+            private,
+            strict_sacl,
+        )?;
+        let restored =
+            observe_open_config_file_with_full_sacl(path, &mut old_file, private, strict_sacl)?;
+        if !original.matches(&restored) {
+            anyhow::bail!(
+                "failed Windows managed config original changed after exact restoration; WAL and objects retained"
+            );
+        }
+    } else {
+        match (canonical, staged, retained) {
+            (Some(new_file), None, None) if canonical_is_replacement => {
+                super::update::windows_update::rename_managed_file_handle_exact(
+                    &new_file,
+                    &staged_path,
+                    false,
+                )?;
+                staged_authority = new_file;
+            }
+            (None, Some(new_file), None) if staged_is_replacement => {
+                staged_authority = new_file;
+            }
+            _ => anyhow::bail!(
+                "failed Windows managed config create has ambiguous rollback identities; WAL and objects retained"
+            ),
+        }
+        require_windows_path_absent(
+            path,
+            "failed Windows managed config create canonical slot after stage relocation",
+        )?;
+    }
+
+    parent.revalidate_visible()?;
     record.phase = ConfigTransactionPhase::RollbackApplied;
     write_config_transaction(lock_file, record)?;
+    let staged_observed = observe_open_config_file_with_full_sacl(
+        &staged_path,
+        &mut staged_authority,
+        private,
+        strict_sacl,
+    )?;
+    if !replacement.matches(&staged_observed) {
+        anyhow::bail!(
+            "rolled-back Windows replacement changed; original was restored and suspect residue plus WAL were retained"
+        );
+    }
     dispose_windows_recorded_config_owned(
-        staged_authority.0,
+        staged_authority,
         &staged_path,
         private,
         "rolled-back Windows managed config replacement",
-        replacement,
+        &replacement,
+        strict_sacl,
     )?;
     parent.revalidate_visible()?;
-    complete_config_transaction(lock_file, record, ConfigTransactionOutcome::RolledBack)?;
+    complete_windows_config_transaction(
+        lock_file,
+        parent,
+        path,
+        private,
+        record,
+        ConfigTransactionOutcome::RolledBack,
+    )?;
     Ok(FailedWriteResolution::RolledBack)
 }
 
@@ -6439,21 +7512,39 @@ fn finish_windows_removal_rollback(
         .as_ref()
         .context("Windows removal rollback lost original authority")?;
     let mut reader = quarantined.file.try_clone()?;
-    let observed = observe_open_config_file(quarantine_path, &mut reader, private)?;
-    if !original.same_identity(&observed) {
+    let observed =
+        observe_open_config_file_with_full_sacl(quarantine_path, &mut reader, private, true)?;
+    if !original.matches(&observed) {
         anyhow::bail!(
-            "Windows removal rollback quarantine changed identity; exact object and WAL retained: {error:#}"
+            "Windows removal rollback quarantine changed; exact object and WAL retained: {error:#}"
         );
     }
-    rename_windows_config_exact(&quarantined.file, path, private)?;
+    rename_windows_config_exact(
+        &quarantined.file,
+        path,
+        private,
+        Some(strict_windows_full_sacl(original, "removal original")?),
+    )?;
     quarantined.name = record.destination_name.clone();
-    super::update::windows_update::revalidate_managed_file_path(path, &quarantined.file, private)?;
+    super::update::windows_update::revalidate_managed_file_path(
+        path,
+        &quarantined.file,
+        private,
+        true,
+    )?;
     quarantined.file.sync_all()?;
     parent.revalidate_visible()?;
     record.phase = ConfigTransactionPhase::RollbackApplied;
     write_config_transaction(lock_file, record)?;
     parent.revalidate_visible()?;
-    complete_config_transaction(lock_file, record, ConfigTransactionOutcome::RolledBack)?;
+    complete_windows_config_transaction(
+        lock_file,
+        parent,
+        path,
+        private,
+        record,
+        ConfigTransactionOutcome::RolledBack,
+    )?;
     Err(error.context("Windows managed config removal failed and was rolled back exactly"))
 }
 
@@ -6590,6 +7681,24 @@ fn observed_config_matches(
     left: Option<&ObservedConfigFile>,
     right: Option<&ObservedConfigFile>,
 ) -> bool {
+    observed_config_matches_inner(left, right, false)
+}
+
+#[cfg(windows)]
+fn observed_config_matches_pre_strict_baseline(
+    left: Option<&ObservedConfigFile>,
+    right: Option<&ObservedConfigFile>,
+) -> bool {
+    observed_config_matches_inner(left, right, true)
+}
+
+fn observed_config_matches_inner(
+    left: Option<&ObservedConfigFile>,
+    right: Option<&ObservedConfigFile>,
+    ignore_windows_full_sacl: bool,
+) -> bool {
+    #[cfg(not(windows))]
+    let _ = ignore_windows_full_sacl;
     match (left, right) {
         (None, None) => true,
         (Some(left), Some(right)) => {
@@ -6604,6 +7713,7 @@ fn observed_config_matches(
                 #[cfg(windows)]
                 {
                     left.security == right.security
+                        && (ignore_windows_full_sacl || left.full_sacl == right.full_sacl)
                 }
                 #[cfg(all(not(unix), not(windows)))]
                 {
@@ -6922,7 +8032,8 @@ impl ConfigLock {
         for plan in plans {
             #[cfg(unix)]
             plan.revalidate_parent()?;
-            let transaction = ConfigTransactionAuthority::acquire(&plan.lock_identity)?;
+            let transaction =
+                ConfigTransactionAuthority::acquire(&plan.lock_identity, &plan.lock_path)?;
             #[cfg(unix)]
             plan.revalidate_parent()?;
             guarded.push((plan, transaction));
@@ -7277,11 +8388,17 @@ impl ConfigLock {
             .with_context(|| format!("failed to create {}", temp.display()))?;
         #[cfg(windows)]
         let mut staged = Some(if private {
-            super::update::windows_update::create_current_user_private_staged_file(&temp)
-                .with_context(|| format!("failed to create {}", temp.display()))?
+            super::update::windows_update::create_current_user_private_staged_file(
+                &temp,
+                self.original.is_some(),
+            )
+            .with_context(|| format!("failed to create {}", temp.display()))?
         } else {
-            super::update::windows_update::create_managed_config_staged_file(&temp)
-                .with_context(|| format!("failed to create {}", temp.display()))?
+            super::update::windows_update::create_managed_config_staged_file(
+                &temp,
+                self.original.is_some(),
+            )
+            .with_context(|| format!("failed to create {}", temp.display()))?
         });
         // Arm exact cleanup immediately after CREATE. Every fallible
         // validation and identity probe below runs inside the cleanup envelope.
@@ -7330,9 +8447,10 @@ impl ConfigLock {
             let final_current = if self.original.is_some() {
                 let mut file =
                     super::update::windows_update::open_managed_config_for_exact_quarantine(
-                        &self.path,
+                        &self.path, true,
                     )?;
-                let observed = observe_open_config_file(&self.path, &mut file, private)?;
+                let observed =
+                    observe_open_config_file_with_full_sacl(&self.path, &mut file, private, true)?;
                 Some((file, observed))
             } else {
                 None
@@ -7343,7 +8461,13 @@ impl ConfigLock {
             let final_observed = final_current.as_ref().map(|(_, observed)| observed);
             #[cfg(all(not(unix), not(windows)))]
             let final_observed = final_current.as_ref();
-            if !observed_config_matches(final_observed, self.original.as_ref()) {
+            #[cfg(windows)]
+            let final_matches_original =
+                observed_config_matches_pre_strict_baseline(final_observed, self.original.as_ref());
+            #[cfg(not(windows))]
+            let final_matches_original =
+                observed_config_matches(final_observed, self.original.as_ref());
+            if !final_matches_original {
                 anyhow::bail!(
                     "managed config changed before quarantine: {}",
                     path.display()
@@ -7757,6 +8881,7 @@ impl ConfigLock {
 
             #[cfg(windows)]
             let platform_result: Result<()> = (|| {
+                let strict_sacl = windows_quarantine.is_some();
                 parent_guard.revalidate_visible()?;
                 if let Some(source) = windows_quarantine.as_ref() {
                     super::update::windows_update::copy_managed_file_metadata(
@@ -7766,12 +8891,13 @@ impl ConfigLock {
                             .context("Windows staging handle disappeared before metadata copy")?,
                     )?;
                 }
-                let staged_observed = observe_open_config_file(
+                let staged_observed = observe_open_config_file_with_full_sacl(
                     &temp,
                     staged
                         .as_mut()
                         .context("Windows staging handle disappeared before observation")?,
                     private,
+                    strict_sacl,
                 )?;
                 let replacement = RecordedConfigObject::from_observed(&staged_observed);
                 let quarantine_name = windows_quarantine
@@ -7797,16 +8923,87 @@ impl ConfigLock {
                         file: parent_file,
                     },
                 };
+                if strict_sacl {
+                    super::update::windows_update::validate_managed_file_full_sacl(
+                        staged
+                            .as_ref()
+                            .context("Windows staging handle disappeared before Prepared")?,
+                    )?;
+                    super::update::windows_update::validate_managed_file_full_sacl(
+                        &windows_quarantine
+                            .as_ref()
+                            .context("Windows replacement lost source authority before Prepared")?
+                            .file,
+                    )?;
+                }
                 self.revalidate_lock()?;
                 write_config_transaction(&self.transaction.file, &transaction)?;
+                // The durable Prepared frame owns recovery from this point,
+                // including any crash during the two-file-object handoff.
                 staged_committed = true;
+                let armed = staged
+                    .take()
+                    .context("Windows staging handle disappeared after Prepared WAL")?;
+                let durable = super::update::windows_update::disarm_staged_file_delete_on_close(
+                    armed,
+                    &temp,
+                    private,
+                    strict_sacl,
+                )?;
+                staged = Some(durable);
+
+                maybe_inject_windows_stage_drift(
+                    "before-old-quarantine",
+                    staged.as_ref().context(
+                        "Windows staging handle disappeared before first drift boundary",
+                    )?,
+                )?;
+                let staged_before_namespace = observe_open_config_file_with_full_sacl(
+                    &temp,
+                    staged.as_mut().context(
+                        "Windows staging handle disappeared before first namespace mutation",
+                    )?,
+                    private,
+                    strict_sacl,
+                )?;
+                if !replacement.matches(&staged_before_namespace) {
+                    anyhow::bail!(
+                        "Windows replacement changed immediately before first namespace mutation"
+                    );
+                }
+                if let (Some(old), Some(original)) =
+                    (windows_quarantine.as_mut(), transaction.original.as_ref())
+                {
+                    let original_before_namespace = observe_open_config_file_with_full_sacl(
+                        &self.path,
+                        &mut old.file,
+                        private,
+                        strict_sacl,
+                    )?;
+                    if !original.matches(&original_before_namespace) {
+                        anyhow::bail!(
+                            "Windows original changed immediately before first namespace mutation"
+                        );
+                    }
+                }
 
                 if let Some(old) = windows_quarantine.as_mut() {
                     let name = quarantine_name
                         .clone()
                         .context("Windows write transaction lost quarantine name")?;
                     let quarantine_path = parent.join(&name);
-                    rename_windows_config_exact(&old.file, &quarantine_path, private)?;
+                    rename_windows_config_exact(
+                        &old.file,
+                        &quarantine_path,
+                        private,
+                        transaction
+                            .original
+                            .as_ref()
+                            .map(|original| {
+                                strict_windows_full_sacl(original, "replacement original")
+                            })
+                            .transpose()?,
+                    )?;
                     // Record the new exact-handle location immediately after
                     // the namespace transition, before any fallible check.
                     old.name = name;
@@ -7814,28 +9011,66 @@ impl ConfigLock {
                         &quarantine_path,
                         &old.file,
                         private,
+                        strict_sacl,
                     )?;
                     parent_guard.revalidate_visible()?;
+                }
+                if maybe_inject_windows_stage_crash(
+                    "after-old-quarantine-before-stage-commit",
+                    staged.as_ref().context(
+                        "Windows staging handle disappeared before crash-recovery injection",
+                    )?,
+                )? {
+                    namespace_phase_sync_failed = true;
+                    anyhow::bail!(
+                        "injected crash after old quarantine with an unsupported replacement SACL"
+                    );
+                }
+                maybe_inject_windows_stage_drift(
+                    "after-old-quarantine-before-stage-commit",
+                    staged.as_ref().context(
+                        "Windows staging handle disappeared before post-quarantine drift boundary",
+                    )?,
+                )?;
+                let staged_before_commit = observe_open_config_file_with_full_sacl(
+                    &temp,
+                    staged
+                        .as_mut()
+                        .context("Windows staging handle disappeared before exact commit")?,
+                    private,
+                    strict_sacl,
+                )?;
+                if !replacement.matches(&staged_before_commit) {
+                    anyhow::bail!(
+                        "Windows replacement changed after old quarantine and before exact commit"
+                    );
+                }
+                if let (Some(old), Some(original)) =
+                    (windows_quarantine.as_mut(), transaction.original.as_ref())
+                {
+                    let quarantine_path = parent.join(&old.name);
+                    let original_before_commit = observe_open_config_file_with_full_sacl(
+                        &quarantine_path,
+                        &mut old.file,
+                        private,
+                        strict_sacl,
+                    )?;
+                    if !original.matches(&original_before_commit) {
+                        anyhow::bail!(
+                            "Windows original changed after quarantine and before replacement commit"
+                        );
+                    }
                 }
                 let staged_file = staged
                     .as_ref()
                     .context("Windows staging handle disappeared before exact commit")?;
-                let commit = if private {
-                    super::update::windows_update::rename_private_file_handle_exact(
-                        staged_file,
-                        &self.path,
-                        false,
-                    )
-                } else {
-                    super::update::windows_update::rename_managed_file_handle_exact(
-                        staged_file,
-                        &self.path,
-                        false,
-                    )
-                };
-                commit.context(
-                    "failed to commit managed config; durable recovery authority retained",
-                )?;
+                rename_windows_config_exact(
+                    staged_file,
+                    &self.path,
+                    private,
+                    replacement.full_sacl.as_deref(),
+                )
+                .context("failed to commit managed config; durable recovery authority retained")?;
                 windows_staged_location = WindowsStagedLocation::Canonical;
                 super::update::windows_update::revalidate_managed_file_path(
                     &self.path,
@@ -7843,6 +9078,7 @@ impl ConfigLock {
                         .as_ref()
                         .context("Windows staging handle disappeared after exact commit")?,
                     private,
+                    strict_sacl,
                 )?;
                 parent_guard.revalidate_visible()?;
                 validate_regular_config_file(
@@ -7856,8 +9092,14 @@ impl ConfigLock {
                     .as_ref()
                     .context("Windows staging handle disappeared before flush")?
                     .sync_all()?;
-                let installed = read_config_file_nofollow(&self.path, private)?
-                    .context("managed config disappeared after exact-handle commit")?;
+                let installed = observe_open_config_file_with_full_sacl(
+                    &self.path,
+                    staged
+                        .as_mut()
+                        .context("Windows installed handle disappeared after exact commit")?,
+                    private,
+                    strict_sacl,
+                )?;
                 if !replacement.matches(&installed) {
                     anyhow::bail!(
                         "managed config failed exact post-commit readback; durable recovery evidence retained: {}",
@@ -7870,9 +9112,14 @@ impl ConfigLock {
                         &quarantine_path,
                         &quarantined.file,
                         private,
+                        strict_sacl,
                     )?;
-                    let reobserved =
-                        observe_open_config_file(&quarantine_path, &mut quarantined.file, private)?;
+                    let reobserved = observe_open_config_file_with_full_sacl(
+                        &quarantine_path,
+                        &mut quarantined.file,
+                        private,
+                        strict_sacl,
+                    )?;
                     if !observed_config_matches(Some(&reobserved), Some(&quarantined.observed)) {
                         anyhow::bail!(
                             "retained old managed config accrued concurrent edits; exact-handle rollback required"
@@ -7894,6 +9141,7 @@ impl ConfigLock {
                         &quarantine_path,
                         &quarantined.file,
                         private,
+                        strict_sacl,
                     )?;
                     let original = transaction
                         .original
@@ -7905,6 +9153,7 @@ impl ConfigLock {
                         private,
                         "quarantined managed config",
                         original,
+                        strict_sacl,
                     )?;
                     let quarantined = windows_quarantine
                         .take()
@@ -7923,18 +9172,26 @@ impl ConfigLock {
                     &self.path,
                     staged_file,
                     private,
+                    strict_sacl,
                 )?;
                 let mut final_reader = staged_file.try_clone()?;
-                let installed_before_terminal =
-                    observe_open_config_file(&self.path, &mut final_reader, private)?;
+                let installed_before_terminal = observe_open_config_file_with_full_sacl(
+                    &self.path,
+                    &mut final_reader,
+                    private,
+                    strict_sacl,
+                )?;
                 if !replacement.matches(&installed_before_terminal) {
                     anyhow::bail!(
                         "managed config changed before terminal commit; terminal WAL was not written"
                     );
                 }
                 parent_guard.revalidate_visible()?;
-                complete_config_transaction(
+                complete_windows_config_transaction(
                     &self.transaction.file,
+                    &parent_guard,
+                    &self.path,
+                    private,
                     &mut transaction,
                     ConfigTransactionOutcome::Committed,
                 )?;
@@ -8328,15 +9585,23 @@ impl ConfigLock {
         let platform_result: Result<()> = (|| {
             let parent_guard = super::update::windows_update::WindowsParentGuard::open(parent)?;
             let mut file = super::update::windows_update::open_managed_config_for_exact_quarantine(
-                &self.path,
+                &self.path, true,
             )?;
-            let observed = observe_open_config_file(&self.path, &mut file, self.private)?;
-            if !observed_config_matches(Some(&observed), self.original.as_ref()) {
+            let observed =
+                observe_open_config_file_with_full_sacl(&self.path, &mut file, self.private, true)?;
+            if !observed_config_matches_pre_strict_baseline(Some(&observed), self.original.as_ref())
+            {
                 anyhow::bail!(
                     "managed config changed before removal quarantine: {}",
                     path.display()
                 );
             }
+            super::update::windows_update::revalidate_managed_file_path(
+                &self.path,
+                &file,
+                self.private,
+                true,
+            )?;
             let mut quarantined = QuarantinedConfig {
                 name: file_name.to_string(),
                 file,
@@ -8365,9 +9630,22 @@ impl ConfigLock {
                     file: parent_file,
                 },
             };
+            super::update::windows_update::validate_managed_file_full_sacl(&quarantined.file)
+                .context("managed config full SACL changed before removal Prepared WAL")?;
             self.revalidate_lock()?;
             write_config_transaction(&self.transaction.file, &transaction)?;
-            rename_windows_config_exact(&quarantined.file, &quarantine_path, self.private)?;
+            rename_windows_config_exact(
+                &quarantined.file,
+                &quarantine_path,
+                self.private,
+                Some(strict_windows_full_sacl(
+                    transaction
+                        .original
+                        .as_ref()
+                        .context("Windows removal transaction lost original authority")?,
+                    "removal original",
+                )?),
+            )?;
             quarantined.name = transaction
                 .retained_name
                 .clone()
@@ -8377,12 +9655,14 @@ impl ConfigLock {
                     &quarantine_path,
                     &quarantined.file,
                     self.private,
+                    true,
                 )?;
                 parent_guard.revalidate_visible()?;
-                let reobserved = observe_open_config_file(
+                let reobserved = observe_open_config_file_with_full_sacl(
                     &quarantine_path,
                     &mut quarantined.file,
                     self.private,
+                    true,
                 )?;
                 if !observed_config_matches(Some(&reobserved), Some(&quarantined.observed)) {
                     anyhow::bail!("managed config changed at removal quarantine boundary");
@@ -8418,6 +9698,7 @@ impl ConfigLock {
                 self.private,
                 "quarantined managed config",
                 &original,
+                true,
             ) {
                 return Err(error.context(
                     "committed Windows removal retained its exact quarantine handle before disposition; restart recovery remains required",
@@ -8445,8 +9726,11 @@ impl ConfigLock {
                     error,
                 );
             }
-            if let Err(error) = complete_config_transaction(
+            if let Err(error) = complete_windows_config_transaction(
                 &self.transaction.file,
+                &parent_guard,
+                &self.path,
+                self.private,
                 &mut transaction,
                 ConfigTransactionOutcome::Committed,
             ) {
@@ -8510,6 +9794,7 @@ fn merge_json_mcp_target_locked(
     if servers.get("kin").is_some_and(|value| !value.is_object()) {
         anyhow::bail!("existing mcpServers.kin value is not an object");
     }
+    let entry_preexisted = servers.contains_key("kin");
     let entry = servers
         .entry("kin")
         .or_insert_with(|| serde_json::json!({}))
@@ -8519,12 +9804,21 @@ fn merge_json_mcp_target_locked(
         "command".to_string(),
         serde_json::Value::String(command.to_string()),
     );
-    entry.insert("args".to_string(), serde_json::json!(["mcp", "start"]));
+    let args = match target.repo_root.as_deref() {
+        Some(repo_root) => {
+            serde_json::json!(["mcp", "start", "--repo", repo_root.to_string_lossy()])
+        }
+        None => serde_json::json!(["mcp", "start"]),
+    };
+    entry.insert("args".to_string(), args);
     if let Some(repo_root) = target.repo_root.as_deref() {
-        entry.insert(
-            "cwd".to_string(),
-            serde_json::Value::String(repo_root.to_string_lossy().into_owned()),
-        );
+        if target.id == "antigravity_workspace" || (target.id == "antigravity" && !entry_preexisted)
+        {
+            entry.insert(
+                "cwd".to_string(),
+                serde_json::Value::String(repo_root.to_string_lossy().into_owned()),
+            );
+        }
     }
     if entry.get("env").is_some_and(|value| !value.is_object()) {
         anyhow::bail!("existing Kin MCP env value is not an object");
@@ -8771,19 +10065,17 @@ fn mcp_entry_matches_repair_target(
     {
         return false;
     }
-    let expected_args = if target.id == "codex" {
-        let Some(repo_root) = target.repo_root.as_deref() else {
-            return false;
-        };
-        serde_json::json!(["mcp", "start", "--repo", repo_root.to_string_lossy()])
-    } else {
-        serde_json::json!(["mcp", "start"])
+    let expected_args = match target.repo_root.as_deref() {
+        Some(repo_root) => {
+            serde_json::json!(["mcp", "start", "--repo", repo_root.to_string_lossy()])
+        }
+        None => serde_json::json!(["mcp", "start"]),
     };
     if entry.get("args") != Some(&expected_args) {
         return false;
     }
     match target.repo_root.as_deref() {
-        Some(repo_root) if target.id != "codex" => {
+        Some(repo_root) if target.id == "antigravity_workspace" => {
             entry.get("cwd").and_then(serde_json::Value::as_str)
                 == Some(repo_root.to_string_lossy().as_ref())
         }
@@ -9368,6 +10660,7 @@ fn mcp_config_path_for_index(idx: usize) -> Option<PathBuf> {
                 .join("windsurf")
                 .join("mcp_config.json"),
         ),
+        IDX_ANTIGRAVITY => Some(home.join(".gemini").join("config").join("mcp_config.json")),
         _ => None,
     }
 }
@@ -9380,6 +10673,7 @@ fn configure_assistant_by_index(idx: usize) -> Option<Result<PathBuf>> {
         IDX_CODEX => Some(configure_codex()),
         IDX_GEMINI => Some(configure_gemini_cli()),
         IDX_WINDSURF => Some(configure_windsurf()),
+        IDX_ANTIGRAVITY => Some(configure_antigravity()),
         _ => None,
     }
 }
@@ -10659,12 +11953,9 @@ mod tests {
             unsafe {
                 libc::umask(0o777);
             }
-            let transaction = ConfigTransactionAuthority::acquire(&subject_identity).unwrap();
-            let kin_home = std::env::temp_dir()
-                .join(format!(
-                    "kin-config-transaction-tests-{}",
-                    std::process::id()
-                ))
+            let transaction =
+                ConfigTransactionAuthority::acquire(&subject_identity, &subject).unwrap();
+            let kin_home = config_transaction_test_kin_home(&subject)
                 .canonicalize()
                 .unwrap();
             let transaction_root = kin_home.join("config-transactions");
@@ -11032,6 +12323,54 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_unavailable_se_security_privilege_fails_before_wal_or_namespace_change() {
+        struct ResetPrivilegeInjection;
+        impl Drop for ResetPrivilegeInjection {
+            fn drop(&mut self) {
+                super::super::update::windows_update::inject_se_security_privilege_unavailable(
+                    false,
+                );
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        fs::write(&path, b"original\n").unwrap();
+        let lock = ConfigLock::acquire(&path).unwrap();
+        super::super::update::windows_update::inject_se_security_privilege_unavailable(true);
+        let _reset = ResetPrivilegeInjection;
+        let error = lock
+            .write_guarded(&path, b"replacement\n", Some(b"original\n"))
+            .expect_err("strict replacement must fail when SeSecurityPrivilege is unavailable");
+
+        assert!(format!("{error:#}").contains("SeSecurityPrivilege"));
+        assert_eq!(fs::read(&path).unwrap(), b"original\n");
+        assert_eq!(lock.transaction.file.metadata().unwrap().len(), 0);
+        assert!(
+            lock.lock_path.is_file(),
+            "the persistent lock sidecar is expected and must remain"
+        );
+        let residue = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                name.rsplit_once(".kin-update-")
+                    .and_then(|(_, suffix)| suffix.strip_suffix(".tmp"))
+                    .is_some_and(|suffix| uuid::Uuid::parse_str(suffix).is_ok())
+                    || name
+                        .rsplit_once(".kin-quarantine-")
+                        .is_some_and(|(_, suffix)| uuid::Uuid::parse_str(suffix).is_ok())
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            residue.is_empty(),
+            "unexpected pre-WAL residue: {residue:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_config_lock_round_trips_public_and_private_files() {
         let dir = tempfile::tempdir().unwrap();
         let public = dir.path().join("config.json");
@@ -11065,14 +12404,55 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_prepared_handoff_failure_deletes_stage_and_rolls_back_from_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        fs::write(&config, b"original\n").unwrap();
+        let lock = ConfigLock::acquire(&config).unwrap();
+        super::super::update::windows_update::inject_staged_file_disarm_failure(true);
+        let error = lock
+            .write_guarded(&config, b"replacement\n", Some(b"original\n"))
+            .expect_err("handoff failure must not publish the replacement");
+        assert!(
+            format!("{error:#}").contains("rolled back"),
+            "unexpected handoff failure diagnostic: {error:#}"
+        );
+        assert_eq!(fs::read(&config).unwrap(), b"original\n");
+        let residue = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                name.rsplit_once(".kin-update-")
+                    .and_then(|(_, suffix)| suffix.strip_suffix(".tmp"))
+                    .is_some_and(|suffix| uuid::Uuid::parse_str(suffix).is_ok())
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            residue.is_empty(),
+            "failed handoff leaked a named stage: {residue:?}"
+        );
+        let durable = read_config_transaction(&lock.transaction.file)
+            .unwrap()
+            .expect("handoff rollback must retain terminal WAL authority");
+        assert_eq!(durable.phase, ConfigTransactionPhase::RollbackComplete);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_file_id_info_is_stable_across_handles_and_rename() {
         let dir = tempfile::tempdir().unwrap();
         let original = dir.path().join("identity-original.tmp");
         let renamed = dir.path().join("identity-renamed.tmp");
         let distinct = dir.path().join("identity-distinct.tmp");
-        let first =
-            super::super::update::windows_update::create_managed_config_staged_file(&original)
-                .unwrap();
+        let first = super::super::update::windows_update::create_managed_config_staged_file(
+            &original, false,
+        )
+        .unwrap();
+        let first = super::super::update::windows_update::disarm_staged_file_delete_on_close(
+            first, &original, false, false,
+        )
+        .unwrap();
         let second = fs::File::open(&original).unwrap();
         let first_identity =
             super::super::update::windows_update::managed_object_identity(&first, false).unwrap();
@@ -11094,9 +12474,10 @@ mod tests {
             first_identity
         );
 
-        let other =
-            super::super::update::windows_update::create_managed_config_staged_file(&distinct)
-                .unwrap();
+        let other = super::super::update::windows_update::create_managed_config_staged_file(
+            &distinct, false,
+        )
+        .unwrap();
         let other_identity =
             super::super::update::windows_update::managed_object_identity(&other, false).unwrap();
         assert_ne!(first_identity, other_identity);
@@ -11114,7 +12495,8 @@ mod tests {
         inject_created_file_validation_failure(Some(CreatedFileValidationFailure::Identity));
         assert!(
             super::super::update::windows_update::create_current_user_private_staged_file(
-                &private_identity
+                &private_identity,
+                false,
             )
             .is_err()
         );
@@ -11124,7 +12506,8 @@ mod tests {
         inject_created_file_validation_failure(Some(CreatedFileValidationFailure::Security));
         assert!(
             super::super::update::windows_update::create_current_user_private_staged_file(
-                &private_security
+                &private_security,
+                false,
             )
             .is_err()
         );
@@ -11134,7 +12517,8 @@ mod tests {
         inject_created_file_validation_failure(Some(CreatedFileValidationFailure::Identity));
         assert!(
             super::super::update::windows_update::create_managed_config_staged_file(
-                &public_identity
+                &public_identity,
+                false,
             )
             .is_err()
         );
@@ -11224,6 +12608,8 @@ mod tests {
                 metadata_sha256: crate::commands::setup_ledger::sha256_hex(b"test-unix-metadata"),
                 #[cfg(windows)]
                 security: "test-security".to_string(),
+                #[cfg(windows)]
+                full_sacl: None,
             }),
             parent: ConfigParentIdentity {
                 #[cfg(unix)]
@@ -11350,6 +12736,224 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_schema_v6_full_sacl_authority_is_validated_for_every_phase() {
+        let phases = [
+            ConfigTransactionPhase::Prepared,
+            ConfigTransactionPhase::NamespaceCommitted,
+            ConfigTransactionPhase::RollbackApplied,
+            ConfigTransactionPhase::CommitComplete,
+            ConfigTransactionPhase::RollbackComplete,
+        ];
+        for phase in phases {
+            let mut existing_write = wal_test_record(phase);
+            let mut original = existing_write.replacement.clone().unwrap();
+            original.full_sacl = Some("a".repeat(64));
+            existing_write.original = Some(original);
+            existing_write.replacement.as_mut().unwrap().full_sacl = Some("b".repeat(64));
+            validate_config_transaction_record(
+                Path::new("/tmp/config.json"),
+                false,
+                &existing_write,
+            )
+            .unwrap();
+
+            for (label, mutate) in [
+                ("missing original full SACL", 0_u8),
+                ("missing replacement full SACL", 1_u8),
+                ("uppercase replacement full SACL", 2_u8),
+            ] {
+                let mut invalid = existing_write.clone();
+                match mutate {
+                    0 => invalid.original.as_mut().unwrap().full_sacl = None,
+                    1 => invalid.replacement.as_mut().unwrap().full_sacl = None,
+                    2 => invalid.replacement.as_mut().unwrap().full_sacl = Some("B".repeat(64)),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    validate_config_transaction_record(
+                        Path::new("/tmp/config.json"),
+                        false,
+                        &invalid,
+                    )
+                    .is_err(),
+                    "{label} was accepted in {phase:?}"
+                );
+            }
+
+            let create = wal_test_record(phase);
+            validate_config_transaction_record(Path::new("/tmp/config.json"), false, &create)
+                .unwrap();
+            let mut invalid_create = create.clone();
+            invalid_create.replacement.as_mut().unwrap().full_sacl = Some("c".repeat(64));
+            assert!(
+                validate_config_transaction_record(
+                    Path::new("/tmp/config.json"),
+                    false,
+                    &invalid_create,
+                )
+                .is_err(),
+                "create full-SACL authority was accepted in {phase:?}"
+            );
+
+            let mut removal = existing_write.clone();
+            removal.operation = ConfigTransactionOperation::Remove;
+            removal.replacement = None;
+            validate_config_transaction_record(Path::new("/tmp/config.json"), false, &removal)
+                .unwrap();
+            removal.original.as_mut().unwrap().full_sacl = Some("short".to_string());
+            assert!(
+                validate_config_transaction_record(Path::new("/tmp/config.json"), false, &removal,)
+                    .is_err(),
+                "invalid removal full-SACL authority was accepted in {phase:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[serial]
+    fn windows_stage_drift_restores_original_before_retaining_suspect_residue() {
+        struct ResetWindowsStageDrift;
+        impl Drop for ResetWindowsStageDrift {
+            fn drop(&mut self) {
+                inject_windows_stage_drift_at_phase(None);
+            }
+        }
+
+        for (phase, drift) in [
+            ("before-old-quarantine", InjectedWindowsStageDrift::Dacl),
+            (
+                "before-old-quarantine",
+                InjectedWindowsStageDrift::SupportedSacl,
+            ),
+            (
+                "after-old-quarantine-before-stage-commit",
+                InjectedWindowsStageDrift::Dacl,
+            ),
+            (
+                "after-old-quarantine-before-stage-commit",
+                InjectedWindowsStageDrift::SupportedSacl,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("config.json");
+            fs::write(&config, b"original\n").unwrap();
+            let lock = ConfigLock::acquire(&config).unwrap();
+            inject_windows_stage_drift_at_phase(Some((phase, drift)));
+            let _reset = ResetWindowsStageDrift;
+
+            let error = lock
+                .write_guarded(&config, b"replacement\n", Some(b"original\n"))
+                .expect_err("stage authority drift must retain recovery evidence");
+            let diagnostic = format!("{error:#}");
+            assert!(
+                diagnostic.contains("original was restored")
+                    || diagnostic.contains("suspect residue"),
+                "unexpected {phase} drift diagnostic: {diagnostic}"
+            );
+            assert_eq!(fs::read(&config).unwrap(), b"original\n");
+            let durable = read_config_transaction(&lock.transaction.file)
+                .unwrap()
+                .expect("drift recovery must retain a durable WAL");
+            assert_eq!(durable.phase, ConfigTransactionPhase::RollbackApplied);
+            assert!(!matches!(
+                durable.phase,
+                ConfigTransactionPhase::CommitComplete | ConfigTransactionPhase::RollbackComplete
+            ));
+            let residues = fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| {
+                    name.rsplit_once(".kin-update-")
+                        .and_then(|(_, suffix)| suffix.strip_suffix(".tmp"))
+                        .is_some_and(|suffix| uuid::Uuid::parse_str(suffix).is_ok())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                residues.len(),
+                1,
+                "{phase} drift must retain exactly one suspect stage: {residues:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[serial]
+    fn windows_restart_recovery_restores_original_before_rejecting_unsupported_stage_sacl() {
+        struct ResetWindowsStageDrift;
+        impl Drop for ResetWindowsStageDrift {
+            fn drop(&mut self) {
+                inject_windows_stage_drift_at_phase(None);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        fs::write(&config, b"original\n").unwrap();
+        let lock = ConfigLock::acquire(&config).unwrap();
+        let wal_path = lock.transaction.path.clone();
+        inject_windows_stage_drift_at_phase(Some((
+            "after-old-quarantine-before-stage-commit",
+            InjectedWindowsStageDrift::UnsupportedSaclCrash,
+        )));
+        let _reset = ResetWindowsStageDrift;
+
+        let crash = lock
+            .write_guarded(&config, b"replacement\n", Some(b"original\n"))
+            .expect_err("post-quarantine crash injection must preserve durable recovery state");
+        assert!(
+            format!("{crash:#}").contains("injected crash after old quarantine"),
+            "unexpected crash diagnostic: {crash:#}"
+        );
+        assert!(
+            !config.exists(),
+            "the simulated crash point must leave the original quarantined"
+        );
+        drop(lock);
+
+        let recovery = match ConfigLock::acquire(&config) {
+            Ok(_) => {
+                panic!("unsupported replacement SACL must fail after exact original restoration")
+            }
+            Err(error) => error,
+        };
+        let diagnostic = format!("{recovery:#}");
+        assert!(
+            diagnostic.contains("unsupported"),
+            "unexpected restart recovery diagnostic: {diagnostic}"
+        );
+        assert_eq!(fs::read(&config).unwrap(), b"original\n");
+
+        let wal = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&wal_path)
+            .unwrap();
+        let durable = read_config_transaction(&wal)
+            .unwrap()
+            .expect("failed replacement validation must retain the durable WAL");
+        assert_eq!(durable.phase, ConfigTransactionPhase::RollbackApplied);
+        let residues = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                name.rsplit_once(".kin-update-")
+                    .and_then(|(_, suffix)| suffix.strip_suffix(".tmp"))
+                    .is_some_and(|suffix| uuid::Uuid::parse_str(suffix).is_ok())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            residues.len(),
+            1,
+            "suspect stage must remain exact: {residues:?}"
+        );
+    }
+
     #[test]
     #[serial]
     fn recovery_rejects_a_sidecar_renamed_to_a_different_target_slot() {
@@ -11400,7 +13004,8 @@ mod tests {
         assert_eq!(fs::read(&original_path).unwrap(), b"owner-data\n");
         assert!(!redirected_path.exists());
 
-        let cleanup = ConfigTransactionAuthority::acquire(&sidecar_identity).unwrap();
+        let cleanup =
+            ConfigTransactionAuthority::acquire(&sidecar_identity, &original_sidecar).unwrap();
         cleanup.file.set_len(0).unwrap();
         cleanup.file.sync_all().unwrap();
     }
@@ -11414,6 +13019,66 @@ mod tests {
         assert_eq!(parsed.committed_len, pair.len());
         assert_eq!(parsed.next_sequence, 2);
         assert!(parsed.uncommitted_tail_sha256.is_none());
+    }
+
+    #[test]
+    fn config_transaction_test_authority_is_fixture_scoped_and_stable() {
+        let fixture_a = tempfile::tempdir().unwrap();
+        let fixture_b = tempfile::tempdir().unwrap();
+        let identity = wal_test_record(ConfigTransactionPhase::Prepared).sidecar;
+        let subject_a = fixture_a.path().join("first.lock");
+        let subject_a_renamed = fixture_a.path().join("renamed.lock");
+        let subject_b = fixture_b.path().join("first.lock");
+
+        let authority_a = ConfigTransactionAuthority::acquire(&identity, &subject_a).unwrap();
+        let authority_a_path = authority_a.path.clone();
+        let mut record = wal_test_record(ConfigTransactionPhase::Prepared);
+        record.sidecar = identity.clone();
+        write_config_transaction(&authority_a.file, &record).unwrap();
+        drop(authority_a);
+
+        let authority_b = ConfigTransactionAuthority::acquire(&identity, &subject_b).unwrap();
+        assert_ne!(authority_b.path, authority_a_path);
+        assert!(read_config_transaction(&authority_b.file)
+            .unwrap()
+            .is_none());
+        drop(authority_b);
+
+        let authority_a_renamed =
+            ConfigTransactionAuthority::acquire(&identity, &subject_a_renamed).unwrap();
+        assert_eq!(authority_a_renamed.path, authority_a_path);
+        assert_eq!(
+            read_config_transaction(&authority_a_renamed.file).unwrap(),
+            Some(record)
+        );
+        authority_a_renamed.file.set_len(0).unwrap();
+        authority_a_renamed.file.sync_all().unwrap();
+    }
+
+    #[test]
+    fn config_transaction_test_authority_normalizes_relative_nonexistent_paths() {
+        let current = env::current_dir().unwrap();
+        let fixture = tempfile::Builder::new()
+            .prefix("kin-config-relative-")
+            .tempdir_in(&current)
+            .unwrap();
+        let fixture_name = fixture.path().strip_prefix(&current).unwrap();
+        let relative = PathBuf::from(".")
+            .join(fixture_name)
+            .join("missing")
+            .join("..")
+            .join("renamed.lock");
+        let absolute = fixture.path().join("renamed.lock");
+
+        assert!(!absolute.exists());
+        assert_eq!(
+            canonicalize_nearest_existing_test_path(&relative),
+            canonicalize_nearest_existing_test_path(&absolute)
+        );
+        assert_eq!(
+            config_transaction_test_kin_home(&relative),
+            config_transaction_test_kin_home(&absolute)
+        );
     }
 
     #[test]
@@ -12147,5 +13812,221 @@ mod tests {
             "workspace MCP config or lock leaked into Git status: {}",
             String::from_utf8_lossy(&status.stdout)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn antigravity_first_setup_captures_and_repairs_global_and_workspace_bindings() {
+        use std::process::Command;
+
+        struct CurrentDirGuard(PathBuf);
+        impl Drop for CurrentDirGuard {
+            fn drop(&mut self) {
+                let _ = env::set_current_dir(&self.0);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let kin_home = dir.path().join("kin-home");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(kin_home.join("bin")).unwrap();
+        fs::create_dir_all(repo.join(".kin")).unwrap();
+        fs::copy(env::current_exe().unwrap(), kin_home.join("bin/kin")).unwrap();
+        let git = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(git.status.success());
+        let _home = EnvGuard::set("HOME", &home);
+        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        let previous = env::current_dir().unwrap();
+        env::set_current_dir(&repo).unwrap();
+        let _cwd = CurrentDirGuard(previous);
+        let canonical_repo = repo.canonicalize().unwrap();
+
+        let global = configure_antigravity().unwrap();
+        let workspace = repo.join(".agents/mcp_config.json");
+        assert_eq!(global, home.join(".gemini/config/mcp_config.json"));
+        for path in [&global, &workspace] {
+            let entry = read_kin_mcp_entry(path).unwrap();
+            assert_eq!(
+                entry["command"].as_str(),
+                Some(kin_home.join("bin/kin").to_string_lossy().as_ref())
+            );
+            assert_eq!(
+                entry["args"],
+                serde_json::json!(["mcp", "start", "--repo", canonical_repo.to_string_lossy()])
+            );
+            assert_eq!(
+                entry["cwd"].as_str(),
+                Some(canonical_repo.to_string_lossy().as_ref())
+            );
+        }
+
+        let targets = current_mcp_repair_targets().unwrap();
+        let antigravity = targets
+            .iter()
+            .filter(|target| target.id == "antigravity" || target.id == "antigravity_workspace")
+            .collect::<Vec<_>>();
+        assert_eq!(antigravity.len(), 2);
+        assert!(antigravity
+            .iter()
+            .all(|target| target.repo_root.as_deref() == Some(canonical_repo.as_path())));
+        let finalized = std::cell::Cell::new(false);
+        let repaired = remerge_mcp_targets_exact_with_finalizer(&targets, || {
+            finalized.set(true);
+            Ok(())
+        })
+        .unwrap();
+        assert!(finalized.get());
+        assert!(repaired.contains(&ConfigLock::normalized_path(&global).unwrap()));
+        assert!(repaired.contains(&ConfigLock::normalized_path(&workspace).unwrap()));
+        assert!(mcp_repair_targets_ledger_verified(&targets).unwrap());
+        assert!(!kin_home.join("update-restart-ack-required.json").exists());
+    }
+
+    #[test]
+    #[serial]
+    fn antigravity_global_remerge_preserves_existing_cwd_and_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_home = dir.path().join("kin-home");
+        let repo = dir.path().join("repo");
+        let config = dir.path().join("mcp_config.json");
+        fs::create_dir_all(repo.join(".kin")).unwrap();
+        fs::write(
+            &config,
+            br#"{
+  "mcpServers": {
+    "kin": {
+      "command": "/old/kin",
+      "args": ["mcp", "start"],
+      "cwd": "/user/chosen/cwd",
+      "policy": {"approval": "manual"}
+    }
+  }
+}"#,
+        )
+        .unwrap();
+        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        let target = McpRepairTarget {
+            id: "antigravity".to_string(),
+            path: config.clone(),
+            repo_root: Some(repo.canonicalize().unwrap()),
+            captured_config_sha256: "0".repeat(64),
+        };
+        let lock = ConfigLock::acquire(&config).unwrap();
+        merge_json_mcp_target_locked(&target, "/managed/kin", &lock).unwrap();
+        let entry = read_kin_mcp_entry(&config).unwrap();
+        assert_eq!(entry["cwd"], "/user/chosen/cwd");
+        assert_eq!(entry["policy"]["approval"], "manual");
+        assert_eq!(
+            entry["args"],
+            serde_json::json!([
+                "mcp",
+                "start",
+                "--repo",
+                repo.canonicalize().unwrap().to_string_lossy()
+            ])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_mcp_excludes_reject_symlink_and_external_gitdir_authority() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let trusted = dir.path().join("trusted");
+        fs::create_dir_all(&trusted).unwrap();
+        let output = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&trusted)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let external_exclude = trusted.join(".git/info/exclude");
+        let baseline = fs::read(&external_exclude).unwrap();
+
+        let symlinked = dir.path().join("symlinked");
+        fs::create_dir_all(&symlinked).unwrap();
+        symlink(trusted.join(".git"), symlinked.join(".git")).unwrap();
+        let error = ensure_workspace_mcp_git_excluded(&symlinked)
+            .expect_err("symlinked .git authority must fail closed");
+        assert!(format!("{error:#}").contains("must not be a symlink"));
+        assert_eq!(fs::read(&external_exclude).unwrap(), baseline);
+
+        let redirected = dir.path().join("redirected");
+        fs::create_dir_all(&redirected).unwrap();
+        fs::write(
+            redirected.join(".git"),
+            format!("gitdir: {}\n", trusted.join(".git").display()),
+        )
+        .unwrap();
+        ensure_workspace_mcp_git_excluded(&redirected)
+            .expect_err("arbitrary external gitdir authority must fail closed");
+        assert_eq!(fs::read(&external_exclude).unwrap(), baseline);
+    }
+
+    #[test]
+    fn workspace_mcp_excludes_reject_escaped_commondir_and_wrong_backpointer() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        let linked = dir.path().join("linked");
+        fs::create_dir_all(&main).unwrap();
+        let git = |args: &[&str], cwd: &Path| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"], &main);
+        git(&["config", "user.email", "kin-test@example.invalid"], &main);
+        git(&["config", "user.name", "Kin Test"], &main);
+        fs::write(main.join("README.md"), "fixture\n").unwrap();
+        git(&["add", "README.md"], &main);
+        git(&["commit", "-qm", "fixture"], &main);
+        let linked_text = linked.to_string_lossy().into_owned();
+        git(
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "authority-test",
+                &linked_text,
+            ],
+            &main,
+        );
+
+        let pointer = fs::read_to_string(linked.join(".git")).unwrap();
+        let git_dir = PathBuf::from(pointer.trim().strip_prefix("gitdir:").unwrap().trim());
+        let commondir = git_dir.join("commondir");
+        let original_commondir = fs::read(&commondir).unwrap();
+        fs::write(&commondir, format!("{}\n", dir.path().display())).unwrap();
+        let error = ensure_workspace_mcp_git_excluded(&linked)
+            .expect_err("absolute commondir escape must fail closed");
+        assert!(format!("{error:#}").contains("commondir authority must be relative"));
+        fs::write(&commondir, original_commondir).unwrap();
+
+        let reverse = git_dir.join("gitdir");
+        let original_reverse = fs::read(&reverse).unwrap();
+        fs::write(&reverse, format!("{}\n", main.join(".git/HEAD").display())).unwrap();
+        let error = ensure_workspace_mcp_git_excluded(&linked)
+            .expect_err("wrong gitdir backpointer must fail closed");
+        assert!(format!("{error:#}").contains("backpointer"));
+        fs::write(reverse, original_reverse).unwrap();
     }
 }

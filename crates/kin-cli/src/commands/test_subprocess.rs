@@ -5,8 +5,11 @@
 //!
 //! Regular files, rather than pipes, capture output so a descendant inheriting
 //! stdout or stderr cannot keep the caller blocked after the direct child exits.
-//! Every worker gets its own process tree, which is terminated and proven empty
-//! before captured output is read or control returns to the test.
+//! On Unix, every worker gets its own process group, which is terminated and
+//! proven empty before captured output is read or control returns to the test.
+//! Workers must not detach or call `setsid`, because that escapes the bounded
+//! process-group contract. On Windows, each worker is assigned to a
+//! kill-on-close Job Object that contains its descendants.
 
 use anyhow::{Context, Result};
 use std::fs::File;
@@ -77,13 +80,36 @@ struct TestProcessTree {
 }
 
 #[cfg(windows)]
+struct TestOwnedHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for TestOwnedHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() && self.0 != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            let _ = unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+        }
+    }
+}
+
+#[cfg(windows)]
 impl TestProcessTree {
     fn spawn(command: &mut Command, label: &str) -> Result<(Child, Self)> {
         use std::os::windows::io::AsRawHandle as _;
+        use std::os::windows::process::CommandExt as _;
+        use windows_sys::Win32::Foundation::{
+            GetLastError, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE,
+        };
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+        };
         use windows_sys::Win32::System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
             SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetProcessIdOfThread, OpenThread, ResumeThread, CREATE_SUSPENDED,
+            THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
         };
 
         let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -107,38 +133,162 @@ impl TestProcessTree {
                 .context("failed to configure bounded test job object");
         }
 
+        command.creation_flags(CREATE_SUSPENDED);
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to spawn {label}"))?;
         let assigned = unsafe { AssignProcessToJobObject(tree.job, child.as_raw_handle()) };
         if assigned == 0 {
             let assign_error = std::io::Error::last_os_error();
-            let kill_error = child.kill().err();
-            let reaped = poll_child_until(
+            return Err(Self::failed_spawn_cleanup(
                 &mut child,
-                Instant::now() + TEST_SUBPROCESS_REAP_GRACE,
+                None,
                 label,
-            )?;
-            anyhow::bail!(
-                "failed to assign {label} to its bounded job object: {assign_error}; direct-kill error: {kill_error:?}; reaped: {}",
-                reaped.is_some()
-            );
+                format!("failed to assign process to bounded job object: {assign_error}"),
+            ));
+        }
+
+        let thread_id = (|| -> Result<u32> {
+            let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+            if snapshot == INVALID_HANDLE_VALUE {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to snapshot suspended bounded-process threads");
+            }
+            let snapshot = TestOwnedHandle(snapshot);
+            let mut entry = THREADENTRY32 {
+                dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+                ..Default::default()
+            };
+            if unsafe { Thread32First(snapshot.0, &mut entry) } == 0 {
+                let error = unsafe { GetLastError() };
+                if error == ERROR_NO_MORE_FILES {
+                    anyhow::bail!("suspended bounded process has no enumerable primary thread");
+                }
+                return Err(std::io::Error::from_raw_os_error(error as i32))
+                    .context("failed to begin suspended bounded-process thread enumeration");
+            }
+            let expected_size = std::mem::size_of::<THREADENTRY32>() as u32;
+            let minimum_size = (std::mem::offset_of!(THREADENTRY32, th32OwnerProcessID)
+                + std::mem::size_of::<u32>()) as u32;
+            let mut matches = Vec::new();
+            loop {
+                if entry.dwSize < minimum_size {
+                    anyhow::bail!(
+                        "suspended bounded-process thread entry is too small: {} (minimum {})",
+                        entry.dwSize,
+                        minimum_size
+                    );
+                }
+                if entry.th32OwnerProcessID == child.id() {
+                    matches.push(entry.th32ThreadID);
+                }
+                entry.dwSize = expected_size;
+                if unsafe { Thread32Next(snapshot.0, &mut entry) } == 0 {
+                    let error = unsafe { GetLastError() };
+                    if error == ERROR_NO_MORE_FILES {
+                        break;
+                    }
+                    return Err(std::io::Error::from_raw_os_error(error as i32))
+                        .context("failed during suspended bounded-process thread enumeration");
+                }
+            }
+            if matches.len() != 1 {
+                anyhow::bail!(
+                    "suspended bounded process must have exactly one primary thread, found {}",
+                    matches.len()
+                );
+            }
+            Ok(matches[0])
+        })();
+        let thread_id = match thread_id {
+            Ok(thread_id) => thread_id,
+            Err(error) => {
+                return Err(Self::failed_spawn_cleanup(
+                    &mut child,
+                    Some(&tree),
+                    label,
+                    format!("failed to bind suspended primary thread: {error:#}"),
+                ));
+            }
+        };
+        let thread = unsafe {
+            OpenThread(
+                THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
+                0,
+                thread_id,
+            )
+        };
+        if thread.is_null() {
+            let error = std::io::Error::last_os_error();
+            return Err(Self::failed_spawn_cleanup(
+                &mut child,
+                Some(&tree),
+                label,
+                format!("failed to open suspended primary thread: {error}"),
+            ));
+        }
+        let thread = TestOwnedHandle(thread);
+        let owner = unsafe { GetProcessIdOfThread(thread.0) };
+        let child_id = child.id();
+        if owner != child_id {
+            return Err(Self::failed_spawn_cleanup(
+                &mut child,
+                Some(&tree),
+                label,
+                format!(
+                    "suspended primary thread owner changed: expected {}, observed {owner}",
+                    child_id
+                ),
+            ));
+        }
+        let previous_suspend_count = unsafe { ResumeThread(thread.0) };
+        if previous_suspend_count != 1 {
+            return Err(Self::failed_spawn_cleanup(
+                &mut child,
+                Some(&tree),
+                label,
+                format!(
+                    "suspended primary thread resume returned {previous_suspend_count}, expected exactly 1"
+                ),
+            ));
         }
         Ok((child, tree))
+    }
+
+    fn failed_spawn_cleanup(
+        child: &mut Child,
+        tree: Option<&Self>,
+        label: &str,
+        cause: String,
+    ) -> anyhow::Error {
+        let deadline = Instant::now() + TEST_SUBPROCESS_REAP_GRACE;
+        let tree_terminate_error = tree.and_then(|tree| tree.terminate().err());
+        let direct_kill_error = child.kill().err();
+        let (reaped, reap_error) = match poll_child_until(child, deadline, label) {
+            Ok(status) => (status.is_some(), None),
+            Err(error) => (false, Some(error)),
+        };
+        let tree_error = tree
+            .and_then(|tree| confirm_tree_empty_until(tree, deadline, tree_terminate_error).err());
+        anyhow::anyhow!(
+            "{cause}; direct-kill error: {direct_kill_error:?}; reap error: {}; containment-cleanup error: {}; direct child reaped: {reaped}",
+            reap_error
+                .as_ref()
+                .map(|error| format!("{error:#}"))
+                .unwrap_or_else(|| "none".to_string()),
+            tree_error
+                .as_ref()
+                .map(|error| format!("{error:#}"))
+                .unwrap_or_else(|| "none".to_string())
+        )
     }
 
     fn terminate(&self) -> Result<()> {
         use windows_sys::Win32::System::JobObjects::TerminateJobObject;
 
-        if self.is_empty()? {
-            return Ok(());
-        }
         if unsafe { TerminateJobObject(self.job, 1) } == 0 {
-            let error = std::io::Error::last_os_error();
-            if self.is_empty()? {
-                return Ok(());
-            }
-            return Err(error).context("failed to terminate bounded test job object");
+            return Err(std::io::Error::last_os_error())
+                .context("failed to terminate bounded test job object");
         }
         Ok(())
     }
@@ -216,9 +366,11 @@ fn poll_child_until(
     }
 }
 
-fn terminate_and_confirm_tree(tree: &TestProcessTree) -> Result<()> {
-    let terminate_error = tree.terminate().err();
-    let deadline = Instant::now() + TEST_SUBPROCESS_REAP_GRACE;
+fn confirm_tree_empty_until(
+    tree: &TestProcessTree,
+    deadline: Instant,
+    terminate_error: Option<anyhow::Error>,
+) -> Result<()> {
     loop {
         if tree.is_empty()? {
             return Ok(());
@@ -226,13 +378,22 @@ fn terminate_and_confirm_tree(tree: &TestProcessTree) -> Result<()> {
         if Instant::now() >= deadline {
             if let Some(error) = terminate_error {
                 anyhow::bail!(
-                    "bounded test process tree remained live after termination failed: {error:#}"
+                    "bounded test containment remained live after termination failed: {error:#}"
                 );
             }
-            anyhow::bail!("bounded test process tree remained live after termination deadline");
+            anyhow::bail!("bounded test containment remained live after termination deadline");
         }
         std::thread::sleep(TEST_SUBPROCESS_POLL_INTERVAL);
     }
+}
+
+fn terminate_and_confirm_tree(tree: &TestProcessTree) -> Result<()> {
+    let terminate_error = tree.terminate().err();
+    confirm_tree_empty_until(
+        tree,
+        Instant::now() + TEST_SUBPROCESS_REAP_GRACE,
+        terminate_error,
+    )
 }
 
 fn read_captured_file(mut file: File, label: &str) -> Result<Vec<u8>> {
@@ -285,18 +446,25 @@ pub(crate) fn output_with_timeout(
                 std::thread::sleep(TEST_SUBPROCESS_POLL_INTERVAL);
             }
             Ok(None) => {
+                let cleanup_deadline = Instant::now() + TEST_SUBPROCESS_REAP_GRACE;
+                let tree_terminate_error = tree.terminate().err();
                 let direct_kill_error = child.kill().err();
-                let tree_error = terminate_and_confirm_tree(&tree).err();
-                let status = poll_child_until(
-                    &mut child,
-                    Instant::now() + TEST_SUBPROCESS_REAP_GRACE,
-                    label,
-                )?;
+                let (status, reap_error) =
+                    match poll_child_until(&mut child, cleanup_deadline, label) {
+                        Ok(status) => (status, None),
+                        Err(error) => (None, Some(error)),
+                    };
+                let tree_error =
+                    confirm_tree_empty_until(&tree, cleanup_deadline, tree_terminate_error).err();
                 let direct_child_reaped = status.is_some();
                 let captured_stdout = read_captured_file(stdout, "stdout")?;
                 let captured_stderr = read_captured_file(stderr, "stderr")?;
                 anyhow::bail!(
-                    "{label} timed out after {timeout:?}; direct-kill error: {direct_kill_error:?}; tree-cleanup error: {}; direct child reaped: {}; stdout={} stderr={}",
+                    "{label} timed out after {timeout:?}; direct-kill error: {direct_kill_error:?}; reap error: {}; containment-cleanup error: {}; direct child reaped: {}; stdout={} stderr={}",
+                    reap_error
+                        .as_ref()
+                        .map(|error| format!("{error:#}"))
+                        .unwrap_or_else(|| "none".to_string()),
                     tree_error
                         .as_ref()
                         .map(|error| format!("{error:#}"))
@@ -307,15 +475,22 @@ pub(crate) fn output_with_timeout(
                 );
             }
             Err(error) => {
+                let cleanup_deadline = Instant::now() + TEST_SUBPROCESS_REAP_GRACE;
+                let tree_terminate_error = tree.terminate().err();
                 let direct_kill_error = child.kill().err();
-                let tree_error = terminate_and_confirm_tree(&tree).err();
-                let reaped = poll_child_until(
-                    &mut child,
-                    Instant::now() + TEST_SUBPROCESS_REAP_GRACE,
-                    label,
-                )?;
+                let (reaped, reap_error) =
+                    match poll_child_until(&mut child, cleanup_deadline, label) {
+                        Ok(status) => (status, None),
+                        Err(error) => (None, Some(error)),
+                    };
+                let tree_error =
+                    confirm_tree_empty_until(&tree, cleanup_deadline, tree_terminate_error).err();
                 anyhow::bail!(
-                    "failed to poll {label}: {error}; direct-kill error: {direct_kill_error:?}; tree-cleanup error: {}; direct child reaped: {}",
+                    "failed to poll {label}: {error}; direct-kill error: {direct_kill_error:?}; reap error: {}; containment-cleanup error: {}; direct child reaped: {}",
+                    reap_error
+                        .as_ref()
+                        .map(|cleanup| format!("{cleanup:#}"))
+                        .unwrap_or_else(|| "none".to_string()),
                     tree_error
                         .as_ref()
                         .map(|cleanup| format!("{cleanup:#}"))
@@ -366,16 +541,19 @@ mod tests {
             ])
             .env(SLEEP_WORKER, &marker);
 
-        let error = output_with_timeout(
-            &mut command,
-            "bounded sleep-worker fixture",
-            Duration::from_secs(5),
-        )
-        .expect_err("the bounded helper must terminate the sleeping worker");
+        let started = Instant::now();
+        let timeout = Duration::from_secs(5);
+        let error = output_with_timeout(&mut command, "bounded sleep-worker fixture", timeout)
+            .expect_err("the bounded helper must terminate the sleeping worker");
 
         let message = format!("{error:#}");
         assert!(message.contains("timed out"), "{message}");
+        assert!(
+            message.contains("containment-cleanup error: none"),
+            "{message}"
+        );
         assert!(message.contains("direct child reaped: true"), "{message}");
+        assert!(started.elapsed() < timeout + TEST_SUBPROCESS_REAP_GRACE + Duration::from_secs(2));
         assert!(message.contains("bounded child stdout"), "{message}");
         assert!(message.contains("bounded child stderr"), "{message}");
         assert!(marker.with_extension("started").is_file());

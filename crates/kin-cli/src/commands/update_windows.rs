@@ -23,24 +23,29 @@ use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND,
-    ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
-    GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, GetLastError, SetLastError, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS,
+    ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_NOT_ALL_ASSIGNED,
+    ERROR_NO_TOKEN, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION, ERROR_SUCCESS, GENERIC_READ,
+    GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::Authorization::{
     GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    AclSizeInformation, AddAccessAllowedAceEx, EqualSid, GetAce, GetAclInformation, GetLengthSid,
-    GetSecurityDescriptorControl, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor,
-    IsValidSid, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
-    SetSecurityDescriptorOwner, TokenUser, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
-    CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION,
-    LABEL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
-    SE_DACL_AUTO_INHERITED, SE_DACL_AUTO_INHERIT_REQ, SE_DACL_PROTECTED, SE_SACL_AUTO_INHERITED,
-    SE_SACL_AUTO_INHERIT_REQ, SE_SACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
-    UNPROTECTED_DACL_SECURITY_INFORMATION,
+    AclSizeInformation, AddAccessAllowedAceEx, AdjustTokenPrivileges, DuplicateTokenEx, EqualSid,
+    GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorControl,
+    GetSecurityDescriptorSacl, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor,
+    IsValidSid, LookupPrivilegeValueW, SecurityImpersonation, SetSecurityDescriptorControl,
+    SetSecurityDescriptorDacl, SetSecurityDescriptorOwner, TokenImpersonation, TokenUser, ACL,
+    ACL_REVISION, ACL_REVISION_DS, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
+    DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, INHERITED_ACE, INHERIT_ONLY_ACE,
+    LABEL_SECURITY_INFORMATION, NO_PROPAGATE_INHERIT_ACE, OBJECT_INHERIT_ACE,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
+    SACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_AUTO_INHERITED,
+    SE_DACL_AUTO_INHERIT_REQ, SE_DACL_PROTECTED, SE_PRIVILEGE_ENABLED, SE_SACL_AUTO_INHERITED,
+    SE_SACL_AUTO_INHERIT_REQ, SE_SACL_DEFAULTED, SE_SACL_PRESENT, SE_SACL_PROTECTED,
+    SE_SECURITY_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_DUPLICATE, TOKEN_IMPERSONATE,
+    TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER, UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FileBasicInfo, FileIdInfo, FileStreamInfo,
@@ -48,12 +53,24 @@ use windows_sys::Win32::Storage::FileSystem::{
     SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, CREATE_NEW, DELETE, FILE_ALL_ACCESS,
     FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM,
-    FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_FLAG_WRITE_THROUGH, FILE_ID_INFO, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STREAM_INFO, OPEN_EXISTING,
-    READ_CONTROL, VOLUME_NAME_DOS, WRITE_DAC, WRITE_OWNER,
+    FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_DELETE_ON_CLOSE,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_ID_INFO, FILE_NAME_NORMALIZED,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STREAM_INFO,
+    OPEN_EXISTING, READ_CONTROL, VOLUME_NAME_DOS, WRITE_DAC, WRITE_OWNER,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::System::SystemServices::{
+    ACCESS_SYSTEM_SECURITY, SYSTEM_ACCESS_FILTER_ACE_TYPE, SYSTEM_ALARM_ACE_TYPE,
+    SYSTEM_ALARM_CALLBACK_ACE_TYPE, SYSTEM_ALARM_CALLBACK_OBJECT_ACE_TYPE,
+    SYSTEM_ALARM_OBJECT_ACE_TYPE, SYSTEM_AUDIT_ACE_TYPE, SYSTEM_AUDIT_CALLBACK_ACE_TYPE,
+    SYSTEM_AUDIT_CALLBACK_OBJECT_ACE_TYPE, SYSTEM_AUDIT_OBJECT_ACE_TYPE,
+    SYSTEM_MANDATORY_LABEL_ACE_TYPE, SYSTEM_MANDATORY_LABEL_NO_EXECUTE_UP,
+    SYSTEM_MANDATORY_LABEL_NO_READ_UP, SYSTEM_MANDATORY_LABEL_NO_WRITE_UP,
+    SYSTEM_PROCESS_TRUST_LABEL_ACE_TYPE, SYSTEM_RESOURCE_ATTRIBUTE_ACE_TYPE,
+    SYSTEM_SCOPED_POLICY_ID_ACE_TYPE,
+};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken, SetThreadToken,
+};
 
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
@@ -69,6 +86,9 @@ pub(crate) enum CreatedFileValidationFailure {
 thread_local! {
     static FAIL_NEXT_CREATED_FILE_VALIDATION: std::cell::Cell<Option<CreatedFileValidationFailure>> =
         const { std::cell::Cell::new(None) };
+    static FAIL_NEXT_STAGED_FILE_DISARM: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
 }
 
 #[cfg(test)]
@@ -76,6 +96,11 @@ pub(crate) fn inject_created_file_validation_failure(
     failure: Option<CreatedFileValidationFailure>,
 ) {
     FAIL_NEXT_CREATED_FILE_VALIDATION.with(|configured| configured.set(failure));
+}
+
+#[cfg(test)]
+pub(crate) fn inject_staged_file_disarm_failure(fail: bool) {
+    FAIL_NEXT_STAGED_FILE_DISARM.with(|configured| configured.set(fail));
 }
 
 #[cfg(test)]
@@ -147,6 +172,480 @@ impl Drop for OwnedHandle {
             let _ = unsafe { CloseHandle(self.0) };
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_SE_SECURITY_PRIVILEGE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_se_security_privilege_unavailable(unavailable: bool) {
+    FAIL_SE_SECURITY_PRIVILEGE.with(|configured| configured.set(unavailable));
+}
+
+fn se_security_privilege_injected_unavailable() -> bool {
+    #[cfg(test)]
+    {
+        return FAIL_SE_SECURITY_PRIVILEGE.with(std::cell::Cell::get);
+    }
+    #[cfg(not(test))]
+    false
+}
+
+struct ThreadSeSecurityPrivilege {
+    previous_thread_token: Option<OwnedHandle>,
+    _impersonation_token: OwnedHandle,
+    attached: bool,
+}
+
+impl ThreadSeSecurityPrivilege {
+    fn enable() -> Result<Self> {
+        if se_security_privilege_injected_unavailable() {
+            anyhow::bail!(
+                "SeSecurityPrivilege is unavailable; strict Windows full-SACL authority refused before any managed config WAL or namespace transition"
+            );
+        }
+        let mut previous_thread_token = null_mut();
+        let previous_thread_token = if unsafe {
+            OpenThreadToken(
+                GetCurrentThread(),
+                TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_IMPERSONATE,
+                1,
+                &mut previous_thread_token,
+            )
+        } != 0
+        {
+            Some(OwnedHandle::new(
+                previous_thread_token,
+                "effective thread token for SeSecurityPrivilege was invalid",
+            )?)
+        } else if unsafe { GetLastError() } == ERROR_NO_TOKEN {
+            None
+        } else {
+            return Err(win32_error(
+                "failed to capture the exact prior thread impersonation token",
+            ));
+        };
+        let process_token = if previous_thread_token.is_none() {
+            let mut token = null_mut();
+            if unsafe {
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_DUPLICATE | TOKEN_QUERY,
+                    &mut token,
+                )
+            } == 0
+            {
+                return Err(win32_error(
+                    "failed to open the process token for thread-scoped SeSecurityPrivilege",
+                ));
+            }
+            Some(OwnedHandle::new(
+                token,
+                "process token for thread-scoped SeSecurityPrivilege was invalid",
+            )?)
+        } else {
+            None
+        };
+        let base_token = previous_thread_token
+            .as_ref()
+            .or(process_token.as_ref())
+            .context("thread-scoped SeSecurityPrivilege lost its effective base token")?
+            .raw();
+        let mut impersonation_token = null_mut();
+        if unsafe {
+            DuplicateTokenEx(
+                base_token,
+                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY | TOKEN_IMPERSONATE,
+                null(),
+                SecurityImpersonation,
+                TokenImpersonation,
+                &mut impersonation_token,
+            )
+        } == 0
+        {
+            return Err(win32_error(
+                "failed to duplicate the effective token for thread-scoped SeSecurityPrivilege",
+            ));
+        }
+        let impersonation_token = OwnedHandle::new(
+            impersonation_token,
+            "duplicated thread-scoped SeSecurityPrivilege token was invalid",
+        )?;
+        let mut requested = TOKEN_PRIVILEGES::default();
+        requested.PrivilegeCount = 1;
+        if unsafe {
+            LookupPrivilegeValueW(null(), SE_SECURITY_NAME, &mut requested.Privileges[0].Luid)
+        } == 0
+        {
+            return Err(win32_error(
+                "failed to resolve SeSecurityPrivilege for strict Windows full-SACL authority",
+            ));
+        }
+        requested.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        unsafe { SetLastError(ERROR_SUCCESS) };
+        let adjusted = unsafe {
+            AdjustTokenPrivileges(
+                impersonation_token.raw(),
+                0,
+                &requested,
+                0,
+                null_mut(),
+                null_mut(),
+            )
+        };
+        let last_error = unsafe { GetLastError() };
+        if adjusted == 0 {
+            return Err(win32_error(
+                "failed to enable SeSecurityPrivilege for strict Windows full-SACL authority",
+            ));
+        }
+        match last_error {
+            ERROR_SUCCESS => {}
+            ERROR_NOT_ALL_ASSIGNED => anyhow::bail!(
+                "SeSecurityPrivilege is not assigned to the effective token; strict Windows full-SACL authority refused before any managed config WAL or namespace transition. Run Kin from a token granted Manage auditing and security log"
+            ),
+            _ => anyhow::bail!(
+                "enabling thread-scoped SeSecurityPrivilege returned unexpected Windows error {last_error}; strict Windows full-SACL authority refused"
+            ),
+        }
+        if unsafe { SetThreadToken(null(), impersonation_token.raw()) } == 0 {
+            return Err(win32_error(
+                "failed to attach the thread-scoped SeSecurityPrivilege token",
+            ));
+        }
+        Ok(Self {
+            previous_thread_token,
+            _impersonation_token: impersonation_token,
+            attached: true,
+        })
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if !self.attached {
+            return Ok(());
+        }
+        let prior = self
+            .previous_thread_token
+            .as_ref()
+            .map_or(null_mut(), OwnedHandle::raw);
+        for _ in 0..2 {
+            if unsafe { SetThreadToken(null(), prior) } != 0 {
+                self.attached = false;
+                return Ok(());
+            }
+        }
+        anyhow::bail!(
+            "failed to restore the exact prior thread token after thread-scoped SeSecurityPrivilege (Windows error {})",
+            unsafe { GetLastError() }
+        )
+    }
+}
+
+impl Drop for ThreadSeSecurityPrivilege {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            eprintln!(
+                "fatal: {error:#}; aborting to prevent a pooled worker from continuing elevated"
+            );
+            std::process::abort();
+        }
+    }
+}
+
+fn open_with_se_security_privilege(
+    context: &str,
+    cleanup_new_file_on_restore_failure: bool,
+    open: impl FnOnce() -> HANDLE,
+) -> Result<OwnedHandle> {
+    let mut privilege = ThreadSeSecurityPrivilege::enable()?;
+    let opened = OwnedHandle::new(open(), context);
+    if let Err(error) = privilege.restore() {
+        let cleanup = match opened.as_ref() {
+            Ok(handle) if cleanup_new_file_on_restore_failure => {
+                mark_newly_created_handle_for_cleanup(handle.raw()).err()
+            }
+            _ => None,
+        };
+        drop(opened);
+        if let Some(cleanup) = cleanup {
+            eprintln!(
+                "fatal: {error:#}; exact CREATE_NEW cleanup also failed: {cleanup:#}; aborting to prevent a pooled worker from continuing elevated"
+            );
+        } else {
+            eprintln!(
+                "fatal: {error:#}; aborting to prevent a pooled worker from continuing elevated"
+            );
+        }
+        std::process::abort();
+    }
+    opened
+}
+
+fn unsupported_sacl_ace_name(ace_type: u8) -> &'static str {
+    match u32::from(ace_type) {
+        SYSTEM_AUDIT_ACE_TYPE
+        | SYSTEM_AUDIT_OBJECT_ACE_TYPE
+        | SYSTEM_AUDIT_CALLBACK_ACE_TYPE
+        | SYSTEM_AUDIT_CALLBACK_OBJECT_ACE_TYPE => "audit",
+        SYSTEM_ALARM_ACE_TYPE
+        | SYSTEM_ALARM_OBJECT_ACE_TYPE
+        | SYSTEM_ALARM_CALLBACK_ACE_TYPE
+        | SYSTEM_ALARM_CALLBACK_OBJECT_ACE_TYPE => "alarm",
+        SYSTEM_RESOURCE_ATTRIBUTE_ACE_TYPE => "resource attribute",
+        SYSTEM_SCOPED_POLICY_ID_ACE_TYPE => "central access policy scope",
+        SYSTEM_PROCESS_TRUST_LABEL_ACE_TYPE => "process trust label",
+        SYSTEM_ACCESS_FILTER_ACE_TYPE => "access filter",
+        _ => "unknown",
+    }
+}
+
+fn validate_supported_full_sacl_bytes(bytes: &[u8]) -> Result<u16> {
+    const ACL_HEADER_BYTES: usize = 8;
+    const ACE_HEADER_BYTES: usize = 4;
+    const MANDATORY_LABEL_FIXED_BYTES: usize = 8;
+    const SID_HEADER_BYTES: usize = 8;
+    const MANDATORY_LABEL_AUTHORITY: [u8; 6] = [0, 0, 0, 0, 0, 16];
+
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+    if bytes.len() < ACL_HEADER_BYTES {
+        anyhow::bail!("managed config full SACL header is truncated");
+    }
+    if bytes[0] != ACL_REVISION as u8 && bytes[0] != ACL_REVISION_DS as u8 {
+        anyhow::bail!(
+            "managed config full SACL has unsupported ACL revision {}",
+            bytes[0]
+        );
+    }
+    let allocated = usize::from(u16::from_le_bytes([bytes[2], bytes[3]]));
+    if allocated < bytes.len() {
+        anyhow::bail!("managed config full SACL bytes exceed the ACL allocation");
+    }
+    let ace_count = u16::from_le_bytes([bytes[4], bytes[5]]);
+    let mut offset = ACL_HEADER_BYTES;
+    let mut mandatory_labels = 0_u16;
+    for index in 0..ace_count {
+        let header_end = offset
+            .checked_add(ACE_HEADER_BYTES)
+            .context("managed config full SACL ACE header offset overflow")?;
+        if header_end > bytes.len() {
+            anyhow::bail!("managed config full SACL ACE {index} header is truncated");
+        }
+        let ace_type = bytes[offset];
+        let ace_flags = bytes[offset + 1];
+        let ace_size = usize::from(u16::from_le_bytes([bytes[offset + 2], bytes[offset + 3]]));
+        if ace_size < ACE_HEADER_BYTES || ace_size % size_of::<u32>() != 0 {
+            anyhow::bail!("managed config full SACL ACE {index} has invalid AceSize {ace_size}");
+        }
+        let ace_end = offset
+            .checked_add(ace_size)
+            .context("managed config full SACL ACE size overflow")?;
+        if ace_end > bytes.len() {
+            anyhow::bail!("managed config full SACL ACE {index} escapes AclBytesInUse");
+        }
+        if u32::from(ace_type) != SYSTEM_MANDATORY_LABEL_ACE_TYPE {
+            let kind = unsupported_sacl_ace_name(ace_type);
+            anyhow::bail!(
+                "managed config full SACL contains unsupported {kind} ACE type {ace_type}; only one optional mandatory label ACE is supported"
+            );
+        }
+        mandatory_labels = mandatory_labels
+            .checked_add(1)
+            .context("managed config mandatory label count overflow")?;
+        if mandatory_labels > 1 {
+            anyhow::bail!("managed config full SACL contains duplicate mandatory label ACEs");
+        }
+        let supported_ace_flags = (OBJECT_INHERIT_ACE
+            | CONTAINER_INHERIT_ACE
+            | NO_PROPAGATE_INHERIT_ACE
+            | INHERIT_ONLY_ACE
+            | INHERITED_ACE) as u8;
+        if ace_flags & !supported_ace_flags != 0 {
+            anyhow::bail!(
+                "managed config mandatory label ACE has unsupported flags 0x{ace_flags:02x}"
+            );
+        }
+        if ace_size < MANDATORY_LABEL_FIXED_BYTES + SID_HEADER_BYTES + size_of::<u32>() {
+            anyhow::bail!("managed config mandatory label ACE is structurally truncated");
+        }
+        let mask = u32::from_le_bytes(
+            bytes[offset + ACE_HEADER_BYTES..offset + MANDATORY_LABEL_FIXED_BYTES]
+                .try_into()
+                .expect("mandatory label mask has a fixed four-byte span"),
+        );
+        let supported_mask = SYSTEM_MANDATORY_LABEL_NO_WRITE_UP
+            | SYSTEM_MANDATORY_LABEL_NO_READ_UP
+            | SYSTEM_MANDATORY_LABEL_NO_EXECUTE_UP;
+        if mask & !supported_mask != 0 {
+            anyhow::bail!(
+                "managed config mandatory label ACE has unsupported policy mask 0x{mask:08x}"
+            );
+        }
+        let sid = &bytes[offset + MANDATORY_LABEL_FIXED_BYTES..ace_end];
+        if sid[0] != 1 || sid[1] != 1 || sid[2..8] != MANDATORY_LABEL_AUTHORITY {
+            anyhow::bail!("managed config mandatory label ACE has a non-integrity SID");
+        }
+        let sid_len = SID_HEADER_BYTES
+            .checked_add(usize::from(sid[1]) * size_of::<u32>())
+            .context("managed config mandatory label SID length overflow")?;
+        if sid_len != sid.len() {
+            anyhow::bail!("managed config mandatory label SID length is not exact");
+        }
+        offset = ace_end;
+    }
+    if offset != bytes.len() {
+        anyhow::bail!("managed config full SACL has trailing or unenumerated bytes");
+    }
+    Ok(mandatory_labels)
+}
+
+pub(crate) fn validate_managed_file_full_sacl(file: &File) -> Result<()> {
+    validate_full_sacl_handle(file.as_raw_handle().cast())
+}
+
+pub(crate) fn managed_file_full_sacl_fingerprint(file: &File) -> Result<String> {
+    full_sacl_fingerprint_handle(file.as_raw_handle().cast())
+}
+
+pub(crate) fn require_managed_file_full_sacl_fingerprint(
+    file: &File,
+    expected: &str,
+) -> Result<()> {
+    let observed = managed_file_full_sacl_fingerprint(file)?;
+    if observed != expected {
+        anyhow::bail!("managed config full SACL differs from recorded transaction authority");
+    }
+    Ok(())
+}
+
+fn validate_full_sacl_handle(handle: HANDLE) -> Result<()> {
+    full_sacl_fingerprint_handle(handle).map(|_| ())
+}
+
+fn full_sacl_fingerprint_handle(handle: HANDLE) -> Result<String> {
+    let mut sacl = null_mut();
+    let mut descriptor = null_mut();
+    let result = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            SACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut sacl,
+            &mut descriptor,
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "failed to inspect exact managed config full SACL with retained ACCESS_SYSTEM_SECURITY: Windows error {result}"
+        );
+    }
+    if descriptor.is_null() {
+        anyhow::bail!("full-SACL query returned no security descriptor authority");
+    }
+    let _descriptor = LocalSecurityDescriptor(descriptor);
+    let mut descriptor_sacl = null_mut();
+    let mut sacl_present = 0;
+    let mut sacl_defaulted = 0;
+    if unsafe {
+        GetSecurityDescriptorSacl(
+            descriptor,
+            &mut sacl_present,
+            &mut descriptor_sacl,
+            &mut sacl_defaulted,
+        )
+    } == 0
+    {
+        return Err(win32_error(
+            "failed to cross-check exact managed config full SACL presence",
+        ));
+    }
+    if descriptor_sacl != sacl {
+        anyhow::bail!("full-SACL query returned inconsistent descriptor and ACL pointers");
+    }
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
+        return Err(win32_error(
+            "failed to inspect exact managed config full SACL control",
+        ));
+    }
+    if control & SE_SACL_PROTECTED != 0 {
+        anyhow::bail!(
+            "managed config has SE_SACL_PROTECTED authority that Kin cannot preserve with label-only staging; refusing before Prepared"
+        );
+    }
+    if (control & SE_SACL_PRESENT != 0) != (sacl_present != 0) {
+        anyhow::bail!("managed config full SACL presence control is inconsistent");
+    }
+    if (control & SE_SACL_DEFAULTED != 0) != (sacl_defaulted != 0) {
+        anyhow::bail!("managed config full SACL defaulted control is inconsistent");
+    }
+    let bytes = if sacl.is_null() {
+        validate_supported_full_sacl_bytes(&[])?;
+        &[][..]
+    } else {
+        let mut info = ACL_SIZE_INFORMATION::default();
+        if unsafe {
+            GetAclInformation(
+                sacl,
+                (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } == 0
+        {
+            return Err(win32_error("failed to size exact managed config full SACL"));
+        }
+        let bytes_in_use = usize::try_from(info.AclBytesInUse)
+            .context("managed config full SACL byte length overflow")?;
+        if bytes_in_use < size_of::<ACL>() {
+            anyhow::bail!("managed config full SACL has an invalid byte length");
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(sacl.cast::<u8>(), bytes_in_use) };
+        let parsed_count = validate_supported_full_sacl_bytes(bytes)?;
+        if u32::from(parsed_count) != info.AceCount {
+            anyhow::bail!("managed config full SACL parser count differs from GetAclInformation");
+        }
+        for index in 0..info.AceCount {
+            let mut ace = null_mut();
+            if unsafe { GetAce(sacl, index, &mut ace) } == 0 {
+                return Err(win32_error(
+                    "failed to enumerate exact managed config full SACL",
+                ));
+            }
+            let base = sacl as usize;
+            let ace_offset = (ace as usize)
+                .checked_sub(base)
+                .context("managed config full SACL ACE precedes its ACL")?;
+            if ace_offset < size_of::<ACL>() || ace_offset >= bytes_in_use {
+                anyhow::bail!("managed config full SACL GetAce pointer escapes AclBytesInUse");
+            }
+        }
+        bytes
+    };
+    let relevant_control = control
+        & (SE_SACL_PRESENT
+            | SE_SACL_DEFAULTED
+            | SE_SACL_PROTECTED
+            | SE_SACL_AUTO_INHERITED
+            | SE_SACL_AUTO_INHERIT_REQ);
+    let mut canonical = Vec::with_capacity(bytes.len() + 24);
+    canonical.extend_from_slice(b"KIN_WINDOWS_FULL_SACL_V1\0");
+    canonical.extend_from_slice(&relevant_control.to_le_bytes());
+    canonical.push(u8::from(sacl_present != 0));
+    canonical.push(u8::from(sacl_defaulted != 0));
+    canonical.push(u8::from(sacl.is_null()));
+    canonical.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    canonical.extend_from_slice(bytes);
+    Ok(crate::commands::setup_ledger::sha256_hex(&canonical))
 }
 
 struct CurrentUserSid {
@@ -717,6 +1216,10 @@ pub(crate) fn managed_file_metadata_fingerprint(file: &File) -> Result<String> {
 
 /// Preserve the bounded Windows metadata contract on the staged replacement.
 pub(crate) fn copy_managed_file_metadata(source: &File, destination: &File) -> Result<()> {
+    let source_full_sacl = managed_file_full_sacl_fingerprint(source)
+        .context("existing managed config full SACL is unsupported before metadata copy")?;
+    managed_file_full_sacl_fingerprint(destination)
+        .context("staged managed config full SACL is unsupported before metadata copy")?;
     let source_fingerprint = managed_file_metadata_fingerprint(source)?;
     copy_managed_file_security(source, destination)?;
     let attributes = managed_config_attributes(source)?;
@@ -747,6 +1250,120 @@ pub(crate) fn copy_managed_file_metadata(source: &File, destination: &File) -> R
     if destination_fingerprint != source_fingerprint {
         anyhow::bail!("staged managed config Windows metadata differs after exact copy");
     }
+    let source_full_sacl_after = managed_file_full_sacl_fingerprint(source)
+        .context("existing managed config full SACL changed during metadata copy")?;
+    if source_full_sacl_after != source_full_sacl {
+        anyhow::bail!("existing managed config full SACL changed during metadata copy");
+    }
+    let destination_full_sacl = managed_file_full_sacl_fingerprint(destination)
+        .context("staged managed config full SACL is unsupported after metadata copy")?;
+    if destination_full_sacl != source_full_sacl {
+        anyhow::bail!("staged managed config full SACL differs after label-only metadata copy");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn inject_test_managed_file_dacl_drift(file: &File) -> Result<()> {
+    let before = managed_file_metadata_fingerprint(file)?;
+    let user = CurrentUserSid::load()?;
+    apply_private_security(file.as_raw_handle().cast(), &user)?;
+    let after = managed_file_metadata_fingerprint(file)?;
+    if after == before {
+        anyhow::bail!("test DACL injection did not change managed-file authority");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn inject_test_managed_file_supported_sacl_drift(file: &File) -> Result<()> {
+    use windows_sys::Win32::Security::AddMandatoryAce;
+
+    let before = managed_file_full_sacl_fingerprint(file)?;
+    let mut label_storage = vec![0_usize; 4];
+    let label_bytes = label_storage.len() * size_of::<usize>();
+    let label = label_storage.as_mut_ptr().cast::<ACL>();
+    if unsafe { InitializeAcl(label, label_bytes as u32, ACL_REVISION) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to initialize test mandatory-label ACL");
+    }
+    let mut sid_storage = [0_usize; 2];
+    let sid = unsafe {
+        std::slice::from_raw_parts_mut(
+            sid_storage.as_mut_ptr().cast::<u8>(),
+            sid_storage.len() * size_of::<usize>(),
+        )
+    };
+    sid[..12].copy_from_slice(&[1, 1, 0, 0, 0, 0, 0, 16, 0, 16, 0, 0]);
+    if unsafe {
+        AddMandatoryAce(
+            label,
+            ACL_REVISION,
+            0,
+            SYSTEM_MANDATORY_LABEL_NO_WRITE_UP | SYSTEM_MANDATORY_LABEL_NO_READ_UP,
+            sid.as_mut_ptr().cast(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to build test mandatory-label ACE");
+    }
+    let result = unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            LABEL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            label,
+        )
+    };
+    if result != 0 {
+        anyhow::bail!("failed to inject supported test SACL drift: Windows error {result}");
+    }
+    let after = managed_file_full_sacl_fingerprint(file)?;
+    if after == before {
+        anyhow::bail!("test SACL injection did not change managed-file authority");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn inject_test_managed_file_unsupported_sacl(file: &File) -> Result<()> {
+    use windows_sys::Win32::Security::AddAuditAccessAceEx;
+
+    let user = CurrentUserSid::load()?;
+    let mut sacl_storage = vec![0_usize; 16];
+    let sacl_bytes = sacl_storage.len() * size_of::<usize>();
+    let sacl = sacl_storage.as_mut_ptr().cast::<ACL>();
+    if unsafe { InitializeAcl(sacl, sacl_bytes as u32, ACL_REVISION) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to initialize unsupported test SACL");
+    }
+    if unsafe { AddAuditAccessAceEx(sacl, ACL_REVISION, 0, GENERIC_READ, user.sid(), 1, 0) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to build unsupported test audit ACE");
+    }
+    let result = unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            SACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            sacl,
+        )
+    };
+    if result != 0 {
+        anyhow::bail!("failed to inject unsupported test SACL: Windows error {result}");
+    }
+    let error = managed_file_full_sacl_fingerprint(file)
+        .expect_err("test audit ACE must be rejected by strict full-SACL policy");
+    if !format!("{error:#}").contains("unsupported") {
+        anyhow::bail!("test audit SACL produced an unexpected strict-policy error: {error:#}");
+    }
     Ok(())
 }
 
@@ -755,6 +1372,7 @@ fn create_current_user_private_file_with_disposition(
     disposition: u32,
     share_mode: u32,
     additional_access: u32,
+    arm_delete_on_close: bool,
 ) -> Result<File> {
     let user = CurrentUserSid::load()?;
     let path_wide = wide_null(path.as_os_str())?;
@@ -779,25 +1397,32 @@ fn create_current_user_private_file_with_disposition(
         lpSecurityDescriptor: (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
         bInheritHandle: 0,
     };
-    // SAFETY: path and security descriptor buffers remain live for the call.
-    let handle = unsafe {
+    let context = format!(
+        "failed to create/open private managed file {}",
+        path.display()
+    );
+    let open = || unsafe {
         CreateFileW(
             path_wide.as_ptr(),
             GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES | additional_access,
             share_mode,
             &attributes,
             disposition,
-            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
+            FILE_FLAG_OPEN_REPARSE_POINT
+                | FILE_FLAG_WRITE_THROUGH
+                | if arm_delete_on_close {
+                    FILE_FLAG_DELETE_ON_CLOSE
+                } else {
+                    0
+                },
             null_mut(),
         )
     };
-    let handle = OwnedHandle::new(
-        handle,
-        &format!(
-            "failed to create/open private managed file {}",
-            path.display()
-        ),
-    )?;
+    let handle = if additional_access & ACCESS_SYSTEM_SECURITY != 0 {
+        open_with_se_security_privilege(&context, disposition == CREATE_NEW, open)?
+    } else {
+        OwnedHandle::new(open(), &context)?
+    };
     if let Err(error) = (|| -> Result<()> {
         #[cfg(test)]
         let injected = if disposition == CREATE_NEW {
@@ -814,9 +1439,15 @@ fn create_current_user_private_file_with_disposition(
         if injected == Some(CreatedFileValidationFailure::Security) {
             anyhow::bail!("injected created-file security validation failure");
         }
-        validate_private_security(handle.raw(), &user)
+        validate_private_security(handle.raw(), &user).and_then(|_| {
+            if additional_access & ACCESS_SYSTEM_SECURITY != 0 {
+                validate_full_sacl_handle(handle.raw())
+            } else {
+                Ok(())
+            }
+        })
     })() {
-        if disposition == CREATE_NEW {
+        if disposition == CREATE_NEW && !arm_delete_on_close {
             if let Err(cleanup) = mark_newly_created_handle_for_cleanup(handle.raw()) {
                 return Err(error.context(format!(
                     "new private managed file validation failed and exact-handle cleanup also failed; object retained at {}: {cleanup:#}",
@@ -850,68 +1481,225 @@ fn mark_newly_created_handle_for_cleanup(handle: HANDLE) -> Result<()> {
     Ok(())
 }
 
+/// Clear the pre-Prepared delete-on-close arm only after the durable Prepared
+/// WAL frame has been synced. FILE_FLAG_DELETE_ON_CLOSE is permanent on its
+/// original file object, so authority is handed to a second no-flag file
+/// object before the armed handle closes and legacy disposition is cleared.
+pub(crate) fn disarm_staged_file_delete_on_close(
+    armed: File,
+    path: &Path,
+    private: bool,
+    require_full_sacl: bool,
+) -> Result<File> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, FileStandardInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+        FILE_STANDARD_INFO,
+    };
+
+    let armed_identity = object_identity(armed.as_raw_handle().cast(), false)?;
+    let durable = if private {
+        create_current_user_private_file_with_disposition(
+            path,
+            OPEN_EXISTING,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            DELETE
+                | WRITE_DAC
+                | WRITE_OWNER
+                | if require_full_sacl {
+                    ACCESS_SYSTEM_SECURITY
+                } else {
+                    0
+                },
+            false,
+        )?
+    } else {
+        let path_wide = wide_null(path.as_os_str())?;
+        let desired_access = GENERIC_READ
+            | GENERIC_WRITE
+            | FILE_READ_ATTRIBUTES
+            | READ_CONTROL
+            | WRITE_DAC
+            | WRITE_OWNER
+            | DELETE
+            | if require_full_sacl {
+                ACCESS_SYSTEM_SECURITY
+            } else {
+                0
+            };
+        let context = format!("failed to open staged handoff object {}", path.display());
+        let open = || unsafe {
+            CreateFileW(
+                path_wide.as_ptr(),
+                desired_access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
+                null_mut(),
+            )
+        };
+        let handle = if require_full_sacl {
+            open_with_se_security_privilege(&context, false, open)?
+        } else {
+            OwnedHandle::new(open(), &context)?
+        };
+        object_identity(handle.raw(), false)?;
+        if require_full_sacl {
+            validate_full_sacl_handle(handle.raw())?;
+        }
+        handle.into_file()
+    };
+    let durable_identity = object_identity(durable.as_raw_handle().cast(), false)?;
+    if durable_identity != armed_identity {
+        anyhow::bail!("staged handoff reopened a different file identity");
+    }
+    #[cfg(test)]
+    if FAIL_NEXT_STAGED_FILE_DISARM.with(|configured| configured.replace(false)) {
+        anyhow::bail!("injected staged-file delete-on-close disarm failure");
+    }
+    drop(armed);
+
+    let handle = durable.as_raw_handle().cast();
+    let mut before = FILE_STANDARD_INFO::default();
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileStandardInfo,
+            (&mut before as *mut FILE_STANDARD_INFO).cast(),
+            size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to read staged delete-pending state during handoff");
+    }
+    if !before.DeletePending {
+        anyhow::bail!("armed staged object did not become delete-pending during handoff");
+    }
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: false };
+    if unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to disarm exact staged object after durable Prepared WAL");
+    }
+    let mut after = FILE_STANDARD_INFO::default();
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileStandardInfo,
+            (&mut after as *mut FILE_STANDARD_INFO).cast(),
+            size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to verify staged delete-on-close state after disarm");
+    }
+    if after.DeletePending {
+        anyhow::bail!("staged object remained delete-pending after exact disarm");
+    }
+    if object_identity(handle, false)? != armed_identity {
+        anyhow::bail!("staged handoff identity changed after disposition clear");
+    }
+    revalidate_managed_file_path(path, &durable, private, require_full_sacl)?;
+    Ok(durable)
+}
+
 /// Create one current-user-only marker with exact-object cleanup authority.
 /// DELETE is requested on the returned handle and FILE_SHARE_DELETE remains
 /// absent, so callers can dispose only this CREATE_NEW object by handle if a
 /// write/sync fails without ever unlinking a replacement pathname.
 pub(crate) fn create_current_user_private_file_for_exact_commit(path: &Path) -> Result<File> {
-    create_current_user_private_file_with_disposition(path, CREATE_NEW, FILE_SHARE_READ, DELETE)
+    create_current_user_private_file_with_disposition(
+        path,
+        CREATE_NEW,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        DELETE,
+        false,
+    )
 }
 
 /// Create a private staged file whose live handle remains the rename
 /// authority. DELETE access authorizes FileRenameInfoEx on this exact handle;
 /// sharing remains read-only so no writer or path replacement can race it.
-pub(crate) fn create_current_user_private_staged_file(path: &Path) -> Result<File> {
+pub(crate) fn create_current_user_private_staged_file(
+    path: &Path,
+    require_full_sacl: bool,
+) -> Result<File> {
     create_current_user_private_file_with_disposition(
         path,
         CREATE_NEW,
         FILE_SHARE_READ,
-        DELETE | WRITE_DAC | WRITE_OWNER,
+        DELETE
+            | WRITE_DAC
+            | WRITE_OWNER
+            | if require_full_sacl {
+                ACCESS_SYSTEM_SECURITY
+            } else {
+                0
+            },
+        true,
     )
 }
 
 /// Create a non-private managed config staging file while retaining exact
 /// rename and disposition authority on its handle.
-pub(crate) fn create_managed_config_staged_file(path: &Path) -> Result<File> {
+pub(crate) fn create_managed_config_staged_file(
+    path: &Path,
+    require_full_sacl: bool,
+) -> Result<File> {
     let path_wide = wide_null(path.as_os_str())?;
-    let handle = unsafe {
+    let desired_access = GENERIC_READ
+        | GENERIC_WRITE
+        | FILE_READ_ATTRIBUTES
+        | READ_CONTROL
+        | WRITE_DAC
+        | WRITE_OWNER
+        | DELETE
+        | if require_full_sacl {
+            ACCESS_SYSTEM_SECURITY
+        } else {
+            0
+        };
+    let context = format!(
+        "failed to create managed config staging file {}",
+        path.display()
+    );
+    let open = || unsafe {
         CreateFileW(
             path_wide.as_ptr(),
-            GENERIC_READ
-                | GENERIC_WRITE
-                | FILE_READ_ATTRIBUTES
-                | READ_CONTROL
-                | WRITE_DAC
-                | WRITE_OWNER
-                | DELETE,
-            FILE_SHARE_READ,
+            desired_access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             null(),
             CREATE_NEW,
-            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH | FILE_FLAG_DELETE_ON_CLOSE,
             null_mut(),
         )
     };
-    let handle = OwnedHandle::new(
-        handle,
-        &format!(
-            "failed to create managed config staging file {}",
-            path.display()
-        ),
-    )?;
+    let handle = if require_full_sacl {
+        open_with_se_security_privilege(&context, true, open)?
+    } else {
+        OwnedHandle::new(open(), &context)?
+    };
     let validated = (|| -> Result<()> {
         #[cfg(test)]
         if take_created_file_validation_failure() == Some(CreatedFileValidationFailure::Identity) {
             anyhow::bail!("injected created-file identity validation failure");
         }
-        object_identity(handle.raw(), false).map(|_| ())
+        object_identity(handle.raw(), false)?;
+        if require_full_sacl {
+            validate_full_sacl_handle(handle.raw())?;
+        }
+        Ok(())
     })();
     if let Err(error) = validated {
-        if let Err(cleanup) = mark_newly_created_handle_for_cleanup(handle.raw()) {
-            return Err(error.context(format!(
-                "new managed config stage validation failed and exact-handle cleanup also failed; object retained at {}: {cleanup:#}",
-                path.display()
-            )));
-        }
         return Err(error);
     }
     Ok(handle.into_file())
@@ -920,12 +1708,50 @@ pub(crate) fn create_managed_config_staged_file(path: &Path) -> Result<File> {
 /// Open the exact destination config with DELETE authority while deliberately
 /// denying delete sharing. The retained handle prevents a non-cooperating
 /// writer from replacing the pathname between validation and quarantine.
-pub(crate) fn open_managed_config_for_exact_quarantine(path: &Path) -> Result<File> {
+pub(crate) fn open_managed_config_for_exact_quarantine(
+    path: &Path,
+    require_full_sacl: bool,
+) -> Result<File> {
+    open_managed_config_for_exact_quarantine_inner(path, require_full_sacl, true)
+}
+
+/// Open one exact regular object for initial crash-recovery inventory.
+///
+/// The handle retains DELETE and, when requested, ACCESS_SYSTEM_SECURITY so
+/// the caller can relocate it and later perform strict validation. Initial
+/// inventory deliberately does not parse the SACL: a corrupt replacement must
+/// not prevent the exact original from being restored first.
+pub(crate) fn open_managed_config_for_exact_inventory(
+    path: &Path,
+    request_full_sacl_access: bool,
+) -> Result<File> {
+    open_managed_config_for_exact_quarantine_inner(path, request_full_sacl_access, false)
+}
+
+fn open_managed_config_for_exact_quarantine_inner(
+    path: &Path,
+    require_full_sacl: bool,
+    validate_full_sacl: bool,
+) -> Result<File> {
     let path_wide = wide_null(path.as_os_str())?;
-    let handle = unsafe {
+    let context = format!(
+        "failed to retain exact managed config destination {} with full-SACL authority",
+        path.display()
+    );
+    let desired_access = GENERIC_READ
+        | GENERIC_WRITE
+        | FILE_READ_ATTRIBUTES
+        | READ_CONTROL
+        | DELETE
+        | if require_full_sacl {
+            ACCESS_SYSTEM_SECURITY
+        } else {
+            0
+        };
+    let open = || unsafe {
         CreateFileW(
             path_wide.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE,
+            desired_access,
             FILE_SHARE_READ,
             null(),
             OPEN_EXISTING,
@@ -933,14 +1759,58 @@ pub(crate) fn open_managed_config_for_exact_quarantine(path: &Path) -> Result<Fi
             null_mut(),
         )
     };
-    let handle = OwnedHandle::new(
-        handle,
-        &format!(
-            "failed to retain exact managed config destination {}",
-            path.display()
-        ),
-    )?;
+    let handle = if require_full_sacl {
+        open_with_se_security_privilege(&context, false, open)?
+    } else {
+        OwnedHandle::new(open(), &context)?
+    };
     object_identity(handle.raw(), false)?;
+    if require_full_sacl && validate_full_sacl {
+        validate_full_sacl_handle(handle.raw())?;
+    }
+    Ok(handle.into_file())
+}
+
+/// Open a managed config for a terminal authority check without requesting
+/// mutation rights or blocking retained exact handles. Strict replacement
+/// recovery still receives ACCESS_SYSTEM_SECURITY on this thread-scoped open.
+pub(crate) fn open_managed_config_for_terminal_observation(
+    path: &Path,
+    require_full_sacl: bool,
+) -> Result<File> {
+    let path_wide = wide_null(path.as_os_str())?;
+    let desired_access = GENERIC_READ
+        | FILE_READ_ATTRIBUTES
+        | READ_CONTROL
+        | if require_full_sacl {
+            ACCESS_SYSTEM_SECURITY
+        } else {
+            0
+        };
+    let context = format!(
+        "failed to open managed config terminal observation {}",
+        path.display()
+    );
+    let open = || unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            desired_access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    let handle = if require_full_sacl {
+        open_with_se_security_privilege(&context, false, open)?
+    } else {
+        OwnedHandle::new(open(), &context)?
+    };
+    object_identity(handle.raw(), false)?;
+    if require_full_sacl {
+        validate_full_sacl_handle(handle.raw())?;
+    }
     Ok(handle.into_file())
 }
 
@@ -1089,6 +1959,7 @@ pub(crate) fn open_or_create_current_user_private_file_with_status(
             CREATE_NEW,
             FILE_SHARE_READ,
             DELETE,
+            false,
         ) {
             Ok(file) => return Ok((file, true)),
             Err(error)
@@ -1103,6 +1974,7 @@ pub(crate) fn open_or_create_current_user_private_file_with_status(
                     OPEN_EXISTING,
                     FILE_SHARE_READ,
                     0,
+                    false,
                 ) {
                     Ok(file) => return Ok((file, false)),
                     Err(open_error)
@@ -1145,6 +2017,7 @@ pub(crate) fn open_current_user_private_file_existing(path: &Path) -> Result<Fil
             OPEN_EXISTING,
             FILE_SHARE_READ,
             0,
+            false,
         ) {
             Ok(file) => return Ok(file),
             Err(error)
@@ -1397,14 +2270,26 @@ pub(crate) fn revalidate_managed_file_path(
     path: &Path,
     authority: &File,
     private: bool,
+    require_full_sacl: bool,
 ) -> Result<()> {
     let expected = object_identity(authority.as_raw_handle().cast(), false)?;
     let expected_security = managed_file_metadata_fingerprint(authority)?;
+    let expected_full_sacl = require_full_sacl
+        .then(|| managed_file_full_sacl_fingerprint(authority))
+        .transpose()?;
     let path_wide = wide_null(path.as_os_str())?;
-    let visible = unsafe {
+    let desired_access = GENERIC_READ
+        | FILE_READ_ATTRIBUTES
+        | READ_CONTROL
+        | if require_full_sacl {
+            ACCESS_SYSTEM_SECURITY
+        } else {
+            0
+        };
+    let open = || unsafe {
         CreateFileW(
             path_wide.as_ptr(),
-            GENERIC_READ | FILE_READ_ATTRIBUTES | READ_CONTROL,
+            desired_access,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             null(),
             OPEN_EXISTING,
@@ -1412,13 +2297,15 @@ pub(crate) fn revalidate_managed_file_path(
             null_mut(),
         )
     };
-    let visible = OwnedHandle::new(
-        visible,
-        &format!(
-            "failed to revalidate managed config path {}",
-            path.display()
-        ),
-    )?;
+    let context = format!(
+        "failed to revalidate managed config path {}",
+        path.display()
+    );
+    let visible = if require_full_sacl {
+        open_with_se_security_privilege(&context, false, open)?
+    } else {
+        OwnedHandle::new(open(), &context)?
+    };
     if object_identity(visible.raw(), false)? != expected {
         anyhow::bail!("managed config path no longer names its retained exact handle");
     }
@@ -1428,6 +2315,13 @@ pub(crate) fn revalidate_managed_file_path(
     }
     if managed_file_metadata_fingerprint(&visible_file)? != expected_security {
         anyhow::bail!("managed config metadata changed during path revalidation");
+    }
+    if let Some(expected_full_sacl) = expected_full_sacl {
+        if managed_file_full_sacl_fingerprint(&visible_file)? != expected_full_sacl {
+            anyhow::bail!(
+                "visible managed config full SACL differs from retained exact-handle authority"
+            );
+        }
     }
     Ok(())
 }
@@ -1888,6 +2782,278 @@ pub(super) fn verify_managed_bundle_generation_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::Security::AddMandatoryAce;
+
+    fn test_acl(revision: u8, aces: &[Vec<u8>]) -> Vec<u8> {
+        let size = 8 + aces.iter().map(Vec::len).sum::<usize>();
+        let mut acl = vec![0_u8; size];
+        acl[0] = revision;
+        acl[2..4].copy_from_slice(&u16::try_from(size).unwrap().to_le_bytes());
+        acl[4..6].copy_from_slice(&u16::try_from(aces.len()).unwrap().to_le_bytes());
+        let mut offset = 8;
+        for ace in aces {
+            acl[offset..offset + ace.len()].copy_from_slice(ace);
+            offset += ace.len();
+        }
+        acl
+    }
+
+    fn test_mandatory_label_ace(flags: u8) -> Vec<u8> {
+        let mut ace = vec![0_u8; 20];
+        ace[0] = SYSTEM_MANDATORY_LABEL_ACE_TYPE as u8;
+        ace[1] = flags;
+        ace[2..4].copy_from_slice(&(20_u16).to_le_bytes());
+        ace[4..8].copy_from_slice(&SYSTEM_MANDATORY_LABEL_NO_WRITE_UP.to_le_bytes());
+        ace[8] = 1;
+        ace[9] = 1;
+        ace[10..16].copy_from_slice(&[0, 0, 0, 0, 0, 16]);
+        ace[16..20].copy_from_slice(&4096_u32.to_le_bytes());
+        ace
+    }
+
+    fn test_unsupported_ace(ace_type: u8) -> Vec<u8> {
+        let mut ace = vec![0_u8; 8];
+        ace[0] = ace_type;
+        ace[2..4].copy_from_slice(&(8_u16).to_le_bytes());
+        ace
+    }
+
+    #[test]
+    fn windows_staged_delete_on_close_arm_and_disarm_are_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let armed_path = dir.path().join("armed-stage.json");
+        let armed = create_managed_config_staged_file(&armed_path, false).unwrap();
+        assert!(armed.metadata().unwrap().is_file());
+        drop(armed);
+        assert!(
+            !armed_path.exists(),
+            "an armed pre-Prepared stage must disappear when its exact handle closes"
+        );
+
+        let durable_path = dir.path().join("durable-stage.json");
+        let durable = create_managed_config_staged_file(&durable_path, false).unwrap();
+        let durable =
+            disarm_staged_file_delete_on_close(durable, &durable_path, false, false).unwrap();
+        drop(durable);
+        assert!(
+            durable_path.is_file(),
+            "a stage disarmed after durable Prepared WAL must survive handle close"
+        );
+        std::fs::remove_file(durable_path).unwrap();
+
+        let failed_disarm_path = dir.path().join("failed-disarm-stage.json");
+        let failed_disarm = create_managed_config_staged_file(&failed_disarm_path, false).unwrap();
+        inject_staged_file_disarm_failure(true);
+        let error =
+            disarm_staged_file_delete_on_close(failed_disarm, &failed_disarm_path, false, false)
+                .expect_err("injected disarm failure must retain delete-on-close");
+        assert!(format!("{error:#}").contains("injected staged-file"));
+        assert!(
+            !failed_disarm_path.exists(),
+            "a failed disarm must not leave an unjournaled named stage"
+        );
+    }
+
+    fn process_privileges_snapshot() -> Vec<u8> {
+        use windows_sys::Win32::Security::TokenPrivileges;
+
+        let mut token = null_mut();
+        assert_ne!(
+            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) },
+            0
+        );
+        let token = OwnedHandle::new(token, "test process token").unwrap();
+        let mut required = 0_u32;
+        let _ = unsafe {
+            GetTokenInformation(token.raw(), TokenPrivileges, null_mut(), 0, &mut required)
+        };
+        assert!(required > 0);
+        let mut storage = vec![0_usize; (required as usize).div_ceil(size_of::<usize>())];
+        assert_ne!(
+            unsafe {
+                GetTokenInformation(
+                    token.raw(),
+                    TokenPrivileges,
+                    storage.as_mut_ptr().cast(),
+                    required,
+                    &mut required,
+                )
+            },
+            0
+        );
+        unsafe {
+            std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), required as usize).to_vec()
+        }
+    }
+
+    fn current_thread_token_id() -> Option<(u32, i32)> {
+        use windows_sys::Win32::Security::{TokenStatistics, TOKEN_STATISTICS};
+
+        let mut token = null_mut();
+        if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) } == 0 {
+            assert_eq!(unsafe { GetLastError() }, ERROR_NO_TOKEN);
+            return None;
+        }
+        let token = OwnedHandle::new(token, "test thread token").unwrap();
+        let mut statistics = TOKEN_STATISTICS::default();
+        let mut required = 0_u32;
+        assert_ne!(
+            unsafe {
+                GetTokenInformation(
+                    token.raw(),
+                    TokenStatistics,
+                    (&mut statistics as *mut TOKEN_STATISTICS).cast(),
+                    size_of::<TOKEN_STATISTICS>() as u32,
+                    &mut required,
+                )
+            },
+            0
+        );
+        Some((statistics.TokenId.LowPart, statistics.TokenId.HighPart))
+    }
+
+    #[test]
+    fn full_sacl_parser_accepts_only_empty_or_one_valid_mandatory_label() {
+        validate_supported_full_sacl_bytes(&[]).unwrap();
+        validate_supported_full_sacl_bytes(&test_acl(ACL_REVISION as u8, &[])).unwrap();
+        let inheritance_flags = (OBJECT_INHERIT_ACE
+            | CONTAINER_INHERIT_ACE
+            | NO_PROPAGATE_INHERIT_ACE
+            | INHERIT_ONLY_ACE
+            | INHERITED_ACE) as u8;
+        for revision in [ACL_REVISION as u8, ACL_REVISION_DS as u8] {
+            assert_eq!(
+                validate_supported_full_sacl_bytes(&test_acl(
+                    revision,
+                    &[test_mandatory_label_ace(inheritance_flags)],
+                ))
+                .unwrap(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn full_sacl_parser_rejects_unsupported_duplicate_and_malformed_aces() {
+        for ace_type in [
+            SYSTEM_AUDIT_ACE_TYPE as u8,
+            SYSTEM_ALARM_ACE_TYPE as u8,
+            SYSTEM_RESOURCE_ATTRIBUTE_ACE_TYPE as u8,
+            SYSTEM_SCOPED_POLICY_ID_ACE_TYPE as u8,
+            SYSTEM_PROCESS_TRUST_LABEL_ACE_TYPE as u8,
+            SYSTEM_ACCESS_FILTER_ACE_TYPE as u8,
+            0xfe,
+        ] {
+            let error = validate_supported_full_sacl_bytes(&test_acl(
+                ACL_REVISION_DS as u8,
+                &[test_unsupported_ace(ace_type)],
+            ))
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("unsupported"));
+        }
+
+        let label = test_mandatory_label_ace(0);
+        assert!(validate_supported_full_sacl_bytes(&test_acl(
+            ACL_REVISION as u8,
+            &[label.clone(), label],
+        ))
+        .is_err());
+
+        let mut escaping = test_mandatory_label_ace(0);
+        escaping[2..4].copy_from_slice(&(24_u16).to_le_bytes());
+        assert!(
+            validate_supported_full_sacl_bytes(&test_acl(ACL_REVISION as u8, &[escaping],))
+                .is_err()
+        );
+
+        let mut unsupported_flags = test_mandatory_label_ace(0x40);
+        unsupported_flags[1] = 0x40;
+        assert!(validate_supported_full_sacl_bytes(&test_acl(
+            ACL_REVISION as u8,
+            &[unsupported_flags],
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn mandatory_label_round_trips_through_managed_metadata_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.json");
+        let destination_path = dir.path().join("destination.json");
+        let source = create_managed_config_staged_file(&source_path, true).unwrap();
+        let destination = create_managed_config_staged_file(&destination_path, true).unwrap();
+
+        let mut label_storage = vec![0_usize; 4];
+        let label_bytes = label_storage.len() * size_of::<usize>();
+        let label = label_storage.as_mut_ptr().cast::<ACL>();
+        assert_ne!(
+            unsafe { InitializeAcl(label, label_bytes as u32, ACL_REVISION) },
+            0
+        );
+        let mut sid_storage = [0_usize; 2];
+        let sid = unsafe {
+            std::slice::from_raw_parts_mut(
+                sid_storage.as_mut_ptr().cast::<u8>(),
+                sid_storage.len() * size_of::<usize>(),
+            )
+        };
+        sid[..12].copy_from_slice(&[1, 1, 0, 0, 0, 0, 0, 16, 0, 16, 0, 0]);
+        assert_ne!(
+            unsafe {
+                AddMandatoryAce(
+                    label,
+                    ACL_REVISION,
+                    0,
+                    SYSTEM_MANDATORY_LABEL_NO_WRITE_UP,
+                    sid.as_mut_ptr().cast(),
+                )
+            },
+            0
+        );
+        let result = unsafe {
+            SetSecurityInfo(
+                source.as_raw_handle().cast(),
+                SE_FILE_OBJECT,
+                LABEL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                label,
+            )
+        };
+        assert_eq!(result, 0);
+
+        let expected = managed_file_full_sacl_fingerprint(&source).unwrap();
+        copy_managed_file_metadata(&source, &destination).unwrap();
+        assert_eq!(
+            managed_file_full_sacl_fingerprint(&destination).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn se_security_privilege_is_thread_scoped_and_restores_prior_token() {
+        let process_before = process_privileges_snapshot();
+        let thread_before = current_thread_token_id();
+        let mut privilege = match ThreadSeSecurityPrivilege::enable() {
+            Ok(privilege) => privilege,
+            Err(error) if format!("{error:#}").contains("not assigned") => {
+                assert_eq!(process_privileges_snapshot(), process_before);
+                assert_eq!(current_thread_token_id(), thread_before);
+                return;
+            }
+            Err(error) => panic!("unexpected thread-scoped privilege failure: {error:#}"),
+        };
+        assert_ne!(current_thread_token_id(), thread_before);
+        assert_eq!(process_privileges_snapshot(), process_before);
+        let concurrent = std::thread::spawn(process_privileges_snapshot)
+            .join()
+            .unwrap();
+        assert_eq!(concurrent, process_before);
+        privilege.restore().unwrap();
+        assert_eq!(current_thread_token_id(), thread_before);
+        assert_eq!(process_privileges_snapshot(), process_before);
+    }
 
     const TEST_CMD_COMPONENTS: &[ComponentSpec] = &[ComponentSpec {
         name: "probe.exe",

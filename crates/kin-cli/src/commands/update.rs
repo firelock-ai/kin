@@ -549,9 +549,9 @@ pub async fn run(
     // Check-only must remain byte-for-byte read-only. It inspects a stale
     // transaction and fails with a recovery instruction. An interactive
     // mutation keeps its existing lock-before-network behavior. A pinned
-    // unattended mutation takes a short early install lock only to fence an
-    // existing restart marker, releases it for network/temp staging, and then
-    // reacquires and revalidates the install authority before mutation.
+    // unattended mutation performs only a no-follow, read-only restart-marker
+    // existence fence before network preflight, then acquires and revalidates
+    // the install authority before any managed mutation.
     let requested_home = crate::commands::setup::kin_dir()?;
     let inspected_home = validate_existing_install_root(&requested_home)?;
     let spec = platform_bundle_spec(std::env::consts::OS)?;
@@ -571,12 +571,10 @@ pub async fn run(
         );
     }
     if pinned_mutation {
-        // Do not hold the install lock across network preflight, but do fence
-        // restart supersession under it before the preflight creates or
-        // extracts any private local temporary state. The install-phase check
-        // repeats this after the network interval to close the race.
-        let preflight_lock = InstallRootLock::acquire_existing(&requested_home)?;
-        refuse_new_update_while_restart_marker_exists(&preflight_lock)?;
+        // This fence must not create or harden update.lock, chmod KIN_HOME, or
+        // create bin/lib on a pin mismatch or remote failure. The locked check
+        // after authenticated preflight closes the race before mutation.
+        refuse_restart_marker_before_remote_preflight(&inspected_home)?;
     }
     if !check_only {
         ensure_no_active_managed_runtimes(&inspected_home, spec).context(
@@ -1117,9 +1115,9 @@ fn validate_pinned_preflight_build_identity(
 /// `Result` is deliberately consumed before the install-phase lock is
 /// reacquired, so every mismatch, timeout, download error, and provenance
 /// failure exits without changing managed install bytes or transaction state.
-/// The earlier restart fence may already have created or hardened the persistent
-/// update-lock sidecar; this phase reacquires that lock and revalidates all
-/// authority after the unlocked network/temp-staging interval.
+/// The earlier restart fence was strictly read-only. This phase first creates
+/// or opens the persistent update-lock sidecar and revalidates all authority
+/// after the unlocked network/temp-staging interval.
 fn enter_pinned_install_phase<T>(
     requested_home: &Path,
     spec: &[ComponentSpec],
@@ -8927,6 +8925,23 @@ fn restart_pending_path(kin_home: &Path) -> PathBuf {
     kin_home.join(RESTART_ACK_REQUIRED_FILE)
 }
 
+fn refuse_restart_marker_before_remote_preflight(kin_home: &Path) -> Result<()> {
+    let path = restart_pending_path(kin_home);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => anyhow::bail!(
+            "a runtime restart acknowledgement path already exists at {}; refusing pinned remote preflight before any install lock or managed-directory mutation",
+            path.display()
+        ),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to inspect runtime restart acknowledgement path {} without following links; refusing pinned remote preflight before local mutation",
+                path.display()
+            )
+        }),
+    }
+}
+
 fn refuse_new_update_while_restart_marker_exists(lock: &InstallRootLock) -> Result<()> {
     #[cfg(unix)]
     let present = lock
@@ -9725,6 +9740,12 @@ fn validate_runtime_convergence(
     Ok(())
 }
 
+fn restart_acknowledgement_output(installed_version: &str) -> String {
+    format!(
+        "Verified the persisted process fence and installed byte identities for Kin v{installed_version}; live runtime convergence was not inferred."
+    )
+}
+
 fn acknowledge_runtime_restart(evidence: &[RuntimeSessionEvidence]) -> Result<()> {
     let requested_home = crate::commands::setup::kin_dir()?;
     let lock = InstallRootLock::acquire_existing(&requested_home)?;
@@ -9784,8 +9805,8 @@ fn acknowledge_runtime_restart(evidence: &[RuntimeSessionEvidence]) -> Result<()
     #[cfg(not(unix))]
     marker.remove_unchanged("runtime restart acknowledgement marker")?;
     println!(
-        "Verified post-update runtime convergence for Kin v{}.",
-        record.installed_version
+        "{}",
+        restart_acknowledgement_output(&record.installed_version)
     );
     Ok(())
 }
@@ -12656,9 +12677,15 @@ cwd = {:?}
     }
 
     #[test]
+    #[serial]
     fn windows_bundle_uses_exe_names_and_removes_stale_projection_files() {
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&kin_home).unwrap();
+        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        let _home = EnvGuard::set("HOME", &home);
         let stage = tmp.path().join("stage");
         write_bundle(&kin_home, WINDOWS_COMPONENTS, b"old-");
         let archive = make_zip(&[("kin.exe", b"new-kin"), ("kin-daemon.exe", b"new-daemon")]);
@@ -13601,6 +13628,15 @@ cwd = {:?}
         assert_eq!(fs::read(&marker).unwrap(), marker_before);
     }
 
+    #[test]
+    fn restart_acknowledgement_output_preserves_proof_boundary() {
+        let output = restart_acknowledgement_output("0.2.23");
+        assert!(output.contains("persisted process fence"));
+        assert!(output.contains("installed byte identities"));
+        assert!(output.contains("live runtime convergence was not inferred"));
+        assert!(!output.contains("Verified post-update runtime convergence"));
+    }
+
     #[cfg(unix)]
     #[test]
     #[serial]
@@ -14326,6 +14362,56 @@ cwd = {:?}
 
     #[cfg(unix)]
     #[test]
+    fn pinned_remote_preflight_restart_fence_is_read_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for marker_kind in ["absent", "malformed-directory"] {
+            let temp = tempfile::tempdir().unwrap();
+            let kin_home = temp.path().join("kin-home");
+            fs::create_dir(&kin_home).unwrap();
+            fs::set_permissions(&kin_home, fs::Permissions::from_mode(0o751)).unwrap();
+            if marker_kind == "malformed-directory" {
+                fs::create_dir(restart_pending_path(&kin_home)).unwrap();
+            }
+            let before = install_tree_snapshot(&kin_home);
+            let before_mode = fs::symlink_metadata(&kin_home)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+
+            let result = refuse_restart_marker_before_remote_preflight(&kin_home);
+            if marker_kind == "absent" {
+                result.unwrap();
+            } else {
+                let error = result.expect_err("any restart-marker path must fence preflight");
+                assert!(format!("{error:#}").contains("before any install lock"));
+            }
+
+            assert_eq!(install_tree_snapshot(&kin_home), before);
+            assert_eq!(
+                fs::symlink_metadata(&kin_home)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                before_mode
+            );
+            assert!(!kin_home.join("update.lock").exists());
+            assert!(!kin_home.join("bin").exists());
+            assert!(!kin_home.join("lib").exists());
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let absent_home = temp.path().join("absent-kin-home");
+        let before = install_tree_snapshot(temp.path());
+        refuse_restart_marker_before_remote_preflight(&absent_home).unwrap();
+        assert_eq!(install_tree_snapshot(temp.path()), before);
+        assert!(!absent_home.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn failed_pinned_preflight_is_byte_entry_inode_and_mode_read_only() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -14341,8 +14427,14 @@ cwd = {:?}
             fs::write(&sentinel, b"existing-install-state").unwrap();
             fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o640)).unwrap();
 
-            validate_existing_install_root(&kin_home).unwrap();
             let before = install_tree_snapshot(&kin_home);
+            let before_mode = fs::symlink_metadata(&kin_home)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            validate_existing_install_root(&kin_home).unwrap();
+            refuse_restart_marker_before_remote_preflight(&kin_home).unwrap();
             let expectation = ReleaseExpectation {
                 version: Version::parse("0.2.22").unwrap(),
                 commit_sha: "a".repeat(40),
@@ -14369,6 +14461,15 @@ cwd = {:?}
                 install_tree_snapshot(&kin_home),
                 before,
                 "{failure} changed KIN_HOME entries, bytes, inodes, or modes"
+            );
+            assert_eq!(
+                fs::symlink_metadata(&kin_home)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                before_mode,
+                "{failure} chmodded KIN_HOME before install authority"
             );
             assert!(!kin_home.join("update.lock").exists());
             assert!(!kin_home.join("bin").exists());
