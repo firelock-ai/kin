@@ -1017,7 +1017,7 @@ fn read_managed_file_security(file: &File) -> Result<ManagedFileSecurity> {
 
 /// Stable proof of the exact owner/DACL/protection attached to a managed
 /// config handle. Recovery records use this alongside bytes and file identity.
-pub(crate) fn managed_file_security_fingerprint(file: &File) -> Result<String> {
+fn managed_file_security_canonical(file: &File) -> Result<Vec<u8>> {
     let security = read_managed_file_security(file)?;
     let owner_len = unsafe { GetLengthSid(security.owner) } as usize;
     let group_len = unsafe { GetLengthSid(security.group) } as usize;
@@ -1048,7 +1048,13 @@ pub(crate) fn managed_file_security_fingerprint(file: &File) -> Result<String> {
     canonical.extend_from_slice(&(label.len() as u32).to_le_bytes());
     canonical.extend_from_slice(&label);
     canonical.extend_from_slice(&relevant_control.to_le_bytes());
-    Ok(crate::commands::setup_ledger::sha256_hex(&canonical))
+    Ok(canonical)
+}
+
+pub(crate) fn managed_file_security_fingerprint(file: &File) -> Result<String> {
+    Ok(crate::commands::setup_ledger::sha256_hex(
+        &managed_file_security_canonical(file)?,
+    ))
 }
 
 /// Preserve the existing non-private config's owner, DACL, and inheritance
@@ -1056,7 +1062,8 @@ pub(crate) fn managed_file_security_fingerprint(file: &File) -> Result<String> {
 pub(crate) fn copy_managed_file_security(source: &File, destination: &File) -> Result<()> {
     object_identity(source.as_raw_handle().cast(), false)?;
     object_identity(destination.as_raw_handle().cast(), false)?;
-    let source_fingerprint = managed_file_security_fingerprint(source)?;
+    let source_canonical = managed_file_security_canonical(source)?;
+    let source_fingerprint = crate::commands::setup_ledger::sha256_hex(&source_canonical);
     let security = read_managed_file_security(source)?;
     let protection = if security.control & SE_DACL_PROTECTED != 0 {
         PROTECTED_DACL_SECURITY_INFORMATION
@@ -1087,10 +1094,13 @@ pub(crate) fn copy_managed_file_security(source: &File, destination: &File) -> R
     if result != 0 {
         anyhow::bail!("failed to preserve managed config owner/DACL: Windows error {result}");
     }
-    let destination_fingerprint = managed_file_security_fingerprint(destination)?;
+    let destination_canonical = managed_file_security_canonical(destination)?;
+    let destination_fingerprint = crate::commands::setup_ledger::sha256_hex(&destination_canonical);
     if destination_fingerprint != source_fingerprint {
         anyhow::bail!(
-            "staged managed config owner/DACL differs after security copy (source {source_fingerprint}, destination {destination_fingerprint})"
+            "staged managed config owner/DACL differs after security copy (source {source_fingerprint}: {}, destination {destination_fingerprint}: {})",
+            hex::encode(source_canonical),
+            hex::encode(destination_canonical),
         );
     }
     Ok(())
@@ -3192,7 +3202,11 @@ mod tests {
                 let error = guard
                     .validate(Some(&user))
                     .expect_err("a renamed guarded candidate must fail binding revalidation");
-                assert!(format!("{error:#}").contains("binding changed"));
+                let rendered = format!("{error:#}");
+                assert!(
+                    rendered.contains("binding changed"),
+                    "unexpected guarded rename diagnostic: {rendered}"
+                );
             }
         }
         drop(guard);
