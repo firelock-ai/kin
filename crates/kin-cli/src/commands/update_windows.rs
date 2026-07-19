@@ -947,9 +947,7 @@ fn canonical_acl_bytes(acl: *mut ACL, label: &str) -> Result<Vec<u8>> {
     if u32::from(header.AceCount) != info.AceCount {
         anyhow::bail!("managed config {label} ACE count changed during inspection");
     }
-    let mut canonical = Vec::with_capacity(info.AclBytesInUse as usize);
-    canonical.push(header.AclRevision);
-    canonical.extend_from_slice(&header.AceCount.to_le_bytes());
+    let mut entries = Vec::with_capacity(info.AceCount as usize);
     for index in 0..info.AceCount {
         let mut ace = null_mut();
         if unsafe { GetAce(acl, index, &mut ace) } == 0 || ace.is_null() {
@@ -963,6 +961,39 @@ fn canonical_acl_bytes(acl: *mut ACL, label: &str) -> Result<Vec<u8>> {
             anyhow::bail!("managed config {label} ACE {index} has invalid byte length");
         }
         let ace_bytes = unsafe { std::slice::from_raw_parts(ace.cast::<u8>(), ace_len) };
+        entries.push(ace_bytes.to_vec());
+    }
+
+    // Applying an unprotected DACL through SetSecurityInfo can materialize an
+    // inherited copy of an already-explicit ACE from the parent. The inherited
+    // duplicate carries no additional access authority, while retaining unique
+    // inherited ACEs remains security-significant. Collapse only byte-identical
+    // inherited duplicates of an explicit DACL ACE; never do this for a label
+    // ACL or for two entries with different masks, types, SIDs, or other flags.
+    let mut canonical_entries = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        let inherited = entry[1] & INHERITED_ACE as u8 != 0;
+        let redundant_inherited = label == "DACL"
+            && inherited
+            && entries.iter().any(|candidate| {
+                if candidate[1] & INHERITED_ACE as u8 != 0 || candidate.len() != entry.len() {
+                    return false;
+                }
+                let mut normalized = entry.clone();
+                normalized[1] &= !(INHERITED_ACE as u8);
+                candidate == &normalized
+            });
+        if !redundant_inherited {
+            canonical_entries.push(entry);
+        }
+    }
+    let canonical_count = u16::try_from(canonical_entries.len())
+        .context("managed config ACL has too many canonical entries")?;
+    let mut canonical = Vec::with_capacity(info.AclBytesInUse as usize);
+    canonical.push(header.AclRevision);
+    canonical.extend_from_slice(&canonical_count.to_le_bytes());
+    for ace_bytes in canonical_entries {
+        let ace_len = ace_bytes.len();
         canonical.extend_from_slice(&(ace_len as u32).to_le_bytes());
         canonical.extend_from_slice(ace_bytes);
     }
