@@ -45,7 +45,6 @@ use windows_sys::Win32::Security::{
     SE_PRIVILEGE_ENABLED, SE_SACL_AUTO_INHERITED, SE_SACL_AUTO_INHERIT_REQ, SE_SACL_DEFAULTED,
     SE_SACL_PRESENT, SE_SACL_PROTECTED, SE_SECURITY_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_DUPLICATE,
     TOKEN_IMPERSONATE, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
-    UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FileBasicInfo, FileIdInfo, FileStreamInfo,
@@ -1065,15 +1064,19 @@ pub(crate) fn copy_managed_file_security(source: &File, destination: &File) -> R
     let source_canonical = managed_file_security_canonical(source)?;
     let source_fingerprint = crate::commands::setup_ledger::sha256_hex(&source_canonical);
     let security = read_managed_file_security(source)?;
-    let protection = if security.control & SE_DACL_PROTECTED != 0 {
-        PROTECTED_DACL_SECURITY_INFORMATION
-    } else {
-        UNPROTECTED_DACL_SECURITY_INFORMATION
-    };
-    let mut security_information = OWNER_SECURITY_INFORMATION
-        | GROUP_SECURITY_INFORMATION
-        | DACL_SECURITY_INFORMATION
-        | protection;
+    let source_is_protected = security.control & SE_DACL_PROTECTED != 0;
+    let destination_is_protected =
+        read_managed_file_security(destination)?.control & SE_DACL_PROTECTED != 0;
+    if !source_is_protected && destination_is_protected {
+        anyhow::bail!(
+            "staged managed config unexpectedly has a protected DACL before security copy"
+        );
+    }
+    let mut security_information =
+        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    if source_is_protected {
+        security_information |= PROTECTED_DACL_SECURITY_INFORMATION;
+    }
     if !security.label.is_null() {
         // LABEL_SECURITY_INFORMATION is a READ_CONTROL/WRITE_OWNER surface.
         // SACL protection flags describe the privileged full audit SACL and
@@ -1098,9 +1101,7 @@ pub(crate) fn copy_managed_file_security(source: &File, destination: &File) -> R
     let destination_fingerprint = crate::commands::setup_ledger::sha256_hex(&destination_canonical);
     if destination_fingerprint != source_fingerprint {
         anyhow::bail!(
-            "staged managed config owner/DACL differs after security copy (source {source_fingerprint}: {}, destination {destination_fingerprint}: {})",
-            hex::encode(source_canonical),
-            hex::encode(destination_canonical),
+            "staged managed config owner/DACL differs after security copy (source {source_fingerprint}, destination {destination_fingerprint})",
         );
     }
     Ok(())
