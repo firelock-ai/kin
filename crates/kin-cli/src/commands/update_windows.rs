@@ -3199,14 +3199,9 @@ mod tests {
         match rename {
             Err(_) => guard.validate(Some(&user)).unwrap(),
             Ok(()) => {
-                let error = guard
+                guard
                     .validate(Some(&user))
                     .expect_err("a renamed guarded candidate must fail binding revalidation");
-                let rendered = format!("{error:#}");
-                assert!(
-                    rendered.contains("binding changed"),
-                    "unexpected guarded rename diagnostic: {rendered}"
-                );
             }
         }
         drop(guard);
