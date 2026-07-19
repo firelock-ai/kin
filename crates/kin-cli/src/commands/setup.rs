@@ -6977,10 +6977,67 @@ fn resolve_failed_windows_write_with_retained_handles(
         ConfigTransactionPhase::Prepared => {
             if staged.is_none() {
                 // A crash or failure during the durable handoff closes the
-                // permanently armed file object and removes the stage. Use
-                // WAL plus fresh exact inventory to prove the untouched
-                // original (or prior absence) and terminalize rollback.
-                return rollback_failed_windows_write(lock_file, parent, path, private, record);
+                // permanently armed file object and removes the stage. The
+                // caller can still hold the exact original with delete sharing
+                // denied, so reopening the canonical path is both unnecessary
+                // and expected to fail. Prove rollback from the retained
+                // handle plus WAL authority and terminalize it directly.
+                require_windows_path_absent(
+                    staged_path,
+                    "prepared Windows handoff stage after armed-handle failure",
+                )?;
+                match record.original.as_ref() {
+                    Some(original) => {
+                        let old = quarantine.as_mut().context(
+                            "prepared Windows handoff rollback lost retained original handle",
+                        )?;
+                        if old.name != record.destination_name {
+                            anyhow::bail!(
+                                "prepared Windows handoff original has unknown retained-handle location"
+                            );
+                        }
+                        let observed = observe_open_config_file_with_full_sacl(
+                            path,
+                            &mut old.file,
+                            private,
+                            strict_sacl,
+                        )?;
+                        if !original.matches(&observed) {
+                            anyhow::bail!(
+                                "prepared Windows handoff original changed; retained exact handle and WAL"
+                            );
+                        }
+                        super::update::windows_update::revalidate_managed_file_path(
+                            path,
+                            &old.file,
+                            private,
+                            strict_sacl,
+                        )?;
+                    }
+                    None => {
+                        if quarantine.is_some() {
+                            anyhow::bail!(
+                                "prepared Windows handoff create unexpectedly retained an original"
+                            );
+                        }
+                        require_windows_path_absent(
+                            path,
+                            "prepared Windows handoff create canonical slot",
+                        )?;
+                    }
+                }
+                parent.revalidate_visible()?;
+                record.phase = ConfigTransactionPhase::RollbackApplied;
+                write_config_transaction(lock_file, record)?;
+                complete_windows_config_transaction(
+                    lock_file,
+                    parent,
+                    path,
+                    private,
+                    record,
+                    ConfigTransactionOutcome::RolledBack,
+                )?;
+                return Ok(FailedWriteResolution::RolledBack);
             }
             // Inventory retained-handle locations before touching either
             // object. Stage policy is deliberately not consulted until the
