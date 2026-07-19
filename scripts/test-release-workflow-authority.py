@@ -392,7 +392,7 @@ def main() -> None:
         'if [ "$digest" != "$EXPECTED_DIGEST" ]',
         '"${IMAGE}@${digest}" "$COMMIT"',
         "Attest immutable daemon image",
-        "actions/attest@a1948c3f048ba23858d222213b7c278aabede763",
+        "actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6",
         "subject-name: ghcr.io/firelock-ai/kin",
         "subject-digest: ${{ steps.subject.outputs.digest }}",
         "push-to-registry: true",
