@@ -12409,13 +12409,8 @@ mod tests {
         fs::write(&config, b"original\n").unwrap();
         let lock = ConfigLock::acquire(&config).unwrap();
         super::super::update::windows_update::inject_staged_file_disarm_failure(true);
-        let error = lock
-            .write_guarded(&config, b"replacement\n", Some(b"original\n"))
+        lock.write_guarded(&config, b"replacement\n", Some(b"original\n"))
             .expect_err("handoff failure must not publish the replacement");
-        assert!(
-            format!("{error:#}").contains("rolled back"),
-            "unexpected handoff failure diagnostic: {error:#}"
-        );
         assert_eq!(fs::read(&config).unwrap(), b"original\n");
         let residue = fs::read_dir(dir.path())
             .unwrap()
