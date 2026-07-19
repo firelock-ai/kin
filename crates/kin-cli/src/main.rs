@@ -1937,11 +1937,8 @@ fn main() -> Result<()> {
 
     // A durable MCP marker is an active repair obligation. Ordinary commands
     // retry it; the update command retries while holding the install lock.
-    if !matches!(&cli.command, Command::Update { .. })
-        && commands::update::mcp_repair_is_pending()
-        && commands::update::automatic_mcp_repair_is_authorized()
-    {
-        match commands::update::retry_pending_mcp_repair() {
+    if !matches!(&cli.command, Command::Update { .. }) {
+        match commands::update::retry_pending_mcp_repair_from_managed_process() {
             Ok(_) => {}
             Err(error) => eprintln!("kin: MCP repair remains pending: {error:#}"),
         }

@@ -91,7 +91,7 @@ jobs:
   windows-installer:
     name: Windows installer + vector-free release build
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Preserve tracked bytes on Windows
         shell: bash
@@ -138,6 +138,15 @@ jobs:
         run: >
           cargo build --locked --release --target x86_64-pc-windows-msvc
           -p kin-cli -p kin-daemon --no-default-features
+
+      - name: Compile and run native Windows authority tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --release --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --no-run
+          cargo test --locked --release --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features windows -- --test-threads=1
 
       - name: Verify Windows build provenance and disabled features
         shell: bash

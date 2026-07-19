@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 #[cfg(not(unix))]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
-use std::io::{Read, Seek, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::process::Command;
@@ -18,7 +18,7 @@ use sysinfo::{Pid, System};
 
 #[cfg(windows)]
 #[path = "update_windows.rs"]
-mod windows_update;
+pub(crate) mod windows_update;
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GITHUB_RELEASES_LATEST_URL: &str =
@@ -73,6 +73,7 @@ const RESTART_ACK_REQUIRED_FILE: &str = "update-restart-ack-required.json";
 const RESTART_MARKER_SCHEMA_VERSION: u32 = 3;
 const RESTART_FENCE_REASON: &str = "all managed daemon, supervisor, MCP, VFS, and NFS serving executables were proven quiescent before remote preflight and again before the durable update commit; acknowledgement confirms the persisted process fence and installed byte identities, not version text";
 const MCP_REPAIR_PENDING_FILE: &str = "update-mcp-repair-pending.json";
+const MCP_REPAIR_MARKER_SCHEMA_VERSION: u32 = 3;
 const PRIVATE_TEMP_CONTAINER: &str = ".kin-update-private";
 const PREFLIGHT_TEMP_PREFIX: &str = ".kin-update-preflight-";
 const PRIVATE_TEMP_RECLAIM_PREFIX: &str = ".kin-update-reclaim-";
@@ -421,6 +422,7 @@ struct StaticBuildIdentity {
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 struct RestartPending {
     schema_version: u32,
     installed_version: String,
@@ -439,6 +441,7 @@ struct RestartPending {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 struct RuntimeCommitIdentity {
     kind: RuntimeKind,
     component: String,
@@ -466,6 +469,7 @@ impl RuntimeKind {
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 struct RuntimeRestartObligation {
     kind: RuntimeKind,
     component: String,
@@ -474,6 +478,7 @@ struct RuntimeRestartObligation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 struct RuntimeSessionAtUpdate {
     pid: u32,
     start_time: u64,
@@ -489,9 +494,7 @@ struct McpRepairPending {
     schema_version: u32,
     installed_version: String,
     recorded_at: String,
-    #[serde(default)]
     repair_required: bool,
-    #[serde(default)]
     targets: Vec<crate::commands::setup::McpRepairTarget>,
 }
 
@@ -545,8 +548,10 @@ pub async fn run(
 
     // Check-only must remain byte-for-byte read-only. It inspects a stale
     // transaction and fails with a recovery instruction. An interactive
-    // mutation keeps its existing lock-before-network behavior, while a pinned
-    // unattended mutation completes remote preflight before opening the lock.
+    // mutation keeps its existing lock-before-network behavior. A pinned
+    // unattended mutation takes a short early install lock only to fence an
+    // existing restart marker, releases it for network/temp staging, and then
+    // reacquires and revalidates the install authority before mutation.
     let requested_home = crate::commands::setup::kin_dir()?;
     let inspected_home = validate_existing_install_root(&requested_home)?;
     let spec = platform_bundle_spec(std::env::consts::OS)?;
@@ -565,9 +570,17 @@ pub async fn run(
             stale[0].display()
         );
     }
+    if pinned_mutation {
+        // Do not hold the install lock across network preflight, but do fence
+        // restart supersession under it before the preflight creates or
+        // extracts any private local temporary state. The install-phase check
+        // repeats this after the network interval to close the race.
+        let preflight_lock = InstallRootLock::acquire_existing(&requested_home)?;
+        refuse_new_update_while_restart_marker_exists(&preflight_lock)?;
+    }
     if !check_only {
         ensure_no_active_managed_runtimes(&inspected_home, spec).context(
-            "initial update preflight requires every managed serving executable to be stopped; no install lock was created and no recovery, cleanup, repair, preference mutation, or release download was attempted",
+            "initial update preflight requires every managed serving executable to be stopped; no recovery, cleanup, repair, preference mutation, or release download was attempted",
         )?;
     }
 
@@ -585,10 +598,12 @@ pub async fn run(
         inspected_home
     } else {
         let lock = InstallRootLock::acquire_existing(&requested_home)?;
+        refuse_new_update_while_restart_marker_exists(&lock)?;
         if let Some(authority) = start_authority.as_ref() {
             authority.verify_locked(&lock, spec)?;
         }
         recover_stale_transactions(&lock, spec)?;
+        refuse_new_update_while_restart_marker_exists(&lock)?;
         cleanup_stale_staging_dirs(&lock)?;
         if start_authority.is_none() {
             start_authority = Some(UpdaterStartAuthority::capture(lock.root(), spec)?);
@@ -1099,9 +1114,12 @@ fn validate_pinned_preflight_build_identity(
 }
 
 /// Convert a successful remote preflight into local mutation authority. The
-/// `Result` is deliberately consumed before `InstallRootLock::acquire_existing`
-/// so every mismatch, timeout, download error, and provenance failure exits
-/// without creating an entry or changing bytes, inodes, or modes in KIN_HOME.
+/// `Result` is deliberately consumed before the install-phase lock is
+/// reacquired, so every mismatch, timeout, download error, and provenance
+/// failure exits without changing managed install bytes or transaction state.
+/// The earlier restart fence may already have created or hardened the persistent
+/// update-lock sidecar; this phase reacquires that lock and revalidates all
+/// authority after the unlocked network/temp-staging interval.
 fn enter_pinned_install_phase<T>(
     requested_home: &Path,
     spec: &[ComponentSpec],
@@ -1111,11 +1129,13 @@ fn enter_pinned_install_phase<T>(
     let prepared = preflight?;
     let start_authority = start_authority.context("pinned updater lost its startup authority")?;
     let lock = InstallRootLock::acquire_existing(requested_home)?;
+    refuse_new_update_while_restart_marker_exists(&lock)?;
     // This comparison is the downgrade gate: an updater that spent its remote
     // preflight interval behind a newer concurrent install cannot use its old
     // embedded CURRENT_VERSION to overwrite the new full bundle generation.
     start_authority.verify_locked(&lock, spec)?;
     recover_stale_transactions(&lock, spec)?;
+    refuse_new_update_while_restart_marker_exists(&lock)?;
     cleanup_stale_staging_dirs(&lock)?;
     start_authority.verify_locked(&lock, spec)?;
     ensure_no_active_managed_runtimes(lock.root(), spec).context(
@@ -1126,27 +1146,199 @@ fn enter_pinned_install_phase<T>(
 }
 
 fn validate_mcp_repair_record(record: &McpRepairPending) -> Result<()> {
-    if record.schema_version != 2 {
+    if record.schema_version != MCP_REPAIR_MARKER_SCHEMA_VERSION {
         anyhow::bail!(
-            "unsupported MCP repair marker schema {} (schema v1 has no exact target manifest)",
-            record.schema_version
+            "unsupported MCP repair marker schema {} (only schema {} carries complete exact-target authority)",
+            record.schema_version,
+            MCP_REPAIR_MARKER_SCHEMA_VERSION,
         );
     }
     parse_release_version(&record.installed_version)?;
-    if record.repair_required && record.targets.is_empty() {
+    chrono::DateTime::parse_from_rfc3339(&record.recorded_at).with_context(|| {
+        format!(
+            "MCP repair record has an invalid recorded_at timestamp: {}",
+            record.recorded_at
+        )
+    })?;
+    if !record.repair_required {
+        if !record.targets.is_empty() {
+            anyhow::bail!("no-op MCP repair journal payload unexpectedly contains targets");
+        }
+        return Ok(());
+    }
+    if record.targets.is_empty() {
         anyhow::bail!("MCP repair obligation has an empty target manifest");
     }
-    if !record.repair_required && !record.targets.is_empty() {
-        anyhow::bail!("non-required MCP repair record unexpectedly contains targets");
-    }
-    if record.repair_required {
-        let normalized =
-            crate::commands::setup::normalize_mcp_repair_targets(record.targets.clone())?;
-        if normalized.len() != record.targets.len() {
-            anyhow::bail!("MCP repair obligation contains duplicate targets");
-        }
+    let normalized = crate::commands::setup::normalize_mcp_repair_targets(record.targets.clone())?;
+    if normalized != record.targets {
+        anyhow::bail!(
+            "MCP repair obligation targets are not canonical, sorted, unique, and conflict-free"
+        );
     }
     Ok(())
+}
+
+fn validate_retained_mcp_repair_record(record: &McpRepairPending) -> Result<()> {
+    validate_mcp_repair_record(record)?;
+    if !record.repair_required || record.targets.is_empty() {
+        anyhow::bail!(
+            "retained MCP repair marker is not an active nonempty repair obligation; marker retained for evidence-preserving recovery"
+        );
+    }
+    Ok(())
+}
+
+fn validate_mcp_repair_targets_not_reserved(
+    record: &McpRepairPending,
+    kin_home: &Path,
+) -> Result<()> {
+    let marker = crate::commands::setup::ConfigLock::normalized_path_with_existing_parent(
+        &mcp_repair_pending_path(kin_home),
+    )?;
+    if record.targets.iter().any(|target| target.path == marker) {
+        anyhow::bail!(
+            "MCP repair target manifest names its own durable marker {}; refusing recursive marker authority",
+            marker.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+struct LockedPrivateMarker {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    #[cfg(windows)]
+    file: File,
+    _lock: crate::commands::setup::ConfigLock,
+}
+
+#[cfg(windows)]
+fn open_windows_private_marker(path: &Path, label: &str) -> Result<Option<(File, Vec<u8>)>> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::FromRawHandle as _;
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_READ, GENERIC_WRITE,
+        INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, OPEN_EXISTING,
+    };
+
+    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if wide.contains(&0) {
+        anyhow::bail!("{label} path contains an interior NUL");
+    }
+    wide.push(0);
+    // The retained handle denies both write and delete sharing. Every type,
+    // reparse, link-count, owner, ACL, and byte check below is handle-derived;
+    // the pathname is never trusted again for validation or deletion.
+    let raw = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE,
+            FILE_SHARE_READ,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
+            std::ptr::null_mut(),
+        )
+    };
+    if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+        let error = io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(code)
+                if code == ERROR_FILE_NOT_FOUND as i32 || code == ERROR_PATH_NOT_FOUND as i32
+        ) {
+            return Ok(None);
+        }
+        return Err(error)
+            .with_context(|| format!("failed to retain exact {label} {}", path.display()));
+    }
+    let file = unsafe { File::from_raw_handle(raw) };
+    windows_update::validate_current_user_private_file(&file)
+        .with_context(|| format!("invalid {label} handle {}", path.display()))?;
+    let mut bytes = Vec::new();
+    (&file)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read exact {label} handle {}", path.display()))?;
+    Ok(Some((file, bytes)))
+}
+
+#[cfg(not(unix))]
+impl LockedPrivateMarker {
+    fn open(path: &Path, label: &str) -> Result<Option<Self>> {
+        let lock = crate::commands::setup::ConfigLock::acquire_nofollow(path)
+            .with_context(|| format!("failed to lock {label} {}", path.display()))?;
+        let Some(locked_bytes) = lock
+            .original_bytes(path)
+            .with_context(|| format!("failed to read locked {label} {}", path.display()))?
+        else {
+            return Ok(None);
+        };
+        #[cfg(windows)]
+        let Some((file, bytes)) = open_windows_private_marker(path, label)?
+        else {
+            anyhow::bail!("locked {label} disappeared before its exact handle was retained");
+        };
+        #[cfg(windows)]
+        if locked_bytes != bytes {
+            anyhow::bail!("{label} bytes disagree with its retained exact handle");
+        }
+        #[cfg(all(not(unix), not(windows)))]
+        let bytes = locked_bytes;
+        Ok(Some(Self {
+            path: path.to_path_buf(),
+            bytes,
+            #[cfg(windows)]
+            file,
+            _lock: lock,
+        }))
+    }
+
+    fn remove_unchanged(self, label: &str) -> Result<()> {
+        #[cfg(windows)]
+        {
+            windows_update::validate_current_user_private_file(&self.file).with_context(|| {
+                format!(
+                    "{label} exact handle lost object authority at {}",
+                    self.path.display()
+                )
+            })?;
+            let mut observed = Vec::new();
+            let mut reader = &self.file;
+            reader.seek(io::SeekFrom::Start(0))?;
+            reader.read_to_end(&mut observed)?;
+            if observed != self.bytes {
+                anyhow::bail!("{label} exact object bytes changed; marker retained");
+            }
+            windows_update::dispose_private_file_handle_exact(&self.file, &self.path, label)?;
+            let sync = self
+                .file
+                .sync_all()
+                .with_context(|| format!("failed to flush disposed exact {label}"));
+            let path = self.path.clone();
+            drop(self.file);
+            sync?;
+            return match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Ok(_) => anyhow::bail!(
+                    "disposed exact {label} is still visible at {}; clear not acknowledged",
+                    path.display()
+                ),
+                Err(error) => Err(error)
+                    .with_context(|| format!("failed to verify exact {label} disposition")),
+            };
+        }
+        #[cfg(all(not(unix), not(windows)))]
+        {
+            self._lock
+                .remove_guarded(&self.path, Some(&self.bytes))
+                .with_context(|| format!("{label} changed before marker clear; marker retained"))
+        }
+    }
 }
 
 fn attempt_pending_mcp_repair(lock: &InstallRootLock) -> Result<bool> {
@@ -1154,10 +1346,21 @@ fn attempt_pending_mcp_repair(lock: &InstallRootLock) -> Result<bool> {
     #[cfg(unix)]
     let install = lock.install()?;
     #[cfg(unix)]
+    let marker_present = install.root.stat_entry(MCP_REPAIR_PENDING_FILE)?.is_some();
+    #[cfg(not(unix))]
+    let marker_present = match fs::symlink_metadata(mcp_repair_pending_path(kin_home)) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error).context("failed to inspect MCP repair pending marker"),
+    };
+    if !marker_present {
+        return Ok(false);
+    }
+    // Global writer order: install authority -> MCP topology -> marker
+    // ConfigLock -> retained marker target handle -> sorted config targets.
+    let topology = crate::commands::setup::McpTopologyLock::acquire()?;
+    #[cfg(unix)]
     let (marker_identity, record) = {
-        if install.root.stat_entry(MCP_REPAIR_PENDING_FILE)?.is_none() {
-            return Ok(false);
-        }
         let marker = install
             .root
             .read_regular(MCP_REPAIR_PENDING_FILE, "MCP repair pending marker")?;
@@ -1172,26 +1375,46 @@ fn attempt_pending_mcp_repair(lock: &InstallRootLock) -> Result<bool> {
         }
         let record: McpRepairPending = serde_json::from_slice(&marker)
             .context("malformed or unsupported MCP repair pending state; marker retained")?;
-        validate_mcp_repair_record(&record)
+        validate_retained_mcp_repair_record(&record)
             .context("unsupported MCP repair pending state; marker retained")?;
         (marker_identity, record)
     };
     #[cfg(not(unix))]
-    if !mcp_repair_pending_path(kin_home).exists() {
-        return Ok(false);
-    }
+    let marker_path = mcp_repair_pending_path(kin_home);
     #[cfg(not(unix))]
-    let record: McpRepairPending = fs::read(mcp_repair_pending_path(kin_home))
-        .context("failed to read MCP repair pending marker")
-        .and_then(|bytes| serde_json::from_slice(&bytes).context("invalid MCP repair marker"))
-        .context("MCP repair marker was retained")?;
-    validate_mcp_repair_record(&record).context("MCP repair marker was retained")?;
-    if !record.repair_required {
-        anyhow::bail!("unexpected non-required MCP repair marker retained");
+    let marker = match LockedPrivateMarker::open(&marker_path, "MCP repair pending marker")? {
+        Some(marker) => marker,
+        None => anyhow::bail!(
+            "MCP repair pending marker disappeared while exact authority was acquired; marker state retained"
+        ),
+    };
+    #[cfg(not(unix))]
+    let record: McpRepairPending = serde_json::from_slice(&marker.bytes)
+        .context("malformed or unsupported MCP repair pending state; marker retained")?;
+    #[cfg(not(unix))]
+    validate_retained_mcp_repair_record(&record)
+        .context("unsupported MCP repair pending state; marker retained")?;
+    validate_mcp_repair_targets_not_reserved(&record, kin_home)
+        .context("invalid MCP repair target lifecycle; marker retained")?;
+    #[cfg(not(unix))]
+    for target in &record.targets {
+        if marker._lock.protects_alias(&target.path).with_context(|| {
+            format!(
+                "failed to compare MCP repair target {} with reserved marker authority",
+                target.path.display()
+            )
+        })? {
+            anyhow::bail!(
+                "MCP repair target {} aliases its own durable marker sidecar; marker retained",
+                target.path.display()
+            );
+        }
     }
 
-    let repaired =
-        crate::commands::setup::remerge_mcp_targets_exact_with_finalizer(&record.targets, || {
+    let repaired = crate::commands::setup::remerge_mcp_targets_exact_with_topology_and_finalizer(
+        &record.targets,
+        &topology,
+        || {
             #[cfg(unix)]
             {
                 install.ensure_bound()?;
@@ -1207,15 +1430,16 @@ fn attempt_pending_mcp_repair(lock: &InstallRootLock) -> Result<bool> {
                 install.root.unlink_file(MCP_REPAIR_PENDING_FILE)?;
             }
             #[cfg(not(unix))]
-            durable_remove_file(&mcp_repair_pending_path(kin_home))?;
+            marker.remove_unchanged("MCP repair pending marker")?;
             Ok(())
-        })
-        .with_context(|| {
-            format!(
-                "MCP repair remains pending at {}",
-                mcp_repair_pending_path(kin_home).display()
-            )
-        })?;
+        },
+    )
+    .with_context(|| {
+        format!(
+            "MCP repair remains pending at {}",
+            mcp_repair_pending_path(kin_home).display()
+        )
+    })?;
     for path in repaired {
         eprintln!("Refreshed Kin MCP launcher: {}", path.display());
     }
@@ -1232,35 +1456,11 @@ pub(crate) fn enqueue_mcp_repair_targets(
     }
     let kin_home = crate::commands::setup::kin_dir()?;
     let lock = InstallRootLock::acquire_existing(&kin_home)?;
-    #[cfg(unix)]
-    let existing = {
-        let install = lock.install()?;
-        match install.root.stat_entry(MCP_REPAIR_PENDING_FILE)? {
-            None => None,
-            Some(_) => {
-                let bytes = install
-                    .root
-                    .read_regular(MCP_REPAIR_PENDING_FILE, "MCP repair pending marker")?;
-                Some(
-                    serde_json::from_slice::<McpRepairPending>(&bytes)
-                        .context("invalid MCP repair pending marker")?,
-                )
-            }
-        }
-    };
-    #[cfg(not(unix))]
-    let existing = match fs::read(mcp_repair_pending_path(&kin_home)) {
-        Ok(bytes) => Some(
-            serde_json::from_slice::<McpRepairPending>(&bytes)
-                .context("invalid MCP repair pending marker")?,
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
+    let existing = read_existing_mcp_repair_record(&lock)?;
 
     let mut combined = existing
         .map(|record| {
-            validate_mcp_repair_record(&record)?;
+            validate_retained_mcp_repair_record(&record)?;
             Ok::<_, anyhow::Error>(record.targets)
         })
         .transpose()?
@@ -1268,12 +1468,13 @@ pub(crate) fn enqueue_mcp_repair_targets(
     combined.extend(targets);
     let combined = crate::commands::setup::normalize_mcp_repair_targets(combined)?;
     let record = McpRepairPending {
-        schema_version: 2,
+        schema_version: MCP_REPAIR_MARKER_SCHEMA_VERSION,
         installed_version: CURRENT_VERSION.to_string(),
         recorded_at: chrono::Utc::now().to_rfc3339(),
         repair_required: true,
         targets: combined,
     };
+    validate_mcp_repair_targets_not_reserved(&record, &kin_home)?;
     #[cfg(unix)]
     persist_mcp_repair_record_at(lock.install()?, &record)?;
     #[cfg(not(unix))]
@@ -1281,37 +1482,37 @@ pub(crate) fn enqueue_mcp_repair_targets(
     Ok(true)
 }
 
-pub fn retry_pending_mcp_repair() -> Result<bool> {
-    let kin_home = crate::commands::setup::kin_dir()?;
-    if !mcp_repair_pending_path(&kin_home).exists() {
-        return Ok(false);
-    }
-    let lock = InstallRootLock::acquire_existing(&kin_home)?;
+fn retry_pending_mcp_repair_with_start_authority(
+    requested_home: &Path,
+    spec: &[ComponentSpec],
+    start_authority: &UpdaterStartAuthority,
+) -> Result<bool> {
+    let lock = InstallRootLock::acquire_existing_waiting(requested_home)?;
+    start_authority.verify_locked(&lock, spec).context(
+        "managed Kin bundle changed while ordinary-command MCP repair waited for install authority; marker retained",
+    )?;
     attempt_pending_mcp_repair(&lock)
 }
 
-pub fn mcp_repair_is_pending() -> bool {
-    crate::commands::setup::kin_dir()
-        .map(|home| mcp_repair_pending_path(&home).is_file())
-        .unwrap_or(false)
-}
-
-/// Automatic ordinary-command repair is only authorized from the exact
-/// managed launcher. Test binaries, checkout builds, copied executables, and
-/// stale package-manager shims must not mutate live user configuration merely
-/// because they inherited a real HOME containing an updater marker.
-pub fn automatic_mcp_repair_is_authorized() -> bool {
-    let Ok(kin_home) = crate::commands::setup::kin_dir() else {
-        return false;
-    };
-    let Ok(spec) = platform_bundle_spec(std::env::consts::OS) else {
-        return false;
-    };
+/// Retry a durable MCP repair from an ordinary command without splitting
+/// authorization into a check-then-act boolean. The exact executing image and
+/// complete managed bundle are captured before waiting for the install lock,
+/// then reverified while that lock is held before any config can change.
+pub fn retry_pending_mcp_repair_from_managed_process() -> Result<bool> {
+    let requested_home = crate::commands::setup::kin_dir()?;
+    match fs::symlink_metadata(mcp_repair_pending_path(&requested_home)) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("failed to inspect MCP repair pending marker"),
+    }
+    let spec = platform_bundle_spec(std::env::consts::OS)?;
     // UpdaterStartAuthority retains the live process image (`/proc/self/exe`
-    // on Linux, the Mach text vnode on macOS, and an image handle on Windows)
-    // and compares both its object identity and bytes to the complete managed
-    // bundle generation. Pathname equality alone is intentionally insufficient.
-    UpdaterStartAuthority::capture(&kin_home, spec).is_ok()
+    // on Linux, the Mach text vnode on macOS, and an image handle on Windows).
+    // A copied checkout binary therefore cannot mutate a real user's configs.
+    let start_authority = UpdaterStartAuthority::capture(&requested_home, spec).context(
+        "automatic MCP repair requires the exact managed Kin launcher and full installed generation; marker retained",
+    )?;
+    retry_pending_mcp_repair_with_start_authority(&requested_home, spec, &start_authority)
 }
 
 fn ensure_mutating_update_supported(os: &str, check_only: bool) -> Result<()> {
@@ -1338,14 +1539,18 @@ pub(crate) struct InstallRootLock {
 impl InstallRootLock {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn acquire(kin_home: &Path) -> Result<Self> {
-        Self::acquire_inner(kin_home, true)
+        Self::acquire_inner(kin_home, true, false)
     }
 
     fn acquire_existing(kin_home: &Path) -> Result<Self> {
-        Self::acquire_inner(kin_home, false)
+        Self::acquire_inner(kin_home, false, false)
     }
 
-    fn acquire_inner(kin_home: &Path, create: bool) -> Result<Self> {
+    fn acquire_existing_waiting(kin_home: &Path) -> Result<Self> {
+        Self::acquire_inner(kin_home, false, true)
+    }
+
+    fn acquire_inner(kin_home: &Path, create: bool, wait: bool) -> Result<Self> {
         let root = validate_install_root(kin_home, create)?;
         let path = root.join("update.lock");
         #[cfg(unix)]
@@ -1367,18 +1572,28 @@ impl InstallRootLock {
         #[cfg(not(unix))]
         let (mut file, created) = open_lock_file(&path)?;
 
-        match FileExt::try_lock_exclusive(&file) {
-            Ok(()) => {}
-            Err(err) if err.kind() == fs2::lock_contended_error().kind() => {
-                anyhow::bail!(
-                    "another Kin install mutation is already active for {} (lock: {})",
-                    root.display(),
+        if wait {
+            FileExt::lock_exclusive(&file).with_context(|| {
+                format!(
+                    "failed while waiting for Kin install authority {}",
                     path.display()
-                );
-            }
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("failed to acquire update lock {}", path.display()));
+                )
+            })?;
+        } else {
+            match FileExt::try_lock_exclusive(&file) {
+                Ok(()) => {}
+                Err(err) if err.kind() == fs2::lock_contended_error().kind() => {
+                    anyhow::bail!(
+                        "another Kin install mutation is already active for {} (lock: {})",
+                        root.display(),
+                        path.display()
+                    );
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("failed to acquire update lock {}", path.display())
+                    });
+                }
             }
         }
 
@@ -1777,6 +1992,46 @@ struct AnchoredDir {
 }
 
 #[cfg(unix)]
+struct PendingAnchoredChild<'a> {
+    parent: &'a AnchoredDir,
+    name: String,
+    identity: Option<(u64, u64)>,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl PendingAnchoredChild<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PendingAnchoredChild<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some((dev, ino)) = self.identity else {
+            return;
+        };
+        let removable = self
+            .parent
+            .stat_entry(&self.name)
+            .ok()
+            .flatten()
+            .is_some_and(|stat| {
+                rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Directory
+                    && stat.st_dev as u64 == dev
+                    && stat.st_ino as u64 == ino
+            });
+        if removable {
+            let _ = self.parent.remove_child_dir(&self.name);
+        }
+    }
+}
+
+#[cfg(unix)]
 impl AnchoredDir {
     fn from_file(file: File, display: PathBuf) -> Result<Self> {
         let stat = rustix::fs::fstat(&file)
@@ -1867,6 +2122,27 @@ impl AnchoredDir {
                     name
                 )
             })?;
+        let mut pending = PendingAnchoredChild {
+            parent: self,
+            name: name.to_string(),
+            identity: None,
+            armed: true,
+        };
+        let created = self.stat_entry(name)?.with_context(|| {
+            format!(
+                "newly created anchored directory disappeared: {}/{}",
+                self.display.display(),
+                name
+            )
+        })?;
+        pending.identity = Some((created.st_dev as u64, created.st_ino as u64));
+        if rustix::fs::FileType::from_raw_mode(created.st_mode) != rustix::fs::FileType::Directory {
+            anyhow::bail!(
+                "newly created anchored child is not a directory: {}/{}",
+                self.display.display(),
+                name
+            );
+        }
         // mkdir honors umask, so explicitly restore the required private mode
         // before opening the directory and verify it again on the descriptor.
         match rustix::fs::chmodat(
@@ -1894,6 +2170,7 @@ impl AnchoredDir {
                 stat.st_mode as u32 & 0o777
             );
         }
+        pending.disarm();
         Ok(child)
     }
 
@@ -2085,6 +2362,102 @@ impl AnchoredDir {
         C: FnMut() -> Result<()>,
     {
         self.atomic_write_with_hooks(name, bytes, mode, || Ok(()), check_binding)
+    }
+
+    fn create_private_file_absent_or_identical_with_hook<B, C>(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        label: &str,
+        before_create: B,
+        after_noreplace_conflict: C,
+    ) -> Result<()>
+    where
+        B: FnOnce() -> Result<()>,
+        C: FnOnce() -> Result<()>,
+    {
+        let verify_existing = || -> Result<bool> {
+            let Some((mut file, stat)) = self.open_regular(name, label)? else {
+                return Ok(false);
+            };
+            let mut existing = Vec::new();
+            file.read_to_end(&mut existing)?;
+            self.ensure_regular_binding(name, stat.st_dev as u64, stat.st_ino as u64)?;
+            if existing != bytes {
+                anyhow::bail!(
+                    "{label} already exists with different bytes; existing object retained without replacement"
+                );
+            }
+            Ok(true)
+        };
+        if verify_existing()? {
+            return Ok(());
+        }
+        let temp = format!(".{name}.create-{}", uuid::Uuid::new_v4());
+        let fd = rustix::fs::openat(
+            &self.file,
+            temp.as_str(),
+            rustix::fs::OFlags::WRONLY
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )
+        .with_context(|| {
+            format!(
+                "failed to create private {label} staging file {}/{}",
+                self.display.display(),
+                temp
+            )
+        })?;
+        let mut file = File::from(fd);
+        let created = rustix::fs::fstat(&file)?;
+        let mut committed = false;
+        let result = (|| -> Result<()> {
+            set_and_verify_file_mode(&file, 0o600, label)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            self.ensure_regular_binding(&temp, created.st_dev as u64, created.st_ino as u64)?;
+            before_create()?;
+            self.ensure_regular_binding(&temp, created.st_dev as u64, created.st_ino as u64)?;
+            match rustix::fs::renameat_with(
+                &self.file,
+                temp.as_str(),
+                &self.file,
+                name,
+                rustix::fs::RenameFlags::NOREPLACE,
+            ) {
+                Ok(()) => {
+                    committed = true;
+                    self.sync()
+                }
+                Err(rustix::io::Errno::EXIST) => {
+                    after_noreplace_conflict()?;
+                    if !verify_existing()? {
+                        anyhow::bail!(
+                            "{label} disappeared after the no-replace conflict; durable marker creation was not proven"
+                        );
+                    }
+                    Ok(())
+                }
+                Err(error) => Err(error).with_context(|| {
+                    format!(
+                        "failed to commit {label} without replacement at {}/{}",
+                        self.display.display(),
+                        name
+                    )
+                }),
+            }
+        })();
+        if !committed
+            && self
+                .ensure_regular_binding(&temp, created.st_dev as u64, created.st_ino as u64)
+                .is_ok()
+        {
+            let _ = self.unlink_file(&temp);
+        }
+        result
     }
 
     fn atomic_write_with_hooks<B, C>(
@@ -2462,6 +2835,65 @@ fn open_or_create_managed_dir(
 
 #[cfg(unix)]
 #[derive(Debug)]
+enum UnjournaledRootKind {
+    Transaction,
+    Staging,
+}
+
+#[cfg(unix)]
+struct PendingUnjournaledRoot<'a> {
+    install: &'a InstallLayout,
+    name: String,
+    root: Option<AnchoredDir>,
+    kind: UnjournaledRootKind,
+}
+
+#[cfg(unix)]
+impl<'a> PendingUnjournaledRoot<'a> {
+    fn new(
+        install: &'a InstallLayout,
+        name: String,
+        root: AnchoredDir,
+        kind: UnjournaledRootKind,
+    ) -> Self {
+        Self {
+            install,
+            name,
+            root: Some(root),
+            kind,
+        }
+    }
+
+    fn root(&self) -> &AnchoredDir {
+        self.root
+            .as_ref()
+            .expect("pending updater root must remain armed")
+    }
+
+    fn disarm(mut self) -> AnchoredDir {
+        self.root
+            .take()
+            .expect("pending updater root must remain armed")
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PendingUnjournaledRoot<'_> {
+    fn drop(&mut self) {
+        let Some(root) = self.root.as_ref() else {
+            return;
+        };
+        let _ = match self.kind {
+            UnjournaledRootKind::Transaction => {
+                cleanup_journalless_transaction_at(self.install, &self.name, root)
+            }
+            UnjournaledRootKind::Staging => cleanup_staging_tree_at(self.install, &self.name, root),
+        };
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
 struct TransactionLayout {
     name: String,
     root: AnchoredDir,
@@ -2473,30 +2905,52 @@ struct TransactionLayout {
 #[cfg(unix)]
 impl TransactionLayout {
     fn create(install: &InstallLayout) -> Result<Self> {
+        Self::create_with_hook(install, |_| Ok(()))
+    }
+
+    fn create_with_hook<F>(install: &InstallLayout, mut after_step: F) -> Result<Self>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
         install.ensure_bound()?;
         let name = format!("{TRANSACTION_PREFIX}{}", uuid::Uuid::new_v4());
         let root = install.root.create_child(&name, 0o700)?;
+        let pending = PendingUnjournaledRoot::new(
+            install,
+            name.clone(),
+            root,
+            UnjournaledRootKind::Transaction,
+        );
+        after_step("transaction-root")?;
         install.ensure_bound()?;
-        install.root.ensure_child_binding(&name, &root)?;
-        let old = root.create_child("old", 0o700)?;
+        install.root.ensure_child_binding(&name, pending.root())?;
+        let old = pending.root().create_child("old", 0o700)?;
+        after_step("transaction-old")?;
         install.ensure_bound()?;
-        install.root.ensure_child_binding(&name, &root)?;
-        root.ensure_child_binding("old", &old)?;
+        install.root.ensure_child_binding(&name, pending.root())?;
+        pending.root().ensure_child_binding("old", &old)?;
         let old_bin = old.create_child("bin", 0o700)?;
+        after_step("transaction-old-bin")?;
         install.ensure_bound()?;
-        install.root.ensure_child_binding(&name, &root)?;
-        root.ensure_child_binding("old", &old)?;
+        install.root.ensure_child_binding(&name, pending.root())?;
+        pending.root().ensure_child_binding("old", &old)?;
         old.ensure_child_binding("bin", &old_bin)?;
         let old_lib = old.create_child("lib", 0o700)?;
-        let layout = Self {
+        after_step("transaction-old-lib")?;
+        install.ensure_bound()?;
+        install.root.ensure_child_binding(&name, pending.root())?;
+        pending.root().ensure_child_binding("old", &old)?;
+        old.ensure_child_binding("bin", &old_bin)?;
+        old.ensure_child_binding("lib", &old_lib)?;
+        after_step("transaction-validated")?;
+        let root = pending.disarm();
+        Ok(Self {
             name,
             root,
             old,
             old_bin,
             old_lib,
-        };
-        layout.ensure_bound(install)?;
-        Ok(layout)
+        })
     }
 
     fn open(install: &InstallLayout, transaction_root: &Path) -> Result<Self> {
@@ -2789,10 +3243,112 @@ struct FileIdentity {
     size_bytes: u64,
 }
 
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct WindowsFileId([u8; 16]);
+
+#[cfg(windows)]
+impl WindowsFileId {
+    pub(crate) fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) fn zero() -> Self {
+        Self([0; 16])
+    }
+
+    fn from_legacy_u64(value: u64) -> Self {
+        let mut bytes = [0_u8; 16];
+        bytes[..8].copy_from_slice(&value.to_le_bytes());
+        Self(bytes)
+    }
+
+    fn is_zero(self) -> bool {
+        self.0 == [0; 16]
+    }
+}
+
+#[cfg(windows)]
+impl std::fmt::Display for WindowsFileId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&hex::encode(self.0))
+    }
+}
+
+#[cfg(windows)]
+impl PartialEq<u64> for WindowsFileId {
+    fn eq(&self, other: &u64) -> bool {
+        if *other == 0 {
+            self.is_zero()
+        } else {
+            *self == Self::from_legacy_u64(*other)
+        }
+    }
+}
+
+#[cfg(windows)]
+impl serde::Serialize for WindowsFileId {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&hex::encode(self.0))
+    }
+}
+
+#[cfg(windows)]
+impl<'de> serde::Deserialize<'de> for WindowsFileId {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = WindowsFileId;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a 32-character lowercase file-id hex string or legacy u64")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(WindowsFileId::from_legacy_u64(value))
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value.len() != 32
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err(E::custom(
+                        "Windows file identity must be exactly 32 lowercase hexadecimal characters",
+                    ));
+                }
+                let mut bytes = [0_u8; 16];
+                hex::decode_to_slice(value, &mut bytes).map_err(E::custom)?;
+                Ok(WindowsFileId(bytes))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 struct PlatformObjectIdentity {
     namespace: u64,
+    #[cfg(not(windows))]
     file: u64,
+    #[cfg(windows)]
+    file: WindowsFileId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4068,6 +4624,32 @@ fn component_is_recovery_cli(component: ComponentSpec) -> bool {
     matches!(component.name, "kin" | "kin.exe")
 }
 
+#[cfg(not(unix))]
+struct PendingUpdateRoot {
+    path: PathBuf,
+    armed: bool,
+}
+
+#[cfg(not(unix))]
+impl PendingUpdateRoot {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(not(unix))]
+impl Drop for PendingUpdateRoot {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = durable_remove_dir_all(&self.path);
+        }
+    }
+}
+
 struct StagingDir<'a> {
     path: PathBuf,
     lock: &'a InstallRootLock,
@@ -4077,6 +4659,13 @@ struct StagingDir<'a> {
 
 impl<'a> StagingDir<'a> {
     fn create(lock: &'a InstallRootLock) -> Result<Self> {
+        Self::create_with_hook(lock, |_| Ok(()))
+    }
+
+    fn create_with_hook<F>(lock: &'a InstallRootLock, mut after_step: F) -> Result<Self>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
         let kin_home = lock.root();
         let name = format!(".update-stage-{}", uuid::Uuid::new_v4());
         let path = kin_home.join(&name);
@@ -4085,25 +4674,36 @@ impl<'a> StagingDir<'a> {
             let install = lock.install()?;
             install.ensure_bound()?;
             let root = install.root.create_child(&name, 0o700)?;
+            let pending = PendingUnjournaledRoot::new(
+                install,
+                name.clone(),
+                root,
+                UnjournaledRootKind::Staging,
+            );
+            after_step("staging-root")?;
             install.ensure_bound()?;
-            install.root.ensure_child_binding(&name, &root)?;
-            let bin = root.create_child("bin", 0o700)?;
+            install.root.ensure_child_binding(&name, pending.root())?;
+            let bin = pending.root().create_child("bin", 0o700)?;
+            after_step("staging-bin")?;
             install.ensure_bound()?;
-            install.root.ensure_child_binding(&name, &root)?;
-            root.ensure_child_binding("bin", &bin)?;
-            let lib = root.create_child("lib", 0o700)?;
+            install.root.ensure_child_binding(&name, pending.root())?;
+            pending.root().ensure_child_binding("bin", &bin)?;
+            let lib = pending.root().create_child("lib", 0o700)?;
+            after_step("staging-lib")?;
             install.ensure_bound()?;
-            install.root.ensure_child_binding(&name, &root)?;
-            root.ensure_child_binding("bin", &bin)?;
-            root.ensure_child_binding("lib", &lib)?;
+            install.root.ensure_child_binding(&name, pending.root())?;
+            pending.root().ensure_child_binding("bin", &bin)?;
+            pending.root().ensure_child_binding("lib", &lib)?;
+            let parent = install.root.try_clone()?;
+            after_step("staging-validated")?;
+            let root = pending.disarm();
             let layout = StagingLayout {
-                parent: install.root.try_clone()?,
+                parent,
                 root_name: name,
                 root,
                 bin,
                 lib,
             };
-            layout.ensure_bound()?;
             return Ok(Self { path, lock, layout });
         }
         #[cfg(not(unix))]
@@ -4111,8 +4711,13 @@ impl<'a> StagingDir<'a> {
             fs::create_dir(&path).with_context(|| {
                 format!("failed to create update staging dir {}", path.display())
             })?;
+            let mut pending = PendingUpdateRoot::new(path.clone());
+            after_step("staging-root")?;
             sync_dir(kin_home)?;
-            Ok(Self { path, lock })
+            after_step("staging-validated")?;
+            let staging = Self { path, lock };
+            pending.disarm();
+            Ok(staging)
         }
     }
 
@@ -5204,6 +5809,7 @@ fn install_staged_bundle_locked(
     if !std::ptr::eq(lock, staging.lock) {
         anyhow::bail!("staging authority does not match the held install lock");
     }
+    refuse_new_update_while_restart_marker_exists(lock)?;
     #[cfg(unix)]
     {
         return install_staged_bundle_unix(
@@ -5268,6 +5874,7 @@ fn install_staged_bundle_locked_with_hook<F>(
 where
     F: FnMut(usize, &Path) -> Result<()>,
 {
+    refuse_new_update_while_restart_marker_exists(lock)?;
     #[cfg(unix)]
     {
         let staging = StagingLayout::open(stage_root)?;
@@ -5578,14 +6185,30 @@ fn persist_restart_record_at(install: &InstallLayout, record: &RestartPending) -
     let bytes = serde_json::to_vec_pretty(record).context("failed to serialize restart state")?;
     install
         .root
-        .atomic_write_checked(RESTART_ACK_REQUIRED_FILE, &bytes, 0o600, || {
-            install.ensure_bound()
-        })
+        .create_private_file_absent_or_identical_with_hook(
+            RESTART_ACK_REQUIRED_FILE,
+            &bytes,
+            "restart acknowledgement marker",
+            || install.ensure_bound(),
+            || Ok(()),
+        )
         .context("failed to persist anchored restart acknowledgement state")
 }
 
 #[cfg(unix)]
 fn persist_mcp_repair_record_at(install: &InstallLayout, record: &McpRepairPending) -> Result<()> {
+    persist_mcp_repair_record_at_with_hook(install, record, || Ok(()))
+}
+
+#[cfg(unix)]
+fn persist_mcp_repair_record_at_with_hook<B>(
+    install: &InstallLayout,
+    record: &McpRepairPending,
+    before_create: B,
+) -> Result<()>
+where
+    B: FnOnce() -> Result<()>,
+{
     validate_mcp_repair_record(record)?;
     if !record.repair_required {
         return Ok(());
@@ -5595,9 +6218,16 @@ fn persist_mcp_repair_record_at(install: &InstallLayout, record: &McpRepairPendi
         serde_json::to_vec_pretty(record).context("failed to serialize MCP repair state")?;
     install
         .root
-        .atomic_write_checked(MCP_REPAIR_PENDING_FILE, &bytes, 0o600, || {
-            install.ensure_bound()
-        })
+        .create_private_file_absent_or_identical_with_hook(
+            MCP_REPAIR_PENDING_FILE,
+            &bytes,
+            "MCP repair pending marker",
+            || {
+                before_create()?;
+                install.ensure_bound()
+            },
+            || Ok(()),
+        )
         .context("failed to persist anchored MCP repair state")
 }
 
@@ -5738,11 +6368,12 @@ where
         restart_pending,
         |_, _| Ok(()),
         before_install,
+        |_| Ok(()),
     )
 }
 
 #[cfg(unix)]
-fn install_staged_bundle_unix_with_hooks<B, F>(
+fn install_staged_bundle_unix_with_hooks<B, F, P>(
     lock: &InstallRootLock,
     staging: &StagingLayout,
     spec: &[ComponentSpec],
@@ -5751,10 +6382,12 @@ fn install_staged_bundle_unix_with_hooks<B, F>(
     restart_pending: &RestartPending,
     mut before_backup: B,
     mut before_install: F,
+    mut after_precommit_mutation: P,
 ) -> Result<InstallOutcome>
 where
     B: FnMut(usize, &Path) -> Result<()>,
     F: FnMut(usize, &Path) -> Result<()>,
+    P: FnMut(&str) -> Result<()>,
 {
     let kin_home = lock.root();
     let install = lock.install()?;
@@ -5818,219 +6451,140 @@ where
         let _ = cleanup_transaction_at(install, &transaction, &journal, spec);
         return Err(error);
     }
-    journal.phase = TransactionPhase::BackingUp;
-    persist_journal_at(install, &transaction, &journal)?;
+    let precommit = (|| -> Result<()> {
+        journal.phase = TransactionPhase::BackingUp;
+        persist_journal_at(install, &transaction, &journal)?;
 
-    for (index, component) in spec.iter().enumerate() {
-        let record = journal_component(&journal, component.name)?;
-        let Some(expected) = &record.original_identity else {
-            continue;
-        };
-        let destination_path = component_path(kin_home, *component);
-        if let Err(error) = before_backup(index, &destination_path) {
-            return rollback_after_failure_at(
-                error,
-                &mut journal,
-                install,
-                &transaction,
-                &transaction_root,
-                spec,
-            );
-        }
-        install.ensure_bound()?;
-        staging.ensure_bound()?;
-        transaction.ensure_bound(install)?;
-        let live_dir = install.component_dir(*component);
-        let backup_dir = transaction.component_dir(*component);
-        if live_dir
-            .identity(component.name, "live component before backup")?
-            .as_ref()
-            != Some(expected)
-        {
-            return rollback_after_failure_at(
-                anyhow::anyhow!(
+        for (index, component) in spec.iter().enumerate() {
+            let record = journal_component(&journal, component.name)?;
+            let Some(expected) = &record.original_identity else {
+                continue;
+            };
+            let destination_path = component_path(kin_home, *component);
+            before_backup(index, &destination_path)?;
+            install.ensure_bound()?;
+            staging.ensure_bound()?;
+            transaction.ensure_bound(install)?;
+            let live_dir = install.component_dir(*component);
+            let backup_dir = transaction.component_dir(*component);
+            if live_dir
+                .identity(component.name, "live component before backup")?
+                .as_ref()
+                != Some(expected)
+            {
+                anyhow::bail!(
                     "live component '{}' changed after its journal identity was recorded",
                     component.name
-                ),
-                &mut journal,
-                install,
-                &transaction,
-                &transaction_root,
-                spec,
-            );
-        }
-        if backup_dir
-            .identity(component.name, "preexisting transaction backup")?
-            .is_some()
-        {
-            return rollback_after_failure_at(
-                anyhow::anyhow!("transaction backup '{}' already exists", component.name),
-                &mut journal,
-                install,
-                &transaction,
-                &transaction_root,
-                spec,
-            );
-        }
-        transaction.ensure_bound(install)?;
-        if component_is_recovery_cli(*component) {
-            // Keep the canonical recovery launcher executable throughout the
-            // transaction. The backup is an exact durable copy; install later
-            // atomically renames the staged CLI over the still-live original.
-            let bytes = live_dir.read_regular(component.name, "live recovery CLI")?;
-            if bytes_identity(&bytes) != *expected {
-                return rollback_after_failure_at(
-                    anyhow::anyhow!("live recovery CLI changed while its backup was copied"),
-                    &mut journal,
-                    install,
-                    &transaction,
-                    &transaction_root,
-                    spec,
                 );
             }
-            backup_dir.atomic_write_checked(component.name, &bytes, 0o755, || {
-                transaction.ensure_bound(install)
-            })?;
-        } else {
-            live_dir.rename_to(component.name, backup_dir, component.name)?;
-        }
-        transaction.ensure_bound(install)?;
-        if backup_dir
-            .identity(component.name, "new transaction backup")?
-            .as_ref()
-            != Some(expected)
-        {
-            return rollback_after_failure_at(
-                anyhow::anyhow!(
+            if backup_dir
+                .identity(component.name, "preexisting transaction backup")?
+                .is_some()
+            {
+                anyhow::bail!("transaction backup '{}' already exists", component.name);
+            }
+            transaction.ensure_bound(install)?;
+            if component_is_recovery_cli(*component) {
+                // Keep the canonical recovery launcher executable throughout the
+                // transaction. The backup is an exact durable copy; install later
+                // atomically renames the staged CLI over the still-live original.
+                let bytes = live_dir.read_regular(component.name, "live recovery CLI")?;
+                if bytes_identity(&bytes) != *expected {
+                    anyhow::bail!("live recovery CLI changed while its backup was copied");
+                }
+                backup_dir.atomic_write_checked(component.name, &bytes, 0o755, || {
+                    transaction.ensure_bound(install)
+                })?;
+            } else {
+                live_dir.rename_to(component.name, backup_dir, component.name)?;
+            }
+            after_precommit_mutation(&format!("after-backup-mutation-{index}"))?;
+            transaction.ensure_bound(install)?;
+            if backup_dir
+                .identity(component.name, "new transaction backup")?
+                .as_ref()
+                != Some(expected)
+            {
+                anyhow::bail!(
                     "transaction backup '{}' does not match the recorded original identity",
                     component.name
-                ),
-                &mut journal,
-                install,
-                &transaction,
-                &transaction_root,
-                spec,
-            );
+                );
+            }
+            maybe_crash_at(&format!("after-backup-{index}"));
         }
-        maybe_crash_at(&format!("after-backup-{index}"));
-    }
 
-    journal.phase = TransactionPhase::Installing;
-    persist_journal_at(install, &transaction, &journal)?;
-    let mut install_index = 0;
-    for component in spec {
-        let record = journal_component(&journal, component.name)?;
-        let Some(expected) = &record.staged_identity else {
-            continue;
-        };
-        let destination_path = component_path(kin_home, *component);
-        if let Err(error) = before_install(install_index, &destination_path) {
-            return rollback_after_failure_at(
-                error,
-                &mut journal,
-                install,
-                &transaction,
-                &transaction_root,
-                spec,
-            );
-        }
-        if let Err(error) = install.ensure_bound() {
-            return rollback_after_failure_at(
-                error,
-                &mut journal,
-                install,
-                &transaction,
-                &transaction_root,
-                spec,
-            );
-        }
-        staging.ensure_bound()?;
-        transaction.ensure_bound(install)?;
-        let stage_dir = staging.component_dir(*component);
-        let live_dir = install.component_dir(*component);
-        if stage_dir
-            .identity(component.name, "staged component before install")?
-            .as_ref()
-            != Some(expected)
-        {
-            return rollback_after_failure_at(
-                anyhow::anyhow!(
+        journal.phase = TransactionPhase::Installing;
+        persist_journal_at(install, &transaction, &journal)?;
+        let mut install_index = 0;
+        for component in spec {
+            let record = journal_component(&journal, component.name)?;
+            let Some(expected) = &record.staged_identity else {
+                continue;
+            };
+            let destination_path = component_path(kin_home, *component);
+            before_install(install_index, &destination_path)?;
+            install.ensure_bound()?;
+            staging.ensure_bound()?;
+            transaction.ensure_bound(install)?;
+            let stage_dir = staging.component_dir(*component);
+            let live_dir = install.component_dir(*component);
+            if stage_dir
+                .identity(component.name, "staged component before install")?
+                .as_ref()
+                != Some(expected)
+            {
+                anyhow::bail!(
                     "staged component '{}' changed after its journal identity was recorded",
                     component.name
-                ),
-                &mut journal,
-                install,
-                &transaction,
-                &transaction_root,
-                spec,
-            );
-        }
-        let live_before_install =
-            live_dir.identity(component.name, "live destination before install")?;
-        let destination_ready = if component_is_recovery_cli(*component) {
-            live_before_install.as_ref() == record.original_identity.as_ref()
-        } else {
-            live_before_install.is_none()
-        };
-        if !destination_ready {
-            return rollback_after_failure_at(
-                anyhow::anyhow!(
+                );
+            }
+            let live_before_install =
+                live_dir.identity(component.name, "live destination before install")?;
+            let destination_ready = if component_is_recovery_cli(*component) {
+                live_before_install.as_ref() == record.original_identity.as_ref()
+            } else {
+                live_before_install.is_none()
+            };
+            if !destination_ready {
+                anyhow::bail!(
                     "live destination '{}' is not in its expected pre-install state",
                     component.name
-                ),
-                &mut journal,
-                install,
-                &transaction,
-                &transaction_root,
-                spec,
-            );
+                );
+            }
+            install.ensure_bound()?;
+            staging.ensure_bound()?;
+            transaction.ensure_bound(install)?;
+            stage_dir.rename_to(component.name, live_dir, component.name)?;
+            after_precommit_mutation(&format!("after-install-mutation-{install_index}"))?;
+            install.ensure_bound()?;
+            if live_dir
+                .identity(component.name, "installed component")?
+                .as_ref()
+                != Some(expected)
+            {
+                anyhow::bail!(
+                    "installed component '{}' does not match its staged identity",
+                    component.name
+                );
+            }
+            maybe_crash_at(&format!("after-install-{install_index}"));
+            install_index += 1;
         }
+
+        validate_installed_bundle_at(install, &journal, spec)?;
+        validate_backup_tree_at(install, &transaction, &journal, spec)?;
         install.ensure_bound()?;
         staging.ensure_bound()?;
         transaction.ensure_bound(install)?;
-        stage_dir.rename_to(component.name, live_dir, component.name)?;
-        install.ensure_bound()?;
-        if live_dir
-            .identity(component.name, "installed component")?
-            .as_ref()
-            != Some(expected)
-        {
-            return rollback_after_failure_at(
-                anyhow::anyhow!(
-                    "installed component '{}' does not match its staged identity",
-                    component.name
-                ),
-                &mut journal,
-                install,
-                &transaction,
-                &transaction_root,
-                spec,
-            );
-        }
-        maybe_crash_at(&format!("after-install-{install_index}"));
-        install_index += 1;
-    }
-
-    if let Err(error) = validate_installed_bundle_at(install, &journal, spec) {
+        ensure_no_active_managed_runtimes(kin_home, spec).context(
+            "a managed serving executable appeared before the durable commit point; the uncommitted update will be rolled back",
+        )?;
+        after_precommit_mutation("precommit-validated")?;
+        Ok(())
+    })();
+    if let Err(error) = precommit {
         return rollback_after_failure_at(
             error,
-            &mut journal,
-            install,
-            &transaction,
-            &transaction_root,
-            spec,
-        );
-    }
-    validate_backup_tree_at(install, &transaction, &journal, spec)?;
-    install.ensure_bound()?;
-    staging.ensure_bound()?;
-    transaction.ensure_bound(install)?;
-
-    if let Err(error) = ensure_no_active_managed_runtimes(kin_home, spec) {
-        return rollback_after_failure_at(
-            error.context(
-                "a managed serving executable appeared before the durable commit point; the uncommitted update will be rolled back",
-            ),
             &mut journal,
             install,
             &transaction,
@@ -6371,6 +6925,14 @@ fn cleanup_transaction_at(
 
 #[cfg(not(unix))]
 fn create_transaction_root(kin_home: &Path) -> Result<PathBuf> {
+    create_transaction_root_with_hook(kin_home, |_| Ok(()))
+}
+
+#[cfg(not(unix))]
+fn create_transaction_root_with_hook<F>(kin_home: &Path, mut after_step: F) -> Result<PathBuf>
+where
+    F: FnMut(&str) -> Result<()>,
+{
     let transaction_root = kin_home.join(format!("{TRANSACTION_PREFIX}{}", uuid::Uuid::new_v4()));
     fs::create_dir(&transaction_root).with_context(|| {
         format!(
@@ -6378,14 +6940,24 @@ fn create_transaction_root(kin_home: &Path) -> Result<PathBuf> {
             transaction_root.display()
         )
     })?;
+    let mut pending = PendingUpdateRoot::new(transaction_root.clone());
+    after_step("transaction-root")?;
     sync_dir(kin_home)?;
     let old = transaction_root.join("old");
     fs::create_dir(&old)?;
+    after_step("transaction-old")?;
     sync_dir(&transaction_root)?;
     for name in ["bin", "lib"] {
         fs::create_dir(old.join(name))?;
+        after_step(match name {
+            "bin" => "transaction-old-bin",
+            "lib" => "transaction-old-lib",
+            _ => unreachable!("fixed transaction directory inventory"),
+        })?;
         sync_dir(&old)?;
     }
+    after_step("transaction-validated")?;
+    pending.disarm();
     Ok(transaction_root)
 }
 
@@ -6434,7 +7006,7 @@ fn validate_journal(journal: &TransactionJournal, spec: &[ComponentSpec]) -> Res
     if journal.components.len() != spec.len() {
         anyhow::bail!("update journal component inventory does not match this platform");
     }
-    if journal.mcp_repair_pending.schema_version != 2
+    if journal.mcp_repair_pending.schema_version != MCP_REPAIR_MARKER_SCHEMA_VERSION
         || parse_release_version(&journal.target_version)?
             != parse_release_version(&journal.restart_pending.installed_version)?
         || parse_release_version(&journal.target_version)?
@@ -8164,6 +8736,9 @@ fn runtime_executable_diagnostic(
     #[cfg(not(unix))]
     let object = PlatformObjectIdentity {
         namespace: 0,
+        #[cfg(windows)]
+        file: WindowsFileId::zero(),
+        #[cfg(not(windows))]
         file: 0,
     };
     Ok(RuntimeExecutableDiagnostic {
@@ -8363,12 +8938,158 @@ fn restart_pending_path(kin_home: &Path) -> PathBuf {
     kin_home.join(RESTART_ACK_REQUIRED_FILE)
 }
 
+fn refuse_new_update_while_restart_marker_exists(lock: &InstallRootLock) -> Result<()> {
+    #[cfg(unix)]
+    let present = lock
+        .install()?
+        .root
+        .stat_entry(RESTART_ACK_REQUIRED_FILE)?
+        .is_some();
+    #[cfg(windows)]
+    let present = {
+        let path = restart_pending_path(lock.root());
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(error)
+                    .context("failed to inspect restart acknowledgement marker path")
+            }
+            Ok(_) => match LockedPrivateMarker::open(
+                &path,
+                "runtime restart acknowledgement marker",
+            ) {
+                Ok(Some(_marker)) => {
+                    anyhow::bail!(
+                        "a runtime restart acknowledgement marker already exists at {}; refusing a newer update before recovery, cleanup, MCP repair, channel persistence, staging, or live-bundle mutation. Acknowledge it with `kin update --ack-restart` first; malformed, unsupported, and non-regular markers are retained exactly",
+                        path.display()
+                    )
+                }
+                Ok(None) => {
+                    anyhow::bail!(
+                        "restart acknowledgement marker changed while exact authority was acquired; refusing update"
+                    )
+                }
+                Err(error) => {
+                    return Err(error).context(
+                        "a restart acknowledgement path exists or is inaccessible, malformed, unsupported, or unsafe; refusing update before local mutation and retaining it exactly",
+                    )
+                }
+            },
+        }
+    };
+    #[cfg(all(not(unix), not(windows)))]
+    let present = match fs::symlink_metadata(restart_pending_path(lock.root())) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error).context("failed to inspect restart acknowledgement marker")
+        }
+    };
+    if present {
+        anyhow::bail!(
+            "a runtime restart acknowledgement marker already exists at {}; refusing a newer update before recovery, cleanup, MCP repair, channel persistence, staging, or live-bundle mutation. Acknowledge it with `kin update --ack-restart` first; malformed, unsupported, and non-regular markers are retained exactly",
+            restart_pending_path(lock.root()).display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_private_marker_absent_or_identical(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
+    let lock = crate::commands::setup::ConfigLock::acquire_nofollow(path)?;
+    let original = lock.original_bytes(path)?;
+    if let Some(original) = original {
+        #[cfg(windows)]
+        {
+            let existing_label = format!("existing {label}");
+            let (file, exact) = open_windows_private_marker(path, &existing_label)?
+                .with_context(|| format!("existing {label} disappeared"))?;
+            if exact != original {
+                anyhow::bail!("existing {label} disagrees with its retained handle");
+            }
+            if exact != bytes {
+                anyhow::bail!(
+                    "{label} already exists with different bytes; existing object retained without replacement"
+                );
+            }
+            drop(file);
+            return Ok(());
+        }
+        #[cfg(all(not(unix), not(windows)))]
+        {
+            if original != bytes {
+                anyhow::bail!(
+                    "{label} already exists with different bytes; existing object retained without replacement"
+                );
+            }
+            return Ok(());
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        match windows_update::create_current_user_private_file_for_exact_commit(path) {
+            Ok(mut file) => {
+                let write_result = (|| -> Result<()> {
+                    file.write_all(bytes)?;
+                    file.sync_all()?;
+                    sync_dir(
+                        path.parent()
+                            .with_context(|| format!("{label} has no parent"))?,
+                    )
+                })();
+                if let Err(error) = write_result {
+                    let partial_label = format!("partial {label}");
+                    let cleanup = windows_update::dispose_private_file_handle_exact(
+                        &file,
+                        path,
+                        &partial_label,
+                    );
+                    return match cleanup {
+                        Ok(()) => Err(error),
+                        Err(cleanup) => Err(error.context(format!(
+                            "exact partial-marker cleanup also failed: {cleanup:#}"
+                        ))),
+                    };
+                }
+                return Ok(());
+            }
+            Err(create_error) => {
+                let concurrent_label = format!("concurrent {label}");
+                if let Some((file, exact)) = open_windows_private_marker(path, &concurrent_label)? {
+                    if exact == bytes {
+                        drop(file);
+                        return Ok(());
+                    }
+                    anyhow::bail!(
+                        "{label} appeared at the create boundary with different bytes; existing object retained without replacement"
+                    );
+                }
+                return Err(create_error)
+                    .with_context(|| format!("failed to create {label} exclusively"));
+            }
+        }
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = options.open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        sync_dir(
+            path.parent()
+                .with_context(|| format!("{label} has no parent"))?,
+        )
+    }
+}
+
 #[cfg(not(unix))]
 fn persist_restart_record(kin_home: &Path, record: &RestartPending) -> Result<PathBuf> {
     let path = restart_pending_path(kin_home);
     validate_restart_record_ready(record)?;
     let bytes = serde_json::to_vec_pretty(record).context("failed to serialize restart state")?;
-    write_file_atomically(&path, &bytes, 0o600)
+    create_private_marker_absent_or_identical(&path, &bytes, "restart acknowledgement marker")
         .with_context(|| format!("failed to persist restart state {}", path.display()))?;
     Ok(path)
 }
@@ -8396,24 +9117,22 @@ fn read_existing_mcp_repair_record(lock: &InstallRootLock) -> Result<Option<McpR
         {
             anyhow::bail!("MCP repair pending marker changed while it was read");
         }
-        let record = serde_json::from_slice(&bytes)
+        let record: McpRepairPending = serde_json::from_slice(&bytes)
             .context("invalid or unsupported MCP repair pending marker")?;
+        validate_retained_mcp_repair_record(&record)
+            .context("unsupported MCP repair pending marker; marker retained")?;
         return Ok(Some(record));
     }
     #[cfg(not(unix))]
     {
         let path = mcp_repair_pending_path(lock.root());
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
+        let Some(marker) = LockedPrivateMarker::open(&path, "MCP repair pending marker")? else {
+            return Ok(None);
         };
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            anyhow::bail!("MCP repair pending marker is not a regular non-symlink file");
-        }
-        let bytes = fs::read(&path)?;
-        let record = serde_json::from_slice(&bytes)
+        let record: McpRepairPending = serde_json::from_slice(&marker.bytes)
             .context("invalid or unsupported MCP repair pending marker")?;
+        validate_retained_mcp_repair_record(&record)
+            .context("unsupported MCP repair pending marker; marker retained")?;
         Ok(Some(record))
     }
 }
@@ -8428,7 +9147,7 @@ fn mcp_repair_pending_record(lock: &InstallRootLock, version: &str) -> Result<Mc
     targets.extend(crate::commands::setup::current_mcp_repair_targets()?);
     let targets = crate::commands::setup::normalize_mcp_repair_targets(targets)?;
     Ok(McpRepairPending {
-        schema_version: 2,
+        schema_version: MCP_REPAIR_MARKER_SCHEMA_VERSION,
         installed_version: version.to_string(),
         recorded_at: chrono::Utc::now().to_rfc3339(),
         repair_required: !targets.is_empty(),
@@ -8445,34 +9164,24 @@ fn persist_mcp_repair_record(kin_home: &Path, record: &McpRepairPending) -> Resu
     }
     let bytes =
         serde_json::to_vec_pretty(record).context("failed to serialize MCP repair state")?;
-    write_file_atomically(&path, &bytes, 0o600)
+    create_private_marker_absent_or_identical(&path, &bytes, "MCP repair pending marker")
         .with_context(|| format!("failed to persist MCP repair state {}", path.display()))?;
     Ok(path)
 }
 
 #[cfg(not(unix))]
-fn read_restart_record(kin_home: &Path) -> Result<RestartPending> {
+fn read_restart_record_locked(kin_home: &Path) -> Result<(RestartPending, LockedPrivateMarker)> {
     let path = restart_pending_path(kin_home);
-    let metadata = fs::symlink_metadata(&path).with_context(|| {
-        format!(
-            "no runtime restart acknowledgement is pending at {}",
-            path.display()
-        )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        anyhow::bail!(
-            "runtime restart acknowledgement marker is not a regular non-symlink file: {}",
-            path.display()
-        );
-    }
-    let bytes = fs::read(&path).with_context(|| {
-        format!(
-            "failed to read restart acknowledgement marker {}",
-            path.display()
-        )
-    })?;
-    serde_json::from_slice(&bytes)
-        .with_context(|| format!("invalid restart acknowledgement marker {}", path.display()))
+    let marker = LockedPrivateMarker::open(&path, "runtime restart acknowledgement marker")?
+        .with_context(|| {
+            format!(
+                "no runtime restart acknowledgement is pending at {}",
+                path.display()
+            )
+        })?;
+    let record = serde_json::from_slice(&marker.bytes)
+        .with_context(|| format!("invalid restart acknowledgement marker {}", path.display()))?;
+    Ok((record, marker))
 }
 
 fn validate_restart_ack_identity(
@@ -8540,6 +9249,12 @@ fn validate_restart_record_schema(record: &RestartPending) -> Result<()> {
                     if identity.object.namespace == 0 || identity.object.file == 0 {
                         anyhow::bail!(
                             "restart acknowledgement marker has an invalid commit runtime object identity"
+                        );
+                    }
+                    #[cfg(windows)]
+                    if identity.object.namespace == 0 || identity.object.file.is_zero() {
+                        anyhow::bail!(
+                            "restart acknowledgement marker has an invalid full Windows commit runtime object identity"
                         );
                     }
                 }
@@ -9025,6 +9740,8 @@ fn acknowledge_runtime_restart(evidence: &[RuntimeSessionEvidence]) -> Result<()
     let requested_home = crate::commands::setup::kin_dir()?;
     let lock = InstallRootLock::acquire_existing(&requested_home)?;
     let spec = platform_bundle_spec(std::env::consts::OS)?;
+    // Restart persistence is create-only-or-identical, so committed recovery
+    // can finish idempotently without ever superseding this exact marker.
     recover_stale_transactions(&lock, spec)?;
     let start_authority = UpdaterStartAuthority::capture(lock.root(), spec)?;
     start_authority.verify_locked(&lock, spec)?;
@@ -9051,7 +9768,7 @@ fn acknowledge_runtime_restart(evidence: &[RuntimeSessionEvidence]) -> Result<()
     let record: RestartPending =
         serde_json::from_slice(&marker_bytes).context("invalid restart acknowledgement marker")?;
     #[cfg(not(unix))]
-    let record = read_restart_record(lock.root())?;
+    let (record, marker) = read_restart_record_locked(lock.root())?;
     let build = kin_buildinfo::get();
     validate_restart_ack_identity(
         &record,
@@ -9076,7 +9793,7 @@ fn acknowledge_runtime_restart(evidence: &[RuntimeSessionEvidence]) -> Result<()
         install.root.unlink_file(RESTART_ACK_REQUIRED_FILE)?;
     }
     #[cfg(not(unix))]
-    durable_remove_file(&restart_pending_path(lock.root()))?;
+    marker.remove_unchanged("runtime restart acknowledgement marker")?;
     println!(
         "Verified post-update runtime convergence for Kin v{}.",
         record.installed_version
@@ -9372,6 +10089,39 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_marker_guard_denies_path_replacement_and_disposes_exact_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker_path = tmp.path().join("restart-marker.json");
+        let bytes = b"exact retained marker";
+        let config_lock =
+            crate::commands::setup::ConfigLock::acquire_nofollow(&marker_path).unwrap();
+        config_lock
+            .write_private_guarded(&marker_path, bytes, None)
+            .unwrap();
+        drop(config_lock);
+
+        let marker = LockedPrivateMarker::open(&marker_path, "test marker")
+            .unwrap()
+            .unwrap();
+        assert_eq!(marker.bytes, bytes);
+        assert!(
+            fs::remove_file(&marker_path).is_err(),
+            "held marker handle must deny external pathname deletion"
+        );
+        let replacement = tmp.path().join("replacement.json");
+        fs::write(&replacement, b"hostile replacement").unwrap();
+        assert!(
+            fs::rename(&replacement, &marker_path).is_err(),
+            "held marker handle must deny external pathname replacement"
+        );
+        marker.remove_unchanged("test marker").unwrap();
+
+        assert!(!marker_path.exists());
+        assert_eq!(fs::read(replacement).unwrap(), b"hostile replacement");
     }
 
     struct ConfigDirectorySyncFailureGuard;
@@ -10521,6 +11271,164 @@ cwd = {:?}
     }
 
     #[test]
+    fn staging_constructor_failures_remove_the_owned_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
+        let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
+        #[cfg(unix)]
+        let failure_points = [
+            "staging-root",
+            "staging-bin",
+            "staging-lib",
+            "staging-validated",
+        ];
+        #[cfg(not(unix))]
+        let failure_points = ["staging-root", "staging-validated"];
+
+        for failure_point in failure_points {
+            let error = StagingDir::create_with_hook(&lock, |point| {
+                if point == failure_point {
+                    anyhow::bail!("injected staging constructor failure at {point}");
+                }
+                Ok(())
+            })
+            .err()
+            .expect("the constructor failure must be injected");
+            assert!(format!("{error:#}").contains(failure_point));
+            let leftovers = fs::read_dir(&kin_home)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(STAGING_PREFIX)
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                leftovers.is_empty(),
+                "staging root leaked after {failure_point}: {leftovers:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_transaction_constructor_failures_remove_the_owned_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
+        let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
+        let install = lock.install().unwrap();
+
+        for failure_point in [
+            "transaction-root",
+            "transaction-old",
+            "transaction-old-bin",
+            "transaction-old-lib",
+            "transaction-validated",
+        ] {
+            let error = TransactionLayout::create_with_hook(install, |point| {
+                if point == failure_point {
+                    anyhow::bail!("injected transaction constructor failure at {point}");
+                }
+                Ok(())
+            })
+            .expect_err("the constructor failure must be injected");
+            assert!(format!("{error:#}").contains(failure_point));
+            assert!(
+                transaction_dirs(&kin_home).unwrap().is_empty(),
+                "transaction root leaked after {failure_point}"
+            );
+        }
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn non_unix_transaction_constructor_failures_remove_the_owned_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        fs::create_dir(&kin_home).unwrap();
+
+        for failure_point in [
+            "transaction-root",
+            "transaction-old",
+            "transaction-old-bin",
+            "transaction-old-lib",
+            "transaction-validated",
+        ] {
+            let error = create_transaction_root_with_hook(&kin_home, |point| {
+                if point == failure_point {
+                    anyhow::bail!("injected transaction constructor failure at {point}");
+                }
+                Ok(())
+            })
+            .expect_err("the constructor failure must be injected");
+            assert!(format!("{error:#}").contains(failure_point));
+            assert!(
+                transaction_dirs(&kin_home).unwrap().is_empty(),
+                "transaction root leaked after {failure_point}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_post_mutation_precommit_error_restores_the_old_bundle_immediately() {
+        for failure_point in [
+            "after-backup-mutation-0",
+            "after-install-mutation-0",
+            "precommit-validated",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let kin_home = tmp.path().join("kin-home");
+            let stage = tmp.path().join("stage");
+            write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
+            let expected = bundle_snapshot(&kin_home, LINUX_COMPONENTS);
+            stage_archive(
+                &full_linux_archive("kin-linux-x86_64"),
+                "kin-linux-x86_64.tar.gz",
+                &stage,
+                LINUX_COMPONENTS,
+            )
+            .unwrap();
+            let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
+            let verified_staged_identities =
+                staged_identities_for_test(&stage, LINUX_COMPONENTS).unwrap();
+
+            let error = install_staged_bundle_unix_with_hooks(
+                &lock,
+                &StagingLayout::open(&stage).unwrap(),
+                LINUX_COMPONENTS,
+                &verified_staged_identities,
+                "0.2.22",
+                &test_restart_pending("0.2.22"),
+                |_, _| Ok(()),
+                |_, _| Ok(()),
+                |point| {
+                    if point == failure_point {
+                        anyhow::bail!("injected precommit failure at {point}");
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("the precommit failure must abort the transaction");
+            let message = format!("{error:#}");
+            assert!(message.contains(failure_point), "{message}");
+            assert!(
+                message.contains("previous bundle was restored"),
+                "{message}"
+            );
+            assert_bundle_matches(&kin_home, LINUX_COMPONENTS, &expected);
+            assert!(
+                transaction_dirs(&kin_home).unwrap().is_empty(),
+                "rollback must clean the transaction after {failure_point}"
+            );
+        }
+    }
+
+    #[test]
     fn crash_recovery_worker() {
         let Some(kin_home) = std::env::var_os("KIN_UPDATE_TEST_WORKER_HOME") else {
             return;
@@ -11072,6 +11980,7 @@ cwd = {:?}
                 Ok(())
             },
             |_, _| Ok(()),
+            |_| Ok(()),
         )
         .expect_err("replaced bin binding must abort before backup");
         assert!(format!("{error:#}").contains("binding changed"));
@@ -11461,6 +12370,31 @@ cwd = {:?}
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_id_json_round_trips_all_128_bits_in_lowercase_hex() {
+        let id = WindowsFileId::from_bytes([
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ]);
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, "\"00112233445566778899aabbccddeeff\"");
+        assert_eq!(serde_json::from_str::<WindowsFileId>(&json).unwrap(), id);
+        assert!(
+            serde_json::from_str::<WindowsFileId>("\"00112233445566778899AABBCCDDEEFF\"").is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_legacy_u64_file_id_maps_to_low_little_endian_bytes() {
+        let id = serde_json::from_str::<WindowsFileId>("72623859790382856").unwrap();
+        assert_eq!(
+            serde_json::to_string(&id).unwrap(),
+            "\"08070605040302010000000000000000\""
+        );
+    }
+
     #[test]
     fn windows_mutating_update_fails_before_any_state_change() {
         assert!(ensure_mutating_update_supported("windows", false).is_err());
@@ -11643,6 +12577,7 @@ cwd = {:?}
                 Ok(())
             },
             |_, _| Ok(()),
+            |_| Ok(()),
         )
         .expect_err("replaced install root must invalidate the held authority");
 
@@ -11692,6 +12627,7 @@ cwd = {:?}
                 Ok(())
             },
             |_, _| Ok(()),
+            |_| Ok(()),
         )
         .expect_err("replaced lock inode must invalidate the held authority");
 
@@ -11847,7 +12783,9 @@ cwd = {:?}
         let _kin_dir = EnvGuard::set("KIN_DIR", tmp.path().join("wrong-install"));
 
         let repaired = crate::commands::setup::remerge_existing_mcp_configs();
-        assert!(repaired.contains(&config));
+        let normalized_config = crate::commands::setup::ConfigLock::normalized_path(&config)
+            .expect("test MCP config path must normalize");
+        assert!(repaired.contains(&normalized_config));
         let root: toml::Value = toml::from_str(&fs::read_to_string(config).unwrap()).unwrap();
         let entry = &root["mcp_servers"]["kin"];
         let expected_launcher = kin_home
@@ -11951,6 +12889,7 @@ cwd = {:?}
             id: "codex".to_string(),
             path: config.clone(),
             repo_root: Some(repo),
+            captured_config_sha256: crate::commands::setup_ledger::sha256_hex(malformed),
         }])
         .unwrap();
         let marker = mcp_repair_pending_path(&state.kin_home);
@@ -11989,6 +12928,9 @@ cwd = {:?}
             id: "codex".to_string(),
             path: config.clone(),
             repo_root: Some(intended_repo.clone()),
+            captured_config_sha256: crate::commands::setup_ledger::sha256_hex(
+                &fs::read(&config).unwrap(),
+            ),
         }])
         .unwrap();
         let _cwd = CwdGuard::set(&unrelated_repo);
@@ -12006,6 +12948,9 @@ cwd = {:?}
             crate::commands::setup::mcp_repair_targets_ledger_verified(&[
                 crate::commands::setup::McpRepairTarget {
                     id: "codex".to_string(),
+                    captured_config_sha256: crate::commands::setup_ledger::sha256_hex(
+                        &fs::read(&config).unwrap(),
+                    ),
                     path: config,
                     repo_root: Some(intended_repo),
                 }
@@ -12080,8 +13025,9 @@ cwd = {:?}
         .into_bytes();
         fs::write(&config, &config_bytes).unwrap();
         let marker = mcp_repair_pending_path(&kin_home);
+        let captured_config_sha256 = crate::commands::setup_ledger::sha256_hex(&config_bytes);
         let marker_bytes = serde_json::to_vec_pretty(&serde_json::json!({
-            "schema_version": 2,
+            "schema_version": MCP_REPAIR_MARKER_SCHEMA_VERSION,
             "installed_version": "0.2.21",
             "recorded_at": "2026-07-16T13:44:00-04:00",
             "repair_required": true,
@@ -12092,6 +13038,7 @@ cwd = {:?}
                 "id": "codex",
                 "path": config,
                 "repo_root": repo,
+                "captured_config_sha256": captured_config_sha256,
             }]
         }))
         .unwrap();
@@ -12105,6 +13052,109 @@ cwd = {:?}
         assert!(format!("{error:#}").contains("unknown field"));
         assert_eq!(fs::read(&marker).unwrap(), marker_bytes);
         assert_eq!(fs::read(&config).unwrap(), config_bytes);
+        drop(lock);
+
+        let nested_marker_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": MCP_REPAIR_MARKER_SCHEMA_VERSION,
+            "installed_version": "0.2.21",
+            "recorded_at": "2026-07-16T13:44:00-04:00",
+            "repair_required": true,
+            "targets": [{
+                "id": "codex",
+                "path": config,
+                "repo_root": repo,
+                "captured_config_sha256": captured_config_sha256,
+                "acknowledged": false,
+            }]
+        }))
+        .unwrap();
+        fs::write(&marker, &nested_marker_bytes).unwrap();
+        let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
+        let error = attempt_pending_mcp_repair(&lock)
+            .expect_err("unknown target lifecycle fields must fail closed");
+        assert!(format!("{error:#}").contains("unknown field"));
+        assert_eq!(fs::read(&marker).unwrap(), nested_marker_bytes);
+        assert_eq!(fs::read(&config).unwrap(), config_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn mcp_marker_self_target_fails_without_recursive_target_locking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        write_bundle(&kin_home, LINUX_COMPONENTS, b"installed-");
+        let marker = mcp_repair_pending_path(&kin_home);
+        let marker_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": MCP_REPAIR_MARKER_SCHEMA_VERSION,
+            "installed_version": "0.2.21",
+            "recorded_at": "2026-07-16T20:00:00Z",
+            "repair_required": true,
+            "targets": [{
+                "id": "cursor",
+                "path": marker,
+                "captured_config_sha256": "0".repeat(64),
+            }]
+        }))
+        .unwrap();
+        fs::write(&marker, &marker_bytes).unwrap();
+        let _home = EnvGuard::set("HOME", tmp.path().join("home"));
+        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+
+        let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
+        let error = attempt_pending_mcp_repair(&lock)
+            .expect_err("a marker must never become its own config target");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("own durable marker") || message.contains("arbitrary path authority"),
+            "unexpected self-target rejection: {message}"
+        );
+        assert_eq!(fs::read(&marker).unwrap(), marker_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn retained_mcp_marker_rejects_arbitrary_id_path_authority_without_writes() {
+        for victim_kind in ["arbitrary_json", "restart_marker", "setup_ledger"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let kin_home = tmp.path().join("kin-home");
+            write_bundle(&kin_home, LINUX_COMPONENTS, b"installed-");
+            let home = tmp.path().join("home");
+            fs::create_dir_all(home.join(".cursor")).unwrap();
+            let _home = EnvGuard::set("HOME", &home);
+            let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+            let victim = match victim_kind {
+                "arbitrary_json" => home.join("victim.json"),
+                "restart_marker" => restart_pending_path(&kin_home),
+                "setup_ledger" => crate::commands::setup_ledger::ledger_path().unwrap(),
+                _ => unreachable!(),
+            };
+            fs::create_dir_all(victim.parent().unwrap()).unwrap();
+            let victim_bytes = format!("protected victim: {victim_kind}").into_bytes();
+            fs::write(&victim, &victim_bytes).unwrap();
+            let marker = mcp_repair_pending_path(&kin_home);
+            let marker_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": MCP_REPAIR_MARKER_SCHEMA_VERSION,
+                "installed_version": "0.2.21",
+                "recorded_at": "2026-07-16T20:00:00Z",
+                "repair_required": true,
+                "targets": [{
+                    "id": "cursor",
+                    "path": victim,
+                    "captured_config_sha256": crate::commands::setup_ledger::sha256_hex(&victim_bytes),
+                }]
+            }))
+            .unwrap();
+            fs::write(&marker, &marker_bytes).unwrap();
+
+            let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
+            let error = attempt_pending_mcp_repair(&lock)
+                .expect_err("strict markers cannot grant arbitrary client path authority");
+            assert!(format!("{error:#}").contains("arbitrary path authority"));
+            assert_eq!(fs::read(&marker).unwrap(), marker_bytes);
+            assert_eq!(fs::read(&victim).unwrap(), victim_bytes);
+        }
     }
 
     #[cfg(unix)]
@@ -12144,22 +13194,204 @@ cwd = {:?}
     #[cfg(unix)]
     #[test]
     #[serial]
+    fn any_restart_marker_blocks_new_install_before_transaction_or_live_mutation() {
+        for marker_bytes in [
+            b"{malformed restart marker".as_slice(),
+            br#"{"schema_version":99,"unknown_lifecycle":true}"#.as_slice(),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let kin_home = tmp.path().join("kin-home");
+            let stage = tmp.path().join("stage");
+            write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
+            stage_archive(
+                &full_linux_archive("kin-linux-x86_64"),
+                "kin-linux-x86_64.tar.gz",
+                &stage,
+                LINUX_COMPONENTS,
+            )
+            .unwrap();
+            let before = bundle_snapshot(&kin_home, LINUX_COMPONENTS);
+            let marker = restart_pending_path(&kin_home);
+            fs::write(&marker, marker_bytes).unwrap();
+
+            let error = install_staged_bundle(
+                &kin_home,
+                &stage,
+                LINUX_COMPONENTS,
+                "0.2.22",
+                &test_restart_pending("0.2.22"),
+            )
+            .expect_err("an existing restart path must supersede a newer install");
+            assert!(format!("{error:#}").contains("restart acknowledgement marker"));
+            assert_eq!(fs::read(&marker).unwrap(), marker_bytes);
+            assert!(transaction_dirs(&kin_home).unwrap().is_empty());
+            assert_bundle_matches(&kin_home, LINUX_COMPONENTS, &before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_persistence_retains_marker_appearing_after_precheck() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        write_bundle(&kin_home, LINUX_COMPONENTS, b"committed-");
+        let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
+        refuse_new_update_while_restart_marker_exists(&lock).unwrap();
+        let mut record = test_restart_pending("0.2.22");
+        record.schema_version = RESTART_MARKER_SCHEMA_VERSION;
+        record.reason = RESTART_FENCE_REASON.to_string();
+        for obligation in &mut record.runtime_obligations {
+            obligation.expected_identity =
+                file_identity(&kin_home.join("bin").join(&obligation.component)).unwrap();
+        }
+        mark_restart_record_committed(&mut record, &kin_home, LINUX_COMPONENTS).unwrap();
+
+        let marker = restart_pending_path(&kin_home);
+        let hostile = b"external marker after updater precheck";
+        let bytes = serde_json::to_vec_pretty(&record).unwrap();
+        let install = lock.install().unwrap();
+        let error = install
+            .root
+            .create_private_file_absent_or_identical_with_hook(
+                RESTART_ACK_REQUIRED_FILE,
+                &bytes,
+                "restart acknowledgement marker",
+                || {
+                    fs::write(&marker, hostile)?;
+                    Ok(())
+                },
+                || Ok(()),
+            )
+            .expect_err("restart persistence must never supersede a late marker");
+        assert!(format!("{error:#}").contains("different bytes"));
+        assert_eq!(fs::read(marker).unwrap(), hostile);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_marker_create_fails_if_conflict_disappears_before_verification() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        write_bundle(&kin_home, LINUX_COMPONENTS, b"committed-");
+        let marker = restart_pending_path(&kin_home);
+        let bytes = b"identical late marker";
+        let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
+        let install = lock.install().unwrap();
+
+        let error = install
+            .root
+            .create_private_file_absent_or_identical_with_hook(
+                RESTART_ACK_REQUIRED_FILE,
+                bytes,
+                "restart acknowledgement marker",
+                || {
+                    fs::write(&marker, bytes)?;
+                    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600))?;
+                    Ok(())
+                },
+                || {
+                    fs::remove_file(&marker)?;
+                    Ok(())
+                },
+            )
+            .expect_err("a vanished conflict cannot prove durable marker creation");
+
+        assert!(format!("{error:#}").contains("durable marker creation was not proven"));
+        assert!(!marker.exists());
+        assert!(fs::read_dir(&kin_home).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".create-")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn mcp_persistence_retains_different_marker_appearing_at_create_boundary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        write_bundle(&kin_home, LINUX_COMPONENTS, b"committed-");
+        let home = tmp.path().join("home");
+        let config = home.join(".cursor/mcp.json");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let config_bytes =
+            br#"{"mcpServers":{"kin":{"command":"/stale/kin","args":["mcp","start"]}}}"#;
+        fs::write(&config, config_bytes).unwrap();
+        let _home = EnvGuard::set("HOME", &home);
+        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        let target = crate::commands::setup::McpRepairTarget {
+            id: "cursor".to_string(),
+            path: config,
+            repo_root: None,
+            captured_config_sha256: crate::commands::setup_ledger::sha256_hex(config_bytes),
+        };
+        let target = crate::commands::setup::normalize_mcp_repair_targets([target])
+            .unwrap()
+            .remove(0);
+        let desired = McpRepairPending {
+            schema_version: MCP_REPAIR_MARKER_SCHEMA_VERSION,
+            installed_version: "0.2.22".to_string(),
+            recorded_at: "2026-07-16T00:00:00Z".to_string(),
+            repair_required: true,
+            targets: vec![target],
+        };
+        let mut hostile = desired.clone();
+        hostile.installed_version = "0.2.23".to_string();
+        hostile.recorded_at = "2026-07-16T00:00:01Z".to_string();
+        validate_mcp_repair_record(&desired).unwrap();
+        validate_mcp_repair_record(&hostile).unwrap();
+        let hostile_bytes = serde_json::to_vec_pretty(&hostile).unwrap();
+        let marker = mcp_repair_pending_path(&kin_home);
+        let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
+        let error =
+            persist_mcp_repair_record_at_with_hook(lock.install().unwrap(), &desired, || {
+                fs::write(&marker, &hostile_bytes)?;
+                fs::set_permissions(&marker, fs::Permissions::from_mode(0o600))?;
+                Ok(())
+            })
+            .expect_err("MCP persistence must never supersede a late valid obligation");
+
+        assert!(format!("{error:#}").contains("different bytes"));
+        assert_eq!(fs::read(marker).unwrap(), hostile_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
     fn transaction_manifest_preserves_existing_mcp_repair_targets() {
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
+        let home = home.canonicalize().unwrap();
+        let existing_path = home.join(".cursor/mcp.json");
+        fs::create_dir_all(existing_path.parent().unwrap()).unwrap();
+        fs::write(
+            &existing_path,
+            r#"{"mcpServers":{"kin":{"command":"/stale/kin","args":["mcp","start"]}}}"#,
+        )
+        .unwrap();
         let existing_target = crate::commands::setup::McpRepairTarget {
             id: "cursor".to_string(),
-            path: home.join(".cursor/mcp.json"),
+            captured_config_sha256: crate::commands::setup_ledger::sha256_hex(
+                &fs::read(&existing_path).unwrap(),
+            ),
+            path: existing_path,
             repo_root: None,
         };
+        let _home = EnvGuard::set("HOME", &home);
+        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
         let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
         persist_mcp_repair_record_at(
             lock.install().unwrap(),
             &McpRepairPending {
-                schema_version: 2,
+                schema_version: MCP_REPAIR_MARKER_SCHEMA_VERSION,
                 installed_version: "0.2.21".to_string(),
                 recorded_at: "2026-07-16T00:00:00Z".to_string(),
                 repair_required: true,
@@ -12167,8 +13399,6 @@ cwd = {:?}
             },
         )
         .unwrap();
-        let _home = EnvGuard::set("HOME", &home);
-        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
 
         let record = mcp_repair_pending_record(&lock, "0.2.22").unwrap();
         assert!(record.repair_required);
@@ -12192,12 +13422,110 @@ cwd = {:?}
         let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
         let _home = EnvGuard::set("HOME", tmp.path().join("home"));
 
-        assert!(automatic_mcp_repair_is_authorized());
+        assert!(UpdaterStartAuthority::capture(&kin_home, LINUX_COMPONENTS).is_ok());
         let replacement = kin_home.join("bin/.kin-identical-replacement");
         fs::copy(std::env::current_exe().unwrap(), &replacement).unwrap();
         fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755)).unwrap();
         fs::rename(&replacement, &managed).unwrap();
-        assert!(!automatic_mcp_repair_is_authorized());
+        assert!(UpdaterStartAuthority::capture(&kin_home, LINUX_COMPONENTS).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn ordinary_mcp_repair_reverifies_start_authority_after_install_lock_wait() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::mpsc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
+        let managed = kin_home.join("bin/kin");
+        fs::remove_file(&managed).unwrap();
+        fs::hard_link(std::env::current_exe().unwrap(), &managed).unwrap();
+        fs::set_permissions(&managed, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join(".kin")).unwrap();
+        let repo = repo.canonicalize().unwrap();
+        let config = home.join(".codex/config.toml");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let config_bytes = format!(
+            "[mcp_servers.kin]\ncommand = \"/stale/kin\"\nargs = [\"mcp\", \"start\", \"--repo\", {:?}]\n",
+            repo.to_string_lossy()
+        )
+        .into_bytes();
+        fs::write(&config, &config_bytes).unwrap();
+        let _home = EnvGuard::set("HOME", &home);
+        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        enqueue_mcp_repair_targets(&[crate::commands::setup::McpRepairTarget {
+            id: "codex".to_string(),
+            path: config.clone(),
+            repo_root: Some(repo),
+            captured_config_sha256: crate::commands::setup_ledger::sha256_hex(&config_bytes),
+        }])
+        .unwrap();
+        let marker = mcp_repair_pending_path(&kin_home);
+        let old_marker = fs::read(&marker).unwrap();
+        let authority =
+            UpdaterStartAuthority::capture_test_file(&kin_home, LINUX_COMPONENTS, &managed)
+                .unwrap();
+
+        let blocking_lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let thread_home = kin_home.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            retry_pending_mcp_repair_with_start_authority(
+                &thread_home,
+                LINUX_COMPONENTS,
+                &authority,
+            )
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !worker.is_finished(),
+            "ordinary repair must wait for the existing install authority"
+        );
+
+        // Model a newer updater replacing every managed pathname and its
+        // repair marker while the old process retains its original executable
+        // inode and waits for the install lock.
+        for component in LINUX_COMPONENTS {
+            let destination = component_path(&kin_home, *component);
+            let replacement = destination.with_extension("newer-generation");
+            fs::write(&replacement, format!("newer-{}", component.name)).unwrap();
+            fs::set_permissions(
+                &replacement,
+                fs::Permissions::from_mode(if component.location == ComponentLocation::Bin {
+                    0o755
+                } else {
+                    0o644
+                }),
+            )
+            .unwrap();
+            fs::rename(&replacement, &destination).unwrap();
+        }
+        let mut replacement_marker: serde_json::Value =
+            serde_json::from_slice(&old_marker).unwrap();
+        replacement_marker["recorded_at"] =
+            serde_json::Value::String("2026-07-16T20:00:00Z".to_string());
+        let replacement_marker = serde_json::to_vec_pretty(&replacement_marker).unwrap();
+        let replacement_path = marker.with_extension("newer-marker");
+        fs::write(&replacement_path, &replacement_marker).unwrap();
+        fs::set_permissions(&replacement_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::rename(&replacement_path, &marker).unwrap();
+        drop(blocking_lock);
+
+        let error = worker
+            .join()
+            .unwrap()
+            .expect_err("old process must refuse the newer generation and marker");
+        assert!(format!("{error:#}").contains("bundle generation changed"));
+        assert_eq!(fs::read(&marker).unwrap(), replacement_marker);
+        assert_eq!(fs::read(&config).unwrap(), config_bytes);
     }
 
     #[cfg(unix)]
@@ -12231,6 +13559,9 @@ cwd = {:?}
             id: "codex".to_string(),
             path: config.clone(),
             repo_root: Some(repo),
+            captured_config_sha256: crate::commands::setup_ledger::sha256_hex(
+                &fs::read(&config).unwrap(),
+            ),
         }])
         .unwrap();
         let marker_before = fs::read(&marker).unwrap();
@@ -12283,6 +13614,86 @@ cwd = {:?}
         acknowledge_runtime_restart(&[]).unwrap();
 
         assert!(!restart_pending_path(&kin_home).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn unknown_restart_lifecycle_fields_retain_exact_marker_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for location in ["marker", "obligation", "session", "commit_identity"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let kin_home = tmp.path().join("kin-home");
+            let lock = InstallRootLock::acquire(&kin_home).unwrap();
+            fs::hard_link(std::env::current_exe().unwrap(), kin_home.join("bin/kin")).unwrap();
+            fs::write(kin_home.join("bin/kin-daemon"), b"new-daemon").unwrap();
+            fs::write(kin_home.join("bin/kin-vfs"), b"new-vfs").unwrap();
+            let build = kin_buildinfo::get();
+            let mut record = test_restart_pending(CURRENT_VERSION);
+            record.kin_commit = build.sha.to_string();
+            record.dependency_provenance = build.dependency_provenance.to_string();
+            for obligation in &mut record.runtime_obligations {
+                obligation.expected_identity =
+                    file_identity(&kin_home.join("bin").join(&obligation.component)).unwrap();
+            }
+            record.schema_version = RESTART_MARKER_SCHEMA_VERSION;
+            record.reason = RESTART_FENCE_REASON.to_string();
+            mark_restart_record_committed(&mut record, &kin_home, LINUX_COMPONENTS).unwrap();
+            let mut value = serde_json::to_value(&record).unwrap();
+            match location {
+                "marker" => {
+                    value
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("acknowledged".to_string(), serde_json::json!(false));
+                }
+                "obligation" => {
+                    value["runtime_obligations"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("restarted".to_string(), serde_json::json!(true));
+                }
+                "session" => {
+                    let executable = std::env::current_exe().unwrap();
+                    let mut session = serde_json::to_value(RuntimeSessionAtUpdate {
+                        pid: 1,
+                        start_time: 1,
+                        executable: executable.clone(),
+                        executable_identity: file_identity(&executable).unwrap(),
+                        binding: None,
+                    })
+                    .unwrap();
+                    session
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("acknowledged".to_string(), serde_json::json!(false));
+                    value["runtime_obligations"][0]["prior_sessions"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(session);
+                }
+                "commit_identity" => {
+                    value["commit_runtime_fence"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("reopened".to_string(), serde_json::json!(true));
+                }
+                _ => unreachable!(),
+            }
+            let marker_bytes = serde_json::to_vec_pretty(&value).unwrap();
+            let marker = restart_pending_path(&kin_home);
+            fs::write(&marker, &marker_bytes).unwrap();
+            fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+            drop(lock);
+            let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+            let _home = EnvGuard::set("HOME", tmp.path().join("home"));
+
+            let error = acknowledge_runtime_restart(&[])
+                .expect_err("unknown restart lifecycle fields must fail closed");
+            assert!(format!("{error:#}").contains("unknown field"), "{location}");
+            assert_eq!(fs::read(&marker).unwrap(), marker_bytes, "{location}");
+        }
     }
 
     #[cfg(target_os = "linux")]

@@ -10,19 +10,22 @@
 
 use super::{
     component_path, file_identity, ComponentSpec, InstallRootLock, ManagedBundleGeneration,
-    ManagedComponentGeneration, PlatformObjectIdentity,
+    ManagedComponentGeneration, PlatformObjectIdentity, WindowsFileId,
 };
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::mem::{size_of, zeroed};
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
+use std::time::Duration;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
+    GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::Authorization::{
     GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT,
@@ -32,24 +35,66 @@ use windows_sys::Win32::Security::{
     GetSecurityDescriptorControl, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor,
     IsValidSid, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
     SetSecurityDescriptorOwner, TokenUser, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
-    CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
-    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES,
-    SECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+    CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION,
+    LABEL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PROTECTED_SACL_SECURITY_INFORMATION, PSID,
+    SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_AUTO_INHERITED, SE_DACL_AUTO_INHERIT_REQ,
+    SE_DACL_PROTECTED, SE_SACL_AUTO_INHERITED, SE_SACL_AUTO_INHERIT_REQ, SE_SACL_PROTECTED,
+    TOKEN_QUERY, TOKEN_USER, UNPROTECTED_DACL_SECURITY_INFORMATION,
+    UNPROTECTED_SACL_SECURITY_INFORMATION,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-    FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+    CreateDirectoryW, CreateFileW, FileBasicInfo, FileIdInfo, FileStreamInfo,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+    SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, CREATE_NEW, DELETE, FILE_ALL_ACCESS,
+    FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM,
+    FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_FLAG_WRITE_THROUGH, FILE_ID_INFO, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STREAM_INFO, OPEN_EXISTING,
+    READ_CONTROL, VOLUME_NAME_DOS, WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CreatedFileValidationFailure {
+    Identity,
+    Security,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_CREATED_FILE_VALIDATION: std::cell::Cell<Option<CreatedFileValidationFailure>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_created_file_validation_failure(
+    failure: Option<CreatedFileValidationFailure>,
+) {
+    FAIL_NEXT_CREATED_FILE_VALIDATION.with(|configured| configured.set(failure));
+}
+
+#[cfg(test)]
+fn take_created_file_validation_failure() -> Option<CreatedFileValidationFailure> {
+    FAIL_NEXT_CREATED_FILE_VALIDATION.with(std::cell::Cell::take)
+}
+
 fn win32_error(context: &str) -> anyhow::Error {
     let error = std::io::Error::last_os_error();
-    anyhow::anyhow!("{context}: {error}")
+    anyhow::Error::new(error).context(context.to_string())
+}
+
+fn windows_error_code(error: &anyhow::Error) -> Option<i32> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+    })
 }
 
 fn wide_null(value: &OsStr) -> Result<Vec<u16>> {
@@ -82,6 +127,17 @@ impl OwnedHandle {
         // SAFETY: ownership of this valid HANDLE is transferred exactly once
         // to File, and Drop is disabled by clearing self.0 above.
         unsafe { File::from_raw_handle(handle) }
+    }
+}
+
+struct LocalSecurityDescriptor(*mut core::ffi::c_void);
+
+impl Drop for LocalSecurityDescriptor {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: GetSecurityInfo allocated this descriptor with LocalAlloc.
+            let _ = unsafe { windows_sys::Win32::Foundation::LocalFree(self.0) };
+        }
     }
 }
 
@@ -338,6 +394,807 @@ fn validate_private_security(handle: HANDLE, user: &CurrentUserSid) -> Result<()
     Ok(())
 }
 
+/// Validate a private managed file using its already-open, no-reparse handle.
+/// This is shared with setup-ledger/config authority on Windows.
+pub(crate) fn validate_current_user_private_file(file: &File) -> Result<()> {
+    let user = CurrentUserSid::load()?;
+    let handle = file.as_raw_handle().cast();
+    object_identity(handle, false)?;
+    validate_private_security(handle, &user)
+}
+
+struct ManagedFileSecurity {
+    _descriptor: LocalSecurityDescriptor,
+    owner: PSID,
+    group: PSID,
+    dacl: *mut ACL,
+    label: *mut ACL,
+    control: u16,
+}
+
+fn read_managed_file_security(file: &File) -> Result<ManagedFileSecurity> {
+    let mut owner = null_mut();
+    let mut group = null_mut();
+    let mut dacl = null_mut();
+    let mut label = null_mut();
+    let mut descriptor = null_mut();
+    let result = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | GROUP_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | LABEL_SECURITY_INFORMATION,
+            &mut owner,
+            &mut group,
+            &mut dacl,
+            &mut label,
+            &mut descriptor,
+        )
+    };
+    if result != 0 {
+        anyhow::bail!("failed to inspect managed config security: Windows error {result}");
+    }
+    let descriptor_owner = LocalSecurityDescriptor(descriptor);
+    if owner.is_null() || group.is_null() || dacl.is_null() {
+        anyhow::bail!("managed config requires explicit owner, group, and non-NULL DACL authority");
+    }
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
+        return Err(win32_error(
+            "failed to inspect managed config DACL protection",
+        ));
+    }
+    Ok(ManagedFileSecurity {
+        _descriptor: descriptor_owner,
+        owner,
+        group,
+        dacl,
+        label,
+        control,
+    })
+}
+
+/// Stable proof of the exact owner/DACL/protection attached to a managed
+/// config handle. Recovery records use this alongside bytes and file identity.
+pub(crate) fn managed_file_security_fingerprint(file: &File) -> Result<String> {
+    let security = read_managed_file_security(file)?;
+    let owner_len = unsafe { GetLengthSid(security.owner) } as usize;
+    let group_len = unsafe { GetLengthSid(security.group) } as usize;
+    if owner_len == 0 || group_len == 0 {
+        anyhow::bail!("managed config owner/group SID has invalid length");
+    }
+    let mut acl_info = ACL_SIZE_INFORMATION::default();
+    if unsafe {
+        GetAclInformation(
+            security.dacl,
+            (&mut acl_info as *mut ACL_SIZE_INFORMATION).cast(),
+            size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    } == 0
+    {
+        return Err(win32_error("failed to size managed config DACL"));
+    }
+    let acl_len = acl_info.AclBytesInUse as usize;
+    if acl_len < size_of::<ACL>() {
+        anyhow::bail!("managed config DACL has invalid byte length");
+    }
+    let owner = unsafe { std::slice::from_raw_parts(security.owner.cast::<u8>(), owner_len) };
+    let group = unsafe { std::slice::from_raw_parts(security.group.cast::<u8>(), group_len) };
+    let dacl = unsafe { std::slice::from_raw_parts(security.dacl.cast::<u8>(), acl_len) };
+    let label = if security.label.is_null() {
+        &[][..]
+    } else {
+        let mut label_info = ACL_SIZE_INFORMATION::default();
+        if unsafe {
+            GetAclInformation(
+                security.label,
+                (&mut label_info as *mut ACL_SIZE_INFORMATION).cast(),
+                size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } == 0
+        {
+            return Err(win32_error("failed to size managed config mandatory label"));
+        }
+        let label_len = label_info.AclBytesInUse as usize;
+        if label_len < size_of::<ACL>() {
+            anyhow::bail!("managed config mandatory label has invalid byte length");
+        }
+        unsafe { std::slice::from_raw_parts(security.label.cast::<u8>(), label_len) }
+    };
+    let relevant_control = security.control
+        & (SE_DACL_PROTECTED
+            | SE_DACL_AUTO_INHERITED
+            | SE_DACL_AUTO_INHERIT_REQ
+            | SE_SACL_PROTECTED
+            | SE_SACL_AUTO_INHERITED
+            | SE_SACL_AUTO_INHERIT_REQ);
+    let mut canonical = Vec::with_capacity(owner_len + group_len + acl_len + label.len() + 18);
+    canonical.extend_from_slice(&(owner_len as u32).to_le_bytes());
+    canonical.extend_from_slice(owner);
+    canonical.extend_from_slice(&(group_len as u32).to_le_bytes());
+    canonical.extend_from_slice(group);
+    canonical.extend_from_slice(&(acl_len as u32).to_le_bytes());
+    canonical.extend_from_slice(dacl);
+    canonical.extend_from_slice(&(label.len() as u32).to_le_bytes());
+    canonical.extend_from_slice(label);
+    canonical.extend_from_slice(&relevant_control.to_le_bytes());
+    Ok(crate::commands::setup_ledger::sha256_hex(&canonical))
+}
+
+/// Preserve the existing non-private config's owner, DACL, and inheritance
+/// policy on its staged replacement before the namespace transition.
+pub(crate) fn copy_managed_file_security(source: &File, destination: &File) -> Result<()> {
+    object_identity(source.as_raw_handle().cast(), false)?;
+    object_identity(destination.as_raw_handle().cast(), false)?;
+    let source_fingerprint = managed_file_security_fingerprint(source)?;
+    let security = read_managed_file_security(source)?;
+    let protection = if security.control & SE_DACL_PROTECTED != 0 {
+        PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        UNPROTECTED_DACL_SECURITY_INFORMATION
+    };
+    let mut security_information = OWNER_SECURITY_INFORMATION
+        | GROUP_SECURITY_INFORMATION
+        | DACL_SECURITY_INFORMATION
+        | protection;
+    if !security.label.is_null() {
+        security_information |= LABEL_SECURITY_INFORMATION
+            | if security.control & SE_SACL_PROTECTED != 0 {
+                PROTECTED_SACL_SECURITY_INFORMATION
+            } else {
+                UNPROTECTED_SACL_SECURITY_INFORMATION
+            };
+    }
+    let result = unsafe {
+        SetSecurityInfo(
+            destination.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            security_information,
+            security.owner,
+            security.group,
+            security.dacl,
+            security.label,
+        )
+    };
+    if result != 0 {
+        anyhow::bail!("failed to preserve managed config owner/DACL: Windows error {result}");
+    }
+    let destination_fingerprint = managed_file_security_fingerprint(destination)?;
+    if destination_fingerprint != source_fingerprint {
+        anyhow::bail!("staged managed config owner/DACL differs after security copy");
+    }
+    Ok(())
+}
+
+const SUPPORTED_CONFIG_ATTRIBUTES: u32 = FILE_ATTRIBUTE_HIDDEN
+    | FILE_ATTRIBUTE_SYSTEM
+    | FILE_ATTRIBUTE_ARCHIVE
+    | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
+
+fn managed_config_attributes(file: &File) -> Result<u32> {
+    let mut basic = FILE_BASIC_INFO::default();
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle().cast(),
+            FileBasicInfo,
+            (&raw mut basic).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(win32_error(
+            "failed to inspect managed config basic attributes",
+        ));
+    }
+    let attributes = basic.FileAttributes;
+    if attributes & FILE_ATTRIBUTE_NORMAL != 0 && attributes != FILE_ATTRIBUTE_NORMAL {
+        anyhow::bail!("managed config combines FILE_ATTRIBUTE_NORMAL with other attributes");
+    }
+    let unsupported = attributes & !(SUPPORTED_CONFIG_ATTRIBUTES | FILE_ATTRIBUTE_NORMAL);
+    if unsupported != 0 {
+        anyhow::bail!(
+            "managed config carries unsupported Windows attributes 0x{unsupported:08x}; refusing replacement before Prepared"
+        );
+    }
+    Ok(attributes & SUPPORTED_CONFIG_ATTRIBUTES)
+}
+
+fn parse_managed_config_stream_buffer(bytes: &[u8]) -> Result<Vec<String>> {
+    let header_len = std::mem::offset_of!(FILE_STREAM_INFO, StreamName);
+    let next_offset = std::mem::offset_of!(FILE_STREAM_INFO, NextEntryOffset);
+    let name_length_offset = std::mem::offset_of!(FILE_STREAM_INFO, StreamNameLength);
+    let mut offset = 0_usize;
+    let mut names = Vec::new();
+    loop {
+        let remaining = bytes
+            .get(offset..)
+            .context("managed config stream record offset exceeds its buffer")?;
+        if remaining.len() < header_len {
+            anyhow::bail!("managed config stream record header is truncated");
+        }
+        let next_entry = u32::from_ne_bytes(
+            remaining[next_offset..next_offset + size_of::<u32>()]
+                .try_into()
+                .expect("FILE_STREAM_INFO next-entry field fits its header"),
+        );
+        let name_bytes = usize::try_from(u32::from_ne_bytes(
+            remaining[name_length_offset..name_length_offset + size_of::<u32>()]
+                .try_into()
+                .expect("FILE_STREAM_INFO name-length field fits its header"),
+        ))
+        .context("managed config stream name length overflow")?;
+        if name_bytes == 0 || name_bytes % size_of::<u16>() != 0 {
+            anyhow::bail!("managed config stream name has invalid UTF-16 byte length");
+        }
+        let record_len = header_len
+            .checked_add(name_bytes)
+            .context("managed config stream record length overflow")?;
+        if record_len > remaining.len() {
+            anyhow::bail!("managed config stream name exceeds its record buffer");
+        }
+        let name = remaining[header_len..record_len]
+            .chunks_exact(size_of::<u16>())
+            .map(|unit| u16::from_ne_bytes([unit[0], unit[1]]))
+            .collect::<Vec<_>>();
+        names.push(
+            String::from_utf16(&name).context("managed config stream name is invalid UTF-16")?,
+        );
+        if next_entry == 0 {
+            break;
+        }
+        let next = usize::try_from(next_entry).context("managed config stream offset overflow")?;
+        if next < record_len || next % size_of::<usize>() != 0 {
+            anyhow::bail!("managed config stream chain has an invalid next-entry offset");
+        }
+        offset = offset
+            .checked_add(next)
+            .context("managed config stream chain offset overflow")?;
+        if offset >= bytes.len() {
+            anyhow::bail!("managed config stream chain escapes its buffer");
+        }
+    }
+    Ok(names)
+}
+
+fn managed_config_streams(file: &File) -> Result<Vec<String>> {
+    const MAX_STREAM_BUFFER: usize = 16 * 1024 * 1024;
+    let mut bytes = 4096_usize;
+    loop {
+        let mut storage = vec![0_usize; bytes.div_ceil(size_of::<usize>())];
+        if unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle().cast(),
+                FileStreamInfo,
+                storage.as_mut_ptr().cast(),
+                u32::try_from(bytes).context("managed config stream buffer exceeds u32")?,
+            )
+        } != 0
+        {
+            let buffer = unsafe {
+                std::slice::from_raw_parts(
+                    storage.as_ptr().cast::<u8>(),
+                    storage.len() * size_of::<usize>(),
+                )
+            };
+            let streams = parse_managed_config_stream_buffer(buffer)?;
+            if streams != ["::$DATA"] {
+                anyhow::bail!(
+                    "managed config has alternate or ambiguous data streams; refusing replacement before Prepared: {streams:?}"
+                );
+            }
+            return Ok(streams);
+        }
+        let error = unsafe { GetLastError() };
+        if (error == ERROR_MORE_DATA || error == ERROR_INSUFFICIENT_BUFFER)
+            && bytes < MAX_STREAM_BUFFER
+        {
+            bytes = bytes
+                .checked_mul(2)
+                .context("managed config stream buffer growth overflow")?;
+            continue;
+        }
+        anyhow::bail!("failed to inspect managed config streams: Windows error {error}");
+    }
+}
+
+/// Stable handle-derived Windows metadata authority used by setup CAS and WAL.
+pub(crate) fn managed_file_metadata_fingerprint(file: &File) -> Result<String> {
+    let security = managed_file_security_fingerprint(file)?;
+    let attributes = managed_config_attributes(file)?;
+    let streams = managed_config_streams(file)?;
+    let mut canonical = Vec::new();
+    canonical.extend_from_slice(b"KIN_WINDOWS_CONFIG_METADATA_V1\0");
+    canonical.extend_from_slice(security.as_bytes());
+    canonical.extend_from_slice(&attributes.to_le_bytes());
+    for stream in streams {
+        canonical.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+        canonical.extend_from_slice(stream.as_bytes());
+    }
+    Ok(crate::commands::setup_ledger::sha256_hex(&canonical))
+}
+
+/// Preserve the bounded Windows metadata contract on the staged replacement.
+pub(crate) fn copy_managed_file_metadata(source: &File, destination: &File) -> Result<()> {
+    let source_fingerprint = managed_file_metadata_fingerprint(source)?;
+    copy_managed_file_security(source, destination)?;
+    let attributes = managed_config_attributes(source)?;
+    let basic = FILE_BASIC_INFO {
+        CreationTime: 0,
+        LastAccessTime: 0,
+        LastWriteTime: 0,
+        ChangeTime: 0,
+        FileAttributes: if attributes == 0 {
+            FILE_ATTRIBUTE_NORMAL
+        } else {
+            attributes
+        },
+    };
+    if unsafe {
+        SetFileInformationByHandle(
+            destination.as_raw_handle().cast(),
+            FileBasicInfo,
+            (&basic as *const FILE_BASIC_INFO).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to preserve managed config basic attributes");
+    }
+    let destination_fingerprint = managed_file_metadata_fingerprint(destination)?;
+    if destination_fingerprint != source_fingerprint {
+        anyhow::bail!("staged managed config Windows metadata differs after exact copy");
+    }
+    Ok(())
+}
+
+fn create_current_user_private_file_with_disposition(
+    path: &Path,
+    disposition: u32,
+    share_mode: u32,
+    additional_access: u32,
+) -> Result<File> {
+    let user = CurrentUserSid::load()?;
+    let path_wide = wide_null(path.as_os_str())?;
+    let mut acl = build_private_acl(user.sid())?;
+    let mut descriptor = SECURITY_DESCRIPTOR::default();
+    let descriptor_ptr = (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast();
+    // SAFETY: descriptor is writable and all SID/ACL buffers remain live until
+    // CreateFileW returns.
+    if unsafe { InitializeSecurityDescriptor(descriptor_ptr, SECURITY_DESCRIPTOR_REVISION) } == 0
+        || unsafe { SetSecurityDescriptorOwner(descriptor_ptr, user.sid(), 0) } == 0
+        || unsafe { SetSecurityDescriptorDacl(descriptor_ptr, 1, acl.as_mut_ptr().cast(), 0) } == 0
+        || unsafe {
+            SetSecurityDescriptorControl(descriptor_ptr, SE_DACL_PROTECTED, SE_DACL_PROTECTED)
+        } == 0
+    {
+        return Err(win32_error(
+            "failed to configure private managed-file security descriptor",
+        ));
+    }
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+        bInheritHandle: 0,
+    };
+    // SAFETY: path and security descriptor buffers remain live for the call.
+    let handle = unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES | additional_access,
+            share_mode,
+            &attributes,
+            disposition,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
+            null_mut(),
+        )
+    };
+    let handle = OwnedHandle::new(
+        handle,
+        &format!(
+            "failed to create/open private managed file {}",
+            path.display()
+        ),
+    )?;
+    if let Err(error) = (|| -> Result<()> {
+        #[cfg(test)]
+        let injected = if disposition == CREATE_NEW {
+            take_created_file_validation_failure()
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if injected == Some(CreatedFileValidationFailure::Identity) {
+            anyhow::bail!("injected created-file identity validation failure");
+        }
+        object_identity(handle.raw(), false)?;
+        #[cfg(test)]
+        if injected == Some(CreatedFileValidationFailure::Security) {
+            anyhow::bail!("injected created-file security validation failure");
+        }
+        validate_private_security(handle.raw(), &user)
+    })() {
+        if disposition == CREATE_NEW {
+            if let Err(cleanup) = mark_newly_created_handle_for_cleanup(handle.raw()) {
+                return Err(error.context(format!(
+                    "new private managed file validation failed and exact-handle cleanup also failed; object retained at {}: {cleanup:#}",
+                    path.display()
+                )));
+            }
+        }
+        return Err(error);
+    }
+    Ok(handle.into_file())
+}
+
+fn mark_newly_created_handle_for_cleanup(handle: HANDLE) -> Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+    };
+
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    if unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to mark newly created exact handle for cleanup");
+    }
+    Ok(())
+}
+
+/// Atomically create a current-user-only file. Existing paths are refused.
+pub(crate) fn create_current_user_private_file(path: &Path) -> Result<File> {
+    create_current_user_private_file_with_disposition(path, CREATE_NEW, FILE_SHARE_READ, DELETE)
+}
+
+/// Create one current-user-only marker with exact-object cleanup authority.
+/// DELETE is requested on the returned handle and FILE_SHARE_DELETE remains
+/// absent, so callers can dispose only this CREATE_NEW object by handle if a
+/// write/sync fails without ever unlinking a replacement pathname.
+pub(crate) fn create_current_user_private_file_for_exact_commit(path: &Path) -> Result<File> {
+    create_current_user_private_file_with_disposition(path, CREATE_NEW, FILE_SHARE_READ, DELETE)
+}
+
+/// Create a private staged file whose live handle remains the rename
+/// authority. DELETE access authorizes FileRenameInfoEx on this exact handle;
+/// sharing remains read-only so no writer or path replacement can race it.
+pub(crate) fn create_current_user_private_staged_file(path: &Path) -> Result<File> {
+    create_current_user_private_file_with_disposition(
+        path,
+        CREATE_NEW,
+        FILE_SHARE_READ,
+        DELETE | WRITE_DAC | WRITE_OWNER,
+    )
+}
+
+/// Create a non-private managed config staging file while retaining exact
+/// rename and disposition authority on its handle.
+pub(crate) fn create_managed_config_staged_file(path: &Path) -> Result<File> {
+    let path_wide = wide_null(path.as_os_str())?;
+    let handle = unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            GENERIC_READ
+                | GENERIC_WRITE
+                | FILE_READ_ATTRIBUTES
+                | READ_CONTROL
+                | WRITE_DAC
+                | WRITE_OWNER
+                | DELETE,
+            FILE_SHARE_READ,
+            null(),
+            CREATE_NEW,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
+            null_mut(),
+        )
+    };
+    let handle = OwnedHandle::new(
+        handle,
+        &format!(
+            "failed to create managed config staging file {}",
+            path.display()
+        ),
+    )?;
+    let validated = (|| -> Result<()> {
+        #[cfg(test)]
+        if take_created_file_validation_failure() == Some(CreatedFileValidationFailure::Identity) {
+            anyhow::bail!("injected created-file identity validation failure");
+        }
+        object_identity(handle.raw(), false).map(|_| ())
+    })();
+    if let Err(error) = validated {
+        if let Err(cleanup) = mark_newly_created_handle_for_cleanup(handle.raw()) {
+            return Err(error.context(format!(
+                "new managed config stage validation failed and exact-handle cleanup also failed; object retained at {}: {cleanup:#}",
+                path.display()
+            )));
+        }
+        return Err(error);
+    }
+    Ok(handle.into_file())
+}
+
+/// Open the exact destination config with DELETE authority while deliberately
+/// denying delete sharing. The retained handle prevents a non-cooperating
+/// writer from replacing the pathname between validation and quarantine.
+pub(crate) fn open_managed_config_for_exact_quarantine(path: &Path) -> Result<File> {
+    let path_wide = wide_null(path.as_os_str())?;
+    let handle = unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE,
+            FILE_SHARE_READ,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
+            null_mut(),
+        )
+    };
+    let handle = OwnedHandle::new(
+        handle,
+        &format!(
+            "failed to retain exact managed config destination {}",
+            path.display()
+        ),
+    )?;
+    object_identity(handle.raw(), false)?;
+    Ok(handle.into_file())
+}
+
+/// Rename the exact private object named by `file` to an absolute destination.
+/// The variable-size FILE_RENAME_INFO buffer is pointer-aligned and carries
+/// FileRenameInfoEx's replace flag; the source pathname is never reopened.
+pub(crate) fn rename_private_file_handle_exact(
+    file: &File,
+    destination: &Path,
+    replace: bool,
+) -> Result<()> {
+    validate_current_user_private_file(file)?;
+    rename_managed_file_handle_exact(file, destination, replace)
+}
+
+/// Rename an already validated regular managed-file handle. The handle, not a
+/// source pathname reopened after validation, is the mutation authority.
+pub(crate) fn rename_managed_file_handle_exact(
+    file: &File,
+    destination: &Path,
+    replace: bool,
+) -> Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileRenameInfoEx, SetFileInformationByHandle, FILE_RENAME_INFO,
+    };
+
+    if !destination.is_absolute() {
+        anyhow::bail!(
+            "private handle rename destination is not absolute: {}",
+            destination.display()
+        );
+    }
+    object_identity(file.as_raw_handle().cast(), false)?;
+    let destination_path = destination.to_path_buf();
+    let destination_wide = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    if destination_wide.is_empty() || destination_wide.contains(&0) {
+        anyhow::bail!("private handle rename destination is empty or contains an interior NUL");
+    }
+    let name_bytes = destination_wide
+        .len()
+        .checked_mul(size_of::<u16>())
+        .context("private handle rename destination length overflow")?;
+    let buffer_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName)
+        .checked_add(name_bytes)
+        .and_then(|value| value.checked_add(size_of::<u16>()))
+        .context("private handle rename buffer length overflow")?;
+    let file_name_length = u32::try_from(name_bytes)
+        .context("private handle rename destination exceeds Windows length limit")?;
+    let buffer_length = u32::try_from(buffer_bytes)
+        .context("private handle rename buffer exceeds Windows length limit")?;
+    let mut storage = vec![0_usize; buffer_bytes.div_ceil(size_of::<usize>())];
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // FileRenameInfoEx uses the union's Flags member. Bit zero is the
+    // documented FILE_RENAME_FLAG_REPLACE_IF_EXISTS value.
+    unsafe {
+        (*info).Anonymous.Flags = u32::from(replace);
+        (*info).RootDirectory = null_mut();
+        (*info).FileNameLength = file_name_length;
+        std::ptr::copy_nonoverlapping(
+            destination_wide.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            destination_wide.len(),
+        );
+        *std::ptr::addr_of_mut!((*info).FileName)
+            .cast::<u16>()
+            .add(destination_wide.len()) = 0;
+    }
+    let renamed = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle().cast(),
+            FileRenameInfoEx,
+            info.cast(),
+            buffer_length,
+        )
+    };
+    if renamed == 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "failed to rename exact private handle to {}",
+                destination_path.display()
+            )
+        });
+    }
+    // Crossing this boundary commits the exact object at `destination`.
+    // Do not perform any fallible post-commit work here: callers must first
+    // mark the object committed, then validate/sync it without ever disposing
+    // the destination handle on a post-commit failure.
+    Ok(())
+}
+
+/// Delete the exact private object retained by `file`. The handle is validated
+/// before disposition so a substituted pathname can never become cleanup
+/// authority.
+pub(crate) fn dispose_private_file_handle_exact(
+    file: &File,
+    path: &Path,
+    label: &str,
+) -> Result<()> {
+    validate_current_user_private_file(file).with_context(|| {
+        format!(
+            "{label} exact handle lost object authority at {}",
+            path.display()
+        )
+    })?;
+    dispose_managed_file_handle_exact(file, label)
+}
+
+/// Delete the exact regular managed-file object retained by `file`.
+pub(crate) fn dispose_managed_file_handle_exact(file: &File, label: &str) -> Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+    };
+
+    object_identity(file.as_raw_handle().cast(), false)
+        .with_context(|| format!("{label} exact handle lost object authority"))?;
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let removed = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle().cast(),
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if removed == 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to dispose exact {label}; object retained"));
+    }
+    Ok(())
+}
+
+/// Open or create the persistent setup ConfigLock sidecar. A new file receives
+/// its protected current-user-only DACL in the CreateFileW call; an existing
+/// file must already satisfy the same authority.
+pub(crate) fn open_or_create_current_user_private_file(path: &Path) -> Result<File> {
+    open_or_create_current_user_private_file_with_status(path).map(|(file, _)| file)
+}
+
+pub(crate) fn open_or_create_current_user_private_file_with_status(
+    path: &Path,
+) -> Result<(File, bool)> {
+    const ATTEMPTS: usize = 200;
+    for attempt in 0..ATTEMPTS {
+        match create_current_user_private_file_with_disposition(
+            path,
+            CREATE_NEW,
+            FILE_SHARE_READ,
+            DELETE,
+        ) {
+            Ok(file) => return Ok((file, true)),
+            Err(error)
+                if matches!(
+                    windows_error_code(&error),
+                    Some(code)
+                        if code == ERROR_FILE_EXISTS as i32 || code == ERROR_ALREADY_EXISTS as i32
+                ) =>
+            {
+                match create_current_user_private_file_with_disposition(
+                    path,
+                    OPEN_EXISTING,
+                    FILE_SHARE_READ,
+                    0,
+                ) {
+                    Ok(file) => return Ok((file, false)),
+                    Err(open_error)
+                        if windows_error_code(&open_error)
+                            == Some(ERROR_SHARING_VIOLATION as i32)
+                            && attempt + 1 < ATTEMPTS =>
+                    {
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(open_error)
+                        if matches!(
+                            windows_error_code(&open_error),
+                            Some(code)
+                                if code == ERROR_FILE_NOT_FOUND as i32
+                                    || code == ERROR_PATH_NOT_FOUND as i32
+                        ) && attempt + 1 < ATTEMPTS => {}
+                    Err(open_error) => return Err(open_error),
+                }
+            }
+            Err(error)
+                if windows_error_code(&error) == Some(ERROR_SHARING_VIOLATION as i32)
+                    && attempt + 1 < ATTEMPTS =>
+            {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded Windows private-file retry loop always returns")
+}
+
+/// Reopen an already-created private sidecar without permitting recreation.
+/// This is used to prove that the durable directory entry still names the
+/// full FILE_ID_INFO captured before its identity-keyed WAL is acquired.
+pub(crate) fn open_current_user_private_file_existing(path: &Path) -> Result<File> {
+    const ATTEMPTS: usize = 200;
+    for attempt in 0..ATTEMPTS {
+        match create_current_user_private_file_with_disposition(
+            path,
+            OPEN_EXISTING,
+            FILE_SHARE_READ,
+            0,
+        ) {
+            Ok(file) => return Ok(file),
+            Err(error)
+                if windows_error_code(&error) == Some(ERROR_SHARING_VIOLATION as i32)
+                    && attempt + 1 < ATTEMPTS =>
+            {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded Windows existing-private-file retry loop always returns")
+}
+
+/// Open a private sidecar read-only with permissive sharing so an already-held
+/// strict ConfigLock handle can be compared against a recorded namespace slot.
+pub(crate) fn open_current_user_private_file_existing_shared(path: &Path) -> Result<File> {
+    let path_wide = wide_null(path.as_os_str())?;
+    let handle = unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            GENERIC_READ | FILE_READ_ATTRIBUTES | READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    let handle = OwnedHandle::new(
+        handle,
+        &format!(
+            "failed to open shared private managed file {}",
+            path.display()
+        ),
+    )?;
+    object_identity(handle.raw(), false)?;
+    let file = handle.into_file();
+    validate_current_user_private_file(&file)?;
+    Ok(file)
+}
+
 fn object_identity(handle: HANDLE, expect_directory: bool) -> Result<PlatformObjectIdentity> {
     // SAFETY: zero is a valid initialization for this output structure.
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
@@ -358,10 +1215,229 @@ fn object_identity(handle: HANDLE, expect_directory: bool) -> Result<PlatformObj
             info.nNumberOfLinks
         );
     }
-    Ok(PlatformObjectIdentity {
-        namespace: u64::from(info.dwVolumeSerialNumber),
-        file: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-    })
+    // FILE_ID_INFO carries the full 128-bit file identity. The legacy
+    // BY_HANDLE_FILE_INFORMATION index is only 64 bits and can alias on modern
+    // filesystems, so it is never used as durable namespace authority.
+    let mut id: FILE_ID_INFO = unsafe { zeroed() };
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            (&raw mut id).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(win32_error(
+            "failed to inspect full Windows updater object identity",
+        ));
+    }
+    let identity = PlatformObjectIdentity {
+        namespace: id.VolumeSerialNumber,
+        file: WindowsFileId::from_bytes(id.FileId.Identifier),
+    };
+    if identity.namespace == 0 || identity.file.is_zero() {
+        anyhow::bail!(
+            "Windows updater object returned an invalid zero volume or FILE_ID_128 authority"
+        );
+    }
+    Ok(identity)
+}
+
+pub(crate) struct WindowsParentGuard {
+    path: PathBuf,
+    file: File,
+    identity: PlatformObjectIdentity,
+}
+
+impl WindowsParentGuard {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
+        let path_wide = wide_null(path.as_os_str())?;
+        let handle = unsafe {
+            CreateFileW(
+                path_wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
+                null_mut(),
+            )
+        };
+        let handle = OwnedHandle::new(
+            handle,
+            &format!("failed to retain managed config parent {}", path.display()),
+        )?;
+        let identity = object_identity(handle.raw(), true)?;
+        let guard = Self {
+            path: path.to_path_buf(),
+            file: handle.into_file(),
+            identity,
+        };
+        guard.revalidate_visible()?;
+        Ok(guard)
+    }
+
+    pub(crate) fn revalidate_visible(&self) -> Result<()> {
+        if object_identity(self.file.as_raw_handle().cast(), true)? != self.identity {
+            anyhow::bail!("retained managed config parent changed identity");
+        }
+        let path_wide = wide_null(self.path.as_os_str())?;
+        let visible = unsafe {
+            CreateFileW(
+                path_wide.as_ptr(),
+                FILE_READ_ATTRIBUTES | READ_CONTROL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        let visible = OwnedHandle::new(
+            visible,
+            &format!(
+                "failed to revalidate visible managed config parent {}",
+                self.path.display()
+            ),
+        )?;
+        if object_identity(visible.raw(), true)? != self.identity {
+            anyhow::bail!(
+                "visible managed config parent binding changed: {}",
+                self.path.display()
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn identity(&self) -> (u64, WindowsFileId) {
+        (self.identity.namespace, self.identity.file)
+    }
+}
+
+pub(crate) fn managed_object_identity(
+    file: &File,
+    expect_directory: bool,
+) -> Result<(u64, WindowsFileId)> {
+    let identity = object_identity(file.as_raw_handle().cast(), expect_directory)?;
+    Ok((identity.namespace, identity.file))
+}
+
+/// Resolve an existing final component through its exact no-follow handle.
+/// This expands 8.3 aliases and preserves the filesystem's stored long-name
+/// spelling before ConfigLock derives the adjacent sidecar namespace.
+pub(crate) fn managed_file_stored_final_component(path: &Path) -> Result<Option<OsString>> {
+    let path_wide = wide_null(path.as_os_str())?;
+    let raw = unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            FILE_READ_ATTRIBUTES | READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(code)
+                if code == ERROR_FILE_NOT_FOUND as i32 || code == ERROR_PATH_NOT_FOUND as i32 =>
+            {
+                Ok(None)
+            }
+            _ => Err(error).with_context(|| {
+                format!(
+                    "failed to open managed config target for long-name resolution {}",
+                    path.display()
+                )
+            }),
+        };
+    }
+    let handle = OwnedHandle::new(
+        raw,
+        &format!(
+            "failed to retain managed config target for long-name resolution {}",
+            path.display()
+        ),
+    )?;
+    object_identity(handle.raw(), false)?;
+    let flags = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS;
+    let mut capacity = 256_usize;
+    loop {
+        let mut buffer = vec![0_u16; capacity];
+        let written = unsafe {
+            GetFinalPathNameByHandleW(
+                handle.raw(),
+                buffer.as_mut_ptr(),
+                u32::try_from(buffer.len()).context("Windows final path buffer is too large")?,
+                flags,
+            )
+        };
+        if written == 0 {
+            return Err(win32_error(
+                "failed to resolve managed config long final path",
+            ));
+        }
+        let written = usize::try_from(written).context("Windows final path length overflow")?;
+        if written >= buffer.len() {
+            capacity = written
+                .checked_add(1)
+                .context("Windows final path length overflow")?;
+            continue;
+        }
+        buffer.truncate(written);
+        let resolved = PathBuf::from(OsString::from_wide(&buffer));
+        let component = resolved.file_name().with_context(|| {
+            format!(
+                "resolved managed config target has no final component: {}",
+                resolved.display()
+            )
+        })?;
+        return Ok(Some(component.to_os_string()));
+    }
+}
+
+/// Reopen a renamed object through its visible path without requesting write
+/// or delete authority, then prove it still names the retained strict handle.
+pub(crate) fn revalidate_managed_file_path(
+    path: &Path,
+    authority: &File,
+    private: bool,
+) -> Result<()> {
+    let expected = object_identity(authority.as_raw_handle().cast(), false)?;
+    let expected_security = managed_file_metadata_fingerprint(authority)?;
+    let path_wide = wide_null(path.as_os_str())?;
+    let visible = unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            GENERIC_READ | FILE_READ_ATTRIBUTES | READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    let visible = OwnedHandle::new(
+        visible,
+        &format!(
+            "failed to revalidate managed config path {}",
+            path.display()
+        ),
+    )?;
+    if object_identity(visible.raw(), false)? != expected {
+        anyhow::bail!("managed config path no longer names its retained exact handle");
+    }
+    let visible_file = visible.into_file();
+    if private {
+        validate_current_user_private_file(&visible_file)?;
+    }
+    if managed_file_metadata_fingerprint(&visible_file)? != expected_security {
+        anyhow::bail!("managed config metadata changed during path revalidation");
+    }
+    Ok(())
 }
 
 /// Durable authority over the exact image object mapped by the executing
@@ -611,7 +1687,7 @@ pub(super) struct WindowsPrivateTempDir {
     tree: Option<WindowsPrivateTree>,
 }
 
-pub(super) fn ensure_private_temp_container(parent: &Path, name: &str) -> Result<PathBuf> {
+pub(crate) fn ensure_private_temp_container(parent: &Path, name: &str) -> Result<PathBuf> {
     let parent_guard = SecurePathGuard::open(parent, true, None, false, false)?;
     parent_guard.validate(None)?;
     let user = CurrentUserSid::load()?;
@@ -833,6 +1909,55 @@ mod tests {
             &format!(".kin-private-test-{}", uuid::Uuid::new_v4()),
         )
         .unwrap()
+    }
+
+    fn stream_info_buffer(names: &[&str]) -> Vec<u8> {
+        let header_len = std::mem::offset_of!(FILE_STREAM_INFO, StreamName);
+        let next_offset = std::mem::offset_of!(FILE_STREAM_INFO, NextEntryOffset);
+        let name_length_offset = std::mem::offset_of!(FILE_STREAM_INFO, StreamNameLength);
+        let alignment = size_of::<usize>();
+        let mut buffer = Vec::new();
+        for (index, name) in names.iter().enumerate() {
+            let name = name.encode_utf16().collect::<Vec<_>>();
+            let name_bytes = name.len() * size_of::<u16>();
+            let record_len = header_len + name_bytes;
+            let padded_len = record_len.div_ceil(alignment) * alignment;
+            let next = if index + 1 == names.len() {
+                0
+            } else {
+                u32::try_from(padded_len).unwrap()
+            };
+            let start = buffer.len();
+            buffer.resize(start + padded_len, 0);
+            buffer[start + next_offset..start + next_offset + size_of::<u32>()]
+                .copy_from_slice(&next.to_ne_bytes());
+            buffer[start + name_length_offset..start + name_length_offset + size_of::<u32>()]
+                .copy_from_slice(&u32::try_from(name_bytes).unwrap().to_ne_bytes());
+            for (unit_index, unit) in name.into_iter().enumerate() {
+                let offset = start + header_len + unit_index * size_of::<u16>();
+                buffer[offset..offset + size_of::<u16>()].copy_from_slice(&unit.to_ne_bytes());
+            }
+        }
+        buffer
+    }
+
+    #[test]
+    fn stream_inventory_parser_is_bounded_and_preserves_exact_names() {
+        let default = stream_info_buffer(&["::$DATA"]);
+        assert_eq!(
+            parse_managed_config_stream_buffer(&default).unwrap(),
+            ["::$DATA"]
+        );
+
+        let alternate = stream_info_buffer(&["::$DATA", ":zone.identifier:$DATA"]);
+        assert_eq!(
+            parse_managed_config_stream_buffer(&alternate).unwrap(),
+            ["::$DATA", ":zone.identifier:$DATA"]
+        );
+
+        let mut malformed = default;
+        malformed[..size_of::<u32>()].copy_from_slice(&1_u32.to_ne_bytes());
+        assert!(parse_managed_config_stream_buffer(&malformed).is_err());
     }
 
     #[test]
