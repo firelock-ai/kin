@@ -1918,6 +1918,14 @@ enum InjectedConfigObjectDrift {
     Mode(fs::File, u32),
 }
 
+#[cfg(all(test, unix))]
+enum InjectedPrivateDirectoryStage {
+    FailAfterMkdir,
+    FailAfterRepair,
+    PublishUnsafeWinner,
+    SubstituteWithSymlink(PathBuf),
+}
+
 #[cfg(test)]
 thread_local! {
     static FAIL_CONFIG_DIRECTORY_SYNC_UNDER: std::cell::RefCell<Option<PathBuf>> =
@@ -1933,6 +1941,15 @@ thread_local! {
     static INJECT_CONFIG_OBJECT_DRIFT_AT_PHASE:
         std::cell::RefCell<Option<(&'static str, InjectedConfigObjectDrift)>> =
         const { std::cell::RefCell::new(None) };
+    #[cfg(unix)]
+    static INJECT_PRIVATE_DIRECTORY_STAGE_AT:
+        std::cell::RefCell<Option<(PathBuf, InjectedPrivateDirectoryStage)>> =
+        const { std::cell::RefCell::new(None) };
+    #[cfg(unix)]
+    static INJECTED_PRIVATE_DIRECTORY_WINNER_IDENTITY:
+        std::cell::RefCell<Option<ConfigFileIdentity>> = const {
+            std::cell::RefCell::new(None)
+        };
 }
 
 #[cfg(test)]
@@ -1981,6 +1998,120 @@ fn maybe_inject_config_directory_eexist(path: &Path) -> Result<()> {
 
 #[cfg(all(not(test), unix))]
 fn maybe_inject_config_directory_eexist(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+fn inject_private_directory_stage_at(
+    path: Option<&Path>,
+    injection: Option<InjectedPrivateDirectoryStage>,
+) {
+    INJECT_PRIVATE_DIRECTORY_STAGE_AT.with(|configured| {
+        *configured.borrow_mut() = path
+            .zip(injection)
+            .map(|(path, injection)| (path.to_path_buf(), injection));
+    });
+    INJECTED_PRIVATE_DIRECTORY_WINNER_IDENTITY.with(|identity| {
+        identity.borrow_mut().take();
+    });
+}
+
+#[cfg(all(test, unix))]
+fn take_injected_private_directory_winner_identity() -> Option<ConfigFileIdentity> {
+    INJECTED_PRIVATE_DIRECTORY_WINNER_IDENTITY.with(|identity| identity.borrow_mut().take())
+}
+
+#[cfg(all(test, unix))]
+fn maybe_inject_private_directory_stage(
+    phase: &'static str,
+    parent: &fs::File,
+    stage_name: &str,
+    final_name: &std::ffi::OsStr,
+    final_path: &Path,
+) -> Result<()> {
+    let should_take = INJECT_PRIVATE_DIRECTORY_STAGE_AT.with(|configured| {
+        let configured = configured.borrow();
+        configured.as_ref().is_some_and(|(path, injection)| {
+            path == final_path
+                && matches!(
+                    (phase, injection),
+                    ("after_mkdir", InjectedPrivateDirectoryStage::FailAfterMkdir)
+                        | (
+                            "before_repair",
+                            InjectedPrivateDirectoryStage::SubstituteWithSymlink(_)
+                        )
+                        | (
+                            "after_repair",
+                            InjectedPrivateDirectoryStage::FailAfterRepair
+                        )
+                        | (
+                            "before_publish",
+                            InjectedPrivateDirectoryStage::PublishUnsafeWinner
+                        )
+                )
+        })
+    });
+    if !should_take {
+        return Ok(());
+    }
+    let (_, injection) = INJECT_PRIVATE_DIRECTORY_STAGE_AT
+        .with(|configured| configured.borrow_mut().take())
+        .context("private-directory stage injection disappeared")?;
+    match injection {
+        InjectedPrivateDirectoryStage::FailAfterMkdir => {
+            anyhow::bail!("injected crash after private-directory staged mkdir")
+        }
+        InjectedPrivateDirectoryStage::FailAfterRepair => {
+            anyhow::bail!("injected crash after private-directory staged repair")
+        }
+        InjectedPrivateDirectoryStage::PublishUnsafeWinner => {
+            rustix::fs::mkdirat(parent, final_name, rustix::fs::Mode::from_raw_mode(0o777))?;
+            let fd = rustix::fs::openat(
+                parent,
+                final_name,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )?;
+            let winner = fs::File::from(fd);
+            rustix::fs::fchmod(&winner, rustix::fs::Mode::from_raw_mode(0o777))?;
+            let sentinel = rustix::fs::openat(
+                &winner,
+                "sentinel",
+                rustix::fs::OFlags::WRONLY
+                    | rustix::fs::OFlags::CREATE
+                    | rustix::fs::OFlags::EXCL
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::from_raw_mode(0o600),
+            )?;
+            let mut sentinel = fs::File::from(sentinel);
+            sentinel.write_all(b"raced winner must survive")?;
+            sentinel.sync_all()?;
+            winner.sync_all()?;
+            let identity = ConfigFileIdentity::from_metadata(&winner.metadata()?);
+            INJECTED_PRIVATE_DIRECTORY_WINNER_IDENTITY.with(|configured| {
+                *configured.borrow_mut() = Some(identity);
+            });
+            Ok(())
+        }
+        InjectedPrivateDirectoryStage::SubstituteWithSymlink(target) => {
+            rustix::fs::unlinkat(parent, stage_name, rustix::fs::AtFlags::REMOVEDIR)?;
+            rustix::fs::symlinkat(&target, parent, stage_name)?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(all(not(test), unix))]
+fn maybe_inject_private_directory_stage(
+    _phase: &'static str,
+    _parent: &fs::File,
+    _stage_name: &str,
+    _final_name: &std::ffi::OsStr,
+    _final_path: &Path,
+) -> Result<()> {
     Ok(())
 }
 
@@ -2128,50 +2259,18 @@ impl ConfigTransactionAuthority {
             let kin_home_handle = kin_home_authority.file.try_clone()?;
             let kin_home_identity = kin_home_authority.identity.clone();
             let root_name = "config-transactions";
-            let root_created = match rustix::fs::mkdirat(
+            let (root_handle, _, identity) = open_or_create_private_unix_directory_at(
                 &kin_home_handle,
-                root_name,
-                rustix::fs::Mode::from_raw_mode(0o700),
-            ) {
-                Ok(()) => true,
-                Err(rustix::io::Errno::EXIST) => false,
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "failed to create managed config transaction root {}",
-                            root.display()
-                        )
-                    })
-                }
-            };
-            let fd = rustix::fs::openat(
-                &kin_home_handle,
-                root_name,
-                rustix::fs::OFlags::RDONLY
-                    | rustix::fs::OFlags::DIRECTORY
-                    | rustix::fs::OFlags::NOFOLLOW
-                    | rustix::fs::OFlags::CLOEXEC,
-                rustix::fs::Mode::empty(),
+                &kin_home,
+                std::ffi::OsStr::new(root_name),
+                &root,
             )
-            .with_context(|| format!("failed to anchor {}", root.display()))?;
-            let root_handle = fs::File::from(fd);
-            let identity = validate_private_unix_directory(&root, &root_handle, root_created)?;
-            let named = rustix::fs::statat(
-                &kin_home_handle,
-                root_name,
-                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-            )?;
-            if named.st_dev as u64 != identity.device
-                || named.st_ino as u64 != identity.inode
-                || rustix::fs::FileType::from_raw_mode(named.st_mode)
-                    != rustix::fs::FileType::Directory
-            {
-                anyhow::bail!("managed config transaction root changed during anchored creation");
-            }
-            sync_config_parent(&root_handle)?;
-            if root_created {
-                sync_config_parent(&kin_home_handle)?;
-            }
+            .with_context(|| {
+                format!(
+                    "failed to create managed config transaction root {}",
+                    root.display()
+                )
+            })?;
             ensure_config_parent_binding(&kin_home, &kin_home_handle, &kin_home_identity)?;
             (root_handle, identity)
         };
@@ -2188,47 +2287,16 @@ impl ConfigTransactionAuthority {
         #[cfg(unix)]
         let (vault, vault_path, vault_identity) = {
             let vault_name = format!("{key}.objects");
-            let vault_created = match rustix::fs::mkdirat(
-                &transaction_root,
-                vault_name.as_str(),
-                rustix::fs::Mode::from_raw_mode(0o700),
-            ) {
-                Ok(()) => true,
-                Err(rustix::io::Errno::EXIST) => false,
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("failed to create managed config object vault {vault_name}")
-                    })
-                }
-            };
-            let fd = rustix::fs::openat(
-                &transaction_root,
-                vault_name.as_str(),
-                rustix::fs::OFlags::RDONLY
-                    | rustix::fs::OFlags::DIRECTORY
-                    | rustix::fs::OFlags::NOFOLLOW
-                    | rustix::fs::OFlags::CLOEXEC,
-                rustix::fs::Mode::empty(),
-            )?;
-            let vault = fs::File::from(fd);
             let vault_path = root.join(&vault_name);
-            let identity = validate_private_unix_directory(&vault_path, &vault, vault_created)?;
-            let named = rustix::fs::statat(
+            let (vault, _, identity) = open_or_create_private_unix_directory_at(
                 &transaction_root,
-                vault_name.as_str(),
-                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-            )?;
-            if named.st_dev as u64 != identity.device
-                || named.st_ino as u64 != identity.inode
-                || rustix::fs::FileType::from_raw_mode(named.st_mode)
-                    != rustix::fs::FileType::Directory
-            {
-                anyhow::bail!("managed config object vault changed during anchored creation");
-            }
-            sync_config_parent(&vault)?;
-            if vault_created {
-                sync_config_parent(&transaction_root)?;
-            }
+                &root,
+                std::ffi::OsStr::new(&vault_name),
+                &vault_path,
+            )
+            .with_context(|| {
+                format!("failed to create managed config object vault {vault_name}")
+            })?;
             (vault, vault_path, identity)
         };
         let guard_name = format!("{key}.guard");
@@ -2987,6 +3055,397 @@ fn validate_private_unix_directory(
         device: stat.st_dev as u64,
         inode: stat.st_ino as u64,
     })
+}
+
+#[cfg(unix)]
+fn repair_restrictive_umask_on_new_private_directory(
+    parent: &fs::File,
+    name: &std::ffi::OsStr,
+    display: &Path,
+) -> Result<ConfigFileIdentity> {
+    let created_stat = rustix::fs::statat(parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+    if rustix::fs::FileType::from_raw_mode(created_stat.st_mode) != rustix::fs::FileType::Directory
+        || created_stat.st_uid != unsafe { libc::geteuid() }
+    {
+        anyhow::bail!(
+            "new private directory changed before restrictive-umask repair: {}",
+            display.display()
+        );
+    }
+    let identity = ConfigFileIdentity {
+        device: created_stat.st_dev as u64,
+        inode: created_stat.st_ino as u64,
+    };
+    // mkdirat honors the process umask and can therefore create mode 000. This
+    // is an unpublished random staging name beneath a locked, anchored parent;
+    // EEXIST winners at the final name never enter this repair path.
+    if created_stat.st_mode as u32 & 0o7777 != 0o700 {
+        #[cfg(target_os = "linux")]
+        {
+            use std::ffi::CString;
+            use std::os::fd::AsRawFd as _;
+            use std::os::unix::ffi::OsStrExt as _;
+
+            let name =
+                CString::new(name.as_bytes()).context("new private directory name contains NUL")?;
+            // fchmodat2 is syscall 452 on Kin's supported Linux x86_64 and
+            // aarch64 targets. libc does not expose SYS_fchmodat2 on every
+            // supported architecture, so keep the number local and fail loud
+            // with ENOSYS on an older kernel rather than following a symlink.
+            const LINUX_SYS_FCHMODAT2: libc::c_long = 452;
+            let result = unsafe {
+                libc::syscall(
+                    LINUX_SYS_FCHMODAT2,
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    0o700 as libc::mode_t,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if result != 0 {
+                return Err(io::Error::last_os_error()).with_context(|| {
+                    format!(
+                        "failed exact no-follow restrictive-umask repair for {}",
+                        display.display()
+                    )
+                });
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        rustix::fs::chmodat(
+            parent,
+            name,
+            rustix::fs::Mode::from_raw_mode(0o700),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )?;
+    }
+    let repaired = rustix::fs::statat(parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+    if repaired.st_dev as u64 != identity.device
+        || repaired.st_ino as u64 != identity.inode
+        || rustix::fs::FileType::from_raw_mode(repaired.st_mode) != rustix::fs::FileType::Directory
+        || repaired.st_uid != unsafe { libc::geteuid() }
+        || repaired.st_mode as u32 & 0o7777 != 0o700
+    {
+        anyhow::bail!(
+            "new private directory changed during restrictive-umask repair: {}",
+            display.display()
+        );
+    }
+    Ok(identity)
+}
+
+#[cfg(unix)]
+const PRIVATE_DIRECTORY_STAGE_PREFIX: &str = ".kin-private-directory-stage-";
+
+#[cfg(unix)]
+const PRIVATE_DIRECTORY_STAGE_SUFFIX: &str = ".tmp";
+
+#[cfg(unix)]
+fn private_directory_stage_uuid(name: &str) -> Option<&str> {
+    name.strip_prefix(PRIVATE_DIRECTORY_STAGE_PREFIX)
+        .and_then(|name| name.strip_suffix(PRIVATE_DIRECTORY_STAGE_SUFFIX))
+        .filter(|uuid| uuid::Uuid::parse_str(uuid).is_ok())
+}
+
+#[cfg(unix)]
+fn lock_private_directory_parent(parent: &fs::File, display: &Path) -> Result<fs::File> {
+    let expected = config_parent_identity(parent)?;
+    let fd = rustix::fs::openat(
+        parent,
+        ".",
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    let guard = fs::File::from(fd);
+    if config_parent_identity(&guard)? != expected {
+        anyhow::bail!(
+            "private-directory parent changed before staging: {}",
+            display.display()
+        );
+    }
+    lock_file_exclusive_bounded(
+        &guard,
+        &format!("private-directory parent {}", display.display()),
+    )?;
+    if config_parent_identity(parent)? != expected || config_parent_identity(&guard)? != expected {
+        anyhow::bail!(
+            "private-directory parent changed while Kin waited: {}",
+            display.display()
+        );
+    }
+    Ok(guard)
+}
+
+#[cfg(unix)]
+fn cleanup_orphaned_private_directory_stages(parent: &fs::File, display: &Path) -> Result<()> {
+    const MAX_ORPHAN_STAGES: usize = 64;
+
+    let mut entries = rustix::fs::Dir::read_from(parent).with_context(|| {
+        format!(
+            "failed to enumerate private-directory parent {}",
+            display.display()
+        )
+    })?;
+    let mut owned = Vec::new();
+    for entry in &mut entries {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to read private-directory parent {}",
+                display.display()
+            )
+        })?;
+        let bytes = entry.file_name().to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        let Ok(name) = std::str::from_utf8(bytes) else {
+            continue;
+        };
+        if private_directory_stage_uuid(name).is_none() {
+            continue;
+        }
+        if owned.len() == MAX_ORPHAN_STAGES {
+            anyhow::bail!(
+                "private-directory parent has more than {MAX_ORPHAN_STAGES} Kin staging residues: {}",
+                display.display()
+            );
+        }
+        let stat = rustix::fs::statat(parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+        if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory
+            || stat.st_uid != unsafe { libc::geteuid() }
+        {
+            anyhow::bail!(
+                "Kin private-directory staging residue has unsafe authority and was retained: {}",
+                display.join(name).display()
+            );
+        }
+        owned.push(name.to_string());
+    }
+    if owned.is_empty() {
+        return Ok(());
+    }
+    for name in &owned {
+        rustix::fs::unlinkat(parent, name.as_str(), rustix::fs::AtFlags::REMOVEDIR).with_context(
+            || {
+                format!(
+                    "Kin private-directory staging residue is not an empty owned directory and was retained: {}",
+                    display.join(name).display()
+                )
+            },
+        )?;
+    }
+    sync_config_parent(parent)
+}
+
+#[cfg(unix)]
+fn ensure_private_directory_binding_at(
+    parent: &fs::File,
+    name: &std::ffi::OsStr,
+    identity: &ConfigFileIdentity,
+    label: &str,
+) -> Result<()> {
+    let stat = rustix::fs::statat(parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        .with_context(|| format!("{label} disappeared"))?;
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory
+        || stat.st_dev as u64 != identity.device
+        || stat.st_ino as u64 != identity.inode
+    {
+        anyhow::bail!("{label} changed object identity");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_existing_private_unix_directory_at(
+    parent: &fs::File,
+    name: &std::ffi::OsStr,
+    display: &Path,
+) -> Result<(fs::File, ConfigFileIdentity)> {
+    let fd = rustix::fs::openat(
+        parent,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .with_context(|| format!("failed to anchor private directory {}", display.display()))?;
+    let directory = fs::File::from(fd);
+    let identity = validate_private_unix_directory(display, &directory, false)?;
+    ensure_private_directory_binding_at(parent, name, &identity, "managed private directory")?;
+    Ok((directory, identity))
+}
+
+#[cfg(unix)]
+fn open_or_create_private_unix_directory_at(
+    parent: &fs::File,
+    parent_display: &Path,
+    final_name: &std::ffi::OsStr,
+    final_display: &Path,
+) -> Result<(fs::File, bool, ConfigFileIdentity)> {
+    let _parent_guard = lock_private_directory_parent(parent, parent_display)?;
+    cleanup_orphaned_private_directory_stages(parent, parent_display)?;
+
+    match rustix::fs::statat(parent, final_name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(_) => {
+            let (directory, identity) =
+                open_existing_private_unix_directory_at(parent, final_name, final_display)?;
+            return Ok((directory, false, identity));
+        }
+        Err(rustix::io::Errno::NOENT) => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect private directory {}",
+                    final_display.display()
+                )
+            })
+        }
+    }
+
+    let stage_name = (0..8)
+        .find_map(|attempt| {
+            let name = format!(
+                "{PRIVATE_DIRECTORY_STAGE_PREFIX}{}{PRIVATE_DIRECTORY_STAGE_SUFFIX}",
+                uuid::Uuid::new_v4()
+            );
+            match rustix::fs::mkdirat(
+                parent,
+                name.as_str(),
+                rustix::fs::Mode::from_raw_mode(0o700),
+            ) {
+                Ok(()) => Some(Ok(name)),
+                Err(rustix::io::Errno::EXIST) if attempt + 1 < 8 => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .context("failed to allocate a unique private-directory staging name")?
+        .with_context(|| {
+            format!(
+                "failed to create private-directory stage for {}",
+                final_display.display()
+            )
+        })?;
+
+    maybe_inject_private_directory_stage(
+        "after_mkdir",
+        parent,
+        &stage_name,
+        final_name,
+        final_display,
+    )?;
+    maybe_inject_private_directory_stage(
+        "before_repair",
+        parent,
+        &stage_name,
+        final_name,
+        final_display,
+    )?;
+    let created_identity = repair_restrictive_umask_on_new_private_directory(
+        parent,
+        std::ffi::OsStr::new(&stage_name),
+        &parent_display.join(&stage_name),
+    )?;
+    maybe_inject_private_directory_stage(
+        "after_repair",
+        parent,
+        &stage_name,
+        final_name,
+        final_display,
+    )?;
+
+    let fd = rustix::fs::openat(
+        parent,
+        stage_name.as_str(),
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .with_context(|| {
+        format!(
+            "failed to anchor private-directory stage for {}",
+            final_display.display()
+        )
+    })?;
+    let staged = fs::File::from(fd);
+    if ConfigFileIdentity::from_metadata(&staged.metadata()?) != created_identity {
+        anyhow::bail!(
+            "private-directory stage changed before anchored validation: {}",
+            final_display.display()
+        );
+    }
+    let staged_identity = validate_private_unix_directory(final_display, &staged, true)?;
+    if staged_identity != created_identity {
+        anyhow::bail!(
+            "private-directory stage changed during anchored validation: {}",
+            final_display.display()
+        );
+    }
+    ensure_private_directory_binding_at(
+        parent,
+        std::ffi::OsStr::new(&stage_name),
+        &staged_identity,
+        "managed private-directory stage",
+    )?;
+    sync_config_parent(&staged)?;
+    sync_config_parent(parent)?;
+    maybe_inject_private_directory_stage(
+        "before_publish",
+        parent,
+        &stage_name,
+        final_name,
+        final_display,
+    )?;
+
+    match rustix::fs::renameat_with(
+        parent,
+        stage_name.as_str(),
+        parent,
+        final_name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => {
+            if config_directory_sync_injected(final_display) {
+                anyhow::bail!(
+                    "injected durable config directory sync failure at {}",
+                    final_display.display()
+                );
+            }
+            sync_config_parent(parent)?;
+            ensure_private_directory_binding_at(
+                parent,
+                final_name,
+                &staged_identity,
+                "published managed private directory",
+            )?;
+            Ok((staged, true, staged_identity))
+        }
+        Err(rustix::io::Errno::EXIST) => {
+            ensure_private_directory_binding_at(
+                parent,
+                std::ffi::OsStr::new(&stage_name),
+                &staged_identity,
+                "unpublished managed private-directory stage",
+            )?;
+            rustix::fs::unlinkat(parent, stage_name.as_str(), rustix::fs::AtFlags::REMOVEDIR)?;
+            sync_config_parent(parent)?;
+            let (directory, identity) =
+                open_existing_private_unix_directory_at(parent, final_name, final_display)?;
+            Ok((directory, false, identity))
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to publish private directory {} without replacement",
+                final_display.display()
+            )
+        }),
+    }
 }
 
 #[cfg(unix)]
@@ -4001,50 +4460,58 @@ fn create_config_directory_all_durable(
     }
     let mut final_created = false;
     for (index, component) in missing.iter().rev().enumerate() {
-        maybe_inject_config_directory_eexist(&display.join(component))?;
-        let created = match rustix::fs::mkdirat(
-            &parent,
-            component.as_os_str(),
-            rustix::fs::Mode::from_raw_mode(if private_chain { 0o700 } else { 0o777 }),
-        ) {
-            Ok(()) => true,
-            Err(rustix::io::Errno::EXIST) => false,
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to create anchored config directory {}",
-                        display.join(component).display()
-                    )
-                })
+        let child_display = display.join(component);
+        maybe_inject_config_directory_eexist(&child_display)?;
+        let (child, created) = if private_chain {
+            let (child, created, _) = open_or_create_private_unix_directory_at(
+                &parent,
+                &display,
+                component.as_os_str(),
+                &child_display,
+            )?;
+            (child, created)
+        } else {
+            let created = match rustix::fs::mkdirat(
+                &parent,
+                component.as_os_str(),
+                rustix::fs::Mode::from_raw_mode(0o777),
+            ) {
+                Ok(()) => true,
+                Err(rustix::io::Errno::EXIST) => false,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to create anchored config directory {}",
+                            child_display.display()
+                        )
+                    })
+                }
+            };
+            if created {
+                if config_directory_sync_injected(&child_display) {
+                    anyhow::bail!(
+                        "injected durable config directory sync failure at {}",
+                        child_display.display()
+                    );
+                }
+                // Persist the new directory entry before any later fallible open.
+                sync_config_parent(&parent)?;
             }
+            let fd = rustix::fs::openat(
+                &parent,
+                component.as_os_str(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )?;
+            let child = fs::File::from(fd);
+            if created {
+                sync_config_parent(&child)?;
+            }
+            (child, created)
         };
-        if created {
-            let created_path = display.join(component);
-            if config_directory_sync_injected(&created_path) {
-                anyhow::bail!(
-                    "injected durable config directory sync failure at {}",
-                    created_path.display()
-                );
-            }
-            // Persist the new directory entry before any later fallible open.
-            sync_config_parent(&parent)?;
-        }
-        let fd = rustix::fs::openat(
-            &parent,
-            component.as_os_str(),
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::DIRECTORY
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::empty(),
-        )?;
-        let child = fs::File::from(fd);
-        if private_chain {
-            validate_private_unix_directory(&display.join(component), &child, created)?;
-        }
-        if created {
-            sync_config_parent(&child)?;
-        }
         display.push(component);
         parent = child;
         if index + 1 == missing.len() {
@@ -10126,6 +10593,353 @@ mod tests {
             !raced.join("deeper").exists(),
             "unsafe authority must be rejected before deeper descendants"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_chain_repairs_only_new_entries_under_restrictive_umask() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Command;
+
+        const WORKER_PATH: &str = "KIN_TEST_RESTRICTIVE_PRIVATE_CHAIN_PATH";
+        if let Some(path) = std::env::var_os(WORKER_PATH) {
+            unsafe {
+                libc::umask(0o777);
+            }
+            let nested = PathBuf::from(path).join("first/second");
+            let authority = create_config_directory_all_durable(&nested, true).unwrap();
+            for path in [
+                authority.path.clone(),
+                authority.path.parent().unwrap().to_path_buf(),
+            ] {
+                assert_eq!(
+                    fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777,
+                    0o700
+                );
+            }
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::setup::tests::private_directory_chain_repairs_only_new_entries_under_restrictive_umask",
+                "--nocapture",
+            ])
+            .env(WORKER_PATH, dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "restrictive-umask worker output: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restrictive_umask_keeps_transaction_root_vault_and_guard_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Command;
+
+        const WORKER_ROOT: &str = "KIN_TEST_RESTRICTIVE_TRANSACTION_ROOT";
+        if let Some(root) = std::env::var_os(WORKER_ROOT) {
+            let root = PathBuf::from(root);
+            let subject = root.join("subject");
+            fs::write(&subject, b"subject").unwrap();
+            let subject_identity =
+                ConfigFileIdentity::from_metadata(&fs::metadata(&subject).unwrap());
+            unsafe {
+                libc::umask(0o777);
+            }
+            let transaction = ConfigTransactionAuthority::acquire(&subject_identity).unwrap();
+            let kin_home = std::env::temp_dir()
+                .join(format!(
+                    "kin-config-transaction-tests-{}",
+                    std::process::id()
+                ))
+                .canonicalize()
+                .unwrap();
+            let transaction_root = kin_home.join("config-transactions");
+            let vault =
+                transaction_root.join(format!("{}.objects", subject_identity.authority_key()));
+            let guard =
+                transaction_root.join(format!("{}.guard", subject_identity.authority_key()));
+            for directory in [&kin_home, &transaction_root, &vault] {
+                assert_eq!(
+                    fs::symlink_metadata(directory)
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o7777,
+                    0o700,
+                    "unexpected private-directory mode at {}",
+                    directory.display()
+                );
+                assert!(private_directory_stage_paths(directory).is_empty());
+            }
+            assert_eq!(
+                fs::symlink_metadata(&guard).unwrap().permissions().mode() & 0o7777,
+                0o600
+            );
+            assert_eq!(transaction.root_path, transaction_root);
+            assert_eq!(transaction.vault_path, vault);
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::setup::tests::restrictive_umask_keeps_transaction_root_vault_and_guard_private",
+                "--nocapture",
+            ])
+            .env(WORKER_ROOT, dir.path())
+            .env("TMPDIR", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "restrictive transaction worker output: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    fn private_directory_stage_paths(parent: &Path) -> Vec<PathBuf> {
+        fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| private_directory_stage_uuid(name).is_some())
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_retry_cleans_crash_after_staged_mkdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_path = dir.path().canonicalize().unwrap();
+        let parent = open_config_parent_nofollow(&parent_path).unwrap();
+        let final_path = parent_path.join("private");
+        inject_private_directory_stage_at(
+            Some(&final_path),
+            Some(InjectedPrivateDirectoryStage::FailAfterMkdir),
+        );
+
+        let error = open_or_create_private_unix_directory_at(
+            &parent,
+            &parent_path,
+            std::ffi::OsStr::new("private"),
+            &final_path,
+        )
+        .expect_err("the injected crash boundary must retain only the unpublished stage");
+
+        assert!(format!("{error:#}").contains("after private-directory staged mkdir"));
+        assert!(!final_path.exists());
+        assert_eq!(private_directory_stage_paths(&parent_path).len(), 1);
+        let (_, created, _) = open_or_create_private_unix_directory_at(
+            &parent,
+            &parent_path,
+            std::ffi::OsStr::new("private"),
+            &final_path,
+        )
+        .unwrap();
+        assert!(created);
+        assert!(final_path.is_dir());
+        assert!(private_directory_stage_paths(&parent_path).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_retry_cleans_crash_after_staged_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_path = dir.path().canonicalize().unwrap();
+        let parent = open_config_parent_nofollow(&parent_path).unwrap();
+        let final_path = parent_path.join("private");
+        inject_private_directory_stage_at(
+            Some(&final_path),
+            Some(InjectedPrivateDirectoryStage::FailAfterRepair),
+        );
+
+        let error = open_or_create_private_unix_directory_at(
+            &parent,
+            &parent_path,
+            std::ffi::OsStr::new("private"),
+            &final_path,
+        )
+        .expect_err("the injected crash boundary must retain only the unpublished stage");
+
+        assert!(format!("{error:#}").contains("after private-directory staged repair"));
+        assert!(!final_path.exists());
+        assert_eq!(private_directory_stage_paths(&parent_path).len(), 1);
+        let (_, created, _) = open_or_create_private_unix_directory_at(
+            &parent,
+            &parent_path,
+            std::ffi::OsStr::new("private"),
+            &final_path,
+        )
+        .unwrap();
+        assert!(created);
+        assert!(final_path.is_dir());
+        assert!(private_directory_stage_paths(&parent_path).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_stage_symlink_substitution_never_mutates_target() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent_path = dir.path().canonicalize().unwrap();
+        let parent = open_config_parent_nofollow(&parent_path).unwrap();
+        let final_path = parent_path.join("private");
+        let sentinel = parent_path.join("sentinel");
+        fs::write(&sentinel, b"must survive unchanged").unwrap();
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o640)).unwrap();
+        let original_mode = fs::metadata(&sentinel).unwrap().permissions().mode() & 0o7777;
+        inject_private_directory_stage_at(
+            Some(&final_path),
+            Some(InjectedPrivateDirectoryStage::SubstituteWithSymlink(
+                sentinel.clone(),
+            )),
+        );
+
+        let error = open_or_create_private_unix_directory_at(
+            &parent,
+            &parent_path,
+            std::ffi::OsStr::new("private"),
+            &final_path,
+        )
+        .expect_err("a substituted staging symlink must be rejected before chmod");
+
+        assert!(format!("{error:#}").contains("changed before restrictive-umask repair"));
+        assert!(!final_path.exists());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"must survive unchanged");
+        assert_eq!(
+            fs::metadata(&sentinel).unwrap().permissions().mode() & 0o7777,
+            original_mode
+        );
+        let residues = private_directory_stage_paths(&parent_path);
+        assert_eq!(residues.len(), 1);
+        assert!(fs::symlink_metadata(&residues[0])
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        fs::remove_file(&residues[0]).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_noreplace_rejects_unsafe_raced_winner_without_repair() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent_path = dir.path().canonicalize().unwrap();
+        let parent = open_config_parent_nofollow(&parent_path).unwrap();
+        let final_path = parent_path.join("private");
+        inject_private_directory_stage_at(
+            Some(&final_path),
+            Some(InjectedPrivateDirectoryStage::PublishUnsafeWinner),
+        );
+
+        let error = open_or_create_private_unix_directory_at(
+            &parent,
+            &parent_path,
+            std::ffi::OsStr::new("private"),
+            &final_path,
+        )
+        .expect_err("an unsafe final-name winner must fail after NOREPLACE");
+
+        let injected_identity = take_injected_private_directory_winner_identity()
+            .expect("the exact injected winner identity must be retained for comparison");
+        assert!(format!("{error:#}").contains("mode 0700"));
+        assert_eq!(
+            ConfigFileIdentity::from_metadata(&fs::symlink_metadata(&final_path).unwrap()),
+            injected_identity,
+            "NOREPLACE must retain the exact raced winner"
+        );
+        assert_eq!(
+            fs::symlink_metadata(&final_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o777,
+            "the raced EEXIST winner must never be repaired"
+        );
+        assert_eq!(
+            fs::read(final_path.join("sentinel")).unwrap(),
+            b"raced winner must survive"
+        );
+        assert!(
+            private_directory_stage_paths(&parent_path).is_empty(),
+            "only the exact Kin-owned unpublished stage may be removed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_parent_lock_preserves_live_cooperative_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_path = dir.path().canonicalize().unwrap();
+        let holder_parent_path = parent_path.clone();
+        let holder_parent = open_config_parent_nofollow(&holder_parent_path).unwrap();
+        let stage_name = format!(
+            "{PRIVATE_DIRECTORY_STAGE_PREFIX}{}{PRIVATE_DIRECTORY_STAGE_SUFFIX}",
+            uuid::Uuid::new_v4()
+        );
+        let holder_stage_name = stage_name.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let guard = lock_private_directory_parent(&holder_parent, &holder_parent_path).unwrap();
+            rustix::fs::mkdirat(
+                &holder_parent,
+                holder_stage_name.as_str(),
+                rustix::fs::Mode::from_raw_mode(0o700),
+            )
+            .unwrap();
+            sync_config_parent(&holder_parent).unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(guard);
+        });
+        ready_rx.recv().unwrap();
+
+        let creator_parent_path = parent_path.clone();
+        let creator_parent = open_config_parent_nofollow(&creator_parent_path).unwrap();
+        let final_path = creator_parent_path.join("private");
+        let creator_final_path = final_path.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let creator = std::thread::spawn(move || {
+            done_tx
+                .send(open_or_create_private_unix_directory_at(
+                    &creator_parent,
+                    &creator_parent_path,
+                    std::ffi::OsStr::new("private"),
+                    &creator_final_path,
+                ))
+                .unwrap();
+        });
+        assert!(matches!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(150)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(parent_path.join(&stage_name).is_dir());
+        release_tx.send(()).unwrap();
+        done_rx.recv().unwrap().unwrap();
+        holder.join().unwrap();
+        creator.join().unwrap();
+
+        assert!(final_path.is_dir());
+        assert!(private_directory_stage_paths(&parent_path).is_empty());
     }
 
     #[cfg(unix)]

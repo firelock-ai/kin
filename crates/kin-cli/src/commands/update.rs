@@ -10062,6 +10062,9 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::ffi::{OsStr, OsString};
+    use std::process::{Output, Stdio};
+
+    const TEST_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 
     struct EnvGuard {
         key: &'static str,
@@ -10083,6 +10086,122 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    fn join_test_child_pipe(
+        reader: std::thread::JoinHandle<io::Result<Vec<u8>>>,
+        label: &str,
+    ) -> Result<Vec<u8>> {
+        reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("{label} output reader panicked"))?
+            .with_context(|| format!("failed to read {label} output"))
+    }
+
+    fn test_subprocess_output_with_timeout(
+        command: &mut Command,
+        label: &str,
+        timeout: Duration,
+    ) -> Result<Output> {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to spawn {label}"))?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .context("bounded test child has no stdout pipe")?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .context("bounded test child has no stderr pipe")?;
+        let stdout_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        });
+        let stderr_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        });
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(status) = child
+                .try_wait()
+                .with_context(|| format!("failed to poll {label}"))?
+            {
+                return Ok(Output {
+                    status,
+                    stdout: join_test_child_pipe(stdout_reader, "test child stdout")?,
+                    stderr: join_test_child_pipe(stderr_reader, "test child stderr")?,
+                });
+            }
+            if std::time::Instant::now() >= deadline {
+                let kill_error = child.kill().err();
+                let status = child.wait().ok();
+                let stdout = join_test_child_pipe(stdout_reader, "timed-out test child stdout")?;
+                let stderr = join_test_child_pipe(stderr_reader, "timed-out test child stderr")?;
+                anyhow::bail!(
+                    "{label} timed out after {timeout:?}; kill_error={kill_error:?}; status={status:?}; stdout={} stderr={}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn test_subprocess_output(command: &mut Command, label: &str) -> Result<Output> {
+        test_subprocess_output_with_timeout(command, label, TEST_SUBPROCESS_TIMEOUT)
+    }
+
+    #[test]
+    fn bounded_test_subprocess_worker() {
+        let Some(marker) = std::env::var_os("KIN_TEST_BOUNDED_CHILD_MARKER") else {
+            return;
+        };
+        println!("bounded child stdout");
+        io::stdout().flush().unwrap();
+        eprintln!("bounded child stderr");
+        fs::write(PathBuf::from(&marker).with_extension("started"), b"started").unwrap();
+        std::thread::sleep(Duration::from_secs(30));
+        fs::write(
+            PathBuf::from(marker).with_extension("finished"),
+            b"finished",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn bounded_test_subprocess_kills_and_reaps_a_stalled_child_with_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("bounded-child");
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "commands::update::tests::bounded_test_subprocess_worker",
+                "--nocapture",
+            ])
+            .env("KIN_TEST_BOUNDED_CHILD_MARKER", &marker);
+
+        let error = test_subprocess_output_with_timeout(
+            &mut command,
+            "bounded sleep-worker fixture",
+            Duration::from_secs(5),
+        )
+        .expect_err("the bounded helper must terminate the sleeping worker");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("timed out"), "{message}");
+        assert!(message.contains("bounded child stdout"), "{message}");
+        assert!(message.contains("bounded child stderr"), "{message}");
+        assert!(marker.with_extension("started").is_file());
+        assert!(!marker.with_extension("finished").exists());
     }
 
     #[cfg(windows)]
@@ -10665,7 +10784,8 @@ mod tests {
         )
         .unwrap();
 
-        let output = Command::new(std::env::current_exe().unwrap())
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
             .args([
                 "--exact",
                 "commands::update::tests::crash_recovery_worker",
@@ -10679,9 +10799,10 @@ mod tests {
             .env_remove("KIN_MCP_REPO")
             .env("KIN_UPDATE_TEST_WORKER_HOME", &kin_home)
             .env("KIN_UPDATE_TEST_WORKER_STAGE", &stage)
-            .env("KIN_UPDATE_TEST_CRASH_POINT", point)
-            .output()
-            .unwrap();
+            .env("KIN_UPDATE_TEST_CRASH_POINT", point);
+        let output =
+            test_subprocess_output(&mut command, &format!("crash recovery worker at {point}"))
+                .unwrap();
         assert_eq!(
             output.status.code(),
             Some(86),
@@ -10806,7 +10927,9 @@ cwd = {:?}
         if let Some(umask) = umask {
             command.env("KIN_UPDATE_TEST_UMASK", umask);
         }
-        let output = command.output().unwrap();
+        let output =
+            test_subprocess_output(&mut command, &format!("crash update worker at {point}"))
+                .unwrap();
         assert_eq!(
             output.status.code(),
             Some(86),
@@ -11369,6 +11492,7 @@ cwd = {:?}
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn every_post_mutation_precommit_error_restores_the_old_bundle_immediately() {
         for failure_point in [
             "after-backup-mutation-0",
@@ -11378,6 +11502,10 @@ cwd = {:?}
             let tmp = tempfile::tempdir().unwrap();
             let kin_home = tmp.path().join("kin-home");
             let stage = tmp.path().join("stage");
+            let home = tmp.path().join("home");
+            fs::create_dir(&home).unwrap();
+            let _home = EnvGuard::set("HOME", &home);
+            let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
             write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
             let expected = bundle_snapshot(&kin_home, LINUX_COMPONENTS);
             stage_archive(
@@ -11476,7 +11604,8 @@ cwd = {:?}
         let state = crash_update("after-install-3", None);
         let home = state._tmp.path().join("rollback-home");
         fs::create_dir_all(&home).unwrap();
-        let output = Command::new(std::env::current_exe().unwrap())
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
             .args([
                 "--exact",
                 "commands::update::tests::crash_recovery_worker",
@@ -11486,9 +11615,12 @@ cwd = {:?}
             .env("KIN_HOME", &state.kin_home)
             .env("KIN_UPDATE_TEST_WORKER_HOME", &state.kin_home)
             .env("KIN_UPDATE_TEST_WORKER_RECOVER", "1")
-            .env("KIN_UPDATE_TEST_CRASH_POINT", "after-rollback-remove-kin")
-            .output()
-            .unwrap();
+            .env("KIN_UPDATE_TEST_CRASH_POINT", "after-rollback-remove-kin");
+        let output = test_subprocess_output(
+            &mut command,
+            "crash recovery worker at after-rollback-remove-kin",
+        )
+        .unwrap();
         assert_eq!(
             output.status.code(),
             Some(86),
@@ -14639,16 +14771,17 @@ cwd = {:?}
 
     fn spawn_private_temp_orphan(parent: &Path) -> PathBuf {
         let marker = parent.join(format!("marker-{}", uuid::Uuid::new_v4()));
-        let output = Command::new(std::env::current_exe().unwrap())
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
             .args([
                 "--exact",
                 "commands::update::tests::private_temp_lease_crash_worker",
                 "--nocapture",
             ])
             .env("KIN_UPDATE_TEMP_LEASE_CRASH_PARENT", parent)
-            .env("KIN_UPDATE_TEMP_LEASE_CRASH_MARKER", &marker)
-            .output()
-            .unwrap();
+            .env("KIN_UPDATE_TEMP_LEASE_CRASH_MARKER", &marker);
+        let output =
+            test_subprocess_output(&mut command, "private temp lease crash worker").unwrap();
         assert_eq!(
             output.status.code(),
             Some(86),
@@ -14683,16 +14816,20 @@ cwd = {:?}
             let temp = tempfile::tempdir().unwrap();
             let orphan = spawn_private_temp_orphan(temp.path());
             fs::write(orphan.join("payload"), b"owned payload").unwrap();
-            let output = Command::new(std::env::current_exe().unwrap())
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
                 .args([
                     "--exact",
                     "commands::update::tests::private_temp_cleanup_crash_worker",
                     "--nocapture",
                 ])
                 .env("KIN_UPDATE_TEMP_CLEANUP_CRASH_PARENT", temp.path())
-                .env("KIN_UPDATE_TEST_TEMP_CLEANUP_CRASH_POINT", point)
-                .output()
-                .unwrap();
+                .env("KIN_UPDATE_TEST_TEMP_CLEANUP_CRASH_POINT", point);
+            let output = test_subprocess_output(
+                &mut command,
+                &format!("private temp cleanup crash worker at {point}"),
+            )
+            .unwrap();
             assert_eq!(
                 output.status.code(),
                 Some(87),
