@@ -17,6 +17,42 @@ use crate::state::{
     RECON_PROCESSING,
 };
 
+pub(crate) const DISABLE_FILESYSTEM_RECONCILE_ENV: &str = "KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE";
+
+fn env_flag_enabled(value: Option<String>) -> bool {
+    value
+        .as_deref()
+        .map(str::trim)
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Whether this daemon must treat its remote graph as the only write authority.
+///
+/// This is deliberately independent of `KIN_ALLOW_MASS_DELETION`: graph-only
+/// deployments do not scan an empty/projected checkout in the first place, so
+/// they never need to authorize destructive filesystem reconciliation.
+fn resolve_filesystem_reconcile_disabled(
+    storage_backend_graph_authority: bool,
+    environment_disabled: bool,
+) -> bool {
+    storage_backend_graph_authority || environment_disabled
+}
+
+pub(crate) fn filesystem_reconcile_disabled_at_startup(
+    storage_backend_graph_authority: bool,
+) -> bool {
+    resolve_filesystem_reconcile_disabled(
+        storage_backend_graph_authority,
+        env_flag_enabled(std::env::var(DISABLE_FILESYSTEM_RECONCILE_ENV).ok()),
+    )
+}
+
 /// Configuration for the reconciliation loop.
 #[derive(Debug, Clone)]
 pub struct LoopConfig {
@@ -64,6 +100,20 @@ pub async fn run_loop(
     config: LoopConfig,
     cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
+    if state.filesystem_reconcile_disabled() {
+        info!(
+            env = DISABLE_FILESYSTEM_RECONCILE_ENV,
+            "filesystem watcher and reconciliation loop disabled; remote graph remains authoritative"
+        );
+        let mut cancel = cancel;
+        while !*cancel.borrow() {
+            if cancel.changed().await.is_err() {
+                break;
+            }
+        }
+        return Ok(());
+    }
+
     let working_dir = state.layout.working_dir();
     if is_bare_repository(working_dir) {
         info!(working_dir = %working_dir.display(), "working directory is a bare Git repository; reconciliation loop disabled");
@@ -436,6 +486,54 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn graph_only_flag_accepts_only_explicit_truthy_values() {
+        for value in ["1", "true", " TRUE ", "yes", "on", "ON"] {
+            assert!(env_flag_enabled(Some(value.to_string())), "{value}");
+        }
+        for value in ["", "0", "false", "off", "no", "graph-only"] {
+            assert!(!env_flag_enabled(Some(value.to_string())), "{value}");
+        }
+        assert!(!env_flag_enabled(None));
+    }
+
+    #[test]
+    fn storage_backend_graph_authority_cannot_be_reenabled_by_environment() {
+        assert!(!resolve_filesystem_reconcile_disabled(false, false));
+        assert!(resolve_filesystem_reconcile_disabled(false, true));
+        assert!(resolve_filesystem_reconcile_disabled(true, false));
+        assert!(resolve_filesystem_reconcile_disabled(true, true));
+    }
+
+    #[tokio::test]
+    async fn graph_only_mode_skips_direct_sync_and_run_loop_without_mass_delete_override() {
+        let mass_delete_before = std::env::var_os("KIN_ALLOW_MASS_DELETION");
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/lib.rs"), "pub fn disk_only() {}\n").unwrap();
+        let init = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(init.layout).unwrap());
+        state
+            .filesystem_reconcile_disabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        sync_filesystem_with_graph(&state).await.unwrap();
+        assert_eq!(state.graph.entity_count(), 0, "direct sync must be inert");
+
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(true);
+        run_loop(Arc::clone(&state), LoopConfig::default(), cancel_rx)
+            .await
+            .unwrap();
+        assert_eq!(state.graph.entity_count(), 0, "run loop must be inert");
+        assert!(!state.is_mass_deletion_blocked());
+        assert_eq!(
+            std::env::var_os("KIN_ALLOW_MASS_DELETION"),
+            mass_delete_before,
+            "graph-only mode must not set or clear the mass-deletion escape hatch"
+        );
+    }
+
+    #[test]
     fn dedup_keeps_last_event_per_path() {
         let events = vec![
             FileEvent::Changed(PathBuf::from("/a.rs")),
@@ -628,6 +726,14 @@ fn should_block_mass_deletion(removed: u64, total_graph_files: u64, allow_overri
 
 #[tracing::instrument(skip(state))]
 pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
+    if state.filesystem_reconcile_disabled() {
+        debug!(
+            env = DISABLE_FILESYSTEM_RECONCILE_ENV,
+            "filesystem sync skipped; remote graph remains authoritative"
+        );
+        return Ok(());
+    }
+
     let working_dir = state.layout.working_dir();
     if is_bare_repository(working_dir) {
         debug!(working_dir = %working_dir.display(), "working directory is a bare Git repository; skipping filesystem sync");

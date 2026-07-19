@@ -52,6 +52,10 @@ impl Default for DaemonConfig {
     }
 }
 
+fn should_enable_lsp_enrichment(config_enabled: bool, filesystem_reconcile_disabled: bool) -> bool {
+    config_enabled && !filesystem_reconcile_disabled
+}
+
 fn idle_check_interval(idle_timeout: Duration) -> Duration {
     let millis = (idle_timeout.as_millis() / 4).clamp(100, 5_000) as u64;
     Duration::from_millis(millis)
@@ -491,7 +495,10 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
     }
 
     // Set up LSP enrichment channel before wrapping state in Arc.
-    let lsp_rx = if config.lsp_enabled {
+    let lsp_rx = if should_enable_lsp_enrichment(
+        config.lsp_enabled,
+        state.filesystem_reconcile_disabled(),
+    ) {
         let discovered = kin_lsp::discovery::discover_servers();
         if !discovered.is_empty() {
             info!(
@@ -507,6 +514,11 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
             None
         }
     } else {
+        if config.lsp_enabled && state.filesystem_reconcile_disabled() {
+            info!(
+                "LSP discovery and enrichment disabled; filesystem-derived relations cannot mutate graph-only authority"
+            );
+        }
         None
     };
 
@@ -869,6 +881,12 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
     let embed_pipeline_overlap = config.embed_pipeline_overlap;
     let mut embed_cancel = cancel_rx.clone();
     let embed_handle = tokio::spawn(async move {
+        if !embed_state.can_persist_embed_progress_locally() {
+            warn!(
+                "background embedding worker disabled: storage-backend graph authority has no durable vector-sidecar persistence contract; graph serving remains available"
+            );
+            return;
+        }
         // Wait for the daemon to finish its first reconciliation cycle
         // before starting embedding work — no point embedding an empty graph.
         while !embed_state
@@ -1948,9 +1966,9 @@ async fn select_with_signals(
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        drain_pending_flush, next_embed_error_backoff, parse_duration_secs, should_flush_now,
-        watched_process_is_alive, DaemonConfig, DEFAULT_RUNTIME_SHUTDOWN_GRACE,
-        DEFAULT_SHUTDOWN_ESCALATION_GRACE,
+        drain_pending_flush, next_embed_error_backoff, parse_duration_secs,
+        should_enable_lsp_enrichment, should_flush_now, watched_process_is_alive, DaemonConfig,
+        DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1959,6 +1977,14 @@ mod tests {
     #[test]
     fn default_embed_batch_is_backlog_friendly() {
         assert_eq!(DaemonConfig::default().embed_batch_size, 512);
+    }
+
+    #[test]
+    fn graph_only_authority_disables_lsp_discovery_and_worker() {
+        assert!(should_enable_lsp_enrichment(true, false));
+        assert!(!should_enable_lsp_enrichment(true, true));
+        assert!(!should_enable_lsp_enrichment(false, false));
+        assert!(!should_enable_lsp_enrichment(false, true));
     }
 
     #[test]

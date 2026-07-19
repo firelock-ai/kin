@@ -361,6 +361,10 @@ pub struct DaemonState {
     /// `None` = legacy file-based path (via SnapshotManager).
     /// `Some` = StorageBackend (LocalFile for CLI, GCS for cloud).
     pub storage_backend: Option<Box<dyn StorageBackend>>,
+    /// Frozen startup policy for deployments whose graph backend is the only
+    /// write authority. When true, no filesystem/session/VFS compatibility
+    /// surface may reconcile bytes back into graph truth.
+    pub(crate) filesystem_reconcile_disabled: AtomicBool,
     /// Generation from the last snapshot load (for CAS on save).
     pub snapshot_generation: AtomicU64,
     /// A graph authority commit advanced, but its local generation marker and
@@ -744,6 +748,9 @@ impl DaemonState {
             is_initialized: AtomicBool::new(loaded_snapshot),
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: None,
+            filesystem_reconcile_disabled: AtomicBool::new(
+                crate::loop_runner::filesystem_reconcile_disabled_at_startup(false),
+            ),
             snapshot_generation: AtomicU64::new(generation),
             post_commit_finalization_pending: AtomicBool::new(false),
             pending_persistence_event: Mutex::new(None),
@@ -897,6 +904,9 @@ impl DaemonState {
             is_initialized: AtomicBool::new(loaded_snapshot),
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: Some(backend),
+            filesystem_reconcile_disabled: AtomicBool::new(
+                crate::loop_runner::filesystem_reconcile_disabled_at_startup(true),
+            ),
             snapshot_generation: AtomicU64::new(generation),
             post_commit_finalization_pending: AtomicBool::new(false),
             pending_persistence_event: Mutex::new(None),
@@ -1777,6 +1787,37 @@ impl DaemonState {
         self.save_snapshot_impl(true, None)
     }
 
+    /// Whether derived embedding progress can be committed through the local
+    /// `SnapshotManager` authority path.
+    ///
+    /// A configured `StorageBackend` owns a distinct generation cursor (GCS in
+    /// hosted deployments). Until that backend has an explicit vector-sidecar
+    /// persistence contract, writing local embed progress with its generation is
+    /// unsafe and must fail loud rather than fabricate a durable checkpoint.
+    pub(crate) fn can_persist_embed_progress_locally(&self) -> bool {
+        self.storage_backend.is_none()
+    }
+
+    /// Whether filesystem-to-graph compatibility ingestion is disabled for
+    /// this daemon. The value is captured when state opens so runtime behavior
+    /// cannot drift if the process environment later changes.
+    pub(crate) fn filesystem_reconcile_disabled(&self) -> bool {
+        self.filesystem_reconcile_disabled.load(Ordering::Relaxed)
+    }
+
+    #[cfg(any(feature = "embeddings", feature = "vector"))]
+    fn reject_remote_backend_embed_persistence(&self, operation: &str) -> Result<()> {
+        if self.can_persist_embed_progress_locally() {
+            return Ok(());
+        }
+        let generation = self.snapshot_generation.load(Ordering::SeqCst);
+        Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+            format!(
+                "{operation} skipped: storage-backend graph authority is at generation {generation}, and no backend vector-sidecar persistence contract exists; refusing to write a local SnapshotManager checkpoint against remote authority"
+            ),
+        )))
+    }
+
     fn save_snapshot_impl(&self, force_full: bool, event: Option<DaemonEvent>) -> Result<()> {
         // Serialize the whole kndb + generation-marker + kidx write sequence
         // against any other save (persist loop, idle flush, embed worker).
@@ -1929,6 +1970,7 @@ impl DaemonState {
     /// coverage.
     #[cfg(feature = "embeddings")]
     pub fn flush_embed_progress(&self) -> Result<usize> {
+        self.reject_remote_backend_embed_persistence("embed progress persistence")?;
         let _persist_guard = self
             .persist_lock
             .lock()
@@ -1979,6 +2021,7 @@ impl DaemonState {
     /// batch.
     #[cfg(feature = "vector")]
     pub fn persist_vector_sidecar(&self) -> Result<()> {
+        self.reject_remote_backend_embed_persistence("vector sidecar persistence")?;
         let _persist_guard = self
             .persist_lock
             .lock()
@@ -2532,6 +2575,9 @@ impl DaemonState {
     /// Queue changed entities for background LSP enrichment (non-blocking).
     /// No-op if LSP enrichment is not available.
     pub fn queue_lsp_enrichment(&self, request: LspEnrichmentRequest) {
+        if self.filesystem_reconcile_disabled() {
+            return;
+        }
         if let Some(ref tx) = self.lsp_enrichment_tx {
             if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
                 tx.try_send(LspEnrichmentMessage::Incremental(request))
@@ -2544,6 +2590,9 @@ impl DaemonState {
     /// Queue a cold sweep that enriches ALL entities in the graph via LSP.
     /// Triggered after init/migrate/reconcile. No-op if LSP enrichment is not available.
     pub fn queue_lsp_sweep(&self) {
+        if self.filesystem_reconcile_disabled() {
+            return;
+        }
         if let Some(ref tx) = self.lsp_enrichment_tx {
             if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
                 tx.try_send(LspEnrichmentMessage::Sweep)
@@ -2789,6 +2838,7 @@ mod tests {
             is_initialized: AtomicBool::new(false),
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: None,
+            filesystem_reconcile_disabled: AtomicBool::new(false),
             snapshot_generation: AtomicU64::new(snapshot_generation),
             post_commit_finalization_pending: AtomicBool::new(false),
             pending_persistence_event: Mutex::new(None),
@@ -4473,6 +4523,64 @@ mod tests {
             pending >= 1,
             "the unembedded entity must remain pending (no embedder ran); got {pending}"
         );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn storage_backend_embed_progress_fails_before_local_snapshot_write() {
+        use kin_db::LocalFileBackend;
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+        let snapshot_path = layout.kindb_snapshot_path();
+        let storage = tempfile::tempdir().unwrap();
+        let state = DaemonState::open_with_backend(
+            layout,
+            Box::new(LocalFileBackend::new(storage.path())),
+            "remote-embed-authority",
+            None,
+        )
+        .unwrap();
+        state
+            .graph
+            .upsert_entity(&test_entity("embed_me", "src/lib.rs"))
+            .unwrap();
+        state
+            .save_snapshot_full()
+            .expect("seed remote authority at the local authority generation");
+        state.graph.queue_missing_for_embedding();
+
+        let local_before = kin_db::SnapshotManager::open_read_only(snapshot_path.as_path())
+            .expect("kin init creates a local authority fixture");
+        let local_generation_before = local_before.generation();
+        let local_entities_before = local_before.graph().entity_count();
+        drop(local_before);
+        assert_eq!(
+            state.snapshot_generation.load(Ordering::SeqCst),
+            local_generation_before,
+            "the fixture must align generations so an unguarded local flush would mutate"
+        );
+        let error = state
+            .flush_embed_progress()
+            .expect_err("remote authority must reject local embed checkpoints");
+        let message = error.to_string();
+        assert!(
+            message.contains("storage-backend graph authority"),
+            "{message}"
+        );
+        assert!(
+            message.contains("refusing to write a local SnapshotManager checkpoint"),
+            "{message}"
+        );
+        assert_eq!(
+            state.snapshot_generation.load(Ordering::SeqCst),
+            local_generation_before
+        );
+        let local_after = kin_db::SnapshotManager::open_read_only(snapshot_path.as_path())
+            .expect("guard must preserve local authority");
+        assert_eq!(local_after.generation(), local_generation_before);
+        assert_eq!(local_after.graph().entity_count(), local_entities_before);
     }
 
     #[test]
