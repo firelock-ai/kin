@@ -658,7 +658,7 @@ pub(crate) fn mcp_client_config_paths() -> Vec<(&'static str, &'static str, Path
         Some(h) => h,
         None => return Vec::new(),
     };
-    vec![
+    let mut paths = vec![
         (
             "claude",
             "Claude Code",
@@ -692,7 +692,29 @@ pub(crate) fn mcp_client_config_paths() -> Vec<(&'static str, &'static str, Path
                 .join("windsurf")
                 .join("mcp_config.json"),
         ),
-    ]
+        (
+            "antigravity",
+            "Google Antigravity",
+            home.join(".gemini").join("config").join("mcp_config.json"),
+        ),
+    ];
+    if let Some(repo_root) = current_health_repo() {
+        paths.push((
+            "antigravity_workspace",
+            "Google Antigravity workspace",
+            repo_root.join(".agents").join("mcp_config.json"),
+        ));
+    }
+    paths
+}
+
+fn current_health_repo() -> Option<PathBuf> {
+    let cwd = env::current_dir().ok()?;
+    let root = kin_core::KinLayout::discover_with_daemon_url(&cwd, None)?
+        .working_dir()
+        .canonicalize()
+        .ok()?;
+    root.join(".kin").is_dir().then_some(root)
 }
 
 /// Inspect a single MCP config file for a `kin` server entry carrying the
@@ -784,6 +806,38 @@ pub(crate) fn evaluate_mcp_client(path: &PathBuf) -> (HealthStatus, String) {
     }
 }
 
+fn evaluate_antigravity_binding(path: &Path, workspace: bool) -> Option<(HealthStatus, String)> {
+    let repo_root = if workspace {
+        path.parent()?.parent()?.canonicalize().ok()?
+    } else {
+        current_health_repo()?
+    };
+    let root: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let entry = root.get("mcpServers")?.get("kin")?;
+    let expected_command =
+        kin_dir()
+            .ok()?
+            .join("bin")
+            .join(if cfg!(windows) { "kin.exe" } else { "kin" });
+    let command_matches = entry.get("command").and_then(Value::as_str)
+        == Some(expected_command.to_string_lossy().as_ref());
+    let expected_args = serde_json::json!(["mcp", "start", "--repo", repo_root.to_string_lossy()]);
+    let args_match = entry.get("args") == Some(&expected_args);
+    let cwd_matches = !workspace
+        || entry.get("cwd").and_then(Value::as_str) == Some(repo_root.to_string_lossy().as_ref());
+    if command_matches && args_match && cwd_matches {
+        None
+    } else {
+        Some((
+            HealthStatus::Misconfigured,
+            format!(
+                "Antigravity Kin binding at {} does not use the exact managed binary, repository arguments, or workspace cwd",
+                path.display()
+            ),
+        ))
+    }
+}
+
 fn check_mcp_clients() -> Vec<HealthCheck> {
     let clients: Vec<McpClient> = mcp_client_config_paths()
         .into_iter()
@@ -803,7 +857,17 @@ fn check_mcp_clients() -> Vec<HealthCheck> {
     clients
         .into_iter()
         .map(|client| {
-            let (status, detail) = evaluate_mcp_client(&client.path);
+            let (mut status, mut detail) = evaluate_mcp_client(&client.path);
+            if matches!(status, HealthStatus::Healthy)
+                && (client.id == "antigravity" || client.id == "antigravity_workspace")
+            {
+                if let Some((binding_status, binding_detail)) =
+                    evaluate_antigravity_binding(&client.path, client.id == "antigravity_workspace")
+                {
+                    status = binding_status;
+                    detail = binding_detail;
+                }
+            }
             let mut check = HealthCheck::new(
                 &format!("mcp_client_{}", client.id),
                 &format!("MCP: {}", client.label),

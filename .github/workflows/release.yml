@@ -881,8 +881,14 @@ jobs:
           const path = require("path");
 
           const artifact = process.env.ARTIFACT;
+          const { readUpdateBuildIdentity } = require("./scripts/read-update-build-identity.cjs");
           const target = process.env.TARGET;
           const root = process.cwd();
+          const authorityNames = new Set(
+            target.includes("-windows-")
+              ? ["kin.exe", "kin-daemon.exe"]
+              : ["kin", "kin-daemon"]
+          );
           const sha256 = (file) =>
             crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
           const git = (cwd, ...args) =>
@@ -916,19 +922,45 @@ jobs:
             .filter((entry) => entry.isFile())
             .map((entry) => {
               const file = path.join(artifact, entry.name);
-              return {
+              const record = {
                 name: entry.name,
                 sha256: sha256(file),
                 size_bytes: fs.statSync(file).size,
               };
+              if (authorityNames.has(entry.name)) {
+                record.build_identity = readUpdateBuildIdentity(file);
+              }
+              return record;
             })
             .sort((left, right) => left.name.localeCompare(right.name));
           if (contents.length < 2) {
             throw new Error(`${artifact} does not contain the mandatory kin and kin-daemon binaries`);
           }
+          const expectedVersion = process.env.GITHUB_REF_NAME.replace(/^v/, "");
+          const authorityRecords = contents.filter((record) => authorityNames.has(record.name));
+          if (authorityRecords.length !== authorityNames.size) {
+            throw new Error(`${artifact} does not contain both static build-identity authorities`);
+          }
+          const graphVersions = new Set();
+          for (const record of authorityRecords) {
+            const identity = record.build_identity;
+            if (
+              identity.version !== expectedVersion ||
+              identity.commit !== kinCommit ||
+              identity.clean !== true ||
+              identity.source_known !== true ||
+              identity.dependency_provenance !== kinLockSha
+            ) {
+              throw new Error(`${record.name} static build identity does not match the tagged release source`);
+            }
+            graphVersions.add(identity.graph_snapshot_version);
+          }
+          if (graphVersions.size !== 1) {
+            throw new Error(`${artifact} CLI and daemon graph snapshot identities disagree`);
+          }
 
           const manifest = {
-            schema_version: 1,
+            schema_version: 2,
             release_tag: process.env.GITHUB_REF_NAME,
             artifact,
             target,
@@ -1170,6 +1202,7 @@ jobs:
           const fs = require("fs");
           const os = require("os");
           const path = require("path");
+          const { readUpdateBuildIdentity } = require("./scripts/read-update-build-identity.cjs");
 
           const root = process.cwd();
           const sha256 = (file) =>
@@ -1228,7 +1261,7 @@ jobs:
           const artifacts = specs.map((spec) => {
             const manifestPath = `${spec.artifact}.provenance.json`;
             const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-            fail(manifest.schema_version === 1, `${manifestPath} has an unsupported schema`);
+            fail(manifest.schema_version === 2, `${manifestPath} has an unsupported schema`);
             fail(manifest.release_tag === process.env.GITHUB_REF_NAME,
               `${manifestPath} release tag does not match ${process.env.GITHUB_REF_NAME}`);
             fail(manifest.artifact === spec.artifact, `${manifestPath} artifact identity is wrong`);
@@ -1276,15 +1309,43 @@ jobs:
               const records = new Map(manifest.archive_contents.map((entry) => [entry.name, entry]));
               fail(records.size === manifest.archive_contents.length,
                 `${manifestPath} contains duplicate content records`);
+              const authorityNames = new Set(
+                spec.target.includes("-windows-")
+                  ? ["kin.exe", "kin-daemon.exe"]
+                  : ["kin", "kin-daemon"]
+              );
+              const expectedVersion = process.env.GITHUB_REF_NAME.replace(/^v/, "");
+              const graphVersions = new Set();
               for (const name of actualNames) {
                 const file = path.join(contentRoot, name);
                 const record = records.get(name);
                 fail(record?.sha256 === sha256(file), `${manifestPath} hash mismatch for ${name}`);
                 fail(record?.size_bytes === fs.statSync(file).size, `${manifestPath} size mismatch for ${name}`);
+                if (authorityNames.has(name)) {
+                  const identity = readUpdateBuildIdentity(file);
+                  fail(JSON.stringify(record?.build_identity) === JSON.stringify(identity),
+                    `${manifestPath} static build identity mismatch for ${name}`);
+                  fail(identity.version === expectedVersion,
+                    `${manifestPath} static build version mismatch for ${name}`);
+                  fail(identity.commit === kinCommit,
+                    `${manifestPath} static build commit mismatch for ${name}`);
+                  fail(identity.clean === true && identity.source_known === true,
+                    `${manifestPath} static build source is not clean and known for ${name}`);
+                  fail(identity.dependency_provenance === kinLockSha,
+                    `${manifestPath} static dependency provenance mismatch for ${name}`);
+                  graphVersions.add(identity.graph_snapshot_version);
+                } else {
+                  fail(record?.build_identity === undefined,
+                    `${manifestPath} gives non-authority component ${name} a static build identity`);
+                }
               }
               for (const required of spec.required) {
                 fail(records.has(required), `${spec.archive} is missing required ${required}`);
               }
+              fail([...authorityNames].every((name) => records.has(name)),
+                `${spec.archive} is missing a static build-identity authority`);
+              fail(graphVersions.size === 1,
+                `${spec.archive} CLI and daemon graph snapshot identities disagree`);
             } finally {
               fs.rmSync(extractRoot, { recursive: true, force: true });
             }
@@ -1292,7 +1353,7 @@ jobs:
           });
 
           const releaseManifest = {
-            schema_version: 1,
+            schema_version: 2,
             release_tag: process.env.GITHUB_REF_NAME,
             kin: { commit: kinCommit, cargo_lock_sha256: kinLockSha },
             kin_vfs: { commit: vfsCommit, dirty: false, cargo_lock_sha256: vfsLockSha },

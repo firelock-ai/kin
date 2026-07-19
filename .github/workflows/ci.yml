@@ -79,8 +79,10 @@ jobs:
           python3 ./scripts/test-npm-automatic-release.py
           python3 ./scripts/test-verify-npm-release.py
           node --test \
+            ./scripts/read-update-build-identity.test.cjs \
             ./scripts/release-order.test.mjs \
             ./scripts/verify-npm-attestation.test.mjs
+          node --check ./scripts/read-update-build-identity.cjs
           node --check ./scripts/release-order.mjs
           node --check ./scripts/verify-npm-attestation.mjs
           bash -n ./scripts/publish-npm-release.sh
@@ -89,7 +91,7 @@ jobs:
   windows-installer:
     name: Windows installer + vector-free release build
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Preserve tracked bytes on Windows
         shell: bash
@@ -130,6 +132,17 @@ jobs:
             echo "::error::Windows vector-free build still enables a heavy kin-db feature"
             exit 1
           fi
+
+      - name: Compile and run native Windows authority tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --no-run
+          test_binary=$(find target/x86_64-pc-windows-msvc/debug/deps \
+            -maxdepth 1 -type f -name 'kin_cli-*.exe' -print -quit)
+          test -n "$test_binary"
+          "$test_binary" windows --test-threads=1
 
       - name: Build Windows release binaries without vector features
         shell: bash

@@ -22,6 +22,7 @@
 //! explicit paths so they are unit-testable without touching a real `$HOME`.
 //! The glue that knows *what* `kin setup` writes lives in [`super::setup`].
 
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -85,7 +86,8 @@ impl ArtifactKind {
 
 /// One artifact `kin setup` wrote, with a fingerprint of the exact slice Kin
 /// owns at `path`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LedgerEntry {
     pub kind: ArtifactKind,
     /// Stable identifier for the target within its kind: a client id
@@ -176,7 +178,8 @@ impl LedgerEntry {
 
 /// The full install ledger, persisted as JSON at
 /// `~/.kin/config/setup-ledger.json`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetupLedger {
     pub schema_version: u32,
     pub entries: Vec<LedgerEntry>,
@@ -196,39 +199,65 @@ impl SetupLedger {
     /// has not run yet); a present-but-unparseable file is an error rather than
     /// being silently discarded, so we never lose track of what to uninstall.
     pub fn load(path: &Path) -> Result<Self> {
-        if !path.exists() {
+        let bytes = super::setup::read_private_file_nofollow(path)?;
+        Self::from_locked_bytes(path, bytes.as_deref())
+    }
+
+    fn from_locked_bytes(path: &Path, bytes: Option<&[u8]>) -> Result<Self> {
+        let Some(bytes) = bytes else {
             return Ok(Self::default());
-        }
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let ledger: SetupLedger = serde_json::from_str(&content).with_context(|| {
+        };
+        let ledger: SetupLedger = serde_json::from_slice(bytes).with_context(|| {
             format!(
                 "install ledger {} is not valid JSON — fix or remove it and re-run `kin setup`",
                 path.display()
             )
         })?;
+        if ledger.schema_version != LEDGER_SCHEMA_VERSION {
+            anyhow::bail!(
+                "install ledger {} uses unsupported schema version {}; expected {}. Its bytes were retained unchanged",
+                path.display(),
+                ledger.schema_version,
+                LEDGER_SCHEMA_VERSION
+            );
+        }
         Ok(ledger)
     }
 
     /// Serialize the ledger to `path` (pretty), creating the parent directory.
     /// An empty ledger removes the file so a clean uninstall leaves no residue.
     pub fn save(&self, path: &Path) -> Result<()> {
+        let lock = super::setup::ConfigLock::acquire_nofollow(path)?;
+        let original = lock.original_bytes(path)?;
+        self.save_locked(path, &lock, original.as_deref())
+    }
+
+    fn save_locked(
+        &self,
+        path: &Path,
+        lock: &super::setup::ConfigLock,
+        original: Option<&[u8]>,
+    ) -> Result<()> {
         if self.entries.is_empty() {
-            if path.exists() {
-                fs::remove_file(path)
-                    .with_context(|| format!("failed to remove empty ledger {}", path.display()))?;
-            }
+            lock.remove_guarded(path, original)?;
             return Ok(());
-        }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create directory {}", parent.display()))?;
         }
         let formatted =
             serde_json::to_string_pretty(self).context("failed to serialize install ledger")?;
-        fs::write(path, formatted)
-            .with_context(|| format!("failed to write {}", path.display()))?;
+        lock.write_private_guarded(path, formatted.as_bytes(), original)?;
         Ok(())
+    }
+
+    /// Perform a locked load-modify-save transaction. Every ledger writer uses
+    /// this path so concurrent setup, doctor, updater repair, and uninstall
+    /// operations cannot overwrite one another's entries.
+    pub fn update<R>(path: &Path, mutate: impl FnOnce(&mut SetupLedger) -> Result<R>) -> Result<R> {
+        let lock = super::setup::ConfigLock::acquire_nofollow(path)?;
+        let original = lock.original_bytes(path)?;
+        let mut ledger = Self::from_locked_bytes(path, original.as_deref())?;
+        let result = mutate(&mut ledger)?;
+        ledger.save_locked(path, &lock, original.as_deref())?;
+        Ok(result)
     }
 
     /// Upsert `entry` by its `(kind, target, path)` identity. A re-record keeps
@@ -276,35 +305,17 @@ pub struct EntryVerification {
     pub detail: String,
 }
 
-/// Compute the fingerprint of the slice Kin owns for `entry` from current disk
-/// state. Returns `None` when that slice is absent (file missing/corrupt, the
-/// `kin` MCP key removed, or the appended marker gone).
-fn current_owned_fingerprint(entry: &LedgerEntry) -> Option<String> {
+fn current_owned_fingerprint_from_bytes(entry: &LedgerEntry, content: &[u8]) -> Option<String> {
     match entry.kind {
-        ArtifactKind::McpConfig => {
-            let content = fs::read_to_string(&entry.path).ok()?;
-            // Codex's config.toml is TOML (`mcp_servers.kin`); every other
-            // client config is JSON (`mcpServers.kin`). Normalize to JSON so
-            // the fingerprint matches what the install path recorded.
-            let kin = if entry.path.extension().and_then(|e| e.to_str()) == Some("toml") {
-                let root: toml::Value = toml::from_str(&content).ok()?;
-                let kin = root.get("mcp_servers")?.get("kin")?;
-                serde_json::to_value(kin).ok()?
-            } else {
-                let root: serde_json::Value = serde_json::from_str(&content).ok()?;
-                root.get("mcpServers")?.get("kin")?.clone()
-            };
-            Some(fingerprint_mcp_entry(&kin))
-        }
+        ArtifactKind::McpConfig => current_mcp_fingerprint_from_bytes(entry, content),
         ArtifactKind::ShellHook | ArtifactKind::VfsShim | ArtifactKind::DaemonConfig => {
-            let bytes = fs::read(&entry.path).ok()?;
-            Some(sha256_hex(&bytes))
+            Some(sha256_hex(content))
         }
         ArtifactKind::ShellRcLine
         | ArtifactKind::ShellPathLine
         | ArtifactKind::DiscoveryReminder => {
             let snippet = entry.snippet.as_ref()?;
-            let content = fs::read_to_string(&entry.path).ok()?;
+            let content = std::str::from_utf8(content).ok()?;
             content
                 .contains(snippet.as_str())
                 .then(|| sha256_hex(snippet.as_bytes()))
@@ -312,14 +323,36 @@ fn current_owned_fingerprint(entry: &LedgerEntry) -> Option<String> {
     }
 }
 
-/// Verify one entry against current disk state.
-pub fn verify_entry(entry: &LedgerEntry) -> EntryVerification {
-    let (state, detail) = match current_owned_fingerprint(entry) {
+fn current_mcp_fingerprint_from_bytes(entry: &LedgerEntry, content: &[u8]) -> Option<String> {
+    // Codex's config.toml is TOML (`mcp_servers.kin`); every other client
+    // config is JSON (`mcpServers.kin`). Normalize to JSON so the fingerprint
+    // matches what the install path recorded.
+    let kin = if entry.path.extension().and_then(|e| e.to_str()) == Some("toml") {
+        let content = std::str::from_utf8(content).ok()?;
+        let root: toml::Value = toml::from_str(content).ok()?;
+        let kin = root.get("mcp_servers")?.get("kin")?;
+        serde_json::to_value(kin).ok()?
+    } else {
+        let root: serde_json::Value = serde_json::from_slice(content).ok()?;
+        root.get("mcpServers")?.get("kin")?.clone()
+    };
+    Some(fingerprint_mcp_entry(&kin))
+}
+
+pub(crate) fn verify_entry_locked(
+    entry: &LedgerEntry,
+    lock: &super::setup::ConfigLock,
+) -> Result<EntryVerification> {
+    let bytes = lock.original_bytes(&entry.path)?;
+    let (state, detail) = match bytes
+        .as_deref()
+        .and_then(|bytes| current_owned_fingerprint_from_bytes(entry, bytes))
+    {
         None => (
             EntryState::Removed,
             format!("{} gone from {}", entry.kind.label(), entry.path.display()),
         ),
-        Some(fp) if fp == entry.fingerprint => (
+        Some(fingerprint) if fingerprint == entry.fingerprint => (
             EntryState::Verified,
             format!("{} present and unmodified", entry.kind.label()),
         ),
@@ -332,10 +365,32 @@ pub fn verify_entry(entry: &LedgerEntry) -> EntryVerification {
             ),
         ),
     };
-    EntryVerification {
+    Ok(EntryVerification {
         entry: entry.clone(),
         state,
         detail,
+    })
+}
+
+/// Verify one entry against current disk state.
+pub fn verify_entry(entry: &LedgerEntry) -> EntryVerification {
+    match super::setup::ConfigLock::acquire(&entry.path)
+        .and_then(|lock| verify_entry_locked(entry, &lock))
+    {
+        Ok(verification) => verification,
+        Err(error) => EntryVerification {
+            entry: entry.clone(),
+            // Unsafe ownership, links, path types, or lock ambiguity are
+            // present state that Kin cannot authenticate. Treat them as
+            // modified so no marker reconciliation or uninstall path can
+            // mistake the object for an absent or verified artifact.
+            state: EntryState::Modified,
+            detail: format!(
+                "{} at {} could not be safely verified — Kin will not trust or touch it: {error:#}",
+                entry.kind.label(),
+                entry.path.display()
+            ),
+        },
     }
 }
 
@@ -378,7 +433,50 @@ impl RemovalOutcome {
 /// user's own edits are never clobbered. Under `dry_run` the action is
 /// classified but nothing is written.
 pub fn uninstall_entry(entry: &LedgerEntry, dry_run: bool, force: bool) -> RemovalOutcome {
-    let verification = verify_entry(entry);
+    if !dry_run {
+        return match super::setup::ConfigLock::acquire(&entry.path) {
+            Ok(lock) => uninstall_entry_with_lock(entry, false, force, &lock),
+            Err(error) => RemovalOutcome {
+                entry: entry.clone(),
+                action: RemovalAction::Failed,
+                detail: format!(
+                    "failed to lock setup-owned path {}: {error:#}",
+                    entry.path.display()
+                ),
+            },
+        };
+    }
+    uninstall_entry_with_verification(entry, dry_run, force, verify_entry(entry), None)
+}
+
+fn uninstall_entry_with_lock(
+    entry: &LedgerEntry,
+    dry_run: bool,
+    force: bool,
+    lock: &super::setup::ConfigLock,
+) -> RemovalOutcome {
+    match verify_entry_locked(entry, lock) {
+        Ok(verification) => {
+            uninstall_entry_with_verification(entry, dry_run, force, verification, Some(lock))
+        }
+        Err(error) => RemovalOutcome {
+            entry: entry.clone(),
+            action: RemovalAction::Failed,
+            detail: format!(
+                "failed to verify locked setup-owned path {}: {error:#}",
+                entry.path.display()
+            ),
+        },
+    }
+}
+
+fn uninstall_entry_with_verification(
+    entry: &LedgerEntry,
+    dry_run: bool,
+    force: bool,
+    verification: EntryVerification,
+    target_lock: Option<&super::setup::ConfigLock>,
+) -> RemovalOutcome {
     match verification.state {
         EntryState::Removed => RemovalOutcome {
             entry: entry.clone(),
@@ -402,7 +500,11 @@ pub fn uninstall_entry(entry: &LedgerEntry, dry_run: bool, force: bool) -> Remov
                     detail: format!("would remove {} at {}", entry.kind.label(), entry.path.display()),
                 };
             }
-            match remove_owned_slice(entry) {
+            let removed = match target_lock {
+                Some(lock) => remove_owned_slice_locked(entry, lock),
+                None => remove_owned_slice(entry),
+            };
+            match removed {
                 Ok(detail) => RemovalOutcome {
                     entry: entry.clone(),
                     action: RemovalAction::Removed,
@@ -421,72 +523,83 @@ pub fn uninstall_entry(entry: &LedgerEntry, dry_run: bool, force: bool) -> Remov
 /// Perform the actual removal of the owned slice. Callers gate this on
 /// verification, so it assumes the slice is present.
 fn remove_owned_slice(entry: &LedgerEntry) -> Result<String> {
-    match entry.kind {
-        ArtifactKind::McpConfig => {
-            let content = fs::read_to_string(&entry.path)
-                .with_context(|| format!("failed to read {}", entry.path.display()))?;
-            if entry.path.extension().and_then(|e| e.to_str()) == Some("toml") {
-                // Codex's config.toml: excise only the [mcp_servers.kin] table
-                // with a format-preserving edit; the rest of the user's config
-                // (keys, tables, comments) is left byte-for-byte intact.
-                let mut doc: toml_edit::DocumentMut = content
-                    .parse()
-                    .with_context(|| format!("{} is not valid TOML", entry.path.display()))?;
-                if let Some(servers) = doc
-                    .get_mut("mcp_servers")
-                    .and_then(|s| s.as_table_like_mut())
-                {
-                    servers.remove("kin");
-                }
-                fs::write(&entry.path, doc.to_string())
-                    .with_context(|| format!("failed to write {}", entry.path.display()))?;
-                return Ok(format!(
-                    "removed mcp_servers.kin from {}",
-                    entry.path.display()
-                ));
-            }
-            let mut root: serde_json::Value = serde_json::from_str(&content)
-                .with_context(|| format!("{} is not valid JSON", entry.path.display()))?;
-            if let Some(servers) = root.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
-                servers.remove("kin");
-            }
-            // Leave the (possibly now-empty) shared config file in place; Kin
-            // never deletes a user's config, only its own key within it.
-            let formatted =
-                serde_json::to_string_pretty(&root).context("failed to serialize MCP config")?;
-            fs::write(&entry.path, formatted)
-                .with_context(|| format!("failed to write {}", entry.path.display()))?;
-            Ok(format!(
-                "removed mcpServers.kin from {}",
-                entry.path.display()
-            ))
+    let _ = entry;
+    anyhow::bail!("setup-owned removal requires its persistent ConfigLock authority")
+}
+
+fn remove_owned_slice_locked(
+    entry: &LedgerEntry,
+    lock: &super::setup::ConfigLock,
+) -> Result<String> {
+    let original = lock
+        .original_bytes(&entry.path)?
+        .with_context(|| format!("setup-owned path disappeared: {}", entry.path.display()))?;
+    if entry.kind == ArtifactKind::McpConfig
+        && entry
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("toml")
+    {
+        // Codex's config.toml: excise only the [mcp_servers.kin] table with a
+        // format-preserving edit; unrelated bytes remain under one CAS write.
+        let content = std::str::from_utf8(&original)
+            .with_context(|| format!("{} is not UTF-8", entry.path.display()))?;
+        let mut document: toml_edit::DocumentMut = content
+            .parse()
+            .with_context(|| format!("{} is not valid TOML", entry.path.display()))?;
+        if let Some(servers) = document
+            .get_mut("mcp_servers")
+            .and_then(|servers| servers.as_table_like_mut())
+        {
+            servers.remove("kin");
         }
-        ArtifactKind::ShellHook | ArtifactKind::VfsShim | ArtifactKind::DaemonConfig => {
-            fs::remove_file(&entry.path)
-                .with_context(|| format!("failed to remove {}", entry.path.display()))?;
-            Ok(format!("removed {}", entry.path.display()))
-        }
-        ArtifactKind::ShellRcLine
-        | ArtifactKind::ShellPathLine
-        | ArtifactKind::DiscoveryReminder => {
-            let snippet = entry
-                .snippet
-                .as_ref()
-                .context("appended-marker entry has no recorded snippet")?;
-            let content = fs::read_to_string(&entry.path)
-                .with_context(|| format!("failed to read {}", entry.path.display()))?;
-            // Excise exactly the block Kin appended; surrounding content is
-            // preserved. The shared file itself is never deleted.
-            let stripped = content.replacen(snippet.as_str(), "", 1);
-            fs::write(&entry.path, stripped)
-                .with_context(|| format!("failed to write {}", entry.path.display()))?;
-            Ok(format!(
-                "removed {} block from {}",
-                entry.kind.label(),
-                entry.path.display()
-            ))
-        }
+        lock.write_guarded(
+            &entry.path,
+            document.to_string().as_bytes(),
+            Some(&original),
+        )?;
+        return Ok(format!(
+            "removed mcp_servers.kin from {}",
+            entry.path.display()
+        ));
     }
+    if entry.kind == ArtifactKind::McpConfig {
+        let mut root: serde_json::Value = serde_json::from_slice(&original)
+            .with_context(|| format!("{} is not valid JSON", entry.path.display()))?;
+        if let Some(servers) = root
+            .get_mut("mcpServers")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            servers.remove("kin");
+        }
+        // Leave the (possibly now-empty) shared config file in place; Kin never
+        // deletes a user's config, only its own key within it.
+        let formatted =
+            serde_json::to_vec_pretty(&root).context("failed to serialize MCP config")?;
+        lock.write_guarded(&entry.path, &formatted, Some(&original))?;
+        return Ok(format!(
+            "removed mcpServers.kin from {}",
+            entry.path.display()
+        ));
+    }
+    if entry.kind.is_appended_marker() {
+        let snippet = entry
+            .snippet
+            .as_ref()
+            .context("appended-marker entry has no recorded snippet")?;
+        let content = std::str::from_utf8(&original)
+            .with_context(|| format!("{} is not UTF-8", entry.path.display()))?;
+        let stripped = content.replacen(snippet.as_str(), "", 1);
+        lock.write_guarded(&entry.path, stripped.as_bytes(), Some(&original))?;
+        return Ok(format!(
+            "removed {} block from {}",
+            entry.kind.label(),
+            entry.path.display()
+        ));
+    }
+    lock.remove_guarded(&entry.path, Some(&original))?;
+    Ok(format!("removed {}", entry.path.display()))
 }
 
 /// Load the ledger at `ledger_path`, uninstall every entry, and rewrite the
@@ -497,27 +610,102 @@ pub fn run_uninstall(
     dry_run: bool,
     force: bool,
 ) -> Result<Vec<RemovalOutcome>> {
-    let mut ledger = SetupLedger::load(ledger_path)?;
-    let outcomes: Vec<RemovalOutcome> = ledger
+    if dry_run {
+        let ledger = SetupLedger::load(ledger_path)?;
+        return Ok(ledger
+            .entries
+            .iter()
+            .map(|entry| uninstall_entry(entry, true, force))
+            .collect());
+    }
+    // Global writer order is MCP topology, canonical target locks, then the
+    // setup-ledger lock. Updater repair uses the same order. A snapshot
+    // supplies the target set; once the ledger lock is acquired below, any
+    // entry/topology change makes the operation fail closed before the first
+    // artifact is removed.
+    let snapshot = SetupLedger::load(ledger_path)?;
+    let snapshot_entries = snapshot.entries.clone();
+    let normalized_ledger_path = super::setup::ConfigLock::normalized_path(ledger_path)?;
+    let mut target_paths = snapshot
         .entries
         .iter()
-        .map(|entry| uninstall_entry(entry, dry_run, force))
-        .collect();
-
-    if !dry_run {
-        // Keep only entries that still need tracking (modified-and-skipped or
-        // failed removals); drop everything successfully cleared.
-        let keep: Vec<bool> = outcomes.iter().map(|o| !o.is_cleared()).collect();
-        let mut idx = 0;
+        .map(|entry| super::setup::ConfigLock::normalized_path(&entry.path))
+        .collect::<Result<Vec<_>>>()?;
+    target_paths.sort();
+    target_paths.dedup();
+    let mut authority_paths = target_paths
+        .iter()
+        .cloned()
+        .map(|path| (path, false))
+        .collect::<Vec<_>>();
+    authority_paths.push((normalized_ledger_path.clone(), true));
+    super::setup::ConfigLock::preflight_distinct(&authority_paths).context(
+        "setup ledger and uninstall targets contain aliased sidecar authority; refusing nested lock acquisition",
+    )?;
+    // Preflight is non-locking. Acquire the topology authority only after it
+    // proves the target and ledger sidecars are distinct, then preserve the
+    // global topology -> target -> ledger lock order below.
+    let _topology = super::setup::McpTopologyLock::acquire_for_ledger(ledger_path)?;
+    let mut target_locks = super::setup::ConfigLock::acquire_many(&target_paths)?;
+    SetupLedger::update(ledger_path, |ledger| {
+        if ledger.entries != snapshot_entries {
+            anyhow::bail!(
+                "setup ledger changed while uninstall acquired target locks; retry uninstall"
+            );
+        }
+        let mut outcomes = Vec::with_capacity(ledger.entries.len());
+        for entry in &ledger.entries {
+            let normalized = match super::setup::ConfigLock::normalized_path(&entry.path) {
+                Ok(path) => path,
+                Err(error) => {
+                    outcomes.push(RemovalOutcome {
+                        entry: entry.clone(),
+                        action: RemovalAction::Failed,
+                        detail: format!(
+                            "failed to normalize setup-owned path {}: {error:#}",
+                            entry.path.display()
+                        ),
+                    });
+                    continue;
+                }
+            };
+            let Some(lock_index) = target_paths.iter().position(|path| *path == normalized) else {
+                outcomes.push(RemovalOutcome {
+                    entry: entry.clone(),
+                    action: RemovalAction::Failed,
+                    detail: "locked setup target disappeared from uninstall authority".to_string(),
+                });
+                continue;
+            };
+            let lock = &mut target_locks[lock_index];
+            let mut outcome = uninstall_entry_with_lock(entry, false, force, lock);
+            if outcome.action == RemovalAction::Removed {
+                if let Err(error) = lock.refresh_locked_state() {
+                    // The owned slice is already gone, but retain its ledger
+                    // entry so a later uninstall can reconcile it as absent.
+                    // More importantly, never apply a second mutation to this
+                    // path using the stale pre-mutation CAS baseline.
+                    outcome.action = RemovalAction::Failed;
+                    outcome.detail = format!(
+                        "removed {}, but failed to refresh its locked CAS authority: {error:#}",
+                        entry.path.display()
+                    );
+                }
+            }
+            outcomes.push(outcome);
+        }
+        let keep: Vec<bool> = outcomes
+            .iter()
+            .map(|outcome| !outcome.is_cleared())
+            .collect();
+        let mut index = 0;
         ledger.entries.retain(|_| {
-            let k = keep[idx];
-            idx += 1;
-            k
+            let retain = keep[index];
+            index += 1;
+            retain
         });
-        ledger.save(ledger_path)?;
-    }
-
-    Ok(outcomes)
+        Ok(outcomes)
+    })
 }
 
 /// Verify every entry in the ledger at `ledger_path` against disk.
@@ -685,11 +873,62 @@ mod tests {
         assert!(SetupLedger::load(&path).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ledger_load_rejects_symlink_and_unsafe_mode() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.json");
+        write(&target, r#"{"schema_version":1,"entries":[]}"#);
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("linked-ledger.json");
+        symlink(&target, &link).unwrap();
+        assert!(SetupLedger::load(&link).is_err());
+
+        let unsafe_mode = dir.path().join("unsafe-ledger.json");
+        write(&unsafe_mode, r#"{"schema_version":1,"entries":[]}"#);
+        fs::set_permissions(&unsafe_mode, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(SetupLedger::load(&unsafe_mode).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ledger_and_persistent_lock_are_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("setup-ledger.json");
+        let mut ledger = SetupLedger::default();
+        ledger.record(LedgerEntry::whole_file(
+            ArtifactKind::DaemonConfig,
+            "daemon",
+            dir.path().join("setup.toml"),
+            b"[daemon]",
+        ));
+        ledger.save(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let lock = dir.path().join(".setup-ledger.json.kin-update.lock");
+        assert!(lock.is_file(), "ledger lock must remain persistent");
+        assert_eq!(
+            fs::metadata(lock).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
     #[test]
     fn save_empty_ledger_removes_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("setup-ledger.json");
         write(&path, "{}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
         SetupLedger::default().save(&path).unwrap();
         assert!(!path.exists(), "empty ledger leaves no residue on disk");
     }
@@ -749,6 +988,56 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(verify_entry(&entry).state, EntryState::Removed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_mcp_rejects_byte_identical_symlink_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.json");
+        let path = dir.path().join("claude.json");
+        let kin = serde_json::json!({
+            "command": "kin",
+            "args": ["mcp", "start"]
+        });
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "mcpServers": { "kin": kin }
+        }))
+        .unwrap();
+        fs::write(&real, &bytes).unwrap();
+        symlink(&real, &path).unwrap();
+        let entry = LedgerEntry::mcp("claude", path, &kin);
+
+        let verification = verify_entry(&entry);
+
+        assert_eq!(verification.state, EntryState::Modified);
+        assert!(verification.detail.contains("could not be safely verified"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_mcp_rejects_byte_identical_hardlink_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.json");
+        let path = dir.path().join("claude.json");
+        let kin = serde_json::json!({
+            "command": "kin",
+            "args": ["mcp", "start"]
+        });
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "mcpServers": { "kin": kin }
+        }))
+        .unwrap();
+        fs::write(&real, &bytes).unwrap();
+        fs::hard_link(&real, &path).unwrap();
+        let entry = LedgerEntry::mcp("claude", path, &kin);
+
+        let verification = verify_entry(&entry);
+
+        assert_eq!(verification.state, EntryState::Modified);
+        assert!(verification.detail.contains("could not be safely verified"));
     }
 
     #[test]
@@ -963,6 +1252,67 @@ mod tests {
     }
 
     #[test]
+    fn run_uninstall_chains_cas_baselines_for_two_blocks_in_one_rc_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("config/setup-ledger.json");
+        let rc = dir.path().join("home/.zshrc");
+        let user = "# user rc\nexport EDITOR=vim\n";
+        let hook = "\n# kin-vfs shell integration\nsource /managed/kin-vfs.zsh\n";
+        let path = "\n# Kin managed PATH\nexport PATH=\"/managed/bin:$PATH\"\n";
+        write(&rc, &format!("{user}{hook}{path}"));
+
+        let mut ledger = SetupLedger::default();
+        ledger.record(LedgerEntry::appended(
+            ArtifactKind::ShellRcLine,
+            "zsh",
+            rc.clone(),
+            hook,
+        ));
+        ledger.record(LedgerEntry::appended(
+            ArtifactKind::ShellPathLine,
+            "zsh",
+            rc.clone(),
+            path,
+        ));
+        ledger.save(&ledger_path).unwrap();
+
+        let outcomes = run_uninstall(&ledger_path, false, false).unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes
+            .iter()
+            .all(|outcome| outcome.action == RemovalAction::Removed));
+        assert_eq!(fs::read_to_string(&rc).unwrap(), user);
+        assert!(SetupLedger::load(&ledger_path).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn run_uninstall_rejects_target_ledger_sidecar_alias_before_wal_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("config/setup-ledger.json");
+        let mut ledger = SetupLedger::default();
+        ledger.record(LedgerEntry::whole_file(
+            ArtifactKind::DaemonConfig,
+            "self-alias",
+            ledger_path.clone(),
+            b"not-the-ledger-bytes",
+        ));
+        ledger.save(&ledger_path).unwrap();
+        let before = fs::read(&ledger_path).unwrap();
+
+        super::super::setup::reset_config_transaction_acquire_count();
+        let error = run_uninstall(&ledger_path, false, false)
+            .expect_err("ledger/target sidecar alias must fail before nested guard acquisition");
+
+        assert!(format!("{error:#}").contains("aliased sidecar authority"));
+        assert_eq!(
+            super::super::setup::config_transaction_acquire_count(),
+            0,
+            "preflight alias rejection must happen before any WAL guard acquisition"
+        );
+        assert_eq!(fs::read(&ledger_path).unwrap(), before);
+    }
+
+    #[test]
     fn run_uninstall_dry_run_mutates_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let ledger_path = dir.path().join("setup-ledger.json");
@@ -985,5 +1335,111 @@ mod tests {
             1,
             "dry-run leaves the ledger unchanged"
         );
+    }
+
+    #[test]
+    fn incompatible_or_unknown_ledger_data_is_retained_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("setup-ledger.json");
+        let hook = dir.path().join("hook.zsh");
+        write(&hook, "HOOK");
+        let mut ledger = SetupLedger::default();
+        ledger.record(LedgerEntry::whole_file(
+            ArtifactKind::ShellHook,
+            "zsh",
+            hook.clone(),
+            b"HOOK",
+        ));
+
+        for mutation in ["schema", "ledger-field", "entry-field"] {
+            let mut value = serde_json::to_value(&ledger).unwrap();
+            match mutation {
+                "schema" => value["schema_version"] = serde_json::json!(99),
+                "ledger-field" => {
+                    value["future_lifecycle"] = serde_json::json!({"acknowledged": true})
+                }
+                "entry-field" => {
+                    value["entries"][0]["future_authority"] = serde_json::json!("external")
+                }
+                _ => unreachable!(),
+            }
+            let bytes = serde_json::to_vec_pretty(&value).unwrap();
+            fs::write(&ledger_path, &bytes).unwrap();
+
+            assert!(
+                run_uninstall(&ledger_path, false, false).is_err(),
+                "{mutation}"
+            );
+            assert_eq!(fs::read(&ledger_path).unwrap(), bytes, "{mutation}");
+            assert_eq!(fs::read(&hook).unwrap(), b"HOOK", "{mutation}");
+        }
+    }
+
+    #[test]
+    fn uninstall_waits_for_shared_path_lock_and_preserves_concurrent_shell_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("config/setup-ledger.json");
+        let rc = dir.path().join("home/.zshrc");
+        let snippet = "\n# Kin block\nsource /managed/hook\n";
+        let original = format!("# user\n{snippet}");
+        write(&rc, &original);
+        let mut ledger = SetupLedger::default();
+        ledger.record(LedgerEntry::appended(
+            ArtifactKind::ShellRcLine,
+            "zsh",
+            rc.clone(),
+            snippet,
+        ));
+        ledger.save(&ledger_path).unwrap();
+
+        let held = super::super::setup::ConfigLock::acquire(&rc).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker_ledger = ledger_path.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            run_uninstall(&worker_ledger, false, false).unwrap()
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let edited = format!("# concurrent user edit\n{original}");
+        fs::write(&rc, &edited).unwrap();
+        drop(held);
+
+        let outcomes = worker.join().unwrap();
+        assert_eq!(outcomes[0].action, RemovalAction::Removed);
+        assert_eq!(
+            fs::read_to_string(&rc).unwrap(),
+            "# concurrent user edit\n# user\n",
+            "the concurrent user bytes survive while only Kin's exact block is removed"
+        );
+        assert!(SetupLedger::load(&ledger_path).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn uninstall_preserves_concurrently_replaced_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("config/setup-ledger.json");
+        let hook = dir.path().join("shell/kin-vfs.zsh");
+        write(&hook, "KIN OWNED");
+        let mut ledger = SetupLedger::default();
+        ledger.record(LedgerEntry::whole_file(
+            ArtifactKind::ShellHook,
+            "zsh",
+            hook.clone(),
+            b"KIN OWNED",
+        ));
+        ledger.save(&ledger_path).unwrap();
+
+        let held = super::super::setup::ConfigLock::acquire(&hook).unwrap();
+        let worker_ledger = ledger_path.clone();
+        let worker = std::thread::spawn(move || run_uninstall(&worker_ledger, false, false));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(&hook, b"USER REPLACEMENT").unwrap();
+        drop(held);
+
+        let outcomes = worker.join().unwrap().unwrap();
+        assert_eq!(outcomes[0].action, RemovalAction::SkippedModified);
+        assert_eq!(fs::read(&hook).unwrap(), b"USER REPLACEMENT");
+        assert_eq!(SetupLedger::load(&ledger_path).unwrap().entries.len(), 1);
     }
 }

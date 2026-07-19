@@ -15,6 +15,12 @@ use kin_core::KinLayout;
 use kin_daemon::{run, DaemonConfig, DaemonState};
 use tracing_subscriber::EnvFilter;
 
+kin_buildinfo::embed_update_build_identity!(
+    KIN_UPDATE_BUILD_IDENTITY,
+    env!("CARGO_PKG_VERSION"),
+    kin_db::GraphSnapshot::CURRENT_VERSION
+);
+
 /// Storage mode for graph snapshots.
 #[derive(Debug, Clone, PartialEq)]
 enum StorageMode {
@@ -256,6 +262,7 @@ fn embed_batch_size_from_env() -> Result<Option<usize>, String> {
 }
 
 fn main() {
+    kin_buildinfo::retain_update_build_identity(&KIN_UPDATE_BUILD_IDENTITY);
     // Build the async runtime explicitly (rather than via `#[tokio::main]`) so
     // we own its teardown. The embedding worker dispatches batches onto the
     // blocking pool doing synchronous GPU compute that cannot observe the
