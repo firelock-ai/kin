@@ -10941,7 +10941,7 @@ pub async fn doctor(fix: bool, json: bool) -> Result<()> {
     // Try a local copy first; a standalone binary (no sibling shim, no ledger
     // source) has none, so fall back to downloading the shim from the release
     // that matches THIS binary's version. Only if both fail do we print a manual
-    // step — and never one that points back at `kin doctor --fix` (FIR-1409).
+    // step — and never one that points back at `kin doctor --fix`.
     let vfs_needs_fix = report.checks.iter().any(|c| {
         c.id == "vfs_projection"
             && c.fixable
@@ -11281,7 +11281,7 @@ mod tests {
 
     #[test]
     fn restore_shim_repairs_a_zeroed_shim_from_a_usable_source() {
-        // FIR-1409 repair path: a deliberately-zeroed shim + a usable source is
+        // Repair path: a deliberately-zeroed shim + a usable source is
         // restored to the real bytes.
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("source-shim");
@@ -11301,7 +11301,7 @@ mod tests {
 
     #[test]
     fn restore_shim_reports_none_when_no_usable_source_exists() {
-        // FIR-1409 honest path: with no usable source, the repair reports None
+        // Honest path: with no usable source, the repair reports None
         // (so the caller escalates / prints a manual step) and never fabricates
         // content over the zeroed shim.
         let tmp = tempfile::tempdir().unwrap();
