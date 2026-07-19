@@ -270,11 +270,11 @@ impl UpdateConfig {
             .unwrap_or_default()
     }
 
-    fn save_to(&self, _kin_home: &Path, lock: Option<&InstallRootLock>) -> Result<()> {
+    fn save_to(&self, _kin_home: &Path, _lock: Option<&InstallRootLock>) -> Result<()> {
         let contents = toml::to_string_pretty(self).context("failed to serialize update config")?;
         #[cfg(unix)]
         {
-            let install = lock
+            let install = _lock
                 .context("update config mutation requires the held install lock")?
                 .install()?;
             install
@@ -1104,12 +1104,12 @@ fn validate_pinned_preflight_build_identity(
     staging.persist_status("validating staged provenance")?;
     validate_staged_artifact_provenance(staging.path(), spec, provenance_identities, true)?;
     #[cfg(windows)]
-    staging.validate()?;
+    staging.validate_windows()?;
     staging.persist_status("validating staged static build identity")?;
     let result =
         validate_staged_static_build_identity(staging.path(), spec, expected_version, provenance);
     #[cfg(windows)]
-    staging.validate()?;
+    staging.validate_windows()?;
     result
 }
 
@@ -4150,13 +4150,13 @@ fn maybe_crash_private_temp_cleanup(point: &str) {
 fn maybe_crash_private_temp_cleanup(_point: &str) {}
 
 fn remove_quarantined_private_temp_root(
-    parent: &Path,
+    _parent: &Path,
     quarantine: &Path,
     expected: &PlatformObjectIdentity,
 ) -> Result<()> {
     #[cfg(unix)]
     {
-        let parent_dir = AnchoredDir::open_ambient(parent)?;
+        let parent_dir = AnchoredDir::open_ambient(_parent)?;
         let name = quarantine
             .file_name()
             .and_then(|name| name.to_str())

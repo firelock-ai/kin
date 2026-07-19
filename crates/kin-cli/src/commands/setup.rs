@@ -2186,6 +2186,8 @@ impl ConfigTransactionAuthority {
         let file = super::update::windows_update::open_or_create_current_user_private_file(&path)?;
         #[cfg(not(unix))]
         let metadata = validate_regular_config_file(&path, &file, true)?;
+        #[cfg(windows)]
+        let _ = &metadata;
         #[cfg(unix)]
         let identity = ConfigFileIdentity::from_metadata(&metadata);
         #[cfg(windows)]
@@ -5458,9 +5460,6 @@ fn recover_windows_config_transaction(
                 .original
                 .as_ref()
                 .context("Windows removal recovery lost original authority")?;
-            let retained_path = retained_path
-                .as_deref()
-                .context("Windows removal recovery lost quarantine path")?;
             debug_assert_eq!(record.phase, ConfigTransactionPhase::Prepared);
             match (canonical, retained) {
                 (None, Some((old_file, old))) if original.same_identity(&old) => {
@@ -6687,8 +6686,7 @@ impl ConfigLock {
                     temp.display()
                 )
             })?;
-            let file = fs::File::from(fd);
-            file
+            fs::File::from(fd)
         };
         #[cfg(all(not(unix), not(windows)))]
         let mut staged = options
@@ -7337,6 +7335,7 @@ impl ConfigLock {
             if !staged_committed {
                 let _ = fs::remove_file(&temp);
             }
+            #[cfg(not(windows))]
             return Err(error);
         }
         Ok(())
