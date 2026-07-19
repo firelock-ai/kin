@@ -3055,7 +3055,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
- "console 0.15.11",
+ "console 0.16.3",
  "dialoguer",
  "directories 5.0.1",
  "ed25519-dalek",

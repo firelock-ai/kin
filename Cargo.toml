@@ -97,7 +97,7 @@ socket2 = "0.6"
 
 # Interactive CLI
 dialoguer = { version = "0.11", features = ["fuzzy-select"] }
-console = "0.15"
+console = "0.16"
 
 # Archive generation
 tar = "0.4"
