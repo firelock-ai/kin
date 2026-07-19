@@ -1169,14 +1169,17 @@ fn atomic_create_once(path: &Path, bytes: &[u8], role: &str) -> Result<()> {
     result
 }
 
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        File::open(path)
-            .with_context(|| format!("failed to open directory {} for sync", path.display()))?
-            .sync_all()
-            .with_context(|| format!("failed to sync directory {}", path.display()))?;
-    }
+    File::open(path)
+        .with_context(|| format!("failed to open directory {} for sync", path.display()))?
+        .sync_all()
+        .with_context(|| format!("failed to sync directory {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -1231,6 +1234,7 @@ fn require_regular_file(path: &Path, role: &str) -> Result<()> {
 
 fn read_regular(path: &Path, role: &str) -> Result<Vec<u8>> {
     require_regular_file(path, role)?;
+    #[cfg(unix)]
     let before = fs::symlink_metadata(path)?;
     let mut options = OpenOptions::new();
     options.read(true);
