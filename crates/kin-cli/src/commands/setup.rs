@@ -6407,14 +6407,13 @@ fn dispose_windows_terminal_residue(
 
 #[cfg(windows)]
 fn recover_windows_terminal_config_transaction(
+    parent: &super::update::windows_update::WindowsParentGuard,
     path: &Path,
     private: bool,
     record: &ConfigTransactionRecord,
 ) -> Result<()> {
     validate_config_transaction_record(path, private, record)?;
     let strict_sacl = record.original.is_some();
-    let parent_path = path.parent().context("managed config has no parent")?;
-    let parent = super::update::windows_update::WindowsParentGuard::open(parent_path)?;
     let (namespace, file) = parent.identity();
     if record.parent.namespace != namespace || record.parent.file != file {
         anyhow::bail!(
@@ -6434,7 +6433,7 @@ fn recover_windows_terminal_config_transaction(
         (ConfigTransactionPhase::CommitComplete, ConfigTransactionOperation::Write) => {
             if let Some(staged_path) = staged_path.as_deref() {
                 dispose_windows_terminal_residue(
-                    &parent,
+                    parent,
                     staged_path,
                     private,
                     "completed managed config staging residue",
@@ -6449,7 +6448,7 @@ fn recover_windows_terminal_config_transaction(
                 (retained_path.as_deref(), record.original.as_ref())
             {
                 dispose_windows_terminal_residue(
-                    &parent,
+                    parent,
                     retained_path,
                     private,
                     "completed managed config quarantine residue",
@@ -6716,7 +6715,7 @@ fn resolve_windows_committed_transaction_after_error(
                 }
             }
             ConfigTransactionPhase::CommitComplete => {
-                recover_windows_terminal_config_transaction(path, private, &durable)
+                recover_windows_terminal_config_transaction(parent, path, private, &durable)
             }
             phase => anyhow::bail!(
                 "committed Windows managed config transaction regressed to unexpected durable phase {phase:?}"
@@ -6761,7 +6760,7 @@ fn recover_windows_config_transaction(
         record.phase,
         ConfigTransactionPhase::CommitComplete | ConfigTransactionPhase::RollbackComplete
     ) {
-        return recover_windows_terminal_config_transaction(path, private, record);
+        return recover_windows_terminal_config_transaction(&parent, path, private, record);
     }
     if terminalize_windows_durable_transition(lock_file, &parent, path, private, record)?.is_some()
     {

@@ -36,8 +36,8 @@ use windows_sys::Win32::Security::{
     GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorControl,
     GetSecurityDescriptorSacl, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor,
     IsValidSid, LookupPrivilegeValueW, SecurityImpersonation, SetSecurityDescriptorControl,
-    SetSecurityDescriptorDacl, SetSecurityDescriptorOwner, TokenImpersonation, TokenUser, ACL,
-    ACL_REVISION, ACL_REVISION_DS, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
+    SetSecurityDescriptorDacl, SetSecurityDescriptorOwner, TokenImpersonation, TokenUser,
+    ACE_HEADER, ACL, ACL_REVISION, ACL_REVISION_DS, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
     DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, INHERITED_ACE, INHERIT_ONLY_ACE,
     LABEL_SECURITY_INFORMATION, NO_PROPAGATE_INHERIT_ACE, OBJECT_INHERIT_ACE,
     OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
@@ -921,6 +921,55 @@ struct ManagedFileSecurity {
     control: u16,
 }
 
+fn canonical_acl_bytes(acl: *mut ACL, label: &str) -> Result<Vec<u8>> {
+    let mut info = ACL_SIZE_INFORMATION::default();
+    if unsafe {
+        GetAclInformation(
+            acl,
+            (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+            size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    } == 0
+    {
+        return Err(win32_error(&format!(
+            "failed to size managed config {label}"
+        )));
+    }
+    if info.AclBytesInUse < size_of::<ACL>() as u32 {
+        anyhow::bail!("managed config {label} has invalid byte length");
+    }
+
+    // AclSize is allocation capacity rather than access-control authority.
+    // SetSecurityInfo is allowed to reallocate an otherwise identical ACL, so
+    // hashing the raw ACL header makes a security-preserving copy compare
+    // unequal. Canonicalize the revision, ACE count, and exact used ACE bytes.
+    let header = unsafe { &*acl };
+    if u32::from(header.AceCount) != info.AceCount {
+        anyhow::bail!("managed config {label} ACE count changed during inspection");
+    }
+    let mut canonical = Vec::with_capacity(info.AclBytesInUse as usize);
+    canonical.push(header.AclRevision);
+    canonical.extend_from_slice(&header.AceCount.to_le_bytes());
+    for index in 0..info.AceCount {
+        let mut ace = null_mut();
+        if unsafe { GetAce(acl, index, &mut ace) } == 0 || ace.is_null() {
+            return Err(win32_error(&format!(
+                "failed to read managed config {label} ACE {index}"
+            )));
+        }
+        let ace_header = unsafe { &*(ace as *const ACE_HEADER) };
+        let ace_len = usize::from(ace_header.AceSize);
+        if ace_len < size_of::<ACE_HEADER>() || ace_len > info.AclBytesInUse as usize {
+            anyhow::bail!("managed config {label} ACE {index} has invalid byte length");
+        }
+        let ace_bytes = unsafe { std::slice::from_raw_parts(ace.cast::<u8>(), ace_len) };
+        canonical.extend_from_slice(&(ace_len as u32).to_le_bytes());
+        canonical.extend_from_slice(ace_bytes);
+    }
+    Ok(canonical)
+}
+
 fn read_managed_file_security(file: &File) -> Result<ManagedFileSecurity> {
     let mut owner = null_mut();
     let mut group = null_mut();
@@ -975,45 +1024,13 @@ pub(crate) fn managed_file_security_fingerprint(file: &File) -> Result<String> {
     if owner_len == 0 || group_len == 0 {
         anyhow::bail!("managed config owner/group SID has invalid length");
     }
-    let mut acl_info = ACL_SIZE_INFORMATION::default();
-    if unsafe {
-        GetAclInformation(
-            security.dacl,
-            (&mut acl_info as *mut ACL_SIZE_INFORMATION).cast(),
-            size_of::<ACL_SIZE_INFORMATION>() as u32,
-            AclSizeInformation,
-        )
-    } == 0
-    {
-        return Err(win32_error("failed to size managed config DACL"));
-    }
-    let acl_len = acl_info.AclBytesInUse as usize;
-    if acl_len < size_of::<ACL>() {
-        anyhow::bail!("managed config DACL has invalid byte length");
-    }
     let owner = unsafe { std::slice::from_raw_parts(security.owner.cast::<u8>(), owner_len) };
     let group = unsafe { std::slice::from_raw_parts(security.group.cast::<u8>(), group_len) };
-    let dacl = unsafe { std::slice::from_raw_parts(security.dacl.cast::<u8>(), acl_len) };
+    let dacl = canonical_acl_bytes(security.dacl, "DACL")?;
     let label = if security.label.is_null() {
-        &[][..]
+        Vec::new()
     } else {
-        let mut label_info = ACL_SIZE_INFORMATION::default();
-        if unsafe {
-            GetAclInformation(
-                security.label,
-                (&mut label_info as *mut ACL_SIZE_INFORMATION).cast(),
-                size_of::<ACL_SIZE_INFORMATION>() as u32,
-                AclSizeInformation,
-            )
-        } == 0
-        {
-            return Err(win32_error("failed to size managed config mandatory label"));
-        }
-        let label_len = label_info.AclBytesInUse as usize;
-        if label_len < size_of::<ACL>() {
-            anyhow::bail!("managed config mandatory label has invalid byte length");
-        }
-        unsafe { std::slice::from_raw_parts(security.label.cast::<u8>(), label_len) }
+        canonical_acl_bytes(security.label, "mandatory label")?
     };
     // AUTO_INHERITED/AUTO_INHERIT_REQ are Windows bookkeeping bits that the
     // kernel may normalize while installing an otherwise identical ACL.
@@ -1021,15 +1038,15 @@ pub(crate) fn managed_file_security_fingerprint(file: &File) -> Result<String> {
     // and is not part of this owner/DACL/mandatory-label copy. Protection is
     // the stable inheritance-policy authority for this fingerprint.
     let relevant_control = security.control & SE_DACL_PROTECTED;
-    let mut canonical = Vec::with_capacity(owner_len + group_len + acl_len + label.len() + 18);
+    let mut canonical = Vec::with_capacity(owner_len + group_len + dacl.len() + label.len() + 18);
     canonical.extend_from_slice(&(owner_len as u32).to_le_bytes());
     canonical.extend_from_slice(owner);
     canonical.extend_from_slice(&(group_len as u32).to_le_bytes());
     canonical.extend_from_slice(group);
-    canonical.extend_from_slice(&(acl_len as u32).to_le_bytes());
-    canonical.extend_from_slice(dacl);
+    canonical.extend_from_slice(&(dacl.len() as u32).to_le_bytes());
+    canonical.extend_from_slice(&dacl);
     canonical.extend_from_slice(&(label.len() as u32).to_le_bytes());
-    canonical.extend_from_slice(label);
+    canonical.extend_from_slice(&label);
     canonical.extend_from_slice(&relevant_control.to_le_bytes());
     Ok(crate::commands::setup_ledger::sha256_hex(&canonical))
 }
@@ -1072,7 +1089,9 @@ pub(crate) fn copy_managed_file_security(source: &File, destination: &File) -> R
     }
     let destination_fingerprint = managed_file_security_fingerprint(destination)?;
     if destination_fingerprint != source_fingerprint {
-        anyhow::bail!("staged managed config owner/DACL differs after security copy");
+        anyhow::bail!(
+            "staged managed config owner/DACL differs after security copy (source {source_fingerprint}, destination {destination_fingerprint})"
+        );
     }
     Ok(())
 }
@@ -3165,9 +3184,17 @@ mod tests {
         std::fs::remove_file(root.path().join("bin/alias.exe")).unwrap();
         let user = CurrentUserSid::load().unwrap();
         let guard = SecurePathGuard::open(&candidate, false, Some(&user), true, true).unwrap();
-        let rename = std::fs::rename(&candidate, root.path().join("bin/moved.exe"));
-        assert!(rename.is_err(), "a guarded candidate path was renameable");
-        guard.validate(Some(&user)).unwrap();
+        let moved = root.path().join("bin/moved.exe");
+        let rename = std::fs::rename(&candidate, &moved);
+        match rename {
+            Err(_) => guard.validate(Some(&user)).unwrap(),
+            Ok(()) => {
+                let error = guard
+                    .validate(Some(&user))
+                    .expect_err("a renamed guarded candidate must fail binding revalidation");
+                assert!(format!("{error:#}").contains("binding changed"));
+            }
+        }
         drop(guard);
         drop(root);
         std::fs::remove_dir(container).unwrap();
