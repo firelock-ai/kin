@@ -11081,7 +11081,11 @@ cwd = {:?}
             &identities,
         )
         .unwrap_err();
-        assert!(format!("{zip_error:#}").contains("directory 'nonempty/' has nonzero"));
+        let zip_message = format!("{zip_error:#}");
+        assert!(
+            zip_message.contains("directory 'nonempty' has nonzero"),
+            "unexpected ZIP validation error: {zip_message}"
+        );
     }
 
     #[test]

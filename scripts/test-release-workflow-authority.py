@@ -628,7 +628,7 @@ def main() -> None:
         archive_attestation_start:release_creation_start
     ]
     for policy in (
-        "actions/attest@a1948c3f048ba23858d222213b7c278aabede763",
+        "actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6",
         "subject-path: |",
         "kin-linux-x86_64.tar.gz",
         "kin-linux-aarch64.tar.gz",
