@@ -133,12 +133,6 @@ jobs:
             exit 1
           fi
 
-      - name: Build Windows release binaries without vector features
-        shell: bash
-        run: >
-          cargo build --locked --release --target x86_64-pc-windows-msvc
-          -p kin-cli -p kin-daemon --no-default-features
-
       - name: Compile and run native Windows authority tests
         shell: bash
         run: |
@@ -149,6 +143,12 @@ jobs:
             -maxdepth 1 -type f -name 'kin_cli-*.exe' -print -quit)
           test -n "$test_binary"
           "$test_binary" windows --test-threads=1
+
+      - name: Build Windows release binaries without vector features
+        shell: bash
+        run: >
+          cargo build --locked --release --target x86_64-pc-windows-msvc
+          -p kin-cli -p kin-daemon --no-default-features
 
       - name: Verify Windows build provenance and disabled features
         shell: bash
