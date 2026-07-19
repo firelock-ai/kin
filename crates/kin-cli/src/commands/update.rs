@@ -11243,6 +11243,7 @@ cwd = {:?}
     }
 
     #[test]
+    #[serial]
     fn install_failure_rolls_back_every_component() {
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
@@ -11986,6 +11987,7 @@ cwd = {:?}
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn replacing_bin_before_first_backup_cannot_redirect_mutation() {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().unwrap();
@@ -12039,6 +12041,7 @@ cwd = {:?}
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn replacing_lib_before_shim_install_cannot_redirect_mutation() {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().unwrap();
@@ -12581,6 +12584,7 @@ cwd = {:?}
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn replacing_install_root_aborts_before_component_mutation() {
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
@@ -12636,6 +12640,7 @@ cwd = {:?}
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn replacing_update_lock_aborts_before_component_mutation() {
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
