@@ -13,6 +13,12 @@ use tracing::Instrument;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
+kin_buildinfo::embed_update_build_identity!(
+    KIN_UPDATE_BUILD_IDENTITY,
+    env!("CARGO_PKG_VERSION"),
+    kin_db::GraphSnapshot::CURRENT_VERSION
+);
+
 #[derive(Parser)]
 #[command(name = "kin", version = kin_buildinfo::version(), about = "Kin semantic VCS")]
 struct Cli {
@@ -832,13 +838,75 @@ enum Command {
     },
     /// Update Kin to the latest release
     Update {
-        /// Skip signature and checksum verification (NOT recommended)
-        #[arg(long)]
+        /// Skip SHA-256 checksum verification (NOT recommended)
+        #[arg(long, conflicts_with = "check_only")]
         skip_verify: bool,
         /// Release channel: `stable` (default) or `alpha` (latest pre-release,
-        /// unstable). The chosen channel is saved as the default for future updates.
+        /// unstable). A mutating update saves the choice; check-only never writes it.
         #[arg(long, value_enum)]
         channel: Option<commands::update::Channel>,
+        /// Require the selected release to have this exact SemVer. This selects
+        /// a release; it does not authenticate archive bytes. Automation must
+        /// provide the complete pinned expectation tuple.
+        #[arg(
+            long,
+            requires_all = ["expect_sha", "expect_archive_sha256"],
+            conflicts_with = "ack_restart",
+            value_name = "SEMVER"
+        )]
+        expect_version: Option<semver::Version>,
+        /// Require the selected release tag to peel to this exact Kin commit.
+        /// This selects the tag source; it does not authenticate archive bytes.
+        #[arg(
+            long,
+            requires_all = ["expect_version", "expect_archive_sha256"],
+            conflicts_with = "ack_restart",
+            value_parser = commands::update::parse_expected_commit_sha,
+            value_name = "40HEX"
+        )]
+        expect_sha: Option<String>,
+        /// Require the downloaded platform archive to match this exact SHA-256.
+        /// Supply it only after external cryptographic attestation verification
+        /// pins firelock-ai/kin, release.yml, the release tag, and source commit.
+        #[arg(
+            long,
+            requires_all = ["expect_version", "expect_sha"],
+            conflicts_with = "ack_restart",
+            value_parser = commands::update::parse_expected_archive_sha256,
+            value_name = "64HEX"
+        )]
+        expect_archive_sha256: Option<String>,
+        /// Check whether an update is available without downloading or installing it.
+        #[arg(long)]
+        check_only: bool,
+        /// Emit the check-only result as JSON.
+        #[arg(long, requires = "check_only")]
+        json: bool,
+        /// Verify the durable restart fence and exact installed binary
+        /// identities for the release awaiting acknowledgement. Legacy markers
+        /// may additionally require explicit replacement-session evidence.
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "skip_verify",
+                "channel",
+                "expect_version",
+                "expect_sha",
+                "expect_archive_sha256",
+                "check_only",
+                "json"
+            ]
+        )]
+        ack_restart: bool,
+        /// Legacy-marker live replacement proof: `daemon=PID`, `mcp=PID`, or
+        /// `vfs=PID`. New stop-before-update markers reject these arguments and
+        /// require no replacement session evidence.
+        #[arg(
+            long = "runtime-session",
+            requires = "ack_restart",
+            value_name = "KIND=PID"
+        )]
+        runtime_sessions: Vec<String>,
     },
     /// Show or manage the global Kin repository registry
     Registry {
@@ -1834,6 +1902,7 @@ enum HostedReleaseAction {
 }
 
 fn main() -> Result<()> {
+    kin_buildinfo::retain_update_build_identity(&KIN_UPDATE_BUILD_IDENTITY);
     let cli = Cli::parse();
     let command_name = current_command_name();
     let cwd = std::env::current_dir()?.display().to_string();
@@ -1864,6 +1933,15 @@ fn main() -> Result<()> {
     if let Err(err) = kin_core::env_registry::enforce_startup_env() {
         eprintln!("kin: {err}");
         std::process::exit(2);
+    }
+
+    // A durable MCP marker is an active repair obligation. Ordinary commands
+    // retry it; the update command retries while holding the install lock.
+    if !matches!(&cli.command, Command::Update { .. }) {
+        match commands::update::retry_pending_mcp_repair_from_managed_process() {
+            Ok(_) => {}
+            Err(error) => eprintln!("kin: MCP repair remains pending: {error:#}"),
+        }
     }
 
     let root_span = tracing::info_span!(
@@ -2759,7 +2837,27 @@ fn main() -> Result<()> {
                 Command::Update {
                     skip_verify,
                     channel,
-                } => commands::update::run(skip_verify, channel).await,
+                    expect_version,
+                    expect_sha,
+                    expect_archive_sha256,
+                    check_only,
+                    json,
+                    ack_restart,
+                    runtime_sessions,
+                } => {
+                    commands::update::run(
+                        skip_verify,
+                        channel,
+                        expect_version,
+                        expect_sha,
+                        expect_archive_sha256,
+                        check_only,
+                        json,
+                        ack_restart,
+                        runtime_sessions,
+                    )
+                    .await
+                }
                 Command::Registry { action } => match action {
                     Some(RegistryAction::Authority {
                         json,
@@ -2899,6 +2997,15 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    fn on_cli_test_stack(test: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(test)
+            .expect("spawn CLI test thread")
+            .join()
+            .expect("CLI test thread must succeed");
+    }
+
     #[test]
     fn cli_definition_is_valid() {
         // clap's debug_assert recurses over the full command tree, which has
@@ -2910,5 +3017,88 @@ mod tests {
             .expect("spawn cli validation thread")
             .join()
             .expect("cli definition validation must succeed");
+    }
+
+    #[test]
+    fn update_release_expectation_tuple_is_complete_and_works_with_check_only() {
+        on_cli_test_stack(|| {
+            let digest = "a".repeat(64);
+            let uppercase_digest = "C".repeat(64);
+            for args in [
+                vec!["kin", "update", "--expect-version", "0.2.22"],
+                vec![
+                    "kin",
+                    "update",
+                    "--expect-sha",
+                    "0123456789abcdef0123456789abcdef01234567",
+                ],
+                vec!["kin", "update", "--expect-archive-sha256", digest.as_str()],
+                vec![
+                    "kin",
+                    "update",
+                    "--expect-version",
+                    "0.2.22",
+                    "--expect-sha",
+                    "0123456789abcdef0123456789abcdef01234567",
+                ],
+            ] {
+                assert!(Cli::try_parse_from(args).is_err());
+            }
+
+            let cli = Cli::try_parse_from([
+                "kin",
+                "update",
+                "--channel",
+                "stable",
+                "--expect-version",
+                "0.2.22",
+                "--expect-sha",
+                "0123456789ABCDEF0123456789ABCDEF01234567",
+                "--expect-archive-sha256",
+                uppercase_digest.as_str(),
+                "--check-only",
+                "--json",
+            ])
+            .expect("complete release expectation must be accepted for check-only automation");
+            match cli.command {
+                Command::Update {
+                    expect_version,
+                    expect_sha,
+                    expect_archive_sha256,
+                    check_only,
+                    json,
+                    ..
+                } => {
+                    assert_eq!(expect_version.unwrap(), semver::Version::new(0, 2, 22));
+                    assert_eq!(
+                        expect_sha.unwrap(),
+                        "0123456789abcdef0123456789abcdef01234567"
+                    );
+                    assert_eq!(expect_archive_sha256.unwrap(), "c".repeat(64));
+                    assert!(check_only);
+                    assert!(json);
+                }
+                _ => panic!("expected update command"),
+            }
+        });
+    }
+
+    #[test]
+    fn restart_ack_rejects_release_pins_at_argument_parsing() {
+        on_cli_test_stack(|| {
+            let digest = "a".repeat(64);
+            assert!(Cli::try_parse_from([
+                "kin",
+                "update",
+                "--expect-version",
+                "0.2.22",
+                "--expect-sha",
+                "0123456789abcdef0123456789abcdef01234567",
+                "--expect-archive-sha256",
+                digest.as_str(),
+                "--ack-restart",
+            ])
+            .is_err());
+        });
     }
 }

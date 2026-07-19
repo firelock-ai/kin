@@ -3018,6 +3018,8 @@ dependencies = [
  "reqwest 0.12.28",
  "rpassword",
  "rustc-hash 1.1.0",
+ "rustix",
+ "semver",
  "serde",
  "serde_json",
  "serial_test",
@@ -3033,6 +3035,7 @@ dependencies = [
  "url",
  "uuid",
  "which 8.0.4",
+ "windows-sys 0.61.2",
  "zip",
 ]
 

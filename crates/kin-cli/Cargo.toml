@@ -63,6 +63,7 @@ rpassword = "7"
 serde = { workspace = true }
 uuid = { workspace = true }
 serde_json = { workspace = true }
+semver = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "json"] }
 hex = { workspace = true }
@@ -82,15 +83,29 @@ rustc-hash = "1.1"
 sysinfo = "0.39"
 toml = { workspace = true }
 toml_edit = "0.25"
+tempfile = { workspace = true }
 kin-spine = { version = "0.2.0", path = "../kin-spine" }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
 serial_test = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+rustix = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Pipes",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
 
 # macOS-only: re-enable the Metal embedding backend (kin-db/metal -> kin-infer/metal).
 # Feature unification is additive, so on macOS kin-db is built with metal; on Linux this

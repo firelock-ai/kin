@@ -592,6 +592,81 @@ def main() -> None:
     ):
         require(build_job, policy, "cross-platform release lockfile authority")
 
+    for policy in (
+        'require("./scripts/read-update-build-identity.cjs")',
+        "record.build_identity = readUpdateBuildIdentity(file)",
+        "schema_version: 2",
+        "static build identity does not match the tagged release source",
+        "CLI and daemon graph snapshot identities disagree",
+    ):
+        require(build_job, policy, "static release build identity generation")
+
+    for policy in (
+        "manifest.schema_version === 2",
+        "const identity = readUpdateBuildIdentity(file)",
+        "record?.build_identity === undefined",
+        "static build source is not clean and known",
+        "static dependency provenance mismatch",
+    ):
+        require(publish_job, policy, "static release build identity aggregation")
+    require(
+        ci_workflow,
+        "./scripts/read-update-build-identity.test.cjs",
+        "static release build identity parser regression",
+    )
+    archive_attestation_start = publish_job.index(
+        "      - name: Attest final release archives and provenance"
+    )
+    release_creation_start = publish_job.index(
+        "      - name: Create GitHub Release", archive_attestation_start
+    )
+    if archive_attestation_start >= release_creation_start:
+        raise AssertionError(
+            "final release archives must be attested before the first GitHub Release write"
+        )
+    archive_attestation_step = publish_job[
+        archive_attestation_start:release_creation_start
+    ]
+    for policy in (
+        "actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6",
+        "subject-path: |",
+        "kin-linux-x86_64.tar.gz",
+        "kin-linux-aarch64.tar.gz",
+        "kin-macos-x86_64.tar.gz",
+        "kin-macos-aarch64.tar.gz",
+        "kin-windows-x86_64.zip",
+        "release-provenance.json",
+        "Fail closed",
+    ):
+        require(
+            archive_attestation_step,
+            policy,
+            "final platform-archive attestation authority",
+        )
+    for policy in (
+        "--expect-version",
+        "--expect-sha",
+        "--expect-archive-sha256",
+        "gh attestation verify",
+        "firelock-ai/kin/.github/workflows/release.yml",
+        "sourceRepositoryDigest",
+        "opens the install lock or performs local mutation",
+        "selection and drift evidence only",
+        "does not authenticate archive bytes",
+    ):
+        require(update_trust, policy, "pinned updater external byte-authority contract")
+    parser = (ROOT / "scripts" / "read-update-build-identity.cjs").read_text(
+        encoding="utf-8"
+    )
+    for policy in (
+        "MAX_COMPONENT_BYTES = 256 * 1024 * 1024",
+        "bytes.length > MAX_COMPONENT_BYTES",
+        "expected exactly one",
+        "static build identity end marker is invalid",
+        "graph snapshot version must be nonzero",
+    ):
+        require(parser, policy, "bounded static build identity parser")
+
     aggregate_start = publish_job.index(
         "      - name: Aggregate per-artifact checksums"
     )
