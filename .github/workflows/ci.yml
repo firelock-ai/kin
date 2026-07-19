@@ -137,9 +137,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked --release --target x86_64-pc-windows-msvc \
+          cargo test --locked --target x86_64-pc-windows-msvc \
             -p kin-cli --no-default-features --no-run
-          test_binary=$(find target/x86_64-pc-windows-msvc/release/deps \
+          test_binary=$(find target/x86_64-pc-windows-msvc/debug/deps \
             -maxdepth 1 -type f -name 'kin_cli-*.exe' -print -quit)
           test -n "$test_binary"
           "$test_binary" windows --test-threads=1
