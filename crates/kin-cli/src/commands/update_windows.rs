@@ -41,11 +41,11 @@ use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, INHERITED_ACE, INHERIT_ONLY_ACE,
     LABEL_SECURITY_INFORMATION, NO_PROPAGATE_INHERIT_ACE, OBJECT_INHERIT_ACE,
     OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
-    SACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_AUTO_INHERITED,
-    SE_DACL_AUTO_INHERIT_REQ, SE_DACL_PROTECTED, SE_PRIVILEGE_ENABLED, SE_SACL_AUTO_INHERITED,
-    SE_SACL_AUTO_INHERIT_REQ, SE_SACL_DEFAULTED, SE_SACL_PRESENT, SE_SACL_PROTECTED,
-    SE_SECURITY_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_DUPLICATE, TOKEN_IMPERSONATE,
-    TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER, UNPROTECTED_DACL_SECURITY_INFORMATION,
+    SACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+    SE_PRIVILEGE_ENABLED, SE_SACL_AUTO_INHERITED, SE_SACL_AUTO_INHERIT_REQ, SE_SACL_DEFAULTED,
+    SE_SACL_PRESENT, SE_SACL_PROTECTED, SE_SECURITY_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_DUPLICATE,
+    TOKEN_IMPERSONATE, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
+    UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FileBasicInfo, FileIdInfo, FileStreamInfo,
@@ -698,7 +698,7 @@ impl CurrentUserSid {
     }
 }
 
-fn build_private_acl(sid: PSID) -> Result<Vec<usize>> {
+fn build_private_acl(sid: PSID, inherit_children: bool) -> Result<Vec<usize>> {
     // SAFETY: sid was validated when CurrentUserSid was constructed.
     let sid_len = unsafe { GetLengthSid(sid) } as usize;
     let bytes = size_of::<ACL>()
@@ -713,17 +713,15 @@ fn build_private_acl(sid: PSID) -> Result<Vec<usize>> {
         return Err(win32_error("failed to initialize private updater ACL"));
     }
     // SAFETY: acl and sid are valid. The only ACE grants this user full
-    // control and is inherited by both child files and directories.
-    if unsafe {
-        AddAccessAllowedAceEx(
-            acl,
-            ACL_REVISION,
-            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
-            FILE_ALL_ACCESS,
-            sid,
-        )
-    } == 0
-    {
+    // control. Directories propagate it to child files and directories;
+    // regular-file ACEs carry no inheritance flags because Windows strips
+    // those flags from non-container objects.
+    let ace_flags = if inherit_children {
+        OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+    } else {
+        0
+    };
+    if unsafe { AddAccessAllowedAceEx(acl, ACL_REVISION, ace_flags, FILE_ALL_ACCESS, sid) } == 0 {
         return Err(win32_error(
             "failed to add current user to private updater ACL",
         ));
@@ -733,7 +731,7 @@ fn build_private_acl(sid: PSID) -> Result<Vec<usize>> {
 
 fn create_private_directory(path: &Path, user: &CurrentUserSid) -> Result<bool> {
     let path_wide = wide_null(path.as_os_str())?;
-    let mut acl = build_private_acl(user.sid())?;
+    let mut acl = build_private_acl(user.sid(), true)?;
     let mut descriptor = SECURITY_DESCRIPTOR::default();
     let descriptor_ptr = (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast();
     // SAFETY: descriptor is writable and revision one is the documented
@@ -777,8 +775,12 @@ fn create_private_directory(path: &Path, user: &CurrentUserSid) -> Result<bool> 
     )
 }
 
-fn apply_private_security(handle: HANDLE, user: &CurrentUserSid) -> Result<()> {
-    let mut acl = build_private_acl(user.sid())?;
+fn apply_private_security(
+    handle: HANDLE,
+    user: &CurrentUserSid,
+    expect_directory: bool,
+) -> Result<()> {
+    let mut acl = build_private_acl(user.sid(), expect_directory)?;
     // SAFETY: handle is live; owner SID and ACL remain valid for the call.
     let result = unsafe {
         SetSecurityInfo(
@@ -799,7 +801,11 @@ fn apply_private_security(handle: HANDLE, user: &CurrentUserSid) -> Result<()> {
     Ok(())
 }
 
-fn validate_private_security(handle: HANDLE, user: &CurrentUserSid) -> Result<()> {
+fn validate_private_security(
+    handle: HANDLE,
+    user: &CurrentUserSid,
+    expect_directory: bool,
+) -> Result<()> {
     let mut owner = null_mut();
     let mut dacl = null_mut();
     let mut descriptor = null_mut();
@@ -876,8 +882,13 @@ fn validate_private_security(handle: HANDLE, user: &CurrentUserSid) -> Result<()
     // SAFETY: GetAce returned a valid ACCESS_ALLOWED_ACE-sized entry after we
     // verify its type. SidStart is the variable-length SID prefix.
     let allowed = unsafe { &*(ace as *const windows_sys::Win32::Security::ACCESS_ALLOWED_ACE) };
+    let expected_flags = if expect_directory {
+        OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+    } else {
+        0
+    };
     if allowed.Header.AceType != ACCESS_ALLOWED_ACE_TYPE
-        || u32::from(allowed.Header.AceFlags) != OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+        || u32::from(allowed.Header.AceFlags) != expected_flags
         || allowed.Mask != FILE_ALL_ACCESS
     {
         anyhow::bail!(
@@ -898,7 +909,7 @@ pub(crate) fn validate_current_user_private_file(file: &File) -> Result<()> {
     let user = CurrentUserSid::load()?;
     let handle = file.as_raw_handle().cast();
     object_identity(handle, false)?;
-    validate_private_security(handle, &user)
+    validate_private_security(handle, &user, false)
 }
 
 struct ManagedFileSecurity {
@@ -1004,13 +1015,12 @@ pub(crate) fn managed_file_security_fingerprint(file: &File) -> Result<String> {
         }
         unsafe { std::slice::from_raw_parts(security.label.cast::<u8>(), label_len) }
     };
-    let relevant_control = security.control
-        & (SE_DACL_PROTECTED
-            | SE_DACL_AUTO_INHERITED
-            | SE_DACL_AUTO_INHERIT_REQ
-            | SE_SACL_PROTECTED
-            | SE_SACL_AUTO_INHERITED
-            | SE_SACL_AUTO_INHERIT_REQ);
+    // AUTO_INHERITED/AUTO_INHERIT_REQ are Windows bookkeeping bits that the
+    // kernel may normalize while installing an otherwise identical ACL.
+    // SE_SACL_* describes the full audit SACL, which is validated separately
+    // and is not part of this owner/DACL/mandatory-label copy. Protection is
+    // the stable inheritance-policy authority for this fingerprint.
+    let relevant_control = security.control & SE_DACL_PROTECTED;
     let mut canonical = Vec::with_capacity(owner_len + group_len + acl_len + label.len() + 18);
     canonical.extend_from_slice(&(owner_len as u32).to_le_bytes());
     canonical.extend_from_slice(owner);
@@ -1267,7 +1277,7 @@ pub(crate) fn copy_managed_file_metadata(source: &File, destination: &File) -> R
 pub(crate) fn inject_test_managed_file_dacl_drift(file: &File) -> Result<()> {
     let before = managed_file_metadata_fingerprint(file)?;
     let user = CurrentUserSid::load()?;
-    apply_private_security(file.as_raw_handle().cast(), &user)?;
+    apply_private_security(file.as_raw_handle().cast(), &user, false)?;
     let after = managed_file_metadata_fingerprint(file)?;
     if after == before {
         anyhow::bail!("test DACL injection did not change managed-file authority");
@@ -1376,7 +1386,7 @@ fn create_current_user_private_file_with_disposition(
 ) -> Result<File> {
     let user = CurrentUserSid::load()?;
     let path_wide = wide_null(path.as_os_str())?;
-    let mut acl = build_private_acl(user.sid())?;
+    let mut acl = build_private_acl(user.sid(), false)?;
     let mut descriptor = SECURITY_DESCRIPTOR::default();
     let descriptor_ptr = (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast();
     // SAFETY: descriptor is writable and all SID/ACL buffers remain live until
@@ -1439,7 +1449,7 @@ fn create_current_user_private_file_with_disposition(
         if injected == Some(CreatedFileValidationFailure::Security) {
             anyhow::bail!("injected created-file security validation failure");
         }
-        validate_private_security(handle.raw(), &user).and_then(|_| {
+        validate_private_security(handle.raw(), &user, false).and_then(|_| {
             if additional_access & ACCESS_SYSTEM_SECURITY != 0 {
                 validate_full_sacl_handle(handle.raw())
             } else {
@@ -1628,7 +1638,9 @@ pub(crate) fn create_current_user_private_file_for_exact_commit(path: &Path) -> 
 
 /// Create a private staged file whose live handle remains the rename
 /// authority. DELETE access authorizes FileRenameInfoEx on this exact handle;
-/// sharing remains read-only so no writer or path replacement can race it.
+/// sharing permits the post-Prepared no-flag handoff required to clear the
+/// delete-on-close arm. Exact-handle identity, bytes, metadata, and namespace
+/// checks fail closed if another same-user process races the staged object.
 pub(crate) fn create_current_user_private_staged_file(
     path: &Path,
     require_full_sacl: bool,
@@ -1636,7 +1648,7 @@ pub(crate) fn create_current_user_private_staged_file(
     create_current_user_private_file_with_disposition(
         path,
         CREATE_NEW,
-        FILE_SHARE_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         DELETE
             | WRITE_DAC
             | WRITE_OWNER
@@ -2454,11 +2466,12 @@ impl SecurePathGuard {
             apply_private_security(
                 handle.raw(),
                 user.context("private updater path validation lost its current-user SID")?,
+                expect_directory,
             )?;
         }
         let identity = object_identity(handle.raw(), expect_directory)?;
         if let Some(user) = user {
-            validate_private_security(handle.raw(), user)?;
+            validate_private_security(handle.raw(), user, expect_directory)?;
         }
         Ok(Self {
             path: path.to_path_buf(),
@@ -2484,8 +2497,8 @@ impl SecurePathGuard {
             );
         }
         if let Some(user) = user {
-            validate_private_security(self.handle.raw(), user)?;
-            validate_private_security(reopened.raw(), user)?;
+            validate_private_security(self.handle.raw(), user, self.expect_directory)?;
+            validate_private_security(reopened.raw(), user, self.expect_directory)?;
         }
         Ok(())
     }
