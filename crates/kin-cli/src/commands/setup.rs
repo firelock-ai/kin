@@ -2136,6 +2136,32 @@ fn codex_repo_from_entry_bytes(content: &[u8]) -> Result<Option<PathBuf>> {
     Ok(canonical_initialized_repo(&candidate))
 }
 
+pub(crate) fn codex_entry_has_exact_repo_binding(
+    content: &[u8],
+    expected_repo: &Path,
+) -> Result<bool> {
+    let text = std::str::from_utf8(content).context("Codex MCP config is not UTF-8")?;
+    let root: toml::Value = toml::from_str(text).context("Codex MCP config is not valid TOML")?;
+    let Some(entry) = root
+        .get("mcp_servers")
+        .and_then(|servers| servers.get("kin"))
+    else {
+        return Ok(false);
+    };
+    let Some(args) = entry.get("args").and_then(toml::Value::as_array) else {
+        return Ok(false);
+    };
+    if args.len() != 4
+        || args[0].as_str() != Some("mcp")
+        || args[1].as_str() != Some("start")
+        || args[2].as_str() != Some("--repo")
+        || args[3].as_str().is_none()
+    {
+        return Ok(false);
+    }
+    Ok(codex_repo_from_entry_bytes(content)?.as_deref() == Some(expected_repo))
+}
+
 fn json_mcp_repo_from_entry_bytes(content: &[u8], client: &str) -> Result<Option<PathBuf>> {
     let root: serde_json::Value = serde_json::from_slice(content)
         .with_context(|| format!("{client} MCP config is invalid JSON"))?;
@@ -3121,9 +3147,17 @@ impl UnixConfigMetadata {
 
 #[cfg(target_os = "macos")]
 fn macos_acl_has_deny_entry(acl: &[u8]) -> Result<bool> {
+    Ok(macos_acl_entries(acl)?
+        .iter()
+        .any(|(disposition, _)| disposition == "deny"))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_acl_entries(acl: &[u8]) -> Result<Vec<(String, Vec<String>)>> {
     let text = std::str::from_utf8(acl).context("managed config ACL text is not UTF-8")?;
     let mut saw_header = false;
     let mut saw_entry = false;
+    let mut entries = Vec::new();
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
         if line.starts_with("!#acl") {
             if line != "!#acl 1" || saw_header || saw_entry {
@@ -3151,17 +3185,57 @@ fn macos_acl_has_deny_entry(acl: &[u8]) -> Result<bool> {
         if permissions.split(',').any(str::is_empty) {
             anyhow::bail!("managed config ACL entry contains an empty permission");
         }
-        match disposition_and_flags.split(',').next() {
-            Some("deny") => return Ok(true),
-            Some("allow") => {}
-            _ => anyhow::bail!("managed config ACL entry has an unknown disposition"),
-        }
+        let disposition = disposition_and_flags
+            .split(',')
+            .next()
+            .filter(|value| *value == "allow" || *value == "deny")
+            .context("managed config ACL entry has an unknown disposition")?;
+        entries.push((
+            disposition.to_string(),
+            permissions.split(',').map(str::to_string).collect(),
+        ));
         saw_entry = true;
     }
     if !acl.is_empty() && (!saw_header || !saw_entry) {
         anyhow::bail!("managed config ACL contains no entries");
     }
-    Ok(false)
+    Ok(entries)
+}
+
+#[cfg(target_os = "macos")]
+fn validate_macos_directory_namespace_acl(acl: &[u8], label: &str) -> Result<()> {
+    for (disposition, permissions) in macos_acl_entries(acl)? {
+        if disposition == "allow"
+            && permissions.iter().any(|permission| {
+                matches!(
+                    permission.as_str(),
+                    "write"
+                        | "append"
+                        | "add_file"
+                        | "add_subdirectory"
+                        | "delete"
+                        | "delete_child"
+                        | "writesecurity"
+                        | "chown"
+                )
+            })
+        {
+            anyhow::bail!("{label} carries extended namespace authority");
+        }
+        // A standard macOS home directory carries `everyone deny delete`.
+        // That protects the retained home entry and does not block anchored
+        // child creation, replacement, or removal. Every other deny right is
+        // rejected because it can make the transaction incomplete or
+        // platform-dependent.
+        if disposition == "deny"
+            && permissions
+                .iter()
+                .any(|permission| permission.as_str() != "delete")
+        {
+            anyhow::bail!("{label} carries a deny ACL that blocks child namespace operations");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -3209,9 +3283,7 @@ fn validate_unix_directory_namespace_metadata(
         if metadata.flags.is_some_and(|flags| flags & blocking != 0) {
             anyhow::bail!("{label} carries child-namespace-blocking BSD flags");
         }
-        if macos_acl_has_deny_entry(&metadata.acl)? {
-            anyhow::bail!("{label} carries a deny ACL that cannot be safely transacted");
-        }
+        validate_macos_directory_namespace_acl(&metadata.acl, label)?;
     }
     #[cfg(target_os = "linux")]
     if metadata
@@ -4023,6 +4095,7 @@ fn validate_kin_home_namespace(authority: &DurableConfigDirectory) -> Result<()>
             parent_path.display()
         );
     }
+    #[cfg(not(target_os = "macos"))]
     if parent_extended.grants_extended_private_access() {
         anyhow::bail!(
             "Kin-home parent carries extended namespace authority: {}",
@@ -5022,9 +5095,13 @@ fn create_config_directory_all_durable(
     if private_chain {
         let stat = rustix::fs::fstat(&parent)?;
         let extended = unix_config_metadata(&parent)?;
+        #[cfg(target_os = "macos")]
+        let grants_extended_private_access = false;
+        #[cfg(not(target_os = "macos"))]
+        let grants_extended_private_access = extended.grants_extended_private_access();
         if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory
             || (stat.st_mode as u32 & 0o022 != 0 && stat.st_mode as u32 & 0o1000 == 0)
-            || extended.grants_extended_private_access()
+            || grants_extended_private_access
         {
             anyhow::bail!(
                 "existing Kin-home ancestor permits unsafe namespace replacement: {}",
@@ -12702,6 +12779,38 @@ mod tests {
         ] {
             assert!(macos_acl_has_deny_entry(malformed).is_err());
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_namespace_acl_accepts_protective_home_delete_deny_only() {
+        let standard_home =
+            b"!#acl 1\n0: ABCDEFAB-CDEF-ABCD-EFAB-CDEFABCDEFAB:everyone:deny:delete\n";
+        validate_macos_directory_namespace_acl(standard_home, "home").unwrap();
+
+        let read_only_allow =
+            b"!#acl 1\n0: ABCDEFAB-CDEF-ABCD-EFAB-CDEFABCDEFAB:everyone:allow:read\n";
+        validate_macos_directory_namespace_acl(read_only_allow, "home").unwrap();
+
+        let namespace_grant =
+            b"!#acl 1\n0: ABCDEFAB-CDEF-ABCD-EFAB-CDEFABCDEFAB:everyone:allow:add_file\n";
+        assert!(validate_macos_directory_namespace_acl(namespace_grant, "home").is_err());
+
+        let child_deny =
+            b"!#acl 1\n0: ABCDEFAB-CDEF-ABCD-EFAB-CDEFABCDEFAB:everyone:deny:delete_child\n";
+        assert!(validate_macos_directory_namespace_acl(child_deny, "home").is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_current_home_namespace_acl_is_transactable() {
+        let home = directories::BaseDirs::new()
+            .unwrap()
+            .home_dir()
+            .to_path_buf();
+        let handle = open_config_parent_nofollow(&home).unwrap();
+        let acl = macos_config_acl(&handle).unwrap();
+        validate_macos_directory_namespace_acl(&acl, "current home").unwrap();
     }
 
     #[cfg(target_os = "macos")]
