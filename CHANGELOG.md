@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.26] - 2026-07-20
+
+### Fixed
+
+- Public install proof now accepts the aggregate release-provenance schema
+  emitted by the protected publisher, restoring the fail-closed promotion path
+  for stable GitHub, npm, container, Homebrew, and installer releases.
+
 ## [0.2.25] - 2026-07-19
 
 This patch strengthens graph authority across local, hosted, and recovery paths,
@@ -673,7 +681,8 @@ Historical note: this snapshot predates the public GitHub prerelease series and 
 - Daemon mode for background file watching (`kin-daemon`)
 - 19-crate workspace architecture
 
-[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.25...HEAD
+[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.26...HEAD
+[0.2.26]: https://github.com/firelock-ai/kin/compare/v0.2.25...v0.2.26
 [0.2.25]: https://github.com/firelock-ai/kin/compare/v0.2.24...v0.2.25
 [0.2.24]: https://github.com/firelock-ai/kin/compare/v0.2.23...v0.2.24
 [0.2.23]: https://github.com/firelock-ai/kin/compare/v0.2.22...v0.2.23

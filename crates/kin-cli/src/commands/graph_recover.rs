@@ -175,6 +175,18 @@ struct RepoPaths {
     recovery_lock: PathBuf,
 }
 
+struct RecoveryLock(File);
+
+impl Drop for RecoveryLock {
+    fn drop(&mut self) {
+        // Closing the parent's descriptor is not sufficient if a concurrent
+        // fork inherited the open file description before exec. Explicitly
+        // unlock so an unrelated child cannot extend the recovery critical
+        // section after this guard leaves scope.
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
 struct ManifestPlan {
     repo_id: String,
     existing: bool,
@@ -1060,7 +1072,7 @@ fn read_generation_file(path: &Path, role: &str) -> Result<u64> {
         .with_context(|| format!("invalid generation in {role} {}", path.display()))
 }
 
-fn acquire_recovery_lock(path: &Path) -> Result<File> {
+fn acquire_recovery_lock(path: &Path) -> Result<RecoveryLock> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
             bail!("recovery lock {} is not a regular file", path.display());
@@ -1078,7 +1090,7 @@ fn acquire_recovery_lock(path: &Path) -> Result<File> {
         .with_context(|| format!("failed to open recovery lock {}", path.display()))?;
     file.try_lock_exclusive()
         .with_context(|| format!("another graph authority recovery holds {}", path.display()))?;
-    Ok(file)
+    Ok(RecoveryLock(file))
 }
 
 fn verify_kindb_unlocked(snapshot: &Path) -> Result<()> {
@@ -1641,6 +1653,21 @@ mod tests {
             .to_string()
             .contains("--confirm-quiesced"));
         assert!(!authority_path(&fixture.snapshot).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_guard_unlocks_a_duplicated_open_file_description() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("graph.kndb.recovery.lock");
+        let guard = acquire_recovery_lock(&path).unwrap();
+        let inherited = guard.0.try_clone().unwrap();
+
+        drop(guard);
+        let reacquired = acquire_recovery_lock(&path).unwrap();
+
+        drop(reacquired);
+        drop(inherited);
     }
 
     #[cfg(unix)]

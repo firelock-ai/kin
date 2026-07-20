@@ -129,6 +129,11 @@ def main() -> None:
         "non-healthy checks: ${nonHealthyChecks(report)}",
     ):
         require(install_proof, policy, "actionable install-proof health failure")
+    require(
+        install_proof,
+        "manifest.schema_version === 2",
+        "aggregate release-provenance schema accepted by install proof",
+    )
 
     for policy in (
         "Graph-backed VFS projection proof",
