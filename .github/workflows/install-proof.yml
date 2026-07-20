@@ -232,7 +232,7 @@ jobs:
             "release provenance checksum does not match its public sidecar");
 
           const manifest = JSON.parse(fs.readFileSync("release-provenance.json", "utf8"));
-          fail(manifest.schema_version === 1, "release provenance schema is unsupported");
+          fail(manifest.schema_version === 2, "release provenance schema is unsupported");
           fail(manifest.release_tag === process.env.EXPECTED_TAG,
             "release provenance tag does not match the installed release");
           fail(manifest.kin?.commit === process.env.EXPECTED_COMMIT,
