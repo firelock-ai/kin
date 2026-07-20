@@ -3,7 +3,7 @@
 
 //! Feature vector definitions for the learning-to-rank pipeline.
 //!
-//! [`LocateFeatureVector`] captures the 33-dimensional feature space used by
+//! [`LocateFeatureVector`] captures the 32-dimensional feature space used by
 //! [`crate::ltr::GradientBoostedRanker`] to rerank locate-pipeline candidates.
 
 use serde::{Deserialize, Serialize};
