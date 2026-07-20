@@ -124,6 +124,18 @@ enum Command {
         /// Maximum depth
         #[arg(short, long, default_value = "3")]
         depth: u32,
+        /// Exact repo-relative file qualifier for stable identity resolution
+        #[arg(long)]
+        file: Option<String>,
+        /// Exact entity-kind qualifier (for example: function or method)
+        #[arg(long)]
+        kind: Option<String>,
+        /// Whitespace-normalized declaration signature for overload resolution
+        #[arg(long)]
+        signature: Option<String>,
+        /// Emit the ranked graph-evidence report as JSON; ambiguous identities fail closed
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Build a context pack for an entity
     Context {
@@ -2022,7 +2034,14 @@ fn main() -> Result<()> {
                     yes,
                     force,
                 } => commands::eject::run(revert_files, yes || force).await,
-                Command::Impact { entity, depth } => commands::impact::run(entity, depth).await,
+                Command::Impact {
+                    entity,
+                    depth,
+                    file,
+                    kind,
+                    signature,
+                    json,
+                } => commands::impact::run(entity, depth, file, kind, signature, json).await,
                 Command::Context {
                     entity,
                     budget,
