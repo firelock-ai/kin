@@ -8,6 +8,7 @@ pub mod format;
 pub mod gate;
 pub mod impact;
 pub mod inline;
+pub mod ranked_impact;
 pub mod ref_graph;
 pub mod release_gate;
 pub mod revert_history;
@@ -32,6 +33,11 @@ pub use impact::{analyze_impact, analyze_impact_at, EntityImpact, ImpactGraph, I
 pub use inline::{
     collect_inline_comments, group_by_file, InlineComment, InlineCommentKind,
     CONSUMER_FANOUT_THRESHOLD,
+};
+pub use ranked_impact::{
+    rank_impact, rank_impact_at, CandidateLocation, ImpactBucket, PriorityScoreComponents,
+    RankedImpactCandidate, RankedImpactReport, RelationPathStep, StableEntityIdentity,
+    PRIORITY_SCORE_FORMULA, RANKED_IMPACT_SCHEMA_VERSION,
 };
 pub use ref_graph::GraphAtRef;
 pub use release_gate::{
