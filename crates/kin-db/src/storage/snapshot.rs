@@ -1750,20 +1750,46 @@ struct ValidatedAuthorityRecoveryInputs {
     recovered: crate::storage::GraphSnapshot,
 }
 
-fn unordered_snapshot_items_equal(
-    left: Vec<serde_json::Value>,
-    right: Vec<serde_json::Value>,
-) -> Result<bool, KinDbError> {
-    fn canonical_items(items: Vec<serde_json::Value>) -> Result<Vec<Vec<u8>>, KinDbError> {
-        let mut encoded = items
-            .into_iter()
-            .map(|item| {
-                serde_json::to_vec(&item).map_err(|error| {
-                    KinDbError::StorageError(format!(
-                        "failed to canonicalize unordered graph domain for authority recovery comparison: {error}"
-                    ))
-                })
-            })
+fn recovery_json_bytes<T: serde::Serialize + ?Sized>(
+    value: &T,
+    domain: &str,
+) -> Result<Vec<u8>, KinDbError> {
+    let canonical = serde_json::to_value(value).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to canonicalize graph domain {domain} for authority recovery comparison: {error}"
+        ))
+    })?;
+    serde_json::to_vec(&canonical).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to encode canonical graph domain {domain} for authority recovery comparison: {error}"
+        ))
+    })
+}
+
+fn unordered_snapshot_map_equal<K, V>(
+    left: &std::collections::HashMap<K, V>,
+    right: &std::collections::HashMap<K, V>,
+    domain: &str,
+) -> Result<bool, KinDbError>
+where
+    K: serde::Serialize + Eq + std::hash::Hash,
+    V: serde::Serialize,
+{
+    fn canonical_entries<K, V>(
+        values: &std::collections::HashMap<K, V>,
+        domain: &str,
+    ) -> Result<Vec<Vec<u8>>, KinDbError>
+    where
+        K: serde::Serialize + Eq + std::hash::Hash,
+        V: serde::Serialize,
+    {
+        let mut encoded = values
+            .iter()
+            // Encoding a map entry as a tuple keeps content-addressed IDs in
+            // value position. JSON cannot encode Hash256-backed IDs as object
+            // keys, which is exactly why serializing GraphSnapshot wholesale
+            // rejects real legacy graphs with changes or verification state.
+            .map(|(key, value)| recovery_json_bytes(&(key, value), domain))
             .collect::<Result<Vec<_>, _>>()?;
         encoded.sort_unstable();
         Ok(encoded)
@@ -1772,7 +1798,67 @@ fn unordered_snapshot_items_equal(
     if left.len() != right.len() {
         return Ok(false);
     }
-    Ok(canonical_items(left)? == canonical_items(right)?)
+    Ok(canonical_entries(left, domain)? == canonical_entries(right, domain)?)
+}
+
+fn unordered_snapshot_vec_equal<T: serde::Serialize>(
+    left: &[T],
+    right: &[T],
+    domain: &str,
+) -> Result<bool, KinDbError> {
+    fn canonical_items<T: serde::Serialize>(
+        values: &[T],
+        domain: &str,
+    ) -> Result<Vec<Vec<u8>>, KinDbError> {
+        let mut encoded = values
+            .iter()
+            .map(|value| recovery_json_bytes(value, domain))
+            .collect::<Result<Vec<_>, _>>()?;
+        encoded.sort_unstable();
+        Ok(encoded)
+    }
+
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    Ok(canonical_items(left, domain)? == canonical_items(right, domain)?)
+}
+
+fn unordered_snapshot_adjacency_equal<K, V>(
+    left: &std::collections::HashMap<K, Vec<V>>,
+    right: &std::collections::HashMap<K, Vec<V>>,
+    domain: &str,
+) -> Result<bool, KinDbError>
+where
+    K: serde::Serialize + Eq + std::hash::Hash,
+    V: serde::Serialize,
+{
+    fn canonical_entries<K, V>(
+        values: &std::collections::HashMap<K, Vec<V>>,
+        domain: &str,
+    ) -> Result<Vec<Vec<u8>>, KinDbError>
+    where
+        K: serde::Serialize + Eq + std::hash::Hash,
+        V: serde::Serialize,
+    {
+        let mut entries = Vec::with_capacity(values.len());
+        for (key, relation_ids) in values {
+            let key = recovery_json_bytes(key, domain)?;
+            let mut relation_ids = relation_ids
+                .iter()
+                .map(|relation_id| recovery_json_bytes(relation_id, domain))
+                .collect::<Result<Vec<_>, _>>()?;
+            relation_ids.sort_unstable();
+            entries.push(recovery_json_bytes(&(key, relation_ids), domain)?);
+        }
+        entries.sort_unstable();
+        Ok(entries)
+    }
+
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    Ok(canonical_entries(left, domain)? == canonical_entries(right, domain)?)
 }
 
 /// Compare every serialized graph domain while treating only collections
@@ -1782,85 +1868,153 @@ fn authority_recovery_snapshot_domains_match(
     expected: &crate::storage::GraphSnapshot,
     actual: &crate::storage::GraphSnapshot,
 ) -> Result<bool, KinDbError> {
-    fn encode(snapshot: &crate::storage::GraphSnapshot) -> Result<serde_json::Value, KinDbError> {
-        serde_json::to_value(snapshot).map_err(|error| {
-            KinDbError::StorageError(format!(
-                "failed to encode graph domains for authority recovery comparison: {error}"
-            ))
-        })
+    // Keep the field-by-field comparison compile-time exhaustive. A newly
+    // persisted graph domain must make this pattern fail to compile until its
+    // recovery comparison semantics are chosen explicitly below.
+    let crate::storage::GraphSnapshot {
+        version: _,
+        entities: _,
+        relations: _,
+        outgoing: _,
+        incoming: _,
+        changes: _,
+        change_children: _,
+        branches: _,
+        work_items: _,
+        annotations: _,
+        work_links: _,
+        reviews: _,
+        review_decisions: _,
+        review_notes: _,
+        review_discussions: _,
+        review_assignments: _,
+        test_cases: _,
+        assertions: _,
+        verification_runs: _,
+        test_covers_entity: _,
+        test_covers_contract: _,
+        test_verifies_work: _,
+        run_proves_entity: _,
+        run_proves_work: _,
+        mock_hints: _,
+        contracts: _,
+        actors: _,
+        delegations: _,
+        approvals: _,
+        audit_events: _,
+        shallow_files: _,
+        file_layouts: _,
+        structured_artifacts: _,
+        opaque_artifacts: _,
+        file_hashes: _,
+        sessions: _,
+        intents: _,
+        downstream_warnings: _,
+        entity_revisions: _,
+        entity_tombstones: _,
+        relation_tombstones: _,
+        change_order: _,
+        artifact_index: _,
+    } = expected;
+
+    if expected.version != actual.version {
+        return Ok(false);
     }
 
-    fn take_array(
-        value: &mut serde_json::Value,
-        domain: &str,
-    ) -> Result<Vec<serde_json::Value>, KinDbError> {
-        value
-            .as_object_mut()
-            .and_then(|object| object.get_mut(domain))
-            .and_then(serde_json::Value::as_array_mut)
-            .map(std::mem::take)
-            .ok_or_else(|| {
-                KinDbError::StorageError(format!(
-                    "graph authority recovery comparison is missing array domain {domain}"
-                ))
-            })
+    macro_rules! compare_maps {
+        ($($domain:ident),+ $(,)?) => {
+            $(
+                if !unordered_snapshot_map_equal(
+                    &expected.$domain,
+                    &actual.$domain,
+                    stringify!($domain),
+                )? {
+                    return Ok(false);
+                }
+            )+
+        };
+    }
+    compare_maps!(
+        entities,
+        relations,
+        changes,
+        change_children,
+        branches,
+        work_items,
+        annotations,
+        reviews,
+        review_decisions,
+        review_assignments,
+        test_cases,
+        assertions,
+        verification_runs,
+        contracts,
+        actors,
+        file_hashes,
+        sessions,
+        intents,
+        entity_revisions,
+        entity_tombstones,
+        relation_tombstones,
+        change_order,
+        artifact_index,
+    );
+
+    if !unordered_snapshot_adjacency_equal(&expected.outgoing, &actual.outgoing, "outgoing")? {
+        return Ok(false);
+    }
+    if !unordered_snapshot_adjacency_equal(&expected.incoming, &actual.incoming, "incoming")? {
+        return Ok(false);
     }
 
-    fn normalize_adjacency(value: &mut serde_json::Value, domain: &str) -> Result<(), KinDbError> {
-        let adjacency = value
-            .as_object_mut()
-            .and_then(|object| object.get_mut(domain))
-            .and_then(serde_json::Value::as_object_mut)
-            .ok_or_else(|| {
-                KinDbError::StorageError(format!(
-                    "graph authority recovery comparison is missing adjacency domain {domain}"
-                ))
-            })?;
-        for relation_ids in adjacency.values_mut() {
-            let relation_ids = relation_ids.as_array_mut().ok_or_else(|| {
-                KinDbError::StorageError(format!(
-                    "graph authority recovery adjacency domain {domain} contains a non-array value"
-                ))
-            })?;
-            let mut keyed = relation_ids
-                .drain(..)
-                .map(|relation_id| {
-                    serde_json::to_vec(&relation_id)
-                        .map(|key| (key, relation_id))
-                        .map_err(|error| {
-                            KinDbError::StorageError(format!(
-                                "failed to canonicalize graph adjacency for authority recovery comparison: {error}"
-                            ))
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            keyed.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-            relation_ids.extend(keyed.into_iter().map(|(_, relation_id)| relation_id));
-        }
-        Ok(())
+    macro_rules! compare_unordered_vecs {
+        ($($domain:ident),+ $(,)?) => {
+            $(
+                if !unordered_snapshot_vec_equal(
+                    &expected.$domain,
+                    &actual.$domain,
+                    stringify!($domain),
+                )? {
+                    return Ok(false);
+                }
+            )+
+        };
     }
+    compare_unordered_vecs!(
+        review_notes,
+        review_discussions,
+        shallow_files,
+        file_layouts,
+        structured_artifacts,
+        opaque_artifacts,
+    );
 
-    let mut expected = encode(expected)?;
-    let mut actual = encode(actual)?;
-    for domain in ["outgoing", "incoming"] {
-        normalize_adjacency(&mut expected, domain)?;
-        normalize_adjacency(&mut actual, domain)?;
+    macro_rules! compare_ordered_domains {
+        ($($domain:ident),+ $(,)?) => {
+            $(
+                if recovery_json_bytes(&expected.$domain, stringify!($domain))?
+                    != recovery_json_bytes(&actual.$domain, stringify!($domain))?
+                {
+                    return Ok(false);
+                }
+            )+
+        };
     }
-    for domain in [
-        "review_notes",
-        "review_discussions",
-        "shallow_files",
-        "file_layouts",
-        "structured_artifacts",
-        "opaque_artifacts",
-    ] {
-        let expected_items = take_array(&mut expected, domain)?;
-        let actual_items = take_array(&mut actual, domain)?;
-        if !unordered_snapshot_items_equal(expected_items, actual_items)? {
-            return Ok(false);
-        }
-    }
-    Ok(expected == actual)
+    compare_ordered_domains!(
+        work_links,
+        test_covers_entity,
+        test_covers_contract,
+        test_verifies_work,
+        run_proves_entity,
+        run_proves_work,
+        mock_hints,
+        delegations,
+        approvals,
+        audit_events,
+        downstream_warnings,
+    );
+
+    Ok(true)
 }
 
 fn capture_and_validate_authority_recovery_inputs(
@@ -5237,6 +5391,34 @@ mod tests {
         let evidence = recovery_evidence(&snapshot_bytes, GENERATION_INIT, root, &[]);
         SnapshotManager::recover_local_authority_with_evidence(&path, &caller, &evidence).unwrap();
         assert!(local_authority_path(&path).is_file());
+    }
+
+    #[test]
+    fn evidence_bound_recovery_compares_content_addressed_map_keys() {
+        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([9; 32]));
+        let mut expected = GraphSnapshot::empty();
+        expected.change_order.insert(change_id, 1);
+        let mut actual = expected.clone();
+
+        assert!(authority_recovery_snapshot_domains_match(&expected, &actual).unwrap());
+
+        actual.change_order.insert(change_id, 2);
+        assert!(!authority_recovery_snapshot_domains_match(&expected, &actual).unwrap());
+    }
+
+    #[test]
+    fn recovery_map_comparison_canonicalizes_nested_string_maps() {
+        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([7; 32]));
+        let mut left_value = std::collections::HashMap::new();
+        left_value.insert("alpha".to_string(), 1_u64);
+        left_value.insert("beta".to_string(), 2_u64);
+        let mut right_value = std::collections::HashMap::new();
+        right_value.insert("beta".to_string(), 2_u64);
+        right_value.insert("alpha".to_string(), 1_u64);
+        let left = std::collections::HashMap::from([(change_id, left_value)]);
+        let right = std::collections::HashMap::from([(change_id, right_value)]);
+
+        assert!(unordered_snapshot_map_equal(&left, &right, "nested").unwrap());
     }
 
     #[test]
