@@ -182,7 +182,7 @@ impl CoordinationEventLog {
                 .open(&path)?
                 .sync_data()?;
             if let Some(parent) = path.parent() {
-                std::fs::File::open(parent)?.sync_all()?;
+                sync_directory_metadata(parent)?;
             }
         }
 
@@ -320,7 +320,7 @@ impl CoordinationEventLog {
             file.sync_data()?;
             if !path_existed {
                 if let Some(parent) = self.path.parent() {
-                    std::fs::File::open(parent)?.sync_all()?;
+                    sync_directory_metadata(parent)?;
                 }
             }
             Ok(())
@@ -345,11 +345,17 @@ impl CoordinationEventLog {
     fn persist_failure_count(&self, count: u64) {
         let temp = self.failure_marker.with_extension("failed.tmp");
         let result = (|| -> std::io::Result<()> {
-            std::fs::write(&temp, format!("{count}\n"))?;
-            std::fs::File::open(&temp)?.sync_data()?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp)?;
+            file.write_all(format!("{count}\n").as_bytes())?;
+            file.sync_data()?;
+            drop(file);
             std::fs::rename(&temp, &self.failure_marker)?;
             if let Some(parent) = self.failure_marker.parent() {
-                std::fs::File::open(parent)?.sync_all()?;
+                sync_directory_metadata(parent)?;
             }
             Ok(())
         })();
