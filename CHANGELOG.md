@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.27] - 2026-07-20
+
+### Fixed
+
+- Public install proof now validates Codex's repo-bound MCP configuration,
+  including the canonical `--repo` target, instead of rejecting the stronger
+  binding as though it were the legacy unbound argument list.
+
 ## [0.2.26] - 2026-07-20
 
 ### Fixed
@@ -681,7 +689,8 @@ Historical note: this snapshot predates the public GitHub prerelease series and 
 - Daemon mode for background file watching (`kin-daemon`)
 - 19-crate workspace architecture
 
-[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.26...HEAD
+[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.27...HEAD
+[0.2.27]: https://github.com/firelock-ai/kin/compare/v0.2.26...v0.2.27
 [0.2.26]: https://github.com/firelock-ai/kin/compare/v0.2.25...v0.2.26
 [0.2.25]: https://github.com/firelock-ai/kin/compare/v0.2.24...v0.2.25
 [0.2.24]: https://github.com/firelock-ai/kin/compare/v0.2.23...v0.2.24

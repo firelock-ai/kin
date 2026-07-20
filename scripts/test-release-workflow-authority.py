@@ -134,6 +134,12 @@ def main() -> None:
         "manifest.schema_version === 2",
         "aggregate release-provenance schema accepted by install proof",
     )
+    for policy in (
+        "codexArgs.length !== 4",
+        'codexArgs[2] !== "--repo"',
+        "codexRepo !== fs.realpathSync(process.cwd())",
+    ):
+        require(install_proof, policy, "repo-bound Codex MCP install proof")
 
     for policy in (
         "Graph-backed VFS projection proof",
