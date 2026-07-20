@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.28] - 2026-07-20
+
+### Fixed
+
+- Setup now accepts macOS's standard protective `everyone deny delete` home
+  ACL while continuing to reject ACLs that grant or block child-namespace
+  mutation, restoring first-run configuration and install-ledger writes on
+  Apple Silicon hosted runners.
+- Public install proof delegates Codex TOML validation to Kin's own parser and
+  health check, so Windows literal paths remain repo-bound without being
+  misparsed as JSON.
+
 ## [0.2.27] - 2026-07-20
 
 ### Fixed
@@ -689,7 +701,8 @@ Historical note: this snapshot predates the public GitHub prerelease series and 
 - Daemon mode for background file watching (`kin-daemon`)
 - 19-crate workspace architecture
 
-[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.27...HEAD
+[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.28...HEAD
+[0.2.28]: https://github.com/firelock-ai/kin/compare/v0.2.27...v0.2.28
 [0.2.27]: https://github.com/firelock-ai/kin/compare/v0.2.26...v0.2.27
 [0.2.26]: https://github.com/firelock-ai/kin/compare/v0.2.25...v0.2.26
 [0.2.25]: https://github.com/firelock-ai/kin/compare/v0.2.24...v0.2.25

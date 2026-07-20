@@ -834,25 +834,6 @@ jobs:
               throw new Error(`${configPath}: Kin MCP entry is missing or malformed`);
             }
           }
-          const codexConfig = fs.readFileSync(path.join(home, ".codex", "config.toml"), "utf8");
-          const codexArgsMatch = codexConfig.match(/^args\s*=\s*(\[.*\])\s*$/m);
-          const codexArgs = codexArgsMatch ? JSON.parse(codexArgsMatch[1]) : null;
-          const codexRepo = Array.isArray(codexArgs) && codexArgs.length === 4
-            ? fs.realpathSync(codexArgs[3])
-            : null;
-          if (
-            !codexConfig.includes("[mcp_servers.kin]") ||
-            !Array.isArray(codexArgs) ||
-            codexArgs.length !== 4 ||
-            codexArgs[0] !== "mcp" ||
-            codexArgs[1] !== "start" ||
-            codexArgs[2] !== "--repo" ||
-            codexRepo !== fs.realpathSync(process.cwd()) ||
-            !codexConfig.includes("KIN_MCP_TOOL_PROFILE = \"agent-default\"")
-          ) {
-            throw new Error("Codex Kin MCP config is missing or malformed");
-          }
-
           if (runnerOs === "Windows") {
             const vectorDegradations = (locate.degradations ?? []).filter((entry) => entry.component === "vector_index");
             if (vectorDegradations.length !== 1 || vectorDegradations[0].reason !== "feature_disabled") {

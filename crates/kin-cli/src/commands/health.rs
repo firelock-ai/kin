@@ -837,6 +837,44 @@ fn evaluate_antigravity_binding(path: &Path, workspace: bool) -> Option<(HealthS
     }
 }
 
+fn evaluate_codex_binding_for(path: &Path, expected_repo: &Path) -> Option<(HealthStatus, String)> {
+    let content = match std::fs::read(path) {
+        Ok(content) => content,
+        Err(error) => {
+            return Some((
+                HealthStatus::Misconfigured,
+                format!(
+                    "could not read Codex MCP config {}: {error}",
+                    path.display()
+                ),
+            ));
+        }
+    };
+    match super::setup::codex_entry_has_exact_repo_binding(&content, expected_repo) {
+        Ok(true) => None,
+        Ok(false) => Some((
+            HealthStatus::Misconfigured,
+            format!(
+                "Codex Kin binding at {} does not use the exact `mcp start --repo <current-repository>` arguments for {}",
+                path.display(),
+                expected_repo.display()
+            ),
+        )),
+        Err(error) => Some((
+            HealthStatus::Misconfigured,
+            format!(
+                "Codex Kin binding at {} is invalid: {error:#}",
+                path.display()
+            ),
+        )),
+    }
+}
+
+fn evaluate_codex_binding(path: &Path) -> Option<(HealthStatus, String)> {
+    let expected_repo = current_health_repo()?;
+    evaluate_codex_binding_for(path, &expected_repo)
+}
+
 fn check_mcp_clients() -> Vec<HealthCheck> {
     let clients: Vec<McpClient> = mcp_client_config_paths()
         .into_iter()
@@ -862,6 +900,13 @@ fn check_mcp_clients() -> Vec<HealthCheck> {
             {
                 if let Some((binding_status, binding_detail)) =
                     evaluate_antigravity_binding(&client.path, client.id == "antigravity_workspace")
+                {
+                    status = binding_status;
+                    detail = binding_detail;
+                }
+            }
+            if matches!(status, HealthStatus::Healthy) && client.id == "codex" {
+                if let Some((binding_status, binding_detail)) = evaluate_codex_binding(&client.path)
                 {
                     status = binding_status;
                     detail = binding_detail;
@@ -1554,6 +1599,41 @@ mod tests {
         let (status, detail) = evaluate_mcp_client(&path);
         assert!(matches!(status, HealthStatus::Missing), "got: {detail}");
         assert!(detail.contains("mcp_servers.kin"));
+    }
+
+    #[test]
+    fn codex_health_binding_uses_the_product_toml_parser() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = dir.path().join("expected");
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(expected.join(".kin")).unwrap();
+        std::fs::create_dir_all(other.join(".kin")).unwrap();
+        let expected = expected.canonicalize().unwrap();
+        let other = other.canonicalize().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[mcp_servers.kin]\ncommand = 'kin'\nargs = ['mcp', 'start', '--repo', '{}']\nenv = {{ KIN_MCP_TOOL_PROFILE = 'agent-default' }}\n",
+                expected.display()
+            ),
+        )
+        .unwrap();
+
+        assert!(evaluate_codex_binding_for(&path, &expected).is_none());
+        let (status, detail) = evaluate_codex_binding_for(&path, &other).unwrap();
+        assert!(matches!(status, HealthStatus::Misconfigured));
+        assert!(detail.contains("does not use the exact"));
+
+        std::fs::write(
+            &path,
+            format!(
+                "[mcp_servers.kin]\nargs = ['not-mcp', 'start', '--repo', '{}']\nenv = {{ KIN_MCP_TOOL_PROFILE = 'agent-default' }}\n",
+                expected.display()
+            ),
+        )
+        .unwrap();
+        assert!(evaluate_codex_binding_for(&path, &expected).is_some());
     }
 
     #[test]

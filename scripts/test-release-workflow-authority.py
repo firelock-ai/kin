@@ -19,6 +19,7 @@ INSTALLER_CALLBACK = WORKFLOWS / "publish-release-installers.yml"
 UPDATE_TRUST = ROOT / "docs" / "security" / "signing-and-update-trust.md"
 INSTALL_SH = ROOT / "scripts" / "install.sh"
 INSTALL_PS1 = ROOT / "scripts" / "install.ps1"
+HEALTH = ROOT / "crates" / "kin-cli" / "src" / "commands" / "health.rs"
 
 
 def require(content: str, needle: str, context: str) -> None:
@@ -47,6 +48,7 @@ def main() -> None:
     update_trust = UPDATE_TRUST.read_text(encoding="utf-8")
     install_sh = INSTALL_SH.read_text(encoding="utf-8")
     install_ps1 = INSTALL_PS1.read_text(encoding="utf-8")
+    health = HEALTH.read_text(encoding="utf-8")
     docker_workflow = (WORKFLOWS / "docker.yml").read_text(encoding="utf-8")
     require(
         install_sh,
@@ -134,12 +136,25 @@ def main() -> None:
         "manifest.schema_version === 2",
         "aggregate release-provenance schema accepted by install proof",
     )
-    for policy in (
-        "codexArgs.length !== 4",
-        'codexArgs[2] !== "--repo"',
-        "codexRepo !== fs.realpathSync(process.cwd())",
-    ):
-        require(install_proof, policy, "repo-bound Codex MCP install proof")
+    require(
+        install_proof,
+        '["mcp_client_codex", "healthy"]',
+        "repo-bound Codex MCP install proof",
+    )
+    require(
+        health,
+        "evaluate_codex_binding(&client.path)",
+        "product-owned Codex MCP binding validation",
+    )
+    require(
+        health,
+        "super::setup::codex_entry_has_exact_repo_binding(&content, expected_repo)",
+        "shared TOML parser for Codex MCP binding validation",
+    )
+    if "JSON.parse(codexArgsMatch[1])" in install_proof:
+        raise AssertionError(
+            "install proof must not parse TOML as JSON; the product health check owns Codex binding validation"
+        )
 
     for policy in (
         "Graph-backed VFS projection proof",
