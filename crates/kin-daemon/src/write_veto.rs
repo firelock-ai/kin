@@ -95,6 +95,14 @@ impl WriteVetoMode {
     pub fn evaluates(self) -> bool {
         !self.is_off()
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Warn => "warn",
+            Self::Enforce => "enforce",
+        }
+    }
 }
 
 /// Outcome of [`evaluate_write_veto`].

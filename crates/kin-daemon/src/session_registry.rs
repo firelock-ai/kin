@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tracing::{debug, info, warn};
@@ -30,6 +30,19 @@ pub enum IntentRegistrationResult {
         intent_id: IntentId,
         conflicts: Vec<IntentSummary>,
     },
+    /// Registration rejected because the session has reached the concurrency
+    /// limit it declared at session start.
+    LimitExceeded {
+        intent_id: IntentId,
+        active: usize,
+        limit: usize,
+    },
+    /// A hard intent can block other writers, so only a session that declared
+    /// write capability may register one.
+    CapabilityDenied {
+        intent_id: IntentId,
+        capability: &'static str,
+    },
 }
 
 /// Traffic check result for a set of scopes.
@@ -48,6 +61,12 @@ pub struct TrafficCheck {
 /// higher-level lifecycle operations described in PLAN_P2.md Section 4.7.
 pub struct SessionCoordinator {
     graph: Arc<kin_db::InMemoryGraph>,
+    /// Linearization point for session/intent lifecycle mutations. `kin-db`'s
+    /// public `SessionStore` API exposes individual CRUD calls, so the
+    /// conflict-check + limit-check + insert sequence must be serialized here
+    /// at the owning coordinator boundary rather than performed as racy reads
+    /// followed by a later write.
+    arbitration: Mutex<()>,
     /// Heartbeat interval used for stale-session detection.
     heartbeat_interval: Duration,
 }
@@ -57,6 +76,7 @@ impl SessionCoordinator {
     pub fn new(graph: Arc<kin_db::InMemoryGraph>) -> Self {
         Self {
             graph,
+            arbitration: Mutex::new(()),
             heartbeat_interval: Duration::from_secs(30),
         }
     }
@@ -65,6 +85,7 @@ impl SessionCoordinator {
     pub fn with_heartbeat_interval(graph: Arc<kin_db::InMemoryGraph>, interval: Duration) -> Self {
         Self {
             graph,
+            arbitration: Mutex::new(()),
             heartbeat_interval: interval,
         }
     }
@@ -135,6 +156,10 @@ impl SessionCoordinator {
 
     /// Deregister a session and clean up all its intents.
     pub fn deregister_session(&self, session_id: &SessionId) -> Result<()> {
+        let _arbitration = self
+            .arbitration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for intent in self.list_intents(session_id)? {
             self.graph
                 .delete_intent(&intent.intent_id)
@@ -179,12 +204,21 @@ impl SessionCoordinator {
         task_description: &str,
         expires_at: Option<Timestamp>,
     ) -> Result<IntentRegistrationResult> {
+        // This guard is the linearization point for the whole arbitration
+        // decision. Concurrent hard registrations cannot both observe an
+        // empty conflict set, and a release/deregister cannot race the session
+        // limit check.
+        let _arbitration = self
+            .arbitration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         // 1. Validate session exists.
         let session = self
             .graph
             .get_session(session_id)
             .map_err(DaemonError::from)?;
-        let _session = session.ok_or_else(|| {
+        let session = session.ok_or_else(|| {
             DaemonError::Graph(kin_db::KinDbError::NotFound(format!(
                 "session not found: {}",
                 session_id
@@ -193,6 +227,27 @@ impl SessionCoordinator {
 
         let intent_id = IntentId::new();
         let now = Timestamp::now();
+
+        if lock_type == LockType::Hard && !session.capabilities.can_write {
+            return Ok(IntentRegistrationResult::CapabilityDenied {
+                intent_id,
+                capability: "can_write",
+            });
+        }
+
+        let active = self
+            .graph
+            .list_intents_for_session(session_id)
+            .map_err(DaemonError::from)?
+            .len();
+        let limit = session.capabilities.max_concurrent_intents;
+        if active >= limit {
+            return Ok(IntentRegistrationResult::LimitExceeded {
+                intent_id,
+                active,
+                limit,
+            });
+        }
 
         // 2. Check for hard collisions on all scope types.
         let mut all_conflicts = Vec::new();
@@ -204,6 +259,11 @@ impl SessionCoordinator {
                         .hard_collisions_for_entity(entity_id, &intent_id)
                         .map_err(DaemonError::from)?;
                     for collision in &collisions {
+                        // A session's own intent is not a collision: own-write
+                        // exclusion is the invariant used by every apply path.
+                        if collision.session_id == *session_id {
+                            continue;
+                        }
                         let col_session = self
                             .graph
                             .get_session(&collision.session_id)
@@ -328,6 +388,10 @@ impl SessionCoordinator {
 
     /// Release (delete) an intent.
     pub fn release_intent(&self, session_id: &SessionId, intent_id: &IntentId) -> Result<()> {
+        let _arbitration = self
+            .arbitration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Verify the intent belongs to this session.
         let intent = self
             .graph
@@ -785,6 +849,21 @@ mod tests {
         SessionCoordinator::new(graph)
     }
 
+    fn write_capabilities() -> SessionCapabilities {
+        SessionCapabilities {
+            can_write: true,
+            ..SessionCapabilities::default()
+        }
+    }
+
+    fn write_capabilities_with_limit(limit: usize) -> SessionCapabilities {
+        SessionCapabilities {
+            can_write: true,
+            max_concurrent_intents: limit,
+            ..SessionCapabilities::default()
+        }
+    }
+
     #[test]
     fn register_and_get_session() {
         let coord = make_coordinator();
@@ -922,7 +1001,7 @@ mod tests {
                 SessionTransport::Mcp,
                 None,
                 PathBuf::from("/"),
-                SessionCapabilities::default(),
+                write_capabilities(),
             )
             .unwrap();
         let s2 = coord
@@ -932,7 +1011,7 @@ mod tests {
                 SessionTransport::Cli,
                 None,
                 PathBuf::from("/"),
-                SessionCapabilities::default(),
+                write_capabilities(),
             )
             .unwrap();
 
@@ -1050,7 +1129,7 @@ mod tests {
                 SessionTransport::Mcp,
                 None,
                 PathBuf::from("/"),
-                SessionCapabilities::default(),
+                write_capabilities(),
             )
             .unwrap();
 
@@ -1103,7 +1182,7 @@ mod tests {
                 SessionTransport::Mcp,
                 None,
                 PathBuf::from("/"),
-                SessionCapabilities::default(),
+                write_capabilities(),
             )
             .unwrap();
         let s2 = coord
@@ -1113,7 +1192,7 @@ mod tests {
                 SessionTransport::Cli,
                 None,
                 PathBuf::from("/"),
-                SessionCapabilities::default(),
+                write_capabilities(),
             )
             .unwrap();
 
@@ -1154,7 +1233,7 @@ mod tests {
                 SessionTransport::Mcp,
                 None,
                 PathBuf::from("/"),
-                SessionCapabilities::default(),
+                write_capabilities(),
             )
             .unwrap();
         let s2 = coord
@@ -1164,7 +1243,7 @@ mod tests {
                 SessionTransport::Cli,
                 None,
                 PathBuf::from("/"),
-                SessionCapabilities::default(),
+                write_capabilities(),
             )
             .unwrap();
 
@@ -1207,7 +1286,7 @@ mod tests {
                 SessionTransport::Mcp,
                 None,
                 PathBuf::from("/"),
-                SessionCapabilities::default(),
+                write_capabilities_with_limit(3),
             )
             .unwrap();
 
@@ -1358,7 +1437,7 @@ mod tests {
                 SessionTransport::Mcp,
                 None,
                 PathBuf::from("/"),
-                SessionCapabilities::default(),
+                write_capabilities(),
             )
             .unwrap();
         coord
@@ -1403,7 +1482,7 @@ mod tests {
                 SessionTransport::Mcp,
                 None,
                 PathBuf::from("/"),
-                SessionCapabilities::default(),
+                write_capabilities(),
             )
             .unwrap();
         let s2 = coord
@@ -1413,7 +1492,7 @@ mod tests {
                 SessionTransport::Cli,
                 None,
                 PathBuf::from("/"),
-                SessionCapabilities::default(),
+                write_capabilities(),
             )
             .unwrap();
 
@@ -1455,7 +1534,10 @@ mod tests {
                 SessionTransport::Mcp,
                 None,
                 PathBuf::from("/"),
-                SessionCapabilities::default(),
+                SessionCapabilities {
+                    max_concurrent_intents: 5,
+                    ..SessionCapabilities::default()
+                },
             )
             .unwrap();
 
@@ -1480,6 +1562,135 @@ mod tests {
     }
 
     #[test]
+    fn max_concurrent_intents_is_enforced_at_registration_boundary() {
+        let coord = make_coordinator();
+        let sid = coord
+            .register_session(
+                "codex",
+                "bounded",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                write_capabilities_with_limit(1),
+            )
+            .unwrap();
+
+        let first = coord
+            .register_intent(
+                &sid,
+                vec![IntentScope::Entity(EntityId::new())],
+                LockType::Hard,
+                "first",
+                None,
+            )
+            .unwrap();
+        assert!(matches!(first, IntentRegistrationResult::Registered { .. }));
+
+        let second = coord
+            .register_intent(
+                &sid,
+                vec![IntentScope::Entity(EntityId::new())],
+                LockType::Hard,
+                "second",
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            second,
+            IntentRegistrationResult::LimitExceeded {
+                active: 1,
+                limit: 1,
+                ..
+            }
+        ));
+        assert_eq!(coord.list_intents(&sid).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hard_intent_requires_session_write_capability() {
+        let coord = make_coordinator();
+        let sid = coord
+            .register_session(
+                "read-only-agent",
+                "reader",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
+            .unwrap();
+
+        let result = coord
+            .register_intent(
+                &sid,
+                vec![IntentScope::Entity(EntityId::new())],
+                LockType::Hard,
+                "must not block writers",
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            result,
+            IntentRegistrationResult::CapabilityDenied {
+                capability: "can_write",
+                ..
+            }
+        ));
+        assert!(coord.list_intents(&sid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_hard_registration_has_one_linearizable_winner() {
+        use std::sync::{Arc, Barrier};
+
+        let coord = Arc::new(make_coordinator());
+        let entity = make_test_entity(&coord);
+        let sessions = ["one", "two"].map(|name| {
+            coord
+                .register_session(
+                    "codex",
+                    name,
+                    SessionTransport::Mcp,
+                    None,
+                    PathBuf::from("/"),
+                    write_capabilities(),
+                )
+                .unwrap()
+        });
+        let barrier = Arc::new(Barrier::new(2));
+
+        let handles = sessions.map(|session_id| {
+            let coord = Arc::clone(&coord);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                coord
+                    .register_intent(
+                        &session_id,
+                        vec![IntentScope::Entity(entity)],
+                        LockType::Hard,
+                        "racing registration",
+                        None,
+                    )
+                    .unwrap()
+            })
+        });
+        let outcomes = handles.map(|handle| handle.join().unwrap());
+        let registered = outcomes
+            .iter()
+            .filter(|result| matches!(result, IntentRegistrationResult::Registered { .. }))
+            .count();
+        let blocked = outcomes
+            .iter()
+            .filter(|result| matches!(result, IntentRegistrationResult::Blocked { .. }))
+            .count();
+
+        assert_eq!(registered, 1);
+        assert_eq!(blocked, 1);
+        assert_eq!(coord.graph.list_all_intents().unwrap().len(), 1);
+    }
+
+    #[test]
     fn soft_lock_does_not_block_hard_lock_from_other_session() {
         let coord = make_coordinator();
         let entity = make_test_entity(&coord);
@@ -1491,7 +1702,7 @@ mod tests {
                 SessionTransport::Mcp,
                 None,
                 PathBuf::from("/"),
-                SessionCapabilities::default(),
+                write_capabilities(),
             )
             .unwrap();
         let s2 = coord
@@ -1501,7 +1712,7 @@ mod tests {
                 SessionTransport::Cli,
                 None,
                 PathBuf::from("/"),
-                SessionCapabilities::default(),
+                write_capabilities(),
             )
             .unwrap();
 
@@ -1652,7 +1863,7 @@ mod tests {
                 SessionTransport::Mcp,
                 None,
                 PathBuf::from("/"),
-                SessionCapabilities::default(),
+                write_capabilities(),
             )
             .unwrap();
 

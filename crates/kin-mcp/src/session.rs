@@ -60,6 +60,105 @@ pub struct McpTransaction {
     pub staged_operations: Vec<McpMutationOperation>,
 }
 
+/// Linearized outcome of an in-process intent registration attempt.
+#[derive(Debug, Clone)]
+pub enum IntentRegistrationAttempt {
+    Registered(Intent),
+    Blocked {
+        intent_id: IntentId,
+        conflicts: Vec<IntentSummary>,
+    },
+    LimitExceeded {
+        intent_id: IntentId,
+        active: usize,
+        limit: usize,
+    },
+    CapabilityDenied {
+        intent_id: IntentId,
+        capability: &'static str,
+    },
+    SessionNotFound,
+}
+
+/// Effective coordination enforcement mode shared by transaction preflight
+/// and proof/build attestation. Warn remains the default; only explicit
+/// `enforce` may reject a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinationEnforcementMode {
+    Off,
+    Warn,
+    Enforce,
+}
+
+impl CoordinationEnforcementMode {
+    pub fn from_env() -> Self {
+        Self::parse(std::env::var("KIN_WRITE_VETO").ok().as_deref())
+    }
+
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            Some(value) if value.eq_ignore_ascii_case("enforce") => Self::Enforce,
+            Some(value) if value.eq_ignore_ascii_case("off") => Self::Off,
+            _ => Self::Warn,
+        }
+    }
+
+    pub fn is_enforcing(self) -> bool {
+        matches!(self, Self::Enforce)
+    }
+
+    pub fn evaluates(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Warn => "warn",
+            Self::Enforce => "enforce",
+        }
+    }
+}
+
+/// Honest surface attestation for MCP transaction coordination. Contract
+/// scopes stay explicitly ineligible until a transaction can derive a touched
+/// contract from the actual semantic delta.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoordinationSurfaceCoverage {
+    pub entity_scopes: bool,
+    pub artifact_scopes_from_entity_origin: bool,
+    pub relation_endpoint_entities: bool,
+    pub contract_scopes: bool,
+    pub direct_filesystem_writes: bool,
+}
+
+impl Default for CoordinationSurfaceCoverage {
+    fn default() -> Self {
+        Self {
+            entity_scopes: true,
+            artifact_scopes_from_entity_origin: true,
+            relation_endpoint_entities: true,
+            contract_scopes: false,
+            direct_filesystem_writes: false,
+        }
+    }
+}
+
+/// Result of checking a transaction immediately before graph application.
+#[derive(Debug, Clone, Serialize)]
+pub struct CoordinationWritePreflight {
+    pub schema: &'static str,
+    pub mode: CoordinationEnforcementMode,
+    pub evaluated: bool,
+    pub allowed: bool,
+    pub session_id: String,
+    pub touched_scopes: Vec<IntentScope>,
+    pub blocking_intents: Vec<IntentSummary>,
+    pub capability_violations: Vec<String>,
+    pub coverage: CoordinationSurfaceCoverage,
+}
+
 /// The mutation verbs the transaction commit path understands, listed for
 /// actionable error messages.
 const KNOWN_MUTATION_VERBS: &str = "create/add/upsert/insert, update/modify, or delete/remove";
@@ -201,6 +300,15 @@ pub struct SessionRegistry {
     intents: Mutex<HashMap<IntentId, Intent>>,
     /// Active transactions keyed by TransactionId.
     transactions: Mutex<HashMap<String, McpTransaction>>,
+    /// Linearization point for rich-session and intent lifecycle mutations.
+    /// The maps stay separate for low-impact compatibility, but registration's
+    /// session lookup + concurrency check + conflict check + insert is one
+    /// indivisible coordinator operation under this gate.
+    intent_registration_gate: Mutex<()>,
+    /// Daemon-owned mode snapshot. `None` keeps standalone/offline MCP behavior
+    /// environment-driven; the daemon sets this explicitly so a request cannot
+    /// observe a process-global env change mid-run.
+    coordination_mode: Mutex<Option<CoordinationEnforcementMode>>,
 }
 
 impl SessionRegistry {
@@ -210,6 +318,8 @@ impl SessionRegistry {
             agent_sessions: Mutex::new(HashMap::new()),
             intents: Mutex::new(HashMap::new()),
             transactions: Mutex::new(HashMap::new()),
+            intent_registration_gate: Mutex::new(()),
+            coordination_mode: Mutex::new(None),
         }
     }
 
@@ -274,6 +384,10 @@ impl SessionRegistry {
         cwd: PathBuf,
         capabilities: SessionCapabilities,
     ) -> AgentSession {
+        let _gate = self
+            .intent_registration_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Timestamp::now();
         let session = AgentSession {
             session_id: SessionId::new(),
@@ -310,6 +424,10 @@ impl SessionRegistry {
 
     /// End an agent session and release all its intents.
     pub fn end_agent_session(&self, session_id: &SessionId) -> Option<AgentSession> {
+        let _gate = self
+            .intent_registration_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let session = self
             .agent_sessions
             .lock()
@@ -354,6 +472,10 @@ impl SessionRegistry {
         agent_sessions: Vec<AgentSession>,
         intents: Vec<Intent>,
     ) {
+        let _gate = self
+            .intent_registration_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut sessions_map = self
             .agent_sessions
             .lock()
@@ -373,7 +495,22 @@ impl SessionRegistry {
 
     // ── Intent API ──
 
-    /// Register a new intent. Returns the created Intent.
+    pub fn set_coordination_mode(&self, mode: CoordinationEnforcementMode) {
+        *self
+            .coordination_mode
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(mode);
+    }
+
+    pub(crate) fn lock_coordination_apply(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.intent_registration_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Backward-compatible registration API. Callers that need to distinguish
+    /// conflict, capability, and concurrency-limit rejection should use
+    /// [`Self::register_intent_checked`].
     pub fn register_intent(
         &self,
         session_id: SessionId,
@@ -382,15 +519,42 @@ impl SessionRegistry {
         task_description: String,
         expires_at: Option<Timestamp>,
     ) -> Option<Intent> {
-        // Verify session exists.
-        let sessions = self
+        match self.register_intent_checked(
+            session_id,
+            scopes,
+            lock_type,
+            task_description,
+            expires_at,
+        ) {
+            IntentRegistrationAttempt::Registered(intent) => Some(intent),
+            _ => None,
+        }
+    }
+
+    /// Register a new intent as one linearized arbitration operation and
+    /// preserve the exact rejection reason.
+    pub fn register_intent_checked(
+        &self,
+        session_id: SessionId,
+        scopes: Vec<IntentScope>,
+        lock_type: LockType,
+        task_description: String,
+        expires_at: Option<Timestamp>,
+    ) -> IntentRegistrationAttempt {
+        let _gate = self
+            .intent_registration_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let session = self
             .agent_sessions
             .lock()
-            .expect("agent_sessions lock poisoned");
-        if !sessions.contains_key(&session_id) {
-            return None;
-        }
-        drop(sessions);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&session_id)
+            .cloned();
+        let Some(session) = session else {
+            return IntentRegistrationAttempt::SessionNotFound;
+        };
 
         let now = Timestamp::now();
         let intent = Intent {
@@ -403,15 +567,76 @@ impl SessionRegistry {
             expires_at,
         };
         let id = intent.intent_id;
-        self.intents
+        let mut intents = self
+            .intents
             .lock()
-            .expect("intents lock poisoned")
-            .insert(id, intent.clone());
-        Some(intent)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if lock_type == LockType::Hard && !session.capabilities.can_write {
+            return IntentRegistrationAttempt::CapabilityDenied {
+                intent_id: id,
+                capability: "can_write",
+            };
+        }
+
+        let active = intents
+            .values()
+            .filter(|active| active.session_id == session_id)
+            .count();
+        let limit = session.capabilities.max_concurrent_intents;
+        if active >= limit {
+            return IntentRegistrationAttempt::LimitExceeded {
+                intent_id: id,
+                active,
+                limit,
+            };
+        }
+
+        if lock_type == LockType::Hard {
+            let sessions = self
+                .agent_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let conflicts: Vec<IntentSummary> = intents
+                .values()
+                .filter(|active| {
+                    active.session_id != session_id
+                        && active.lock_type == LockType::Hard
+                        && active
+                            .scopes
+                            .iter()
+                            .any(|scope| intent.scopes.contains(scope))
+                })
+                .map(|active| IntentSummary {
+                    intent_id: active.intent_id,
+                    session_id: active.session_id,
+                    vendor: sessions
+                        .get(&active.session_id)
+                        .map(|owner| owner.vendor.clone())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    task_description: active.task_description.clone(),
+                    lock_type: active.lock_type,
+                    registered_at: active.registered_at.clone(),
+                })
+                .collect();
+            if !conflicts.is_empty() {
+                return IntentRegistrationAttempt::Blocked {
+                    intent_id: id,
+                    conflicts,
+                };
+            }
+        }
+
+        intents.insert(id, intent.clone());
+        IntentRegistrationAttempt::Registered(intent)
     }
 
     /// Release a specific intent. Returns it if it existed.
     pub fn release_intent(&self, session_id: &SessionId, intent_id: &IntentId) -> Option<Intent> {
+        let _gate = self
+            .intent_registration_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut intents = self.intents.lock().expect("intents lock poisoned");
         if let Some(intent) = intents.get(intent_id) {
             if intent.session_id == *session_id {
@@ -430,6 +655,105 @@ impl SessionRegistry {
             .filter(|i| i.session_id == *session_id)
             .cloned()
             .collect()
+    }
+
+    /// Evaluate exact-scope intent conflicts and declared write capabilities
+    /// immediately before a transaction delta is applied. In enforce mode an
+    /// unknown/non-rich session fails closed; warn mode records the same
+    /// violations while preserving the historical proceed behavior.
+    pub fn evaluate_transaction_write(
+        &self,
+        session_id: &str,
+        touched_scopes: Vec<IntentScope>,
+    ) -> CoordinationWritePreflight {
+        let mode = self
+            .coordination_mode
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(CoordinationEnforcementMode::from_env);
+        self.evaluate_transaction_write_with_mode(session_id, touched_scopes, mode)
+    }
+
+    pub fn evaluate_transaction_write_with_mode(
+        &self,
+        session_id: &str,
+        touched_scopes: Vec<IntentScope>,
+        mode: CoordinationEnforcementMode,
+    ) -> CoordinationWritePreflight {
+        if !mode.evaluates() {
+            return CoordinationWritePreflight {
+                schema: "kin.coordination-preflight.v1",
+                mode,
+                evaluated: false,
+                allowed: true,
+                session_id: session_id.to_string(),
+                touched_scopes,
+                blocking_intents: Vec::new(),
+                capability_violations: Vec::new(),
+                coverage: CoordinationSurfaceCoverage::default(),
+            };
+        }
+
+        let parsed_session = uuid::Uuid::parse_str(session_id).ok().map(SessionId);
+        let session = parsed_session.and_then(|id| self.get_agent_session(&id));
+        let mut capability_violations = Vec::new();
+
+        match session.as_ref() {
+            Some(session) => {
+                if !session.capabilities.can_write {
+                    capability_violations.push("can_write=false".to_string());
+                }
+                if !session.capabilities.can_commit {
+                    capability_violations.push("can_commit=false".to_string());
+                }
+            }
+            None => capability_violations
+                .push("transaction session is not an active rich agent session".to_string()),
+        }
+
+        let intents = self
+            .intents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sessions = self
+            .agent_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let blocking_intents: Vec<IntentSummary> = intents
+            .values()
+            .filter(|intent| {
+                Some(intent.session_id) != parsed_session
+                    && intent.lock_type == LockType::Hard
+                    && intent
+                        .scopes
+                        .iter()
+                        .any(|scope| touched_scopes.contains(scope))
+            })
+            .map(|intent| IntentSummary {
+                intent_id: intent.intent_id,
+                session_id: intent.session_id,
+                vendor: sessions
+                    .get(&intent.session_id)
+                    .map(|owner| owner.vendor.clone())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                task_description: intent.task_description.clone(),
+                lock_type: intent.lock_type,
+                registered_at: intent.registered_at.clone(),
+            })
+            .collect();
+
+        let violates_policy = !blocking_intents.is_empty() || !capability_violations.is_empty();
+        CoordinationWritePreflight {
+            schema: "kin.coordination-preflight.v1",
+            mode,
+            evaluated: true,
+            allowed: !mode.is_enforcing() || !violates_policy,
+            session_id: session_id.to_string(),
+            touched_scopes,
+            blocking_intents,
+            capability_violations,
+            coverage: CoordinationSurfaceCoverage::default(),
+        }
     }
 
     /// Check traffic for the given scopes. Returns a TrafficReport per scope.
@@ -746,15 +1070,16 @@ mod tests {
             SessionCapabilities::default(),
         );
 
-        let intent = registry
-            .register_intent(
-                session.session_id,
-                vec![IntentScope::Entity(EntityId::new())],
-                LockType::Soft,
-                "testing".into(),
-                None,
-            )
-            .unwrap();
+        let intent = match registry.register_intent_checked(
+            session.session_id,
+            vec![IntentScope::Entity(EntityId::new())],
+            LockType::Soft,
+            "testing".into(),
+            None,
+        ) {
+            IntentRegistrationAttempt::Registered(intent) => intent,
+            other => panic!("expected registered intent, got {other:?}"),
+        };
 
         assert_eq!(
             registry.list_intents_for_session(&session.session_id).len(),
@@ -809,14 +1134,182 @@ mod tests {
         let registry = SessionRegistry::new();
         let fake_session = SessionId::new();
 
-        let result = registry.register_intent(
+        let result = registry.register_intent_checked(
             fake_session,
             vec![IntentScope::Entity(EntityId::new())],
             LockType::Soft,
             "test".into(),
             None,
         );
-        assert!(result.is_none());
+        assert!(matches!(result, IntentRegistrationAttempt::SessionNotFound));
+    }
+
+    #[test]
+    fn intent_registration_enforces_limit_and_foreign_hard_conflict() {
+        let registry = SessionRegistry::new();
+        let capabilities = SessionCapabilities {
+            can_write: true,
+            can_commit: true,
+            max_concurrent_intents: 1,
+            ..SessionCapabilities::default()
+        };
+        let first = registry.start_agent_session(
+            "codex",
+            "first",
+            SessionTransport::Mcp,
+            None,
+            PathBuf::from("/tmp"),
+            capabilities.clone(),
+        );
+        let second = registry.start_agent_session(
+            "claude-code",
+            "second",
+            SessionTransport::Mcp,
+            None,
+            PathBuf::from("/tmp"),
+            capabilities,
+        );
+        let entity = EntityId::new();
+
+        let registered = registry.register_intent_checked(
+            first.session_id,
+            vec![IntentScope::Entity(entity)],
+            LockType::Hard,
+            "first write".into(),
+            None,
+        );
+        assert!(matches!(
+            registered,
+            IntentRegistrationAttempt::Registered(_)
+        ));
+
+        let limited = registry.register_intent_checked(
+            first.session_id,
+            vec![IntentScope::Entity(EntityId::new())],
+            LockType::Hard,
+            "second write".into(),
+            None,
+        );
+        assert!(matches!(
+            limited,
+            IntentRegistrationAttempt::LimitExceeded {
+                active: 1,
+                limit: 1,
+                ..
+            }
+        ));
+
+        let blocked = registry.register_intent_checked(
+            second.session_id,
+            vec![IntentScope::Entity(entity)],
+            LockType::Hard,
+            "conflicting write".into(),
+            None,
+        );
+        assert!(matches!(blocked, IntentRegistrationAttempt::Blocked { .. }));
+    }
+
+    #[test]
+    fn hard_intent_requires_declared_write_capability() {
+        let registry = SessionRegistry::new();
+        let session = registry.start_agent_session(
+            "read-only-agent",
+            "reader",
+            SessionTransport::Mcp,
+            None,
+            PathBuf::from("/tmp"),
+            SessionCapabilities::default(),
+        );
+        let result = registry.register_intent_checked(
+            session.session_id,
+            vec![IntentScope::Entity(EntityId::new())],
+            LockType::Hard,
+            "must not block writers".into(),
+            None,
+        );
+        assert!(matches!(
+            result,
+            IntentRegistrationAttempt::CapabilityDenied {
+                capability: "can_write",
+                ..
+            }
+        ));
+        assert!(registry
+            .list_intents_for_session(&session.session_id)
+            .is_empty());
+    }
+
+    #[test]
+    fn transaction_preflight_enforce_fails_closed_before_apply() {
+        let registry = SessionRegistry::new();
+        let capabilities = SessionCapabilities {
+            can_write: true,
+            can_commit: true,
+            ..SessionCapabilities::default()
+        };
+        let owner = registry.start_agent_session(
+            "claude-code",
+            "owner",
+            SessionTransport::Mcp,
+            None,
+            PathBuf::from("/tmp"),
+            capabilities.clone(),
+        );
+        let caller = registry.start_agent_session(
+            "codex",
+            "caller",
+            SessionTransport::Mcp,
+            None,
+            PathBuf::from("/tmp"),
+            capabilities,
+        );
+        let entity = EntityId::new();
+        assert!(matches!(
+            registry.register_intent_checked(
+                owner.session_id,
+                vec![IntentScope::Entity(entity)],
+                LockType::Hard,
+                "owner write".into(),
+                None,
+            ),
+            IntentRegistrationAttempt::Registered(_)
+        ));
+
+        let denied = registry.evaluate_transaction_write_with_mode(
+            &caller.session_id.to_string(),
+            vec![IntentScope::Entity(entity)],
+            CoordinationEnforcementMode::Enforce,
+        );
+        assert!(!denied.allowed);
+        assert_eq!(denied.blocking_intents.len(), 1);
+        assert!(denied.capability_violations.is_empty());
+        assert!(!denied.coverage.contract_scopes);
+
+        let warned = registry.evaluate_transaction_write_with_mode(
+            &caller.session_id.to_string(),
+            vec![IntentScope::Entity(entity)],
+            CoordinationEnforcementMode::Warn,
+        );
+        assert!(warned.allowed);
+        assert_eq!(warned.blocking_intents.len(), 1);
+
+        let off = registry.evaluate_transaction_write_with_mode(
+            "legacy-session",
+            vec![IntentScope::Entity(entity)],
+            CoordinationEnforcementMode::Off,
+        );
+        assert!(off.allowed);
+        assert!(!off.evaluated);
+        assert!(off.blocking_intents.is_empty());
+        assert!(off.capability_violations.is_empty());
+
+        let unknown = registry.evaluate_transaction_write_with_mode(
+            "legacy-session",
+            vec![IntentScope::Entity(EntityId::new())],
+            CoordinationEnforcementMode::Enforce,
+        );
+        assert!(!unknown.allowed);
+        assert!(!unknown.capability_violations.is_empty());
     }
 
     #[test]
@@ -828,18 +1321,22 @@ mod tests {
             SessionTransport::Mcp,
             None,
             PathBuf::from("/tmp"),
-            SessionCapabilities::default(),
+            SessionCapabilities {
+                can_write: true,
+                ..SessionCapabilities::default()
+            },
         );
 
-        let intent = registry
-            .register_intent(
-                session.session_id,
-                vec![IntentScope::Entity(EntityId::new())],
-                LockType::Hard,
-                "editing".into(),
-                None,
-            )
-            .unwrap();
+        let intent = match registry.register_intent_checked(
+            session.session_id,
+            vec![IntentScope::Entity(EntityId::new())],
+            LockType::Hard,
+            "editing".into(),
+            None,
+        ) {
+            IntentRegistrationAttempt::Registered(intent) => intent,
+            other => panic!("expected registered intent, got {other:?}"),
+        };
 
         // Wrong session cannot release.
         let other_session = SessionId::new();
@@ -894,7 +1391,10 @@ mod tests {
             SessionTransport::Mcp,
             None,
             PathBuf::from("/tmp"),
-            SessionCapabilities::default(),
+            SessionCapabilities {
+                can_write: true,
+                ..SessionCapabilities::default()
+            },
         );
 
         let entity_id = EntityId::new();

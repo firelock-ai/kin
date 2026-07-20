@@ -1122,7 +1122,10 @@ mod tests {
             SessionTransport::Cli,
             None,
             PathBuf::from("/tmp"),
-            SessionCapabilities::default(),
+            SessionCapabilities {
+                can_write: true,
+                ..SessionCapabilities::default()
+            },
         );
         let session_id_str = session.session_id.to_string();
 
