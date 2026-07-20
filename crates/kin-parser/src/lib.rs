@@ -4,7 +4,8 @@
 //! Tree-sitter parsing and language adapters for Kin.
 //!
 //! This crate provides the `LanguageAdapter` trait and built-in adapters
-//! for TypeScript, JavaScript, Python, Go, Java, Rust, C, C++, C#, Ruby, and PHP.
+//! for TypeScript, JavaScript, Python, Go, Java, Rust, C, C++, C#, Ruby, PHP, Swift,
+//! Kotlin, and HCL/Terraform.
 
 pub const PARSER_SCHEMA_EPOCH: &str = "parser-schema-2026-03-29-v1";
 
