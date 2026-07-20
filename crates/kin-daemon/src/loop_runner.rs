@@ -169,10 +169,56 @@ pub async fn run_loop(
             break;
         }
 
-        // Sweep expired intents so stale leases don't block work.
-        if let Ok(reaped) = state.coordinator.sweep_expired_intents() {
-            if reaped > 0 {
-                debug!(reaped, "swept expired intents");
+        // Sweep under the same cross-surface gate used by registration and
+        // graph apply, then record every automatic release durably.
+        {
+            let _coordination = state.coordination_gate.lock().await;
+            let mode = state.coordination_mode().as_str().to_string();
+            match state
+                .coordinator
+                .sweep_expired_intents_with_reservation(|intent| {
+                    state
+                        .record_coordination_event(crate::state::CoordinationEventDraft {
+                            event: "intent_release",
+                            outcome: "pending:expired".to_string(),
+                            session_id: Some(intent.session_id.to_string()),
+                            intent_id: Some(intent.intent_id.to_string()),
+                            intent_ids: vec![intent.intent_id.to_string()],
+                            transaction_id: None,
+                            scopes: intent.scopes.iter().map(crate::api::format_scope).collect(),
+                            enforcement_mode: mode.clone(),
+                            blocking_intent_ids: Vec::new(),
+                        })
+                        .map(|_| ())
+                }) {
+                Ok(reaped) => {
+                    for intent in &reaped {
+                        let _ =
+                            state.record_coordination_event(crate::state::CoordinationEventDraft {
+                                event: "intent_release",
+                                outcome: "expired".to_string(),
+                                session_id: Some(intent.session_id.to_string()),
+                                intent_id: Some(intent.intent_id.to_string()),
+                                intent_ids: vec![intent.intent_id.to_string()],
+                                transaction_id: None,
+                                scopes: intent
+                                    .scopes
+                                    .iter()
+                                    .map(crate::api::format_scope)
+                                    .collect(),
+                                enforcement_mode: mode.clone(),
+                                blocking_intent_ids: Vec::new(),
+                            });
+                    }
+                    if !reaped.is_empty() {
+                        debug!(reaped = reaped.len(), "swept expired intents");
+                    }
+                }
+                Err(error) => {
+                    state.mark_coordination_evidence_incomplete(format!(
+                        "expired-intent sweep failed after reservation may have been written: {error}"
+                    ));
+                }
             }
         }
 

@@ -95,6 +95,24 @@ impl WriteVetoMode {
     pub fn evaluates(self) -> bool {
         !self.is_off()
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Warn => "warn",
+            Self::Enforce => "enforce",
+        }
+    }
+}
+
+impl From<kin_mcp::CoordinationEnforcementMode> for WriteVetoMode {
+    fn from(mode: kin_mcp::CoordinationEnforcementMode) -> Self {
+        match mode {
+            kin_mcp::CoordinationEnforcementMode::Off => Self::Off,
+            kin_mcp::CoordinationEnforcementMode::Warn => Self::Warn,
+            kin_mcp::CoordinationEnforcementMode::Enforce => Self::Enforce,
+        }
+    }
 }
 
 /// Outcome of [`evaluate_write_veto`].

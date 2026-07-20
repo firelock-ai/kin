@@ -32,6 +32,40 @@ fn bench_meta_json_reports_cache_key_dimensions() {
     assert!(payload["kin_commit"].is_string());
     assert!(payload["kin_dirty"].is_boolean());
 
+    let coordination = payload["coordination"]
+        .as_object()
+        .expect("coordination attestation object");
+    assert_eq!(coordination["schema"], "kin.coordination-enforcement.v1");
+    assert!(matches!(
+        coordination["effective_mode"].as_str(),
+        Some("off" | "warn" | "enforce")
+    ));
+    assert_eq!(coordination["default_mode"], "warn");
+    assert_eq!(coordination["effective_mode_source"], "process_env");
+    assert_eq!(coordination["daemon_runtime_attested"], false);
+    assert_eq!(
+        coordination["hard_rejection_active"],
+        coordination["effective_mode"] == "enforce"
+    );
+    assert_eq!(coordination["intent_registration_linearized"], true);
+    assert_eq!(
+        coordination["max_concurrent_intents_enforced"],
+        coordination["effective_mode"] == "enforce"
+    );
+    assert_eq!(coordination["contract_scope_claim_eligible"], false);
+    assert_eq!(coordination["all_write_surfaces_claim_eligible"], false);
+    assert_eq!(coordination["surfaces"]["mcp_transaction_entity"], true);
+    assert_eq!(coordination["surfaces"]["contract"], false);
+    assert_eq!(
+        coordination["durable_event_schema"],
+        "kin.coordination-event.v1"
+    );
+    assert_eq!(coordination["durable_event_fsync_before_broadcast"], true);
+    assert_eq!(coordination["durable_event_mutation_fail_closed"], true);
+    assert_eq!(coordination["durable_event_lifecycle_complete"], true);
+    assert_eq!(coordination["durable_event_reservation_prefix"], "pending:");
+    assert_eq!(coordination["durable_event_requires_terminal_pair"], true);
+
     let embeddings = payload["embeddings"]
         .as_object()
         .expect("embeddings object");

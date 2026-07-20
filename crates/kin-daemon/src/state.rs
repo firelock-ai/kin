@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -112,6 +113,264 @@ pub(crate) fn write_persisted_mcp_transactions(
     }
 }
 
+/// One append-only, release-attributed coordination event. This is the durable
+/// collector boundary used by citable multi-agent metrics; every record names
+/// its exact enforcement mode and scopes instead of implying unsupported
+/// contract coverage.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CoordinationEventEnvelope {
+    pub schema: String,
+    pub sequence: u64,
+    pub timestamp: String,
+    pub event: String,
+    pub outcome: String,
+    pub repo_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_id: Option<String>,
+    #[serde(default)]
+    pub intent_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_id: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    pub enforcement_mode: String,
+    #[serde(default)]
+    pub blocking_intent_ids: Vec<String>,
+    pub kin_version: String,
+    pub kin_commit: String,
+    pub kin_dirty: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoordinationEventDraft {
+    pub event: &'static str,
+    pub outcome: String,
+    pub session_id: Option<String>,
+    pub intent_id: Option<String>,
+    pub intent_ids: Vec<String>,
+    pub transaction_id: Option<String>,
+    pub scopes: Vec<String>,
+    pub enforcement_mode: String,
+    pub blocking_intent_ids: Vec<String>,
+}
+
+/// Append-only JSONL writer with a monotonic sequence recovered from disk on
+/// daemon restart. Appends are serialized and `sync_data` is called before an
+/// event is broadcast, so live consumers never observe an event the durable
+/// collector failed to record.
+pub struct CoordinationEventLog {
+    path: std::path::PathBuf,
+    failure_marker: std::path::PathBuf,
+    repo_id: String,
+    next_sequence: Mutex<u64>,
+    poisoned: AtomicBool,
+}
+
+impl CoordinationEventLog {
+    pub fn open(layout: &KinLayout, repo_id: &str) -> std::io::Result<Self> {
+        let path = layout.root().join("coordination_events.jsonl");
+        let failure_marker = layout.root().join("coordination_events.failed");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if !path.exists() {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?
+                .sync_data()?;
+            if let Some(parent) = path.parent() {
+                sync_directory_metadata(parent)?;
+            }
+        }
+
+        let mut bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        let mut repaired_tail = false;
+        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+            let repaired_len = bytes
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |index| index + 1);
+            let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+            file.set_len(repaired_len as u64)?;
+            file.sync_data()?;
+            bytes.truncate(repaired_len);
+            repaired_tail = true;
+        }
+
+        let mut previous_sequence = None;
+        let mut pending_reservations: HashMap<String, usize> = HashMap::new();
+        for line in bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            let event: CoordinationEventEnvelope =
+                serde_json::from_slice(line).map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid coordination event JSONL record: {error}"),
+                    )
+                })?;
+            if previous_sequence.is_some_and(|previous| event.sequence <= previous) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "coordination event sequence is not strictly increasing: {}",
+                        event.sequence
+                    ),
+                ));
+            }
+            let reservation_key = serde_json::to_string(&(
+                &event.event,
+                &event.session_id,
+                &event.transaction_id,
+                &event.scopes,
+            ))
+            .map_err(std::io::Error::other)?;
+            if event.outcome.starts_with("pending:") {
+                *pending_reservations.entry(reservation_key).or_default() += 1;
+            } else if let Some(count) = pending_reservations.get_mut(&reservation_key) {
+                *count -= 1;
+                if *count == 0 {
+                    pending_reservations.remove(&reservation_key);
+                }
+            }
+            previous_sequence = Some(event.sequence);
+        }
+        let next_sequence = previous_sequence.unwrap_or(0).saturating_add(1);
+        let log = Self {
+            path,
+            failure_marker,
+            repo_id: repo_id.to_string(),
+            next_sequence: Mutex::new(next_sequence),
+            poisoned: AtomicBool::new(false),
+        };
+        if repaired_tail || !pending_reservations.is_empty() {
+            let failures = log.persisted_failure_count().max(1);
+            log.persist_failure_count(failures);
+        }
+        Ok(log)
+    }
+
+    pub fn append(
+        &self,
+        draft: CoordinationEventDraft,
+    ) -> std::io::Result<CoordinationEventEnvelope> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(std::io::Error::other(
+                "coordination event log is poisoned after a prior append failure",
+            ));
+        }
+        let mut next = self
+            .next_sequence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(std::io::Error::other(
+                "coordination event log is poisoned after a prior append failure",
+            ));
+        }
+        let build = kin_buildinfo::get();
+        let mut intent_ids = draft.intent_ids;
+        intent_ids.sort();
+        intent_ids.dedup();
+        let mut scopes = draft.scopes;
+        scopes.sort();
+        scopes.dedup();
+        let mut blocking_intent_ids = draft.blocking_intent_ids;
+        blocking_intent_ids.sort();
+        blocking_intent_ids.dedup();
+        let envelope = CoordinationEventEnvelope {
+            schema: "kin.coordination-event.v1".to_string(),
+            sequence: *next,
+            timestamp: kin_model::Timestamp::now().to_string(),
+            event: draft.event.to_string(),
+            outcome: draft.outcome,
+            repo_id: self.repo_id.clone(),
+            session_id: draft.session_id,
+            intent_id: draft.intent_id,
+            intent_ids,
+            transaction_id: draft.transaction_id,
+            scopes,
+            enforcement_mode: draft.enforcement_mode,
+            blocking_intent_ids,
+            kin_version: kin_buildinfo::version().to_string(),
+            kin_commit: build.sha.to_string(),
+            kin_dirty: build.dirty,
+        };
+        let mut bytes = serde_json::to_vec(&envelope).map_err(std::io::Error::other)?;
+        bytes.push(b'\n');
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let path_existed = self.path.exists();
+        let original_len = std::fs::metadata(&self.path).map_or(0, |metadata| metadata.len());
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        let persist_result = (|| -> std::io::Result<()> {
+            file.write_all(&bytes)?;
+            file.sync_data()?;
+            if !path_existed {
+                if let Some(parent) = self.path.parent() {
+                    sync_directory_metadata(parent)?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = persist_result {
+            self.poisoned.store(true, Ordering::Release);
+            let _ = file.set_len(original_len);
+            let _ = file.sync_data();
+            return Err(error);
+        }
+        *next = next.saturating_add(1);
+        Ok(envelope)
+    }
+
+    pub fn persisted_failure_count(&self) -> u64 {
+        std::fs::read_to_string(&self.failure_marker)
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    fn persist_failure_count(&self, count: u64) {
+        let temp = self.failure_marker.with_extension("failed.tmp");
+        let result = (|| -> std::io::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp)?;
+            file.write_all(format!("{count}\n").as_bytes())?;
+            file.sync_data()?;
+            drop(file);
+            std::fs::rename(&temp, &self.failure_marker)?;
+            if let Some(parent) = self.failure_marker.parent() {
+                sync_directory_metadata(parent)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            warn!(error = %error, "failed to persist coordination event failure marker");
+            let _ = std::fs::remove_file(temp);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
 /// SSE invalidation events pushed to subscribers (VFS daemon, spine, KinLab).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
@@ -141,6 +400,8 @@ pub enum DaemonEvent {
         old_root_hash: Option<String>,
         new_root_hash: String,
     },
+    /// Durable coordination lifecycle event, appended before broadcast.
+    Coordination { event: CoordinationEventEnvelope },
 }
 
 /// Authority owning the graph selected for a daemon request.
@@ -351,6 +612,18 @@ pub struct DaemonState {
     pub projection: RwLock<ProjectionState>,
     /// Session and intent coordinator (Phase 7).
     pub coordinator: SessionCoordinator,
+    /// Serializes daemon intent lifecycle mutations with MCP transaction
+    /// preflight+apply so those two authority paths have one ordering.
+    pub coordination_gate: tokio::sync::Mutex<()>,
+    /// Mode captured when the daemon state is created. Requests use this
+    /// stable value instead of re-reading process-global environment mid-run.
+    pub coordination_mode: std::sync::RwLock<kin_mcp::CoordinationEnforcementMode>,
+    /// Durable, release-attributed coordination event collector.
+    pub coordination_events: CoordinationEventLog,
+    /// Runtime completeness signal for the durable collector. Citable runs
+    /// must require zero; an append failure never masquerades as a recorded
+    /// event merely because the product action itself completed.
+    pub coordination_event_persist_failures: AtomicU64,
     /// When the daemon was started (for uptime reporting).
     pub started_at: Instant,
     /// Whether the daemon has been initialized (snapshot loaded or first reconciliation done).
@@ -562,6 +835,43 @@ pub(crate) fn graph_collapse_is_wipe(current: u64, baseline: u64) -> bool {
 }
 
 impl DaemonState {
+    pub fn coordination_mode(&self) -> kin_mcp::CoordinationEnforcementMode {
+        *self
+            .coordination_mode
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn record_coordination_event(
+        &self,
+        draft: CoordinationEventDraft,
+    ) -> std::io::Result<CoordinationEventEnvelope> {
+        match self.coordination_events.append(draft) {
+            Ok(event) => {
+                self.emit_event(DaemonEvent::Coordination {
+                    event: event.clone(),
+                });
+                Ok(event)
+            }
+            Err(error) => {
+                self.mark_coordination_evidence_incomplete(&error);
+                Err(error)
+            }
+        }
+    }
+
+    /// Permanently disqualify the current coordination evidence stream after
+    /// a reserved mutation cannot be paired with a trustworthy terminal event.
+    /// The marker survives daemon restart and is surfaced by `/health`.
+    pub(crate) fn mark_coordination_evidence_incomplete(&self, reason: impl std::fmt::Display) {
+        let count = self
+            .coordination_event_persist_failures
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.coordination_events.persist_failure_count(count);
+        warn!(reason = %reason, "coordination evidence is incomplete; stream is not claim-eligible");
+    }
+
     /// Load a persisted vector-index sidecar into a graph that was NOT built
     /// through `SnapshotManager` (the storage-backend path uses
     /// `InMemoryGraph::from_snapshot_with_text_index`, which does not load the
@@ -736,6 +1046,8 @@ impl DaemonState {
         // from the on-disk snapshot. Read before `graph` is moved into the state.
         let loaded_entity_count = graph.entity_count();
 
+        let coordination_events = CoordinationEventLog::open(&layout, &cached_repo_id)?;
+        let coordination_event_persist_failures = coordination_events.persisted_failure_count();
         let mut state = Self {
             layout,
             graph,
@@ -744,6 +1056,14 @@ impl DaemonState {
             reconciler: RwLock::new(reconciler),
             projection: RwLock::new(ProjectionState::new()),
             coordinator,
+            coordination_gate: tokio::sync::Mutex::new(()),
+            coordination_mode: std::sync::RwLock::new(
+                kin_mcp::CoordinationEnforcementMode::from_env(),
+            ),
+            coordination_events,
+            coordination_event_persist_failures: AtomicU64::new(
+                coordination_event_persist_failures,
+            ),
             started_at: Instant::now(),
             is_initialized: AtomicBool::new(loaded_snapshot),
             reconciliation_status: AtomicU8::new(RECON_IDLE),
@@ -892,6 +1212,8 @@ impl DaemonState {
         // the backend snapshot).
         let loaded_entity_count = graph.entity_count();
 
+        let coordination_events = CoordinationEventLog::open(&layout, repo_id)?;
+        let coordination_event_persist_failures = coordination_events.persisted_failure_count();
         let mut state = Self {
             layout,
             graph: Arc::clone(&graph),
@@ -900,6 +1222,14 @@ impl DaemonState {
             reconciler: RwLock::new(reconciler),
             projection: RwLock::new(ProjectionState::new()),
             coordinator,
+            coordination_gate: tokio::sync::Mutex::new(()),
+            coordination_mode: std::sync::RwLock::new(
+                kin_mcp::CoordinationEnforcementMode::from_env(),
+            ),
+            coordination_events,
+            coordination_event_persist_failures: AtomicU64::new(
+                coordination_event_persist_failures,
+            ),
             started_at: Instant::now(),
             is_initialized: AtomicBool::new(loaded_snapshot),
             reconciliation_status: AtomicU8::new(RECON_IDLE),
@@ -2825,6 +3155,8 @@ mod tests {
         };
         let coordinator = SessionCoordinator::new(Arc::clone(&graph));
         let loaded_entity_count = graph.entity_count();
+        let coordination_events =
+            CoordinationEventLog::open(&layout, "test-repo").expect("open coordination log");
 
         DaemonState {
             layout,
@@ -2834,6 +3166,12 @@ mod tests {
             reconciler: RwLock::new(Reconciler::new(working_dir.to_path_buf())),
             projection: RwLock::new(ProjectionState::new()),
             coordinator,
+            coordination_gate: tokio::sync::Mutex::new(()),
+            coordination_mode: std::sync::RwLock::new(
+                kin_mcp::CoordinationEnforcementMode::from_env(),
+            ),
+            coordination_events,
+            coordination_event_persist_failures: AtomicU64::new(0),
             started_at: Instant::now(),
             is_initialized: AtomicBool::new(false),
             reconciliation_status: AtomicU8::new(RECON_IDLE),
@@ -2921,6 +3259,160 @@ mod tests {
         let v = serde_json::to_value(&event).unwrap();
         assert_eq!(v["type"], json!("EntityChanged"));
         assert_eq!(v["session_id"], json!("mission-ctl-7"));
+    }
+
+    #[test]
+    fn coordination_event_log_is_durable_and_sequence_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = KinLayout::new(dir.path().join(".kin"));
+        std::fs::create_dir_all(layout.root()).unwrap();
+        let log = CoordinationEventLog::open(&layout, "test-repo").expect("open coordination log");
+        let first = log
+            .append(CoordinationEventDraft {
+                event: "intent_registration",
+                outcome: "registered".to_string(),
+                session_id: Some("session-1".to_string()),
+                intent_id: Some("intent-1".to_string()),
+                intent_ids: vec!["intent-1".to_string()],
+                transaction_id: None,
+                scopes: vec!["entity:e1".to_string()],
+                enforcement_mode: "warn".to_string(),
+                blocking_intent_ids: vec![],
+            })
+            .unwrap();
+        assert_eq!(first.sequence, 1);
+        assert_eq!(first.schema, "kin.coordination-event.v1");
+
+        let reopened =
+            CoordinationEventLog::open(&layout, "test-repo").expect("reopen coordination log");
+        let second = reopened
+            .append(CoordinationEventDraft {
+                event: "transaction_outcome",
+                outcome: "committed".to_string(),
+                session_id: Some("session-1".to_string()),
+                intent_id: None,
+                intent_ids: Vec::new(),
+                transaction_id: Some("tx-1".to_string()),
+                scopes: vec!["artifact:src/lib.rs".to_string()],
+                enforcement_mode: "enforce".to_string(),
+                blocking_intent_ids: vec![],
+            })
+            .unwrap();
+        assert_eq!(second.sequence, 2);
+
+        let lines = std::fs::read_to_string(reopened.path()).unwrap();
+        let records: Vec<CoordinationEventEnvelope> = lines
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].repo_id, "test-repo");
+        assert_eq!(records[1].transaction_id.as_deref(), Some("tx-1"));
+        assert!(!records[1].kin_commit.is_empty());
+    }
+
+    #[test]
+    fn coordination_event_log_repairs_partial_tail_and_marks_stream_ineligible() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = KinLayout::new(dir.path().join(".kin"));
+        let log = CoordinationEventLog::open(&layout, "test-repo").unwrap();
+        log.append(CoordinationEventDraft {
+            event: "intent_registration",
+            outcome: "registered".to_string(),
+            session_id: Some("session-1".to_string()),
+            intent_id: Some("intent-1".to_string()),
+            intent_ids: vec!["intent-1".to_string()],
+            transaction_id: None,
+            scopes: vec!["entity:e1".to_string()],
+            enforcement_mode: "warn".to_string(),
+            blocking_intent_ids: Vec::new(),
+        })
+        .unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(log.path())
+            .unwrap();
+        file.write_all(b"{\"schema\":\"partial").unwrap();
+        file.sync_data().unwrap();
+        drop(file);
+
+        let reopened = CoordinationEventLog::open(&layout, "test-repo").unwrap();
+        assert_eq!(reopened.persisted_failure_count(), 1);
+        let next = reopened
+            .append(CoordinationEventDraft {
+                event: "transaction_outcome",
+                outcome: "committed".to_string(),
+                session_id: Some("session-1".to_string()),
+                intent_id: None,
+                intent_ids: Vec::new(),
+                transaction_id: Some("tx-1".to_string()),
+                scopes: vec!["entity:e1".to_string()],
+                enforcement_mode: "warn".to_string(),
+                blocking_intent_ids: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(next.sequence, 2);
+        let records = std::fs::read_to_string(reopened.path()).unwrap();
+        assert_eq!(records.lines().count(), 2);
+        assert!(records
+            .lines()
+            .all(|line| serde_json::from_str::<CoordinationEventEnvelope>(line).is_ok()));
+    }
+
+    #[test]
+    fn coordination_event_log_marks_unresolved_reservation_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = KinLayout::new(dir.path().join(".kin"));
+        let log = CoordinationEventLog::open(&layout, "test-repo").unwrap();
+        log.append(CoordinationEventDraft {
+            event: "intent_release",
+            outcome: "pending:released".to_string(),
+            session_id: Some("session-1".to_string()),
+            intent_id: Some("intent-1".to_string()),
+            intent_ids: vec!["intent-1".to_string()],
+            transaction_id: None,
+            scopes: vec!["entity:e1".to_string()],
+            enforcement_mode: "enforce".to_string(),
+            blocking_intent_ids: Vec::new(),
+        })
+        .unwrap();
+        drop(log);
+
+        let reopened = CoordinationEventLog::open(&layout, "test-repo").unwrap();
+        assert_eq!(reopened.persisted_failure_count(), 1);
+    }
+
+    #[test]
+    fn coordination_event_log_rejects_duplicate_sequences() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = KinLayout::new(dir.path().join(".kin"));
+        let log = CoordinationEventLog::open(&layout, "test-repo").unwrap();
+        log.append(CoordinationEventDraft {
+            event: "transaction_outcome",
+            outcome: "committed".to_string(),
+            session_id: Some("session-1".to_string()),
+            intent_id: None,
+            intent_ids: Vec::new(),
+            transaction_id: Some("tx-1".to_string()),
+            scopes: vec!["entity:e1".to_string()],
+            enforcement_mode: "enforce".to_string(),
+            blocking_intent_ids: Vec::new(),
+        })
+        .unwrap();
+        let existing = std::fs::read(log.path()).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(log.path())
+            .unwrap();
+        file.write_all(&existing).unwrap();
+        file.sync_data().unwrap();
+        drop(file);
+        drop(log);
+
+        let error = CoordinationEventLog::open(&layout, "test-repo")
+            .err()
+            .expect("duplicate sequence must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

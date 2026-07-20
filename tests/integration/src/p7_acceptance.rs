@@ -14,6 +14,13 @@ use kin_reconcile::{CollisionCheck, ReconcileError, Reconciler, TrafficChecker};
 
 use crate::helpers::*;
 
+fn writable_capabilities() -> SessionCapabilities {
+    SessionCapabilities {
+        can_write: true,
+        ..SessionCapabilities::default()
+    }
+}
+
 // -----------------------------------------------------------------------
 // 8. Session lifecycle: register -> heartbeat -> verify active -> end -> gone
 // -----------------------------------------------------------------------
@@ -78,7 +85,7 @@ fn intent_hard_collision_blocks_second_agent() {
             SessionTransport::Mcp,
             None,
             PathBuf::from("/project"),
-            SessionCapabilities::default(),
+            writable_capabilities(),
         )
         .unwrap();
 
@@ -89,7 +96,7 @@ fn intent_hard_collision_blocks_second_agent() {
             SessionTransport::Cli,
             None,
             PathBuf::from("/project"),
-            SessionCapabilities::default(),
+            writable_capabilities(),
         )
         .unwrap();
 
@@ -571,7 +578,7 @@ fn contract_scope_collision() {
             SessionTransport::Mcp,
             None,
             PathBuf::from("/project"),
-            SessionCapabilities::default(),
+            writable_capabilities(),
         )
         .unwrap();
 
@@ -582,7 +589,7 @@ fn contract_scope_collision() {
             SessionTransport::Cli,
             None,
             PathBuf::from("/project"),
-            SessionCapabilities::default(),
+            writable_capabilities(),
         )
         .unwrap();
 
@@ -641,7 +648,7 @@ fn artifact_scope_collision() {
             SessionTransport::Mcp,
             None,
             PathBuf::from("/project"),
-            SessionCapabilities::default(),
+            writable_capabilities(),
         )
         .unwrap();
 
@@ -652,7 +659,7 @@ fn artifact_scope_collision() {
             SessionTransport::Cli,
             None,
             PathBuf::from("/project"),
-            SessionCapabilities::default(),
+            writable_capabilities(),
         )
         .unwrap();
 

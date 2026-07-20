@@ -292,8 +292,17 @@ pub async fn handle_register_intent(
         }
     }
 
-    match sessions.register_intent(session_id, scopes, lock_type, task_description, expires_at) {
-        Some(intent) => {
+    match sessions.register_intent_checked(
+        session_id,
+        scopes,
+        lock_type,
+        task_description,
+        expires_at,
+    ) {
+        crate::session::IntentRegistrationAttempt::Registered {
+            intent,
+            policy_warnings,
+        } => {
             let result = serde_json::json!({
                 "intent_id": intent.intent_id.to_string(),
                 "session_id": intent.session_id.to_string(),
@@ -302,15 +311,62 @@ pub async fn handle_register_intent(
                 "task_description": intent.task_description,
                 "registered_at": intent.registered_at,
                 "status": "registered",
+                "coordination_warnings": policy_warnings,
             });
             let json =
                 serde_json::to_string_pretty(&result).map_err(crate::error::McpError::Json)?;
             Ok(ToolCallResult::text(json))
         }
-        None => Ok(ToolCallResult::error(format!(
-            "Session not found: {}. Start a session with kin_session_start first.",
-            id_str
-        ))),
+        crate::session::IntentRegistrationAttempt::Blocked {
+            intent_id,
+            conflicts,
+        } => {
+            let result = serde_json::json!({
+                "intent_id": intent_id.to_string(),
+                "session_id": session_id.to_string(),
+                "status": "blocked",
+                "conflicts": conflicts,
+            });
+            let json =
+                serde_json::to_string_pretty(&result).map_err(crate::error::McpError::Json)?;
+            Ok(ToolCallResult::text(json))
+        }
+        crate::session::IntentRegistrationAttempt::LimitExceeded {
+            intent_id,
+            active,
+            limit,
+        } => {
+            let result = serde_json::json!({
+                "intent_id": intent_id.to_string(),
+                "session_id": session_id.to_string(),
+                "status": "limit_exceeded",
+                "active_intents": active,
+                "max_concurrent_intents": limit,
+            });
+            let json =
+                serde_json::to_string_pretty(&result).map_err(crate::error::McpError::Json)?;
+            Ok(ToolCallResult::text(json))
+        }
+        crate::session::IntentRegistrationAttempt::CapabilityDenied {
+            intent_id,
+            capability,
+        } => {
+            let result = serde_json::json!({
+                "intent_id": intent_id.to_string(),
+                "session_id": session_id.to_string(),
+                "status": "capability_denied",
+                "required_capability": capability,
+            });
+            let json =
+                serde_json::to_string_pretty(&result).map_err(crate::error::McpError::Json)?;
+            Ok(ToolCallResult::text(json))
+        }
+        crate::session::IntentRegistrationAttempt::SessionNotFound => {
+            Ok(ToolCallResult::error(format!(
+                "Session not found: {}. Start a session with kin_session_start first.",
+                id_str
+            )))
+        }
     }
 }
 
@@ -448,6 +504,7 @@ pub async fn handle_transaction_begin(
         }
     }
 
+    let _coordination_apply = sessions.lock_coordination_apply();
     match sessions.begin_transaction(&session_id, &scope) {
         Ok(tx) => {
             let result = serde_json::json!({
@@ -505,6 +562,7 @@ pub async fn handle_transaction_stage(
         }
     }
 
+    let _coordination_apply = sessions.lock_coordination_apply();
     match sessions.stage_transaction(&transaction_id, operations) {
         Ok(tx) => {
             let result = serde_json::json!({
@@ -542,6 +600,7 @@ pub async fn handle_transaction_validate(
         }
     }
 
+    let _coordination_apply = sessions.lock_coordination_apply();
     match sessions.validate_transaction(&transaction_id) {
         Ok(tx) => {
             let result = serde_json::json!({
@@ -563,7 +622,62 @@ returns status, ops_applied (entity+relation deltas applied), empty (true for a 
 no-op commit), new_root_hash (graph Merkle root after the commit), modified_files \
 (working-directory files the projection wrote — entity-body edits reach disk here), \
 collision_warnings, and conflicts (entities skipped due to a concurrent file edit; a \
-non-empty set is surfaced as an error instead).";
+non-empty set is surfaced as an error instead). Before graph application, exact entity/artifact \
+intent conflicts and session write/commit capabilities are attested; enforce mode rejects \
+before graph truth changes. Contract-scope coverage remains explicitly false until touched \
+contracts can be derived from the semantic delta.";
+
+fn push_scope_once(scopes: &mut Vec<kin_model::IntentScope>, scope: kin_model::IntentScope) {
+    if !scopes.contains(&scope) {
+        scopes.push(scope);
+    }
+}
+
+/// Derive only the scopes the transaction payload can prove it touches. Entity
+/// ids and their old/new file origins are exact. Relation mutations cover both
+/// endpoint entities. Contract scopes are intentionally absent: the current
+/// delta carries no touched-contract derivation, so claiming them would be a
+/// false enforcement guarantee.
+fn transaction_touched_scopes<G: GraphStore>(
+    store: &G,
+    operations: &[McpMutationOperation],
+) -> Vec<kin_model::IntentScope> {
+    let mut scopes = Vec::new();
+    for operation in operations {
+        match operation.payload.as_ref() {
+            Some(McpMutationPayload::Entity(entity)) => {
+                push_scope_once(&mut scopes, kin_model::IntentScope::Entity(entity.id));
+                if let Some(file) = entity.file_origin.clone() {
+                    push_scope_once(&mut scopes, kin_model::IntentScope::Artifact(file));
+                }
+                let mut existing = store.get_entity(&entity.id).ok().flatten();
+                if existing.is_none() {
+                    let filter = kin_model::EntityFilter {
+                        name_pattern: Some(entity.name.clone()),
+                        kinds: Some(vec![entity.kind]),
+                        ..Default::default()
+                    };
+                    existing = store
+                        .query_entities(&filter)
+                        .ok()
+                        .and_then(|mut matches| matches.pop());
+                }
+                if let Some(existing) = existing {
+                    push_scope_once(&mut scopes, kin_model::IntentScope::Entity(existing.id));
+                    if let Some(file) = existing.file_origin {
+                        push_scope_once(&mut scopes, kin_model::IntentScope::Artifact(file));
+                    }
+                }
+            }
+            Some(McpMutationPayload::Relation { from, to, .. }) => {
+                push_scope_once(&mut scopes, kin_model::IntentScope::Entity(*from));
+                push_scope_once(&mut scopes, kin_model::IntentScope::Entity(*to));
+            }
+            Some(McpMutationPayload::Blob(_)) | None => {}
+        }
+    }
+    scopes
+}
 
 pub async fn handle_transaction_commit<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -596,6 +710,11 @@ pub async fn handle_transaction_commit<G: GraphStore>(
             Err(err) => return Ok(ToolCallResult::error(err)),
         }
     }
+
+    // Serialize the entire local/offline transaction transition, final
+    // preflight, graph apply, and terminal state change with intent mutation
+    // and the other transaction lifecycle handlers.
+    let _coordination_apply = sessions.lock_coordination_apply();
 
     if let Some(ops) = inline_ops {
         match sessions.stage_transaction(&transaction_id, ops) {
@@ -634,6 +753,19 @@ pub async fn handle_transaction_commit<G: GraphStore>(
             transaction_id,
             uncommittable.len(),
             uncommittable.join("\n  - ")
+        )));
+    }
+
+    // Load-bearing ordering: run coordination enforcement against the fully
+    // staged operation set before constructing or applying any graph delta.
+    // A denied transaction remains active and graph truth is unchanged.
+    let touched_scopes = transaction_touched_scopes(store, &tx.staged_operations);
+    let coordination = sessions.evaluate_transaction_write(&tx.session_id, touched_scopes);
+    if !coordination.allowed {
+        let evidence =
+            serde_json::to_string(&coordination).map_err(crate::error::McpError::Json)?;
+        return Ok(ToolCallResult::error(format!(
+            "coordination enforcement rejected transaction {transaction_id} before graph apply: {evidence}"
         )));
     }
 
@@ -773,6 +905,7 @@ pub async fn handle_transaction_commit<G: GraphStore>(
         "status": "committed",
         "ops_applied": ops_applied,
         "empty": ops_applied == 0,
+        "coordination": coordination,
     });
     let json = serde_json::to_string_pretty(&result).map_err(crate::error::McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -799,6 +932,7 @@ pub async fn handle_transaction_abort(
         }
     }
 
+    let _coordination_apply = sessions.lock_coordination_apply();
     match sessions.abort_transaction(&transaction_id) {
         Ok(tx) => {
             let result = serde_json::json!({

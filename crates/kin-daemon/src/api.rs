@@ -9,8 +9,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::state::{
-    CachedLocateRanking, CachedSemanticPage, DaemonEvent, DaemonState, ProjectionChangedSet,
-    RequestGraphAuthority, VfsTreeCacheKey, VfsTreeSnapshot, LOCATE_RANKING_CACHE_CAP,
+    CachedLocateRanking, CachedSemanticPage, CoordinationEventDraft, DaemonEvent, DaemonState,
+    ProjectionChangedSet, RequestGraphAuthority, VfsTreeCacheKey, VfsTreeSnapshot,
+    LOCATE_RANKING_CACHE_CAP,
 };
 
 use axum::extract::{Path, Query, State};
@@ -123,6 +124,14 @@ pub struct HealthResponse {
     /// `kin_core::behavior_env`.
     #[serde(default)]
     pub behavior_env: kin_core::behavior_env::BehaviorEnv,
+    /// Effective coordination mode and exact surface/capability coverage for
+    /// operator and benchmark attestation.
+    #[serde(default)]
+    pub coordination: Option<kin_cli::commands::bench_meta::CoordinationMeta>,
+    /// Must remain zero for a coordination-event stream to be eligible as a
+    /// complete citable measurement source during this daemon lifetime.
+    #[serde(default)]
+    pub coordination_event_persist_failures: Option<u64>,
     pub build: BuildResponse,
 }
 
@@ -247,6 +256,14 @@ struct RegisterIntentResponse {
     status: String,
     conflicts: Vec<IntentSummary>,
     downstream_warnings: Vec<IntentSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    coordination_warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_intents: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_concurrent_intents: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    required_capability: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1187,8 +1204,8 @@ async fn inject_loopback_host_in_tests(
     next.run(request).await
 }
 
-/// Extract an optional session ID from the `X-Kin-Session` header or
-/// `?session_id=` query parameter. Header takes precedence.
+/// Extract an optional caller session ID from the authoritative
+/// `X-Kin-Session` request header.
 fn extract_session_id_from_headers(
     headers: &axum::http::HeaderMap,
 ) -> Result<Option<SessionId>, (StatusCode, String)> {
@@ -1363,13 +1380,20 @@ async fn health(
         .embed_worker_failed
         .load(std::sync::atomic::Ordering::Relaxed);
     let embed_persistence_unavailable = !state.can_persist_embed_progress_locally();
+    let coordination_event_persist_failures = state
+        .coordination_event_persist_failures
+        .load(std::sync::atomic::Ordering::Relaxed);
     // Surface graph-safety + derived-index health in the top-level status so an
     // operator or client polling /health sees a non-"ok" signal when the daemon
     // is withholding a suspected mass-deletion wipe OR the embedding worker has
     // permanently stopped (embed-degraded), OR the configured storage backend
-    // cannot durably persist vector progress. The graph itself stays intact and
-    // served in all cases.
-    let status = if mass_deletion_blocked || embed_worker_failed || embed_persistence_unavailable {
+    // cannot durably persist vector progress, OR coordination evidence could not
+    // be persisted. The graph itself stays intact and served in all cases.
+    let status = if mass_deletion_blocked
+        || embed_worker_failed
+        || embed_persistence_unavailable
+        || coordination_event_persist_failures > 0
+    {
         "attention"
     } else {
         "ok"
@@ -1402,6 +1426,12 @@ async fn health(
         filesystem_reconcile_disabled: state.filesystem_reconcile_disabled(),
         graph_generation: DaemonState::read_generation_marker(&state.layout),
         behavior_env: kin_core::behavior_env::snapshot_from_process(),
+        coordination: Some(
+            kin_cli::commands::bench_meta::coordination_meta_for_daemon_mode(
+                state.coordination_mode(),
+            ),
+        ),
+        coordination_event_persist_failures: Some(coordination_event_persist_failures),
         build: current_build_response(),
     }))
 }
@@ -2904,6 +2934,7 @@ async fn end_session(
     Path(session_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let _coordination = state.coordination_gate.lock().await;
     let session_id = parse_session_id(&session_id)?;
     let session = state
         .coordinator
@@ -2915,10 +2946,36 @@ async fn end_session(
                 format!("session not found: {session_id}"),
             )
         })?;
-    state
+    let intents = state
         .coordinator
-        .deregister_session(&session_id)
+        .list_intents(&session_id)
         .map_err(internal_error)?;
+    let event_drafts: Vec<_> = intents
+        .iter()
+        .map(|intent| CoordinationEventDraft {
+            event: "intent_release",
+            outcome: "session_ended".to_string(),
+            session_id: Some(session_id.to_string()),
+            intent_id: Some(intent.intent_id.to_string()),
+            intent_ids: vec![intent.intent_id.to_string()],
+            transaction_id: None,
+            scopes: intent.scopes.iter().map(format_scope).collect(),
+            enforcement_mode: state.coordination_mode().as_str().to_string(),
+            blocking_intent_ids: Vec::new(),
+        })
+        .collect();
+    for draft in &event_drafts {
+        persist_coordination_reservation(&state, draft.clone())?;
+    }
+    if let Err(error) = state.coordinator.deregister_session(&session_id) {
+        state.mark_coordination_evidence_incomplete(format!(
+            "session end failed after intent-release reservations: {error}"
+        ));
+        return Err(internal_error(error));
+    }
+    for draft in event_drafts {
+        persist_coordination_event(&state, draft)?;
+    }
 
     Ok(Json(SessionEndResponse {
         session_id: session.session_id.to_string(),
@@ -2952,17 +3009,44 @@ async fn clear_session_intents(
     Path(session_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let _coordination = state.coordination_gate.lock().await;
     let session_id = parse_session_id(&session_id)?;
     let intents = state
         .coordinator
         .list_intents(&session_id)
         .map_err(internal_error)?;
 
+    let event_drafts: Vec<_> = intents
+        .iter()
+        .map(|intent| CoordinationEventDraft {
+            event: "intent_release",
+            outcome: "cleared".to_string(),
+            session_id: Some(session_id.to_string()),
+            intent_id: Some(intent.intent_id.to_string()),
+            intent_ids: vec![intent.intent_id.to_string()],
+            transaction_id: None,
+            scopes: intent.scopes.iter().map(format_scope).collect(),
+            enforcement_mode: state.coordination_mode().as_str().to_string(),
+            blocking_intent_ids: Vec::new(),
+        })
+        .collect();
+    for draft in &event_drafts {
+        persist_coordination_reservation(&state, draft.clone())?;
+    }
+
     for intent in &intents {
-        state
+        if let Err(error) = state
             .coordinator
             .release_intent(&session_id, &intent.intent_id)
-            .map_err(internal_error)?;
+        {
+            state.mark_coordination_evidence_incomplete(format!(
+                "intent clear failed after release reservations: {error}"
+            ));
+            return Err(internal_error(error));
+        }
+    }
+    for draft in event_drafts {
+        persist_coordination_event(&state, draft)?;
     }
 
     Ok(Json(ClearedIntentsResponse {
@@ -2974,7 +3058,20 @@ async fn clear_session_intents(
 async fn list_intents(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let intents = state.graph.list_all_intents().map_err(internal_error)?;
+    let now = kin_model::Timestamp::now();
+    let mut intents: Vec<_> = state
+        .graph
+        .list_all_intents()
+        .map_err(internal_error)?
+        .into_iter()
+        .filter(|intent| {
+            intent
+                .expires_at
+                .as_ref()
+                .is_none_or(|expires_at| expires_at >= &now)
+        })
+        .collect();
+    intents.sort_by_key(|intent| intent.intent_id.to_string());
     Ok(Json(
         intents
             .into_iter()
@@ -2988,6 +3085,10 @@ async fn register_intent(
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<RegisterIntentRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Serialize the full check+register decision with transaction preflight and
+    // apply. This daemon gate complements the coordinator's own linearization
+    // lock and closes the cross-surface HTTP race.
+    let _coordination = state.coordination_gate.lock().await;
     let mut scope_values = request.scopes;
     if scope_values.is_empty() {
         if request.scope.trim().is_empty() {
@@ -3002,45 +3103,142 @@ async fn register_intent(
         .iter()
         .map(|scope| parse_scope(scope))
         .collect::<Result<Vec<_>, _>>()?;
+    let scope_labels = scopes.iter().map(format_scope).collect::<Vec<_>>();
     let lock_type = parse_lock_type(&request.lock_type)?;
     let session_id = resolve_or_create_session(&state, request.session_id.as_deref())?;
-    let result = state
-        .coordinator
-        .register_intent(
-            &session_id,
-            scopes,
-            lock_type,
-            &request.task_description,
-            request
-                .expires_at
-                .as_deref()
-                .map(parse_timestamp)
-                .transpose()?,
-        )
-        .map_err(internal_error)?;
+    persist_coordination_reservation(
+        &state,
+        CoordinationEventDraft {
+            event: "intent_registration",
+            outcome: "registration".to_string(),
+            session_id: Some(session_id.to_string()),
+            intent_id: None,
+            intent_ids: Vec::new(),
+            transaction_id: None,
+            scopes: scope_labels.clone(),
+            enforcement_mode: state.coordination_mode().as_str().to_string(),
+            blocking_intent_ids: Vec::new(),
+        },
+    )?;
+    let result = match state.coordinator.register_intent_with_mode(
+        &session_id,
+        scopes,
+        lock_type,
+        &request.task_description,
+        request
+            .expires_at
+            .as_deref()
+            .map(parse_timestamp)
+            .transpose()?,
+        state.coordination_mode(),
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            state.mark_coordination_evidence_incomplete(format!(
+                "intent registration failed after durable reservation: {error}"
+            ));
+            return Err(internal_error(error));
+        }
+    };
 
-    let response = match result {
+    let (response, outcome, blocking_intent_ids) = match result {
         crate::session_registry::IntentRegistrationResult::Registered {
             intent_id,
             downstream_warnings,
-        } => RegisterIntentResponse {
-            intent_id: intent_id.to_string(),
-            session_id: session_id.to_string(),
-            status: "registered".to_string(),
-            conflicts: Vec::new(),
-            downstream_warnings,
-        },
+            policy_warnings,
+        } => (
+            RegisterIntentResponse {
+                intent_id: intent_id.to_string(),
+                session_id: session_id.to_string(),
+                status: "registered".to_string(),
+                conflicts: Vec::new(),
+                downstream_warnings,
+                coordination_warnings: policy_warnings,
+                active_intents: None,
+                max_concurrent_intents: None,
+                required_capability: None,
+            },
+            "registered".to_string(),
+            Vec::new(),
+        ),
         crate::session_registry::IntentRegistrationResult::Blocked {
             intent_id,
             conflicts,
-        } => RegisterIntentResponse {
-            intent_id: intent_id.to_string(),
-            session_id: session_id.to_string(),
-            status: "blocked".to_string(),
-            conflicts,
-            downstream_warnings: Vec::new(),
-        },
+        } => {
+            let blocking = conflicts
+                .iter()
+                .map(|conflict| conflict.intent_id.to_string())
+                .collect();
+            (
+                RegisterIntentResponse {
+                    intent_id: intent_id.to_string(),
+                    session_id: session_id.to_string(),
+                    status: "blocked".to_string(),
+                    conflicts,
+                    downstream_warnings: Vec::new(),
+                    coordination_warnings: Vec::new(),
+                    active_intents: None,
+                    max_concurrent_intents: None,
+                    required_capability: None,
+                },
+                "blocked".to_string(),
+                blocking,
+            )
+        }
+        crate::session_registry::IntentRegistrationResult::LimitExceeded {
+            intent_id,
+            active,
+            limit,
+        } => (
+            RegisterIntentResponse {
+                intent_id: intent_id.to_string(),
+                session_id: session_id.to_string(),
+                status: "limit_exceeded".to_string(),
+                conflicts: Vec::new(),
+                downstream_warnings: Vec::new(),
+                coordination_warnings: Vec::new(),
+                active_intents: Some(active),
+                max_concurrent_intents: Some(limit),
+                required_capability: None,
+            },
+            "limit_exceeded".to_string(),
+            Vec::new(),
+        ),
+        crate::session_registry::IntentRegistrationResult::CapabilityDenied {
+            intent_id,
+            capability,
+        } => (
+            RegisterIntentResponse {
+                intent_id: intent_id.to_string(),
+                session_id: session_id.to_string(),
+                status: "capability_denied".to_string(),
+                conflicts: Vec::new(),
+                downstream_warnings: Vec::new(),
+                coordination_warnings: Vec::new(),
+                active_intents: None,
+                max_concurrent_intents: None,
+                required_capability: Some(capability.to_string()),
+            },
+            "capability_denied".to_string(),
+            Vec::new(),
+        ),
     };
+
+    let persisted_intent_id = (response.status == "registered").then(|| response.intent_id.clone());
+    persist_coordination_event(
+        &state,
+        CoordinationEventDraft {
+            event: "intent_registration",
+            outcome,
+            session_id: Some(session_id.to_string()),
+            intent_id: persisted_intent_id.clone(),
+            intent_ids: persisted_intent_id.into_iter().collect(),
+            transaction_id: None,
+            scopes: scope_labels,
+            enforcement_mode: state.coordination_mode().as_str().to_string(),
+            blocking_intent_ids,
+        },
+    )?;
 
     Ok(Json(response))
 }
@@ -3050,6 +3248,7 @@ async fn release_intent(
     Path(intent_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let _coordination = state.coordination_gate.lock().await;
     let intent_id = parse_intent_id(&intent_id)?;
     let intent = state
         .graph
@@ -3062,10 +3261,28 @@ async fn release_intent(
             )
         })?;
 
-    state
+    let event_draft = CoordinationEventDraft {
+        event: "intent_release",
+        outcome: "released".to_string(),
+        session_id: Some(intent.session_id.to_string()),
+        intent_id: Some(intent_id.to_string()),
+        intent_ids: vec![intent_id.to_string()],
+        transaction_id: None,
+        scopes: intent.scopes.iter().map(format_scope).collect(),
+        enforcement_mode: state.coordination_mode().as_str().to_string(),
+        blocking_intent_ids: Vec::new(),
+    };
+    persist_coordination_reservation(&state, event_draft.clone())?;
+    if let Err(error) = state
         .coordinator
         .release_intent(&intent.session_id, &intent_id)
-        .map_err(internal_error)?;
+    {
+        state.mark_coordination_evidence_incomplete(format!(
+            "intent release failed after durable reservation: {error}"
+        ));
+        return Err(internal_error(error));
+    }
+    persist_coordination_event(&state, event_draft)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4386,8 +4603,22 @@ fn mcp_session_registry_snapshot(
     state: &DaemonState,
 ) -> Result<kin_mcp::SessionRegistry, (StatusCode, String)> {
     let sessions = state.coordinator.list_sessions().map_err(internal_error)?;
-    let intents = state.graph.list_all_intents().map_err(internal_error)?;
+    let now = kin_model::Timestamp::now();
+    let mut intents: Vec<_> = state
+        .graph
+        .list_all_intents()
+        .map_err(internal_error)?
+        .into_iter()
+        .filter(|intent| {
+            intent
+                .expires_at
+                .as_ref()
+                .is_none_or(|expires_at| expires_at >= &now)
+        })
+        .collect();
+    intents.sort_by_key(|intent| intent.intent_id.to_string());
     let registry = kin_mcp::SessionRegistry::new();
+    registry.set_coordination_mode(state.coordination_mode());
     registry.replace_agent_sessions_and_intents(sessions, intents);
     // Restore in-flight transactions so a registry built fresh for this request
     // sees what earlier requests staged; sessions/intents persist via the graph,
@@ -4478,6 +4709,83 @@ fn collect_pre_commit_entities(
         }
     }
     (entities, supplied_bodies)
+}
+
+fn transaction_coordination_context(
+    state: &DaemonState,
+    sessions: &kin_mcp::SessionRegistry,
+    arguments: &HashMap<String, serde_json::Value>,
+) -> (
+    Option<String>,
+    Option<String>,
+    Vec<IntentScope>,
+    Vec<String>,
+) {
+    let transaction_id = arguments
+        .get("transaction_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let Some(transaction) = transaction_id
+        .as_deref()
+        .and_then(|id| sessions.get_transaction(id))
+    else {
+        return (None, transaction_id, Vec::new(), Vec::new());
+    };
+
+    let mut touched = Vec::new();
+    let mut push = |scope: IntentScope| {
+        if !touched.contains(&scope) {
+            touched.push(scope);
+        }
+    };
+    let mut operations = transaction.staged_operations;
+    if let Some(inline) = arguments.get("operations") {
+        if let Ok(mut parsed) =
+            serde_json::from_value::<Vec<kin_mcp::McpMutationOperation>>(inline.clone())
+        {
+            operations.append(&mut parsed);
+        }
+    }
+    for operation in &operations {
+        match operation.payload.as_ref() {
+            Some(kin_mcp::McpMutationPayload::Entity(entity)) => {
+                push(IntentScope::Entity(entity.id));
+                if let Some(file) = entity.file_origin.clone() {
+                    push(IntentScope::Artifact(file));
+                }
+                let mut existing = state.graph.get_entity(&entity.id).ok().flatten();
+                if existing.is_none() {
+                    existing = state
+                        .graph
+                        .query_entities(&kin_model::EntityFilter {
+                            name_pattern: Some(entity.name.clone()),
+                            kinds: Some(vec![entity.kind]),
+                            ..Default::default()
+                        })
+                        .ok()
+                        .and_then(|mut matches| matches.pop());
+                }
+                if let Some(existing) = existing {
+                    push(IntentScope::Entity(existing.id));
+                    if let Some(file) = existing.file_origin {
+                        push(IntentScope::Artifact(file));
+                    }
+                }
+            }
+            Some(kin_mcp::McpMutationPayload::Relation { from, to, .. }) => {
+                push(IntentScope::Entity(*from));
+                push(IntentScope::Entity(*to));
+            }
+            Some(kin_mcp::McpMutationPayload::Blob(_)) | None => {}
+        }
+    }
+    let labels = touched.iter().map(format_scope).collect();
+    (
+        Some(transaction.session_id),
+        transaction_id,
+        touched,
+        labels,
+    )
 }
 
 /// The transaction id a terminal transaction tool (commit/abort) acted on, used
@@ -5584,7 +5892,108 @@ async fn mcp_tools_call(
         )));
     }
 
+    // Serialize the full daemon transaction lifecycle and other graph-mutating
+    // MCP tools. Commit holds this gate from final intent/capability preflight
+    // through graph application and projection; intent registration uses it
+    // too, closing transaction-state races and keeping touched-scope derivation
+    // stable until apply. Non-transaction mutators are sequenced here but remain
+    // explicitly unattested for intent-veto coverage in bench-meta.
+    let _coordination_guard = if mcp_tool_is_transaction(&request.name) || mutates {
+        Some(state.coordination_gate.lock().await)
+    } else {
+        None
+    };
+
     let sessions = mcp_session_registry_snapshot(&state)?;
+    if mcp_tool_is_transaction(&request.name) && state.coordination_mode().is_enforcing() {
+        if let Some(declared_session) = request
+            .arguments
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            let declared_id = Uuid::parse_str(declared_session).ok().map(SessionId);
+            if declared_id.is_none() || session_id != declared_id {
+                return Ok(Json(kin_mcp::ToolCallResult::error(format!(
+                    "coordination enforcement rejected {}: body session_id is not bound to X-Kin-Session",
+                    request.name
+                ))));
+            }
+        }
+    }
+    if mcp_tool_is_transaction(&request.name) && request.name != "kin_transaction_commit" {
+        let owner = if request.name == "kin_transaction_begin" {
+            request
+                .arguments
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        } else {
+            request
+                .arguments
+                .get("transaction_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|transaction_id| sessions.get_transaction(transaction_id))
+                .map(|transaction| transaction.session_id)
+        };
+        if state.coordination_mode().is_enforcing() {
+            let Some(owner) = owner else {
+                return Ok(Json(kin_mcp::ToolCallResult::error(format!(
+                    "coordination enforcement rejected {}: transaction owner could not be resolved",
+                    request.name
+                ))));
+            };
+            let owner_id = Uuid::parse_str(&owner).ok().map(SessionId);
+            if owner_id.is_none() || session_id != owner_id {
+                return Ok(Json(kin_mcp::ToolCallResult::error(format!(
+                    "coordination enforcement rejected {}: X-Kin-Session does not own transaction session {owner}",
+                    request.name
+                ))));
+            }
+        }
+    }
+    let (transaction_session_id, transaction_id, transaction_scopes, transaction_scope_labels) =
+        if request.name == "kin_transaction_commit" {
+            transaction_coordination_context(&state, &sessions, &request.arguments)
+        } else {
+            (None, None, Vec::new(), Vec::new())
+        };
+    let mut transaction_preflight = transaction_session_id.as_deref().map(|session_id| {
+        sessions.evaluate_transaction_write(session_id, transaction_scopes.clone())
+    });
+    if request.name == "kin_transaction_commit" {
+        if let Some(preflight) = transaction_preflight.as_mut() {
+            let owner = Uuid::parse_str(&preflight.session_id).ok().map(SessionId);
+            if session_id != owner {
+                preflight.capability_violations.push(match session_id {
+                    Some(actual) => format!(
+                        "X-Kin-Session {actual} does not own transaction session {}",
+                        preflight.session_id
+                    ),
+                    None => "transaction commit has no X-Kin-Session caller identity".to_string(),
+                });
+                if preflight.mode.is_enforcing() {
+                    preflight.allowed = false;
+                }
+            }
+        }
+    }
+    let transaction_intent_ids = transaction_session_id
+        .as_deref()
+        .and_then(|session_id| uuid::Uuid::parse_str(session_id).ok().map(SessionId))
+        .map(|session_id| {
+            sessions
+                .list_intents_for_session(&session_id)
+                .into_iter()
+                .filter(|intent| {
+                    intent
+                        .scopes
+                        .iter()
+                        .any(|scope| transaction_scopes.contains(scope))
+                })
+                .map(|intent| intent.intent_id.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     // Snapshot entity state before the commit so we can project the
     // mutations into working-directory files after the graph is updated.
@@ -5596,17 +6005,62 @@ async fn mcp_tools_call(
         (vec![], HashMap::new())
     };
 
-    let mut result = match kin_mcp::handlers::handle_tool_call(
-        &request.name,
-        &request.arguments,
-        graph.as_ref(),
-        &sessions,
-        kin_mcp::SessionAuthorityMode::OfflineFallback,
-    )
-    .await
+    if request.name == "kin_transaction_commit" && transaction_id.is_some() {
+        persist_coordination_reservation(
+            &state,
+            CoordinationEventDraft {
+                event: "transaction_outcome",
+                outcome: "commit".to_string(),
+                session_id: transaction_session_id.clone(),
+                intent_id: None,
+                intent_ids: transaction_intent_ids.clone(),
+                transaction_id: transaction_id.clone(),
+                scopes: transaction_scope_labels.clone(),
+                enforcement_mode: transaction_preflight
+                    .as_ref()
+                    .map(|preflight| preflight.mode.as_str())
+                    .unwrap_or_else(|| state.coordination_mode().as_str())
+                    .to_string(),
+                blocking_intent_ids: transaction_preflight
+                    .as_ref()
+                    .map(|preflight| {
+                        preflight
+                            .blocking_intents
+                            .iter()
+                            .map(|intent| intent.intent_id.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            },
+        )?;
+    }
+
+    let mut result = if transaction_preflight
+        .as_ref()
+        .is_some_and(|preflight| !preflight.allowed)
     {
-        Ok(result) => result,
-        Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
+        let evidence = serde_json::to_string(
+            transaction_preflight
+                .as_ref()
+                .expect("checked preflight must exist"),
+        )
+        .map_err(internal_error)?;
+        kin_mcp::ToolCallResult::error(format!(
+            "coordination enforcement rejected transaction before graph apply: {evidence}"
+        ))
+    } else {
+        match kin_mcp::handlers::handle_tool_call(
+            &request.name,
+            &request.arguments,
+            graph.as_ref(),
+            &sessions,
+            kin_mcp::SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
+        }
     };
 
     // Persist transaction state mutated by this call so the next HTTP request
@@ -5620,6 +6074,45 @@ async fn mcp_tools_call(
                 forget_mcp_transaction(&state, &tx_id);
             }
         }
+    }
+
+    if request.name == "kin_transaction_commit" && result.is_error == Some(true) {
+        let coordination_rejected = transaction_preflight
+            .as_ref()
+            .is_some_and(|preflight| !preflight.allowed);
+        persist_coordination_event(
+            &state,
+            CoordinationEventDraft {
+                event: "transaction_outcome",
+                outcome: if coordination_rejected {
+                    "coordination_rejected_before_graph_apply"
+                } else {
+                    "commit_failed_before_graph_apply"
+                }
+                .to_string(),
+                session_id: transaction_session_id.clone(),
+                intent_id: None,
+                intent_ids: transaction_intent_ids.clone(),
+                transaction_id: transaction_id.clone(),
+                scopes: transaction_scope_labels.clone(),
+                enforcement_mode: transaction_preflight
+                    .as_ref()
+                    .map(|preflight| preflight.mode.as_str())
+                    .unwrap_or_else(|| state.coordination_mode().as_str())
+                    .to_string(),
+                blocking_intent_ids: coordination_rejected
+                    .then_some(transaction_preflight.as_ref())
+                    .flatten()
+                    .map(|preflight| {
+                        preflight
+                            .blocking_intents
+                            .iter()
+                            .map(|intent| intent.intent_id.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            },
+        )?;
     }
 
     if mutates && result.is_error != Some(true) {
@@ -5658,6 +6151,24 @@ async fn mcp_tools_call(
             .await
             {
                 Err(proj_err) => {
+                    persist_coordination_event(
+                        &state,
+                        CoordinationEventDraft {
+                            event: "transaction_outcome",
+                            outcome: "projection_failed_after_graph_apply".to_string(),
+                            session_id: transaction_session_id.clone(),
+                            intent_id: None,
+                            intent_ids: transaction_intent_ids.clone(),
+                            transaction_id: transaction_id.clone(),
+                            scopes: transaction_scope_labels.clone(),
+                            enforcement_mode: transaction_preflight
+                                .as_ref()
+                                .map(|preflight| preflight.mode.as_str())
+                                .unwrap_or_else(|| state.coordination_mode().as_str())
+                                .to_string(),
+                            blocking_intent_ids: Vec::new(),
+                        },
+                    )?;
                     return Ok(Json(kin_mcp::ToolCallResult::error(format!(
                         "graph commit succeeded but file projection failed — agent intent is \
                          preserved in the graph; retry projection or inspect the source file. \
@@ -5680,6 +6191,24 @@ async fn mcp_tools_call(
                             )
                         })
                         .collect();
+                    persist_coordination_event(
+                        &state,
+                        CoordinationEventDraft {
+                            event: "transaction_outcome",
+                            outcome: "projection_conflict_after_graph_apply".to_string(),
+                            session_id: transaction_session_id.clone(),
+                            intent_id: None,
+                            intent_ids: transaction_intent_ids.clone(),
+                            transaction_id: transaction_id.clone(),
+                            scopes: transaction_scope_labels.clone(),
+                            enforcement_mode: transaction_preflight
+                                .as_ref()
+                                .map(|preflight| preflight.mode.as_str())
+                                .unwrap_or_else(|| state.coordination_mode().as_str())
+                                .to_string(),
+                            blocking_intent_ids: Vec::new(),
+                        },
+                    )?;
                     return Ok(Json(kin_mcp::ToolCallResult::error(format!(
                         "graph commit succeeded but {n} entity/entities had concurrent file \
                          edits — those entities were NOT projected (human edits preserved). \
@@ -5696,6 +6225,33 @@ async fn mcp_tools_call(
         // response so a commit reports what it did instead of an opaque
         // "committed". `ops_applied`/`empty` already rode in from the handler.
         result = enrich_commit_result(result, &new_root_hash, &modified_files, &collision_warnings);
+        persist_coordination_event(
+            &state,
+            CoordinationEventDraft {
+                event: "transaction_outcome",
+                outcome: "committed".to_string(),
+                session_id: transaction_session_id,
+                intent_id: None,
+                intent_ids: transaction_intent_ids,
+                transaction_id,
+                scopes: transaction_scope_labels,
+                enforcement_mode: transaction_preflight
+                    .as_ref()
+                    .map(|preflight| preflight.mode.as_str())
+                    .unwrap_or_else(|| state.coordination_mode().as_str())
+                    .to_string(),
+                blocking_intent_ids: transaction_preflight
+                    .as_ref()
+                    .map(|preflight| {
+                        preflight
+                            .blocking_intents
+                            .iter()
+                            .map(|intent| intent.intent_id.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            },
+        )?;
     }
 
     Ok(Json(result))
@@ -7048,17 +7604,31 @@ async fn write_veto_precheck(
     file_path: &FsPath,
     display_path: &str,
     caller: Option<SessionId>,
+    capability_warnings: &[String],
 ) -> std::result::Result<Option<serde_json::Value>, (StatusCode, String)> {
-    let mode = crate::write_veto::WriteVetoMode::from_env();
+    let mode = crate::write_veto::WriteVetoMode::from(state.coordination_mode());
     if mode.is_off() {
         return Ok(None);
     }
     // Cheap short-circuit: with no active intents a write can collide with
     // nothing, so warn-by-default costs nothing on the common single-agent path
     // (no per-file entity query, no scope build).
-    let intents = state.graph.list_all_intents().map_err(internal_error)?;
+    let now = kin_model::Timestamp::now();
+    let mut intents: Vec<_> = state
+        .graph
+        .list_all_intents()
+        .map_err(internal_error)?
+        .into_iter()
+        .filter(|intent| {
+            intent
+                .expires_at
+                .as_ref()
+                .is_none_or(|expires_at| expires_at >= &now)
+        })
+        .collect();
+    intents.sort_by_key(|intent| intent.intent_id.to_string());
     if intents.is_empty() {
-        return Ok(None);
+        return Ok(vfs_capability_warning(capability_warnings));
     }
     let file_id = kin_index::normalize_file_path_id(file_path, state.layout.working_dir());
     let filter = kin_model::EntityFilter {
@@ -7115,12 +7685,75 @@ async fn write_veto_precheck(
                 "write-veto[warn]: write would be rejected under KIN_WRITE_VETO=enforce"
             );
         }
-        return Ok(Some(crate::write_veto::veto_warning_annotation(
-            display_path,
-            &blocking,
-        )));
+        let mut annotation = crate::write_veto::veto_warning_annotation(display_path, &blocking);
+        if !capability_warnings.is_empty() {
+            if let Some(object) = annotation.as_object_mut() {
+                object.insert(
+                    "capability_violations".to_string(),
+                    serde_json::json!(capability_warnings),
+                );
+            }
+        }
+        return Ok(Some(annotation));
     }
-    Ok(None)
+    Ok(vfs_capability_warning(capability_warnings))
+}
+
+fn vfs_capability_warning(violations: &[String]) -> Option<serde_json::Value> {
+    (!violations.is_empty()).then(|| {
+        serde_json::json!({
+            "would_block": true,
+            "conflict_type": "CapabilityDenied",
+            "capability_violations": violations,
+            "message": "VFS write would be rejected in enforce mode because caller identity or can_write capability is invalid",
+        })
+    })
+}
+
+fn resolve_vfs_write_caller(
+    state: &DaemonState,
+    header_session: Option<SessionId>,
+    body_session: Option<SessionId>,
+) -> std::result::Result<(Option<SessionId>, Vec<String>), (StatusCode, String)> {
+    let mode = state.coordination_mode();
+    if !mode.evaluates() {
+        return Ok((header_session.or(body_session), Vec::new()));
+    }
+
+    let mut violations = Vec::new();
+    if header_session.is_none() && body_session.is_some() {
+        violations.push("body session_id is not bound to X-Kin-Session".to_string());
+    }
+    if let (Some(header), Some(body)) = (header_session, body_session) {
+        if header != body {
+            violations.push("body session_id does not match X-Kin-Session".to_string());
+        }
+    }
+    let caller = header_session.or(body_session);
+    match caller {
+        Some(session_id) => match state
+            .coordinator
+            .get_session(&session_id)
+            .map_err(internal_error)?
+        {
+            Some(session) if session.capabilities.can_write => {}
+            Some(_) => violations.push("can_write=false".to_string()),
+            None => violations.push("VFS caller is not an active rich agent session".to_string()),
+        },
+        None => violations.push("VFS write has no attributed agent session".to_string()),
+    }
+
+    if mode.is_enforcing() && !violations.is_empty() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            serde_json::json!({
+                "error": "coordination_capability_denied",
+                "capability_violations": violations,
+            })
+            .to_string(),
+        ));
+    }
+    Ok((caller, violations))
 }
 
 /// How a reconcile-detected hard collision maps under the active write-veto
@@ -7143,8 +7776,8 @@ enum CollisionVeto {
 fn write_veto_collision_response(
     err: &kin_reconcile::ReconcileError,
     display_path: &str,
+    mode: crate::write_veto::WriteVetoMode,
 ) -> CollisionVeto {
-    let mode = crate::write_veto::WriteVetoMode::from_env();
     if mode.is_off() {
         return CollisionVeto::Ignore;
     }
@@ -7215,6 +7848,7 @@ fn filesystem_ingest_disabled_response(endpoint: &str, path: &str) -> (StatusCod
 /// Triggers reconciliation for the specified path. Used by the VFS write-back
 /// flow to inform the daemon that projected content has been written through.
 async fn vfs_file_changed(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<FileChangedRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -7225,18 +7859,31 @@ async fn vfs_file_changed(
         ));
     }
 
+    // One ordering with intent registration and transaction commits: no hard
+    // intent can appear after this path's precheck but before graph apply.
+    let _coordination = state.coordination_gate.lock().await;
     let file_path = std::path::PathBuf::from(&request.path);
     tracing::info!(path = %request.path, "VFS file-changed notification received");
 
     // Rung-3 write veto (KIN_WRITE_VETO=enforce): the general-purpose sibling of
     // /vfs/write-notify must gate too, else enforce is trivially bypassable by
     // choosing this endpoint. Off by default (byte-identical).
-    let caller = request
+    let header_session = extract_session_id_from_headers(&headers)?;
+    let body_session = request
         .session_id
         .as_ref()
-        .and_then(|s| s.parse::<Uuid>().ok())
-        .map(SessionId);
-    let veto_warning = write_veto_precheck(&state, &file_path, &request.path, caller).await?;
+        .map(|session_id| parse_session_id(session_id))
+        .transpose()?;
+    let (caller, capability_warnings) =
+        resolve_vfs_write_caller(&state, header_session, body_session)?;
+    let veto_warning = write_veto_precheck(
+        &state,
+        &file_path,
+        &request.path,
+        caller,
+        &capability_warnings,
+    )
+    .await?;
 
     let event = kin_index::FileEvent::Changed(file_path);
 
@@ -7257,11 +7904,9 @@ async fn vfs_file_changed(
     // Temporarily adopt the caller's session so the reconciler's own collision
     // check excludes the caller's intents (parity with /vfs/write-notify); the
     // write-veto precheck above applies the same own-write exclusion.
-    let prev_session_id = if let Some(ref sid) = request.session_id {
+    let prev_session_id = if let Some(session_id) = caller {
         let prev = reconciler.session_id().copied();
-        if let Ok(parsed) = sid.parse::<Uuid>() {
-            reconciler.set_session_id(SessionId(parsed));
-        }
+        reconciler.set_session_id(session_id);
         prev
     } else {
         None
@@ -7275,7 +7920,7 @@ async fn vfs_file_changed(
         edit_hint.as_ref(),
     );
 
-    if request.session_id.is_some() {
+    if caller.is_some() {
         match prev_session_id {
             Some(prev) => reconciler.set_session_id(prev),
             None => reconciler.clear_session_id(),
@@ -7325,7 +7970,7 @@ async fn vfs_file_changed(
                             file_path: Some(request.path.clone()),
                             // Truthful attribution: the originating session the
                             // VFS write-back request carried (None if anonymous).
-                            session_id: request.session_id.clone(),
+                            session_id: caller.map(|session_id| session_id.to_string()),
                         });
                     }
                     for id in modified {
@@ -7335,7 +7980,7 @@ async fn vfs_file_changed(
                             file_path: Some(request.path.clone()),
                             // Truthful attribution: the originating session the
                             // VFS write-back request carried (None if anonymous).
-                            session_id: request.session_id.clone(),
+                            session_id: caller.map(|session_id| session_id.to_string()),
                         });
                     }
                     for id in removed {
@@ -7345,7 +7990,7 @@ async fn vfs_file_changed(
                             file_path: Some(request.path.clone()),
                             // Truthful attribution: the originating session the
                             // VFS write-back request carried (None if anonymous).
-                            session_id: request.session_id.clone(),
+                            session_id: caller.map(|session_id| session_id.to_string()),
                         });
                     }
                     (added.len(), modified.len(), removed.len())
@@ -7378,7 +8023,11 @@ async fn vfs_file_changed(
             drop(reconciler);
             // Under enforce, surface a hard collision detected during reconcile
             // as a pre-write 409; under warn, annotate the soft notification.
-            let warning = match write_veto_collision_response(&e, &request.path) {
+            let warning = match write_veto_collision_response(
+                &e,
+                &request.path,
+                crate::write_veto::WriteVetoMode::from(state.coordination_mode()),
+            ) {
                 CollisionVeto::Block(body) => {
                     return Err((StatusCode::CONFLICT, body.to_string()));
                 }
@@ -7405,6 +8054,7 @@ async fn vfs_file_changed(
 /// `/vfs/file-changed` (which is general-purpose), this endpoint is
 /// optimized for the shim hot-path: minimal request body, fast response.
 async fn vfs_write_notify(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<WriteNotifyRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -7415,18 +8065,29 @@ async fn vfs_write_notify(
         ));
     }
 
+    let _coordination = state.coordination_gate.lock().await;
     let file_path = std::path::PathBuf::from(&request.file_path);
     tracing::info!(path = %request.file_path, "VFS write-notify received");
 
     // Rung-3 write veto (KIN_WRITE_VETO=enforce): reject a write whose existing
     // entity/artifact scopes are held under another session's hard intent
     // before the reconciler touches the overlay. Off by default (byte-identical).
-    let caller = request
+    let header_session = extract_session_id_from_headers(&headers)?;
+    let body_session = request
         .session_id
         .as_ref()
-        .and_then(|s| s.parse::<Uuid>().ok())
-        .map(SessionId);
-    let veto_warning = write_veto_precheck(&state, &file_path, &request.file_path, caller).await?;
+        .map(|session_id| parse_session_id(session_id))
+        .transpose()?;
+    let (caller, capability_warnings) =
+        resolve_vfs_write_caller(&state, header_session, body_session)?;
+    let veto_warning = write_veto_precheck(
+        &state,
+        &file_path,
+        &request.file_path,
+        caller,
+        &capability_warnings,
+    )
+    .await?;
 
     let event = kin_index::FileEvent::Changed(file_path);
 
@@ -7435,11 +8096,9 @@ async fn vfs_write_notify(
 
     // If the caller supplies a session_id, temporarily set it on the
     // reconciler so check_scopes() excludes the caller's own intents.
-    let prev_session_id = if let Some(ref sid) = request.session_id {
+    let prev_session_id = if let Some(session_id) = caller {
         let prev = reconciler.session_id().copied();
-        if let Ok(parsed) = sid.parse::<Uuid>() {
-            reconciler.set_session_id(SessionId(parsed));
-        }
+        reconciler.set_session_id(session_id);
         prev
     } else {
         None
@@ -7455,7 +8114,7 @@ async fn vfs_write_notify(
 
     // Always restore the previous session_id so caller identity doesn't
     // leak into future reconciles through the shared reconciler.
-    if request.session_id.is_some() {
+    if caller.is_some() {
         match prev_session_id {
             Some(prev) => reconciler.set_session_id(prev),
             None => reconciler.clear_session_id(),
@@ -7552,7 +8211,11 @@ async fn vfs_write_notify(
             // Under enforce, surface a hard collision detected during reconcile
             // (e.g. a brand-new entity the precheck cannot see) as a pre-write
             // 409; under warn, annotate the soft notification below.
-            let warning = match write_veto_collision_response(&e, &request.file_path) {
+            let warning = match write_veto_collision_response(
+                &e,
+                &request.file_path,
+                crate::write_veto::WriteVetoMode::from(state.coordination_mode()),
+            ) {
                 CollisionVeto::Block(body) => {
                     return Err((StatusCode::CONFLICT, body.to_string()));
                 }
@@ -7575,7 +8238,7 @@ async fn vfs_write_notify(
 /// GET /vfs/subscribe — SSE stream for real-time invalidation events.
 ///
 /// Subscribers receive DaemonEvent messages (EntityChanged, TreeChanged,
-/// OverlayUpdated, GraphRootChanged) as they happen. The VFS daemon uses
+/// OverlayUpdated, GraphRootChanged, Coordination) as they happen. The VFS daemon uses
 /// these to invalidate its cache; the spine uses them to update its metadata index.
 ///
 /// Protocol: Server-Sent Events (text/event-stream). Each event is a JSON
@@ -8046,12 +8709,32 @@ fn parse_uuid(value: &str, kind: &str) -> Result<Uuid, (StatusCode, String)> {
     })
 }
 
-fn format_scope(scope: &IntentScope) -> String {
+pub(crate) fn format_scope(scope: &IntentScope) -> String {
     match scope {
         IntentScope::Entity(id) => format!("entity:{id}"),
         IntentScope::Contract(id) => format!("contract:{id}"),
         IntentScope::Artifact(id) => format!("file:{id}"),
     }
+}
+
+fn persist_coordination_event(
+    state: &DaemonState,
+    draft: CoordinationEventDraft,
+) -> Result<crate::state::CoordinationEventEnvelope, (StatusCode, String)> {
+    state.record_coordination_event(draft).map_err(|error| {
+        (
+            StatusCode::INSUFFICIENT_STORAGE,
+            format!("coordination event persistence failed; action is not claim-eligible: {error}"),
+        )
+    })
+}
+
+fn persist_coordination_reservation(
+    state: &DaemonState,
+    mut draft: CoordinationEventDraft,
+) -> Result<crate::state::CoordinationEventEnvelope, (StatusCode, String)> {
+    draft.outcome = format!("pending:{}", draft.outcome);
+    persist_coordination_event(state, draft)
 }
 
 fn primary_repo_id(state: &DaemonState) -> String {
@@ -9264,6 +9947,24 @@ mod tests {
         );
         // Additive freshness marker present; 0 before any snapshot is committed.
         assert_eq!(json.graph_generation, 0);
+        let coordination = json
+            .coordination
+            .expect("new daemon must attest coordination");
+        assert_eq!(coordination.schema, "kin.coordination-enforcement.v1");
+        assert!(coordination.surfaces.mcp_transaction_entity);
+        assert!(!coordination.surfaces.contract);
+        assert!(!coordination.contract_scope_claim_eligible);
+        assert_eq!(json.coordination_event_persist_failures, Some(0));
+
+        let mut legacy: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        legacy.as_object_mut().unwrap().remove("coordination");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("coordination_event_persist_failures");
+        let legacy: HealthResponse = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.coordination.is_none());
+        assert!(legacy.coordination_event_persist_failures.is_none());
     }
 
     #[tokio::test]
@@ -9735,6 +10436,31 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
+    async fn mcp_call_as(
+        router: axum::Router,
+        name: &str,
+        arguments: serde_json::Value,
+        session_id: SessionId,
+    ) -> kin_mcp::ToolCallResult {
+        let response = router
+            .oneshot(
+                Request::post("/mcp/tools/call")
+                    .header("content-type", "application/json")
+                    .header("X-Kin-Session", session_id.to_string())
+                    .body(Body::from(
+                        serde_json::json!({ "name": name, "arguments": arguments }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
     fn mcp_result_text(result: &kin_mcp::ToolCallResult) -> String {
         match result.content.first().unwrap() {
             kin_mcp::ContentBlock::Text { text } => text.clone(),
@@ -9875,6 +10601,377 @@ mod tests {
             before + 1,
             "committed entity must land in the canonical graph"
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_transaction_enforce_rejects_before_graph_apply_and_records_event() {
+        let state = test_state();
+        *state
+            .coordination_mode
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            kin_mcp::CoordinationEnforcementMode::Enforce;
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let capabilities = SessionCapabilities {
+            can_write: true,
+            can_commit: true,
+            ..SessionCapabilities::default()
+        };
+        let owner = state
+            .coordinator
+            .register_session(
+                "claude-code",
+                "owner",
+                SessionTransport::Mcp,
+                None,
+                state.layout.working_dir().to_path_buf(),
+                capabilities.clone(),
+            )
+            .unwrap();
+        let caller = state
+            .coordinator
+            .register_session(
+                "codex",
+                "caller",
+                SessionTransport::Mcp,
+                None,
+                state.layout.working_dir().to_path_buf(),
+                capabilities,
+            )
+            .unwrap();
+        let entity = test_entity("blocked_fn", "src/lib.rs");
+        let registration = state
+            .coordinator
+            .register_intent(
+                &owner,
+                vec![IntentScope::Entity(entity.id)],
+                LockType::Hard,
+                "exclusive edit",
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            registration,
+            crate::session_registry::IntentRegistrationResult::Registered { .. }
+        ));
+        let before = state.graph.entity_count();
+
+        let begin = mcp_call_as(
+            router(Arc::clone(&state)),
+            "kin_transaction_begin",
+            serde_json::json!({
+                "session_id": caller.to_string(),
+                "scope": "file:src/lib.rs"
+            }),
+            caller,
+        )
+        .await;
+        let begin_json: serde_json::Value = serde_json::from_str(&mcp_result_text(&begin)).unwrap();
+        let tx_id = begin_json["transaction_id"].as_str().unwrap().to_string();
+        let stage = mcp_call_as(
+            router(Arc::clone(&state)),
+            "kin_transaction_stage",
+            serde_json::json!({
+                "transaction_id": tx_id,
+                "operations": [{
+                    "verb": "create",
+                    "target": "",
+                    "payload": { "Entity": entity },
+                    "description": "must be vetoed"
+                }]
+            }),
+            caller,
+        )
+        .await;
+        assert_ne!(stage.is_error, Some(true));
+
+        let commit = mcp_call_as(
+            router(Arc::clone(&state)),
+            "kin_transaction_commit",
+            serde_json::json!({ "transaction_id": tx_id }),
+            caller,
+        )
+        .await;
+        assert_eq!(commit.is_error, Some(true));
+        assert!(mcp_result_text(&commit).contains("before graph apply"));
+        assert_eq!(
+            state.graph.entity_count(),
+            before,
+            "rejected transaction must not mutate graph truth"
+        );
+
+        let records = std::fs::read_to_string(state.coordination_events.path()).unwrap();
+        let last: crate::state::CoordinationEventEnvelope =
+            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert_eq!(last.event, "transaction_outcome");
+        assert_eq!(last.outcome, "coordination_rejected_before_graph_apply");
+        assert_eq!(last.transaction_id.as_deref(), Some(tx_id.as_str()));
+        assert_eq!(last.session_id, Some(caller.to_string()));
+        assert_eq!(last.enforcement_mode, "enforce");
+        assert_eq!(last.blocking_intent_ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mcp_transaction_enforce_binds_commit_to_header_session() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        *state
+            .coordination_mode
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            kin_mcp::CoordinationEnforcementMode::Enforce;
+        let writable = SessionCapabilities {
+            can_write: true,
+            can_commit: true,
+            ..SessionCapabilities::default()
+        };
+        let owner = state
+            .coordinator
+            .register_session(
+                "owner",
+                "owner",
+                SessionTransport::Mcp,
+                None,
+                state.layout.working_dir().to_path_buf(),
+                writable,
+            )
+            .unwrap();
+        let caller = state
+            .coordinator
+            .register_session(
+                "caller",
+                "caller",
+                SessionTransport::Mcp,
+                None,
+                state.layout.working_dir().to_path_buf(),
+                SessionCapabilities::default(),
+            )
+            .unwrap();
+        let entity = test_entity("identity_guard", "src/lib.rs");
+        let before = state.graph.entity_count();
+        let missing_identity_begin = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_begin",
+            serde_json::json!({
+                "session_id": owner.to_string(),
+                "scope": "file:src/lib.rs"
+            }),
+        )
+        .await;
+        assert_eq!(missing_identity_begin.is_error, Some(true));
+        assert!(mcp_result_text(&missing_identity_begin).contains("body session_id"));
+
+        let begin = mcp_call_as(
+            router(Arc::clone(&state)),
+            "kin_transaction_begin",
+            serde_json::json!({
+                "session_id": owner.to_string(),
+                "scope": "file:src/lib.rs"
+            }),
+            owner,
+        )
+        .await;
+        let begin_json: serde_json::Value = serde_json::from_str(&mcp_result_text(&begin)).unwrap();
+        let transaction_id = begin_json["transaction_id"].as_str().unwrap().to_string();
+        let rejected_stage = mcp_call_as(
+            router(Arc::clone(&state)),
+            "kin_transaction_stage",
+            serde_json::json!({
+                "transaction_id": transaction_id,
+                "operations": [{
+                    "verb": "create",
+                    "target": "",
+                    "payload": { "Entity": entity.clone() },
+                    "description": "must not borrow owner identity"
+                }]
+            }),
+            caller,
+        )
+        .await;
+        assert_eq!(rejected_stage.is_error, Some(true));
+        assert!(mcp_result_text(&rejected_stage).contains("does not own"));
+
+        let body_mismatch_stage = mcp_call_as(
+            router(Arc::clone(&state)),
+            "kin_transaction_stage",
+            serde_json::json!({
+                "transaction_id": transaction_id,
+                "session_id": caller.to_string(),
+                "operations": [{
+                    "verb": "create",
+                    "target": "",
+                    "payload": { "Entity": entity.clone() },
+                    "description": "body identity must match the authenticated header"
+                }]
+            }),
+            owner,
+        )
+        .await;
+        assert_eq!(body_mismatch_stage.is_error, Some(true));
+        assert!(mcp_result_text(&body_mismatch_stage).contains("body session_id"));
+
+        let stage = mcp_call_as(
+            router(Arc::clone(&state)),
+            "kin_transaction_stage",
+            serde_json::json!({
+                "transaction_id": transaction_id,
+                "operations": [{
+                    "verb": "create",
+                    "target": "",
+                    "payload": { "Entity": entity },
+                    "description": "must not borrow owner identity"
+                }]
+            }),
+            owner,
+        )
+        .await;
+        assert_ne!(stage.is_error, Some(true));
+        let commit = mcp_call_as(
+            router(Arc::clone(&state)),
+            "kin_transaction_commit",
+            serde_json::json!({ "transaction_id": transaction_id }),
+            caller,
+        )
+        .await;
+        assert_eq!(commit.is_error, Some(true));
+        assert!(mcp_result_text(&commit).contains("does not own transaction session"));
+        assert_eq!(state.graph.entity_count(), before);
+    }
+
+    #[tokio::test]
+    async fn mcp_generic_commit_failure_is_not_labeled_coordination_rejection() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let missing = EntityId::new().to_string();
+        let commit = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_commit",
+            serde_json::json!({ "transaction_id": missing }),
+        )
+        .await;
+        assert_eq!(commit.is_error, Some(true));
+        let records = std::fs::read_to_string(state.coordination_events.path()).unwrap();
+        let last: crate::state::CoordinationEventEnvelope =
+            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert_eq!(last.outcome, "commit_failed_before_graph_apply");
+        assert!(last.blocking_intent_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_transaction_preflight_covers_name_kind_upsert_resolution() {
+        let state = test_state();
+        *state
+            .coordination_mode
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            kin_mcp::CoordinationEnforcementMode::Enforce;
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let capabilities = SessionCapabilities {
+            can_write: true,
+            can_commit: true,
+            ..SessionCapabilities::default()
+        };
+        let owner = state
+            .coordinator
+            .register_session(
+                "claude-code",
+                "owner",
+                SessionTransport::Mcp,
+                None,
+                state.layout.working_dir().to_path_buf(),
+                capabilities.clone(),
+            )
+            .unwrap();
+        let caller = state
+            .coordinator
+            .register_session(
+                "codex",
+                "caller",
+                SessionTransport::Mcp,
+                None,
+                state.layout.working_dir().to_path_buf(),
+                capabilities,
+            )
+            .unwrap();
+
+        let existing = test_entity("resolved_by_name", "src/protected.py");
+        state.graph.upsert_entity(&existing).unwrap();
+        assert!(matches!(
+            state
+                .coordinator
+                .register_intent(
+                    &owner,
+                    vec![IntentScope::Entity(existing.id)],
+                    LockType::Hard,
+                    "protect existing entity",
+                    None,
+                )
+                .unwrap(),
+            crate::session_registry::IntentRegistrationResult::Registered { .. }
+        ));
+
+        // The commit path resolves an unknown payload id by name+kind. The
+        // preflight must mirror that resolution or a caller could bypass an
+        // intent on `existing.id` by submitting a fresh id with the same name.
+        let mut alias_payload = existing.clone();
+        alias_payload.id = EntityId::new();
+        alias_payload.signature = "def resolved_by_name(changed)".to_string();
+        let alias_id = alias_payload.id;
+        let begin = mcp_call_as(
+            router(Arc::clone(&state)),
+            "kin_transaction_begin",
+            json!({ "session_id": caller.to_string(), "scope": "entity" }),
+            caller,
+        )
+        .await;
+        let begin_json: serde_json::Value = serde_json::from_str(&mcp_result_text(&begin)).unwrap();
+        let tx_id = begin_json["transaction_id"].as_str().unwrap().to_string();
+        let stage = mcp_call_as(
+            router(Arc::clone(&state)),
+            "kin_transaction_stage",
+            json!({
+                "transaction_id": tx_id,
+                "operations": [{
+                    "verb": "upsert",
+                    "target": "",
+                    "payload": { "Entity": alias_payload },
+                    "description": "attempt id-alias bypass"
+                }]
+            }),
+            caller,
+        )
+        .await;
+        assert_ne!(stage.is_error, Some(true));
+
+        let commit = mcp_call_as(
+            router(Arc::clone(&state)),
+            "kin_transaction_commit",
+            json!({ "transaction_id": tx_id }),
+            caller,
+        )
+        .await;
+        assert_eq!(commit.is_error, Some(true));
+        assert!(mcp_result_text(&commit).contains(&existing.id.to_string()));
+        assert_eq!(
+            state
+                .graph
+                .get_entity(&existing.id)
+                .unwrap()
+                .unwrap()
+                .signature,
+            existing.signature
+        );
+        assert!(state.graph.get_entity(&alias_id).unwrap().is_none());
     }
 
     #[test]
@@ -11625,7 +12722,10 @@ mod tests {
                 SessionTransport::Cli,
                 None,
                 state.layout.working_dir().to_path_buf(),
-                SessionCapabilities::default(),
+                SessionCapabilities {
+                    can_write: true,
+                    ..SessionCapabilities::default()
+                },
             )
             .unwrap();
         let entity_id = EntityId::new();
@@ -11698,6 +12798,66 @@ mod tests {
         let registered: RegisterIntentResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(registered.status, "registered");
         assert!(!registered.session_id.is_empty());
+        assert!(registered
+            .coordination_warnings
+            .iter()
+            .any(|warning| warning.contains("can_write")));
+
+        let records = std::fs::read_to_string(state.coordination_events.path()).unwrap();
+        let registered_event: crate::state::CoordinationEventEnvelope =
+            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert_eq!(registered_event.event, "intent_registration");
+        assert_eq!(registered_event.outcome, "registered");
+        assert_eq!(
+            registered_event.intent_id.as_deref(),
+            Some(registered.intent_id.as_str())
+        );
+        assert_eq!(registered_event.kin_version, kin_buildinfo::version());
+
+        let contender = state
+            .coordinator
+            .register_session(
+                "claude-code",
+                "contender",
+                SessionTransport::Mcp,
+                None,
+                state.layout.working_dir().to_path_buf(),
+                SessionCapabilities {
+                    can_write: true,
+                    ..SessionCapabilities::default()
+                },
+            )
+            .unwrap();
+        let blocked = app
+            .clone()
+            .oneshot(
+                Request::post("/intent/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "session_id": contender.to_string(),
+                            "scope": "file:src/lib.rs",
+                            "lock_type": "hard",
+                            "task_description": "conflicting edit"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::OK);
+        let blocked_body = axum::body::to_bytes(blocked.into_body(), 4096)
+            .await
+            .unwrap();
+        let blocked: RegisterIntentResponse = serde_json::from_slice(&blocked_body).unwrap();
+        assert_eq!(blocked.status, "blocked");
+        assert_eq!(blocked.conflicts.len(), 1);
+        let records = std::fs::read_to_string(state.coordination_events.path()).unwrap();
+        let blocked_event: crate::state::CoordinationEventEnvelope =
+            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert_eq!(blocked_event.outcome, "blocked");
+        assert_eq!(blocked_event.blocking_intent_ids.len(), 1);
 
         let traffic = app
             .clone()
@@ -11968,6 +13128,89 @@ mod tests {
         assert_eq!(json.status, "registered");
         assert!(!json.session_id.is_empty());
         assert!(!json.intent_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn register_intent_enforce_does_not_mint_writable_implicit_session() {
+        let state = test_state();
+        *state
+            .coordination_mode
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            kin_mcp::CoordinationEnforcementMode::Enforce;
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/intent/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "scope": "file:src/main.rs",
+                            "lock_type": "hard",
+                            "task_description": "must require declared write capability"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let payload: RegisterIntentResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.status, "capability_denied");
+        assert!(state.graph.list_all_intents().unwrap().is_empty());
+        let records = std::fs::read_to_string(state.coordination_events.path()).unwrap();
+        let final_event: crate::state::CoordinationEventEnvelope =
+            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert!(final_event.intent_id.is_none());
+        assert!(final_event.intent_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn register_intent_fails_before_mutation_when_event_reservation_fails() {
+        let state = test_state();
+        let session_id = state
+            .coordinator
+            .register_session(
+                "test",
+                "event-failure",
+                SessionTransport::Cli,
+                None,
+                state.layout.working_dir().to_path_buf(),
+                SessionCapabilities::default(),
+            )
+            .unwrap();
+        let event_path = state.coordination_events.path().to_path_buf();
+        std::fs::remove_file(&event_path).unwrap();
+        std::fs::create_dir(&event_path).unwrap();
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/intent/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "session_id": session_id.to_string(),
+                            "scope": "file:src/main.rs",
+                            "lock_type": "soft",
+                            "task_description": "must not land without evidence"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+        assert!(state.graph.list_all_intents().unwrap().is_empty());
+        assert_eq!(
+            state
+                .coordination_event_persist_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[tokio::test]
@@ -14062,6 +15305,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_surfaces_coordination_event_failure_attention() {
+        let state = test_state();
+        state
+            .coordination_event_persist_failures
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        let response = router(state)
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: HealthResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.status, "attention");
+        assert_eq!(json.coordination_event_persist_failures, Some(1));
+    }
+
+    #[tokio::test]
     async fn command_exec_requires_capability_optin() {
         // Default install (no KIN_DAEMON_ALLOW_EXEC) must refuse shell exec even
         // for an initialized daemon — being initialized is not sufficient.
@@ -14752,19 +16013,22 @@ mod tests {
                 SessionTransport::Mcp,
                 None,
                 state.layout.working_dir().to_path_buf(),
-                SessionCapabilities::default(),
+                SessionCapabilities {
+                    can_write: true,
+                    ..SessionCapabilities::default()
+                },
             )
             .unwrap()
     }
 
     async fn write_notify(app: Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let mut request =
+            Request::post("/vfs/write-notify").header("content-type", "application/json");
+        if let Some(session_id) = body.get("session_id").and_then(serde_json::Value::as_str) {
+            request = request.header("X-Kin-Session", session_id);
+        }
         let resp = app
-            .oneshot(
-                Request::post("/vfs/write-notify")
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
             .await
             .unwrap();
         let status = resp.status();
@@ -14829,8 +16093,17 @@ mod tests {
 
         let _env = EnvVarGuard("KIN_WRITE_VETO");
         std::env::set_var("KIN_WRITE_VETO", "enforce");
-        let (status, json) =
-            write_notify(router(state), serde_json::json!({ "file_path": abs })).await;
+        *state
+            .coordination_mode
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            kin_mcp::CoordinationEnforcementMode::Enforce;
+        let caller = register_foreign_session(&state, "caller");
+        let (status, json) = write_notify(
+            router(state),
+            serde_json::json!({ "file_path": abs, "session_id": caller.to_string() }),
+        )
+        .await;
 
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(json["error"], "write_veto");
@@ -14969,6 +16242,11 @@ mod tests {
 
         let _env = EnvVarGuard("KIN_WRITE_VETO");
         std::env::set_var("KIN_WRITE_VETO", "enforce");
+        *state
+            .coordination_mode
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            kin_mcp::CoordinationEnforcementMode::Enforce;
         let (status, json) = write_notify(
             router(state),
             serde_json::json!({ "file_path": abs, "session_id": caller.to_string() }),
@@ -15001,21 +16279,84 @@ mod tests {
 
         let _env = EnvVarGuard("KIN_WRITE_VETO");
         std::env::set_var("KIN_WRITE_VETO", "enforce");
-        let (status, json) =
-            write_notify(router(state), serde_json::json!({ "file_path": abs })).await;
+        *state
+            .coordination_mode
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            kin_mcp::CoordinationEnforcementMode::Enforce;
+        let caller = register_foreign_session(&state, "caller");
+        let (status, json) = write_notify(
+            router(state),
+            serde_json::json!({ "file_path": abs, "session_id": caller.to_string() }),
+        )
+        .await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["reindexed"], true);
     }
 
-    async fn file_changed(app: Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
-        let resp = app
+    #[tokio::test]
+    async fn write_notify_enforce_rejects_read_only_and_mismatched_callers() {
+        let _lock = VETO_ENV_LOCK.lock().await;
+        let state = test_state();
+        *state
+            .coordination_mode
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            kin_mcp::CoordinationEnforcementMode::Enforce;
+        let (_, abs) = veto_file_target(&state, "src/lib.py");
+        let read_only = state
+            .coordinator
+            .register_session(
+                "read-only",
+                "reader",
+                SessionTransport::Mcp,
+                None,
+                state.layout.working_dir().to_path_buf(),
+                SessionCapabilities::default(),
+            )
+            .unwrap();
+        let (status, json) = write_notify(
+            router(Arc::clone(&state)),
+            serde_json::json!({ "file_path": abs, "session_id": read_only.to_string() }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(json["capability_violations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "can_write=false"));
+
+        let first = register_foreign_session(&state, "first");
+        let second = register_foreign_session(&state, "second");
+        let response = router(state)
             .oneshot(
-                Request::post("/vfs/file-changed")
+                Request::post("/vfs/write-notify")
                     .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
+                    .header("X-Kin-Session", first.to_string())
+                    .body(Body::from(
+                        serde_json::json!({
+                            "file_path": abs,
+                            "session_id": second.to_string()
+                        })
+                        .to_string(),
+                    ))
                     .unwrap(),
             )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    async fn file_changed(app: Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let mut request =
+            Request::post("/vfs/file-changed").header("content-type", "application/json");
+        if let Some(session_id) = body.get("session_id").and_then(serde_json::Value::as_str) {
+            request = request.header("X-Kin-Session", session_id);
+        }
+        let resp = app
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
             .await
             .unwrap();
         let status = resp.status();
@@ -15080,7 +16421,17 @@ mod tests {
 
         let _env = EnvVarGuard("KIN_WRITE_VETO");
         std::env::set_var("KIN_WRITE_VETO", "enforce");
-        let (status, json) = file_changed(router(state), serde_json::json!({ "path": abs })).await;
+        *state
+            .coordination_mode
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            kin_mcp::CoordinationEnforcementMode::Enforce;
+        let caller = register_foreign_session(&state, "caller");
+        let (status, json) = file_changed(
+            router(state),
+            serde_json::json!({ "path": abs, "session_id": caller.to_string() }),
+        )
+        .await;
 
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(json["error"], "write_veto");
@@ -15173,6 +16524,11 @@ mod tests {
 
         let _env = EnvVarGuard("KIN_WRITE_VETO");
         std::env::set_var("KIN_WRITE_VETO", "enforce");
+        *state
+            .coordination_mode
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            kin_mcp::CoordinationEnforcementMode::Enforce;
         let (status, json) = file_changed(
             router(state),
             serde_json::json!({ "path": abs, "session_id": caller.to_string() }),
