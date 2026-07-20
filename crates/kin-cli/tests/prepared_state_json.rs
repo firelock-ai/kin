@@ -151,7 +151,13 @@ fn parse_json_output(output: &Output, context: &str) -> Value {
 
 fn kin(repo: &Path, kin_home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
-    command.current_dir(repo).env("KIN_HOME", kin_home);
+    command
+        .current_dir(repo)
+        .env("KIN_HOME", kin_home)
+        .env("KIN_REGISTRY_PATH", kin_home.join("registry.toml"))
+        .env_remove("KIN_DAEMON_URL")
+        .env_remove("KIN_SUPERVISOR_URL")
+        .env_remove("KIN_SESSION_ID");
     command
 }
 
@@ -236,8 +242,8 @@ fn prepared_state_publish_and_materialize_preserve_indexed_state() {
     );
     assert_eq!(support_payload["pending_embedding_count"], 0);
 
-    let artifact_dir = Path::new("/tmp/workstreamA-prepared-state-ownership-proof");
-    fs::create_dir_all(artifact_dir).expect("create proof artifact dir");
+    let artifact_dir = root.path().join("proof-artifact");
+    fs::create_dir_all(&artifact_dir).expect("create proof artifact dir");
     fs::write(
         artifact_dir.join("publish.json"),
         serde_json::to_string_pretty(&publish_payload).expect("serialize publish payload"),

@@ -31,6 +31,8 @@ pub const PRIORITY_SCORE_FORMULA: &str = "bucket_points + relation_points + max(
 /// to compare candidates across re-indexes and distinguish overloads.
 /// `EntityId` includes the declaration's start line, so it is included in the
 /// report as snapshot provenance but is not the candidate's durable identity.
+/// Stable identity is not necessarily unique within one snapshot: conditional
+/// declarations may have identical signatures in the same file.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct StableEntityIdentity {
     pub file: String,
@@ -187,7 +189,8 @@ pub fn rank_impact_at<I: ImpactGraph>(
     // The first route at a hop is canonical because each frontier's inbound
     // relations are sorted. A shorter route always dominates deeper traversal.
     let mut shallowest_hop: HashMap<EntityId, u32> = HashMap::from([(*root, 0)]);
-    let mut candidates: BTreeMap<StableEntityIdentity, RankedImpactCandidate> = BTreeMap::new();
+    let mut candidates: BTreeMap<(StableEntityIdentity, EntityId), RankedImpactCandidate> =
+        BTreeMap::new();
 
     while let Some(frontier) = queue.pop_front() {
         if frontier.hop >= bounded_depth {
@@ -215,6 +218,7 @@ pub fn rank_impact_at<I: ImpactGraph>(
             };
             let hop = frontier.hop + 1;
             let candidate_identity = StableEntityIdentity::from_entity(&candidate_entity);
+            let candidate_key = (candidate_identity.clone(), candidate_id);
             let step = RelationPathStep {
                 relation_id: relation.id,
                 relation_kind: relation.kind,
@@ -244,10 +248,10 @@ pub fn rank_impact_at<I: ImpactGraph>(
                 path: path.clone(),
             };
 
-            match candidates.get(&candidate_identity) {
+            match candidates.get(&candidate_key) {
                 Some(existing) if !candidate_is_better(&ranked, existing) => {}
                 _ => {
-                    candidates.insert(candidate_identity, ranked);
+                    candidates.insert(candidate_key, ranked);
                 }
             }
 
@@ -315,6 +319,7 @@ fn is_impact_relation(kind: RelationKind) -> bool {
             | RelationKind::Implements
             | RelationKind::Overrides
             | RelationKind::Calls
+            | RelationKind::Spawns
             | RelationKind::Instantiates
             | RelationKind::References
             | RelationKind::UsesMacro
@@ -343,9 +348,10 @@ fn impact_bucket(entity: &Entity, relation: RelationKind) -> ImpactBucket {
     } else {
         match relation {
             RelationKind::ConsumesContract => ImpactBucket::ContractConsumer,
-            RelationKind::Calls | RelationKind::Instantiates | RelationKind::SendsMessage => {
-                ImpactBucket::RuntimeCaller
-            }
+            RelationKind::Calls
+            | RelationKind::Spawns
+            | RelationKind::Instantiates
+            | RelationKind::SendsMessage => ImpactBucket::RuntimeCaller,
             RelationKind::Extends
             | RelationKind::Implements
             | RelationKind::Overrides
@@ -381,7 +387,7 @@ fn score_components(
 fn relation_points(kind: RelationKind) -> u32 {
     match kind {
         RelationKind::ConsumesContract => 120,
-        RelationKind::Calls => 110,
+        RelationKind::Calls | RelationKind::Spawns => 110,
         RelationKind::Extends | RelationKind::Implements | RelationKind::Overrides => 105,
         RelationKind::Instantiates | RelationKind::References | RelationKind::UsesType => 90,
         RelationKind::SubscribesTo | RelationKind::SendsMessage => 80,
@@ -662,6 +668,39 @@ mod tests {
     }
 
     #[test]
+    fn identical_conditional_declarations_remain_distinct_candidates() {
+        let root = entity("root", "src/root.rs", 1);
+        let first = entity("platform", "src/platform.rs", 10);
+        let second = entity("platform", "src/platform.rs", 30);
+        assert_eq!(
+            StableEntityIdentity::from_entity(&first),
+            StableEntityIdentity::from_entity(&second)
+        );
+
+        let mut graph = Graph::default();
+        for value in [&root, &first, &second] {
+            graph.entities.insert(value.id, value.clone());
+        }
+        graph.relations.insert(
+            root.id,
+            vec![
+                edge(&first, &root, RelationKind::Calls, true),
+                edge(&second, &root, RelationKind::Calls, true),
+            ],
+        );
+
+        let report = rank_impact_at(&graph, &root.id, 1).unwrap();
+        assert_eq!(report.candidates.len(), 2);
+        let ids: Vec<_> = report
+            .candidates
+            .iter()
+            .map(|candidate| candidate.entity_id)
+            .collect();
+        assert!(ids.contains(&first.id));
+        assert!(ids.contains(&second.id));
+    }
+
+    #[test]
     fn confidence_points_match_the_documented_rounding_formula() {
         let root = entity("root", "src/root.rs", 1);
         let caller = entity("caller", "src/caller.rs", 1);
@@ -669,5 +708,28 @@ mod tests {
         relation.confidence = 0.8049;
         let components = score_components(ImpactBucket::RuntimeCaller, &relation, 1);
         assert_eq!(components.confidence_points, 80);
+    }
+
+    #[test]
+    fn spawned_runtime_caller_is_ranked_with_direct_path_evidence() {
+        let root = entity("worker", "src/worker.rs", 10);
+        let caller = entity("launch", "src/launch.rs", 20);
+        let mut graph = Graph::default();
+        for value in [&root, &caller] {
+            graph.entities.insert(value.id, value.clone());
+        }
+        graph.relations.insert(
+            root.id,
+            vec![edge(&caller, &root, RelationKind::Spawns, true)],
+        );
+
+        let report = rank_impact_at(&graph, &root.id, 1).unwrap();
+        let candidate = report.candidates.first().expect("spawn caller");
+        assert_eq!(candidate.identity.name, "launch");
+        assert_eq!(candidate.bucket, ImpactBucket::RuntimeCaller);
+        assert_eq!(candidate.relation, RelationKind::Spawns);
+        assert_eq!(candidate.score_components.relation_points, 110);
+        assert_eq!(candidate.path[0].relation_kind, RelationKind::Spawns);
+        assert!(candidate.path[0].evidence[0].source_span.is_some());
     }
 }
