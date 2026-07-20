@@ -31,6 +31,10 @@ pub(crate) struct BenchMeta {
 pub struct CoordinationMeta {
     pub schema: String,
     pub effective_mode: String,
+    #[serde(default)]
+    pub effective_mode_source: String,
+    #[serde(default)]
+    pub daemon_runtime_attested: bool,
     pub default_mode: String,
     pub hard_rejection_active: bool,
     pub capability_evaluation_active: bool,
@@ -43,6 +47,14 @@ pub struct CoordinationMeta {
     pub durable_event_schema: String,
     pub durable_event_store: String,
     pub durable_event_fsync_before_broadcast: bool,
+    #[serde(default)]
+    pub durable_event_mutation_fail_closed: bool,
+    #[serde(default)]
+    pub durable_event_lifecycle_complete: bool,
+    #[serde(default)]
+    pub durable_event_reservation_prefix: String,
+    #[serde(default)]
+    pub durable_event_requires_terminal_pair: bool,
     pub durable_event_families: Vec<String>,
     pub contract_scope_claim_eligible: bool,
     pub all_write_surfaces_claim_eligible: bool,
@@ -215,19 +227,39 @@ pub(crate) fn build_meta() -> Result<BenchMeta> {
 }
 
 pub fn coordination_meta() -> CoordinationMeta {
-    coordination_meta_for_mode(kin_mcp::CoordinationEnforcementMode::from_env())
+    coordination_meta_with_source(
+        kin_mcp::CoordinationEnforcementMode::from_env(),
+        "process_env",
+        false,
+    )
 }
 
 pub fn coordination_meta_for_mode(mode: kin_mcp::CoordinationEnforcementMode) -> CoordinationMeta {
+    coordination_meta_with_source(mode, "explicit_mode", false)
+}
+
+pub fn coordination_meta_for_daemon_mode(
+    mode: kin_mcp::CoordinationEnforcementMode,
+) -> CoordinationMeta {
+    coordination_meta_with_source(mode, "daemon_startup_snapshot", true)
+}
+
+fn coordination_meta_with_source(
+    mode: kin_mcp::CoordinationEnforcementMode,
+    source: &str,
+    daemon_runtime_attested: bool,
+) -> CoordinationMeta {
     CoordinationMeta {
         schema: "kin.coordination-enforcement.v1".to_string(),
         effective_mode: mode.as_str().to_string(),
+        effective_mode_source: source.to_string(),
+        daemon_runtime_attested,
         default_mode: "warn".to_string(),
         hard_rejection_active: mode.is_enforcing(),
         capability_evaluation_active: mode.evaluates(),
         capability_fail_closed_active: mode.is_enforcing(),
         intent_registration_linearized: true,
-        max_concurrent_intents_enforced: true,
+        max_concurrent_intents_enforced: mode.is_enforcing(),
         hard_intent_capabilities_checked: vec!["can_write".to_string()],
         transaction_capabilities_covered: vec!["can_write".to_string(), "can_commit".to_string()],
         surfaces: CoordinationSurfaceMeta {
@@ -243,6 +275,10 @@ pub fn coordination_meta_for_mode(mode: kin_mcp::CoordinationEnforcementMode) ->
         durable_event_schema: "kin.coordination-event.v1".to_string(),
         durable_event_store: ".kin/coordination_events.jsonl".to_string(),
         durable_event_fsync_before_broadcast: true,
+        durable_event_mutation_fail_closed: true,
+        durable_event_lifecycle_complete: true,
+        durable_event_reservation_prefix: "pending:".to_string(),
+        durable_event_requires_terminal_pair: true,
         durable_event_families: vec![
             "intent_registration".to_string(),
             "intent_release".to_string(),

@@ -38,9 +38,10 @@
 //! Rung-3 of the write path. The agent-write apply paths (`POST /vfs/write-notify`,
 //! `POST /vfs/file-changed`, and MCP `kin_transaction_commit`) evaluate whether
 //! a write touches a scope held under another session's hard intent and, by
-//! default, surface the collision without blocking. Intent registration and
-//! transaction apply share a coordinator gate, so enforce mode cannot race a
-//! hard-intent registration between preflight and graph apply.
+//! default, surface the collision without blocking. Intent registration,
+//! automatic expiry/orphan sweeps, and transaction apply share the same gates,
+//! so enforce mode cannot race lifecycle cleanup against preflight and graph
+//! apply.
 //!
 //! - Default (unset): **warn**. The write still proceeds — a colliding write is
 //!   declined by the reconciler's own check and reported as a soft notification —
@@ -49,7 +50,8 @@
 //!   collision it would hit under enforce.
 //! - `KIN_WRITE_VETO=enforce`: the write is rejected *before* it is folded into
 //!   the graph with a structured `409 Conflict` (`error: "write_veto"`) naming
-//!   the blocking intent(s).
+//!   the blocking intent(s). Missing, mismatched, unknown, or read-only VFS
+//!   caller identity is rejected first with `403 Forbidden`.
 //! - `KIN_WRITE_VETO=off`: the veto never evaluates and never annotates or
 //!   rejects. MCP transaction responses still carry the additive coordination
 //!   coverage attestation with `evaluated:false`.
@@ -101,9 +103,10 @@
 //!   scopes and non-transaction graph-mutating MCP tools are explicitly not
 //!   claim-eligible yet. Each terminal outcome is submitted to
 //!   `.kin/coordination_events.jsonl` with sequence, repo/session/intent,
-//!   effective mode, and release attribution; a successful append is fsynced
-//!   before live broadcast, and persistence failures are logged without a
-//!   misleading broadcast.
+//!   effective mode, and release attribution. A write-ahead reservation is
+//!   fsynced before mutation, the terminal event is fsynced before live
+//!   broadcast, and any persistence failure makes health `attention` and the
+//!   stream ineligible rather than reporting a misleading success.
 
 pub mod api;
 pub mod commit_deltas;

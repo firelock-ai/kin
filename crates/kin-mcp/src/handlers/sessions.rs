@@ -299,7 +299,10 @@ pub async fn handle_register_intent(
         task_description,
         expires_at,
     ) {
-        crate::session::IntentRegistrationAttempt::Registered(intent) => {
+        crate::session::IntentRegistrationAttempt::Registered {
+            intent,
+            policy_warnings,
+        } => {
             let result = serde_json::json!({
                 "intent_id": intent.intent_id.to_string(),
                 "session_id": intent.session_id.to_string(),
@@ -308,6 +311,7 @@ pub async fn handle_register_intent(
                 "task_description": intent.task_description,
                 "registered_at": intent.registered_at,
                 "status": "registered",
+                "coordination_warnings": policy_warnings,
             });
             let json =
                 serde_json::to_string_pretty(&result).map_err(crate::error::McpError::Json)?;

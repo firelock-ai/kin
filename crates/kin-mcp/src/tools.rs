@@ -479,6 +479,7 @@ pub fn tool_definitions() -> ToolsListResult {
                     "type": "object",
                     "properties": {
                         "transaction_id": { "type": "string", "description": "Transaction UUID" },
+                        "session_id": { "type": "string", "description": "Optional owning session UUID mirror; when present in enforce mode it must match the authenticated caller and transaction owner" },
                         "operations": {
                             "type": "array",
                             "description": "Array of mutation operations to stage",
@@ -510,7 +511,8 @@ pub fn tool_definitions() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "transaction_id": { "type": "string", "description": "Transaction UUID" }
+                        "transaction_id": { "type": "string", "description": "Transaction UUID" },
+                        "session_id": { "type": "string", "description": "Optional owning session UUID mirror; when present in enforce mode it must match the authenticated caller and transaction owner" }
                     },
                     "required": ["transaction_id"]
                 }),
@@ -522,6 +524,7 @@ pub fn tool_definitions() -> ToolsListResult {
                     "type": "object",
                     "properties": {
                         "transaction_id": { "type": "string", "description": "Transaction UUID" },
+                        "session_id": { "type": "string", "description": "Optional owning session UUID mirror; when present in enforce mode it must match the authenticated caller and transaction owner" },
                         "operations": {
                             "type": "array",
                             "description": "Optional array of mutation operations to stage immediately before committing (solves stage+commit HTTP persistence gaps)",
@@ -553,7 +556,8 @@ pub fn tool_definitions() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "transaction_id": { "type": "string", "description": "Transaction UUID" }
+                        "transaction_id": { "type": "string", "description": "Transaction UUID" },
+                        "session_id": { "type": "string", "description": "Optional owning session UUID mirror; when present in enforce mode it must match the authenticated caller and transaction owner" }
                     },
                     "required": ["transaction_id"]
                 }),

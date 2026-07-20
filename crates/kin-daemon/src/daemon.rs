@@ -743,9 +743,59 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
             if *sweep_cancel.borrow() {
                 break;
             }
-            match sweep_state.coordinator.sweep_stale_sessions() {
-                Ok(_) => {}
+            let _coordination = sweep_state.coordination_gate.lock().await;
+            let mode = sweep_state.coordination_mode().as_str().to_string();
+            match sweep_state
+                .coordinator
+                .sweep_stale_sessions_with_reservation(|session, intents| {
+                    for intent in intents {
+                        sweep_state.record_coordination_event(
+                            crate::state::CoordinationEventDraft {
+                                event: "intent_release",
+                                outcome: "pending:session_reaped".to_string(),
+                                session_id: Some(session.session_id.to_string()),
+                                intent_id: Some(intent.intent_id.to_string()),
+                                intent_ids: vec![intent.intent_id.to_string()],
+                                transaction_id: None,
+                                scopes: intent
+                                    .scopes
+                                    .iter()
+                                    .map(crate::api::format_scope)
+                                    .collect(),
+                                enforcement_mode: mode.clone(),
+                                blocking_intent_ids: Vec::new(),
+                            },
+                        )?;
+                    }
+                    Ok(())
+                }) {
+                Ok(reaped) => {
+                    for (session, intents) in reaped {
+                        for intent in intents {
+                            let _ = sweep_state.record_coordination_event(
+                                crate::state::CoordinationEventDraft {
+                                    event: "intent_release",
+                                    outcome: "session_reaped".to_string(),
+                                    session_id: Some(session.session_id.to_string()),
+                                    intent_id: Some(intent.intent_id.to_string()),
+                                    intent_ids: vec![intent.intent_id.to_string()],
+                                    transaction_id: None,
+                                    scopes: intent
+                                        .scopes
+                                        .iter()
+                                        .map(crate::api::format_scope)
+                                        .collect(),
+                                    enforcement_mode: mode.clone(),
+                                    blocking_intent_ids: Vec::new(),
+                                },
+                            );
+                        }
+                    }
+                }
                 Err(e) => {
+                    sweep_state.mark_coordination_evidence_incomplete(format!(
+                        "stale-session sweep failed after reservation may have been written: {e}"
+                    ));
                     error!(error = %e, "session sweeper error");
                 }
             }
