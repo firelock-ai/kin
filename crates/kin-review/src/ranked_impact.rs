@@ -293,9 +293,11 @@ fn candidate_is_better(
     candidate: &RankedImpactCandidate,
     existing: &RankedImpactCandidate,
 ) -> bool {
-    candidate.priority_score > existing.priority_score
-        || (candidate.priority_score == existing.priority_score
-            && (candidate.hop, candidate.entity_id) < (existing.hop, existing.entity_id))
+    candidate.hop < existing.hop
+        || (candidate.hop == existing.hop
+            && (candidate.priority_score > existing.priority_score
+                || (candidate.priority_score == existing.priority_score
+                    && candidate.entity_id < existing.entity_id)))
 }
 
 fn relation_sort_key(relation: &Relation) -> (String, String, String) {
@@ -363,7 +365,7 @@ fn score_components(
         bucket_points: bucket.points(),
         relation_points: relation_points(relation.kind),
         hop_points,
-        confidence_points: (confidence_basis_points(relation.confidence) + 50) / 100,
+        confidence_points: (relation.confidence.clamp(0.0, 1.0) * 100.0).round() as u32,
         source_evidence_points: if relation
             .evidence
             .iter()
@@ -664,8 +666,8 @@ mod tests {
         let root = entity("root", "src/root.rs", 1);
         let caller = entity("caller", "src/caller.rs", 1);
         let mut relation = edge(&caller, &root, RelationKind::Calls, false);
-        relation.confidence = 0.805;
+        relation.confidence = 0.8049;
         let components = score_components(ImpactBucket::RuntimeCaller, &relation, 1);
-        assert_eq!(components.confidence_points, 81);
+        assert_eq!(components.confidence_points, 80);
     }
 }

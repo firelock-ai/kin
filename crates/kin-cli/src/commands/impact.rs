@@ -5,6 +5,8 @@ use anyhow::{Context, Result};
 use kin_model::{EntityFilter, EntityId, EntityStore};
 use serde::{Deserialize, Serialize};
 
+pub const IMPACT_RESPONSE_SCHEMA_VERSION: &str = "kin-impact-response-v1";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImpactRequest {
     pub entity: String,
@@ -30,14 +32,17 @@ pub struct ImpactRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImpactResponse {
     pub lines: Vec<String>,
+    #[serde(default)]
     pub schema_version: String,
+    #[serde(default)]
     pub resolution: String,
+    #[serde(default)]
     pub query: ImpactQuery,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ranked: Option<kin_review::RankedImpactReport>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImpactQuery {
     pub entity: String,
     pub file: Option<String>,
@@ -69,7 +74,15 @@ pub async fn run(
     )
     .await?;
     if json {
+        if response.schema_version.is_empty() {
+            anyhow::bail!(
+                "the running daemon does not support structured ranked impact; restart it with the current Kin build"
+            );
+        }
         println!("{}", serde_json::to_string_pretty(&response)?);
+        if response.resolution != "resolved" {
+            anyhow::bail!("impact resolution failed: {}", response.resolution);
+        }
     } else {
         for line in response.lines {
             println!("{line}");
@@ -117,7 +130,7 @@ pub async fn build_impact_response(
     if matches.is_empty() {
         return Ok(ImpactResponse {
             lines: impact_not_found_guidance(&request.entity),
-            schema_version: kin_review::RANKED_IMPACT_SCHEMA_VERSION.to_string(),
+            schema_version: IMPACT_RESPONSE_SCHEMA_VERSION.to_string(),
             resolution: "not_found".to_string(),
             query,
             ranked: None,
@@ -131,7 +144,7 @@ pub async fn build_impact_response(
                 request.entity,
                 matches.len()
             )],
-            schema_version: kin_review::RANKED_IMPACT_SCHEMA_VERSION.to_string(),
+            schema_version: IMPACT_RESPONSE_SCHEMA_VERSION.to_string(),
             resolution: "ambiguous".to_string(),
             query,
             ranked: None,
@@ -164,13 +177,17 @@ pub async fn build_impact_response(
         }
     }
 
-    let ranked = kin_review::rank_impact(graph, &target.id, request.depth)?;
+    let ranked = if request.require_unique {
+        Some(kin_review::rank_impact(graph, &target.id, request.depth)?)
+    } else {
+        None
+    };
     Ok(ImpactResponse {
         lines,
-        schema_version: kin_review::RANKED_IMPACT_SCHEMA_VERSION.to_string(),
+        schema_version: IMPACT_RESPONSE_SCHEMA_VERSION.to_string(),
         resolution: "resolved".to_string(),
         query,
-        ranked: Some(ranked),
+        ranked,
     })
 }
 
@@ -178,18 +195,21 @@ fn resolve_entities(
     graph: &kin_db::InMemoryGraph,
     request: &ImpactRequest,
 ) -> Result<Vec<kin_model::Entity>> {
-    if let Ok(uuid) = uuid::Uuid::parse_str(&request.entity) {
-        return Ok(graph.get_entity(&EntityId(uuid))?.into_iter().collect());
-    }
-
-    let filter = EntityFilter {
-        name_pattern: Some(request.entity.clone()),
-        ..Default::default()
+    let mut matches = if let Ok(uuid) = uuid::Uuid::parse_str(&request.entity) {
+        graph.get_entity(&EntityId(uuid))?.into_iter().collect()
+    } else {
+        let filter = EntityFilter {
+            name_pattern: Some(request.entity.clone()),
+            ..Default::default()
+        };
+        let mut matches = graph.query_entities(&filter)?;
+        // The human surface preserves Kin's broad name matching. Structured
+        // callers explicitly opt into exact, fail-closed identity resolution.
+        if request.require_unique {
+            matches.retain(|entity| entity.name == request.entity);
+        }
+        matches
     };
-    let mut matches = graph.query_entities(&filter)?;
-    // EntityFilter name matching is intentionally broad for search. Impact
-    // identity resolution is exact and fail-closed.
-    matches.retain(|entity| entity.name == request.entity);
     if let Some(file) = request.file.as_deref() {
         matches.retain(|entity| kin_review::StableEntityIdentity::from_entity(entity).file == file);
     }
@@ -223,7 +243,7 @@ fn impact_not_found_guidance(entity: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_impact_response, impact_not_found_guidance, ImpactRequest};
+    use super::{build_impact_response, impact_not_found_guidance, ImpactRequest, ImpactResponse};
     use kin_model::{
         Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
         FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, Relation, RelationId, RelationKind,
@@ -273,6 +293,71 @@ mod tests {
             joined.contains("kin xref"),
             "notes cross-repo path: {joined}"
         );
+    }
+
+    #[test]
+    fn legacy_daemon_response_deserializes_without_structured_fields() {
+        let response: ImpactResponse =
+            serde_json::from_value(serde_json::json!({ "lines": ["legacy"] })).unwrap();
+        assert_eq!(response.lines, vec!["legacy"]);
+        assert!(response.schema_version.is_empty());
+        assert!(response.resolution.is_empty());
+        assert_eq!(response.query.match_count, 0);
+        assert!(response.ranked.is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_human_resolution_preserves_broad_name_matching_and_skips_ranked_work() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .upsert_entity(&entity("changed", "src/lib.rs"))
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let response = build_impact_response(
+            &layout,
+            &graph,
+            &ImpactRequest {
+                entity: "CHANGED".to_string(),
+                depth: 3,
+                file: None,
+                kind: None,
+                signature: None,
+                require_unique: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.resolution, "resolved");
+        assert!(response.ranked.is_none());
+    }
+
+    #[tokio::test]
+    async fn uuid_resolution_still_enforces_identity_qualifiers() {
+        let graph = kin_db::InMemoryGraph::new();
+        let target = entity("changed", "src/lib.rs");
+        let target_id = target.id;
+        graph.upsert_entity(&target).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let response = build_impact_response(
+            &layout,
+            &graph,
+            &ImpactRequest {
+                entity: target_id.to_string(),
+                depth: 3,
+                file: Some("src/other.rs".to_string()),
+                kind: None,
+                signature: None,
+                require_unique: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.resolution, "not_found");
+        assert!(response.ranked.is_none());
     }
 
     #[tokio::test]
