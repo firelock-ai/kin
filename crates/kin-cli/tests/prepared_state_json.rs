@@ -149,20 +149,26 @@ fn parse_json_output(output: &Output, context: &str) -> Value {
     serde_json::from_slice(&output.stdout).expect("stdout should be valid json")
 }
 
+fn kin(repo: &Path, kin_home: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
+    command.current_dir(repo).env("KIN_HOME", kin_home);
+    command
+}
+
 #[test]
 fn prepared_state_publish_and_materialize_preserve_indexed_state() {
     let root = tempdir().expect("temp root");
     let repo1 = root.path().join("repo1");
     let repo2 = root.path().join("repo2");
     let prepared_dir = root.path().join("prepared");
+    let kin_home = root.path().join("kin-home");
     let remote = "https://example.com/acme/prepared-state.git";
 
     init_seed_repo(&repo1, remote);
     clone_same_repo_identity(&repo1, &repo2, remote);
 
-    let init = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let init = kin(&repo1, &kin_home)
         .args(["init", "--json", "."])
-        .current_dir(&repo1)
         .output()
         .expect("run kin init");
     let init_payload = parse_json_output(&init, "kin init --json");
@@ -170,7 +176,7 @@ fn prepared_state_publish_and_materialize_preserve_indexed_state() {
 
     seed_local_vectors(&repo1.join(".kin/kindb/graph.kndb"));
 
-    let publish = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let publish = kin(&repo1, &kin_home)
         .args([
             "prepared-state",
             "publish",
@@ -178,7 +184,6 @@ fn prepared_state_publish_and_materialize_preserve_indexed_state() {
             "--target",
             prepared_dir.to_str().expect("prepared dir"),
         ])
-        .current_dir(&repo1)
         .output()
         .expect("run kin prepared-state publish");
     let publish_payload = parse_json_output(&publish, "kin prepared-state publish --json");
@@ -186,7 +191,7 @@ fn prepared_state_publish_and_materialize_preserve_indexed_state() {
     assert_eq!(publish_payload["text_index_present"], true);
     assert_eq!(publish_payload["vector_index_present"], true);
 
-    let materialize = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let materialize = kin(&repo2, &kin_home)
         .args([
             "prepared-state",
             "materialize",
@@ -194,7 +199,6 @@ fn prepared_state_publish_and_materialize_preserve_indexed_state() {
             "--source",
             prepared_dir.to_str().expect("prepared dir"),
         ])
-        .current_dir(&repo2)
         .output()
         .expect("run kin prepared-state materialize");
     let materialize_payload =
@@ -209,13 +213,12 @@ fn prepared_state_publish_and_materialize_preserve_indexed_state() {
         publish_payload["cache_key"]
     );
 
-    let support = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let support = kin(&repo2, &kin_home)
         .args(["support", "--json"])
         .env("KIN_DAEMON_BIN", common::fresh_daemon_bin())
         .env("KIN_DAEMON_DISABLE_LSP", "1")
         .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1")
         .env("KIN_DAEMON_READY_TIMEOUT_SECS", "30")
-        .current_dir(&repo2)
         .output()
         .expect("run kin support --json");
     let support_payload = parse_json_output(&support, "kin support --json");
@@ -281,21 +284,21 @@ fn prepared_state_materialize_rejects_repo_state_mismatch() {
     let repo1 = root.path().join("repo1");
     let repo2 = root.path().join("repo2");
     let prepared_dir = root.path().join("prepared");
+    let kin_home = root.path().join("kin-home");
     let remote = "https://example.com/acme/prepared-state.git";
 
     init_seed_repo(&repo1, remote);
     clone_same_repo_identity(&repo1, &repo2, remote);
 
-    let init = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let init = kin(&repo1, &kin_home)
         .args(["init", "--json", "."])
-        .current_dir(&repo1)
         .output()
         .expect("run kin init");
     let _ = parse_json_output(&init, "kin init --json");
 
     seed_local_vectors(&repo1.join(".kin/kindb/graph.kndb"));
 
-    let publish = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let publish = kin(&repo1, &kin_home)
         .args([
             "prepared-state",
             "publish",
@@ -303,7 +306,6 @@ fn prepared_state_materialize_rejects_repo_state_mismatch() {
             "--target",
             prepared_dir.to_str().expect("prepared dir"),
         ])
-        .current_dir(&repo1)
         .output()
         .expect("run kin prepared-state publish");
     let _ = parse_json_output(&publish, "kin prepared-state publish --json");
@@ -312,7 +314,7 @@ fn prepared_state_materialize_rejects_repo_state_mismatch() {
     git(&repo2, &["config", "user.name", "Kin"]);
     git(&repo2, &["commit", "--allow-empty", "-m", "drift"]);
 
-    let materialize = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let materialize = kin(&repo2, &kin_home)
         .args([
             "prepared-state",
             "materialize",
@@ -320,7 +322,6 @@ fn prepared_state_materialize_rejects_repo_state_mismatch() {
             "--source",
             prepared_dir.to_str().expect("prepared dir"),
         ])
-        .current_dir(&repo2)
         .output()
         .expect("run kin prepared-state materialize");
     assert!(
