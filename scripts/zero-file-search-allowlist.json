@@ -85,18 +85,87 @@
       "expiration": "2026-12-31"
     },
     {
-      "file": "crates/kin-core/src/text_refs.rs",
-      "reason": "TRANSITIONAL: Direct filesystem read for text references. Needs migration to graph-derived source.",
-      "owner": "kin-core",
-      "status": "transitional",
-      "removal_target": "Replace direct text-reference reads with graph-derived source projection.",
-      "expiration": "2026-09-30"
-    },
-    {
       "file": "crates/kin-cli/src/retrieval_profile.rs",
       "reason": "Config/capability IO: probes the local model cache directory for reranker availability; never reads repo content and is not a semantic answer path",
       "owner": "kin-cli",
       "expiration": "2026-12-31"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/locate.rs",
+      "reason": "Telemetry consent boundary: the only filesystem touch in the locate authority path is the presence of the consent marker, which gates telemetry and never contributes to the ranked answer. Pinned so any other filesystem primitive in this module fails the guard",
+      "owner": "kin-cli",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "consent_marker_path"
+      ]
+    },
+    {
+      "file": "crates/kin-cli/src/commands/health.rs",
+      "reason": "Config/diagnostic IO: kin health reports on the local installation, so the environment is its subject, not a source of semantic answers. Every probe targets the install — daemon binary, VFS shim header, shell hook and rc, AI-client MCP config files, editor extensions dir, pending session runs. It must never read repo content to answer a semantic query",
+      "owner": "kin-cli",
+      "expiration": "2026-12-31"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/rename.rs",
+      "reason": "PENDING FOUNDER DECISION: the rename plan's file SET is graph-derived, but its edit COORDINATES are not. read_repo_file reads the raw working tree and find_token_occurrences lexically scans those bytes to produce every line/col in the plan, so a tree that has drifted from graph truth yields silently wrong or zero edits with no gap report. A graph-native path already exists (graph.rs get_file_hash -> BlobStore, which bails loud on miss). Not fixed here: routing rename through it is a behavior change owned by another lane. Pinned to the single known read so any additional filesystem access in this module fails the guard",
+      "owner": "kin-cli",
+      "expiration": "2026-09-30",
+      "allow_match": [
+        "std::fs::read_to_string(path)"
+      ]
+    },
+    {
+      "file": "crates/kin-cli/src/commands/deps.rs",
+      "reason": "PENDING FOUNDER DECISION: kin deps answers a cross-repo dependency query by scraping Cargo.toml/package.json and line-scanning for 'git =' entries; the graph is never consulted. xref.rs routes users here on a graph miss, so a compliant command's gap path hands off to this one. Not fixed here: making deps graph-backed, or reclassifying it as an ingestion-boundary command that is not an authority path, is a product decision. Pinned to the known manifest reads so any additional filesystem access in this module fails the guard",
+      "owner": "kin-cli",
+      "expiration": "2026-09-30",
+      "allow_match": [
+        "std::fs::read_to_string(&cargo_path)",
+        "crates_dir.is_dir()",
+        "std::fs::read_dir(&crates_dir)",
+        "member_cargo.is_file()",
+        "std::fs::read_to_string(&member_cargo)",
+        "pkg_path.is_file()",
+        "std::fs::read_to_string(&pkg_path)"
+      ]
+    },
+    {
+      "file": "crates/kin-mcp/src/handlers/common.rs",
+      "reason": "Layout discovery boundary: candidate_source_roots only probes KIN_SOURCE_ROOT and the cwd for a .kin layout so the BlobStore can be located. Entity bodies are still fetched by graph-recorded hash and re-digested before use, and a miss reports graph-miss rather than falling back to the working tree",
+      "owner": "kin-mcp",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "if root.is_dir()",
+        "cwd.is_dir()"
+      ]
+    },
+    {
+      "file": "crates/kin-git/src/import.rs",
+      "reason": "Git ingestion boundary: open_repo probes for a .git directory to distinguish a worktree from a bare repo before handing the path to gix. Explicit input boundary for building graph truth, not a semantic answer",
+      "owner": "kin-git",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "dot_git.is_dir()"
+      ]
+    },
+    {
+      "file": "crates/kin-git/src/export.rs",
+      "reason": "Git export boundary: probes the output path's git layout to decide open-vs-init before materializing graph truth as git objects. Explicit output boundary, not a semantic answer",
+      "owner": "kin-git",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "dot_git.is_dir()",
+        "output_path.join(\".git\").exists()"
+      ]
+    },
+    {
+      "file": "crates/kin-git/src/cochange.rs",
+      "reason": "Git ingestion boundary: open_repo probes the .git layout before mining commit history into graph relations. Co-change relations are read back from the graph, never from this traversal",
+      "owner": "kin-git",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "dot_git.is_dir()"
+      ]
     }
   ]
 }

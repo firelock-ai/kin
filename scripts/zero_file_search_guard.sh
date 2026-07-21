@@ -10,6 +10,18 @@
 # task-input boundary. Filesystem writes and directory creation are
 # materialization, not answer-by-search, and are intentionally not denied.
 #
+# This is the narrow half of a two-guard pair, both run by CI:
+#
+#   scripts/verify-zero-file-search.py   walks every crate, shares this deny
+#                                        set, and carries the owned, dated,
+#                                        existence-validated allowlist
+#   scripts/zero_file_search_guard.sh    this file — a dependency-free check on
+#                                        the core answer modules, driven by the
+#                                        kin-cli unit test as well as by CI
+#
+# Keep the deny sets in step. Coverage beyond these modules belongs in the
+# Python checker rather than being duplicated here.
+#
 # Usage: zero_file_search_guard.sh [repo_root]
 # Exit: 0 when the answer paths are graph-clean, 1 on the first violation.
 set -euo pipefail
