@@ -8514,22 +8514,13 @@ async fn spine_xref(
     })?;
 
     let entity_id = parse_entity_id_hex(&params.entity)?;
-    let edges = spine.cross_repo_edges_for(&params.repo, &entity_id);
-    let entity_keys = edges
-        .iter()
-        .flat_map(|edge| {
-            [
-                (edge.src_repo.clone(), edge.src_entity),
-                (edge.dst_repo.clone(), edge.dst_entity),
-            ]
-        })
-        .collect::<std::collections::BTreeSet<_>>();
-    let entities = entity_keys
-        .into_iter()
-        .filter_map(|(repo_id, entity_id)| spine.lookup_by_id(&repo_id, &entity_id))
-        .collect();
+    let snapshot = spine.cross_repo_edges_snapshot();
 
-    Ok(Json(kin_spine::SpineXrefResponse::new(edges, entities)))
+    Ok(Json(kin_spine::SpineXrefResponse::from_snapshot(
+        snapshot,
+        &params.repo,
+        &entity_id,
+    )))
 }
 
 /// `GET /v1/spine/edges` — one atomic graph-authoritative cross-repo snapshot.
@@ -14007,6 +13998,16 @@ mod tests {
             serde_json::json!(kin_spine::SPINE_PAYLOAD_VERSION),
             "/spine/xref payload must carry the spine wire-format version"
         );
+        assert_eq!(xbody["authority_complete"], true);
+        assert!(xbody["authority_revision"]
+            .as_str()
+            .is_some_and(|revision| revision.starts_with("sha256:") && revision.len() == 71));
+        assert_eq!(xbody["authority_roots"]["consumer"], "consumer-root");
+        assert_eq!(xbody["authority_roots"]["provider"], "provider-root");
+        assert!(xbody["entities"].as_array().is_some_and(|entities| {
+            entities.iter().any(|entity| entity["name"] == "run_task")
+                && entities.iter().any(|entity| entity["name"] == "do_work")
+        }));
 
         let snapshot = app
             .clone()
@@ -14065,6 +14066,85 @@ mod tests {
             serde_json::json!(kin_spine::SPINE_PAYLOAD_VERSION),
             "/spine/impact payload must carry the spine wire-format version"
         );
+    }
+
+    #[tokio::test]
+    async fn spine_xref_fails_closed_while_topology_is_dirty_then_exposes_complete_watermark() {
+        let consumer_id = EntityId::new();
+        let provider_id = EntityId::new();
+        let state = test_state();
+        let spine = state.ensure_spine().expect("spine enabled in test");
+        spine.register_repo(
+            "consumer",
+            vec![spine_test_entry_with_id(
+                "consumer",
+                consumer_id,
+                "run_task",
+            )],
+            "consumer-root",
+        );
+        spine.register_repo(
+            "provider",
+            vec![spine_test_entry_with_id("provider", provider_id, "do_work")],
+            "provider-root",
+        );
+        spine.add_cross_repo_edge(kin_spine::CrossRepoEdge {
+            src_repo: "consumer".to_string(),
+            src_entity: consumer_id,
+            dst_repo: "provider".to_string(),
+            dst_entity: provider_id,
+            confidence: 0.9,
+        });
+
+        let app = router(state.clone());
+        let read_xref = |app: Router| async move {
+            let response = app
+                .oneshot(
+                    Request::get(format!(
+                        "/spine/xref?repo=provider&entity={}",
+                        provider_id.0
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            serde_json::from_slice::<serde_json::Value>(
+                &axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+
+        let dirty = read_xref(app.clone()).await;
+        assert_eq!(dirty["authority_complete"], false);
+        assert!(dirty["authority_revision"]
+            .as_str()
+            .is_some_and(|revision| revision.starts_with("sha256:")));
+        assert_eq!(dirty["authority_roots"]["provider"], "provider-root");
+        assert_eq!(dirty["edges"].as_array().map(Vec::len), Some(1));
+        assert_eq!(dirty["entities"].as_array().map(Vec::len), Some(2));
+
+        let mut repos = state
+            .ensure_spine()
+            .expect("spine enabled in test")
+            .registered_repo_ids()
+            .into_iter()
+            .collect::<Vec<_>>();
+        repos.sort();
+        for repo in &repos {
+            state
+                .ensure_spine()
+                .expect("spine enabled in test")
+                .refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+        let complete = read_xref(app).await;
+        assert_eq!(complete["authority_complete"], true);
+        assert_eq!(complete["authority_roots"], dirty["authority_roots"]);
+        assert_ne!(complete["authority_revision"], dirty["authority_revision"]);
+        assert!(complete["edges"].as_array().is_some_and(Vec::is_empty));
     }
 
     #[tokio::test]
@@ -14476,13 +14556,28 @@ mod tests {
         let layout = state.layout.clone();
         {
             let spine = state.ensure_spine().expect("spine enabled in test");
-            spine.register_repo("provider", vec![provider_entry], "");
-            spine.refresh_cross_repo_edges(
+            spine.register_repo("provider", vec![provider_entry], "provider-root");
+            spine.register_repo(
                 "consumer",
-                &consumer_entities,
-                &consumer_relations,
-                &["provider".to_string()],
+                consumer_entities
+                    .iter()
+                    .map(|entity| spine_test_entry("consumer", entity))
+                    .collect(),
+                "consumer-root",
             );
+            let mut registry = spine.registered_repo_ids().into_iter().collect::<Vec<_>>();
+            registry.sort();
+            for repo in &registry {
+                match repo.as_str() {
+                    "consumer" => spine.refresh_cross_repo_edges(
+                        repo,
+                        &consumer_entities,
+                        &consumer_relations,
+                        &registry,
+                    ),
+                    _ => spine.refresh_cross_repo_edges(repo, &[], &[], &registry),
+                }
+            }
             assert!(
                 spine.edge_count() >= 1,
                 "fixture must materialize a cross-repo edge (parse -> link -> spine)"
@@ -14630,6 +14725,14 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(body["cross_repo"]["status"], "available");
         assert_eq!(body["cross_repo"]["reference_count"], 1);
+        assert_eq!(body["cross_repo"]["authority_complete"], true);
+        assert!(body["cross_repo"]["authority_revision"]
+            .as_str()
+            .is_some_and(|revision| revision.starts_with("sha256:")));
+        assert_eq!(
+            body["cross_repo"]["authority_roots"]["provider"],
+            "provider-root"
+        );
         assert!(body["references"].as_array().is_some_and(|references| {
             references.iter().any(|reference| {
                 reference["name"] == "run_task" && reference["file_path"] == "[consumer] src/app.rs"
@@ -14758,6 +14861,110 @@ mod tests {
         std::env::remove_var("KIN_REPO_ID");
         std::env::remove_var("KIN_DAEMON_URL");
         server.abort();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mcp_find_references_treats_legacy_unwatermarked_xref_as_inconclusive() {
+        async fn legacy_xref() -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "version": kin_spine::SPINE_PAYLOAD_VERSION,
+                "edges": [],
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, Router::new().fallback(legacy_xref)).await;
+        });
+        std::env::set_var("KIN_DAEMON_URL", format!("http://{addr}"));
+        std::env::set_var("KIN_REPO_ID", "provider");
+
+        let target = test_entity("do_work", "src/lib.rs");
+        let graph = kin_db::InMemoryGraph::new();
+        graph.upsert_entity(&target).unwrap();
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let result = kin_mcp::handlers::entities::handle_find_references(&args, &graph)
+            .await
+            .unwrap();
+        let result = kin_mcp::finalize_with_envelope(
+            result,
+            kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+                "initialized": true,
+                "graph_loaded": true,
+                "graph_generation": 12,
+            })),
+            "find_references",
+        );
+        let kin_mcp::types::ContentBlock::Text { text } = result
+            .content
+            .first()
+            .expect("find_references text response");
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["cross_repo"]["status"], "available");
+        assert_eq!(body["cross_repo"]["authority_complete"], false);
+        assert_eq!(
+            body["cross_repo"]["authority_revision"],
+            serde_json::Value::Null
+        );
+        assert_eq!(body["negative"]["safe_to_conclude_absent"], false);
+        assert!(body["negative"]["trust_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("cross_repo_authority_incomplete")));
+
+        std::env::remove_var("KIN_REPO_ID");
+        std::env::remove_var("KIN_DAEMON_URL");
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mcp_find_references_requires_nonblank_repo_binding() {
+        let target = test_entity("do_work", "src/lib.rs");
+        let graph = kin_db::InMemoryGraph::new();
+        graph.upsert_entity(&target).unwrap();
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+
+        for repo_id in [None, Some("   ")] {
+            match repo_id {
+                Some(value) => std::env::set_var("KIN_REPO_ID", value),
+                None => std::env::remove_var("KIN_REPO_ID"),
+            }
+            let result = kin_mcp::handlers::entities::handle_find_references(&args, &graph)
+                .await
+                .unwrap();
+            let result = kin_mcp::finalize_with_envelope(
+                result,
+                kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+                    "initialized": true,
+                    "graph_loaded": true,
+                    "graph_generation": 12,
+                })),
+                "find_references",
+            );
+            let kin_mcp::types::ContentBlock::Text { text } = result
+                .content
+                .first()
+                .expect("find_references text response");
+            let body: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(body["cross_repo"]["status"], "unavailable");
+            assert!(body["cross_repo"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("KIN_REPO_ID is missing or blank")));
+            assert_eq!(body["negative"]["safe_to_conclude_absent"], false);
+            assert!(body["negative"]["trust_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("cross_repo_unavailable")));
+        }
+
+        std::env::remove_var("KIN_REPO_ID");
     }
 
     // -----------------------------------------------------------------------

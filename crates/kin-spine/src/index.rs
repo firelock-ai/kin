@@ -7,7 +7,7 @@
 //! registered repos. Provides name-based resolution with fingerprint
 //! disambiguation for common names like Config, Error, init.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use hashbrown::HashMap;
 use kin_model::{Entity, EntityId, EntityKind, EntityRole, Relation, SemanticFingerprint};
@@ -34,6 +34,25 @@ pub struct EntityEntry {
     pub role: Option<EntityRole>,
 }
 
+impl PartialEq for EntityEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.repo_id == other.repo_id
+            && self.entity_id == other.entity_id
+            && self.name == other.name
+            && self.kind == other.kind
+            && self.signature == other.signature
+            && self.fingerprint.algorithm == other.fingerprint.algorithm
+            && self.fingerprint.ast_hash == other.fingerprint.ast_hash
+            && self.fingerprint.signature_hash == other.fingerprint.signature_hash
+            && self.fingerprint.behavior_hash == other.fingerprint.behavior_hash
+            && self.fingerprint.equivalence_hash == other.fingerprint.equivalence_hash
+            && self.fingerprint.stability_score.to_bits()
+                == other.fingerprint.stability_score.to_bits()
+            && self.file_path == other.file_path
+            && self.role == other.role
+    }
+}
+
 /// Cross-repo edge linking two entities across repo boundaries.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CrossRepoEdge {
@@ -50,22 +69,93 @@ pub struct CrossRepoEdge {
 ///
 /// `edges` remains the canonical topology payload. `entities` is an additive,
 /// metadata-only sidecar that lets clients render useful cross-repo references
-/// without inventing field names or reading another repository's files. Older
-/// version-1 daemons omitted the sidecar, so it defaults to empty on decode.
+/// without inventing field names or reading another repository's files.
+/// `authority_*` carries the exact graph-authority watermark against which the
+/// topology was answered. Older version-1 daemons omitted the additive sidecar
+/// and authority fields, so they decode conservatively as incomplete.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SpineXrefResponse {
     version: u32,
     pub edges: Vec<CrossRepoEdge>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entities: Vec<EntityEntry>,
+    #[serde(default)]
+    pub authority_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub authority_roots: BTreeMap<RepoId, String>,
 }
 
 impl SpineXrefResponse {
+    /// Construct an unwatermarked response.
+    ///
+    /// This remains available for patch-compatible callers that only have an
+    /// edge collection, but it deliberately cannot certify an empty result.
+    /// Production daemon routes should use [`Self::from_snapshot`].
     pub fn new(edges: Vec<CrossRepoEdge>, entities: Vec<EntityEntry>) -> Self {
         Self {
             version: crate::SPINE_PAYLOAD_VERSION,
             edges,
             entities,
+            authority_complete: false,
+            authority_revision: None,
+            authority_roots: BTreeMap::new(),
+        }
+    }
+
+    /// Project one entity's xrefs from a single atomic authority snapshot.
+    ///
+    /// Both topology and the metadata sidecar come from the same spine read.
+    /// Completeness also requires that the requested repository belongs to the
+    /// snapshot's root watermark; a typo or stale binding must not certify an
+    /// empty result against some unrelated repository universe.
+    pub fn from_snapshot(
+        snapshot: CrossRepoEdgesSnapshot,
+        repo_id: &str,
+        entity_id: &EntityId,
+    ) -> Self {
+        let CrossRepoEdgesSnapshot {
+            complete,
+            revision,
+            roots,
+            edges,
+            entities,
+            covered_entities,
+            ..
+        } = snapshot;
+        let edges = edges
+            .into_iter()
+            .filter(|edge| {
+                (edge.src_repo == repo_id && edge.src_entity == *entity_id)
+                    || (edge.dst_repo == repo_id && edge.dst_entity == *entity_id)
+            })
+            .collect::<Vec<_>>();
+        let entity_keys = edges
+            .iter()
+            .flat_map(|edge| {
+                [
+                    (edge.src_repo.clone(), edge.src_entity),
+                    (edge.dst_repo.clone(), edge.dst_entity),
+                ]
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let entities = entities
+            .into_iter()
+            .filter(|entity| entity_keys.contains(&(entity.repo_id.clone(), entity.entity_id)))
+            .collect();
+
+        Self {
+            version: crate::SPINE_PAYLOAD_VERSION,
+            edges,
+            entities,
+            authority_complete: complete
+                && roots.contains_key(repo_id)
+                && covered_entities
+                    .get(repo_id)
+                    .is_some_and(|entities| entities.contains(entity_id)),
+            authority_revision: Some(revision),
+            authority_roots: roots,
         }
     }
 
@@ -86,6 +176,34 @@ impl SpineXrefResponse {
                 supported: crate::SPINE_PAYLOAD_VERSION,
             });
         }
+        if response.authority_complete {
+            let valid_revision = response
+                .authority_revision
+                .as_deref()
+                .is_some_and(|revision| {
+                    revision.len() == 71
+                        && revision.strip_prefix("sha256:").is_some_and(|digest| {
+                            digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        })
+                });
+            let valid_roots = !response.authority_roots.is_empty()
+                && response.authority_roots.iter().all(|(repo, root)| {
+                    !repo.is_empty()
+                        && repo.trim() == repo
+                        && !root.is_empty()
+                        && root.trim() == root
+                });
+            let endpoints_are_watermarked = response.edges.iter().all(|edge| {
+                response.authority_roots.contains_key(&edge.src_repo)
+                    && response.authority_roots.contains_key(&edge.dst_repo)
+            });
+            if !valid_revision || !valid_roots || !endpoints_are_watermarked {
+                return Err(SpineXrefDecodeError::InvalidAuthority(
+                    "complete xref authority requires a canonical revision, non-empty roots, and watermarked edge endpoints"
+                        .to_string(),
+                ));
+            }
+        }
         Ok(response)
     }
 }
@@ -96,6 +214,8 @@ pub enum SpineXrefDecodeError {
     Malformed(#[from] serde_json::Error),
     #[error("unsupported spine xref response version {actual}; supported version is {supported}")]
     UnsupportedVersion { actual: u32, supported: u32 },
+    #[error("invalid spine xref authority: {0}")]
+    InvalidAuthority(String),
 }
 
 /// One atomic, graph-authoritative view of every cross-repo edge in the spine.
@@ -112,6 +232,16 @@ pub struct CrossRepoEdgesSnapshot {
     pub repos: Vec<RepoId>,
     pub roots: BTreeMap<RepoId, String>,
     pub edges: Vec<CrossRepoEdge>,
+    /// Metadata for the returned edge endpoints, captured under the same lock.
+    /// This is an internal authority sidecar; the bulk edge route intentionally
+    /// projects only topology and watermarks onto its public wire response.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<EntityEntry>,
+    /// Entity IDs covered by the same registered root snapshot. Kept off the
+    /// serialized bulk payload; xref projection uses it to ensure the queried
+    /// anchor itself belongs to the watermarked graph before certifying absence.
+    #[serde(skip)]
+    covered_entities: BTreeMap<RepoId, BTreeSet<EntityId>>,
 }
 
 impl Default for CrossRepoEdgesSnapshot {
@@ -124,6 +254,8 @@ impl Default for CrossRepoEdgesSnapshot {
             repos: Vec::new(),
             roots,
             edges,
+            entities: Vec::new(),
+            covered_entities: BTreeMap::new(),
         }
     }
 }
@@ -335,7 +467,7 @@ impl SpineIndex {
     /// authority serialize to identical bytes. No projection or filesystem
     /// surface participates in this read.
     pub fn cross_repo_edges_snapshot(&self) -> CrossRepoEdgesSnapshot {
-        let (complete, roots, mut edges) = {
+        let (complete, roots, mut edges, mut entities, covered_entities) = {
             let inner = self.inner.read();
             let roots = inner
                 .root_hashes
@@ -352,6 +484,24 @@ impl SpineIndex {
                         .by_id
                         .contains_key(&(edge.dst_repo.clone(), edge.dst_entity))
             });
+            let entities = inner
+                .cross_repo_edges
+                .iter()
+                .flat_map(|edge| {
+                    [
+                        (edge.src_repo.clone(), edge.src_entity),
+                        (edge.dst_repo.clone(), edge.dst_entity),
+                    ]
+                })
+                .filter_map(|key| inner.by_id.get(&key).cloned())
+                .collect::<Vec<_>>();
+            let mut covered_entities = BTreeMap::<RepoId, BTreeSet<EntityId>>::new();
+            for (repo_id, entity_id) in inner.by_id.keys() {
+                covered_entities
+                    .entry(repo_id.clone())
+                    .or_default()
+                    .insert(*entity_id);
+            }
             (
                 inner.active_edge_refreshes == 0
                     && inner.dirty_edge_repos.is_empty()
@@ -362,11 +512,21 @@ impl SpineIndex {
                     && edge_authority_is_closed,
                 roots,
                 inner.cross_repo_edges.clone(),
+                entities,
+                covered_entities,
             )
         };
 
         edges.sort_by(cross_repo_edge_order);
         edges.dedup_by(|a, b| cross_repo_edge_identity_order(a, b).is_eq());
+        entities.sort_by(|left, right| {
+            left.repo_id
+                .cmp(&right.repo_id)
+                .then_with(|| left.entity_id.cmp(&right.entity_id))
+        });
+        entities.dedup_by(|left, right| {
+            left.repo_id == right.repo_id && left.entity_id == right.entity_id
+        });
 
         let repos = roots.keys().cloned().collect::<Vec<_>>();
         let revision = cross_repo_snapshot_revision(&roots, &edges);
@@ -376,6 +536,8 @@ impl SpineIndex {
             repos,
             roots,
             edges,
+            entities,
+            covered_entities,
         }
     }
 
@@ -645,10 +807,13 @@ mod tests {
         assert_eq!(decoded.edges[0].src_repo, "consumer");
         assert_eq!(decoded.entities.len(), 1);
         assert_eq!(decoded.entities[0].name, "run_task");
+        assert!(!decoded.authority_complete);
+        assert!(decoded.authority_revision.is_none());
+        assert!(decoded.authority_roots.is_empty());
     }
 
     #[test]
-    fn xref_wire_response_accepts_version_one_without_metadata_sidecar() {
+    fn xref_wire_response_accepts_legacy_version_one_as_incomplete() {
         let src = EntityId::new();
         let dst = EntityId::new();
         let bytes = serde_json::to_vec(&serde_json::json!({
@@ -666,6 +831,71 @@ mod tests {
         let decoded = SpineXrefResponse::from_slice(&bytes).unwrap();
         assert_eq!(decoded.edges.len(), 1);
         assert!(decoded.entities.is_empty());
+        assert!(!decoded.authority_complete);
+        assert!(decoded.authority_revision.is_none());
+        assert!(decoded.authority_roots.is_empty());
+    }
+
+    #[test]
+    fn xref_wire_response_projects_complete_atomic_snapshot() {
+        let src = EntityId::new();
+        let dst = EntityId::new();
+        let no_refs = EntityId::new();
+        let consumer = test_entry_with_id("consumer", src, "run_task");
+        let provider = test_entry_with_id("provider", dst, "do_work");
+        let unused = test_entry_with_id("provider", no_refs, "unused");
+        let index = SpineIndex::new();
+        index.register_repo("consumer", vec![consumer], "consumer-root");
+        index.register_repo("provider", vec![provider, unused], "provider-root");
+        let repos = vec!["consumer".to_string(), "provider".to_string()];
+        for repo in &repos {
+            index.refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+        index.add_cross_repo_edge(CrossRepoEdge {
+            src_repo: "consumer".to_string(),
+            src_entity: src,
+            dst_repo: "provider".to_string(),
+            dst_entity: dst,
+            confidence: 0.9,
+        });
+
+        let response =
+            SpineXrefResponse::from_snapshot(index.cross_repo_edges_snapshot(), "provider", &dst);
+        assert!(response.authority_complete);
+        assert!(response
+            .authority_revision
+            .as_deref()
+            .is_some_and(|revision| revision.starts_with("sha256:")));
+        assert_eq!(response.authority_roots["consumer"], "consumer-root");
+        assert_eq!(response.authority_roots["provider"], "provider-root");
+        assert_eq!(response.edges.len(), 1);
+        assert_eq!(response.entities.len(), 2);
+        assert_eq!(response.entities[0].repo_id, "consumer");
+        assert_eq!(response.entities[1].repo_id, "provider");
+
+        let decoded =
+            SpineXrefResponse::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+        assert!(decoded.authority_complete);
+        assert_eq!(decoded.authority_revision, response.authority_revision);
+
+        let wrong_repo =
+            SpineXrefResponse::from_snapshot(index.cross_repo_edges_snapshot(), "unknown", &dst);
+        assert!(!wrong_repo.authority_complete);
+
+        let covered_empty = SpineXrefResponse::from_snapshot(
+            index.cross_repo_edges_snapshot(),
+            "provider",
+            &no_refs,
+        );
+        assert!(covered_empty.authority_complete);
+        assert!(covered_empty.edges.is_empty());
+
+        let unknown_entity = SpineXrefResponse::from_snapshot(
+            index.cross_repo_edges_snapshot(),
+            "provider",
+            &EntityId::new(),
+        );
+        assert!(!unknown_entity.authority_complete);
     }
 
     #[test]
@@ -693,6 +923,17 @@ mod tests {
         assert!(matches!(
             SpineXrefResponse::from_slice(&unsupported),
             Err(SpineXrefDecodeError::UnsupportedVersion { .. })
+        ));
+
+        let unwatermarked_complete = serde_json::to_vec(&serde_json::json!({
+            "version": crate::SPINE_PAYLOAD_VERSION,
+            "edges": [],
+            "authority_complete": true,
+        }))
+        .unwrap();
+        assert!(matches!(
+            SpineXrefResponse::from_slice(&unwatermarked_complete),
+            Err(SpineXrefDecodeError::InvalidAuthority(_))
         ));
     }
 

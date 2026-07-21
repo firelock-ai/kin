@@ -222,17 +222,40 @@ fn focal_entity_is_method(payload: &Value) -> bool {
         .is_some_and(|kind| kind.eq_ignore_ascii_case("method"))
 }
 
-fn cross_repo_references_unavailable(payload: &Value) -> Option<&str> {
+fn cross_repo_references_gap(payload: &Value) -> Option<String> {
     let cross_repo = payload.get("cross_repo")?;
-    if cross_repo.get("status").and_then(Value::as_str) != Some("unavailable") {
-        return None;
+    match cross_repo.get("status").and_then(Value::as_str) {
+        Some("unavailable") => {
+            let reason = cross_repo
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("the cross-repo spine could not answer");
+            Some(format!("cross_repo_unavailable: {reason}"))
+        }
+        Some("available") => {
+            let authority_complete = cross_repo
+                .get("authority_complete")
+                .and_then(Value::as_bool)
+                == Some(true);
+            let revision = cross_repo
+                .get("authority_revision")
+                .and_then(Value::as_str)
+                .filter(|revision| !revision.is_empty());
+            let roots_are_present = cross_repo
+                .get("authority_roots")
+                .and_then(Value::as_object)
+                .is_some_and(|roots| !roots.is_empty());
+            if authority_complete && revision.is_some() && roots_are_present {
+                None
+            } else {
+                Some(format!(
+                    "cross_repo_authority_incomplete: spine topology is incomplete at revision {}",
+                    revision.unwrap_or("unwatermarked")
+                ))
+            }
+        }
+        _ => None,
     }
-    Some(
-        cross_repo
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or("the cross-repo spine could not answer"),
-    )
 }
 
 /// Build a confidence-qualified negative for `tool`'s `payload`, enriched from
@@ -271,9 +294,9 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
     // Keep the local rows, but make the negative verdict explicitly
     // inconclusive so agents cannot read the gap as safe-to-delete proof.
     if tool == "find_references" {
-        if let Some(reason) = cross_repo_references_unavailable(payload) {
+        if let Some(reason) = cross_repo_references_gap(payload) {
             trustworthy = false;
-            trust_reason = format!("cross_repo_unavailable: {reason}");
+            trust_reason = reason;
         }
     }
 
@@ -559,6 +582,73 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("NOT authoritative"));
+    }
+
+    #[test]
+    fn find_references_incomplete_cross_repo_authority_is_inconclusive() {
+        let payload = json!({
+            "focal_entity": { "kind": "function", "name": "do_work" },
+            "references": [],
+            "cross_repo": {
+                "status": "available",
+                "authority_complete": false,
+                "authority_revision": "sha256:dirty",
+                "authority_roots": { "provider": "provider-root" },
+            },
+        });
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("empty references yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("cross_repo_authority_incomplete"));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("sha256:dirty"));
+    }
+
+    #[test]
+    fn find_references_legacy_unwatermarked_cross_repo_is_inconclusive() {
+        let payload = json!({
+            "focal_entity": { "kind": "function", "name": "do_work" },
+            "references": [],
+            "cross_repo": {
+                "status": "available",
+                "payload_version": 1,
+                "reference_count": 0,
+            },
+        });
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("empty references yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("unwatermarked"));
+    }
+
+    #[test]
+    fn find_references_complete_cross_repo_authority_remains_authoritative() {
+        let payload = json!({
+            "focal_entity": { "kind": "function", "name": "do_work" },
+            "references": [],
+            "cross_repo": {
+                "status": "available",
+                "authority_complete": true,
+                "authority_revision": "sha256:complete",
+                "authority_roots": {
+                    "consumer": "consumer-root",
+                    "provider": "provider-root",
+                },
+            },
+        });
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("empty references yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+        assert_eq!(negative["trust"], json!("authoritative"));
     }
 
     #[test]

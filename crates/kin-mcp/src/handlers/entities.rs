@@ -736,6 +736,27 @@ flag says whether \"nothing depends on this\" is authoritative (daemon-owned gra
 complete coverage, no degraded signals) or merely \"not indexed yet\" — consult it \
 before treating the entity as safe to delete.";
 
+fn normalize_cross_repo_repo_id(raw: Option<&str>) -> std::result::Result<String, String> {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            "KIN_REPO_ID is missing or blank; cross-repo authority cannot bind this graph to a repository"
+                .to_string()
+        })
+}
+
+fn cross_repo_repo_id() -> std::result::Result<String, String> {
+    match std::env::var("KIN_REPO_ID") {
+        Ok(value) => normalize_cross_repo_repo_id(Some(&value)),
+        Err(std::env::VarError::NotPresent) => normalize_cross_repo_repo_id(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(
+            "KIN_REPO_ID is not valid Unicode; cross-repo authority cannot bind this graph to a repository"
+                .to_string(),
+        ),
+    }
+}
+
 fn append_spine_reference_rows(
     rows: &mut Vec<ReferenceRow>,
     repo_id: &str,
@@ -827,35 +848,48 @@ pub async fn handle_find_references<G: GraphStore>(
 
     let mut rows = collect_graph_reference_rows(store, &target.id, &relation_kinds)?;
     // ── Federated Xrefs via Spine ─────────────────────────────────────
-    let repo_id = std::env::var("KIN_REPO_ID").unwrap_or_else(|_| "unknown".into());
-    let cross_repo = match fetch_spine_xref(&repo_id, &target.id).await {
-        kin_spine::SpineQuery::Found(body) => {
-            let reference_count = append_spine_reference_rows(
-                &mut rows,
-                &repo_id,
-                &target.id,
-                &relation_kinds,
-                &body,
-            );
-            serde_json::json!({
-                "status": "available",
-                "payload_version": body.version(),
-                "reference_count": reference_count,
-            })
-        }
-        // Spine configured but unreachable: surface as a warning rather than
-        // silently dropping cross-repo references (which would read as "none").
-        kin_spine::SpineQuery::Unavailable(reason) => {
-            tracing::warn!(reason = %reason, "cross-repo spine unavailable for references enrichment");
+    let cross_repo = match cross_repo_repo_id() {
+        Err(reason) => {
+            tracing::warn!(reason = %reason, "cross-repo repository binding unavailable for references enrichment");
             serde_json::json!({
                 "status": "unavailable",
                 "reason": reason,
             })
         }
-        // Local-only (no spine configured): quiet — cross-repo refs don't apply.
-        kin_spine::SpineQuery::NotConfigured => serde_json::json!({
-            "status": "not_configured",
-        }),
+        Ok(repo_id) => match fetch_spine_xref(&repo_id, &target.id).await {
+            kin_spine::SpineQuery::Found(body) => {
+                let reference_count = append_spine_reference_rows(
+                    &mut rows,
+                    &repo_id,
+                    &target.id,
+                    &relation_kinds,
+                    &body,
+                );
+                let authority_complete =
+                    body.authority_complete && body.authority_roots.contains_key(&repo_id);
+                serde_json::json!({
+                    "status": "available",
+                    "payload_version": body.version(),
+                    "reference_count": reference_count,
+                    "authority_complete": authority_complete,
+                    "authority_revision": body.authority_revision,
+                    "authority_roots": body.authority_roots,
+                })
+            }
+            // Spine configured but unreachable: surface as a warning rather than
+            // silently dropping cross-repo references (which would read as "none").
+            kin_spine::SpineQuery::Unavailable(reason) => {
+                tracing::warn!(reason = %reason, "cross-repo spine unavailable for references enrichment");
+                serde_json::json!({
+                    "status": "unavailable",
+                    "reason": reason,
+                })
+            }
+            // Local-only (no spine configured): quiet — cross-repo refs don't apply.
+            kin_spine::SpineQuery::NotConfigured => serde_json::json!({
+                "status": "not_configured",
+            }),
+        },
     };
 
     rows.sort_by(|left, right| {
@@ -2124,6 +2158,18 @@ mod tests {
             max_lines_per_body: crate::handlers::common::DEFAULT_SOURCE_MAX_LINES,
             max_bytes_per_body: crate::handlers::common::DEFAULT_SOURCE_MAX_BYTES,
         }
+    }
+
+    #[test]
+    fn cross_repo_binding_rejects_missing_or_blank_repo_id() {
+        for raw in [None, Some(""), Some("   "), Some("\t\n")] {
+            let reason = normalize_cross_repo_repo_id(raw).unwrap_err();
+            assert!(reason.contains("KIN_REPO_ID is missing or blank"));
+        }
+        assert_eq!(
+            normalize_cross_repo_repo_id(Some("  provider  ")).unwrap(),
+            "provider"
+        );
     }
 
     #[test]
