@@ -85,13 +85,14 @@ async fn index_lookup(
     // Extract the package name (last path segment)
     let name = params.last().map(|(_, v)| v.as_str()).unwrap_or("");
 
-    let mut versions = match state.manifest_store.get_versions(Ecosystem::Cargo, name) {
+    // The manifest is the sparse index authority. Metadata extraction belongs
+    // to authenticated publish/ingest; a GET must never rebuild or mutate the
+    // index from ambient crate files.
+    let versions = match state.manifest_store.get_versions(Ecosystem::Cargo, name) {
         Ok(v) if v.is_empty() => return StatusCode::NOT_FOUND.into_response(),
         Ok(v) => v,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
-
-    backfill_cargo_metadata_from_crate(&state, &mut versions);
 
     // Cargo expects newline-delimited JSON, one entry per version
     let mut body = String::new();
@@ -680,57 +681,6 @@ fn extract_crate_metadata(crate_bytes: &[u8], name: &str, version: &str) -> serd
     metadata
 }
 
-fn backfill_cargo_metadata_from_crate(state: &CargoRegistryState, versions: &mut [PackageVersion]) {
-    let mut changed = false;
-
-    for version in versions.iter_mut() {
-        let crate_path = state
-            .blobs_dir
-            .join(format!("{}-{}.crate", version.id.name, version.version));
-        let Ok(crate_bytes) = std::fs::read(&crate_path) else {
-            continue;
-        };
-        let extracted = extract_crate_metadata(&crate_bytes, &version.id.name, &version.version);
-        let merged = merge_cargo_metadata(&version.metadata, &extracted);
-        if merged != version.metadata {
-            version.metadata = merged;
-            changed = true;
-        }
-    }
-
-    if changed {
-        if let Some(first) = versions.first() {
-            let _ = state.manifest_store.replace_versions(&first.id, versions);
-        }
-    }
-}
-
-fn merge_cargo_metadata(
-    existing: &serde_json::Value,
-    extracted: &serde_json::Value,
-) -> serde_json::Value {
-    let Some(extracted_obj) = extracted.as_object() else {
-        return existing.clone();
-    };
-
-    let mut merged = existing.clone();
-    if !merged.is_object() {
-        merged = serde_json::json!({});
-    }
-
-    let Some(merged_obj) = merged.as_object_mut() else {
-        return existing.clone();
-    };
-
-    for key in ["features", "deps"] {
-        if let Some(value) = extracted_obj.get(key) {
-            merged_obj.insert(key.to_string(), value.clone());
-        }
-    }
-
-    merged
-}
-
 /// Cargo index entry format (one per version, newline-delimited JSON)
 #[derive(Serialize)]
 struct CargoIndexEntry {
@@ -825,7 +775,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sparse_index_backfills_missing_dependency_metadata_from_crate_blob() {
+    async fn sparse_index_is_a_manifest_only_read_and_never_repairs_from_blob_bytes() {
         let (_root, state) = registry_state();
         std::fs::create_dir_all(&state.blobs_dir).unwrap();
 
@@ -865,6 +815,11 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
             })
             .unwrap();
 
+        let manifest_before = state
+            .manifest_store
+            .get_versions(Ecosystem::Cargo, "kin-infer")
+            .unwrap();
+
         let response = cargo_routes(state.clone())
             .oneshot(
                 Request::builder()
@@ -882,22 +837,83 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
         let line = String::from_utf8(body.to_vec()).unwrap();
         let index_entry: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
         let deps = index_entry["deps"].as_array().unwrap();
+        assert!(deps.is_empty());
 
-        let serde_dep = deps.iter().find(|dep| dep["name"] == "serde").unwrap();
-        assert_eq!(serde_dep["registry"], CRATES_IO_INDEX_URL);
-
-        let ndarray_dep = deps.iter().find(|dep| dep["name"] == "ndarray").unwrap();
-        assert_eq!(ndarray_dep["registry"], CRATES_IO_INDEX_URL);
-
-        let kin_dep = deps.iter().find(|dep| dep["name"] == "kin-blobs").unwrap();
-        assert!(kin_dep["registry"].is_null());
-
-        let versions = state
+        let manifest_after = state
             .manifest_store
             .get_versions(Ecosystem::Cargo, "kin-infer")
             .unwrap();
-        let deps = versions[0].metadata["deps"].as_array().unwrap();
-        assert_eq!(deps.len(), 3);
+        assert_eq!(manifest_after.len(), manifest_before.len());
+        assert_eq!(manifest_after[0].version, manifest_before[0].version);
+        assert_eq!(manifest_after[0].metadata, manifest_before[0].metadata);
+    }
+
+    #[tokio::test]
+    async fn concurrent_sparse_reads_cannot_erase_a_published_version() {
+        let (_root, state) = registry_state_with_token(Some("s3cret"));
+        std::fs::create_dir_all(&state.blobs_dir).unwrap();
+        let first_body = build_test_crate(
+            "demo",
+            "0.1.0",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+        );
+        std::fs::write(state.blobs_dir.join("demo-0.1.0.crate"), &first_body).unwrap();
+        state
+            .manifest_store
+            .add_version(&PackageVersion {
+                id: PackageId {
+                    ecosystem: Ecosystem::Cargo,
+                    scope: None,
+                    name: "demo".to_string(),
+                },
+                version: "0.1.0".to_string(),
+                blob_hash: "hash".to_string(),
+                blob_size: first_body.len() as u64,
+                checksum: "checksum".to_string(),
+                metadata: serde_json::json!({}),
+                published_at: Utc::now(),
+                published_by: "legacy-test".to_string(),
+                yanked: false,
+            })
+            .unwrap();
+
+        let reads = async {
+            for _ in 0..64 {
+                let response = cargo_routes(state.clone())
+                    .oneshot(
+                        Request::get("/registry/cargo/de/mo/demo")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                tokio::task::yield_now().await;
+            }
+        };
+        let publish_second = publish(
+            state.clone(),
+            "demo",
+            "0.2.0",
+            Some("s3cret"),
+            valid_crate("demo", "0.2.0"),
+        );
+
+        let (_, status) = tokio::join!(reads, publish_second);
+        assert_eq!(status, StatusCode::OK);
+
+        let versions = state
+            .manifest_store
+            .get_versions(Ecosystem::Cargo, "demo")
+            .unwrap();
+        assert_eq!(
+            versions
+                .iter()
+                .map(|version| version.version.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0.1.0", "0.2.0"]
+        );
+        assert_eq!(versions[0].metadata, serde_json::json!({}));
     }
 
     /// Build a valid `.crate` blob for a simple `[package]` manifest.
