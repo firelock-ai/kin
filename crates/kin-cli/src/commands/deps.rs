@@ -2,11 +2,15 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_core::registry::KinRegistry;
+use kin_core::registry::{KinRegistry, RegisteredRepo};
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
 
 /// Show cross-repo dependencies across all registered Kin repositories.
+///
+/// The answer is projected from the dependency records ingestion wrote for each
+/// repo, not re-derived by parsing manifests at query time. A repo that carries
+/// no records reports that gap rather than having it filled in from whatever
+/// manifests happen to be on disk.
 pub async fn run() -> Result<()> {
     let registry =
         KinRegistry::load().map_err(|e| anyhow::anyhow!("failed to load registry: {}", e))?;
@@ -17,21 +21,20 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Build a set of known repo IDs for matching
     let known_ids: HashSet<String> = registry.repos.iter().map(|r| r.id.clone()).collect();
 
-    // Detect typed deps for each repo
     let mut repo_deps: BTreeMap<String, Vec<(String, DepType)>> = BTreeMap::new();
     for repo in &registry.repos {
-        let deps = detect_dependencies_for_repo(&repo.path, &known_ids);
-        repo_deps.insert(repo.id.clone(), deps);
+        repo_deps.insert(repo.id.clone(), dependencies_for_repo(repo, &known_ids));
     }
 
     println!("Cross-repo dependencies:\n");
+    let mut unrecorded = Vec::new();
     for (id, deps) in &repo_deps {
         println!("  {}", id);
         if deps.is_empty() {
-            println!("    (no cross-repo dependencies)");
+            println!("    (no cross-repo dependencies recorded)");
+            unrecorded.push(id.clone());
         } else {
             for (name, dep_type) in deps {
                 println!("    -> {} ({})", name, dep_type);
@@ -40,46 +43,68 @@ pub async fn run() -> Result<()> {
         println!();
     }
 
+    if !unrecorded.is_empty() {
+        println!(
+            "note: dependencies are recorded when a repo is registered or re-indexed. If a repo above should have dependencies, re-run `kin init` in it to refresh its records: {}",
+            unrecorded.join(", ")
+        );
+    }
+
     Ok(())
 }
 
-/// Detect deps for a single repo path returning (dep_name, dep_type) pairs.
-pub fn detect_dependencies_for_repo(
-    repo_path: &Path,
+/// Project a registered repo's recorded cross-repo dependencies.
+///
+/// [`RegisteredRepo::dependencies`] is written by the registry at ingestion, so
+/// this is a read of recorded truth. Only dependencies that ingestion resolved
+/// to a repo still present in `known_ids` are reported, so the listing never
+/// names a provider the registry no longer knows.
+pub fn dependencies_for_repo(
+    repo: &RegisteredRepo,
     known_ids: &HashSet<String>,
 ) -> Vec<(String, DepType)> {
-    let mut deps = Vec::new();
+    let mut deps: Vec<(String, DepType)> = repo
+        .dependencies
+        .iter()
+        .filter_map(|dep| {
+            let provider = dep.provider_repo.as_ref()?;
+            known_ids
+                .contains(provider)
+                .then(|| (provider.clone(), DepType::from_source(&dep.source)))
+        })
+        .collect();
 
-    // Cargo git deps
-    let cargo_deps = detect_cargo_git_deps(repo_path);
-    for dep_name in cargo_deps {
-        if let Some(matched) = match_to_known_repo(&dep_name, known_ids) {
-            if !deps.iter().any(|(n, _)| n == &matched) {
-                deps.push((matched, DepType::CargoGit));
-            }
-        }
-    }
-
-    // npm workspace deps
-    let npm_deps = detect_npm_workspace_deps(repo_path);
-    for dep_name in &npm_deps {
-        if let Some(matched) = match_to_known_repo(dep_name, known_ids) {
-            if !deps.iter().any(|(n, _)| n == &matched) {
-                deps.push((matched, DepType::NpmWorkspace));
-            }
-            continue;
-        }
-        // Try scoped npm packages like @kinlab/contracts
-        if let Some(_matched) = match_scoped_npm_to_repo(dep_name, known_ids) {
-            if !deps.iter().any(|(n, _)| n == dep_name) {
-                deps.push((dep_name.clone(), DepType::NpmWorkspace));
-            }
-        }
-    }
-
-    deps.sort_by(|a, b| a.0.cmp(&b.0));
-    deps.dedup_by(|a, b| a.0 == b.0);
+    deps.sort();
+    deps.dedup();
     deps
+}
+
+/// Recorded dependencies for the repo registered at `repo_path`.
+///
+/// Kept for callers that hold a path rather than the registry record; prefer
+/// [`dependencies_for_repo`] when the record is already in hand, since this
+/// re-reads the registry to find it.
+pub fn detect_dependencies_for_repo(
+    repo_path: &std::path::Path,
+    known_ids: &HashSet<String>,
+) -> Vec<(String, DepType)> {
+    let registry = match KinRegistry::load() {
+        Ok(registry) => registry,
+        Err(error) => {
+            tracing::warn!(
+                path = %repo_path.display(),
+                error = %error.to_string(),
+                "registry unreadable; reporting no recorded dependencies"
+            );
+            return Vec::new();
+        }
+    };
+    registry
+        .repos
+        .iter()
+        .find(|repo| repo.path.as_path() == repo_path)
+        .map(|repo| dependencies_for_repo(repo, known_ids))
+        .unwrap_or_default()
 }
 
 /// Format deps as a short suffix string for registry display, e.g. "-> kin-db, kin-vfs-core"
@@ -92,148 +117,150 @@ pub fn format_deps_short(deps: &[(String, DepType)]) -> String {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum DepType {
-    CargoGit,
-    NpmWorkspace,
+/// Where ingestion observed a dependency.
+///
+/// Carries the recorded source verbatim so the projection reports what was
+/// actually captured rather than collapsing every dependency into one of a
+/// couple of guessed manifest kinds.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DepType(String);
+
+impl DepType {
+    fn from_source(source: &str) -> Self {
+        Self(source.to_string())
+    }
 }
 
 impl std::fmt::Display for DepType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DepType::CargoGit => write!(f, "cargo: git dep"),
-            DepType::NpmWorkspace => write!(f, "npm: workspace"),
-        }
+        let label = match self.0.as_str() {
+            "cargo" => "cargo manifest",
+            "npm" => "npm manifest",
+            "go" => "go module",
+            "protocol" => "protocol import",
+            "dockerfile" => "dockerfile",
+            "compose" => "docker compose",
+            "ci" => "ci workflow",
+            "subprocess" => "runtime subprocess",
+            "http" => "http api",
+            other => other,
+        };
+        write!(f, "{label}")
     }
 }
 
-/// Parse Cargo.toml files in the repo and find dependencies with `git = "..."`.
-fn detect_cargo_git_deps(repo_path: &Path) -> Vec<String> {
-    let mut deps = Vec::new();
+#[cfg(test)]
+mod tests {
+    use super::{dependencies_for_repo, DepType};
+    use kin_core::dependencies::RepoDependency;
+    use kin_core::registry::RegisteredRepo;
+    use std::collections::HashSet;
 
-    // Check root Cargo.toml
-    let cargo_path = repo_path.join("Cargo.toml");
-    if let Ok(content) = std::fs::read_to_string(&cargo_path) {
-        collect_cargo_external_deps(&content, &mut deps);
-    }
-
-    // Check workspace member Cargo.toml files
-    let crates_dir = repo_path.join("crates");
-    if crates_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&crates_dir) {
-            for entry in entries.flatten() {
-                let member_cargo = entry.path().join("Cargo.toml");
-                if member_cargo.is_file() {
-                    if let Ok(content) = std::fs::read_to_string(&member_cargo) {
-                        collect_cargo_external_deps(&content, &mut deps);
-                    }
-                }
-            }
+    fn repo(path: std::path::PathBuf, dependencies: Vec<RepoDependency>) -> RegisteredRepo {
+        RegisteredRepo {
+            id: "kin".to_string(),
+            path,
+            entities: 0,
+            last_commit: "2026-01-01T00:00:00Z".to_string(),
+            dependencies,
         }
     }
 
-    deps.sort();
-    deps.dedup();
-    deps
-}
-
-/// Extract dependency names that use `git = "..."` (cross-repo deps).
-fn collect_cargo_external_deps(content: &str, deps: &mut Vec<String>) {
-    let mut in_deps_section = false;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-
-        // Track section headers
-        if trimmed.starts_with('[') {
-            in_deps_section = trimmed.starts_with("[dependencies")
-                || trimmed.starts_with("[dev-dependencies")
-                || trimmed.starts_with("[build-dependencies")
-                || trimmed.starts_with("[workspace.dependencies");
-            continue;
-        }
-
-        if !in_deps_section {
-            continue;
-        }
-
-        // Check for inline git deps: `name = { git = "..." }`
-        if trimmed.contains("git =") || trimmed.contains("git=") {
-            if let Some(dep_name) = trimmed.split('=').next() {
-                let name = dep_name.trim().trim_matches('"');
-                if !name.is_empty() && !name.contains(' ') {
-                    deps.push(name.to_string());
-                }
-            }
-        }
-    }
-}
-
-/// Detect npm workspace / linked dependencies from package.json.
-fn detect_npm_workspace_deps(repo_path: &Path) -> Vec<String> {
-    let mut deps = Vec::new();
-
-    let pkg_path = repo_path.join("package.json");
-    if !pkg_path.is_file() {
-        return deps;
-    }
-
-    let content = match std::fs::read_to_string(&pkg_path) {
-        Ok(c) => c,
-        Err(_) => return deps,
-    };
-
-    let json: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return deps,
-    };
-
-    // Check dependencies, devDependencies for workspace: references
-    for section in ["dependencies", "devDependencies"] {
-        if let Some(obj) = json.get(section).and_then(|v| v.as_object()) {
-            for (name, version) in obj {
-                let ver_str = version.as_str().unwrap_or("");
-                if ver_str.starts_with("workspace:")
-                    || ver_str.starts_with("link:")
-                    || ver_str.starts_with("file:")
-                {
-                    deps.push(name.clone());
-                }
-            }
+    fn dep(name: &str, provider: &str, source: &str) -> RepoDependency {
+        RepoDependency {
+            name: name.to_string(),
+            provider_repo: Some(provider.to_string()),
+            source: source.to_string(),
         }
     }
 
-    deps
-}
+    /// `kin deps` answers from the dependency records ingestion wrote, so a
+    /// manifest sitting in the working tree cannot steer the answer. The
+    /// manifest here contradicts the records on purpose: anything that re-derives
+    /// the answer by parsing it reports kin-vfs and fails.
+    #[test]
+    fn deps_project_recorded_truth_not_the_manifest_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[dependencies]\nkin-vfs = { git = \"git@example.invalid:kin-vfs.git\" }\n",
+        )
+        .unwrap();
 
-/// Try to match a dependency name to a known registered repo ID.
-fn match_to_known_repo(dep_name: &str, known_ids: &HashSet<String>) -> Option<String> {
-    // Exact match
-    if known_ids.contains(dep_name) {
-        return Some(dep_name.to_string());
+        let repo = repo(
+            dir.path().to_path_buf(),
+            vec![dep("kin-db", "kin-db", "cargo")],
+        );
+        let known: HashSet<String> = ["kin-db", "kin-vfs"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        assert_eq!(
+            dependencies_for_repo(&repo, &known),
+            vec![("kin-db".to_string(), DepType("cargo".to_string()))],
+        );
     }
 
-    // Try matching crate name to repo (e.g., "kin-vfs-core" crate from "kin-vfs" repo)
-    for id in known_ids {
-        if dep_name.starts_with(id.as_str()) {
-            let rest = &dep_name[id.len()..];
-            if rest.is_empty() || rest.starts_with('-') {
-                return Some(id.clone());
-            }
+    /// A repo with no recorded dependencies reports none — the gap is surfaced
+    /// rather than filled in from the manifests lying next to it.
+    #[test]
+    fn deps_report_the_gap_rather_than_scraping_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[dependencies]\nkin-db = { git = \"git@example.invalid:kin-db.git\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            "{\"dependencies\":{\"@kinlab/contracts\":\"workspace:*\"}}",
+        )
+        .unwrap();
+
+        let repo = repo(dir.path().to_path_buf(), Vec::new());
+        let known: HashSet<String> = ["kin-db", "kinlab"].iter().map(|s| s.to_string()).collect();
+
+        assert!(dependencies_for_repo(&repo, &known).is_empty());
+    }
+
+    /// A recorded provider the registry no longer knows is dropped rather than
+    /// listed as a live cross-repo edge.
+    #[test]
+    fn deps_drop_providers_the_registry_no_longer_knows() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo(
+            dir.path().to_path_buf(),
+            vec![
+                dep("kin-db", "kin-db", "cargo"),
+                dep("retired-crate", "retired-repo", "cargo"),
+            ],
+        );
+        let known: HashSet<String> = ["kin-db"].iter().map(|s| s.to_string()).collect();
+
+        assert_eq!(
+            dependencies_for_repo(&repo, &known),
+            vec![("kin-db".to_string(), DepType("cargo".to_string()))],
+        );
+    }
+
+    /// Every recorded source family renders with a label, including ones the
+    /// retired two-variant enum could not express.
+    #[test]
+    fn dep_type_labels_every_recorded_source() {
+        for (source, label) in [
+            ("cargo", "cargo manifest"),
+            ("npm", "npm manifest"),
+            ("go", "go module"),
+            ("protocol", "protocol import"),
+            ("dockerfile", "dockerfile"),
+            ("compose", "docker compose"),
+            ("ci", "ci workflow"),
+            ("subprocess", "runtime subprocess"),
+            ("http", "http api"),
+        ] {
+            assert_eq!(DepType::from_source(source).to_string(), label);
         }
+        assert_eq!(DepType::from_source("future").to_string(), "future");
     }
-
-    None
-}
-
-/// Try to match a scoped npm package like `@kinlab/contracts` to a known repo.
-fn match_scoped_npm_to_repo(dep_name: &str, known_ids: &HashSet<String>) -> Option<String> {
-    if let Some(scoped) = dep_name.strip_prefix('@') {
-        if let Some(scope) = scoped.split('/').next() {
-            if known_ids.contains(scope) {
-                return Some(scope.to_string());
-            }
-        }
-    }
-    None
 }

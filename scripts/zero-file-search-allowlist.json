@@ -106,30 +106,6 @@
       "expiration": "2026-12-31"
     },
     {
-      "file": "crates/kin-cli/src/commands/rename.rs",
-      "reason": "PENDING FOUNDER DECISION: the rename plan's file SET is graph-derived, but its edit COORDINATES are not. read_repo_file reads the raw working tree and find_token_occurrences lexically scans those bytes to produce every line/col in the plan, so a tree that has drifted from graph truth yields silently wrong or zero edits with no gap report. A graph-native path already exists (graph.rs get_file_hash -> BlobStore, which bails loud on miss). Not fixed here: routing rename through it is a behavior change owned by another lane. Pinned to the single known read so any additional filesystem access in this module fails the guard",
-      "owner": "kin-cli",
-      "expiration": "2026-09-30",
-      "allow_match": [
-        "std::fs::read_to_string(path)"
-      ]
-    },
-    {
-      "file": "crates/kin-cli/src/commands/deps.rs",
-      "reason": "PENDING FOUNDER DECISION: kin deps answers a cross-repo dependency query by scraping Cargo.toml/package.json and line-scanning for 'git =' entries; the graph is never consulted. xref.rs routes users here on a graph miss, so a compliant command's gap path hands off to this one. Not fixed here: making deps graph-backed, or reclassifying it as an ingestion-boundary command that is not an authority path, is a product decision. Pinned to the known manifest reads so any additional filesystem access in this module fails the guard",
-      "owner": "kin-cli",
-      "expiration": "2026-09-30",
-      "allow_match": [
-        "std::fs::read_to_string(&cargo_path)",
-        "crates_dir.is_dir()",
-        "std::fs::read_dir(&crates_dir)",
-        "member_cargo.is_file()",
-        "std::fs::read_to_string(&member_cargo)",
-        "pkg_path.is_file()",
-        "std::fs::read_to_string(&pkg_path)"
-      ]
-    },
-    {
       "file": "crates/kin-mcp/src/handlers/common.rs",
       "reason": "Layout discovery boundary: candidate_source_roots only probes KIN_SOURCE_ROOT and the cwd for a .kin layout so the BlobStore can be located. Entity bodies are still fetched by graph-recorded hash and re-digested before use, and a miss reports graph-miss rather than falling back to the working tree",
       "owner": "kin-mcp",

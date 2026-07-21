@@ -3,10 +3,10 @@
 
 use anyhow::{Context, Result};
 use kin_model::{
-    Entity, EntityFilter, EntityId, GraphNodeId, GraphStore, RelationKind, SourceSpan,
+    Entity, EntityFilter, EntityId, FilePathId, GraphNodeId, GraphStore, RelationKind, SourceSpan,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Serialize)]
@@ -189,10 +189,19 @@ fn build_rename_plan(
 
     let mut edits = Vec::new();
     let mut seen = HashSet::new();
+    let mut reader = GraphSourceReader::new(layout, graph)?;
+    // Gaps are collected in a sorted set so a plan reports the same warnings in
+    // the same order regardless of relation iteration order.
+    let mut reference_gaps = BTreeSet::new();
 
     if let (Some(file_origin), Some(span)) = (&target.file_origin, &target.span) {
+        // A gap on the declaration file is fatal: without graph-owned bytes for
+        // it there is no trustworthy anchor for any edit, and emitting a plan
+        // built from whatever the working tree happens to hold is exactly the
+        // silent-miscoordinate failure this path must not have.
         add_first_span_edit(
             layout,
+            &mut reader,
             &file_origin.0,
             span.start_byte,
             span.end_byte,
@@ -201,7 +210,14 @@ fn build_rename_plan(
             "declaration".to_string(),
             &mut edits,
             &mut seen,
-        )?;
+        )
+        .map_err(|GraphContentGap(reason)| {
+            anyhow::anyhow!(
+                "graph gap: cannot anchor the rename of '{}' because graph truth cannot supply the contents of its declaration file '{}': {reason}. Rename coordinates are measured against graph-owned bytes, never the working tree — re-ingest the repo so the file's content is recorded in graph truth",
+                target.name,
+                file_origin.0
+            )
+        })?;
     } else {
         warnings.push(
             "target entity has no stable file/span; declaration edit could not be anchored"
@@ -221,8 +237,12 @@ fn build_rename_plan(
         if let Some(source_id) = rel.src.as_entity() {
             if let Some(source) = graph.get_entity(&source_id)? {
                 if let (Some(file_origin), Some(span)) = (&source.file_origin, &source.span) {
-                    add_span_edits(
+                    // A gap on a referencing file leaves the plan incomplete
+                    // rather than unusable, so it is reported as a named
+                    // warning. It is never backfilled from the working tree.
+                    if let Err(GraphContentGap(reason)) = add_span_edits(
                         layout,
+                        &mut reader,
                         &file_origin.0,
                         span.start_byte,
                         span.end_byte,
@@ -231,11 +251,18 @@ fn build_rename_plan(
                         relation_reason(&[rel.kind]),
                         &mut edits,
                         &mut seen,
-                    )?;
+                    ) {
+                        reference_gaps.insert(format!(
+                            "graph gap: references in '{}' were not planned because graph truth cannot supply its contents: {reason}",
+                            file_origin.0
+                        ));
+                    }
                 }
             }
         }
     }
+
+    warnings.extend(reference_gaps);
 
     edits.sort_by(|left, right| {
         left.file
@@ -249,7 +276,7 @@ fn build_rename_plan(
             .push("no semantically anchored occurrences were found for this symbol".to_string());
     } else {
         warnings.push(
-            "plan is token-boundary based inside semantically selected declarations and reference files; review the workspace diff after applying"
+            "coordinates are token-boundary matches measured against graph-owned file content inside semantically selected declaration and reference spans; a working tree that has drifted from graph truth must be reconciled before the plan is applied"
                 .to_string(),
         );
     }
@@ -358,8 +385,9 @@ fn resolve_target(
     Ok(matches.into_iter().next())
 }
 
-fn add_span_edits(
+fn add_span_edits<G: GraphStore>(
     layout: &kin_core::KinLayout,
+    reader: &mut GraphSourceReader<'_, G>,
     rel_path: &str,
     start_byte: usize,
     end_byte: usize,
@@ -368,9 +396,12 @@ fn add_span_edits(
     reason: String,
     edits: &mut Vec<RenameEditJson>,
     seen: &mut HashSet<String>,
-) -> Result<()> {
-    let content = read_repo_file(layout, rel_path)?;
-    for occurrence in find_token_occurrences(&content, old_name, Some((start_byte, end_byte))) {
+) -> Result<(), GraphContentGap> {
+    let occurrences = {
+        let content = reader.content(rel_path)?;
+        find_token_occurrences(content, old_name, Some((start_byte, end_byte)))
+    };
+    for occurrence in occurrences {
         push_edit(
             layout,
             rel_path,
@@ -388,8 +419,9 @@ fn add_span_edits(
     Ok(())
 }
 
-fn add_first_span_edit(
+fn add_first_span_edit<G: GraphStore>(
     layout: &kin_core::KinLayout,
+    reader: &mut GraphSourceReader<'_, G>,
     rel_path: &str,
     start_byte: usize,
     end_byte: usize,
@@ -398,13 +430,14 @@ fn add_first_span_edit(
     reason: String,
     edits: &mut Vec<RenameEditJson>,
     seen: &mut HashSet<String>,
-) -> Result<()> {
-    let content = read_repo_file(layout, rel_path)?;
-    if let Some(occurrence) =
-        find_token_occurrences(&content, old_name, Some((start_byte, end_byte)))
+) -> Result<(), GraphContentGap> {
+    let occurrence = {
+        let content = reader.content(rel_path)?;
+        find_token_occurrences(content, old_name, Some((start_byte, end_byte)))
             .into_iter()
             .next()
-    {
+    };
+    if let Some(occurrence) = occurrence {
         push_edit(
             layout,
             rel_path,
@@ -451,9 +484,100 @@ fn push_edit(
     });
 }
 
-fn read_repo_file(layout: &kin_core::KinLayout, rel_path: &str) -> Result<String> {
-    let path = kin_core::source_dir(layout).join(rel_path);
-    Ok(std::fs::read_to_string(path)?)
+/// A file the graph cannot supply, carrying the reason it could not.
+///
+/// Kept distinct from a plan-level error so a gap in one referencing file is
+/// reported in the plan's warnings while a gap on the declaration file, which
+/// no plan can be anchored without, fails the command outright.
+struct GraphContentGap(String);
+
+/// Supplies the file bytes a rename plan's coordinates are measured against,
+/// resolved from graph-owned truth alone.
+///
+/// Rename is a mutation-planning authority path: every line and column it emits
+/// becomes an edit. Measuring them against the working tree makes a tree that
+/// has drifted from the graph — an un-ingested edit, a stale checkout, a
+/// partially reconciled projection — silently yield coordinates that point at
+/// the wrong bytes. So content is addressed by the hash the graph recorded for
+/// the file and read from the content-addressed blob store, which verifies the
+/// bytes against that address on read. A file the graph cannot supply is
+/// reported as a gap; it is never filled in from disk.
+struct GraphSourceReader<'a, G: GraphStore> {
+    layout: &'a kin_core::KinLayout,
+    graph: &'a G,
+    blobs: kin_blobs::BlobStore,
+    contents: HashMap<String, Result<String, String>>,
+}
+
+impl<'a, G: GraphStore> GraphSourceReader<'a, G> {
+    fn new(layout: &'a kin_core::KinLayout, graph: &'a G) -> Result<Self> {
+        Ok(Self {
+            layout,
+            graph,
+            blobs: kin_blobs::BlobStore::new(layout.objects_dir()).context(
+                "graph blob store is unavailable; rename cannot read graph-owned source",
+            )?,
+            contents: HashMap::new(),
+        })
+    }
+
+    /// Graph-recorded content of `rel_path`, or the gap that prevents it.
+    fn content(&mut self, rel_path: &str) -> Result<&str, GraphContentGap> {
+        if !self.contents.contains_key(rel_path) {
+            let resolved = self.resolve(rel_path).map_err(|err| err.to_string());
+            self.contents.insert(rel_path.to_string(), resolved);
+        }
+        match &self.contents[rel_path] {
+            Ok(content) => Ok(content.as_str()),
+            Err(reason) => Err(GraphContentGap(reason.clone())),
+        }
+    }
+
+    fn resolve(&self, rel_path: &str) -> Result<String> {
+        let file_id = FilePathId::new(rel_path);
+        let hash = self.recorded_hash(&file_id)?;
+        let blob_hash = kin_blobs::Hash256(*hash.as_bytes());
+        let bytes = self.blobs.read(&blob_hash).with_context(|| {
+            format!("graph blob for file '{rel_path}' is unavailable (hash {blob_hash})")
+        })?;
+        String::from_utf8(bytes).with_context(|| {
+            format!("graph-owned content for file '{rel_path}' is not valid UTF-8")
+        })
+    }
+
+    /// The content hash graph truth records for `file_id`, preferring the
+    /// graph's file-layout store and falling back to the file tree at the
+    /// current branch head. Both are graph reads; neither consults the tree.
+    fn recorded_hash(&self, file_id: &FilePathId) -> Result<kin_model::Hash256> {
+        if let Some(hash) = self.graph.get_file_hash(file_id)? {
+            return Ok(hash);
+        }
+
+        let branch_name = kin_core::read_current_branch(self.layout)?;
+        let branch = match self.graph.get_branch(&branch_name)? {
+            Some(branch) => branch,
+            None => self
+                .graph
+                .list_branches()?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "graph records no content hash for file '{}' and no branch is available to resolve one",
+                        file_id.0
+                    )
+                })?,
+        };
+        let genesis = kin_core::build_genesis_change();
+        let tree = kin_core::build_file_tree(self.graph, &genesis.id, &branch.head)?;
+        tree.get(file_id).copied().ok_or_else(|| {
+            anyhow::anyhow!(
+                "file '{}' is not in the graph file tree at branch '{}'",
+                file_id.0,
+                branch.name
+            )
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -708,6 +832,144 @@ fn unique_file_count(edits: &[RenameEditJson]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{build_rename_response, RenameRequest};
+    use kin_db::InMemoryGraph;
+    use kin_model::{
+        ArtifactDelta, ArtifactDeltaKind, AuthorId, Branch, BranchName, ChangeStore, Entity,
+        EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
+        FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, Relation, RelationId, RelationKind,
+        RelationOrigin, SemanticChange, SemanticChangeId, SemanticFingerprint, SourceSpan,
+        Timestamp, Visibility,
+    };
+
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        repo: std::path::PathBuf,
+        layout: kin_core::KinLayout,
+        graph: InMemoryGraph,
+    }
+
+    /// Build a repo whose graph owns the content of `graph_files`.
+    ///
+    /// Each file's bytes are written to the content-addressed blob store and
+    /// recorded on a change, which is exactly how ingestion establishes the
+    /// content a rename plan's coordinates must be measured against.
+    fn fixture(graph_files: &[(&str, &str)]) -> Fixture {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().to_path_buf();
+        let kin_root = repo.join(".kin");
+        std::fs::create_dir_all(kin_root.join("objects")).unwrap();
+        let layout = kin_core::KinLayout::new(kin_root);
+        let graph = InMemoryGraph::new();
+
+        let genesis = kin_core::build_genesis_change();
+        graph.create_change(&genesis).unwrap();
+
+        let blobs = kin_blobs::BlobStore::new(layout.objects_dir()).unwrap();
+        let mut artifact_deltas = Vec::new();
+        let mut projected_files = Vec::new();
+        for (path, content) in graph_files {
+            let hash = blobs.write(content.as_bytes()).unwrap();
+            let file_id = FilePathId::new(*path);
+            artifact_deltas.push(ArtifactDelta {
+                file_id: file_id.clone(),
+                kind: ArtifactDeltaKind::Added,
+                old_hash: None,
+                new_hash: Some(Hash256::from_bytes(hash.0)),
+            });
+            projected_files.push(file_id);
+        }
+
+        let branch_name = BranchName::new("main");
+        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32]));
+        graph
+            .create_change(&SemanticChange {
+                id: change_id,
+                parents: vec![genesis.id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "seed graph-owned source".to_string(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas,
+                projected_files,
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: Some(branch_name.clone()),
+            })
+            .unwrap();
+        graph
+            .create_branch(&Branch {
+                name: branch_name.clone(),
+                head: change_id,
+            })
+            .unwrap();
+        kin_core::write_current_branch(&layout, &branch_name).unwrap();
+
+        Fixture {
+            _temp: temp,
+            repo,
+            layout,
+            graph,
+        }
+    }
+
+    fn entity(name: &str, file: &str, span: SourceSpan) -> Entity {
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([0; 32]),
+                behavior_hash: Hash256::from_bytes([0; 32]),
+                equivalence_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new(file)),
+            span: Some(span),
+            signature: name.to_string(),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn span(file: &str, content: &str, start_line: u32) -> SourceSpan {
+        SourceSpan {
+            file: FilePathId::new(file),
+            start_byte: 0,
+            end_byte: content.len(),
+            start_line,
+            start_col: 0,
+            end_line: start_line + content.lines().count() as u32,
+            end_col: 0,
+        }
+    }
+
+    fn rename_json(fixture: &Fixture, symbol: &str) -> String {
+        build_rename_response(
+            &fixture.layout,
+            &fixture.graph,
+            &RenameRequest {
+                symbol: symbol.to_string(),
+                new_name: "renamed_symbol".to_string(),
+                file: None,
+                line: None,
+                column: None,
+                json: true,
+            },
+        )
+        .unwrap()
+        .json
+        .expect("rename plan json")
+    }
 
     /// A `kin rename` plan may only anchor edits on graph-owned truth: the
     /// declaration span and graph relation edges. A caller that lives in the
@@ -716,66 +978,102 @@ mod tests {
     /// tree.
     #[test]
     fn rename_plan_edits_come_from_graph_not_source_tree_scan() {
-        use kin_db::InMemoryGraph;
-        use kin_model::{
-            Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
-            FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
-        };
-
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path();
-        std::fs::create_dir_all(repo.join(".kin")).unwrap();
-        let layout = kin_core::KinLayout::new(repo.join(".kin"));
-
         let decl_src = "fn probe_symbol() -> i32 { 0 }\n";
-        std::fs::write(repo.join("decl.rs"), decl_src).unwrap();
+        let caller_src = "pub fn linked() -> i32 { probe_symbol() }\n";
+        let fixture = fixture(&[("decl.rs", decl_src), ("caller.rs", caller_src)]);
+
         // A caller present only in the working tree, never linked into the graph.
         // The retired scan would have planned edits here off the `use` import.
         std::fs::write(
-            repo.join("disk_only_caller.rs"),
+            fixture.repo.join("disk_only_caller.rs"),
             "use crate::decl::probe_symbol;\npub fn disk_only() -> i32 { probe_symbol() }\n",
         )
         .unwrap();
 
-        let target = Entity {
-            id: EntityId::new(),
-            kind: EntityKind::Function,
-            name: "probe_symbol".to_string(),
-            language: LanguageId::Rust,
-            fingerprint: SemanticFingerprint {
-                algorithm: FingerprintAlgorithm::V1TreeSitter,
-                ast_hash: Hash256::from_bytes([0; 32]),
-                signature_hash: Hash256::from_bytes([0; 32]),
-                behavior_hash: Hash256::from_bytes([0; 32]),
-                equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
-                stability_score: 1.0,
-            },
-            file_origin: Some(FilePathId::new("decl.rs")),
-            span: Some(SourceSpan {
-                file: FilePathId::new("decl.rs"),
-                start_byte: 0,
-                end_byte: decl_src.len(),
-                start_line: 1,
-                start_col: 0,
-                end_line: 1,
-                end_col: decl_src.len() as u32,
-            }),
-            signature: "probe_symbol".to_string(),
-            visibility: Visibility::Public,
-            role: EntityRole::Source,
-            doc_summary: None,
-            metadata: EntityMetadata::default(),
-            lineage_parent: None,
-            created_in: None,
-            superseded_by: None,
-        };
+        let target = entity("probe_symbol", "decl.rs", span("decl.rs", decl_src, 1));
+        let caller = entity("linked", "caller.rs", span("caller.rs", caller_src, 1));
+        fixture.graph.upsert_entity(&target).unwrap();
+        fixture.graph.upsert_entity(&caller).unwrap();
+        fixture
+            .graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Calls,
+                src: GraphNodeId::Entity(caller.id),
+                dst: GraphNodeId::Entity(target.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
 
-        let graph = InMemoryGraph::new();
-        graph.upsert_entity(&target).unwrap();
+        let json = rename_json(&fixture, "probe_symbol");
 
-        let response = build_rename_response(
-            &layout,
-            &graph,
+        // The graph-anchored declaration edit is present...
+        assert!(
+            json.contains("\"reason\":\"declaration\""),
+            "graph-anchored declaration edit must be present: {json}"
+        );
+        // ...so is the edit for the caller the graph links in...
+        assert!(
+            json.contains("caller.rs"),
+            "graph-linked caller must receive an edit: {json}"
+        );
+        // ...and no edit is planned for the working-tree-only caller.
+        assert!(
+            !json.contains("disk_only_caller.rs"),
+            "rename must not plan edits discovered by scanning the raw source tree: {json}"
+        );
+    }
+
+    /// The coordinates in a rename plan are the edit. They must be measured
+    /// against the bytes graph truth records for a file, never against whatever
+    /// the working tree currently holds — a tree that has drifted from the graph
+    /// otherwise yields a plan whose line/column numbers point at the wrong
+    /// bytes, silently, on a mutation-planning path.
+    #[test]
+    fn rename_plan_coordinates_come_from_graph_content_not_the_working_tree() {
+        let graph_src = "fn probe_symbol() -> i32 { 0 }\n";
+        let fixture = fixture(&[("decl.rs", graph_src)]);
+
+        // The working tree has drifted: same declaration, three lines lower.
+        // Reading it would place the declaration edit on line 4.
+        std::fs::write(fixture.repo.join("decl.rs"), format!("\n\n\n{graph_src}")).unwrap();
+
+        let target = entity("probe_symbol", "decl.rs", span("decl.rs", graph_src, 1));
+        fixture.graph.upsert_entity(&target).unwrap();
+
+        let json = rename_json(&fixture, "probe_symbol");
+
+        assert!(
+            json.contains("\"startLine\":1"),
+            "declaration edit must be anchored on graph-owned content (line 1): {json}"
+        );
+        assert!(
+            !json.contains("\"startLine\":4"),
+            "declaration edit must not be anchored on the drifted working tree (line 4): {json}"
+        );
+    }
+
+    /// When graph truth cannot supply the declaration file's content there is no
+    /// trustworthy anchor for any edit. The command must say so rather than
+    /// quietly measuring coordinates against the working tree.
+    #[test]
+    fn rename_reports_the_graph_gap_instead_of_reading_the_working_tree() {
+        let decl_src = "fn probe_symbol() -> i32 { 0 }\n";
+        // Nothing is seeded into graph-owned content for decl.rs...
+        let fixture = fixture(&[("unrelated.rs", "fn other() {}\n")]);
+        // ...even though the working tree has a perfectly readable copy.
+        std::fs::write(fixture.repo.join("decl.rs"), decl_src).unwrap();
+
+        let target = entity("probe_symbol", "decl.rs", span("decl.rs", decl_src, 1));
+        fixture.graph.upsert_entity(&target).unwrap();
+
+        let err = build_rename_response(
+            &fixture.layout,
+            &fixture.graph,
             &RenameRequest {
                 symbol: "probe_symbol".to_string(),
                 new_name: "renamed_symbol".to_string(),
@@ -785,18 +1083,10 @@ mod tests {
                 json: true,
             },
         )
-        .unwrap();
-        let json = response.json.expect("rename plan json");
+        .expect_err("a graph gap on the declaration file must fail loud");
+        let err = format!("{err:#}");
 
-        // The graph-anchored declaration edit is present...
-        assert!(
-            json.contains("\"reason\":\"declaration\""),
-            "graph-anchored declaration edit must be present: {json}"
-        );
-        // ...and no edit is planned for the working-tree-only caller.
-        assert!(
-            !json.contains("disk_only_caller.rs"),
-            "rename must not plan edits discovered by scanning the raw source tree: {json}"
-        );
+        assert!(err.contains("graph gap"), "{err}");
+        assert!(err.contains("decl.rs"), "{err}");
     }
 }
