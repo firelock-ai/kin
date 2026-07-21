@@ -222,6 +222,19 @@ fn focal_entity_is_method(payload: &Value) -> bool {
         .is_some_and(|kind| kind.eq_ignore_ascii_case("method"))
 }
 
+fn cross_repo_references_unavailable(payload: &Value) -> Option<&str> {
+    let cross_repo = payload.get("cross_repo")?;
+    if cross_repo.get("status").and_then(Value::as_str) != Some("unavailable") {
+        return None;
+    }
+    Some(
+        cross_repo
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("the cross-repo spine could not answer"),
+    )
+}
+
 /// Build a confidence-qualified negative for `tool`'s `payload`, enriched from
 /// `envelope`, or `None` when the tool is not negative-capable or it returned a
 /// non-empty result (and is not an `always`-qualify tool).
@@ -235,7 +248,8 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
         return None;
     }
 
-    let (mut trustworthy, mut trust_reason) = envelope.negative_trust(spec.class);
+    let (mut trustworthy, trust_reason) = envelope.negative_trust(spec.class);
+    let mut trust_reason = trust_reason.to_string();
 
     // Receiver-method calls (`x.method()`) are resolved by bare name in
     // the linker while method entities are keyed by their qualified name, so a
@@ -248,7 +262,19 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
         trustworthy = false;
         trust_reason = "method_call_resolution_incomplete: receiver-method calls are \
              linked by bare name and may be unresolved, so an empty result is not an \
-             authoritative absence for a method";
+             authoritative absence for a method"
+            .to_string();
+    }
+
+    // A healthy local graph is not enough to certify "no references" when the
+    // configured cross-repo authority failed or returned an invalid payload.
+    // Keep the local rows, but make the negative verdict explicitly
+    // inconclusive so agents cannot read the gap as safe-to-delete proof.
+    if tool == "find_references" {
+        if let Some(reason) = cross_repo_references_unavailable(payload) {
+            trustworthy = false;
+            trust_reason = format!("cross_repo_unavailable: {reason}");
+        }
     }
 
     let interpretation = if spec.always {
@@ -509,6 +535,30 @@ mod tests {
             .unwrap()
             .contains("degraded"));
         assert_eq!(negative["degraded_signals"], json!(["embed_worker_failed"]));
+    }
+
+    #[test]
+    fn find_references_cross_repo_gap_is_inconclusive_despite_loaded_graph() {
+        let payload = json!({
+            "focal_entity": { "kind": "function", "name": "do_work" },
+            "references": [],
+            "cross_repo": {
+                "status": "unavailable",
+                "reason": "malformed spine xref response: missing field `src_repo`",
+            },
+        });
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("empty references yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("cross_repo_unavailable"));
+        assert!(negative["advice"]
+            .as_str()
+            .unwrap()
+            .contains("NOT authoritative"));
     }
 
     #[test]
