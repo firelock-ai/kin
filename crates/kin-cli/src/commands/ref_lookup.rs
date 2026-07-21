@@ -1004,9 +1004,7 @@ mod tests {
     /// unavailable so these tests skip the same way the others do.
     fn single_commit_repo_for_hydration() -> Option<(InMemoryGraph, kin_core::KinLayout, String)> {
         let repo = tempfile::tempdir().unwrap();
-        if git_ok(repo.path(), &["init", "-q"]).is_none() {
-            return None;
-        }
+        git_ok(repo.path(), &["init", "-q"])?;
         assert!(git_ok(repo.path(), &["config", "user.email", "test@kin.dev"]).is_some());
         assert!(git_ok(repo.path(), &["config", "user.name", "Kin Test"]).is_some());
         std::fs::write(
