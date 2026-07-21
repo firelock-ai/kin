@@ -11,8 +11,10 @@
 //! - GET /registry/cargo/dl/{name}/{version} -- download .crate file
 
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
+    body::{Body, Bytes},
+    extract::{DefaultBodyLimit, Path, Query, State},
+    http::{header, Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
@@ -22,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use crate::{Ecosystem, ManifestStore, PackageId, PackageVersion};
 
@@ -39,6 +42,32 @@ pub struct CargoRegistryState {
     /// Fail-closed: when this is `None` (env unset/empty) every publish request
     /// is rejected, so a misconfigured deployment cannot silently fall open.
     pub publish_token: Option<String>,
+    /// Serializes the manifest/blob commit while allowing coherent readers.
+    ///
+    /// Publish handlers take the write side before inspecting or mutating
+    /// storage. Sparse-index and download handlers take the read side across
+    /// their full manifest/blob read, so they cannot observe a half-published
+    /// coordinate.
+    publish_gate: RwLock<()>,
+}
+
+impl CargoRegistryState {
+    pub fn new(
+        manifest_store: ManifestStore,
+        blobs_dir: PathBuf,
+        base_url: String,
+        publish_token: Option<String>,
+    ) -> Self {
+        Self {
+            manifest_store,
+            blobs_dir,
+            base_url,
+            publish_token: publish_token
+                .map(|token| token.trim().to_string())
+                .filter(|token| !token.is_empty()),
+            publish_gate: RwLock::new(()),
+        }
+    }
 }
 
 const CRATES_IO_INDEX_URL: &str = "https://github.com/rust-lang/crates.io-index";
@@ -115,7 +144,7 @@ fn bad_coordinate(message: String) -> Response {
 
 /// Create axum router for Cargo registry endpoints
 pub fn cargo_routes(state: Arc<CargoRegistryState>) -> Router {
-    Router::new()
+    let public = Router::new()
         .route("/registry/cargo/config.json", get(config_json))
         .route("/registry/cargo/dl/{name}/{version}", get(download_crate))
         // Cargo sparse index: 1-char names under /1/, 2-char under /2/,
@@ -126,9 +155,22 @@ pub fn cargo_routes(state: Arc<CargoRegistryState>) -> Router {
         .route(
             "/registry/cargo/{prefix1}/{prefix2}/{name}",
             get(index_lookup),
+        );
+
+    // Authentication executes before the Bytes extractor can poll or buffer
+    // the body. The explicit route limit raises Axum's much smaller default to
+    // the registry's documented 50 MiB cap while still bounding chunked bodies.
+    let writes = Router::new()
+        .route(
+            "/registry/cargo/api/v1/crates/publish",
+            post(publish_crate).layer(DefaultBodyLimit::max(MAX_CRATE_SIZE)),
         )
-        .route("/registry/cargo/api/v1/crates/publish", post(publish_crate))
-        .with_state(state)
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            authorize_cargo_publish,
+        ));
+
+    Router::new().merge(public).merge(writes).with_state(state)
 }
 
 /// GET /registry/cargo/config.json
@@ -155,6 +197,8 @@ async fn index_lookup(
     if let Err(message) = validate_cargo_manifest_path(&state.manifest_store, name) {
         return bad_coordinate(message);
     }
+
+    let _read_guard = state.publish_gate.read().await;
 
     // The manifest is the sparse index authority. Metadata extraction belongs
     // to authenticated publish/ingest; a GET must never rebuild or mutate the
@@ -190,6 +234,7 @@ async fn download_crate(
     if let Err(message) = validate_cargo_manifest_path(&state.manifest_store, &name) {
         return bad_coordinate(message);
     }
+    let _read_guard = state.publish_gate.read().await;
     let versions = match state.manifest_store.get_versions(Ecosystem::Cargo, &name) {
         Ok(v) => v,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -239,48 +284,58 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Authorize a publish request against the configured shared secret.
-///
-/// Fail-closed contract:
-/// - `publish_token == None` (env unset/empty) -> `503`, publishing disabled.
-/// - token configured but `Authorization` header missing/malformed/mismatched
-///   -> `401`.
-///
-/// On success returns `None`; otherwise returns the rejection response.
-fn authorize_publish(
-    state: &CargoRegistryState,
-    headers: &axum::http::HeaderMap,
-) -> Option<Response> {
+/// Authenticate Cargo writes before any body extractor runs.
+async fn authorize_cargo_publish(
+    State(state): State<Arc<CargoRegistryState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
     let Some(expected) = state.publish_token.as_deref() else {
-        return Some(
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "registry publishing is disabled: no token configured"
-                })),
-            )
-                .into_response(),
-        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "registry publishing is disabled: no token configured"
+            })),
+        )
+            .into_response();
     };
 
-    let provided = headers
-        .get(axum::http::header::AUTHORIZATION)
+    let provided = request
+        .headers()
+        .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim);
+        .map(str::trim)
+        .filter(|token| !token.is_empty());
 
-    match provided {
-        Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => None,
-        _ => Some(
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "error": "invalid or missing publish token"
-                })),
-            )
-                .into_response(),
-        ),
+    if !provided.is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes())) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "invalid or missing publish token"
+            })),
+        )
+            .into_response();
     }
+
+    // Reject a declared oversize body without polling it. DefaultBodyLimit on
+    // the route remains authoritative for chunked/missing/forged lengths.
+    let declared = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if declared.is_some_and(|length| length > MAX_CRATE_SIZE as u64) {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": format!("crate body exceeds the {MAX_CRATE_SIZE} byte limit")
+            })),
+        )
+            .into_response();
+    }
+
+    next.run(request).await
 }
 
 /// POST /registry/cargo/api/v1/crates/publish
@@ -302,15 +357,8 @@ fn authorize_publish(
 async fn publish_crate(
     State(state): State<Arc<CargoRegistryState>>,
     Query(params): Query<PublishParams>,
-    headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    body: Bytes,
 ) -> Response {
-    // Auth gate runs first so unauthorized callers learn nothing about the
-    // request body or registry contents.
-    if let Some(rejection) = authorize_publish(&state, &headers) {
-        return rejection;
-    }
-
     if let Err(message) = validate_cargo_coordinates(&params.name, &params.version) {
         return bad_coordinate(message);
     }
@@ -360,6 +408,13 @@ async fn publish_crate(
         Ok(path) => path,
         Err(message) => return bad_coordinate(message),
     };
+
+    // Parse metadata before entering the short storage critical section. The
+    // write side serializes the subsequent manifest check + blob write +
+    // manifest append against every other publish in this registry. Readers
+    // hold the read side across their corresponding manifest/blob reads.
+    let metadata = extract_crate_metadata(&body, &params.name, &params.version);
+    let _write_guard = state.publish_gate.write().await;
 
     let existing_versions = match state
         .manifest_store
@@ -419,9 +474,6 @@ async fn publish_crate(
         )
             .into_response();
     }
-
-    // Extract features and deps from the .crate tarball's Cargo.toml
-    let metadata = extract_crate_metadata(&body, &params.name, &params.version);
 
     // Register the version in the manifest store
     let pkg_version = PackageVersion {
@@ -829,12 +881,12 @@ mod tests {
     ) -> (tempfile::TempDir, Arc<CargoRegistryState>) {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".kin")).unwrap();
-        let state = Arc::new(CargoRegistryState {
-            manifest_store: ManifestStore::new(&root.path().join(".kin")),
-            blobs_dir: root.path().join("cargo"),
-            base_url: "https://kinlab.ai".to_string(),
-            publish_token: publish_token.map(String::from),
-        });
+        let state = Arc::new(CargoRegistryState::new(
+            ManifestStore::new(&root.path().join(".kin")),
+            root.path().join("cargo"),
+            "https://kinlab.ai".to_string(),
+            publish_token.map(String::from),
+        ));
         (root, state)
     }
 
@@ -1095,6 +1147,43 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
         build_test_crate(name, version, &cargo_toml)
     }
 
+    fn valid_crate_with_padding(name: &str, version: &str, padding_len: usize) -> Vec<u8> {
+        use flate2::{write::GzEncoder, Compression};
+
+        let encoder = GzEncoder::new(Vec::new(), Compression::none());
+        let mut builder = tar::Builder::new(encoder);
+        let cargo_toml =
+            format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n");
+
+        let mut manifest_header = tar::Header::new_gnu();
+        manifest_header.set_size(cargo_toml.len() as u64);
+        manifest_header.set_mode(0o644);
+        manifest_header.set_cksum();
+        builder
+            .append_data(
+                &mut manifest_header,
+                format!("{name}-{version}/Cargo.toml"),
+                cargo_toml.as_bytes(),
+            )
+            .unwrap();
+
+        let padding = vec![b'x'; padding_len];
+        let mut padding_header = tar::Header::new_gnu();
+        padding_header.set_size(padding.len() as u64);
+        padding_header.set_mode(0o644);
+        padding_header.set_cksum();
+        builder
+            .append_data(
+                &mut padding_header,
+                format!("{name}-{version}/payload.bin"),
+                padding.as_slice(),
+            )
+            .unwrap();
+
+        let encoder = builder.into_inner().unwrap();
+        encoder.finish().unwrap()
+    }
+
     /// Build a `POST .../publish` request with the given query, optional Bearer
     /// token, and raw body bytes.
     fn publish_request(
@@ -1164,6 +1253,64 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
         )
         .await;
         assert_eq!(wrong, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_precedes_extraction_and_the_50_mib_limit_bounds_chunked_bodies() {
+        let (_root, state) = registry_state_with_token(Some("s3cret"));
+
+        // No Content-Length: the body extractor's explicit DefaultBodyLimit is
+        // the only size authority. Invalid auth must still win before that
+        // extractor polls or buffers the oversized body.
+        let unauthorized = cargo_routes(state.clone())
+            .oneshot(publish_request(
+                "demo",
+                "0.1.0",
+                Some("wrong"),
+                vec![b'x'; MAX_CRATE_SIZE + 1],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        drop(unauthorized);
+
+        let oversized = cargo_routes(state)
+            .oneshot(publish_request(
+                "demo",
+                "0.1.0",
+                Some("s3cret"),
+                vec![b'x'; MAX_CRATE_SIZE + 1],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn declared_oversize_publish_is_rejected_without_reading_the_body() {
+        let (_root, state) = registry_state_with_token(Some("s3cret"));
+        let response = cargo_routes(state)
+            .oneshot(
+                Request::post("/registry/cargo/api/v1/crates/publish?name=demo&version=0.1.0")
+                    .header("authorization", "Bearer s3cret")
+                    .header(header::CONTENT_LENGTH, MAX_CRATE_SIZE + 1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn publish_above_axum_default_but_below_registry_limit_succeeds() {
+        let (_root, state) = registry_state_with_token(Some("s3cret"));
+        let body = valid_crate_with_padding("demo", "0.1.0", 3 * 1024 * 1024);
+        assert!(body.len() > 2 * 1024 * 1024);
+        assert!(body.len() < MAX_CRATE_SIZE);
+
+        let status = publish(state, "demo", "0.1.0", Some("s3cret"), body).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1243,6 +1390,114 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
 
         let blob_path = state.blobs_dir.join("demo-0.1.0.crate");
         assert_eq!(std::fs::read(blob_path).unwrap(), original);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_conflicting_publishes_commit_exactly_one_matching_artifact() {
+        let (_root, state) = registry_state_with_token(Some("s3cret"));
+        let first = build_test_crate(
+            "demo",
+            "0.1.0",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\ndescription = \"first\"\n",
+        );
+        let second = build_test_crate(
+            "demo",
+            "0.1.0",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\ndescription = \"second\"\n",
+        );
+        let first_checksum = hex::encode(Sha256::digest(&first));
+        let second_checksum = hex::encode(Sha256::digest(&second));
+        assert_ne!(first_checksum, second_checksum);
+
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+        let first_task = {
+            let state = state.clone();
+            let start = start.clone();
+            let body = first.clone();
+            tokio::spawn(async move {
+                start.wait().await;
+                publish(state, "demo", "0.1.0", Some("s3cret"), body).await
+            })
+        };
+        let second_task = {
+            let state = state.clone();
+            let start = start.clone();
+            let body = second.clone();
+            tokio::spawn(async move {
+                start.wait().await;
+                publish(state, "demo", "0.1.0", Some("s3cret"), body).await
+            })
+        };
+        start.wait().await;
+
+        let statuses = [first_task.await.unwrap(), second_task.await.unwrap()];
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::OK)
+                .count(),
+            1
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::CONFLICT)
+                .count(),
+            1
+        );
+
+        let versions = state
+            .manifest_store
+            .get_versions(Ecosystem::Cargo, "demo")
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+        let committed_checksum = &versions[0].checksum;
+        assert!(
+            committed_checksum == &first_checksum || committed_checksum == &second_checksum,
+            "unexpected committed checksum {committed_checksum}"
+        );
+
+        let blob_path = state.blobs_dir.join("demo-0.1.0.crate");
+        let stored = std::fs::read(&blob_path).unwrap();
+        assert_eq!(hex::encode(Sha256::digest(&stored)), *committed_checksum);
+        let committed_body = if committed_checksum == &first_checksum {
+            &first
+        } else {
+            &second
+        };
+        assert_eq!(&stored, committed_body);
+
+        let index_response = cargo_routes(state.clone())
+            .oneshot(
+                Request::get("/registry/cargo/de/mo/demo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(index_response.status(), StatusCode::OK);
+        let index_body = axum::body::to_bytes(index_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let lines = String::from_utf8(index_body.to_vec()).unwrap();
+        let entries = lines.lines().collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        let entry: serde_json::Value = serde_json::from_str(entries[0]).unwrap();
+        assert_eq!(entry["cksum"].as_str(), Some(committed_checksum.as_str()));
+
+        let download_response = cargo_routes(state)
+            .oneshot(
+                Request::get("/registry/cargo/dl/demo/0.1.0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(download_response.status(), StatusCode::OK);
+        let downloaded = axum::body::to_bytes(download_response.into_body(), MAX_CRATE_SIZE)
+            .await
+            .unwrap();
+        assert_eq!(downloaded.as_ref(), committed_body.as_slice());
     }
 
     #[tokio::test]

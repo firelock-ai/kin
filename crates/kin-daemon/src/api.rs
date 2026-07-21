@@ -1103,12 +1103,12 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty());
     let cargo_routes =
-        kin_registry::cargo::cargo_routes(Arc::new(kin_registry::cargo::CargoRegistryState {
-            manifest_store: kin_registry::ManifestStore::new(state.layout.root()),
-            blobs_dir: crates_dir,
-            base_url: base_url.clone(),
-            publish_token: registry_write_token.clone(),
-        }));
+        kin_registry::cargo::cargo_routes(Arc::new(kin_registry::cargo::CargoRegistryState::new(
+            kin_registry::ManifestStore::new(state.layout.root()),
+            crates_dir,
+            base_url.clone(),
+            registry_write_token.clone(),
+        )));
 
     let npm_routes = npm_registry_routes(
         &state,
