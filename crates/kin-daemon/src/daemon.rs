@@ -117,6 +117,35 @@ async fn drain_pending_flush(pending: &mut Option<tokio::task::JoinHandle<Result
     }
 }
 
+// Shutdown-latency bound — how long the daemon may take to actually disappear.
+// Callers that budget for daemon cleanup (the merge-trust harness attests
+// against a 45s window) depend on this being bounded rather than generous, so
+// the terms are stated explicitly.
+//
+// SIGTERM/SIGINT → process gone:
+// 1. the signal is observed by the async handler — prompt even mid-hydration,
+//    because hydration runs on the blocking pool and leaves the async workers
+//    schedulable;
+// 2. `drain_handles` joins the daemon's tasks, bounded at 10s. An in-flight
+//    hydration is a blocking task rather than a drained handle, but the API
+//    server's graceful shutdown waits on in-flight requests, so a hydrating
+//    daemon rides this full 10s;
+// 3. the final storage flush and endpoint-file removal run (fast on the local
+//    backend);
+// 4. `runtime.shutdown_timeout(runtime_shutdown_grace())` waits up to 8s for
+//    the blocking pool, then abandons whatever is still running;
+// 5. the process exits.
+//
+// That normal path is ~18s. Independently, the escalation watchdog force-exits
+// DEFAULT_SHUTDOWN_ESCALATION_GRACE after shutdown is signalled, so the hard
+// bound is ~25s. Owner death costs at most one OWNER_WATCH_CHECK_INTERVAL of
+// detection on top of the same bound: ~27s from owner exit to process gone,
+// with no signal ever sent.
+//
+// Both grace periods are configurable — KIN_DAEMON_SHUTDOWN_GRACE_SECS and
+// KIN_DAEMON_RUNTIME_SHUTDOWN_GRACE_SECS — so a caller with a tighter cleanup
+// budget than 45s can lower the bound rather than resorting to SIGKILL.
+
 /// Default grace the shutdown-escalation watchdog grants — once graceful
 /// shutdown is signalled — before force-exiting the process. Generous enough
 /// for a legitimate final snapshot flush + task drain to win the race on their
@@ -238,9 +267,55 @@ async fn save_snapshot_blocking(state: Arc<DaemonState>) -> Result<()> {
         .map_err(|error| DaemonError::Io(std::io::Error::other(error.to_string())))?
 }
 
-/// How often the watched-PID watchdog checks whether the watched process is
-/// still alive.
-const WATCH_PID_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the owner-death watchdog checks whether the owning process is
+/// still alive. A `kill(pid, 0)` every couple of seconds is a single cheap
+/// syscall, so this is set for detection latency rather than to save work.
+const OWNER_WATCH_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Validate a raw `KIN_DAEMON_WATCH_PID` value into an owner PID this daemon may
+/// watch, or `None` to run with no owner-death watchdog at all.
+///
+/// The rejections here are the safety boundary for the watchdog, so each one is
+/// deliberate:
+/// - absent / empty / unparseable → no watchdog. This is the default for every
+///   daemon; a spawner must opt in explicitly.
+/// - `<= 1` → rejects a caller that passed `getppid()` after the daemon already
+///   reparented (init is PID 1), and rejects the `kill(0, …)` / `kill(-1, …)`
+///   process-group and broadcast selectors, which are not owner PIDs at all.
+/// - the daemon's own PID → a self-watch can never observe a death. Treat an
+///   obviously misconfigured owner as "no watchdog" instead of as armed.
+///
+/// Note what is NOT accepted as a source: `getppid()`. Both daemon spawn paths
+/// call `setsid()`, so a healthy persistent daemon reparents to init as soon as
+/// the CLI that launched it exits. `ppid == 1` is the normal, correct state for
+/// a legitimately detached daemon, which is why ownership must be stated
+/// explicitly by the spawner rather than inferred from the process tree.
+fn parse_owner_watch_pid(raw: Option<&str>, self_pid: u32) -> Option<i32> {
+    let pid = raw?.trim().parse::<i32>().ok()?;
+    if pid <= 1 {
+        return None;
+    }
+    if i64::from(pid) == i64::from(self_pid) {
+        return None;
+    }
+    Some(pid)
+}
+
+/// Has shutdown been signalled by any path?
+///
+/// `is_shutdown` is the state flag set by the propagation task; `cancel` is the
+/// watch-channel flag that every shutdown trigger (SIGTERM/SIGINT, idle timeout,
+/// owner death, any task exiting) sets synchronously at the moment it fires.
+///
+/// The escalation watchdog arms on EITHER. Keying it on `is_shutdown` alone made
+/// the force-exit backstop depend on a tokio task running: the only writer of
+/// `is_shutdown` is the propagation task, so a wedged or saturated async runtime
+/// silently disarmed the very backstop that exists for the wedged case. `cancel`
+/// is set synchronously by the signal handler itself, so the backstop is now
+/// armed by the signal rather than by the scheduler's willingness to run a task.
+fn shutdown_signalled(is_shutdown: bool, cancel: bool) -> bool {
+    is_shutdown || cancel
+}
 
 /// Is the process with this PID still alive?
 ///
@@ -559,40 +634,65 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
         run_idle_monitor(idle_state, idle_timeout, idle_cancel_tx, idle_cancel).await
     });
 
-    // Opt-in watched-PID watchdog. A harness (e.g. the benchmark driver) sets
-    // KIN_DAEMON_WATCH_PID to its own PID; if that process dies — leaving this
-    // daemon orphaned and potentially busy-spinning on a shared repo — the
-    // daemon shuts itself down gracefully via the same cancel channel the idle
-    // path uses. Unset/empty/<= 1 disables it entirely, so normal persistent
-    // daemons (which legitimately outlive and reparent away from their launcher)
-    // are completely unaffected.
-    if let Some(watch_pid) = std::env::var("KIN_DAEMON_WATCH_PID")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<i32>().ok())
-        .filter(|pid| *pid > 1)
-    {
-        info!(watch_pid, "daemon watched-PID shutdown enabled");
+    // Opt-in owner-death watchdog. A harness (e.g. the benchmark driver) sets
+    // KIN_DAEMON_WATCH_PID to the PID of the process that owns this daemon's
+    // work. When that owner dies, nothing will ever consume what this daemon is
+    // computing, so it shuts itself down instead of burning cores and holding
+    // tens of GB on a result no one will read. An orphaned daemon caught
+    // mid-hydration is the motivating case: hydration cost is superlinear, so
+    // the longer an abandoned walk runs the more expensive it gets.
+    //
+    // Deliberately a plain OS thread, NOT a tokio task. The whole point of this
+    // watchdog is to work when the daemon is in trouble, and the previous tokio
+    // task could only fire if the async runtime was still willing to schedule
+    // it. It also sets `is_shutdown` directly rather than relying on the
+    // propagation task, so the force-exit backstop is armed even if no tokio
+    // task ever runs again.
+    //
+    // Opt-in only, and never inferred from getppid() — see
+    // `parse_owner_watch_pid` for why the process tree cannot answer this
+    // question for a daemon that is detached by design.
+    if let Some(owner_pid) = parse_owner_watch_pid(
+        std::env::var("KIN_DAEMON_WATCH_PID").ok().as_deref(),
+        std::process::id(),
+    ) {
+        info!(owner_pid, "daemon owner-death shutdown enabled");
+        let watch_state = Arc::clone(&state);
         let watch_cancel_tx = cancel_tx.clone();
-        let mut watch_cancel_rx = cancel_rx.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = tokio::time::sleep(WATCH_PID_CHECK_INTERVAL) => {}
-                    _ = watch_cancel_rx.changed() => return,
-                }
-                if *watch_cancel_rx.borrow() {
+        let watch_cancel_rx = cancel_rx.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("kin-owner-watchdog".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(OWNER_WATCH_CHECK_INTERVAL);
+                if shutdown_signalled(
+                    watch_state
+                        .is_shutdown
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    *watch_cancel_rx.borrow(),
+                ) {
                     return;
                 }
-                if !watched_process_is_alive(watch_pid) {
-                    warn!(
-                        watch_pid,
-                        "watched process is gone — shutting down orphaned daemon"
-                    );
-                    let _ = watch_cancel_tx.send(true);
-                    return;
+                if watched_process_is_alive(owner_pid) {
+                    continue;
                 }
-            }
-        });
+                warn!(
+                    owner_pid,
+                    "owner process is gone — shutting down orphaned daemon"
+                );
+                // Arm the force-exit backstop here, not via the propagation
+                // task: an orphaned daemon is exactly the case where the async
+                // runtime may be unable to make progress.
+                watch_state
+                    .is_shutdown
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                // Best-effort graceful path; it normally wins the race against
+                // the escalation grace and exits cleanly with state flushed.
+                let _ = watch_cancel_tx.send(true);
+                return;
+            })
+        {
+            warn!(error = %error, "failed to spawn owner-death watchdog");
+        }
     }
 
     // Spawn the reconciliation loop.
@@ -686,19 +786,28 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
     // This is the hard backstop against the embed-worker zombie: a blocking
     // embedding batch mid GPU-compute cannot observe the cancel signal, so
     // runtime teardown can otherwise block forever and leave a headless,
-    // SIGTERM-immune CPU zombie that still races kvec writes. Keyed on
-    // `is_shutdown` (set by the propagation task above for EVERY shutdown path:
-    // SIGTERM/SIGINT, idle timeout, watched-PID death, or any task exiting), so
-    // it never fires during normal operation.
+    // SIGTERM-immune CPU zombie that still races kvec writes.
+    //
+    // Armed by `shutdown_signalled`, i.e. the cancel watch-channel OR
+    // `is_shutdown`. Watching `is_shutdown` alone was a latent hole: its only
+    // writer is the propagation task above, so the backstop against a wedged
+    // runtime was itself gated on that runtime scheduling a task. The cancel
+    // flag is set synchronously by whichever path triggers shutdown
+    // (SIGTERM/SIGINT, idle timeout, owner death, any task exiting), so the
+    // grace period now starts when the signal lands. Neither flag is ever set
+    // during normal operation, so this still cannot fire on a healthy daemon.
     let escalation_state = Arc::clone(&state);
+    let escalation_cancel = cancel_rx.clone();
     let escalation_grace = shutdown_escalation_grace();
     if let Err(error) = std::thread::Builder::new()
         .name("kin-shutdown-watchdog".to_string())
         .spawn(move || {
-            while !escalation_state
-                .is_shutdown
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
+            while !shutdown_signalled(
+                escalation_state
+                    .is_shutdown
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                *escalation_cancel.borrow(),
+            ) {
                 std::thread::sleep(SHUTDOWN_WATCH_POLL);
             }
             std::thread::sleep(escalation_grace);
@@ -2016,9 +2125,10 @@ async fn select_with_signals(
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        drain_pending_flush, next_embed_error_backoff, parse_duration_secs,
-        should_enable_lsp_enrichment, should_flush_now, watched_process_is_alive, DaemonConfig,
-        DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE,
+        drain_pending_flush, next_embed_error_backoff, parse_duration_secs, parse_owner_watch_pid,
+        should_enable_lsp_enrichment, should_flush_now, shutdown_signalled,
+        watched_process_is_alive, DaemonConfig, DEFAULT_RUNTIME_SHUTDOWN_GRACE,
+        DEFAULT_SHUTDOWN_ESCALATION_GRACE,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -2170,6 +2280,116 @@ mod tests {
         let pid = child.id() as i32;
         child.wait().expect("reap child");
         assert!(!watched_process_is_alive(pid));
+    }
+
+    #[test]
+    fn owner_watchdog_is_opt_in_and_never_derived_from_the_process_tree() {
+        let self_pid = std::process::id();
+
+        // Absent or unusable configuration must leave the watchdog disarmed.
+        // This is the default for every daemon: unless a spawner explicitly
+        // names an owner, nothing can self-terminate.
+        assert_eq!(parse_owner_watch_pid(None, self_pid), None);
+        assert_eq!(parse_owner_watch_pid(Some(""), self_pid), None);
+        assert_eq!(parse_owner_watch_pid(Some("   "), self_pid), None);
+        assert_eq!(parse_owner_watch_pid(Some("garbage"), self_pid), None);
+
+        // PID 1 is the decisive rejection. Both daemon spawn paths call
+        // setsid(), so a healthy persistent daemon reparents to init the moment
+        // the CLI that launched it exits — ppid == 1 is the NORMAL state for a
+        // legitimately detached daemon. A watchdog that accepted 1 as an owner
+        // would treat "init is alive" as its liveness question and, worse, any
+        // getppid()-derived wiring would arm against every daemon on the
+        // machine. Ownership is only ever what the spawner states explicitly.
+        assert_eq!(parse_owner_watch_pid(Some("1"), self_pid), None);
+
+        // 0 and negatives are process-group / broadcast selectors for kill(2),
+        // not owner PIDs; accepting them would make the liveness probe
+        // meaningless.
+        assert_eq!(parse_owner_watch_pid(Some("0"), self_pid), None);
+        assert_eq!(parse_owner_watch_pid(Some("-1"), self_pid), None);
+
+        // A self-watch can never observe a death, so it is misconfiguration
+        // rather than a live watchdog.
+        let self_pid_text = self_pid.to_string();
+        assert_eq!(
+            parse_owner_watch_pid(Some(self_pid_text.as_str()), self_pid),
+            None
+        );
+
+        // A real, explicitly-stated owner arms it (whitespace tolerated).
+        assert_eq!(parse_owner_watch_pid(Some("4242"), self_pid), Some(4242));
+        assert_eq!(parse_owner_watch_pid(Some(" 4242 "), self_pid), Some(4242));
+    }
+
+    #[test]
+    fn escalation_backstop_arms_on_the_signal_not_on_a_scheduled_task() {
+        // A healthy daemon never arms the force-exit backstop.
+        assert!(!shutdown_signalled(false, false));
+
+        // The regression this closes: the cancel watch-channel is set
+        // synchronously by whichever path triggers shutdown, while `is_shutdown`
+        // is written only by a tokio task. Keying the backstop on `is_shutdown`
+        // alone meant a wedged or saturated runtime — precisely the case the
+        // backstop exists for — silently disarmed it, because the propagation
+        // task never ran. Cancel alone must arm it.
+        assert!(shutdown_signalled(false, true));
+
+        // The propagation-task path still arms it, including when the cancel
+        // receiver has already been observed and reset by another consumer.
+        assert!(shutdown_signalled(true, false));
+        assert!(shutdown_signalled(true, true));
+    }
+
+    #[test]
+    fn escalation_arm_loop_fires_when_only_the_cancel_channel_is_set() {
+        // Faithful model of the escalation watchdog's arm loop running on the
+        // real primitives: an AtomicBool standing in for `state.is_shutdown` and
+        // the daemon's actual cancel watch-channel. `is_shutdown` is
+        // deliberately never written — that is precisely what a wedged or
+        // saturated runtime looks like, since the propagation task is its only
+        // writer and it never gets scheduled. The force-exit backstop must still
+        // arm, because SIGTERM sets the cancel flag synchronously.
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let is_shutdown = Arc::new(AtomicBool::new(false));
+        let armed = Arc::new(AtomicBool::new(false));
+
+        let loop_is_shutdown = Arc::clone(&is_shutdown);
+        let loop_armed = Arc::clone(&armed);
+        std::thread::spawn(move || {
+            while !shutdown_signalled(
+                loop_is_shutdown.load(Ordering::Relaxed),
+                *cancel_rx.borrow(),
+            ) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            loop_armed.store(true, Ordering::Relaxed);
+        });
+
+        // Nothing has signalled shutdown yet, so a healthy daemon's watchdog
+        // sits disarmed rather than counting down to a force-exit.
+        assert!(!armed.load(Ordering::Relaxed));
+
+        // Exactly what the SIGTERM arm of `select_with_signals` does — and only
+        // that. No tokio task runs in this test at all.
+        cancel_tx.send(true).expect("cancel receiver alive");
+
+        // Bounded wait rather than join(): a regression here must fail the test,
+        // not hang CI until the job timeout.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !armed.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(
+            armed.load(Ordering::Relaxed),
+            "cancel alone must arm the force-exit backstop; keying it on \
+             is_shutdown made the wedged-runtime backstop depend on the runtime"
+        );
+        assert!(
+            !is_shutdown.load(Ordering::Relaxed),
+            "is_shutdown was never set — the backstop must not depend on it"
+        );
     }
 
     #[test]
