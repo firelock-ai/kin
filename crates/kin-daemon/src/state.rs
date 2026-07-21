@@ -1052,9 +1052,8 @@ impl DaemonState {
         // Resolve the daemon's repository identity once. KIN_PRIMARY_REPO_ID is
         // retained as the multi-repo compatibility alias, but it feeds the same
         // cached authority used by graph, MCP, and spine paths.
-        let cached_repo_id =
-            kin_core::manifest::resolve_repo_id(&layout, explicit_repo_id)
-                .map_err(DaemonError::from)?;
+        let cached_repo_id = kin_core::manifest::resolve_repo_id(&layout, explicit_repo_id)
+            .map_err(DaemonError::from)?;
 
         // Baseline for the shutdown anti-wipe guard: the entity count loaded
         // from the on-disk snapshot. Read before `graph` is moved into the state.
