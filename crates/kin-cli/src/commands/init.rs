@@ -910,6 +910,109 @@ fn repair_legacy_git_import_history(
     })
 }
 
+/// True when `existing` is `canonical` as an artifact-only import would have
+/// stored it: every graph-defining field identical, and the two semantic delta
+/// lists — the only thing the skipped per-commit replay produces — empty.
+///
+/// Exact, not heuristic. A commit that genuinely replays to no semantic deltas
+/// (a whitespace-only edit, say) has an empty `canonical` too, so `existing`
+/// already equals it and nothing here matches or rewrites it.
+fn artifact_only_import_remnant_matches(
+    existing: &SemanticChange,
+    canonical: &SemanticChange,
+) -> bool {
+    if !existing.entity_deltas.is_empty() || !existing.relation_deltas.is_empty() {
+        return false;
+    }
+    if canonical.entity_deltas.is_empty() && canonical.relation_deltas.is_empty() {
+        return false;
+    }
+    let Ok(mut expected) = serde_json::to_value(canonical) else {
+        return false;
+    };
+    let Some(object) = expected.as_object_mut() else {
+        return false;
+    };
+    object.insert(
+        "entity_deltas".to_string(),
+        serde_json::Value::Array(Vec::new()),
+    );
+    object.insert(
+        "relation_deltas".to_string(),
+        serde_json::Value::Array(Vec::new()),
+    );
+    matches!(serde_json::to_value(existing), Ok(actual) if actual == expected)
+}
+
+/// Replace history that a lazy ref hydration imported at artifact-only depth
+/// with the semantically replayed changes this import just produced.
+///
+/// This is the upgrade half of hydration-depth ownership, and it has to happen
+/// here. kin-db's `create_change` cannot re-publish an id that is already in the
+/// graph, so a change imported without its semantic replay stays that way until
+/// an owner that can rewrite the snapshot replaces it — which `kin init` is, and
+/// a ref lookup holding only `&InMemoryGraph` is not.
+///
+/// Two independent facts must agree before anything is rewritten: the id is
+/// recorded as artifact-only hydrated, and the stored change still has the exact
+/// shape such an import leaves behind. History that merely differs from this
+/// import (a parser-semantics change, say) is left alone for the existing
+/// deterministic-collision refusal to report.
+fn upgrade_artifact_only_imported_history(
+    manager: &kin_db::SnapshotManager,
+    layout: &kin_core::KinLayout,
+    boundary_root: SemanticChangeId,
+    canonical_imported: &[kin_git::ImportedChange],
+) -> Result<usize> {
+    if canonical_imported.is_empty() {
+        return Ok(0);
+    }
+    let recorded = crate::commands::hydration_depth::recorded_change_ids(layout)
+        .context("read recorded artifact-only hydration depth before importing Git history")?;
+    if recorded.is_empty() {
+        return Ok(0);
+    }
+
+    let graph = manager.graph();
+    let mut snapshot = graph.to_snapshot();
+    let mut upgraded = Vec::new();
+    for canonical in canonical_imported {
+        if !recorded.contains(&canonical.change.id) {
+            continue;
+        }
+        let Some(existing) = snapshot.changes.get(&canonical.change.id) else {
+            continue;
+        };
+        if artifact_only_import_remnant_matches(existing, &canonical.change) {
+            upgraded.push(canonical.change.id);
+        }
+    }
+    if upgraded.is_empty() {
+        return Ok(0);
+    }
+
+    for canonical in canonical_imported {
+        if upgraded.contains(&canonical.change.id) {
+            snapshot
+                .changes
+                .insert(canonical.change.id, canonical.change.clone());
+        }
+    }
+    validate_repaired_change_history(&snapshot.changes, &snapshot.branches, boundary_root)?;
+    rebuild_history_derived_indexes(&mut snapshot);
+    let upgraded_graph =
+        kin_db::InMemoryGraph::from_snapshot_with_text_index(snapshot, layout.text_index_dir());
+    manager.swap(upgraded_graph);
+    manager
+        .save()
+        .context("persist artifact-only history upgraded to semantic depth")?;
+    // Only after the upgraded history is durable: the records are what keeps a
+    // semantic caller from reading through the gap, so they outlive every
+    // failure that could leave the old history in place.
+    crate::commands::hydration_depth::forget_replayed(layout, &upgraded)?;
+    Ok(upgraded.len())
+}
+
 pub async fn run(
     path: Option<String>,
     json: bool,
@@ -1263,6 +1366,26 @@ pub async fn run(
                         // caller's Arc so exact-once collision checks target
                         // the repaired graph rather than the retired view.
                         graph = snap.graph();
+                    }
+
+                    let upgraded_changes = upgrade_artifact_only_imported_history(
+                        &snap,
+                        &layout,
+                        history_boundary_root,
+                        &imported,
+                    )?;
+                    if upgraded_changes > 0 {
+                        warn!(
+                            upgraded_changes,
+                            "upgraded artifact-only hydrated history to semantic depth"
+                        );
+                        graph = snap.graph();
+                        if !json {
+                            println!(
+                                "  Upgraded {} lazily hydrated commit(s) from artifact-only to semantic depth.",
+                                upgraded_changes
+                            );
+                        }
                     }
 
                     let mut last_id = None;
@@ -9768,6 +9891,152 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         assert_eq!(
             local_graph.list_opaque_artifacts().unwrap()[0].file_id,
             opaque.file_id
+        );
+    }
+
+    /// One change in the shape a lazy artifact-only ref hydration leaves in the
+    /// graph, plus the semantically replayed copy of it a later Git import
+    /// produces.
+    fn artifact_only_remnant_pair(
+        parents: Vec<SemanticChangeId>,
+        branch_name: &kin_model::BranchName,
+    ) -> (SemanticChange, SemanticChange) {
+        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x33; 32]));
+        let entity = test_entity("answer", "src/lib.rs");
+        let remnant = SemanticChange {
+            id: change_id,
+            parents,
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "kin import: git commit".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(branch_name.clone()),
+        };
+        let replayed = SemanticChange {
+            entity_deltas: vec![EntityDelta::Added(entity)],
+            ..remnant.clone()
+        };
+        (remnant, replayed)
+    }
+
+    /// The upgrade half of hydration-depth ownership: history a lazy ref
+    /// hydration left without its semantic replay is replaced by the replayed
+    /// import, and the record that made semantic callers report a gap is
+    /// retired with it.
+    #[test]
+    fn init_upgrades_recorded_artifact_only_history_to_semantic_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(dir.path()).unwrap().layout;
+        let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+        let genesis = kin_core::build_genesis_change();
+        let branch_name = kin_model::BranchName::new("main");
+        let (remnant, replayed) = artifact_only_remnant_pair(vec![genesis.id], &branch_name);
+
+        let graph = snap.graph();
+        if graph.get_change(&genesis.id).unwrap().is_none() {
+            graph.create_change(&genesis).unwrap();
+        }
+        graph.create_change(&remnant).unwrap();
+        crate::commands::hydration_depth::record_artifact_only(
+            &layout,
+            remnant.id,
+            "0123456789abcdef0123456789abcdef01234567",
+            &[remnant.id],
+        )
+        .unwrap();
+
+        let imported = vec![kin_git::ImportedChange {
+            change: replayed.clone(),
+            git_oid: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        }];
+        let upgraded =
+            upgrade_artifact_only_imported_history(&snap, &layout, genesis.id, &imported).unwrap();
+
+        assert_eq!(upgraded, 1);
+        let stored = snap.graph().get_change(&remnant.id).unwrap().unwrap();
+        assert_eq!(
+            stored.entity_deltas.len(),
+            1,
+            "the upgraded change must carry the replayed semantics"
+        );
+        assert!(
+            crate::commands::hydration_depth::recorded_change_ids(&layout)
+                .unwrap()
+                .is_empty(),
+            "upgraded history must stop being reported as a gap"
+        );
+    }
+
+    /// The upgrade needs both facts. History that merely differs from this
+    /// import — a parser-semantics change, say — is not an artifact-only
+    /// remnant and is left for the deterministic-collision refusal to report,
+    /// and history nobody recorded as artifact-only hydrated is never rewritten
+    /// on shape alone.
+    #[test]
+    fn init_upgrade_requires_both_the_record_and_the_remnant_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(dir.path()).unwrap().layout;
+        let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+        let genesis = kin_core::build_genesis_change();
+        let branch_name = kin_model::BranchName::new("main");
+        let (remnant, replayed) = artifact_only_remnant_pair(vec![genesis.id], &branch_name);
+
+        let graph = snap.graph();
+        if graph.get_change(&genesis.id).unwrap().is_none() {
+            graph.create_change(&genesis).unwrap();
+        }
+        graph.create_change(&remnant).unwrap();
+
+        let imported = vec![kin_git::ImportedChange {
+            change: replayed.clone(),
+            git_oid: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        }];
+        assert_eq!(
+            upgrade_artifact_only_imported_history(&snap, &layout, genesis.id, &imported).unwrap(),
+            0,
+            "an unrecorded change must not be rewritten on shape alone"
+        );
+
+        crate::commands::hydration_depth::record_artifact_only(
+            &layout,
+            remnant.id,
+            "0123456789abcdef0123456789abcdef01234567",
+            &[remnant.id],
+        )
+        .unwrap();
+        let diverged = vec![kin_git::ImportedChange {
+            change: SemanticChange {
+                message: "a different commit message".to_string(),
+                ..replayed.clone()
+            },
+            git_oid: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        }];
+        assert_eq!(
+            upgrade_artifact_only_imported_history(&snap, &layout, genesis.id, &diverged).unwrap(),
+            0,
+            "history that differs beyond the skipped replay must not be rewritten"
+        );
+    }
+
+    /// A commit that genuinely replays to no semantic deltas — a whitespace-only
+    /// edit — is stored identically at either depth, so it is never mistaken for
+    /// an unreplayed remnant. This is why depth is recorded rather than inferred
+    /// from "present but empty".
+    #[test]
+    fn a_commit_with_no_semantic_deltas_is_not_an_artifact_only_remnant() {
+        let branch_name = kin_model::BranchName::new("main");
+        let (remnant, replayed) = artifact_only_remnant_pair(vec![], &branch_name);
+
+        assert!(artifact_only_import_remnant_matches(&remnant, &replayed));
+        assert!(
+            !artifact_only_import_remnant_matches(&remnant, &remnant),
+            "an import that replays to nothing leaves the stored change unchanged"
         );
     }
 
