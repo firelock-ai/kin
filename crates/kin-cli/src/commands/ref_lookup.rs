@@ -1030,6 +1030,33 @@ mod tests {
             .expect("hydration must insert the requested commit")
     }
 
+    /// Before-state probe, expected to FAIL on this commit. `locate --ref`
+    /// hydrates at artifact-only depth and persists it; a semantic entry point
+    /// then resolves the same ref successfully into history whose per-commit
+    /// deltas were never replayed, and reports an empty answer that cannot be
+    /// told apart from a real negative.
+    #[test]
+    fn a_semantic_caller_resolves_into_unreplayed_history_after_a_locate_hydration() {
+        let Some((graph, layout, git_oid)) = single_commit_repo_for_hydration() else {
+            return;
+        };
+
+        resolve_ref_importing_git_if_needed_for_locate(&graph, &layout, Some(&git_oid)).unwrap();
+        let resolved =
+            resolve_ref_importing_git_if_needed_with_report(&graph, &layout, Some(&git_oid))
+                .expect("the semantic entry point resolves the already-hydrated ref");
+        assert_eq!(
+            resolved.hydrated_changes, 0,
+            "the tip is present, so no hydration re-runs and nothing upgrades its depth"
+        );
+
+        let change = graph.get_change(&resolved.head).unwrap().unwrap();
+        assert!(
+            !change.entity_deltas.is_empty(),
+            "a semantic caller resolved into history with no replayed entity deltas: history, blame, and review answer empty here"
+        );
+    }
+
     /// The perf contract: an artifact-only hydration imports the same commits
     /// and the same artifact deltas but runs no per-commit semantic replay, so
     /// it writes no entity deltas and never opens a hydration checkpoint store.
