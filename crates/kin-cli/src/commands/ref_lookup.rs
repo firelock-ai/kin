@@ -4,6 +4,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use kin_model::{BranchName, ChangeStore, Entity, EntityFilter, GraphStore};
 use kin_model::{Hash256, SemanticChangeId};
+use std::collections::HashSet;
 
 /// A reference did not resolve to a semantic change — unknown ref syntax, a
 /// ref that legitimately does not exist, or a relative-ref hop (`^N`/`~N`)
@@ -45,6 +46,54 @@ fn ref_error(reference: impl Into<String>, reason: impl Into<String>) -> anyhow:
 pub fn is_ref_resolution_error(err: &anyhow::Error) -> bool {
     err.chain()
         .any(|cause| cause.downcast_ref::<RefResolutionError>().is_some())
+}
+
+/// A ref that resolves, but whose ancestry is in the graph without the
+/// per-commit semantic deltas that `history`, `blame`, and `review` read.
+///
+/// This is a graph gap, not bad client input: the ref names real, present
+/// history. Reporting it is what keeps an unhydrated negative distinguishable
+/// from a real one — the alternative is a confident, well-formed empty answer
+/// that a caller cannot tell apart from "this entity genuinely has no history
+/// at this ref".
+#[derive(Debug)]
+pub struct HydrationDepthGapError {
+    reference: String,
+    change: SemanticChangeId,
+    tip: String,
+}
+
+impl std::fmt::Display for HydrationDepthGapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ref '{}' resolves to change {}, which this repository imported at artifact-only depth while hydrating Git commit {}: its per-commit entity and relation deltas were never replayed, so semantic history at this ref would read as empty rather than as an answer. Re-import semantic history with `kin init --git-history full` to upgrade it.",
+            self.reference, self.change, self.tip
+        )
+    }
+}
+
+impl std::error::Error for HydrationDepthGapError {}
+
+/// True when `err` is, or wraps via added context, a
+/// [`HydrationDepthGapError`]. Kept separate from
+/// [`is_ref_resolution_error`] so a transport owner can report a graph gap
+/// distinctly from a client-input error without matching on message text.
+pub fn is_hydration_depth_gap_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<HydrationDepthGapError>().is_some())
+}
+
+fn hydration_depth_gap_error(
+    reference: Option<&str>,
+    change: SemanticChangeId,
+    tip: impl Into<String>,
+) -> anyhow::Error {
+    anyhow::Error::new(HydrationDepthGapError {
+        reference: reference.unwrap_or("HEAD").to_string(),
+        change,
+        tip: tip.into(),
+    })
 }
 
 pub(crate) fn parse_change_id(input: &str) -> Result<SemanticChangeId> {
@@ -142,6 +191,45 @@ enum HydrationDepth {
     ArtifactOnly,
 }
 
+/// The first candidate this graph is holding exactly as some artifact-only
+/// hydration left it.
+///
+/// Two facts have to agree, and neither decides alone.
+///
+/// The record is necessary: no property of a stored change identifies an
+/// unreplayed import, because a whitespace-only commit replays to no semantic
+/// deltas either. Treating "present but empty" as unhydrated would refuse refs
+/// that are perfectly answerable.
+///
+/// The graph is confirmatory, and only ever narrows what the record claims. A
+/// record describes a hydration, not a graph: hydration into an ephemeral
+/// session graph records and then discards its growth, and a later import can
+/// insert the same change *with* its replay. So a recorded change is a gap only
+/// while this graph still holds it in the shape the record describes.
+fn first_live_artifact_only_gap(
+    graph: &kin_db::InMemoryGraph,
+    layout: &kin_core::KinLayout,
+    candidates: &HashSet<SemanticChangeId>,
+) -> Result<Option<(SemanticChangeId, String)>> {
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    for hydration in crate::commands::hydration_depth::artifact_only_hydrations(layout)? {
+        for change_id in &hydration.changes {
+            if !candidates.contains(change_id) {
+                continue;
+            }
+            let Some(change) = graph.get_change(change_id)? else {
+                continue;
+            };
+            if change.entity_deltas.is_empty() && change.relation_deltas.is_empty() {
+                return Ok(Some((*change_id, hydration.tip.clone())));
+            }
+        }
+    }
+    Ok(None)
+}
+
 pub fn resolve_ref_importing_git_if_needed(
     graph: &kin_db::InMemoryGraph,
     layout: &kin_core::KinLayout,
@@ -199,8 +287,14 @@ fn prepare_ref_importing_git_if_needed(
     depth: HydrationDepth,
 ) -> PreparedRefResolution {
     match resolve_ref(graph, layout, reference) {
+        // A ref that already resolves never re-enters hydration, so this is the
+        // only place a semantic caller can learn that the history it is about to
+        // read was imported without its semantic replay. Answering here is what
+        // the old code did, and what made an unhydrated ancestry indistinguishable
+        // from an entity that genuinely has no history at this ref.
         Ok(head) => PreparedRefResolution {
-            resolution: Ok(head),
+            resolution: semantic_depth_is_available(graph, layout, reference, depth, head)
+                .map(|()| head),
             hydrated_changes: 0,
         },
         Err(original_err) => {
@@ -229,6 +323,28 @@ fn prepare_ref_importing_git_if_needed(
                 },
             }
         }
+    }
+}
+
+/// Confirm the resolved ref can answer at the depth the caller resolves for.
+///
+/// Retrieval reads the ref's tree state and is complete at artifact-only depth,
+/// so it never consults the records. `history`, `blame`, and `review` read the
+/// per-commit deltas the artifact-only import skipped, and get the gap reported
+/// instead of an empty answer.
+fn semantic_depth_is_available(
+    graph: &kin_db::InMemoryGraph,
+    layout: &kin_core::KinLayout,
+    reference: Option<&str>,
+    depth: HydrationDepth,
+    head: SemanticChangeId,
+) -> Result<()> {
+    if depth == HydrationDepth::ArtifactOnly {
+        return Ok(());
+    }
+    match first_live_artifact_only_gap(graph, layout, &HashSet::from([head]))? {
+        Some((change, tip)) => Err(hydration_depth_gap_error(reference, change, tip)),
+        None => Ok(()),
     }
 }
 
@@ -566,10 +682,10 @@ fn hydrate_imported_git_ref(
 ) -> Result<usize> {
     match depth {
         HydrationDepth::Semantic => {
-            hydrate_imported_git_ref_with(graph, layout, git_oid, replay_imported_semantics)
+            hydrate_imported_git_ref_with(graph, layout, git_oid, depth, replay_imported_semantics)
         }
         HydrationDepth::ArtifactOnly => {
-            hydrate_imported_git_ref_with(graph, layout, git_oid, skip_imported_semantics)
+            hydrate_imported_git_ref_with(graph, layout, git_oid, depth, skip_imported_semantics)
         }
     }
 }
@@ -654,6 +770,7 @@ fn hydrate_imported_git_ref_with<F>(
     graph: &kin_db::InMemoryGraph,
     layout: &kin_core::KinLayout,
     git_oid: &str,
+    depth: HydrationDepth,
     enrich_semantics: F,
 ) -> Result<usize>
 where
@@ -679,6 +796,31 @@ where
     )
     .with_context(|| format!("hydrate imported Git commit '{}'", git_oid))?;
 
+    // Split the window before any replay or graph write. kin-db's
+    // `create_change` is an insertion primitive, not an upsert, so a change
+    // already in the graph keeps whatever depth it was imported at and the
+    // enriched copy this pass would produce for it is discarded.
+    let mut absent = Vec::with_capacity(imported.len());
+    let mut present = HashSet::new();
+    for imported_change in &imported {
+        let change_id = imported_change.change.id;
+        if graph.get_change(&change_id)?.is_some() {
+            present.insert(change_id);
+        } else {
+            absent.push(change_id);
+        }
+    }
+
+    // Semantics for the already-present part of this ancestry cannot be
+    // published from here, so completing the import would leave history reading
+    // silently through an unreplayed prefix. Report the gap instead — before the
+    // replay this would waste, and before anything is written.
+    if depth == HydrationDepth::Semantic {
+        if let Some((change, tip)) = first_live_artifact_only_gap(graph, layout, &present)? {
+            return Err(hydration_depth_gap_error(Some(git_oid), change, tip));
+        }
+    }
+
     enrich_semantics(&mut imported, &blob_store, layout.root()).with_context(|| {
         format!(
             "semantically hydrate imported Git history for ref '{}'",
@@ -688,9 +830,26 @@ where
 
     admit_imported_changes_for_insert(graph, &imported, genesis_id)?;
 
+    match depth {
+        HydrationDepth::Semantic => {
+            // Everything this pass is about to insert carries replayed deltas,
+            // so no earlier record still describes it.
+            crate::commands::hydration_depth::forget_replayed(layout, &absent)?;
+        }
+        HydrationDepth::ArtifactOnly => {
+            crate::commands::hydration_depth::record_artifact_only(
+                layout,
+                imported_change_id,
+                git_oid,
+                &absent,
+            )?;
+        }
+    }
+
+    let mut pending: HashSet<SemanticChangeId> = absent.iter().copied().collect();
     let mut inserted = 0usize;
     for imported_change in &imported {
-        if graph.get_change(&imported_change.change.id)?.is_none() {
+        if pending.remove(&imported_change.change.id) {
             graph.create_change(&imported_change.change)?;
             inserted += 1;
         }
@@ -861,6 +1020,7 @@ mod tests {
             &first_graph,
             &layout,
             &git_oid,
+            HydrationDepth::Semantic,
             |imported, blob_store, kin_root| {
                 let stats =
                     crate::commands::init::enrich_imported_changes_with_semantics_test_checkpoint(
@@ -885,6 +1045,7 @@ mod tests {
             &second_graph,
             &layout,
             &git_oid,
+            HydrationDepth::Semantic,
             |imported, blob_store, kin_root| {
                 let stats =
                     crate::commands::init::enrich_imported_changes_with_semantics_test_checkpoint(
@@ -923,6 +1084,7 @@ mod tests {
             &refused_graph,
             &layout,
             &git_oid,
+            HydrationDepth::Semantic,
             |imported, blob_store, kin_root| {
                 crate::commands::init::enrich_imported_changes_with_semantics_test_checkpoint(
                     imported,
@@ -973,6 +1135,7 @@ mod tests {
             &graph,
             &layout,
             &git_oid,
+            HydrationDepth::Semantic,
             |imported, blob_store, kin_root| {
                 imported[0].change.parents = vec![dangling];
                 crate::commands::init::enrich_imported_changes_with_semantics_test_checkpoint(
@@ -1020,6 +1183,182 @@ mod tests {
         // blob store both keep reading from it after this function returns.
         let _kept = repo.keep();
         Some((InMemoryGraph::new(), layout, git_oid))
+    }
+
+    /// A two-commit Git repo initialized for Kin, plus an empty graph and both
+    /// commits' oids, oldest first. Returns `None` when Git is unavailable.
+    fn two_commit_repo_for_hydration(
+    ) -> Option<(InMemoryGraph, kin_core::KinLayout, String, String)> {
+        let repo = tempfile::tempdir().unwrap();
+        git_ok(repo.path(), &["init", "-q"])?;
+        assert!(git_ok(repo.path(), &["config", "user.email", "test@kin.dev"]).is_some());
+        assert!(git_ok(repo.path(), &["config", "user.name", "Kin Test"]).is_some());
+        std::fs::write(
+            repo.path().join("lib.rs"),
+            "pub fn answer() -> i32 {\n    42\n}\n",
+        )
+        .unwrap();
+        assert!(git_ok(repo.path(), &["add", "lib.rs"]).is_some());
+        assert!(git_ok(repo.path(), &["commit", "-q", "-m", "initial"]).is_some());
+        let base_oid = git_ok(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(
+            repo.path().join("lib.rs"),
+            "pub fn answer() -> i32 {\n    43\n}\n\npub fn extra() -> i32 {\n    1\n}\n",
+        )
+        .unwrap();
+        assert!(git_ok(repo.path(), &["add", "lib.rs"]).is_some());
+        assert!(git_ok(repo.path(), &["commit", "-q", "-m", "follow-up"]).is_some());
+        let head_oid = git_ok(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        let layout = kin_core::init(repo.path()).unwrap().layout;
+        let _kept = repo.keep();
+        Some((InMemoryGraph::new(), layout, base_oid, head_oid))
+    }
+
+    /// The reported defect: `locate --ref` hydrates at artifact-only depth and
+    /// persists it, and nothing upgrades it, so a later `history`/`blame`/
+    /// `review` at the same ref used to resolve successfully into an ancestry
+    /// with no semantic deltas and report an empty answer that is
+    /// indistinguishable from a real negative.
+    #[test]
+    fn a_semantic_caller_reports_the_gap_a_persisted_artifact_only_hydration_left() {
+        let Some((graph, layout, git_oid)) = single_commit_repo_for_hydration() else {
+            return;
+        };
+
+        resolve_ref_importing_git_if_needed_for_locate(&graph, &layout, Some(&git_oid)).unwrap();
+        assert!(
+            hydrated_tip_change(&graph, &git_oid)
+                .entity_deltas
+                .is_empty(),
+            "fixture must leave the artifact-only history the semantic caller then meets"
+        );
+
+        let error =
+            prepare_ref_importing_git_if_needed_with_report(&graph, &layout, Some(&git_oid))
+                .into_result()
+                .expect_err("a semantic caller must not answer out of artifact-only history");
+        assert!(
+            is_hydration_depth_gap_error(&error),
+            "the gap must be reported as its own failure, not as a bad ref: {error:#}"
+        );
+        assert!(
+            !is_ref_resolution_error(&error),
+            "a present, valid ref is not client-input error: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains(&git_oid),
+            "the report must name the import that produced the gap: {error:#}"
+        );
+    }
+
+    /// Retrieval reads the ref's tree state, not the per-commit deltas, so it
+    /// stays answerable at artifact-only depth. Refusing here would trade the
+    /// silent wrong answer for a wrong refusal on the path the depth exists for.
+    #[test]
+    fn recorded_artifact_only_depth_never_refuses_the_retrieval_path() {
+        let Some((graph, layout, git_oid)) = single_commit_repo_for_hydration() else {
+            return;
+        };
+
+        resolve_ref_importing_git_if_needed_for_locate(&graph, &layout, Some(&git_oid)).unwrap();
+        let repeat = resolve_ref_importing_git_if_needed_for_locate_with_report(
+            &graph,
+            &layout,
+            Some(&git_oid),
+        )
+        .expect("locate must keep answering at the depth it hydrated");
+        assert_eq!(repeat.hydrated_changes, 0);
+    }
+
+    /// A record is evidence that some hydration ran at artifact-only depth —
+    /// never that this graph is still holding the result. Daemon session graphs
+    /// hydrate and then discard the growth by design, so a record whose changes
+    /// are absent here must not refuse anything.
+    #[test]
+    fn a_record_whose_changes_this_graph_never_received_refuses_nothing() {
+        let Some((discarded_graph, layout, git_oid)) = single_commit_repo_for_hydration() else {
+            return;
+        };
+
+        resolve_ref_importing_git_if_needed_for_locate(&discarded_graph, &layout, Some(&git_oid))
+            .unwrap();
+        assert!(
+            !crate::commands::hydration_depth::recorded_change_ids(&layout)
+                .unwrap()
+                .is_empty(),
+            "fixture must leave a record behind"
+        );
+
+        let fresh_graph = InMemoryGraph::new();
+        let resolved =
+            resolve_ref_importing_git_if_needed_with_report(&fresh_graph, &layout, Some(&git_oid))
+                .expect("a record without matching graph state must not block hydration");
+        assert!(resolved.hydrated_changes > 0);
+        assert!(
+            !hydrated_tip_change(&fresh_graph, &git_oid)
+                .entity_deltas
+                .is_empty(),
+            "the semantic entry point must still replay"
+        );
+        assert!(
+            crate::commands::hydration_depth::recorded_change_ids(&layout)
+                .unwrap()
+                .is_empty(),
+            "history replayed at semantic depth is no longer a recorded gap"
+        );
+    }
+
+    /// A record describes a hydration, not a graph. A later import can insert
+    /// the same change with its replay — a re-`init` after the graph was
+    /// rebuilt, say — and history that this graph did replay must answer
+    /// normally no matter what an older record still names.
+    #[test]
+    fn a_recorded_change_this_graph_replayed_is_not_reported_as_a_gap() {
+        let Some((graph, layout, git_oid)) = single_commit_repo_for_hydration() else {
+            return;
+        };
+
+        resolve_ref_importing_git_if_needed_with_report(&graph, &layout, Some(&git_oid))
+            .expect("semantic hydration replays the ancestry it imports");
+        let tip = kin_git::semantic_change_id_from_git_oid_hex(&git_oid).unwrap();
+        crate::commands::hydration_depth::record_artifact_only(&layout, tip, &git_oid, &[tip])
+            .unwrap();
+
+        prepare_ref_importing_git_if_needed_with_report(&graph, &layout, Some(&git_oid))
+            .into_result()
+            .expect("replayed history must answer, whatever an older record names");
+    }
+
+    /// The descendant case. Hydrating a child ref imports its whole ancestry,
+    /// but kin-db cannot re-publish the ancestors already sitting in the graph
+    /// at artifact-only depth, so their replayed copies are dropped. Completing
+    /// that import would answer through an unreplayed prefix; it is refused
+    /// before anything is written instead.
+    #[test]
+    fn semantic_hydration_refuses_an_ancestry_it_cannot_replay_before_writing_it() {
+        let Some((graph, layout, base_oid, head_oid)) = two_commit_repo_for_hydration() else {
+            return;
+        };
+        let head_id = kin_git::semantic_change_id_from_git_oid_hex(&head_oid).unwrap();
+
+        resolve_ref_importing_git_if_needed_for_locate(&graph, &layout, Some(&base_oid)).unwrap();
+        assert!(
+            graph.get_change(&head_id).unwrap().is_none(),
+            "fixture must leave the descendant unimported"
+        );
+
+        let error =
+            prepare_ref_importing_git_if_needed_with_report(&graph, &layout, Some(&head_oid))
+                .into_result()
+                .expect_err("an unreplayable prefix must be reported, not imported over");
+        assert!(
+            is_hydration_depth_gap_error(&error),
+            "expected a hydration-depth gap: {error:#}"
+        );
+        assert!(
+            graph.get_change(&head_id).unwrap().is_none(),
+            "the refusal must precede the graph write"
+        );
     }
 
     fn hydrated_tip_change(graph: &InMemoryGraph, git_oid: &str) -> kin_model::SemanticChange {
@@ -1187,6 +1526,7 @@ mod tests {
             &graph,
             &layout,
             &git_oid,
+            HydrationDepth::ArtifactOnly,
             |imported, blob_store, kin_root| {
                 imported[0].change.parents = vec![dangling];
                 skip_imported_semantics(imported, blob_store, kin_root)
