@@ -5277,6 +5277,12 @@ fn reglu_2d(x: &Array2<f32>, intermediate_size: usize) -> Array2<f32> {
 fn softmax_rows(x: &mut Array2<f32>) {
     for mut row in x.rows_mut() {
         let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        // Fully-masked row (every score is -inf): emit zeros instead of computing
+        // exp(-inf - -inf) = NaN, which the sum > 0 guard below cannot scrub.
+        if !max.is_finite() {
+            row.fill(0.0);
+            continue;
+        }
         row.mapv_inplace(|v| (v - max).exp());
         let sum = row.sum();
         if sum > 0.0 {
@@ -6407,6 +6413,88 @@ mod tests {
         assert!((sum - 1.0).abs() < 1e-5);
         assert!(row[0] < row[1]);
         assert!(row[1] < row[2]);
+    }
+
+    /// A row whose keys are ALL masked has max = -inf, so the naive
+    /// `exp(score - max)` computes `exp(-inf - -inf) = exp(NaN) = NaN`, and the
+    /// `sum > 0` normalization guard cannot scrub it (`NaN > 0` is false). The
+    /// non-finite-max guard must emit zeros so the row contributes nothing,
+    /// matching the CPU `softmax`, CUDA, and Metal `softmax_rows` kernels.
+    #[test]
+    fn softmax_rows_fully_masked_row_is_zero_not_nan() {
+        let mut x = Array2::from_elem((1, 8), f32::NEG_INFINITY);
+        softmax_rows(&mut x);
+        assert!(
+            x.iter().all(|v| *v == 0.0),
+            "fully-masked softmax row must be all-zero, got {x:?}"
+        );
+    }
+
+    /// Mixed batch: the masked row must not poison its neighbors. Without the
+    /// guard the masked row is NaN while the normal row is still a valid
+    /// distribution, so asserting on the whole array is what catches it.
+    #[test]
+    fn softmax_rows_masked_row_does_not_poison_normal_rows() {
+        let mut x = Array2::from_shape_vec(
+            (2, 4),
+            vec![
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                1.0,
+                2.0,
+                3.0,
+                4.0,
+            ],
+        )
+        .unwrap();
+        softmax_rows(&mut x);
+
+        assert!(x.iter().all(|v| v.is_finite()), "no NaN anywhere: {x:?}");
+        assert!(
+            x.row(0).iter().all(|v| *v == 0.0),
+            "masked row must be zero, got {:?}",
+            x.row(0)
+        );
+        let sum: f32 = x.row(1).sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "unmasked row must still sum to 1, got {sum}"
+        );
+        assert!(x[[1, 0]] < x[[1, 3]], "unmasked row keeps its ordering");
+    }
+
+    /// The attention path masks with -inf per key, so a fully-masked row reaches
+    /// softmax as a whole row of -inf and its product with V must be finite
+    /// zeros rather than NaN propagated into the hidden state.
+    #[test]
+    fn softmax_rows_masked_row_yields_finite_attention_output() {
+        let (seq, head_dim) = (3usize, 4usize);
+        let mut scores = Array2::<f32>::zeros((seq, seq));
+        // Row 1 is fully masked; rows 0 and 2 attend to key 0 only.
+        for i in 0..seq {
+            for j in 0..seq {
+                scores[[i, j]] = if i == 1 || j != 0 {
+                    f32::NEG_INFINITY
+                } else {
+                    0.5
+                };
+            }
+        }
+        softmax_rows(&mut scores);
+
+        let v = Array2::from_shape_fn((seq, head_dim), |(i, j)| (i * head_dim + j) as f32);
+        let out = scores.dot(&v);
+        assert!(
+            out.iter().all(|x| x.is_finite()),
+            "attention output must stay finite for a fully-masked row, got {out:?}"
+        );
+        assert!(
+            out.row(1).iter().all(|x| *x == 0.0),
+            "fully-masked query row contributes nothing, got {:?}",
+            out.row(1)
+        );
     }
 
     #[test]
