@@ -100,6 +100,15 @@
       ]
     },
     {
+      "file": "crates/kin-cli/src/commands/mcp.rs",
+      "reason": "Repository selection boundary: resolves symlinks on a repository root so a client-supplied workspace root and the process working directory compare equal when they name the same repo (/tmp against /private/tmp on macOS, tempdirs under /var/folders in fixtures). It decides which repository to bind, before a binding exists and before any graph is consulted, so it precedes the answer path rather than serving it: no file contents are read and no query result derives from it. The error case falls back to the path as given rather than treating failure as absence, so it is not an existence probe. Pinned to the whole expression, so a bare canonicalize that did read failure as a signal, or any other filesystem primitive in this module, still fails the guard",
+      "owner": "kin-cli",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())"
+      ]
+    },
+    {
       "file": "crates/kin-cli/src/commands/health.rs",
       "reason": "Config/diagnostic IO: kin health reports on the local installation, so the environment is its subject, not a source of semantic answers. Every probe targets the install — daemon binary, VFS shim header, shell hook and rc, AI-client MCP config files, editor extensions dir, pending session runs. It must never read repo content to answer a semantic query",
       "owner": "kin-cli",
