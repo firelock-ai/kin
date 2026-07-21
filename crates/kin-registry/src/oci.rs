@@ -399,8 +399,11 @@ async fn complete_upload(
 
     let blob_path = blob_path_for_digest(&state.blobs_dir, &computed_digest)
         .expect("computed sha256 digest is canonical");
-    let write_result = std::fs::create_dir_all(&state.blobs_dir)
-        .and_then(|()| std::fs::write(&blob_path, &pending.data));
+    // Stage beside the digest path, fsync the complete bytes, and atomically
+    // rename them into place. Public GET/HEAD requests therefore see either no
+    // blob (or the prior complete blob) or the complete replacement, never a
+    // partially written digest object.
+    let write_result = crate::atomic_file::write(&blob_path, &pending.data);
     if let Err(error) = write_result {
         // Preserve the pre-completion upload state so the same final request
         // can be retried after the storage failure without duplicating bytes.
@@ -481,6 +484,12 @@ async fn put_manifest(
     }
 
     let digest = format!("sha256:{}", sha2_hex(&body));
+    if reference.starts_with("sha256:") && reference != digest {
+        return digest_invalid(
+            "manifest digest reference does not match uploaded content",
+            None,
+        );
+    }
     let mut manifests = state.manifests.write().await;
     manifests.insert((name.clone(), reference), body.to_vec());
     manifests.insert((name.clone(), digest.clone()), body.to_vec());
@@ -790,6 +799,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_manifest_url_keeps_get_public_but_rejects_unauthenticated_mutations() {
+        let original = br#"{"schemaVersion":2,"marker":"original"}"#.to_vec();
+        let coordinate = ("demo".to_string(), "latest".to_string());
+
+        let (_root, state) = registry_state_with_token(Some("registry-secret"));
+        state
+            .manifests
+            .write()
+            .await
+            .insert(coordinate.clone(), original.clone());
+
+        let public_get = oci_routes(state.clone())
+            .oneshot(
+                Request::get("/v2/demo/manifests/latest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public_get.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(public_get.into_body(), MAX_OCI_MANIFEST_SIZE)
+                .await
+                .unwrap()
+                .as_ref(),
+            original.as_slice()
+        );
+
+        for request in [
+            Request::put("/v2/demo/manifests/latest")
+                .body(Body::from(
+                    br#"{"schemaVersion":2,"marker":"forged"}"#.as_slice(),
+                ))
+                .unwrap(),
+            Request::delete("/v2/demo/manifests/latest")
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            let rejected = oci_routes(state.clone()).oneshot(request).await.unwrap();
+            assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(error_code(rejected).await, "UNAUTHORIZED");
+            assert_eq!(
+                state.manifests.read().await.get(&coordinate),
+                Some(&original)
+            );
+        }
+
+        let (_root, disabled) = registry_state_with_token(None);
+        disabled
+            .manifests
+            .write()
+            .await
+            .insert(coordinate.clone(), original.clone());
+        for request in [
+            Request::put("/v2/demo/manifests/latest")
+                .header(header::AUTHORIZATION, "Bearer registry-secret")
+                .body(Body::from(
+                    br#"{"schemaVersion":2,"marker":"forged"}"#.as_slice(),
+                ))
+                .unwrap(),
+            Request::delete("/v2/demo/manifests/latest")
+                .header(header::AUTHORIZATION, "Bearer registry-secret")
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            let rejected = oci_routes(disabled.clone()).oneshot(request).await.unwrap();
+            assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(error_code(rejected).await, "DENIED");
+            assert_eq!(
+                disabled.manifests.read().await.get(&coordinate),
+                Some(&original)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn completion_requires_matching_canonical_digest_and_preserves_upload_on_error() {
         let (_root, state) = registry_state_with_token(Some("registry-secret"));
         let location = initiate(state.clone()).await;
@@ -828,6 +913,160 @@ mod tests {
         assert!(state.uploads.read().await.is_empty());
         let blob_path = blob_path_for_digest(&state.blobs_dir, &digest).unwrap();
         assert_eq!(std::fs::read(blob_path).unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn failed_blob_commit_preserves_upload_and_leaves_no_partial_file() {
+        let (_root, state) = registry_state_with_token(Some("registry-secret"));
+        let location = initiate(state.clone()).await;
+        let body = b"complete bytes that must publish atomically";
+        let digest = format!("sha256:{}", sha2_hex(body));
+        let blob_path = blob_path_for_digest(&state.blobs_dir, &digest).unwrap();
+
+        // A directory at the final digest coordinate forces the atomic rename
+        // to fail after the temporary file has been fully written and synced.
+        std::fs::create_dir(&blob_path).unwrap();
+        let failed = oci_routes(state.clone())
+            .oneshot(authenticated_request(
+                "PUT",
+                &format!("{location}?digest={digest}"),
+                Body::from(body.as_slice()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(state.uploads.read().await.len(), 1);
+        assert!(blob_path.is_dir());
+        assert_eq!(std::fs::read_dir(&state.blobs_dir).unwrap().count(), 1);
+
+        // The retained upload can be retried after the storage fault clears.
+        std::fs::remove_dir(&blob_path).unwrap();
+        let retried = oci_routes(state.clone())
+            .oneshot(authenticated_request(
+                "PUT",
+                &format!("{location}?digest={digest}"),
+                Body::from(body.as_slice()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(retried.status(), StatusCode::CREATED);
+        assert!(state.uploads.read().await.is_empty());
+        assert_eq!(std::fs::read(&blob_path).unwrap(), body);
+        assert_eq!(std::fs::read_dir(&state.blobs_dir).unwrap().count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_blob_reads_observe_only_absent_or_complete_bytes() {
+        let (_root, state) = registry_state_with_token(Some("registry-secret"));
+        let location = initiate(state.clone()).await;
+        let body = vec![b'x'; 8 * 1024 * 1024];
+        let digest = format!("sha256:{}", sha2_hex(&body));
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let writer = {
+            let state = state.clone();
+            let start = start.clone();
+            let body = body.clone();
+            let digest = digest.clone();
+            let finished = finished.clone();
+            tokio::spawn(async move {
+                start.wait().await;
+                let response = oci_routes(state)
+                    .oneshot(authenticated_request(
+                        "PUT",
+                        &format!("{location}?digest={digest}"),
+                        Body::from(body),
+                    ))
+                    .await
+                    .unwrap();
+                finished.store(true, Ordering::Release);
+                response.status()
+            })
+        };
+        let reader = {
+            let state = state.clone();
+            let start = start.clone();
+            let body = body.clone();
+            let digest = digest.clone();
+            let finished = finished.clone();
+            tokio::spawn(async move {
+                start.wait().await;
+                let mut reads = 0usize;
+                loop {
+                    let response = oci_routes(state.clone())
+                        .oneshot(
+                            Request::get(format!("/v2/demo/blobs/{digest}"))
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    match response.status() {
+                        StatusCode::NOT_FOUND => {}
+                        StatusCode::OK => {
+                            let observed = to_bytes(response.into_body(), MAX_OCI_BLOB_SIZE)
+                                .await
+                                .unwrap();
+                            assert_eq!(observed.as_ref(), body.as_slice());
+                        }
+                        status => panic!("unexpected concurrent read status {status}"),
+                    }
+                    reads += 1;
+                    if finished.load(Ordering::Acquire) && reads >= 4 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        start.wait().await;
+
+        assert_eq!(writer.await.unwrap(), StatusCode::CREATED);
+        reader.await.unwrap();
+        let blob_path = blob_path_for_digest(&state.blobs_dir, &digest).unwrap();
+        assert_eq!(std::fs::read(blob_path).unwrap(), body);
+        assert_eq!(std::fs::read_dir(&state.blobs_dir).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn manifest_digest_reference_must_equal_the_uploaded_body_digest() {
+        let (_root, state) = registry_state_with_token(Some("registry-secret"));
+        let body = br#"{"schemaVersion":2}"#;
+        let computed = format!("sha256:{}", sha2_hex(body));
+        let mismatched = format!("sha256:{}", "0".repeat(SHA256_HEX_LEN));
+
+        let rejected = oci_routes(state.clone())
+            .oneshot(authenticated_request(
+                "PUT",
+                &format!("/v2/demo/manifests/{mismatched}"),
+                Body::from(body.as_slice()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error_code(rejected).await, "DIGEST_INVALID");
+        assert!(state.manifests.read().await.is_empty());
+
+        let accepted = oci_routes(state.clone())
+            .oneshot(authenticated_request(
+                "PUT",
+                &format!("/v2/demo/manifests/{computed}"),
+                Body::from(body.as_slice()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::CREATED);
+        assert_eq!(state.manifests.read().await.len(), 1);
+        assert_eq!(
+            state
+                .manifests
+                .read()
+                .await
+                .get(&("demo".to_string(), computed))
+                .map(Vec::as_slice),
+            Some(body.as_slice())
+        );
     }
 
     #[tokio::test]

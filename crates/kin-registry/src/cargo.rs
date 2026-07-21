@@ -49,6 +49,8 @@ pub struct CargoRegistryState {
     /// their full manifest/blob read, so they cannot observe a half-published
     /// coordinate.
     publish_gate: RwLock<()>,
+    #[cfg(test)]
+    fail_next_blob_commit: std::sync::atomic::AtomicBool,
 }
 
 impl CargoRegistryState {
@@ -66,6 +68,8 @@ impl CargoRegistryState {
                 .map(|token| token.trim().to_string())
                 .filter(|token| !token.is_empty()),
             publish_gate: RwLock::new(()),
+            #[cfg(test)]
+            fail_next_blob_commit: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -447,7 +451,7 @@ async fn publish_crate(
                 .into_response();
         }
 
-        if let Err(e) = write_crate_blob(&state.blobs_dir, &crate_path, &body) {
+        if let Err(e) = write_crate_blob(&state, &crate_path, &body) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": format!("failed to write crate file: {e}") })),
@@ -467,7 +471,7 @@ async fn publish_crate(
             .into_response();
     }
 
-    if let Err(e) = write_crate_blob(&state.blobs_dir, &crate_path, &body) {
+    if let Err(e) = write_crate_blob(&state, &crate_path, &body) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("failed to write crate file: {e}") })),
@@ -521,18 +525,30 @@ async fn publish_crate(
 }
 
 fn write_crate_blob(
-    blobs_dir: &std::path::Path,
+    state: &CargoRegistryState,
     crate_path: &std::path::Path,
     body: &[u8],
 ) -> std::io::Result<()> {
-    if crate_path.parent() != Some(blobs_dir) {
+    if crate_path.parent() != Some(state.blobs_dir.as_path()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "crate blob path escaped the configured blob directory",
         ));
     }
-    std::fs::create_dir_all(blobs_dir)?;
-    std::fs::write(crate_path, body)
+
+    #[cfg(test)]
+    if state
+        .fail_next_blob_commit
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        return crate::atomic_file::write_with_pre_commit(crate_path, body, |_| {
+            Err(std::io::Error::other(
+                "injected failure before atomic crate commit",
+            ))
+        });
+    }
+
+    crate::atomic_file::write(crate_path, body)
 }
 
 /// Verify an uploaded `.crate` blob is a well-formed gzip-tar whose embedded
@@ -1359,6 +1375,52 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
             .get_versions(Ecosystem::Cargo, "demo")
             .unwrap();
         assert_eq!(versions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_idempotent_repair_preserves_the_existing_blob_until_atomic_commit() {
+        let (_root, state) = registry_state_with_token(Some("s3cret"));
+        let body = valid_crate("demo", "0.1.0");
+        assert_eq!(
+            publish(state.clone(), "demo", "0.1.0", Some("s3cret"), body.clone(),).await,
+            StatusCode::OK
+        );
+
+        let blob_path = state.blobs_dir.join("demo-0.1.0.crate");
+        let prior_bytes = b"preexisting-corrupt-but-complete-bytes";
+        std::fs::write(&blob_path, prior_bytes).unwrap();
+        let manifest_before = state
+            .manifest_store
+            .get_versions(Ecosystem::Cargo, "demo")
+            .unwrap();
+
+        // Fail after the replacement is fully staged and fsynced but before
+        // the atomic rename. The indexed coordinate and old blob must remain
+        // exactly as they were; no temporary file may be exposed or leaked.
+        state
+            .fail_next_blob_commit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let failed = publish(state.clone(), "demo", "0.1.0", Some("s3cret"), body.clone()).await;
+        assert_eq!(failed, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(std::fs::read(&blob_path).unwrap(), prior_bytes);
+        assert_eq!(std::fs::read_dir(&state.blobs_dir).unwrap().count(), 1);
+
+        let manifest_after_failure = state
+            .manifest_store
+            .get_versions(Ecosystem::Cargo, "demo")
+            .unwrap();
+        assert_eq!(manifest_after_failure.len(), manifest_before.len());
+        assert_eq!(
+            manifest_after_failure[0].checksum,
+            manifest_before[0].checksum
+        );
+
+        assert_eq!(
+            publish(state.clone(), "demo", "0.1.0", Some("s3cret"), body.clone(),).await,
+            StatusCode::OK
+        );
+        assert_eq!(std::fs::read(&blob_path).unwrap(), body);
+        assert_eq!(std::fs::read_dir(&state.blobs_dir).unwrap().count(), 1);
     }
 
     #[tokio::test]
