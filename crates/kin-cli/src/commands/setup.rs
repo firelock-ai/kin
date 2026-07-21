@@ -2693,6 +2693,48 @@ fn shared_config_lock_path(path: &Path) -> Result<PathBuf> {
     Ok(parent.join(format!(".{name}.kin-update.lock")))
 }
 
+// Name a managed config's recovery journal and object vault after the durable
+// sidecar pathname that identifies the config, never after the sidecar object's
+// device and inode. The operating system recycles a device+inode pair as soon
+// as the sidecar is unlinked, so an identity-derived name cannot tell "this
+// config" apart from "an unrelated config whose sidecar inherited a freed
+// inode": both hash to one journal and one vault, so the later config reads the
+// earlier config's recovery record and sweeps the earlier config's staged
+// objects out of the shared vault. A pathname is not recycled, so distinct
+// configs always get distinct journals, and one config keeps its journal across
+// a sidecar that is deleted and recreated. Callers pass the normalized sidecar
+// path that `ConfigLock::plan_with_policy` resolved.
+fn config_transaction_subject_key(sidecar_path: &Path) -> String {
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(b"KIN_CONFIG_TXN_SUBJECT_V1\0");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let bytes = sidecar_path.as_os_str().as_bytes();
+        encoded.extend_from_slice(b"unix\0");
+        encoded.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        encoded.extend_from_slice(bytes);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        let units = sidecar_path.as_os_str().encode_wide().collect::<Vec<_>>();
+        encoded.extend_from_slice(b"windows\0");
+        encoded.extend_from_slice(&(units.len() as u64).to_le_bytes());
+        for unit in units {
+            encoded.extend_from_slice(&unit.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let lossy = sidecar_path.to_string_lossy();
+        encoded.extend_from_slice(b"unsupported\0");
+        encoded.extend_from_slice(&(lossy.len() as u64).to_le_bytes());
+        encoded.extend_from_slice(lossy.as_bytes());
+    }
+    crate::commands::setup_ledger::sha256_hex(&encoded)
+}
+
 struct ConfigTransactionAuthority {
     file: fs::File,
     path: PathBuf,
@@ -2790,8 +2832,6 @@ impl ConfigTransactionAuthority {
         CONFIG_TRANSACTION_ACQUIRE_COUNT.with(|count| count.set(count.get() + 1));
         #[cfg(not(test))]
         let kin_home = kin_dir()?;
-        #[cfg(not(test))]
-        let _ = subject_path;
         #[cfg(test)]
         let kin_home = config_transaction_test_kin_home(subject_path);
         #[cfg(unix)]
@@ -2840,7 +2880,7 @@ impl ConfigTransactionAuthority {
                 root.display()
             )
         })?;
-        let key = subject_identity.authority_key();
+        let key = config_transaction_subject_key(subject_path);
         #[cfg(unix)]
         let (vault, vault_path, vault_identity) = {
             let vault_name = format!("{key}.objects");
@@ -3089,16 +3129,6 @@ impl ConfigFileIdentity {
     fn from_open_file(file: &fs::File) -> Result<Self> {
         let (volume, index) = super::update::windows_update::managed_object_identity(file, false)?;
         Ok(Self { volume, index })
-    }
-
-    fn authority_key(&self) -> String {
-        #[cfg(unix)]
-        let authority = format!("unix:{:016x}:{:016x}", self.device, self.inode);
-        #[cfg(windows)]
-        let authority = format!("windows:{:016x}:{}", self.volume, self.index);
-        #[cfg(not(any(unix, windows)))]
-        let authority = "unsupported".to_string();
-        crate::commands::setup_ledger::sha256_hex(authority.as_bytes())
     }
 }
 
@@ -4996,6 +5026,43 @@ fn complete_config_transaction(
     write_config_transaction(lock_file, record)
 }
 
+// Retire a fully resolved recovery journal by truncating it back to empty. A
+// terminal record is not evidence of pending work, so keeping it only grows the
+// journal without bound and leaves a resolved transaction replayable forever.
+// Retirement is the completion step: once the owning operation has finished
+// consulting the record, the transaction stops existing on disk. A still-open
+// transaction (non-terminal latest record) is preserved untouched so durable
+// crash recovery is unaffected.
+fn retire_resolved_config_transaction_wal(lock_file: &fs::File) -> Result<()> {
+    match read_config_transaction(lock_file)? {
+        Some(record)
+            if matches!(
+                record.phase,
+                ConfigTransactionPhase::CommitComplete | ConfigTransactionPhase::RollbackComplete
+            ) =>
+        {
+            lock_file
+                .set_len(0)
+                .context("failed to retire resolved managed config recovery journal")?;
+            lock_file
+                .sync_all()
+                .context("failed to sync retired managed config recovery journal")
+        }
+        _ => Ok(()),
+    }
+}
+
+// Settle a guarded operation: after the operation itself has finished reading
+// the journal, retire it if it reached a terminal outcome. A failed operation
+// keeps its own error; a successful operation surfaces any retirement failure.
+fn settle_config_transaction_after(lock_file: &fs::File, outcome: Result<()>) -> Result<()> {
+    let retired = retire_resolved_config_transaction_wal(lock_file);
+    match outcome {
+        Ok(()) => retired,
+        Err(error) => Err(error),
+    }
+}
+
 fn complete_recovered_config_transaction(
     lock_file: &fs::File,
     record: &ConfigTransactionRecord,
@@ -5941,7 +6008,7 @@ fn recover_unix_config_transaction(
     transaction.revalidate()?;
     if record.sidecar != transaction.subject_identity {
         anyhow::bail!(
-            "managed config recovery sidecar authority does not match its identity-keyed WAL"
+            "managed config recovery sidecar authority does not match the journal recorded for this config"
         );
     }
     let recovery_path = recorded_config_recovery_path(transaction, path, record)?;
@@ -6819,7 +6886,7 @@ fn recover_windows_config_transaction(
     transaction.revalidate()?;
     if record.sidecar != transaction.subject_identity {
         anyhow::bail!(
-            "Windows managed config recovery sidecar authority does not match its identity-keyed WAL"
+            "Windows managed config recovery sidecar authority does not match the journal recorded for this config"
         );
     }
     let recovery_path = recorded_config_recovery_path(transaction, path, record)?;
@@ -8158,7 +8225,7 @@ impl ConfigLock {
     fn acquire_plans(mut plans: Vec<ConfigLockPlan>) -> Result<Vec<Self>> {
         Self::sort_and_reject_duplicate_plans(&mut plans)?;
 
-        // Acquire every identity-keyed WAL guard first in one deterministic
+        // Acquire every subject-keyed WAL guard first in one deterministic
         // order. Only after all guards are held do we reacquire and lock the
         // adjacent sidecars in the same order.
         let mut guarded = Vec::with_capacity(plans.len());
@@ -8241,6 +8308,17 @@ impl ConfigLock {
                     "managed config recovery transaction requires an unsupported platform: {}",
                     plan.path.display()
                 );
+                // Recovery has resolved the interrupted transaction to a
+                // terminal outcome and has finished reading its record, so the
+                // transaction is complete: retire the journal instead of
+                // leaving a resolved record for the next acquisition to reread.
+                #[cfg(any(unix, windows))]
+                retire_resolved_config_transaction_wal(&transaction.file).with_context(|| {
+                    format!(
+                        "failed to retire recovered managed config transaction for {}",
+                        plan.path.display()
+                    )
+                })?;
             }
             #[cfg(unix)]
             cleanup_unjournaled_unix_stages(&transaction, &plan.path)?;
@@ -8414,6 +8492,27 @@ impl ConfigLock {
     }
 
     fn write_guarded_with_policy_and_hook<B>(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        expected: Option<&[u8]>,
+        private: bool,
+        before_destination_transition: B,
+    ) -> Result<()>
+    where
+        B: FnOnce() -> Result<()>,
+    {
+        let outcome = self.write_guarded_transaction(
+            path,
+            bytes,
+            expected,
+            private,
+            before_destination_transition,
+        );
+        settle_config_transaction_after(&self.transaction.file, outcome)
+    }
+
+    fn write_guarded_transaction<B>(
         &self,
         path: &Path,
         bytes: &[u8],
@@ -9496,6 +9595,19 @@ impl ConfigLock {
     }
 
     fn remove_guarded_with_hook<B>(
+        &self,
+        path: &Path,
+        expected: Option<&[u8]>,
+        before_quarantine: B,
+    ) -> Result<()>
+    where
+        B: FnOnce() -> Result<()>,
+    {
+        let outcome = self.remove_guarded_transaction(path, expected, before_quarantine);
+        settle_config_transaction_after(&self.transaction.file, outcome)
+    }
+
+    fn remove_guarded_transaction<B>(
         &self,
         path: &Path,
         expected: Option<&[u8]>,
@@ -12092,10 +12204,9 @@ mod tests {
                 .canonicalize()
                 .unwrap();
             let transaction_root = kin_home.join("config-transactions");
-            let vault =
-                transaction_root.join(format!("{}.objects", subject_identity.authority_key()));
-            let guard =
-                transaction_root.join(format!("{}.guard", subject_identity.authority_key()));
+            let subject_key = config_transaction_subject_key(&subject);
+            let vault = transaction_root.join(format!("{subject_key}.objects"));
+            let guard = transaction_root.join(format!("{subject_key}.guard"));
             for directory in [&kin_home, &transaction_root, &vault] {
                 assert_eq!(
                     fs::symlink_metadata(directory)
@@ -12560,10 +12671,13 @@ mod tests {
             residue.is_empty(),
             "failed handoff leaked a named stage: {residue:?}"
         );
-        let durable = read_config_transaction(&lock.transaction.file)
-            .unwrap()
-            .expect("handoff rollback must retain terminal WAL authority");
-        assert_eq!(durable.phase, ConfigTransactionPhase::RollbackComplete);
+        assert!(
+            read_config_transaction(&lock.transaction.file)
+                .unwrap()
+                .is_none(),
+            "a handoff rollback that reached a terminal outcome must retire its journal"
+        );
+        assert_eq!(lock.transaction.file.metadata().unwrap().len(), 0);
     }
 
     #[cfg(windows)]
@@ -13114,12 +13228,18 @@ mod tests {
         );
     }
 
+    // A managed config's journal belongs to the config, not to whichever object
+    // currently occupies its sidecar name. Renaming a sidecar onto a different
+    // target slot must not carry the journal with it, and the config whose
+    // sidecar was taken must refuse to proceed against a replacement object it
+    // never recorded.
     #[test]
     #[serial]
-    fn recovery_rejects_a_sidecar_renamed_to_a_different_target_slot() {
+    fn a_renamed_sidecar_cannot_carry_a_journal_to_a_different_target_slot() {
         let dir = tempfile::tempdir().unwrap();
-        let original_path = dir.path().join("original.json");
-        let redirected_path = dir.path().join("redirected.json");
+        let dir_path = dir.path().canonicalize().unwrap();
+        let original_path = dir_path.join("original.json");
+        let redirected_path = dir_path.join("redirected.json");
         fs::write(&original_path, b"owner-data\n").unwrap();
 
         let lock = ConfigLock::acquire(&original_path).unwrap();
@@ -13131,7 +13251,7 @@ mod tests {
         record.retained_name = None;
         #[cfg(unix)]
         {
-            let parent = open_config_parent_nofollow(dir.path()).unwrap();
+            let parent = open_config_parent_nofollow(&dir_path).unwrap();
             let stat = rustix::fs::fstat(&parent).unwrap();
             record.parent = ConfigParentIdentity {
                 device: stat.st_dev as u64,
@@ -13142,30 +13262,46 @@ mod tests {
         #[cfg(windows)]
         {
             let parent =
-                super::super::update::windows_update::WindowsParentGuard::open(dir.path()).unwrap();
+                super::super::update::windows_update::WindowsParentGuard::open(&dir_path).unwrap();
             let (namespace, file) = parent.identity();
             record.parent = ConfigParentIdentity { namespace, file };
         }
         write_config_transaction(&lock.transaction.file, &record).unwrap();
-        let sidecar_identity = lock.lock_identity.clone();
         let original_sidecar = lock.lock_path.clone();
         let redirected_sidecar = shared_config_lock_path(&redirected_path).unwrap();
         drop(lock);
 
+        // The renamed sidecar keeps its device+inode, which is the same
+        // aliasing input the kernel hands a later config when it recycles a
+        // freed inode. The redirected target must see its own empty journal.
         fs::rename(&original_sidecar, &redirected_sidecar).unwrap();
-        let error = match ConfigLock::acquire(&redirected_path) {
-            Ok(_) => panic!("renamed sidecar must not redirect durable recovery authority"),
-            Err(error) => error,
-        };
+        let redirected = ConfigLock::acquire(&redirected_path)
+            .expect("a renamed sidecar must not redirect another config's recovery authority");
         assert!(
-            format!("{error:#}").contains("recorded managed config sidecar"),
-            "unexpected renamed-sidecar error: {error:#}"
+            read_config_transaction(&redirected.transaction.file)
+                .unwrap()
+                .is_none(),
+            "the redirected target inherited a journal that belongs to another config"
         );
+        drop(redirected);
         assert_eq!(fs::read(&original_path).unwrap(), b"owner-data\n");
         assert!(!redirected_path.exists());
 
+        // The victim's journal stayed with the victim, so its next acquisition
+        // detects that the recorded sidecar is no longer the sidecar in place.
+        let error = match ConfigLock::acquire(&original_path) {
+            Ok(_) => panic!("a config whose sidecar was taken must not silently proceed"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("does not match the journal recorded for this config"),
+            "unexpected stolen-sidecar error: {error:#}"
+        );
+        assert_eq!(fs::read(&original_path).unwrap(), b"owner-data\n");
+
+        let cleanup_identity = record.sidecar.clone();
         let cleanup =
-            ConfigTransactionAuthority::acquire(&sidecar_identity, &original_sidecar).unwrap();
+            ConfigTransactionAuthority::acquire(&cleanup_identity, &original_sidecar).unwrap();
         cleanup.file.set_len(0).unwrap();
         cleanup.file.sync_all().unwrap();
     }
@@ -13187,7 +13323,6 @@ mod tests {
         let fixture_b = tempfile::tempdir().unwrap();
         let identity = wal_test_record(ConfigTransactionPhase::Prepared).sidecar;
         let subject_a = fixture_a.path().join("first.lock");
-        let subject_a_renamed = fixture_a.path().join("renamed.lock");
         let subject_b = fixture_b.path().join("first.lock");
 
         let authority_a = ConfigTransactionAuthority::acquire(&identity, &subject_a).unwrap();
@@ -13204,15 +13339,172 @@ mod tests {
             .is_none());
         drop(authority_b);
 
-        let authority_a_renamed =
-            ConfigTransactionAuthority::acquire(&identity, &subject_a_renamed).unwrap();
-        assert_eq!(authority_a_renamed.path, authority_a_path);
+        // The same subject must reach the same journal so an interrupted
+        // transaction stays recoverable across acquisitions.
+        let reacquired = ConfigTransactionAuthority::acquire(&identity, &subject_a).unwrap();
+        assert_eq!(reacquired.path, authority_a_path);
         assert_eq!(
-            read_config_transaction(&authority_a_renamed.file).unwrap(),
+            read_config_transaction(&reacquired.file).unwrap(),
             Some(record)
         );
-        authority_a_renamed.file.set_len(0).unwrap();
-        authority_a_renamed.file.sync_all().unwrap();
+        reacquired.file.set_len(0).unwrap();
+        reacquired.file.sync_all().unwrap();
+    }
+
+    // Falsify the (device, inode) key. Genuine inode recycling cannot be forced
+    // from a test — the kernel decides when a freed inode is handed out again,
+    // and the sidecar validator rejects hard links (nlink != 1), so two live
+    // names cannot stand in for one recycled object either. The collision is
+    // therefore constructed at the key-derivation boundary: two managed configs
+    // are handed one identical sidecar identity, which is exactly the state a
+    // config inherits when it is given a recycled inode. Both subjects share one
+    // test vault root here, so nothing but the key itself can separate them.
+    #[test]
+    fn a_recycled_sidecar_identity_does_not_alias_two_configs() {
+        let fixture = tempfile::tempdir().unwrap();
+        let recycled = wal_test_record(ConfigTransactionPhase::Prepared).sidecar;
+        let first = fixture.path().join(".first.json.kin-update.lock");
+        let second = fixture.path().join(".second.json.kin-update.lock");
+        assert_eq!(
+            config_transaction_test_kin_home(&first),
+            config_transaction_test_kin_home(&second),
+            "both subjects must share one vault root or the fixture, not the key, is the isolation"
+        );
+        assert_ne!(
+            config_transaction_subject_key(&first),
+            config_transaction_subject_key(&second),
+            "two configs that share a recycled sidecar identity must not share a subject key"
+        );
+
+        let first_authority = ConfigTransactionAuthority::acquire(&recycled, &first).unwrap();
+        let first_guard = first_authority.path.clone();
+        #[cfg(unix)]
+        let first_vault = first_authority.vault_path.clone();
+        let mut interrupted = wal_test_record(ConfigTransactionPhase::Prepared);
+        interrupted.sidecar = recycled.clone();
+        interrupted.destination = fixture.path().join("first.json");
+        interrupted.destination_name = "first.json".to_string();
+        write_config_transaction(&first_authority.file, &interrupted).unwrap();
+        drop(first_authority);
+
+        let second_authority = ConfigTransactionAuthority::acquire(&recycled, &second).unwrap();
+        assert_ne!(
+            second_authority.path, first_guard,
+            "the second config inherited the first config's recovery journal"
+        );
+        #[cfg(unix)]
+        assert_ne!(
+            second_authority.vault_path, first_vault,
+            "the second config inherited the first config's staged-object vault"
+        );
+        assert!(
+            read_config_transaction(&second_authority.file)
+                .unwrap()
+                .is_none(),
+            "a config that inherited a recycled sidecar identity must start with no transaction"
+        );
+        drop(second_authority);
+
+        let reacquired = ConfigTransactionAuthority::acquire(&recycled, &first).unwrap();
+        assert_eq!(reacquired.path, first_guard);
+        assert_eq!(
+            read_config_transaction(&reacquired.file).unwrap(),
+            Some(interrupted),
+            "the first config lost the interrupted transaction it still owns"
+        );
+        reacquired.file.set_len(0).unwrap();
+        reacquired.file.sync_all().unwrap();
+    }
+
+    #[test]
+    fn config_transaction_subject_key_distinguishes_every_distinct_subject() {
+        let root = Path::new("/home/user/.config");
+        let sibling = Path::new("/home/user/.config2");
+        let subject = root.join(".a.json.kin-update.lock");
+        let neighbour = root.join(".b.json.kin-update.lock");
+        let namesake = sibling.join(".a.json.kin-update.lock");
+        assert_ne!(
+            config_transaction_subject_key(&subject),
+            config_transaction_subject_key(&neighbour)
+        );
+        assert_ne!(
+            config_transaction_subject_key(&subject),
+            config_transaction_subject_key(&namesake)
+        );
+        // Length prefixing keeps a component boundary from being spelled away.
+        assert_ne!(
+            config_transaction_subject_key(Path::new("/home/user/ab")),
+            config_transaction_subject_key(Path::new("/home/user/a/b"))
+        );
+        let restated = PathBuf::from("/home/user/.config/.a.json.kin-update.lock");
+        assert_eq!(
+            config_transaction_subject_key(&subject),
+            config_transaction_subject_key(&restated),
+            "one subject must keep one key so its journal survives a restart"
+        );
+    }
+
+    // Completion must retire the journal, not append a terminal record that is
+    // never pruned: an append-only journal grows without bound and keeps a
+    // finished transaction replayable forever.
+    #[test]
+    fn a_resolved_config_transaction_retires_its_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().canonicalize().unwrap();
+        let config = dir_path.join("config.json");
+        fs::write(&config, b"original\n").unwrap();
+
+        let lock = ConfigLock::acquire(&config).unwrap();
+        lock.write_guarded(&config, b"replacement\n", Some(b"original\n"))
+            .unwrap();
+        assert_eq!(fs::read(&config).unwrap(), b"replacement\n");
+        assert_eq!(
+            lock.transaction.file.metadata().unwrap().len(),
+            0,
+            "a committed transaction must not leave a replayable record behind"
+        );
+        assert!(read_config_transaction(&lock.transaction.file)
+            .unwrap()
+            .is_none());
+        drop(lock);
+
+        let lock = ConfigLock::acquire(&config).unwrap();
+        lock.remove_guarded(&config, Some(b"replacement\n"))
+            .unwrap();
+        assert!(!config.exists());
+        assert_eq!(
+            lock.transaction.file.metadata().unwrap().len(),
+            0,
+            "a completed removal must not leave a replayable record behind"
+        );
+    }
+
+    #[test]
+    fn retirement_keeps_a_transaction_that_is_still_open() {
+        let fixture = tempfile::tempdir().unwrap();
+        let identity = wal_test_record(ConfigTransactionPhase::Prepared).sidecar;
+        let subject = fixture.path().join(".config.json.kin-update.lock");
+        let authority = ConfigTransactionAuthority::acquire(&identity, &subject).unwrap();
+
+        let interrupted = wal_test_record(ConfigTransactionPhase::Prepared);
+        write_config_transaction(&authority.file, &interrupted).unwrap();
+        let open_len = authority.file.metadata().unwrap().len();
+        retire_resolved_config_transaction_wal(&authority.file).unwrap();
+        assert_eq!(
+            read_config_transaction(&authority.file).unwrap(),
+            Some(interrupted),
+            "retirement must not discard a transaction that is still open"
+        );
+
+        let resolved = wal_test_record(ConfigTransactionPhase::CommitComplete);
+        write_config_transaction(&authority.file, &resolved).unwrap();
+        assert!(
+            authority.file.metadata().unwrap().len() > open_len,
+            "terminal records are appended, so only retirement can bound the journal"
+        );
+        retire_resolved_config_transaction_wal(&authority.file).unwrap();
+        assert_eq!(authority.file.metadata().unwrap().len(), 0);
+        assert!(read_config_transaction(&authority.file).unwrap().is_none());
     }
 
     #[test]
