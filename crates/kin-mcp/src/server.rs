@@ -177,6 +177,15 @@ const ROOTS_REQUEST_ID: &str = "kin-mcp-roots-list";
 /// the daemon to the open workspace via `repo_binder`. That is what lets Cursor,
 /// Windsurf, and other editors reach whatever repository the user has open
 /// without a hardcoded path in the MCP config.
+///
+/// The client's workspace can move afterwards, so a `roots/list_changed`
+/// notification re-requests roots whether or not a repository is bound, and the
+/// binder decides: it re-binds the process to the repository the client is now
+/// looking at, or reports that it cannot, in which case every `tools/call` is
+/// refused with a structured repo-mismatch error until a later roots change
+/// resolves it. A bound server never keeps answering from a repository the
+/// client has left — a confident answer about the wrong codebase is worse than
+/// an error.
 pub async fn run_stdio_daemon(
     config: McpServerConfig,
     repo_binder: Option<RepoBinder>,
