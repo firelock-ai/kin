@@ -799,7 +799,7 @@ pub enum SourceTreeResolution {
         entries: HashMap<FilePathId, ResolvedSourceEntry>,
     },
     Incomplete {
-        gap: SourceTreeGap,
+        gaps: Vec<SourceTreeGap>,
     },
 }
 
@@ -1078,38 +1078,48 @@ where
     I: IntoIterator<Item = SemanticChange>,
 {
     let mut entries = HashMap::new();
+    let mut gaps: HashMap<FilePathId, SourceTreeGap> = HashMap::new();
 
     for change in changes {
         for delta in change.artifact_deltas {
             if delta.kind.is_removed() {
                 entries.remove(&delta.file_id);
+                gaps.remove(&delta.file_id);
                 continue;
             }
-            let Some(kind) = delta.kind.source_entry_kind() else {
-                return SourceTreeResolution::Incomplete {
-                    gap: SourceTreeGap {
-                        file_id: delta.file_id,
-                        change_id: change.id,
-                        delta_kind: delta.kind,
-                        reason: SourceTreeGapReason::LegacyModeUnknown,
-                    },
-                };
+            let resolution = match (delta.kind.source_entry_kind(), delta.new_hash) {
+                (Some(kind), Some(hash)) => Ok(ResolvedSourceEntry { hash, kind }),
+                (None, _) => Err(SourceTreeGapReason::LegacyModeUnknown),
+                (Some(_), None) => Err(SourceTreeGapReason::MissingContentHash),
             };
-            let Some(hash) = delta.new_hash else {
-                return SourceTreeResolution::Incomplete {
-                    gap: SourceTreeGap {
-                        file_id: delta.file_id,
-                        change_id: change.id,
-                        delta_kind: delta.kind,
-                        reason: SourceTreeGapReason::MissingContentHash,
-                    },
-                };
-            };
-            entries.insert(delta.file_id, ResolvedSourceEntry { hash, kind });
+            match resolution {
+                Ok(entry) => {
+                    gaps.remove(&delta.file_id);
+                    entries.insert(delta.file_id, entry);
+                }
+                Err(reason) => {
+                    entries.remove(&delta.file_id);
+                    gaps.insert(
+                        delta.file_id.clone(),
+                        SourceTreeGap {
+                            file_id: delta.file_id,
+                            change_id: change.id,
+                            delta_kind: delta.kind,
+                            reason,
+                        },
+                    );
+                }
+            }
         }
     }
 
-    SourceTreeResolution::Exact { entries }
+    if gaps.is_empty() {
+        SourceTreeResolution::Exact { entries }
+    } else {
+        let mut gaps: Vec<_> = gaps.into_values().collect();
+        gaps.sort_by(|left, right| left.file_id.0.cmp(&right.file_id.0));
+        SourceTreeResolution::Incomplete { gaps }
+    }
 }
 
 fn entity_is_touched_by_change(change: &SemanticChange, entity_id: &EntityId) -> bool {
@@ -2029,13 +2039,104 @@ mod tests {
         assert_eq!(
             replay_source_tree([change]),
             SourceTreeResolution::Incomplete {
-                gap: SourceTreeGap {
+                gaps: vec![SourceTreeGap {
                     file_id,
                     change_id,
                     delta_kind: ArtifactDeltaKind::Added,
                     reason: SourceTreeGapReason::LegacyModeUnknown,
-                },
+                }],
             }
+        );
+    }
+
+    #[test]
+    fn later_exact_delta_replaces_legacy_unknown_gap() {
+        let c1 = make_change_id(8);
+        let c2 = make_change_id(9);
+        let file_id = FilePathId::new("legacy.sh");
+        let mut legacy = make_semantic_change(c1, vec![], vec![], vec![]);
+        legacy.artifact_deltas = vec![ArtifactDelta {
+            file_id: file_id.clone(),
+            kind: ArtifactDeltaKind::Added,
+            old_hash: None,
+            new_hash: Some(Hash256::from_bytes([8; 32])),
+        }];
+        let mut backfilled = make_semantic_change(c2, vec![c1], vec![], vec![]);
+        backfilled.artifact_deltas = vec![ArtifactDelta {
+            file_id: file_id.clone(),
+            kind: ArtifactDeltaKind::ModifiedExecutableFile,
+            old_hash: Some(Hash256::from_bytes([8; 32])),
+            new_hash: Some(Hash256::from_bytes([9; 32])),
+        }];
+
+        let SourceTreeResolution::Exact { entries } = replay_source_tree([legacy, backfilled])
+        else {
+            panic!("a later exact delta must replace the same path's legacy gap");
+        };
+        assert_eq!(
+            entries.get(&file_id),
+            Some(&ResolvedSourceEntry {
+                hash: Hash256::from_bytes([9; 32]),
+                kind: SourceEntryKind::File { executable: true },
+            })
+        );
+    }
+
+    #[test]
+    fn later_removal_clears_legacy_unknown_gap() {
+        let c1 = make_change_id(10);
+        let c2 = make_change_id(11);
+        let file_id = FilePathId::new("deleted-legacy-link");
+        let mut legacy = make_semantic_change(c1, vec![], vec![], vec![]);
+        legacy.artifact_deltas = vec![ArtifactDelta {
+            file_id: file_id.clone(),
+            kind: ArtifactDeltaKind::Added,
+            old_hash: None,
+            new_hash: Some(Hash256::from_bytes([10; 32])),
+        }];
+        let mut removed = make_semantic_change(c2, vec![c1], vec![], vec![]);
+        removed.artifact_deltas = vec![ArtifactDelta {
+            file_id,
+            kind: ArtifactDeltaKind::Removed,
+            old_hash: Some(Hash256::from_bytes([10; 32])),
+            new_hash: None,
+        }];
+
+        assert_eq!(
+            replay_source_tree([legacy, removed]),
+            SourceTreeResolution::Exact {
+                entries: HashMap::new()
+            }
+        );
+    }
+
+    #[test]
+    fn remaining_legacy_gaps_are_sorted_stably_by_path() {
+        let change_id = make_change_id(12);
+        let mut change = make_semantic_change(change_id, vec![], vec![], vec![]);
+        change.artifact_deltas = vec![
+            ArtifactDelta {
+                file_id: FilePathId::new("z-last"),
+                kind: ArtifactDeltaKind::Added,
+                old_hash: None,
+                new_hash: Some(Hash256::from_bytes([12; 32])),
+            },
+            ArtifactDelta {
+                file_id: FilePathId::new("a-first"),
+                kind: ArtifactDeltaKind::Modified,
+                old_hash: None,
+                new_hash: Some(Hash256::from_bytes([13; 32])),
+            },
+        ];
+
+        let SourceTreeResolution::Incomplete { gaps } = replay_source_tree([change]) else {
+            panic!("legacy modes must remain incomplete");
+        };
+        assert_eq!(
+            gaps.iter()
+                .map(|gap| gap.file_id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-first", "z-last"]
         );
     }
 
