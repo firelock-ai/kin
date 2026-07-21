@@ -20,14 +20,16 @@ use std::sync::OnceLock;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path as ObjectPath;
 use object_store::{
-    ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
+    GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
+    UpdateVersion,
 };
 use sha2::{Digest, Sha256};
 
 use crate::error::KinDbError;
 use crate::storage::backend::{
-    validate_source_blob_repo_id, verify_source_blob_digest, Generation, SnapshotAuthority,
-    SnapshotRecoveryState, StorageBackend, GENERATION_INIT,
+    validate_source_blob_repo_id, validate_source_blob_size, verify_source_blob_digest, Generation,
+    SnapshotAuthority, SnapshotRecoveryState, StorageBackend, GENERATION_INIT,
+    MAX_SOURCE_BLOB_BYTES,
 };
 
 const GCS_FULL_AUTHORITY_MAGIC: [u8; 8] = *b"KNGCSF02";
@@ -344,6 +346,12 @@ impl StorageBackend for GcsBackend {
         data: &[u8],
     ) -> Result<(), KinDbError> {
         validate_source_blob_repo_id(repo_id)?;
+        let byte_len = u64::try_from(data.len()).map_err(|_| {
+            KinDbError::StorageError(format!(
+                "immutable source blob for repo {repo_id} does not fit the size boundary"
+            ))
+        })?;
+        validate_source_blob_size(byte_len, &format!("repo {repo_id}"))?;
         verify_source_blob_digest(digest, data, &format!("repo {repo_id}"))?;
         let path = self.source_blob_path(repo_id, digest)?;
         let result = self.block_on(self.store.put_opts(
@@ -390,7 +398,15 @@ impl StorageBackend for GcsBackend {
     ) -> Result<Option<Vec<u8>>, KinDbError> {
         validate_source_blob_repo_id(repo_id)?;
         let path = self.source_blob_path(repo_id, digest)?;
-        let get_result = match self.block_on(self.store.get(&path)) {
+        let get_result = match self.block_on(self.store.get_opts(
+            &path,
+            GetOptions {
+                range: Some(GetRange::Bounded(
+                    0..MAX_SOURCE_BLOB_BYTES.saturating_add(1),
+                )),
+                ..GetOptions::default()
+            },
+        )) {
             Ok(result) => result,
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
             Err(error) => {
@@ -399,12 +415,14 @@ impl StorageBackend for GcsBackend {
                 )))
             }
         };
+        validate_source_blob_size(get_result.meta.size, path.as_ref())?;
         let bytes = self.block_on(get_result.bytes()).map_err(|error| {
             KinDbError::StorageError(format!(
                 "GCS source blob read bytes failed for {path}: {error}"
             ))
         })?;
         let data = bytes.to_vec();
+        validate_source_blob_size(data.len() as u64, path.as_ref())?;
         verify_source_blob_digest(digest, &data, path.as_ref())?;
         Ok(Some(data))
     }
@@ -667,8 +685,8 @@ mod tests {
     use futures_util::StreamExt;
     use object_store::memory::InMemory;
     use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions,
-        PutResult, Result as ObjectStoreResult,
+        CopyOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions, PutResult,
+        Result as ObjectStoreResult,
     };
     use std::collections::HashMap;
     use std::fmt;
@@ -687,6 +705,7 @@ mod tests {
         inner: InMemory,
         state: Arc<tokio::sync::Mutex<VersionState>>,
         fail_next_delete: Arc<AtomicBool>,
+        report_next_get_as_oversized: Arc<AtomicBool>,
     }
 
     impl VersionedMemoryStore {
@@ -698,11 +717,17 @@ mod tests {
                     versions: HashMap::new(),
                 })),
                 fail_next_delete: Arc::new(AtomicBool::new(false)),
+                report_next_get_as_oversized: Arc::new(AtomicBool::new(false)),
             }
         }
 
         fn fail_next_delete(&self) {
             self.fail_next_delete.store(true, Ordering::SeqCst);
+        }
+
+        fn report_next_get_as_oversized(&self) {
+            self.report_next_get_as_oversized
+                .store(true, Ordering::SeqCst);
         }
 
         fn precondition_error(path: &ObjectPath, message: String) -> object_store::Error {
@@ -780,6 +805,12 @@ mod tests {
             let mut result = self.inner.get_opts(location, options).await?;
             let state = self.state.lock().await;
             Self::apply_version(&mut result.meta, &state);
+            if self
+                .report_next_get_as_oversized
+                .swap(false, Ordering::SeqCst)
+            {
+                result.meta.size = MAX_SOURCE_BLOB_BYTES + 1;
+            }
             Ok(result)
         }
 
@@ -929,6 +960,24 @@ mod tests {
         assert!(retry_error
             .to_string()
             .contains("retry verification failed"));
+    }
+
+    #[test]
+    fn gcs_source_blob_rejects_oversized_metadata_before_body_read() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        let data = b"small payload with hostile reported size";
+        let digest = source_digest(data);
+        let path = backend.source_blob_path("repo-a", digest).unwrap();
+        backend
+            .block_on(backend.store.put(&path, PutPayload::from(data.to_vec())))
+            .unwrap();
+        store.report_next_get_as_oversized();
+
+        let error = backend
+            .load_source_blob("repo-a", digest)
+            .expect_err("oversized object metadata must fail before body allocation");
+        assert!(error.to_string().contains("safety limit"));
     }
 
     #[test]

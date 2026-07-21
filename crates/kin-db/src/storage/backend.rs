@@ -31,6 +31,11 @@ pub type Generation = u64;
 /// Sentinel value indicating no prior generation exists (first write).
 pub const GENERATION_INIT: Generation = 0;
 
+/// Maximum exact-source object size accepted by any storage backend.
+/// Archive consumers may apply a lower aggregate limit, but no individual
+/// object is allowed to force an allocation larger than this boundary.
+pub const MAX_SOURCE_BLOB_BYTES: u64 = 1024 * 1024 * 1024;
+
 pub(crate) fn validate_source_blob_repo_id(repo_id: &str) -> Result<(), KinDbError> {
     if repo_id.is_empty()
         || repo_id.len() > 255
@@ -57,6 +62,15 @@ pub(crate) fn verify_source_blob_digest(
             "immutable source blob digest mismatch for {authority}: requested {}, found {}",
             hex::encode(digest),
             hex::encode(actual)
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_source_blob_size(byte_len: u64, authority: &str) -> Result<(), KinDbError> {
+    if byte_len > MAX_SOURCE_BLOB_BYTES {
+        return Err(KinDbError::StorageError(format!(
+            "immutable source blob for {authority} is {byte_len} bytes, above the {MAX_SOURCE_BLOB_BYTES}-byte safety limit"
         )));
     }
     Ok(())
@@ -467,6 +481,8 @@ pub struct LocalFileBackend {
     #[cfg(test)]
     legacy_migration_before_cas_hook:
         parking_lot::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
+    #[cfg(test)]
+    source_blob_before_publish_hook: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
 }
 
 const LOCAL_AUTHORITY_VERSION: u32 = 3;
@@ -540,6 +556,8 @@ impl LocalFileBackend {
             snapshot_after_authority_before_projection_hook: parking_lot::Mutex::new(None),
             #[cfg(test)]
             legacy_migration_before_cas_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            source_blob_before_publish_hook: parking_lot::Mutex::new(None),
         }
     }
 
@@ -1756,6 +1774,11 @@ impl LocalFileBackend {
     fn set_legacy_migration_before_cas_hook(&self, hook: impl FnOnce() + Send + 'static) {
         *self.legacy_migration_before_cas_hook.lock() = Some(Box::new(hook));
     }
+
+    #[cfg(test)]
+    fn set_source_blob_before_publish_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.source_blob_before_publish_hook.lock() = Some(Box::new(hook));
+    }
 }
 
 impl StorageBackend for LocalFileBackend {
@@ -1776,12 +1799,22 @@ impl StorageBackend for LocalFileBackend {
         data: &[u8],
     ) -> Result<(), KinDbError> {
         validate_source_blob_repo_id(repo_id)?;
+        let byte_len = u64::try_from(data.len()).map_err(|_| {
+            KinDbError::StorageError(format!(
+                "immutable source blob for repo {repo_id} does not fit the size boundary"
+            ))
+        })?;
+        validate_source_blob_size(byte_len, &format!("repo {repo_id}"))?;
         verify_source_blob_digest(digest, data, &format!("repo {repo_id}"))?;
         let _lock = self.acquire_lock(repo_id)?;
         let path = self.source_blob_path(repo_id, digest)?;
         match std::fs::symlink_metadata(&path) {
             Ok(_) => {
-                let existing = mmap::read_regular_file(&path, "immutable source blob")?;
+                let existing = mmap::read_regular_bounded(
+                    &path,
+                    "immutable source blob",
+                    MAX_SOURCE_BLOB_BYTES,
+                )?;
                 verify_source_blob_digest(digest, &existing, &path.display().to_string())?;
                 if existing != data {
                     return Err(KinDbError::StorageError(format!(
@@ -1800,8 +1833,28 @@ impl StorageBackend for LocalFileBackend {
             }
         }
 
-        Self::atomic_write(&path, data)?;
-        let installed = mmap::read_regular_file(&path, "installed immutable source blob")?;
+        let parent = path.parent().ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "immutable source blob path {} has no parent",
+                path.display()
+            ))
+        })?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to create immutable source blob directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+        #[cfg(test)]
+        if let Some(hook) = self.source_blob_before_publish_hook.lock().take() {
+            hook();
+        }
+        let _published = mmap::publish_new_file_no_clobber(&path, data, "immutable source blob")?;
+        let installed = mmap::read_regular_bounded(
+            &path,
+            "installed immutable source blob",
+            MAX_SOURCE_BLOB_BYTES,
+        )?;
         verify_source_blob_digest(digest, &installed, &path.display().to_string())?;
         if installed != data {
             return Err(KinDbError::StorageError(format!(
@@ -1821,7 +1874,9 @@ impl StorageBackend for LocalFileBackend {
         let _lock = self.acquire_lock(repo_id)?;
         let path = self.source_blob_path(repo_id, digest)?;
         let data = match std::fs::symlink_metadata(&path) {
-            Ok(_) => mmap::read_regular_file(&path, "immutable source blob")?,
+            Ok(_) => {
+                mmap::read_regular_bounded(&path, "immutable source blob", MAX_SOURCE_BLOB_BYTES)?
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
                 return Err(KinDbError::StorageError(format!(
@@ -2517,6 +2572,45 @@ mod tests {
             .expect_err("symlink source object must fail closed");
         assert!(error.to_string().contains("immutable source blob"));
         assert_eq!(std::fs::read(&victim).unwrap(), b"do not replace");
+    }
+
+    #[test]
+    fn local_source_blob_rejects_oversized_sparse_object_before_reading() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let digest = [42; 32];
+        let path = backend.source_blob_path("repo-a", digest).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(MAX_SOURCE_BLOB_BYTES + 1).unwrap();
+
+        let error = backend
+            .load_source_blob("repo-a", digest)
+            .expect_err("oversized source object must fail before allocation");
+        assert!(error.to_string().contains("safety limit"));
+    }
+
+    #[test]
+    fn local_source_blob_never_clobbers_object_created_during_publish_race() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let data = b"expected immutable bytes";
+        let digest = source_digest(data);
+        let path = backend.source_blob_path("repo-a", digest).unwrap();
+        let raced_path = path.clone();
+        backend.set_source_blob_before_publish_hook(move || {
+            std::fs::write(&raced_path, b"non-cooperating writer").unwrap();
+        });
+
+        let error = backend
+            .save_source_blob("repo-a", digest, data)
+            .expect_err("a racing different object must be preserved and rejected");
+        assert!(error.to_string().contains("digest mismatch"));
+        assert_eq!(std::fs::read(path).unwrap(), b"non-cooperating writer");
     }
 
     #[test]
