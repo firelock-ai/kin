@@ -54,6 +54,38 @@ DENY_SET_PROBES = [
         "}",
     ),
     (
+        "grouped std command alias",
+        "fn __grouped_std_command_falsification_probe() -> bool {\n"
+        "    use std::process::{Command as SearchProcess};\n"
+        "    SearchProcess::new(\"rg\").arg(\"needle\").output().is_ok()\n"
+        "}",
+    ),
+    (
+        "multiline std use-tree alias",
+        "fn __multiline_std_command_falsification_probe() -> bool {\n"
+        "    use std::{\n"
+        "        process::{Command as SearchProcess},\n"
+        "    };\n"
+        "    SearchProcess::new(\"grep\").arg(\"needle\").output().is_ok()\n"
+        "}",
+    ),
+    (
+        "grouped tokio command alias",
+        "async fn __grouped_tokio_command_falsification_probe() -> bool {\n"
+        "    use tokio::process::{Command as SearchProcess};\n"
+        "    SearchProcess::new(\"find\").arg(\".\").output().await.is_ok()\n"
+        "}",
+    ),
+    (
+        "multiline tokio use-tree alias",
+        "async fn __multiline_tokio_command_falsification_probe() -> bool {\n"
+        "    use tokio::{\n"
+        "        process::{Command as SearchProcess},\n"
+        "    };\n"
+        "    SearchProcess::new(\"git\").arg(\"grep\").output().await.is_ok()\n"
+        "}",
+    ),
+    (
         "multiline git-grep subprocess",
         "fn __multiline_command_falsification_probe() -> bool {\n"
         "    std::process::Command::new(\"git\")\n"

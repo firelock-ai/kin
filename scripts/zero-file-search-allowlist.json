@@ -91,7 +91,10 @@
         "if sibling.exists()",
         "if target_sibling.exists()",
         "if candidate.exists()",
-        "std::process::Command::new(&daemon_bin)"
+        "std::process::Command::new(&daemon_bin)",
+        "cmd.stdout(std::process::Stdio::null());",
+        "cmd.stderr(std::process::Stdio::null());",
+        "use std::os::unix::process::CommandExt;"
       ]
     },
     {

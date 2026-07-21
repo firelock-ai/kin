@@ -280,7 +280,11 @@ PATTERNS = [
     (re.compile(r'\bread_dir\('), "directory traversal (read_dir)"),
     (re.compile(r'\bWalkDir\b|\bwalkdir::'), "directory traversal (walkdir)"),
     (re.compile(r'\bglob::glob\b'), "filesystem glob"),
-    (re.compile(r'\b(?:std::process::|tokio::process::)?Command::new\s*\(|\b(?:std|tokio)::process::Command\b'), "subprocess execution in answer authority"),
+    # `process::` catches direct paths and grouped/multiline use trees such as
+    # `use std::{process::{Command as SearchProcess}}`; `process as` catches a
+    # namespace alias before it can hide a later `Alias::Command::new` call.
+    # Bare Command::new covers an imported, unaliased constructor.
+    (re.compile(r'\bCommand::new\s*\(|\bprocess\s*(?:::|\bas\b)'), "subprocess execution in answer authority"),
     (re.compile(r'\bstd::fs::[a-zA-Z0-9_]+'), "std::fs API usage"),
     (re.compile(r'(?<![_a-z])fs::(read|read_to_string|read_dir|metadata|write|copy|create_dir|create_dir_all|remove_file|remove_dir|remove_dir_all)\b'), "fs API usage"),
 ]
