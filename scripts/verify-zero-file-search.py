@@ -260,13 +260,18 @@ def is_test_file(rel_path):
 # set shared with scripts/zero_file_search_guard.sh. Answering a semantic query
 # by probing the working tree is the violation the rule exists to stop, and it
 # does not require the `std::fs::` prefix to happen: `path.exists()`,
-# `File::open`, a bare `read_dir(`, or a `WalkDir` traversal all read the tree
-# just as directly. Writes and directory creation stay out of the deny set —
+# `path.try_exists()`, `File::open`, a bare `read_dir(`, or a `WalkDir`
+# traversal all read the tree just as directly. Spawning a subprocess is also
+# denied in answer modules: otherwise `rg`, `grep`, `find`, or a multiline
+# `git grep` builder can replace the semantic authority behind the guard's
+# back. Writes and directory creation stay out of the deny set —
 # materialization is a projection boundary, not answer-by-search.
 PATTERNS = [
     (re.compile(r'\.is_file\(\)'), "filesystem existence probe (is_file)"),
     (re.compile(r'\.is_dir\(\)'), "filesystem existence probe (is_dir)"),
     (re.compile(r'\.exists\(\)'), "filesystem existence probe (exists)"),
+    (re.compile(r'\.try_exists\(\)'), "filesystem existence probe (try_exists)"),
+    (re.compile(r'\.is_symlink\(\)'), "filesystem existence probe (is_symlink)"),
     (re.compile(r'\.canonicalize\(\)'), "filesystem path resolution (canonicalize)"),
     (re.compile(r'\.metadata\(\)'), "filesystem metadata probe"),
     (re.compile(r'\bsymlink_metadata\b'), "filesystem metadata probe"),
@@ -275,9 +280,9 @@ PATTERNS = [
     (re.compile(r'\bread_dir\('), "directory traversal (read_dir)"),
     (re.compile(r'\bWalkDir\b|\bwalkdir::'), "directory traversal (walkdir)"),
     (re.compile(r'\bglob::glob\b'), "filesystem glob"),
+    (re.compile(r'\b(?:std::process::|tokio::process::)?Command::new\s*\(|\b(?:std|tokio)::process::Command\b'), "subprocess execution in answer authority"),
     (re.compile(r'\bstd::fs::[a-zA-Z0-9_]+'), "std::fs API usage"),
     (re.compile(r'(?<![_a-z])fs::(read|read_to_string|read_dir|metadata|write|copy|create_dir|create_dir_all|remove_file|remove_dir|remove_dir_all)\b'), "fs API usage"),
-    (re.compile(r'Command::new\("git"\).*?"grep"'), "git grep subprocess usage")
 ]
 
 

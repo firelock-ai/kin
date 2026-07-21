@@ -30,6 +30,40 @@ METADATA_POISON = (
     "fn __metadata_falsification_probe(p: &std::path::Path) -> bool { "
     "p.metadata().is_ok() }"
 )
+DENY_SET_PROBES = [
+    (
+        "Path::try_exists",
+        "fn __try_exists_falsification_probe(p: &std::path::Path) -> bool { "
+        "p.try_exists().unwrap_or(false) }",
+    ),
+    (
+        "Path::is_symlink",
+        "fn __is_symlink_falsification_probe(p: &std::path::Path) -> bool { "
+        "p.is_symlink() }",
+    ),
+    (
+        "raw-search subprocess",
+        "fn __command_falsification_probe() -> bool { "
+        "std::process::Command::new(\"rg\").arg(\"needle\").output().is_ok() }",
+    ),
+    (
+        "aliased raw-search subprocess",
+        "fn __aliased_command_falsification_probe() -> bool {\n"
+        "    use std::process::Command as SearchProcess;\n"
+        "    SearchProcess::new(\"find\").arg(\".\").output().is_ok()\n"
+        "}",
+    ),
+    (
+        "multiline git-grep subprocess",
+        "fn __multiline_command_falsification_probe() -> bool {\n"
+        "    std::process::Command::new(\"git\")\n"
+        "        .arg(\"grep\")\n"
+        "        .arg(\"needle\")\n"
+        "        .output()\n"
+        "        .is_ok()\n"
+        "}",
+    ),
+]
 CMD_DIR = "crates/kin-cli/src/commands"
 
 
@@ -358,6 +392,57 @@ def main():
         print(
             f"  bare Path::metadata      {'  '.join(marks)}"
         )
+
+    # Deny-set breadth is itself a release boundary. Exercise the standard
+    # fallible existence and symlink probes plus direct and multiline raw-search
+    # subprocess builders. Banning Command::new in answer modules makes the
+    # multiline case independent of how executable/argument strings are laid
+    # out, and prevents a dynamically selected executable from bypassing a
+    # literal-name scanner.
+    deny_rel = f"{CMD_DIR}/search.rs"
+    deny_scope = next((entry for entry in enforced if entry[0] == deny_rel), None)
+    if deny_scope is None or not all(deny_scope[1:]):
+        failures.append(
+            f"{deny_rel}: deny-set falsification needs coverage from both guards"
+        )
+    else:
+        path = os.path.join(root, deny_rel)
+        with open(path, "r", encoding="utf-8") as f:
+            original = f.read()
+        base_lines = original.split("\n")
+        try:
+            for probe_name, probe in DENY_SET_PROBES:
+                marks = []
+                for label, idx in probe_sites(base_lines):
+                    if label not in ("half", "eof"):
+                        continue
+                    poisoned = base_lines[:idx] + probe.split("\n") + base_lines[idx:]
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(poisoned))
+                    cell = []
+                    for tag, cmd in (
+                        ("py", [sys.executable, py_guard, root]),
+                        ("sh", ["bash", sh_guard, root]),
+                    ):
+                        code, out = run(cmd)
+                        if code == 0:
+                            failures.append(
+                                f"{deny_rel} @ {label}: {tag} guard PASSED on {probe_name}"
+                            )
+                            cell.append("BLIND")
+                        elif os.path.basename(deny_rel) not in out:
+                            failures.append(
+                                f"{deny_rel} @ {label}: {tag} guard failed on "
+                                f"{probe_name} but never named the file"
+                            )
+                            cell.append("UNNAMED")
+                        else:
+                            cell.append("ok")
+                    marks.append(f"{label}=py:{cell[0]}/sh:{cell[1]}")
+                print(f"  {probe_name:<27} {'  '.join(marks)}")
+        finally:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(original)
 
     if failures:
         print()

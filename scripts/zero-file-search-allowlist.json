@@ -80,7 +80,7 @@
     },
     {
       "file": "crates/kin-mcp/src/daemon_delegate.rs",
-      "reason": "Daemon-reachability boundary: this module forwards MCP tool calls to the daemon, which is the graph authority. Every filesystem touch here is about reaching that authority, never about answering in its place — no tool result derives from any of them. Three classes, each pinned to its whole expression: (1) the loopback bearer token at <kin_dir>/daemon.token, read so the forwarded request can authenticate; (2) repo binding, walking up from the working directory for the .kin layout marker to locate that token, which precedes any graph consult because it decides which daemon to talk to; (3) revival, resolving the kin-daemon executable via KIN_DAEMON_BIN, the current exe's directory, the cargo target dir, and PATH, a `which` equivalent open-coded to avoid the dependency. The head-generation marker is the daemon's own published counter and only keys a within-session memo; a missing marker reads as generation 0, which costs cross-generation invalidation and never substitutes for a graph answer. Pinned rather than whole-file so any newly added filesystem primitive in this module fails the guard",
+      "reason": "Daemon-reachability boundary: this module forwards MCP tool calls to the daemon, which is the graph authority. Every filesystem touch here is about reaching that authority, never about answering in its place — no tool result derives from any of them. Three classes, each pinned to its whole expression: (1) the loopback bearer token at <kin_dir>/daemon.token, read so the forwarded request can authenticate; (2) repo binding, walking up from the working directory for the .kin layout marker to locate that token, which precedes any graph consult because it decides which daemon to talk to; (3) revival, resolving and spawning the known kin-daemon executable via KIN_DAEMON_BIN, the current exe's directory, the cargo target dir, and PATH, a `which` equivalent open-coded to avoid the dependency. The head-generation marker is the daemon's own published counter and only keys a within-session memo; a missing marker reads as generation 0, which costs cross-generation invalidation and never substitutes for a graph answer. Pinned rather than whole-file so any newly added filesystem primitive or subprocess in this module fails the guard",
       "owner": "kin-mcp",
       "expiration": "2026-12-31",
       "allow_match": [
@@ -90,7 +90,8 @@
         "if path.exists()",
         "if sibling.exists()",
         "if target_sibling.exists()",
-        "if candidate.exists()"
+        "if candidate.exists()",
+        "std::process::Command::new(&daemon_bin)"
       ]
     },
     {
