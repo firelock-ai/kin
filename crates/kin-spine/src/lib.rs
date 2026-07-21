@@ -30,7 +30,10 @@ pub use federation::{federated_impact, FederatedEdge, FederatedImpact, Federated
 pub use firestore::FirestoreSpineBackend;
 #[cfg(feature = "firestore")]
 pub use firestore::FirestoreStore;
-pub use index::{CrossRepoEdge, CrossRepoEdgesSnapshot, EntityEntry, SpineIndex};
+pub use index::{
+    CrossRepoEdge, CrossRepoEdgesSnapshot, EntityEntry, SpineIndex, SpineXrefDecodeError,
+    SpineXrefResponse,
+};
 pub use query::{classify_spine_probe, SpineProbe, SpineQuery};
 pub use routing::{RepoEndpoint, RoutingTable};
 pub use store::{LoadedRepo, SpineStore};

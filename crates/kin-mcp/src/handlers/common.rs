@@ -201,7 +201,7 @@ pub async fn fetch_spine_impact_typed(
 pub async fn fetch_spine_xref(
     repo_id: &str,
     entity_id: &EntityId,
-) -> SpineQuery<serde_json::Value> {
+) -> SpineQuery<kin_spine::SpineXrefResponse> {
     let Ok(daemon_url) = daemon_url_from_env() else {
         return SpineQuery::NotConfigured;
     };
@@ -226,9 +226,12 @@ pub async fn fetch_spine_xref(
     };
 
     match classify_spine_probe(true, Some(resp.status().as_u16())) {
-        SpineProbe::Healthy => match resp.json::<serde_json::Value>().await {
-            Ok(body) => SpineQuery::Found(body),
-            Err(e) => SpineQuery::Unavailable(format!("malformed spine response: {e}")),
+        SpineProbe::Healthy => match resp.bytes().await {
+            Ok(bytes) => match kin_spine::SpineXrefResponse::from_slice(&bytes) {
+                Ok(body) => SpineQuery::Found(body),
+                Err(e) => SpineQuery::Unavailable(e.to_string()),
+            },
+            Err(e) => SpineQuery::Unavailable(format!("failed to read spine response: {e}")),
         },
         SpineProbe::Unavailable(reason) => SpineQuery::Unavailable(reason),
         SpineProbe::NotConfigured => {

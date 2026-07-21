@@ -8515,10 +8515,21 @@ async fn spine_xref(
 
     let entity_id = parse_entity_id_hex(&params.entity)?;
     let edges = spine.cross_repo_edges_for(&params.repo, &entity_id);
+    let entity_keys = edges
+        .iter()
+        .flat_map(|edge| {
+            [
+                (edge.src_repo.clone(), edge.src_entity),
+                (edge.dst_repo.clone(), edge.dst_entity),
+            ]
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let entities = entity_keys
+        .into_iter()
+        .filter_map(|(repo_id, entity_id)| spine.lookup_by_id(&repo_id, &entity_id))
+        .collect();
 
-    Ok(Json(
-        json!({ "version": kin_spine::SPINE_PAYLOAD_VERSION, "edges": edges }),
-    ))
+    Ok(Json(kin_spine::SpineXrefResponse::new(edges, entities)))
 }
 
 /// `GET /v1/spine/edges` — one atomic graph-authoritative cross-repo snapshot.
@@ -14565,13 +14576,13 @@ mod tests {
             kin_spine::SpineQuery::Found(body) => body,
             other => panic!("MCP fetch_spine_xref expected Found, got {other:?}"),
         };
-        let mcp_xref_to_provider = mcp_xref["edges"]
-            .as_array()
-            .map(|edges| edges.iter().any(|e| e["dst_repo"] == "provider"))
-            .unwrap_or(false);
+        let mcp_xref_to_provider = mcp_xref
+            .edges
+            .iter()
+            .any(|edge| edge.dst_repo == "provider");
         assert!(
             mcp_xref_to_provider,
-            "MCP fetch_spine_xref must resolve consumer->provider: {mcp_xref}"
+            "MCP fetch_spine_xref must resolve consumer->provider: {mcp_xref:?}"
         );
 
         let mcp_impact = match fetch_spine_impact_typed("provider", &do_work_id, 5).await {
@@ -14596,6 +14607,36 @@ mod tests {
             "daemon, CLI, and MCP must all resolve the same consumer->provider xref"
         );
 
+        // The agent-facing MCP handler must project that real incoming edge as
+        // a useful external caller. This pins the complete contract, including
+        // edge direction and the metadata sidecar, rather than merely proving
+        // that the transport returned some JSON.
+        let mut provider_entity = test_entity("do_work", "src/lib.rs");
+        provider_entity.id = do_work_id;
+        let local_graph = kin_db::InMemoryGraph::new();
+        local_graph.upsert_entity(&provider_entity).unwrap();
+        std::env::set_var("KIN_REPO_ID", "provider");
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(do_work_id.to_string()),
+        )]);
+        let result = kin_mcp::handlers::entities::handle_find_references(&args, &local_graph)
+            .await
+            .unwrap();
+        let kin_mcp::types::ContentBlock::Text { text } = result
+            .content
+            .first()
+            .expect("find_references text response");
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["cross_repo"]["status"], "available");
+        assert_eq!(body["cross_repo"]["reference_count"], 1);
+        assert!(body["references"].as_array().is_some_and(|references| {
+            references.iter().any(|reference| {
+                reference["name"] == "run_task" && reference["file_path"] == "[consumer] src/app.rs"
+            })
+        }));
+
+        std::env::remove_var("KIN_REPO_ID");
         std::env::remove_var("KIN_DAEMON_URL");
         server.abort();
     }
@@ -14666,6 +14707,55 @@ mod tests {
             other => panic!("MCP impact must be Unavailable on 503, got {other:?}"),
         }
 
+        std::env::remove_var("KIN_DAEMON_URL");
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mcp_find_references_reports_legacy_xref_payload_as_unavailable() {
+        async fn legacy_xref() -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "version": kin_spine::SPINE_PAYLOAD_VERSION,
+                "edges": [{
+                    "repo_id": "consumer",
+                    "from_name": "run_task",
+                    "to_repo_id": "provider",
+                    "kind": "calls",
+                }],
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, Router::new().fallback(legacy_xref)).await;
+        });
+        std::env::set_var("KIN_DAEMON_URL", format!("http://{addr}"));
+        std::env::set_var("KIN_REPO_ID", "provider");
+
+        let target = test_entity("do_work", "src/lib.rs");
+        let graph = kin_db::InMemoryGraph::new();
+        graph.upsert_entity(&target).unwrap();
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let result = kin_mcp::handlers::entities::handle_find_references(&args, &graph)
+            .await
+            .unwrap();
+        let kin_mcp::types::ContentBlock::Text { text } = result
+            .content
+            .first()
+            .expect("find_references text response");
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["cross_repo"]["status"], "unavailable");
+        assert!(body["cross_repo"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("malformed spine xref response")));
+        assert_eq!(body["total_upstream"], 0);
+
+        std::env::remove_var("KIN_REPO_ID");
         std::env::remove_var("KIN_DAEMON_URL");
         server.abort();
     }

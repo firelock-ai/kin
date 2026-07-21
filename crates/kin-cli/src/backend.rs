@@ -556,9 +556,9 @@ pub async fn get_spine_xref(
 
     match classify_spine_probe(true, status) {
         SpineProbe::Healthy => {
-            let body: serde_json::Value = resp?.json().await?;
-            let edges = serde_json::from_value(body["edges"].clone())?;
-            Ok(SpineQuery::Found(edges))
+            let bytes = resp?.bytes().await?;
+            let body = ::kin_spine::SpineXrefResponse::from_slice(&bytes)?;
+            Ok(SpineQuery::Found(body.edges))
         }
         SpineProbe::Unavailable(reason) => Ok(SpineQuery::Unavailable(reason)),
         SpineProbe::NotConfigured => Ok(SpineQuery::Unavailable(

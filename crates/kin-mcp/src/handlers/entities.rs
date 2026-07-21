@@ -736,6 +736,55 @@ flag says whether \"nothing depends on this\" is authoritative (daemon-owned gra
 complete coverage, no degraded signals) or merely \"not indexed yet\" — consult it \
 before treating the entity as safe to delete.";
 
+fn append_spine_reference_rows(
+    rows: &mut Vec<ReferenceRow>,
+    repo_id: &str,
+    target_id: &kin_model::EntityId,
+    relation_kinds: &[RelationKind],
+    response: &kin_spine::SpineXrefResponse,
+) -> usize {
+    // CrossRepoEdge does not encode a source relation kind. Treat it as the
+    // generic cross-repo reference it is, and do not leak it into a calls-only
+    // or imports-only filtered response.
+    if !relation_kinds.contains(&RelationKind::References) {
+        return 0;
+    }
+
+    let before = rows.len();
+    for edge in &response.edges {
+        if edge.dst_repo != repo_id || edge.dst_entity != *target_id || edge.src_repo == repo_id {
+            continue;
+        }
+
+        let source = response
+            .entities
+            .iter()
+            .find(|entity| entity.repo_id == edge.src_repo && entity.entity_id == edge.src_entity);
+        let name = source
+            .map(|entity| entity.name.clone())
+            .unwrap_or_else(|| edge.src_entity.to_string());
+        let file_path = source
+            .and_then(|entity| entity.file_path.as_deref())
+            .map(|path| format!("[{}] {path}", edge.src_repo))
+            .unwrap_or_else(|| format!("[{}] {}", edge.src_repo, edge.src_entity));
+
+        rows.push(ReferenceRow {
+            // The source ID belongs to another repo's graph authority. Returning
+            // it as a local drill-through ID would resolve against the wrong
+            // graph, so the repo-qualified path remains the navigation anchor.
+            entity_id: None,
+            name,
+            kind: source.map(|entity| format!("{:?}", entity.kind)),
+            file_path: Some(file_path),
+            start_line: None,
+            signature: source.map(|entity| entity.signature.clone()),
+            snippet: None,
+            relation_kinds: vec![RelationKind::References],
+        });
+    }
+    rows.len() - before
+}
+
 pub async fn handle_find_references<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -777,48 +826,43 @@ pub async fn handle_find_references<G: GraphStore>(
     };
 
     let mut rows = collect_graph_reference_rows(store, &target.id, &relation_kinds)?;
-    rows.sort_by(|left, right| {
-        left.file_path
-            .cmp(&right.file_path)
-            .then_with(|| left.name.cmp(&right.name))
-    });
-
     // ── Federated Xrefs via Spine ─────────────────────────────────────
     let repo_id = std::env::var("KIN_REPO_ID").unwrap_or_else(|_| "unknown".into());
-    match fetch_spine_xref(&repo_id, &target.id).await {
+    let cross_repo = match fetch_spine_xref(&repo_id, &target.id).await {
         kin_spine::SpineQuery::Found(body) => {
-            if let Some(edges) = body.get("edges").and_then(|v| v.as_array()) {
-                for edge in edges {
-                    if edge["to_repo_id"] == repo_id && edge["repo_id"] != repo_id {
-                        // This is an external caller pointing at us.
-                        rows.push(ReferenceRow {
-                            // Federated xref: the caller lives in another repo, so
-                            // there is no local entity id or graph-owned body here.
-                            entity_id: None,
-                            name: edge["from_name"].as_str().unwrap_or("unknown").to_string(),
-                            kind: edge["kind"].as_str().map(|s| s.to_string()),
-                            file_path: Some(format!(
-                                "[{}] {}",
-                                edge["repo_id"].as_str().unwrap_or("?"),
-                                edge["from_name"].as_str().unwrap_or("?")
-                            )),
-                            start_line: None,
-                            signature: None,
-                            snippet: None,
-                            relation_kinds: vec![RelationKind::References], // Spine edges are generic xrefs
-                        });
-                    }
-                }
-            }
+            let reference_count = append_spine_reference_rows(
+                &mut rows,
+                &repo_id,
+                &target.id,
+                &relation_kinds,
+                &body,
+            );
+            serde_json::json!({
+                "status": "available",
+                "payload_version": body.version(),
+                "reference_count": reference_count,
+            })
         }
         // Spine configured but unreachable: surface as a warning rather than
         // silently dropping cross-repo references (which would read as "none").
         kin_spine::SpineQuery::Unavailable(reason) => {
             tracing::warn!(reason = %reason, "cross-repo spine unavailable for references enrichment");
+            serde_json::json!({
+                "status": "unavailable",
+                "reason": reason,
+            })
         }
         // Local-only (no spine configured): quiet — cross-repo refs don't apply.
-        kin_spine::SpineQuery::NotConfigured => {}
-    }
+        kin_spine::SpineQuery::NotConfigured => serde_json::json!({
+            "status": "not_configured",
+        }),
+    };
+
+    rows.sort_by(|left, right| {
+        left.file_path
+            .cmp(&right.file_path)
+            .then_with(|| left.name.cmp(&right.name))
+    });
 
     let references = rows
         .into_iter()
@@ -857,6 +901,7 @@ pub async fn handle_find_references<G: GraphStore>(
             .collect::<Vec<_>>(),
         "total_upstream": references.len(),
         "references": references,
+        "cross_repo": cross_repo,
     });
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
@@ -2079,6 +2124,87 @@ mod tests {
             max_lines_per_body: crate::handlers::common::DEFAULT_SOURCE_MAX_LINES,
             max_bytes_per_body: crate::handlers::common::DEFAULT_SOURCE_MAX_BYTES,
         }
+    }
+
+    #[test]
+    fn spine_xrefs_append_typed_external_callers() {
+        let source = make_entity("run_task", "src/app.rs");
+        let target = make_entity("do_work", "src/lib.rs");
+        let response = kin_spine::SpineXrefResponse::new(
+            vec![kin_spine::CrossRepoEdge {
+                src_repo: "consumer".to_string(),
+                src_entity: source.id,
+                dst_repo: "provider".to_string(),
+                dst_entity: target.id,
+                confidence: 0.9,
+            }],
+            vec![kin_spine::EntityEntry {
+                repo_id: "consumer".to_string(),
+                entity_id: source.id,
+                name: source.name.clone(),
+                kind: source.kind,
+                signature: source.signature.clone(),
+                fingerprint: source.fingerprint.clone(),
+                file_path: source.file_origin.as_ref().map(|path| path.0.clone()),
+                role: Some(source.role),
+            }],
+        );
+        let mut rows = Vec::new();
+
+        let appended = append_spine_reference_rows(
+            &mut rows,
+            "provider",
+            &target.id,
+            &[RelationKind::References],
+            &response,
+        );
+
+        assert_eq!(appended, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "run_task");
+        assert_eq!(rows[0].kind.as_deref(), Some("Function"));
+        assert_eq!(rows[0].file_path.as_deref(), Some("[consumer] src/app.rs"));
+        assert_eq!(rows[0].signature.as_deref(), Some("fn run_task()"));
+        assert_eq!(rows[0].relation_kinds, vec![RelationKind::References]);
+    }
+
+    #[test]
+    fn spine_xrefs_respect_direction_and_relation_filter() {
+        let target = make_entity("do_work", "src/lib.rs");
+        let other = EntityId::new();
+        let response = kin_spine::SpineXrefResponse::new(
+            vec![kin_spine::CrossRepoEdge {
+                src_repo: "provider".to_string(),
+                src_entity: target.id,
+                dst_repo: "consumer".to_string(),
+                dst_entity: other,
+                confidence: 0.9,
+            }],
+            Vec::new(),
+        );
+        let mut rows = Vec::new();
+
+        assert_eq!(
+            append_spine_reference_rows(
+                &mut rows,
+                "provider",
+                &target.id,
+                &[RelationKind::References],
+                &response,
+            ),
+            0
+        );
+        assert_eq!(
+            append_spine_reference_rows(
+                &mut rows,
+                "consumer",
+                &other,
+                &[RelationKind::Calls],
+                &response,
+            ),
+            0
+        );
+        assert!(rows.is_empty());
     }
 
     #[test]

@@ -46,6 +46,58 @@ pub struct CrossRepoEdge {
     pub confidence: f32,
 }
 
+/// Versioned wire response for `GET /v1/spine/xref`.
+///
+/// `edges` remains the canonical topology payload. `entities` is an additive,
+/// metadata-only sidecar that lets clients render useful cross-repo references
+/// without inventing field names or reading another repository's files. Older
+/// version-1 daemons omitted the sidecar, so it defaults to empty on decode.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SpineXrefResponse {
+    version: u32,
+    pub edges: Vec<CrossRepoEdge>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<EntityEntry>,
+}
+
+impl SpineXrefResponse {
+    pub fn new(edges: Vec<CrossRepoEdge>, entities: Vec<EntityEntry>) -> Self {
+        Self {
+            version: crate::SPINE_PAYLOAD_VERSION,
+            edges,
+            entities,
+        }
+    }
+
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// Decode and version-check an xref response as one shared contract.
+    ///
+    /// Callers must not index ad-hoc JSON fields: required topology fields and
+    /// entity IDs are validated by Serde, while an unsupported version fails
+    /// explicitly instead of degrading to an empty cross-repo result.
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, SpineXrefDecodeError> {
+        let response: Self = serde_json::from_slice(bytes)?;
+        if response.version != crate::SPINE_PAYLOAD_VERSION {
+            return Err(SpineXrefDecodeError::UnsupportedVersion {
+                actual: response.version,
+                supported: crate::SPINE_PAYLOAD_VERSION,
+            });
+        }
+        Ok(response)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SpineXrefDecodeError {
+    #[error("malformed spine xref response: {0}")]
+    Malformed(#[from] serde_json::Error),
+    #[error("unsupported spine xref response version {actual}; supported version is {supported}")]
+    UnsupportedVersion { actual: u32, supported: u32 },
+}
+
 /// One atomic, graph-authoritative view of every cross-repo edge in the spine.
 ///
 /// `roots` is the graph-root watermark for the exact registered repo set and
@@ -569,6 +621,79 @@ mod tests {
         let mut entry = test_entry(repo, name, EntityKind::Function);
         entry.entity_id = id;
         entry
+    }
+
+    #[test]
+    fn xref_wire_response_round_trips_typed_edges_and_metadata() {
+        let src = EntityId::new();
+        let dst = EntityId::new();
+        let response = SpineXrefResponse::new(
+            vec![CrossRepoEdge {
+                src_repo: "consumer".to_string(),
+                src_entity: src,
+                dst_repo: "provider".to_string(),
+                dst_entity: dst,
+                confidence: 0.9,
+            }],
+            vec![test_entry_with_id("consumer", src, "run_task")],
+        );
+
+        let bytes = serde_json::to_vec(&response).unwrap();
+        let decoded = SpineXrefResponse::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.version(), crate::SPINE_PAYLOAD_VERSION);
+        assert_eq!(decoded.edges.len(), 1);
+        assert_eq!(decoded.edges[0].src_repo, "consumer");
+        assert_eq!(decoded.entities.len(), 1);
+        assert_eq!(decoded.entities[0].name, "run_task");
+    }
+
+    #[test]
+    fn xref_wire_response_accepts_version_one_without_metadata_sidecar() {
+        let src = EntityId::new();
+        let dst = EntityId::new();
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "version": crate::SPINE_PAYLOAD_VERSION,
+            "edges": [{
+                "src_repo": "consumer",
+                "src_entity": src,
+                "dst_repo": "provider",
+                "dst_entity": dst,
+                "confidence": 0.9,
+            }],
+        }))
+        .unwrap();
+
+        let decoded = SpineXrefResponse::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.edges.len(), 1);
+        assert!(decoded.entities.is_empty());
+    }
+
+    #[test]
+    fn xref_wire_response_rejects_legacy_field_names_and_versions() {
+        let legacy = serde_json::to_vec(&serde_json::json!({
+            "version": crate::SPINE_PAYLOAD_VERSION,
+            "edges": [{
+                "repo_id": "consumer",
+                "from_name": "run_task",
+                "to_repo_id": "provider",
+                "kind": "calls",
+            }],
+        }))
+        .unwrap();
+        assert!(matches!(
+            SpineXrefResponse::from_slice(&legacy),
+            Err(SpineXrefDecodeError::Malformed(_))
+        ));
+
+        let unsupported = serde_json::to_vec(&serde_json::json!({
+            "version": crate::SPINE_PAYLOAD_VERSION + 1,
+            "edges": [],
+        }))
+        .unwrap();
+        assert!(matches!(
+            SpineXrefResponse::from_slice(&unsupported),
+            Err(SpineXrefDecodeError::UnsupportedVersion { .. })
+        ));
     }
 
     fn test_entity(id: EntityId, name: &str) -> Entity {
