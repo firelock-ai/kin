@@ -125,7 +125,11 @@ impl ManifestStore {
         Ok(versions)
     }
 
-    /// Add a new version (appends to the manifest file)
+    /// Add a new version with a crash-durable whole-file replacement.
+    ///
+    /// Callers that can publish concurrently must serialize the read/modify/
+    /// write transaction. Replacing the complete newline-delimited manifest
+    /// keeps readers from ever observing a torn append after a crash.
     pub fn add_version(&self, version: &PackageVersion) -> Result<(), RegistryError> {
         let canonical_name = version.id.canonical_name();
 
@@ -138,19 +142,9 @@ impl ManifestStore {
             ));
         }
 
-        let path = self.manifest_path(&version.id);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        let line = serde_json::to_string(version)?;
-        writeln!(file, "{}", line)?;
-        Ok(())
+        let mut replacement = existing;
+        replacement.push(version.clone());
+        self.replace_versions(&version.id, &replacement)
     }
 
     /// Rewrite the full version list for a package.
@@ -164,16 +158,27 @@ impl ManifestStore {
             std::fs::create_dir_all(parent)?;
         }
 
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&path)?;
-        for version in versions {
-            let line = serde_json::to_string(version)?;
-            writeln!(file, "{}", line)?;
+        let contents = serialize_versions(versions)?;
+        atomic_file::write(&path, &contents)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn replace_versions_with_pre_commit<F>(
+        &self,
+        id: &PackageId,
+        versions: &[PackageVersion],
+        pre_commit: F,
+    ) -> Result<(), RegistryError>
+    where
+        F: FnOnce(&std::path::Path) -> std::io::Result<()>,
+    {
+        let path = self.manifest_path(id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
+        let contents = serialize_versions(versions)?;
+        atomic_file::write_with_pre_commit(&path, &contents, pre_commit)?;
         Ok(())
     }
 
@@ -211,7 +216,73 @@ impl ManifestStore {
     }
 }
 
+fn serialize_versions(versions: &[PackageVersion]) -> Result<Vec<u8>, RegistryError> {
+    let mut contents = Vec::new();
+    for version in versions {
+        let line = serde_json::to_string(version)?;
+        contents.extend_from_slice(line.as_bytes());
+        contents.push(b'\n');
+    }
+    Ok(contents)
+}
+
 pub mod cargo;
 pub mod go;
 pub mod npm;
 pub mod oci;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cargo_version(version: &str) -> PackageVersion {
+        PackageVersion {
+            id: PackageId {
+                ecosystem: Ecosystem::Cargo,
+                scope: None,
+                name: "demo".to_string(),
+            },
+            version: version.to_string(),
+            blob_hash: format!("hash-{version}"),
+            blob_size: 1,
+            checksum: format!("checksum-{version}"),
+            metadata: serde_json::json!({
+                "cargo_index_format": 1,
+                "features": {},
+                "deps": [],
+            }),
+            published_at: Utc::now(),
+            published_by: "test".to_string(),
+            yanked: false,
+        }
+    }
+
+    #[test]
+    fn failed_cargo_manifest_commit_preserves_prior_authority_and_cleans_stage() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ManifestStore::new(root.path());
+        let first = cargo_version("0.1.0");
+        let second = cargo_version("0.2.0");
+        store.add_version(&first).unwrap();
+        let path = store.manifest_path(&first.id);
+        let original = std::fs::read(&path).unwrap();
+
+        let error = store
+            .replace_versions_with_pre_commit(&first.id, &[first.clone(), second], |_| {
+                Err(std::io::Error::other("injected before manifest rename"))
+            })
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected before manifest rename"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(
+            store.get_versions(Ecosystem::Cargo, "demo").unwrap().len(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+}

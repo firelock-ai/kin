@@ -1093,12 +1093,11 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
     let base_url = std::env::var("KIN_REGISTRY_BASE_URL")
         .unwrap_or_else(|_| "http://localhost:4219".to_string());
 
-    // Cargo and OCI reuse the existing registry write-token contract from
-    // KIN_REGISTRY_CARGO_TOKEN; reads stay open. A None token fails closed, so
-    // an unset/empty env var never silently exposes either write surface.
+    // Cargo and OCI have independent write credentials. Reads stay open, while
+    // an unset/empty token fails its own write surface closed.
     let crates_dir = packages_dir.join("crates");
     std::fs::create_dir_all(&crates_dir).ok();
-    let registry_write_token = std::env::var("KIN_REGISTRY_CARGO_TOKEN")
+    let cargo_write_token = std::env::var("KIN_REGISTRY_CARGO_TOKEN")
         .ok()
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty());
@@ -1107,7 +1106,7 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
             kin_registry::ManifestStore::new(state.layout.root()),
             crates_dir,
             base_url.clone(),
-            registry_write_token.clone(),
+            cargo_write_token,
         )));
 
     let npm_routes = npm_registry_routes(
@@ -1120,8 +1119,12 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
     // OCI container registry
     let oci_dir = packages_dir.join("oci");
     std::fs::create_dir_all(&oci_dir).ok();
+    let oci_write_token = std::env::var("KIN_REGISTRY_OCI_WRITE_TOKEN")
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty());
     let oci_routes = kin_registry::oci::oci_routes(Arc::new(
-        kin_registry::oci::OciRegistryState::new(oci_dir, registry_write_token),
+        kin_registry::oci::OciRegistryState::new(oci_dir, oci_write_token),
     ));
 
     // Go module proxy
@@ -1133,7 +1136,8 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
     }));
 
     // The package registries (cargo/npm/oci/go) are PUBLIC services with their
-    // own per-write gates (cargo + OCI: `KIN_REGISTRY_CARGO_TOKEN`; npm:
+    // own per-write gates (Cargo: `KIN_REGISTRY_CARGO_TOKEN`; OCI:
+    // `KIN_REGISTRY_OCI_WRITE_TOKEN`; npm:
     // `KIN_REGISTRY_NPM_AUTH_URL` introspection); their reads stay open. The
     // daemon API is a PROTECTED control surface. So `daemon_auth` is scoped to
     // ONLY the daemon routes — applied as an inner `.layer()` on the daemon
@@ -15090,10 +15094,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oci_writes_require_registry_token_while_pulls_stay_public() {
+    async fn oci_writes_require_their_own_token_while_pulls_stay_public() {
         let _lock = REGISTRY_ENV_LOCK.lock().await;
 
-        std::env::remove_var("KIN_REGISTRY_CARGO_TOKEN");
+        std::env::remove_var("KIN_REGISTRY_OCI_WRITE_TOKEN");
+        let _cargo_env = RegistryEnvGuard("KIN_REGISTRY_CARGO_TOKEN");
+        std::env::set_var("KIN_REGISTRY_CARGO_TOKEN", "cargo-secret");
         let disabled = router_with_auth(test_state(), Some("daemon-token".to_string()))
             .oneshot(
                 Request::post("/v2/demo/blobs/uploads/")
@@ -15105,9 +15111,22 @@ mod tests {
             .unwrap();
         assert_eq!(disabled.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-        let _env = RegistryEnvGuard("KIN_REGISTRY_CARGO_TOKEN");
-        std::env::set_var("KIN_REGISTRY_CARGO_TOKEN", "registry-secret");
+        let _oci_env = RegistryEnvGuard("KIN_REGISTRY_OCI_WRITE_TOKEN");
+        std::env::set_var("KIN_REGISTRY_OCI_WRITE_TOKEN", "registry-secret");
         let app = router_with_auth(test_state(), Some("daemon-token".to_string()));
+
+        // The Cargo credential is deliberately not accepted on the OCI scope.
+        let cargo_token_rejected = app
+            .clone()
+            .oneshot(
+                Request::post("/v2/demo/blobs/uploads/")
+                    .header("authorization", "Bearer cargo-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cargo_token_rejected.status(), StatusCode::UNAUTHORIZED);
         let unauthorized = app
             .clone()
             .oneshot(

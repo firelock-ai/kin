@@ -82,8 +82,10 @@ const MAX_CRATE_NAME_LEN: usize = 64;
 
 /// Validate a Cargo registry package name before it can reach either the blob
 /// path or the manifest store. This is deliberately at least as strict as the
-/// crates.io publish boundary: an ASCII letter first, then only ASCII letters,
-/// digits, `-`, or `_`, with a 64-byte maximum.
+/// crates.io publish boundary: a lowercase ASCII letter first, then only
+/// lowercase ASCII letters, digits, `-`, or `_`, with a 64-byte maximum.
+/// Rejecting uppercase avoids creating an index coordinate that Cargo later
+/// lowercases and therefore cannot resolve on a case-sensitive filesystem.
 fn validate_cargo_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name.len() > MAX_CRATE_NAME_LEN {
         return Err(format!(
@@ -91,11 +93,13 @@ fn validate_cargo_name(name: &str) -> Result<(), String> {
         ));
     }
     let mut bytes = name.bytes();
-    if !bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
-        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    if !bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
+        || !bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
     {
         return Err(
-            "crate name must start with an ASCII letter and contain only ASCII letters, digits, '-' or '_'"
+            "crate name must start with a lowercase ASCII letter and contain only lowercase ASCII letters, digits, '-' or '_'"
                 .to_string(),
         );
     }
@@ -210,17 +214,44 @@ async fn index_lookup(
     let versions = match state.manifest_store.get_versions(Ecosystem::Cargo, name) {
         Ok(v) if v.is_empty() => return StatusCode::NOT_FOUND.into_response(),
         Ok(v) => v,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("Cargo index manifest is unreadable: {error}")
+                })),
+            )
+                .into_response();
+        }
     };
 
     // Cargo expects newline-delimited JSON, one entry per version
     let mut body = String::new();
     for v in &versions {
-        let entry = CargoIndexEntry::from_version(v);
-        if let Ok(line) = serde_json::to_string(&entry) {
-            body.push_str(&line);
-            body.push('\n');
-        }
+        let entry = match CargoIndexEntry::try_from_version(v) {
+            Ok(entry) => entry,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": error })),
+                )
+                    .into_response();
+            }
+        };
+        let line = match serde_json::to_string(&entry) {
+            Ok(line) => line,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("failed to encode Cargo index entry: {error}")
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        body.push_str(&line);
+        body.push('\n');
     }
 
     (StatusCode::OK, [("content-type", "text/plain")], body).into_response()
@@ -417,7 +448,16 @@ async fn publish_crate(
     // write side serializes the subsequent manifest check + blob write +
     // manifest append against every other publish in this registry. Readers
     // hold the read side across their corresponding manifest/blob reads.
-    let metadata = extract_crate_metadata(&body, &params.name, &params.version);
+    let metadata = match extract_crate_metadata(&body, &params.name, &params.version) {
+        Ok(metadata) => metadata,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response();
+        }
+    };
     let _write_guard = state.publish_gate.write().await;
 
     let existing_versions = match state
@@ -630,7 +670,11 @@ fn verify_crate_coordinates(crate_bytes: &[u8], name: &str, version: &str) -> Re
 /// .crate files are gzipped tarballs containing `{name}-{version}/Cargo.toml`.
 /// We parse this to extract features (for feature resolution) and dependencies
 /// (for the sparse index).
-fn extract_crate_metadata(crate_bytes: &[u8], name: &str, version: &str) -> serde_json::Value {
+fn extract_crate_metadata(
+    crate_bytes: &[u8],
+    name: &str,
+    version: &str,
+) -> Result<serde_json::Value, String> {
     use flate2::read::GzDecoder;
     use std::io::Read;
 
@@ -639,30 +683,38 @@ fn extract_crate_metadata(crate_bytes: &[u8], name: &str, version: &str) -> serd
     let mut archive = tar::Archive::new(gz);
 
     let mut cargo_toml_content = String::new();
-    if let Ok(entries) = archive.entries() {
-        for entry in entries.flatten() {
-            if let Ok(path) = entry.path() {
-                if path.to_str() == Some(&expected_manifest) {
-                    let mut entry = entry;
-                    if entry.read_to_string(&mut cargo_toml_content).is_ok() {
-                        break;
-                    }
-                }
-            }
+    let entries = archive
+        .entries()
+        .map_err(|error| format!("crate is not a valid gzip-tar archive: {error}"))?;
+    for entry in entries {
+        let mut entry =
+            entry.map_err(|error| format!("crate is not a valid gzip-tar archive: {error}"))?;
+        let path = entry
+            .path()
+            .map_err(|error| format!("crate contains an invalid path: {error}"))?;
+        if path.to_str() == Some(&expected_manifest) {
+            entry
+                .read_to_string(&mut cargo_toml_content)
+                .map_err(|error| format!("failed to read {expected_manifest}: {error}"))?;
+            break;
         }
     }
 
     if cargo_toml_content.is_empty() {
-        return serde_json::json!({});
+        return Err(format!("crate does not contain {expected_manifest}"));
     }
 
-    // Parse Cargo.toml to extract features and deps
-    let toml_value: toml::Value = match toml::from_str(&cargo_toml_content) {
-        Ok(v) => v,
-        Err(_) => return serde_json::json!({}),
-    };
+    // Parse Cargo.toml to extract features and deps. This metadata is the
+    // sparse-index authority, so an extraction failure must never be recorded
+    // as an authoritative empty dependency list.
+    let toml_value: toml::Value = toml::from_str(&cargo_toml_content)
+        .map_err(|error| format!("crate {expected_manifest} is not valid TOML: {error}"))?;
 
-    let mut metadata = serde_json::json!({});
+    let mut metadata = serde_json::json!({
+        "cargo_index_format": 1,
+        "features": {},
+        "deps": [],
+    });
 
     // Extract [features]
     if let Some(features) = toml_value.get("features") {
@@ -825,11 +877,9 @@ fn extract_crate_metadata(crate_bytes: &[u8], name: &str, version: &str) -> serd
         }
     }
 
-    if !deps.is_empty() {
-        metadata["deps"] = serde_json::Value::Array(deps);
-    }
+    metadata["deps"] = serde_json::Value::Array(deps);
 
-    metadata
+    Ok(metadata)
 }
 
 /// Cargo index entry format (one per version, newline-delimited JSON)
@@ -857,27 +907,54 @@ struct CargoIndexDep {
 }
 
 impl CargoIndexEntry {
-    fn from_version(v: &PackageVersion) -> Self {
-        // Extract deps from metadata if present
+    fn try_from_version(v: &PackageVersion) -> Result<Self, String> {
+        if v.metadata
+            .get("cargo_index_format")
+            .and_then(|value| value.as_u64())
+            != Some(1)
+        {
+            return Err(format!(
+                "Cargo index metadata for {}@{} is legacy or incomplete; re-publish or migrate the manifest before serving it",
+                v.id.name, v.version
+            ));
+        }
         let deps = v
             .metadata
             .get("deps")
-            .and_then(|d| serde_json::from_value::<Vec<CargoIndexDep>>(d.clone()).ok())
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                format!(
+                    "Cargo index metadata for {}@{} has no dependency authority",
+                    v.id.name, v.version
+                )
+            })
+            .and_then(|deps| {
+                serde_json::from_value::<Vec<CargoIndexDep>>(deps.clone()).map_err(|error| {
+                    format!(
+                        "Cargo index metadata for {}@{} has invalid dependencies: {error}",
+                        v.id.name, v.version
+                    )
+                })
+            })?;
         let features = v
             .metadata
             .get("features")
             .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
+            .filter(serde_json::Value::is_object)
+            .ok_or_else(|| {
+                format!(
+                    "Cargo index metadata for {}@{} has invalid features",
+                    v.id.name, v.version
+                )
+            })?;
 
-        Self {
+        Ok(Self {
             name: v.id.name.clone(),
             vers: v.version.clone(),
             deps,
             cksum: v.checksum.clone(),
             features,
             yanked: v.yanked,
-        }
+        })
     }
 }
 
@@ -926,7 +1003,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sparse_index_is_a_manifest_only_read_and_never_repairs_from_blob_bytes() {
+    async fn sparse_index_fails_loud_on_legacy_metadata_and_never_repairs_from_blob_bytes() {
         let (_root, state) = registry_state();
         std::fs::create_dir_all(&state.blobs_dir).unwrap();
 
@@ -980,15 +1057,16 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        let line = String::from_utf8(body.to_vec()).unwrap();
-        let index_entry: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-        let deps = index_entry["deps"].as_array().unwrap();
-        assert!(deps.is_empty());
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(error["error"]
+            .as_str()
+            .unwrap()
+            .contains("legacy or incomplete"));
 
         let manifest_after = state
             .manifest_store
@@ -1021,7 +1099,7 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
                 blob_hash: "hash".to_string(),
                 blob_size: first_body.len() as u64,
                 checksum: "checksum".to_string(),
-                metadata: serde_json::json!({}),
+                metadata: extract_crate_metadata(&first_body, "demo", "0.1.0").unwrap(),
                 published_at: Utc::now(),
                 published_by: "legacy-test".to_string(),
                 yanked: false,
@@ -1083,7 +1161,7 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
                 .collect::<Vec<_>>(),
             vec!["0.1.0", "0.2.0"]
         );
-        assert_eq!(versions[0].metadata, serde_json::json!({}));
+        assert_eq!(versions[0].metadata["cargo_index_format"].as_u64(), Some(1));
     }
 
     #[test]
@@ -1103,6 +1181,7 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
             "",
             ".",
             "..",
+            "Demo",
             "../outside",
             "demo/outside",
             "demo%2foutside",
@@ -1116,6 +1195,30 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
                 "accepted {version:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn uppercase_publish_is_rejected_before_case_sensitive_index_divergence() {
+        let (_root, state) = registry_state_with_token(Some("s3cret"));
+        let rejected = publish(
+            state.clone(),
+            "Demo",
+            "0.1.0",
+            Some("s3cret"),
+            valid_crate("Demo", "0.1.0"),
+        )
+        .await;
+        assert_eq!(rejected, StatusCode::BAD_REQUEST);
+
+        let lowercase_lookup = cargo_routes(state)
+            .oneshot(
+                Request::get("/registry/cargo/de/mo/demo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(lowercase_lookup.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

@@ -18,6 +18,7 @@ use axum::{
     routing::get,
     Router,
 };
+use sha2::{Digest, Sha256};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
@@ -36,18 +37,21 @@ fn valid_go_module(module: &str) -> bool {
     if module.is_empty() || module.len() > MAX_GO_MODULE_LEN {
         return false;
     }
-    let bytes = module.as_bytes();
-    bytes
-        .first()
-        .is_some_and(|byte| byte.is_ascii_alphanumeric())
-        && bytes
-            .last()
-            .is_some_and(|byte| byte.is_ascii_alphanumeric())
-        && bytes
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'!'))
-        && module != "."
-        && module != ".."
+    module.split('/').all(|segment| {
+        let bytes = segment.as_bytes();
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && bytes
+                .first()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            && bytes
+                .last()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            && bytes.iter().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'!')
+            })
+    })
 }
 
 fn valid_go_version(version: &str) -> bool {
@@ -64,7 +68,12 @@ fn go_zip_path(blobs_dir: &FsPath, module: &str, version: &str) -> Option<PathBu
     if !valid_go_module(module) || !valid_go_version(version) {
         return None;
     }
-    let path = blobs_dir.join(format!("{module}-{version}.zip"));
+    // Module paths contain `/`; hash the validated logical coordinate into one
+    // fixed filename rather than projecting caller-controlled segments onto
+    // the host filesystem.
+    let coordinate = format!("{module}\0{version}");
+    let key = hex::encode(Sha256::digest(coordinate.as_bytes()));
+    let path = blobs_dir.join(format!("module_{key}.zip"));
     (path.parent() == Some(blobs_dir)).then_some(path)
 }
 
@@ -75,46 +84,39 @@ fn invalid_coordinate() -> Response {
 /// Create axum router for Go module proxy endpoints
 pub fn go_routes(state: Arc<GoProxyState>) -> Router {
     Router::new()
-        .route("/registry/go/{module}/@v/list", get(list_versions))
-        .route(
-            "/registry/go/{module}/@v/{*version_file}",
-            get(version_dispatch),
-        )
+        .route("/registry/go/{*path}", get(dispatch))
         .with_state(state)
 }
 
-/// Dispatch /registry/go/{module}/@v/{version}.{ext} to the correct handler
-async fn version_dispatch(
-    state: State<Arc<GoProxyState>>,
-    Path((module, version_file)): Path<(String, String)>,
-) -> Response {
-    if !valid_go_module(&module) {
+/// Parse the fixed `/@v/` protocol marker from the right so normal multi-segment
+/// module paths remain one validated logical coordinate.
+async fn dispatch(State(state): State<Arc<GoProxyState>>, Path(path): Path<String>) -> Response {
+    let Some((module, version_file)) = path.rsplit_once("/@v/") else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !valid_go_module(module) {
         return invalid_coordinate();
     }
+    if version_file == "list" {
+        return list_versions_inner(&state, module);
+    }
     let (version, ext) = match version_file.rsplit_once('.') {
-        Some((v, e)) => (v.to_string(), e),
+        Some((v, e)) => (v, e),
         None => return StatusCode::NOT_FOUND.into_response(),
     };
-    if !valid_go_version(&version) {
+    if !valid_go_version(version) {
         return invalid_coordinate();
     }
     match ext {
-        "info" => version_info_inner(state, &module, &version).await,
-        "mod" => version_mod_inner(state, &module, &version).await,
-        "zip" => version_zip_inner(state, &module, &version).await,
+        "info" => version_info_inner(&state, module, version),
+        "mod" => version_mod_inner(&state, module, version),
+        "zip" => version_zip_inner(&state, module, version),
         _ => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
-/// GET /registry/go/{module}/@v/list -- list all available versions (plain text, one per line)
-async fn list_versions(
-    State(state): State<Arc<GoProxyState>>,
-    Path(module): Path<String>,
-) -> Response {
-    if !valid_go_module(&module) {
-        return invalid_coordinate();
-    }
-    let versions = match state.manifest_store.get_versions(Ecosystem::Go, &module) {
+fn list_versions_inner(state: &GoProxyState, module: &str) -> Response {
+    let versions = match state.manifest_store.get_versions(Ecosystem::Go, module) {
         Ok(v) => v,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
@@ -126,11 +128,7 @@ async fn list_versions(
     (StatusCode::OK, [("content-type", "text/plain")], body).into_response()
 }
 
-async fn version_info_inner(
-    State(state): State<Arc<GoProxyState>>,
-    module: &str,
-    version: &str,
-) -> Response {
+fn version_info_inner(state: &GoProxyState, module: &str, version: &str) -> Response {
     let versions = match state.manifest_store.get_versions(Ecosystem::Go, module) {
         Ok(v) => v,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -145,11 +143,7 @@ async fn version_info_inner(
     }
 }
 
-async fn version_mod_inner(
-    State(state): State<Arc<GoProxyState>>,
-    module: &str,
-    version: &str,
-) -> Response {
+fn version_mod_inner(state: &GoProxyState, module: &str, version: &str) -> Response {
     let versions = match state.manifest_store.get_versions(Ecosystem::Go, module) {
         Ok(v) => v,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -173,11 +167,7 @@ async fn version_mod_inner(
     }
 }
 
-async fn version_zip_inner(
-    State(state): State<Arc<GoProxyState>>,
-    module: &str,
-    version: &str,
-) -> Response {
+fn version_zip_inner(state: &GoProxyState, module: &str, version: &str) -> Response {
     let Some(zip_path) = go_zip_path(&state.blobs_dir, module, version) else {
         return invalid_coordinate();
     };
@@ -214,9 +204,9 @@ mod tests {
         let blobs = root.path().join("go");
         std::fs::create_dir_all(&blobs).unwrap();
 
-        let valid = go_zip_path(&blobs, "example.com", "v1.2.3").unwrap();
-        assert_eq!(valid, blobs.join("example.com-v1.2.3.zip"));
+        let valid = go_zip_path(&blobs, "example.com/team/module", "v1.2.3").unwrap();
         assert_eq!(valid.parent(), Some(blobs.as_path()));
+        assert_eq!(valid.file_name().unwrap().to_string_lossy().len(), 75);
 
         for (module, version) in [
             ("..", "v1.2.3"),
@@ -262,12 +252,13 @@ mod tests {
     async fn validated_go_zip_reads_remain_public() {
         let (_root, state) = state();
         let bytes = b"valid-public-module-zip";
-        let path = go_zip_path(&state.blobs_dir, "example.com", "v1.2.3").unwrap();
+        let module = "github.com/firelock-ai/kin";
+        let path = go_zip_path(&state.blobs_dir, module, "v1.2.3").unwrap();
         std::fs::write(path, bytes).unwrap();
 
         let response = go_routes(state)
             .oneshot(
-                Request::get("/registry/go/example.com/@v/v1.2.3.zip")
+                Request::get("/registry/go/github.com/firelock-ai/kin/@v/v1.2.3.zip")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -278,5 +269,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(observed.as_ref(), bytes);
+    }
+
+    #[tokio::test]
+    async fn standard_multisegment_module_path_lists_versions() {
+        let (_root, state) = state();
+        let module = "github.com/firelock-ai/kin";
+        state
+            .manifest_store
+            .add_version(&crate::PackageVersion {
+                id: crate::PackageId {
+                    ecosystem: Ecosystem::Go,
+                    scope: None,
+                    name: module.to_string(),
+                },
+                version: "v1.2.3".to_string(),
+                blob_hash: "hash".to_string(),
+                blob_size: 0,
+                checksum: "checksum".to_string(),
+                metadata: serde_json::json!({}),
+                published_at: chrono::Utc::now(),
+                published_by: "test".to_string(),
+                yanked: false,
+            })
+            .unwrap();
+
+        let response = go_routes(state)
+            .oneshot(
+                Request::get("/registry/go/github.com/firelock-ai/kin/@v/list")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let observed = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(observed.as_ref(), b"v1.2.3");
     }
 }

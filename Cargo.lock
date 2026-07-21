@@ -3425,10 +3425,12 @@ dependencies = [
 name = "kin-registry"
 version = "0.2.28"
 dependencies = [
+ "async-stream",
  "axum",
  "base64 0.22.1",
  "chrono",
  "flate2",
+ "futures-util",
  "hex",
  "kin-blobs",
  "kin-model",

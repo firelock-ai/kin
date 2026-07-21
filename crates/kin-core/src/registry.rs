@@ -16,6 +16,86 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+#[derive(Default)]
+struct RegistryProcessGates {
+    active: std::collections::HashSet<PathBuf>,
+}
+
+#[cfg(unix)]
+static REGISTRY_PROCESS_GATES: std::sync::OnceLock<(
+    std::sync::Mutex<RegistryProcessGates>,
+    std::sync::Condvar,
+)> = std::sync::OnceLock::new();
+
+#[cfg(unix)]
+struct RegistryProcessGuard {
+    key: PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for RegistryProcessGuard {
+    fn drop(&mut self) {
+        let (state, changed) = REGISTRY_PROCESS_GATES
+            .get()
+            .expect("registry process gate was initialized before guard creation");
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active.remove(&self.key);
+        changed.notify_all();
+    }
+}
+
+/// `flock` semantics for separately-opened descriptors differ across Unix
+/// kernels when contenders are threads in one process. Keep a path-keyed local
+/// gate around the preflight + OS-lock transaction so an atomic rename cannot
+/// unlink a sibling thread's just-opened registry descriptor (`st_nlink == 0`).
+/// Different registry authorities remain independent; the durable lock file
+/// remains the cross-process authority.
+#[cfg(unix)]
+fn lock_registry_process(path: &Path) -> std::io::Result<RegistryProcessGuard> {
+    let key = lexical_absolute_path(path)?;
+    let (state, changed) = REGISTRY_PROCESS_GATES.get_or_init(|| {
+        (
+            std::sync::Mutex::new(RegistryProcessGates::default()),
+            std::sync::Condvar::new(),
+        )
+    });
+    let mut state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while state.active.contains(&key) {
+        state = changed
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    state.active.insert(key.clone());
+    Ok(RegistryProcessGuard { key })
+}
+
+#[cfg(unix)]
+fn lexical_absolute_path(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::RootDir => normalized.push(Path::new("/")),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::Prefix(_) => unreachable!("Unix paths have no prefix"),
+        }
+    }
+    Ok(normalized)
+}
+
 /// Read-only classification of one local registry-authority path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -878,6 +958,7 @@ fn inspect_named_authority(
 fn repair_registry_authority_permissions_at_unix(
     path: &Path,
 ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let _process_guard = lock_registry_process(path)?;
     let anchor = match RegistryAnchor::open(path) {
         Ok(anchor) => anchor,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -931,6 +1012,7 @@ fn repair_registry_authority_permissions_at_unix(
 fn initialize_registry_authority_at_unix(
     path: &Path,
 ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let _process_guard = lock_registry_process(path)?;
     // This preflight is deliberately before directory or lock creation: an
     // unsafe existing registry must not cause any companion-path mutation.
     require_registry_authority_secure_at(path)?;
@@ -959,6 +1041,7 @@ fn initialize_registry_authority_at_unix(
 
 #[cfg(unix)]
 fn load_from_unix(path: &Path) -> Result<KinRegistry, Box<dyn std::error::Error>> {
+    let _process_guard = lock_registry_process(path)?;
     // Reject the complete authority snapshot before a missing lock can be
     // created. Descriptor-anchored checks below then revalidate under lock.
     require_registry_authority_secure_at(path)?;
@@ -978,6 +1061,7 @@ fn load_from_unix(path: &Path) -> Result<KinRegistry, Box<dyn std::error::Error>
 
 #[cfg(unix)]
 fn save_to_unix(registry: &KinRegistry, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let _process_guard = lock_registry_process(path)?;
     require_registry_authority_secure_at(path)?;
     let contents = toml::to_string_pretty(registry)?;
     let anchor = prepare_anchor(path)?;
@@ -992,6 +1076,7 @@ fn update_at_unix<T>(
     path: &Path,
     mutate: impl FnOnce(&mut KinRegistry) -> T,
 ) -> Result<T, Box<dyn std::error::Error>> {
+    let _process_guard = lock_registry_process(path)?;
     require_registry_authority_secure_at(path)?;
     let anchor = prepare_anchor(path)?;
     let lock_file = open_private_lock_at(&anchor).map_err(|err| {
@@ -1644,6 +1729,51 @@ mod tests {
         assert_eq!(std::fs::read(&upgrade_path).unwrap(), existing);
         assert_eq!(mode(&upgrade_path), 0o600);
         assert_eq!(mode(&upgrade_path.with_extension("lock")), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_gate_keeps_same_registry_rename_outside_open_descriptor_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("registry.toml");
+        let replacement = dir.path().join("replacement.toml");
+        let unrelated = dir.path().join("other-registry.toml");
+        std::fs::write(&registry, b"repos = []\n").unwrap();
+        std::fs::write(&replacement, b"repos = []\n").unwrap();
+
+        let guard = lock_registry_process(&registry).unwrap();
+        let opened_before_rename = File::open(&registry).unwrap();
+        assert_eq!(stat_file(&opened_before_rename).unwrap().st_nlink, 1);
+
+        // The key is path-scoped: an unrelated authority remains available.
+        drop(lock_registry_process(&unrelated).unwrap());
+
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (renamed_tx, renamed_rx) = std::sync::mpsc::channel();
+        let registry_for_thread = registry.clone();
+        let replacement_for_thread = replacement.clone();
+        let writer = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let _guard = lock_registry_process(&registry_for_thread).unwrap();
+            std::fs::rename(replacement_for_thread, registry_for_thread).unwrap();
+            renamed_tx.send(()).unwrap();
+        });
+
+        attempted_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            renamed_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(stat_file(&opened_before_rename).unwrap().st_nlink, 1);
+
+        drop(guard);
+        renamed_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        writer.join().unwrap();
+        assert_eq!(stat_file(&opened_before_rename).unwrap().st_nlink, 0);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (404 total, 302 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (405 total, 302 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -123,6 +123,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_REGISTRY_BASE_URL` | url | *(unset)* | operational | kin registry base URL (alternate key) |
 | `KIN_REGISTRY_CARGO_TOKEN` | secret | *(unset)* | secret | cargo registry auth token for publish |
 | `KIN_REGISTRY_NPM_AUTH_URL` | url | *(unset)* | operational | npm auth URL for the registry |
+| `KIN_REGISTRY_OCI_WRITE_TOKEN` | secret | *(unset)* | secret | OCI registry auth token for mutations |
 | `KIN_REGISTRY_PATH` | path | *(unset)* | operational | local registry path override |
 | `KIN_REGISTRY_URL` | url | *(unset)* | operational | kin registry base URL |
 
