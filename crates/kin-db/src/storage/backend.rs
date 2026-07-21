@@ -31,6 +31,37 @@ pub type Generation = u64;
 /// Sentinel value indicating no prior generation exists (first write).
 pub const GENERATION_INIT: Generation = 0;
 
+pub(crate) fn validate_source_blob_repo_id(repo_id: &str) -> Result<(), KinDbError> {
+    if repo_id.is_empty()
+        || repo_id.len() > 255
+        || matches!(repo_id, "." | "..")
+        || !repo_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(KinDbError::StorageError(format!(
+            "invalid repo id {repo_id:?} for immutable source blob storage"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_source_blob_digest(
+    digest: [u8; 32],
+    data: &[u8],
+    authority: &str,
+) -> Result<(), KinDbError> {
+    let actual: [u8; 32] = Sha256::digest(data).into();
+    if actual != digest {
+        return Err(KinDbError::StorageError(format!(
+            "immutable source blob digest mismatch for {authority}: requested {}, found {}",
+            hex::encode(digest),
+            hex::encode(actual)
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn checked_next_generation(
     generation: Generation,
     authority: &str,
@@ -221,6 +252,43 @@ pub trait StorageBackend: Send + Sync {
     /// [`load_recovered_snapshot`].
     fn load_snapshot(&self, repo_id: &str) -> Result<Option<(Vec<u8>, Generation)>, KinDbError>;
 
+    /// Store immutable source bytes under their SHA-256 content identity.
+    ///
+    /// Implementations must validate that `data` hashes to `digest`, must
+    /// never replace different bytes already stored under the same identity,
+    /// and must treat an exact retry as success. Source blobs are deliberately
+    /// separate from graph snapshots: snapshots retain the semantic history
+    /// and its content hashes while this object namespace retains the exact
+    /// bytes those hashes name.
+    fn save_source_blob(
+        &self,
+        repo_id: &str,
+        digest: [u8; 32],
+        data: &[u8],
+    ) -> Result<(), KinDbError> {
+        let _ = (repo_id, digest, data);
+        Err(KinDbError::StorageError(
+            "immutable source blob storage is not supported by this backend".to_string(),
+        ))
+    }
+
+    /// Load immutable source bytes by SHA-256 content identity.
+    ///
+    /// Implementations must verify the returned bytes against `digest` and
+    /// fail closed on corruption. `Ok(None)` means the exact bytes were never
+    /// persisted; callers must not repair that gap from a filesystem or Git
+    /// fallback on an authority path.
+    fn load_source_blob(
+        &self,
+        repo_id: &str,
+        digest: [u8; 32],
+    ) -> Result<Option<Vec<u8>>, KinDbError> {
+        let _ = (repo_id, digest);
+        Err(KinDbError::StorageError(
+            "immutable source blob storage is not supported by this backend".to_string(),
+        ))
+    }
+
     /// Save a snapshot with compare-and-swap semantics.
     ///
     /// `expected_gen` is the generation returned by the last `load_snapshot`
@@ -367,6 +435,7 @@ pub trait StorageBackend: Send + Sync {
 /// {base_path}/{repo_id}/snapshots/GEN.kndb  — immutable snapshot versions
 /// {base_path}/{repo_id}/graph.kndb          — compatibility projection
 /// {base_path}/{repo_id}/graph.kndb.gen      — legacy generation counter
+/// {base_path}/{repo_id}/source-blobs/sha256/HH/HASH — immutable exact source bytes
 /// {base_path}/{repo_id}/overlays/{session_id}.bin — overlay state
 /// ```
 ///
@@ -511,6 +580,18 @@ impl LocalFileBackend {
             .join(repo_id)
             .join("overlays")
             .join(format!("{session_id}.bin"))
+    }
+
+    fn source_blob_path(&self, repo_id: &str, digest: [u8; 32]) -> Result<PathBuf, KinDbError> {
+        validate_source_blob_repo_id(repo_id)?;
+        let digest = hex::encode(digest);
+        Ok(self
+            .base_path
+            .join(repo_id)
+            .join("source-blobs")
+            .join("sha256")
+            .join(&digest[..2])
+            .join(digest))
     }
 
     fn deltas_dir(&self, repo_id: &str) -> PathBuf {
@@ -1688,6 +1769,71 @@ impl StorageBackend for LocalFileBackend {
             .map(|authority| (authority.snapshot_bytes, authority.snapshot_generation)))
     }
 
+    fn save_source_blob(
+        &self,
+        repo_id: &str,
+        digest: [u8; 32],
+        data: &[u8],
+    ) -> Result<(), KinDbError> {
+        validate_source_blob_repo_id(repo_id)?;
+        verify_source_blob_digest(digest, data, &format!("repo {repo_id}"))?;
+        let _lock = self.acquire_lock(repo_id)?;
+        let path = self.source_blob_path(repo_id, digest)?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {
+                let existing = mmap::read_regular_file(&path, "immutable source blob")?;
+                verify_source_blob_digest(digest, &existing, &path.display().to_string())?;
+                if existing != data {
+                    return Err(KinDbError::StorageError(format!(
+                        "immutable source blob collision at {}",
+                        path.display()
+                    )));
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(KinDbError::StorageError(format!(
+                    "failed to inspect immutable source blob {}: {error}",
+                    path.display()
+                )))
+            }
+        }
+
+        Self::atomic_write(&path, data)?;
+        let installed = mmap::read_regular_file(&path, "installed immutable source blob")?;
+        verify_source_blob_digest(digest, &installed, &path.display().to_string())?;
+        if installed != data {
+            return Err(KinDbError::StorageError(format!(
+                "immutable source blob changed while installing {}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn load_source_blob(
+        &self,
+        repo_id: &str,
+        digest: [u8; 32],
+    ) -> Result<Option<Vec<u8>>, KinDbError> {
+        validate_source_blob_repo_id(repo_id)?;
+        let _lock = self.acquire_lock(repo_id)?;
+        let path = self.source_blob_path(repo_id, digest)?;
+        let data = match std::fs::symlink_metadata(&path) {
+            Ok(_) => mmap::read_regular_file(&path, "immutable source blob")?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(KinDbError::StorageError(format!(
+                    "failed to inspect immutable source blob {}: {error}",
+                    path.display()
+                )))
+            }
+        };
+        verify_source_blob_digest(digest, &data, &path.display().to_string())?;
+        Ok(Some(data))
+    }
+
     fn load_snapshot_authority(
         &self,
         repo_id: &str,
@@ -2290,6 +2436,88 @@ impl StorageBackend for LocalFileBackend {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn source_digest(data: &[u8]) -> [u8; 32] {
+        Sha256::digest(data).into()
+    }
+
+    #[test]
+    fn local_source_blob_roundtrips_retries_and_reports_missing() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let data = b"immutable source bytes";
+        let digest = source_digest(data);
+
+        assert!(backend
+            .load_source_blob("repo-a", digest)
+            .unwrap()
+            .is_none());
+        backend.save_source_blob("repo-a", digest, data).unwrap();
+        backend.save_source_blob("repo-a", digest, data).unwrap();
+        drop(backend);
+        let reopened = LocalFileBackend::new(dir.path());
+        assert_eq!(
+            reopened.load_source_blob("repo-a", digest).unwrap(),
+            Some(data.to_vec())
+        );
+        assert!(reopened
+            .load_source_blob("repo-b", digest)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn local_source_blob_rejects_wrong_digest_corruption_and_unsafe_repo_id() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let data = b"expected";
+        let digest = source_digest(data);
+
+        let wrong_digest_error = backend
+            .save_source_blob("repo-a", source_digest(b"different"), data)
+            .expect_err("write identity must bind the exact bytes");
+        assert!(wrong_digest_error.to_string().contains("digest mismatch"));
+
+        for repo_id in ["", ".", "..", "../escape", "owner/repo"] {
+            let error = backend
+                .load_source_blob(repo_id, digest)
+                .expect_err("repo id must not control an object path");
+            assert!(error.to_string().contains("invalid repo id"));
+        }
+
+        let path = backend.source_blob_path("repo-a", digest).unwrap();
+        LocalFileBackend::atomic_write(&path, b"corrupt").unwrap();
+        let read_error = backend
+            .load_source_blob("repo-a", digest)
+            .expect_err("corrupt immutable bytes must fail closed");
+        assert!(read_error.to_string().contains("digest mismatch"));
+        let retry_error = backend
+            .save_source_blob("repo-a", digest, data)
+            .expect_err("a write retry must not replace corrupt authority");
+        assert!(retry_error.to_string().contains("digest mismatch"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_source_blob_rejects_symlink_object_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let data = b"source";
+        let digest = source_digest(data);
+        let path = backend.source_blob_path("repo-a", digest).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"do not replace").unwrap();
+        symlink(&victim, &path).unwrap();
+
+        let error = backend
+            .save_source_blob("repo-a", digest, data)
+            .expect_err("symlink source object must fail closed");
+        assert!(error.to_string().contains("immutable source blob"));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not replace");
+    }
 
     #[test]
     fn local_backend_roundtrip_snapshot() {
