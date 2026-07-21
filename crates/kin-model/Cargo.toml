@@ -3,7 +3,7 @@
 
 [package]
 name = "kin-model"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 license = "Apache-2.0"
 description = "Canonical types for Kin semantic VCS"

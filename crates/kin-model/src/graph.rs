@@ -905,16 +905,10 @@ where
         }
 
         for delta in change.artifact_deltas {
-            match delta.kind {
-                crate::change::ArtifactDeltaKind::Added
-                | crate::change::ArtifactDeltaKind::Modified => {
-                    if let Some(hash) = delta.new_hash {
-                        state.file_tree.insert(delta.file_id, hash);
-                    }
-                }
-                crate::change::ArtifactDeltaKind::Removed => {
-                    state.file_tree.remove(&delta.file_id);
-                }
+            if delta.kind.is_removed() {
+                state.file_tree.remove(&delta.file_id);
+            } else if let Some(hash) = delta.new_hash {
+                state.file_tree.insert(delta.file_id, hash);
             }
         }
     }
@@ -983,35 +977,31 @@ where
                 continue;
             }
 
-            match delta.kind {
-                crate::change::ArtifactDeltaKind::Added
-                | crate::change::ArtifactDeltaKind::Modified => {
-                    let Some(hash) = delta.new_hash else {
-                        continue;
-                    };
-                    let previous_revision = active_revision
-                        .and_then(|index| revisions.get_mut(index))
-                        .map(|revision| {
-                            revision.mark_ended(change_id);
-                            revision.revision_id
-                        });
-                    revisions.push(ArtifactRevision::new(
-                        delta.file_id,
-                        hash,
-                        delta.kind,
-                        change_id,
-                        previous_revision,
-                    ));
-                    active_revision = Some(revisions.len() - 1);
-                }
-                crate::change::ArtifactDeltaKind::Removed => {
-                    if let Some(index) = active_revision.take() {
-                        if let Some(revision) = revisions.get_mut(index) {
-                            revision.mark_ended(change_id);
-                        }
+            if delta.kind.is_removed() {
+                if let Some(index) = active_revision.take() {
+                    if let Some(revision) = revisions.get_mut(index) {
+                        revision.mark_ended(change_id);
                     }
                 }
+                continue;
             }
+            let Some(hash) = delta.new_hash else {
+                continue;
+            };
+            let previous_revision = active_revision
+                .and_then(|index| revisions.get_mut(index))
+                .map(|revision| {
+                    revision.mark_ended(change_id);
+                    revision.revision_id
+                });
+            revisions.push(ArtifactRevision::new(
+                delta.file_id,
+                hash,
+                delta.kind,
+                change_id,
+                previous_revision,
+            ));
+            active_revision = Some(revisions.len() - 1);
         }
     }
 
@@ -1026,16 +1016,10 @@ where
 
     for change in changes {
         for delta in change.artifact_deltas {
-            match delta.kind {
-                crate::change::ArtifactDeltaKind::Added
-                | crate::change::ArtifactDeltaKind::Modified => {
-                    if let Some(hash) = delta.new_hash {
-                        file_tree.insert(delta.file_id, hash);
-                    }
-                }
-                crate::change::ArtifactDeltaKind::Removed => {
-                    file_tree.remove(&delta.file_id);
-                }
+            if delta.kind.is_removed() {
+                file_tree.remove(&delta.file_id);
+            } else if let Some(hash) = delta.new_hash {
+                file_tree.insert(delta.file_id, hash);
             }
         }
     }
