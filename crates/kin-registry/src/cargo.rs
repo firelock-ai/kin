@@ -20,6 +20,7 @@ use axum::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
 use crate::{Ecosystem, ManifestStore, PackageId, PackageVersion};
@@ -44,6 +45,73 @@ const CRATES_IO_INDEX_URL: &str = "https://github.com/rust-lang/crates.io-index"
 
 /// Maximum accepted `.crate` upload size (50 MiB), matching crates.io's cap.
 const MAX_CRATE_SIZE: usize = 50 * 1024 * 1024;
+const MAX_CRATE_NAME_LEN: usize = 64;
+
+/// Validate a Cargo registry package name before it can reach either the blob
+/// path or the manifest store. This is deliberately at least as strict as the
+/// crates.io publish boundary: an ASCII letter first, then only ASCII letters,
+/// digits, `-`, or `_`, with a 64-byte maximum.
+fn validate_cargo_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > MAX_CRATE_NAME_LEN {
+        return Err(format!(
+            "crate name must contain 1 to {MAX_CRATE_NAME_LEN} ASCII characters"
+        ));
+    }
+    let mut bytes = name.bytes();
+    if !bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(
+            "crate name must start with an ASCII letter and contain only ASCII letters, digits, '-' or '_'"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_cargo_version(version: &str) -> Result<(), String> {
+    semver::Version::parse(version)
+        .map(|_| ())
+        .map_err(|error| format!("crate version must be valid SemVer: {error}"))
+}
+
+fn validate_cargo_coordinates(name: &str, version: &str) -> Result<(), String> {
+    validate_cargo_name(name)?;
+    validate_cargo_version(version)
+}
+
+fn validate_cargo_manifest_path(store: &ManifestStore, name: &str) -> Result<(), String> {
+    validate_cargo_name(name)?;
+    let id = PackageId {
+        ecosystem: Ecosystem::Cargo,
+        scope: None,
+        name: name.to_string(),
+    };
+    store
+        .manifest_path_is_direct_child(&id)
+        .then_some(())
+        .ok_or_else(|| "crate manifest path escaped the Cargo manifest directory".to_string())
+}
+
+/// Build the only Cargo blob path shape accepted by this adapter. Coordinate
+/// validation forbids separators and dot components; the parent equality check
+/// is a second, structural containment proof that fails before any IO.
+fn cargo_blob_path(blobs_dir: &FsPath, name: &str, version: &str) -> Result<PathBuf, String> {
+    validate_cargo_coordinates(name, version)?;
+    let path = blobs_dir.join(format!("{name}-{version}.crate"));
+    if path.parent() != Some(blobs_dir) {
+        return Err("crate blob path escaped the configured blob directory".to_string());
+    }
+    Ok(path)
+}
+
+fn bad_coordinate(message: String) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": message })),
+    )
+        .into_response()
+}
 
 /// Create axum router for Cargo registry endpoints
 pub fn cargo_routes(state: Arc<CargoRegistryState>) -> Router {
@@ -84,6 +152,9 @@ async fn index_lookup(
 ) -> Response {
     // Extract the package name (last path segment)
     let name = params.last().map(|(_, v)| v.as_str()).unwrap_or("");
+    if let Err(message) = validate_cargo_manifest_path(&state.manifest_store, name) {
+        return bad_coordinate(message);
+    }
 
     // The manifest is the sparse index authority. Metadata extraction belongs
     // to authenticated publish/ingest; a GET must never rebuild or mutate the
@@ -112,6 +183,13 @@ async fn download_crate(
     State(state): State<Arc<CargoRegistryState>>,
     Path((name, version)): Path<(String, String)>,
 ) -> Response {
+    let crate_path = match cargo_blob_path(&state.blobs_dir, &name, &version) {
+        Ok(path) => path,
+        Err(message) => return bad_coordinate(message),
+    };
+    if let Err(message) = validate_cargo_manifest_path(&state.manifest_store, &name) {
+        return bad_coordinate(message);
+    }
     let versions = match state.manifest_store.get_versions(Ecosystem::Cargo, &name) {
         Ok(v) => v,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -123,7 +201,6 @@ async fn download_crate(
     };
 
     // Read the .crate file from blob store
-    let crate_path = state.blobs_dir.join(format!("{}-{}.crate", name, version));
     match std::fs::read(&crate_path) {
         Ok(bytes) => (
             StatusCode::OK,
@@ -234,12 +311,11 @@ async fn publish_crate(
         return rejection;
     }
 
-    if params.name.is_empty() || params.version.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "name and version are required" })),
-        )
-            .into_response();
+    if let Err(message) = validate_cargo_coordinates(&params.name, &params.version) {
+        return bad_coordinate(message);
+    }
+    if let Err(message) = validate_cargo_manifest_path(&state.manifest_store, &params.name) {
+        return bad_coordinate(message);
     }
 
     // Reject an empty upload before touching the filesystem.
@@ -280,9 +356,10 @@ async fn publish_crate(
     // Compute SHA-256 checksum of the .crate bytes
     let checksum = hex::encode(Sha256::digest(&body));
 
-    let crate_path = state
-        .blobs_dir
-        .join(format!("{}-{}.crate", params.name, params.version));
+    let crate_path = match cargo_blob_path(&state.blobs_dir, &params.name, &params.version) {
+        Ok(path) => path,
+        Err(message) => return bad_coordinate(message),
+    };
 
     let existing_versions = match state
         .manifest_store
@@ -396,6 +473,12 @@ fn write_crate_blob(
     crate_path: &std::path::Path,
     body: &[u8],
 ) -> std::io::Result<()> {
+    if crate_path.parent() != Some(blobs_dir) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "crate blob path escaped the configured blob directory",
+        ));
+    }
     std::fs::create_dir_all(blobs_dir)?;
     std::fs::write(crate_path, body)
 }
@@ -848,7 +931,7 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
         assert_eq!(manifest_after[0].metadata, manifest_before[0].metadata);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_sparse_reads_cannot_erase_a_published_version() {
         let (_root, state) = registry_state_with_token(Some("s3cret"));
         std::fs::create_dir_all(&state.blobs_dir).unwrap();
@@ -877,30 +960,49 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
             })
             .unwrap();
 
-        let reads = async {
-            for _ in 0..64 {
-                let response = cargo_routes(state.clone())
-                    .oneshot(
-                        Request::get("/registry/cargo/de/mo/demo")
-                            .body(Body::empty())
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(response.status(), StatusCode::OK);
-                tokio::task::yield_now().await;
-            }
-        };
-        let publish_second = publish(
-            state.clone(),
-            "demo",
-            "0.2.0",
-            Some("s3cret"),
-            valid_crate("demo", "0.2.0"),
-        );
+        let reader_count = 8;
+        let start = Arc::new(tokio::sync::Barrier::new(reader_count + 2));
+        let mut readers = tokio::task::JoinSet::new();
+        for _ in 0..reader_count {
+            let state = state.clone();
+            let start = start.clone();
+            readers.spawn(async move {
+                start.wait().await;
+                for _ in 0..32 {
+                    let response = cargo_routes(state.clone())
+                        .oneshot(
+                            Request::get("/registry/cargo/de/mo/demo")
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    tokio::task::yield_now().await;
+                }
+            });
+        }
 
-        let (_, status) = tokio::join!(reads, publish_second);
+        let publish_state = state.clone();
+        let publish_start = start.clone();
+        let publisher = tokio::spawn(async move {
+            publish_start.wait().await;
+            publish(
+                publish_state,
+                "demo",
+                "0.2.0",
+                Some("s3cret"),
+                valid_crate("demo", "0.2.0"),
+            )
+            .await
+        });
+        start.wait().await;
+
+        let status = publisher.await.unwrap();
         assert_eq!(status, StatusCode::OK);
+        while let Some(result) = readers.join_next().await {
+            result.unwrap();
+        }
 
         let versions = state
             .manifest_store
@@ -914,6 +1016,76 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
             vec!["0.1.0", "0.2.0"]
         );
         assert_eq!(versions[0].metadata, serde_json::json!({}));
+    }
+
+    #[test]
+    fn cargo_coordinates_are_semver_valid_and_paths_stay_contained() {
+        let root = tempfile::tempdir().unwrap();
+        let blobs = root.path().join("cargo");
+        let manifests = ManifestStore::new(&root.path().join(".kin"));
+        std::fs::create_dir_all(&blobs).unwrap();
+
+        for (name, version) in [("demo", "0.1.0"), ("kin_registry", "1.2.3-alpha.1+build.9")] {
+            let path = cargo_blob_path(&blobs, name, version).unwrap();
+            assert_eq!(path.parent(), Some(blobs.as_path()));
+            validate_cargo_manifest_path(&manifests, name).unwrap();
+        }
+
+        for name in [
+            "",
+            ".",
+            "..",
+            "../outside",
+            "demo/outside",
+            "demo%2foutside",
+            "-demo",
+        ] {
+            assert!(validate_cargo_name(name).is_err(), "accepted {name:?}");
+        }
+        for version in ["", ".", "..", "../1.0.0", "1", "1.0", "01.0.0"] {
+            assert!(
+                validate_cargo_version(version).is_err(),
+                "accepted {version:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn traversal_coordinates_never_touch_blob_or_manifest_paths() {
+        let (root, state) = registry_state_with_token(Some("s3cret"));
+        let sentinel = root.path().join("outside");
+        std::fs::write(&sentinel, b"unchanged").unwrap();
+
+        for uri in [
+            "/registry/cargo/api/v1/crates/publish?name=..%2Foutside&version=0.1.0",
+            "/registry/cargo/api/v1/crates/publish?name=demo&version=..%2Foutside",
+        ] {
+            let response = cargo_routes(state.clone())
+                .oneshot(
+                    Request::post(uri)
+                        .header("authorization", "Bearer s3cret")
+                        .body(Body::from(b"not consulted".as_slice()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        let sparse = cargo_routes(state.clone())
+            .oneshot(
+                Request::get("/registry/cargo/1/%2e%2e")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(sparse.status(), StatusCode::OK);
+
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+        assert!(!root.path().join("outside-0.1.0.crate").exists());
+        assert!(!state.blobs_dir.join("outside.crate").exists());
+        assert!(!root.path().join(".kin/packages/manifests/outside").exists());
     }
 
     /// Build a valid `.crate` blob for a simple `[package]` manifest.

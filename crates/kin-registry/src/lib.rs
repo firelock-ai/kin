@@ -175,15 +175,33 @@ impl ManifestStore {
         Ok(())
     }
 
-    fn manifest_path(&self, id: &PackageId) -> std::path::PathBuf {
-        let eco_str = match id.ecosystem {
+    /// Prove that an unscoped package manifest resolves to one direct child of
+    /// its ecosystem directory. Protocol adapters use this after validating a
+    /// caller-controlled package name and before any manifest IO.
+    pub(crate) fn manifest_path_is_direct_child(&self, id: &PackageId) -> bool {
+        let mut components = std::path::Path::new(&id.name).components();
+        let is_one_normal_segment = matches!(
+            components.next(),
+            Some(std::path::Component::Normal(segment)) if segment == std::ffi::OsStr::new(&id.name)
+        ) && components.next().is_none();
+        let base = self.ecosystem_manifests_dir(id.ecosystem);
+        id.scope.is_none()
+            && is_one_normal_segment
+            && self.manifest_path(id).parent() == Some(base.as_path())
+    }
+
+    fn ecosystem_manifests_dir(&self, ecosystem: Ecosystem) -> std::path::PathBuf {
+        self.manifests_dir.join(match ecosystem {
             Ecosystem::Cargo => "cargo",
             Ecosystem::Npm => "npm",
             Ecosystem::Oci => "oci",
             Ecosystem::Go => "go",
             Ecosystem::Raw => "raw",
-        };
-        let base = self.manifests_dir.join(eco_str);
+        })
+    }
+
+    fn manifest_path(&self, id: &PackageId) -> std::path::PathBuf {
+        let base = self.ecosystem_manifests_dir(id.ecosystem);
         match &id.scope {
             Some(scope) if !scope.is_empty() => base.join(format!("@{scope}")).join(&id.name),
             _ => base.join(&id.name),

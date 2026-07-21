@@ -1093,20 +1093,21 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
     let base_url = std::env::var("KIN_REGISTRY_BASE_URL")
         .unwrap_or_else(|_| "http://localhost:4219".to_string());
 
-    // Cargo registry. The publish (write) path is gated on a shared secret from
-    // KIN_REGISTRY_CARGO_TOKEN; reads stay open. A None token fails closed
-    // (publishing disabled), so an unset/empty env var never falls open.
+    // Cargo and OCI reuse the existing registry write-token contract from
+    // KIN_REGISTRY_CARGO_TOKEN; reads stay open. A None token fails closed, so
+    // an unset/empty env var never silently exposes either write surface.
     let crates_dir = packages_dir.join("crates");
     std::fs::create_dir_all(&crates_dir).ok();
-    let cargo_publish_token = std::env::var("KIN_REGISTRY_CARGO_TOKEN")
+    let registry_write_token = std::env::var("KIN_REGISTRY_CARGO_TOKEN")
         .ok()
-        .filter(|s| !s.is_empty());
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty());
     let cargo_routes =
         kin_registry::cargo::cargo_routes(Arc::new(kin_registry::cargo::CargoRegistryState {
             manifest_store: kin_registry::ManifestStore::new(state.layout.root()),
             blobs_dir: crates_dir,
             base_url: base_url.clone(),
-            publish_token: cargo_publish_token,
+            publish_token: registry_write_token.clone(),
         }));
 
     let npm_routes = npm_registry_routes(
@@ -1119,11 +1120,9 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
     // OCI container registry
     let oci_dir = packages_dir.join("oci");
     std::fs::create_dir_all(&oci_dir).ok();
-    let oci_routes = kin_registry::oci::oci_routes(Arc::new(kin_registry::oci::OciRegistryState {
-        blobs_dir: oci_dir,
-        manifests: Default::default(),
-        uploads: Default::default(),
-    }));
+    let oci_routes = kin_registry::oci::oci_routes(Arc::new(
+        kin_registry::oci::OciRegistryState::new(oci_dir, registry_write_token),
+    ));
 
     // Go module proxy
     let go_dir = packages_dir.join("go");
@@ -1134,7 +1133,7 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
     }));
 
     // The package registries (cargo/npm/oci/go) are PUBLIC services with their
-    // own per-write gates (cargo: `KIN_REGISTRY_CARGO_TOKEN`; npm:
+    // own per-write gates (cargo + OCI: `KIN_REGISTRY_CARGO_TOKEN`; npm:
     // `KIN_REGISTRY_NPM_AUTH_URL` introspection); their reads stay open. The
     // daemon API is a PROTECTED control surface. So `daemon_auth` is scoped to
     // ONLY the daemon routes — applied as an inner `.layer()` on the daemon
@@ -15088,6 +15087,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ok.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn oci_writes_require_registry_token_while_pulls_stay_public() {
+        let _lock = REGISTRY_ENV_LOCK.lock().await;
+
+        std::env::remove_var("KIN_REGISTRY_CARGO_TOKEN");
+        let disabled = router_with_auth(test_state(), Some("daemon-token".to_string()))
+            .oneshot(
+                Request::post("/v2/demo/blobs/uploads/")
+                    .header("authorization", "Bearer anything")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disabled.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let _env = RegistryEnvGuard("KIN_REGISTRY_CARGO_TOKEN");
+        std::env::set_var("KIN_REGISTRY_CARGO_TOKEN", "registry-secret");
+        let app = router_with_auth(test_state(), Some("daemon-token".to_string()));
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::post("/v2/demo/blobs/uploads/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let accepted = app
+            .clone()
+            .oneshot(
+                Request::post("/v2/demo/blobs/uploads/")
+                    .header("authorization", "Bearer registry-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+
+        let public = app
+            .oneshot(Request::get("/v2/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(public.status(), StatusCode::OK);
     }
 
     fn test_packages_dir(state: &Arc<DaemonState>) -> std::path::PathBuf {

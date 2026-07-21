@@ -3,17 +3,20 @@ SPDX-License-Identifier: Apache-2.0
 Copyright 2026 Firelock, LLC
 -->
 
-# Publishing to the Kin Cargo Registry
+# Publishing to the Kin Cargo and OCI Registries
 
-The Kin daemon serves a Cargo sparse registry (the `kin-registry` crate, mounted
-by `kin-daemon`). As of the registry-auth change, **publishing requires
-authentication; reads remain open.**
+The Kin daemon serves Cargo and OCI registries (the `kin-registry` crate,
+mounted by `kin-daemon`). **Publishing and other mutations require
+authentication; reads remain open.** Both adapters currently reuse the same
+registry write token so there is one fail-closed deployment contract.
 
 - Read endpoints — `config.json`, the sparse index, and `dl/{name}/{version}`
   downloads — never check a token, so `cargo` can fetch dependencies without
   credentials.
 - The write endpoint — `POST /registry/cargo/api/v1/crates/publish` — requires a
   bearer token that matches the daemon's configured secret.
+- OCI `POST`, `PUT`, and `DELETE` routes require that same bearer token; OCI
+  `GET` and `HEAD` routes remain public for pulls and discovery.
 
 ## Daemon configuration (fail-closed)
 
@@ -23,12 +26,13 @@ The daemon reads its publish secret from the environment variable:
 KIN_REGISTRY_CARGO_TOKEN=<secret>
 ```
 
-This populates `CargoRegistryState.publish_token`. The behavior is **fail-closed**:
+This populates `CargoRegistryState.publish_token` and
+`OciRegistryState.write_token`. The behavior is **fail-closed**:
 
-- If `KIN_REGISTRY_CARGO_TOKEN` is **unset or empty**, `publish_token` is `None`
-  and **every publish request is rejected**. A misconfigured deployment cannot
-  silently fall open — but it also means publishing is fully disabled until the
-  variable is set.
+- If `KIN_REGISTRY_CARGO_TOKEN` is **unset or empty**, **every Cargo publish and
+  OCI mutation is rejected**. A misconfigured deployment cannot silently fall
+  open — but it also means publishing is fully disabled until the variable is
+  set.
 - If it is set, a publish request is accepted only when its
   `Authorization: Bearer <token>` header carries the exact same value.
 
@@ -101,7 +105,7 @@ the now-fail-closed registry (surfaced as a non-2xx HTTP error).
 
 | Side | Variable | Effect when unset |
 | --- | --- | --- |
-| Daemon | `KIN_REGISTRY_CARGO_TOKEN` | Publishing disabled (fail-closed); reads still work |
+| Daemon | `KIN_REGISTRY_CARGO_TOKEN` | Cargo and OCI mutations disabled (fail-closed); reads still work |
 | `kin publish` | `KINLAB_CARGO_TOKEN`, else `KIN_REGISTRY_CARGO_TOKEN` | Warns; publish rejected by registry |
 | `publish-kinlab-crates.sh` | `KINLAB_CARGO_TOKEN` (or `KINLAB_TOKEN`) | No header; publish rejected by registry |
 
