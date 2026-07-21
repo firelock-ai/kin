@@ -147,12 +147,13 @@
     },
     {
       "name": "kin-bench",
-      "layer": "support",
+      "layer": "proprietary",
       "role": "proof-and-evidence",
       "dependsOn": [
         "kin",
         "kin-db"
-      ]
+      ],
+      "note": "Private benchmarking and proof-packaging harness. Kept private/trade-secret per IP strategy — not one of the open supporting repos."
     },
     {
       "name": "kin-lsp",
