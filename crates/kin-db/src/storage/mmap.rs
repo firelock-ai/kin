@@ -211,6 +211,30 @@ fn normalized_parent(path: &Path) -> Option<&Path> {
 }
 
 pub(crate) fn sync_parent_dir(path: &Path) -> Result<(), KinDbError> {
+    let Some(parent) = normalized_parent(path) else {
+        return Ok(());
+    };
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        let dir = File::open(parent).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to open parent directory {} for fsync: {error}",
+                parent.display()
+            ))
+        })?;
+        sync_directory_handle(&dir, parent)
+    }
+}
+
+/// Fsync an already-pinned directory handle. Capability-style storage paths
+/// use this instead of reopening a path after validation, which would
+/// reintroduce an ancestor-swap race.
+pub(crate) fn sync_directory_handle(dir: &File, display_path: &Path) -> Result<(), KinDbError> {
     #[cfg(test)]
     let inject_failure = PARENT_SYNC_FAILURE_COUNTDOWN.with(|countdown| match countdown.get() {
         Some(0) => {
@@ -228,29 +252,20 @@ pub(crate) fn sync_parent_dir(path: &Path) -> Result<(), KinDbError> {
     if inject_failure {
         return Err(KinDbError::StorageError(format!(
             "injected parent-directory fsync failure for {}",
-            path.display()
+            display_path.display()
         )));
     }
-    let Some(parent) = normalized_parent(path) else {
-        return Ok(());
-    };
     #[cfg(not(unix))]
     {
-        let _ = parent;
+        let _ = (dir, display_path);
         Ok(())
     }
     #[cfg(unix)]
     {
-        let dir = File::open(parent).map_err(|error| {
-            KinDbError::StorageError(format!(
-                "failed to open parent directory {} for fsync: {error}",
-                parent.display()
-            ))
-        })?;
         dir.sync_all().map_err(|error| {
             KinDbError::StorageError(format!(
                 "failed to fsync parent directory {}: {error}",
-                parent.display()
+                display_path.display()
             ))
         })
     }

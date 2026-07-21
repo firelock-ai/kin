@@ -398,6 +398,24 @@ impl StorageBackend for GcsBackend {
     ) -> Result<Option<Vec<u8>>, KinDbError> {
         validate_source_blob_repo_id(repo_id)?;
         let path = self.source_blob_path(repo_id, digest)?;
+        let metadata = match self.block_on(self.store.head(&path)) {
+            Ok(metadata) => metadata,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => {
+                return Err(KinDbError::StorageError(format!(
+                    "GCS source blob metadata load failed for {path}: {error}"
+                )))
+            }
+        };
+        validate_source_blob_size(metadata.size, path.as_ref())?;
+        // Object stores commonly reject a bounded 0..N range request for an
+        // existing zero-byte object. Its HEAD metadata is authoritative enough
+        // to avoid that invalid range; the digest still verifies the identity.
+        if metadata.size == 0 {
+            let data = Vec::new();
+            verify_source_blob_digest(digest, &data, path.as_ref())?;
+            return Ok(Some(data));
+        }
         let get_result = match self.block_on(self.store.get_opts(
             &path,
             GetOptions {
@@ -923,6 +941,23 @@ mod tests {
             .load_source_blob("repo-b", digest)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn gcs_source_blob_roundtrips_zero_length_object() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        let data = b"";
+        let digest = source_digest(data);
+
+        backend.save_source_blob("repo-a", digest, data).unwrap();
+        assert_eq!(
+            backend.load_source_blob("repo-a", digest).unwrap(),
+            Some(Vec::new())
+        );
+        backend
+            .save_source_blob("repo-a", digest, data)
+            .expect("zero-byte immutable retry remains idempotent");
     }
 
     #[test]
