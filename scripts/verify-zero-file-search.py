@@ -39,12 +39,14 @@ def load_allowlist():
     dormant waiting to auto-exempt a file that gets recreated under the same
     path.
 
-    `allow_match` is optional. When present it lists exact substrings that are
-    exempt within that file, mirroring `allow_for` in
-    scripts/zero_file_search_guard.sh: the exemption is pinned to the known
-    lines, so a new or different filesystem primitive in the same file still
-    trips the guard. When absent the whole file is exempt, which is only
-    appropriate for files that are an IO boundary end to end.
+    `allow_match` is optional. When present it lists exact source expressions
+    that are exempt within that file, mirroring `allow_for` in
+    scripts/zero_file_search_guard.sh. Every expression must occur exactly
+    once: the scanner masks only those bytes and still checks the rest of the
+    line, so neither a same-shaped use elsewhere nor a second primitive beside
+    the allowed one can inherit the exemption. When absent the whole file is
+    exempt, which is only appropriate for files that are an IO boundary end to
+    end.
     """
     try:
         with open(ALLOWLIST_PATH, "r", encoding="utf-8") as f:
@@ -67,7 +69,8 @@ def load_allowlist():
             )
             continue
 
-        if not os.path.exists(os.path.join(KIN_ROOT, item["file"])):
+        source_path = os.path.join(KIN_ROOT, item["file"])
+        if not os.path.exists(source_path):
             errors.append(
                 f"  entry {item['file']} names a path that does not exist "
                 f"(owner: {item['owner']}) — remove the stale exemption; leaving "
@@ -75,17 +78,43 @@ def load_allowlist():
             )
             continue
 
+        if item["file"] in files:
+            errors.append(
+                f"  entry {item['file']} is duplicated — one file must have "
+                "exactly one allowlist policy"
+            )
+            continue
+
         matches = item.get("allow_match")
         if matches is not None and (
             not isinstance(matches, list)
             or not matches
-            or not all(isinstance(m, str) and m for m in matches)
+            or not all(isinstance(m, str) and m and "\n" not in m for m in matches)
         ):
             errors.append(
                 f"  entry {item['file']} has an invalid allow_match "
-                f"(want a non-empty list of non-empty strings)"
+                f"(want a non-empty list of non-empty single-line strings)"
             )
             continue
+        if matches and len(set(matches)) != len(matches):
+            errors.append(
+                f"  entry {item['file']} repeats an allow_match expression"
+            )
+            continue
+        if matches:
+            try:
+                with open(source_path, "r", encoding="utf-8") as source_file:
+                    source = source_file.read()
+            except OSError as error:
+                errors.append(f"  entry {item['file']} could not be read: {error}")
+                continue
+            for match in matches:
+                occurrences = source.count(match)
+                if occurrences != 1:
+                    errors.append(
+                        f"  entry {item['file']} allow_match {match!r} occurs "
+                        f"{occurrences} times (want exactly 1)"
+                    )
         files[item["file"]] = set(matches) if matches else None
 
         try:
@@ -231,23 +260,33 @@ def is_test_file(rel_path):
 # set shared with scripts/zero_file_search_guard.sh. Answering a semantic query
 # by probing the working tree is the violation the rule exists to stop, and it
 # does not require the `std::fs::` prefix to happen: `path.exists()`,
-# `File::open`, a bare `read_dir(`, or a `WalkDir` traversal all read the tree
-# just as directly. Writes and directory creation stay out of the deny set —
+# `path.try_exists()`, `File::open`, a bare `read_dir(`, or a `WalkDir`
+# traversal all read the tree just as directly. Spawning a subprocess is also
+# denied in answer modules: otherwise `rg`, `grep`, `find`, or a multiline
+# `git grep` builder can replace the semantic authority behind the guard's
+# back. Writes and directory creation stay out of the deny set —
 # materialization is a projection boundary, not answer-by-search.
 PATTERNS = [
     (re.compile(r'\.is_file\(\)'), "filesystem existence probe (is_file)"),
     (re.compile(r'\.is_dir\(\)'), "filesystem existence probe (is_dir)"),
     (re.compile(r'\.exists\(\)'), "filesystem existence probe (exists)"),
+    (re.compile(r'\.try_exists\(\)'), "filesystem existence probe (try_exists)"),
+    (re.compile(r'\.is_symlink\(\)'), "filesystem existence probe (is_symlink)"),
     (re.compile(r'\.canonicalize\(\)'), "filesystem path resolution (canonicalize)"),
+    (re.compile(r'\.metadata\(\)'), "filesystem metadata probe"),
     (re.compile(r'\bsymlink_metadata\b'), "filesystem metadata probe"),
     (re.compile(r'\bread_link\b'), "filesystem symlink read"),
     (re.compile(r'\bFile::open\b'), "raw file handle open"),
     (re.compile(r'\bread_dir\('), "directory traversal (read_dir)"),
     (re.compile(r'\bWalkDir\b|\bwalkdir::'), "directory traversal (walkdir)"),
     (re.compile(r'\bglob::glob\b'), "filesystem glob"),
+    # `process::` catches direct paths and grouped/multiline use trees such as
+    # `use std::{process::{Command as SearchProcess}}`; `process as` catches a
+    # namespace alias before it can hide a later `Alias::Command::new` call.
+    # Bare Command::new covers an imported, unaliased constructor.
+    (re.compile(r'\bCommand::new\s*\(|\bprocess\s*(?:::|\bas\b)'), "subprocess execution in answer authority"),
     (re.compile(r'\bstd::fs::[a-zA-Z0-9_]+'), "std::fs API usage"),
     (re.compile(r'(?<![_a-z])fs::(read|read_to_string|read_dir|metadata|write|copy|create_dir|create_dir_all|remove_file|remove_dir|remove_dir_all)\b'), "fs API usage"),
-    (re.compile(r'Command::new\("git"\).*?"grep"'), "git grep subprocess usage")
 ]
 
 
@@ -458,16 +497,26 @@ def scan_file(filepath, rel_path, query_fn_names=None, allowed_matches=None):
         ):
             continue
 
-        # Lines pinned by an `allow_match` exemption are a justified IO
-        # boundary. Anything else in the same file still trips the guard.
-        if allowed_matches and any(m in line for m in allowed_matches):
-            continue
+        # Mask only the exact, uniquely validated boundary expression. The
+        # remainder of the line stays authoritative: a second filesystem read
+        # beside an allowed one must still fail rather than inheriting a
+        # whole-line exemption.
+        scan_line = line
+        if allowed_matches:
+            for match in allowed_matches:
+                offset = scan_line.find(match)
+                if offset >= 0:
+                    scan_line = (
+                        scan_line[:offset]
+                        + (" " * len(match))
+                        + scan_line[offset + len(match) :]
+                    )
 
         # Scan for patterns. A line can match several primitives at once
         # (`std::fs::read_dir` is both an fs call and a traversal); report the
         # line once with every primitive it tripped, so the violation count
         # tracks offending lines rather than pattern hits.
-        descs = [desc for pattern, desc in PATTERNS if pattern.search(line)]
+        descs = [desc for pattern, desc in PATTERNS if pattern.search(scan_line)]
         if descs:
             violations.append((idx, line.strip(), ", ".join(dict.fromkeys(descs))))
 

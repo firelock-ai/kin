@@ -26,6 +26,76 @@ import subprocess
 import sys
 
 POISON = "fn __falsification_probe(p: &str) -> String { std::fs::read_to_string(p).unwrap() }"
+METADATA_POISON = (
+    "fn __metadata_falsification_probe(p: &std::path::Path) -> bool { "
+    "p.metadata().is_ok() }"
+)
+DENY_SET_PROBES = [
+    (
+        "Path::try_exists",
+        "fn __try_exists_falsification_probe(p: &std::path::Path) -> bool { "
+        "p.try_exists().unwrap_or(false) }",
+    ),
+    (
+        "Path::is_symlink",
+        "fn __is_symlink_falsification_probe(p: &std::path::Path) -> bool { "
+        "p.is_symlink() }",
+    ),
+    (
+        "raw-search subprocess",
+        "fn __command_falsification_probe() -> bool { "
+        "std::process::Command::new(\"rg\").arg(\"needle\").output().is_ok() }",
+    ),
+    (
+        "aliased raw-search subprocess",
+        "fn __aliased_command_falsification_probe() -> bool {\n"
+        "    use std::process::Command as SearchProcess;\n"
+        "    SearchProcess::new(\"find\").arg(\".\").output().is_ok()\n"
+        "}",
+    ),
+    (
+        "grouped std command alias",
+        "fn __grouped_std_command_falsification_probe() -> bool {\n"
+        "    use std::process::{Command as SearchProcess};\n"
+        "    SearchProcess::new(\"rg\").arg(\"needle\").output().is_ok()\n"
+        "}",
+    ),
+    (
+        "multiline std use-tree alias",
+        "fn __multiline_std_command_falsification_probe() -> bool {\n"
+        "    use std::{\n"
+        "        process::{Command as SearchProcess},\n"
+        "    };\n"
+        "    SearchProcess::new(\"grep\").arg(\"needle\").output().is_ok()\n"
+        "}",
+    ),
+    (
+        "grouped tokio command alias",
+        "async fn __grouped_tokio_command_falsification_probe() -> bool {\n"
+        "    use tokio::process::{Command as SearchProcess};\n"
+        "    SearchProcess::new(\"find\").arg(\".\").output().await.is_ok()\n"
+        "}",
+    ),
+    (
+        "multiline tokio use-tree alias",
+        "async fn __multiline_tokio_command_falsification_probe() -> bool {\n"
+        "    use tokio::{\n"
+        "        process::{Command as SearchProcess},\n"
+        "    };\n"
+        "    SearchProcess::new(\"git\").arg(\"grep\").output().await.is_ok()\n"
+        "}",
+    ),
+    (
+        "multiline git-grep subprocess",
+        "fn __multiline_command_falsification_probe() -> bool {\n"
+        "    std::process::Command::new(\"git\")\n"
+        "        .arg(\"grep\")\n"
+        "        .arg(\"needle\")\n"
+        "        .output()\n"
+        "        .is_ok()\n"
+        "}",
+    ),
+]
 CMD_DIR = "crates/kin-cli/src/commands"
 
 
@@ -54,6 +124,18 @@ def whole_file_exempt(root):
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     return {e["file"] for e in data.get("allowlist", []) if not e.get("allow_match")}
+
+
+def pinned_allowlist(root):
+    """Return every expression-pinned exemption keyed by source file."""
+    path = os.path.join(root, "scripts", "zero-file-search-allowlist.json")
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return {
+        entry["file"]: entry["allow_match"]
+        for entry in data.get("allowlist", [])
+        if entry.get("allow_match")
+    }
 
 
 def production_end(lines):
@@ -187,6 +269,212 @@ def main():
             with open(path, "w", encoding="utf-8") as f:
                 f.write(original)
         print(f"  {os.path.basename(rel):24} {'  '.join(marks)}")
+
+    # An expression pin must exempt only its own bytes, not the entire source
+    # line. Poison every pinned line while retaining the allowed expression on
+    # that same line. The historical `if allow_match in line: continue` bug
+    # passed this mutation because the poison inherited the neighboring
+    # exemption; the hardened guard must name every affected file.
+    pinned = pinned_allowlist(root)
+    originals = {}
+    setup_failed = False
+    try:
+        for rel, matches in pinned.items():
+            path = os.path.join(root, rel)
+            with open(path, "r", encoding="utf-8") as f:
+                original = f.read()
+            originals[path] = original
+            lines = original.split("\n")
+            poisoned_lines = set()
+            for match in matches:
+                locations = [idx for idx, line in enumerate(lines) if match in line]
+                if len(locations) != 1:
+                    failures.append(
+                        f"{rel}: pinned expression {match!r} occurs "
+                        f"{len(locations)} times (want exactly 1)"
+                    )
+                    setup_failed = True
+                    continue
+                poisoned_lines.add(locations[0])
+            for idx in poisoned_lines:
+                lines[idx] = f"{POISON} {lines[idx]}"
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+
+        if not setup_failed:
+            code, out = run([sys.executable, py_guard, root])
+            if code == 0:
+                failures.append(
+                    "Python guard PASSED when poison shared every pinned allowlist line"
+                )
+            else:
+                for rel in pinned:
+                    if os.path.basename(rel) not in out:
+                        failures.append(
+                            f"{rel}: Python same-line falsification failed but "
+                            "the guard never named the file"
+                        )
+            print(
+                "  pinned same-line poison   "
+                + ("py:ok" if code != 0 else "py:BLIND")
+            )
+    finally:
+        for path, original in originals.items():
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(original)
+
+    # The shell guard has its own pinned allowlist. Its locate expression is
+    # also present in the shared JSON policy, so use that one representative
+    # line to prove the dependency-free guard masks rather than drops it.
+    shell_same_line_rel = f"{CMD_DIR}/locate.rs"
+    shell_matches = pinned.get(shell_same_line_rel, [])
+    shell_path = os.path.join(root, shell_same_line_rel)
+    if len(shell_matches) != 1:
+        failures.append(
+            f"{shell_same_line_rel}: expected exactly one shared shell pin"
+        )
+    else:
+        with open(shell_path, "r", encoding="utf-8") as f:
+            original = f.read()
+        lines = original.split("\n")
+        locations = [
+            idx for idx, line in enumerate(lines) if shell_matches[0] in line
+        ]
+        try:
+            if len(locations) != 1:
+                failures.append(
+                    f"{shell_same_line_rel}: shell pin occurs {len(locations)} "
+                    "times (want exactly 1)"
+                )
+            else:
+                idx = locations[0]
+                lines[idx] = f"{POISON} {lines[idx]}"
+                with open(shell_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines))
+                code, out = run(["bash", sh_guard, root])
+                if code == 0:
+                    failures.append(
+                        "shell guard PASSED when poison shared its pinned locate line"
+                    )
+                elif os.path.basename(shell_same_line_rel) not in out:
+                    failures.append(
+                        f"{shell_same_line_rel}: shell same-line falsification "
+                        "failed but never named the file"
+                    )
+                print(
+                    "  shell same-line poison    "
+                    + ("sh:ok" if code != 0 else "sh:BLIND")
+                )
+        finally:
+            with open(shell_path, "w", encoding="utf-8") as f:
+                f.write(original)
+
+    # The broad probe above proves coverage across every claimed module, but
+    # one representative read primitive cannot prove the deny sets themselves
+    # stay complete. In particular, Path::metadata is a bare method call: it
+    # has no `std::fs::` prefix, so a guard that only watches module-qualified
+    # metadata calls misses it. Exercise that spelling explicitly in a module
+    # covered by both guards, once in the middle of production code and once at
+    # EOF so test-module span handling cannot hide either location.
+    metadata_rel = f"{CMD_DIR}/search.rs"
+    metadata_scope = next(
+        (entry for entry in enforced if entry[0] == metadata_rel), None
+    )
+    if metadata_scope is None or not all(metadata_scope[1:]):
+        failures.append(
+            f"{metadata_rel}: bare metadata regression needs coverage from both guards"
+        )
+    else:
+        path = os.path.join(root, metadata_rel)
+        with open(path, "r", encoding="utf-8") as f:
+            original = f.read()
+        lines = original.split("\n")
+        marks = []
+        try:
+            for label, idx in probe_sites(lines):
+                if label not in ("half", "eof"):
+                    continue
+                poisoned = lines[:idx] + [METADATA_POISON] + lines[idx:]
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(poisoned))
+                cell = []
+                for tag, cmd in (
+                    ("py", [sys.executable, py_guard, root]),
+                    ("sh", ["bash", sh_guard, root]),
+                ):
+                    code, out = run(cmd)
+                    if code == 0:
+                        failures.append(
+                            f"{metadata_rel} @ {label}: {tag} guard PASSED "
+                            "on bare Path::metadata"
+                        )
+                        cell.append("BLIND")
+                    elif os.path.basename(metadata_rel) not in out:
+                        failures.append(
+                            f"{metadata_rel} @ {label}: {tag} guard failed but "
+                            "never named the file"
+                        )
+                        cell.append("UNNAMED")
+                    else:
+                        cell.append("ok")
+                marks.append(f"{label}=py:{cell[0]}/sh:{cell[1]}")
+        finally:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(original)
+        print(
+            f"  bare Path::metadata      {'  '.join(marks)}"
+        )
+
+    # Deny-set breadth is itself a release boundary. Exercise the standard
+    # fallible existence and symlink probes plus direct and multiline raw-search
+    # subprocess builders. Banning Command::new in answer modules makes the
+    # multiline case independent of how executable/argument strings are laid
+    # out, and prevents a dynamically selected executable from bypassing a
+    # literal-name scanner.
+    deny_rel = f"{CMD_DIR}/search.rs"
+    deny_scope = next((entry for entry in enforced if entry[0] == deny_rel), None)
+    if deny_scope is None or not all(deny_scope[1:]):
+        failures.append(
+            f"{deny_rel}: deny-set falsification needs coverage from both guards"
+        )
+    else:
+        path = os.path.join(root, deny_rel)
+        with open(path, "r", encoding="utf-8") as f:
+            original = f.read()
+        base_lines = original.split("\n")
+        try:
+            for probe_name, probe in DENY_SET_PROBES:
+                marks = []
+                for label, idx in probe_sites(base_lines):
+                    if label not in ("half", "eof"):
+                        continue
+                    poisoned = base_lines[:idx] + probe.split("\n") + base_lines[idx:]
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(poisoned))
+                    cell = []
+                    for tag, cmd in (
+                        ("py", [sys.executable, py_guard, root]),
+                        ("sh", ["bash", sh_guard, root]),
+                    ):
+                        code, out = run(cmd)
+                        if code == 0:
+                            failures.append(
+                                f"{deny_rel} @ {label}: {tag} guard PASSED on {probe_name}"
+                            )
+                            cell.append("BLIND")
+                        elif os.path.basename(deny_rel) not in out:
+                            failures.append(
+                                f"{deny_rel} @ {label}: {tag} guard failed on "
+                                f"{probe_name} but never named the file"
+                            )
+                            cell.append("UNNAMED")
+                        else:
+                            cell.append("ok")
+                    marks.append(f"{label}=py:{cell[0]}/sh:{cell[1]}")
+                print(f"  {probe_name:<27} {'  '.join(marks)}")
+        finally:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(original)
 
     if failures:
         print()
