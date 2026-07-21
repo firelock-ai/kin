@@ -56,8 +56,9 @@ pub use federation::{
     RemoteRelationOrigin, ScopeRef, SessionLease,
 };
 pub use graph::{
-    ChangeStore, EntityFilter, EntityStore, GraphStore, ProvenanceStore, ReviewStore, SessionStore,
-    SubGraph, VerificationStore, WorkStore,
+    ChangeStore, EntityFilter, EntityStore, GraphStore, ProvenanceStore, ResolvedSourceEntry,
+    ReviewStore, SessionStore, SourceTreeGap, SourceTreeGapReason, SourceTreeResolution, SubGraph,
+    VerificationStore, WorkStore,
 };
 pub use ids::{
     ArtifactRevisionId, AuthorId, BranchId, BranchName, ConflictId, ContractId, EntityId,

@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use crate::branch::Branch;
-use crate::change::{SemanticChange, TransactionDelta};
+use crate::change::{ArtifactDeltaKind, SemanticChange, SourceEntryKind, TransactionDelta};
 use crate::entity::{Entity, EntityKind, EntityRole};
 use crate::ids::*;
 use crate::relation::{GraphNodeId, Relation, RelationKind};
@@ -368,6 +368,16 @@ pub trait ChangeStore: Send + Sync {
     ) -> std::result::Result<HashMap<FilePathId, Hash256>, Self::Error> {
         let (changes, _order) = collect_changes_topologically(self, head)?;
         Ok(replay_file_tree(changes))
+    }
+    /// Resolve exact source entries at `head`, preserving Git-relevant entry
+    /// kinds. Historical deltas that predate mode capture return an explicit
+    /// incomplete resolution and must not be normalized by authority callers.
+    fn resolve_source_tree_at(
+        &self,
+        head: &SemanticChangeId,
+    ) -> std::result::Result<SourceTreeResolution, Self::Error> {
+        let (changes, _order) = collect_changes_topologically(self, head)?;
+        Ok(replay_source_tree(changes))
     }
     /// Build a topological ordinal map for all changes reachable from `head`.
     ///
@@ -757,6 +767,42 @@ pub struct ResolvedGraphState {
     pub relation_tombstones: HashMap<RelationId, (Relation, SemanticChangeId)>,
 }
 
+/// Content identity and exact Git-relevant kind for one resolved source entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedSourceEntry {
+    pub hash: Hash256,
+    pub kind: SourceEntryKind,
+}
+
+/// Why an exact source tree could not be certified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceTreeGapReason {
+    LegacyModeUnknown,
+    MissingContentHash,
+}
+
+/// First deterministic gap encountered while replaying exact source history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceTreeGap {
+    pub file_id: FilePathId,
+    pub change_id: SemanticChangeId,
+    pub delta_kind: ArtifactDeltaKind,
+    pub reason: SourceTreeGapReason,
+}
+
+/// Fail-closed result of exact source-tree replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SourceTreeResolution {
+    Exact {
+        entries: HashMap<FilePathId, ResolvedSourceEntry>,
+    },
+    Incomplete {
+        gap: SourceTreeGap,
+    },
+}
+
 /// Filter for querying entities.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EntityFilter {
@@ -1025,6 +1071,45 @@ where
     }
 
     file_tree
+}
+
+fn replay_source_tree<I>(changes: I) -> SourceTreeResolution
+where
+    I: IntoIterator<Item = SemanticChange>,
+{
+    let mut entries = HashMap::new();
+
+    for change in changes {
+        for delta in change.artifact_deltas {
+            if delta.kind.is_removed() {
+                entries.remove(&delta.file_id);
+                continue;
+            }
+            let Some(kind) = delta.kind.source_entry_kind() else {
+                return SourceTreeResolution::Incomplete {
+                    gap: SourceTreeGap {
+                        file_id: delta.file_id,
+                        change_id: change.id,
+                        delta_kind: delta.kind,
+                        reason: SourceTreeGapReason::LegacyModeUnknown,
+                    },
+                };
+            };
+            let Some(hash) = delta.new_hash else {
+                return SourceTreeResolution::Incomplete {
+                    gap: SourceTreeGap {
+                        file_id: delta.file_id,
+                        change_id: change.id,
+                        delta_kind: delta.kind,
+                        reason: SourceTreeGapReason::MissingContentHash,
+                    },
+                };
+            };
+            entries.insert(delta.file_id, ResolvedSourceEntry { hash, kind });
+        }
+    }
+
+    SourceTreeResolution::Exact { entries }
 }
 
 fn entity_is_touched_by_change(change: &SemanticChange, entity_id: &EntityId) -> bool {
@@ -1778,7 +1863,7 @@ impl<G: GraphStore> GraphStore for &G {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::change::{EntityDelta, RelationDelta, SemanticChange};
+    use crate::change::{ArtifactDelta, EntityDelta, RelationDelta, SemanticChange};
     use crate::entity::{
         Entity, EntityKind, EntityMetadata, FingerprintAlgorithm, SemanticFingerprint, Visibility,
     };
@@ -1851,6 +1936,107 @@ mod tests {
             risk_summary: None,
             authored_on: None,
         }
+    }
+
+    #[test]
+    fn exact_source_tree_preserves_regular_executable_and_symlink_across_changes() {
+        let c1 = make_change_id(1);
+        let c2 = make_change_id(2);
+        let regular = FilePathId::new("README.md");
+        let executable = FilePathId::new("bin/run");
+        let symlink = FilePathId::new("current");
+        let mut first = make_semantic_change(c1, vec![], vec![], vec![]);
+        first.artifact_deltas = vec![
+            ArtifactDelta {
+                file_id: regular.clone(),
+                kind: ArtifactDeltaKind::AddedRegularFile,
+                old_hash: None,
+                new_hash: Some(Hash256::from_bytes([1; 32])),
+            },
+            ArtifactDelta {
+                file_id: executable.clone(),
+                kind: ArtifactDeltaKind::AddedExecutableFile,
+                old_hash: None,
+                new_hash: Some(Hash256::from_bytes([2; 32])),
+            },
+            ArtifactDelta {
+                file_id: symlink.clone(),
+                kind: ArtifactDeltaKind::AddedSymlink,
+                old_hash: None,
+                new_hash: Some(Hash256::from_bytes([3; 32])),
+            },
+        ];
+        let mut second = make_semantic_change(c2, vec![c1], vec![], vec![]);
+        second.artifact_deltas = vec![
+            ArtifactDelta {
+                file_id: regular.clone(),
+                kind: ArtifactDeltaKind::ModifiedRegularFile,
+                old_hash: Some(Hash256::from_bytes([1; 32])),
+                new_hash: Some(Hash256::from_bytes([4; 32])),
+            },
+            ArtifactDelta {
+                file_id: executable.clone(),
+                kind: ArtifactDeltaKind::ModifiedExecutableFile,
+                old_hash: Some(Hash256::from_bytes([2; 32])),
+                new_hash: Some(Hash256::from_bytes([5; 32])),
+            },
+            ArtifactDelta {
+                file_id: symlink.clone(),
+                kind: ArtifactDeltaKind::ModifiedSymlink,
+                old_hash: Some(Hash256::from_bytes([3; 32])),
+                new_hash: Some(Hash256::from_bytes([6; 32])),
+            },
+        ];
+
+        let SourceTreeResolution::Exact { entries } = replay_source_tree([first, second]) else {
+            panic!("known source modes must resolve exactly");
+        };
+        assert_eq!(
+            entries.get(&regular),
+            Some(&ResolvedSourceEntry {
+                hash: Hash256::from_bytes([4; 32]),
+                kind: SourceEntryKind::File { executable: false },
+            })
+        );
+        assert_eq!(
+            entries.get(&executable),
+            Some(&ResolvedSourceEntry {
+                hash: Hash256::from_bytes([5; 32]),
+                kind: SourceEntryKind::File { executable: true },
+            })
+        );
+        assert_eq!(
+            entries.get(&symlink),
+            Some(&ResolvedSourceEntry {
+                hash: Hash256::from_bytes([6; 32]),
+                kind: SourceEntryKind::Symlink,
+            })
+        );
+    }
+
+    #[test]
+    fn exact_source_tree_fails_closed_on_legacy_unknown_mode() {
+        let change_id = make_change_id(7);
+        let file_id = FilePathId::new("legacy.sh");
+        let mut change = make_semantic_change(change_id, vec![], vec![], vec![]);
+        change.artifact_deltas = vec![ArtifactDelta {
+            file_id: file_id.clone(),
+            kind: ArtifactDeltaKind::Added,
+            old_hash: None,
+            new_hash: Some(Hash256::from_bytes([7; 32])),
+        }];
+
+        assert_eq!(
+            replay_source_tree([change]),
+            SourceTreeResolution::Incomplete {
+                gap: SourceTreeGap {
+                    file_id,
+                    change_id,
+                    delta_kind: ArtifactDeltaKind::Added,
+                    reason: SourceTreeGapReason::LegacyModeUnknown,
+                },
+            }
+        );
     }
 
     #[test]
