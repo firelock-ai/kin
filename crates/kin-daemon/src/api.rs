@@ -1624,14 +1624,17 @@ async fn set_scope(
     let scope_task = tokio::task::spawn_blocking(
         move || -> std::result::Result<_, (StatusCode, String)> {
             let _hydration_gate = hydration_gate;
-            // Resolve the ref to a SemanticChangeId using the LOCATE resolve mode
-            // (enrich_semantics=false). Scope-for-retrieval only needs the
-            // base_commit's tree state; the full per-commit semantic-delta enrichment
-            // of its entire ancestry ("Hydrating History: [n/26747]") re-parses and
-            // re-links every ancestor commit — ~10 min on a deep base_commit — and the
-            // session-scope locate path never reads those deltas (it ranks the scoped
-            // entity set with HEAD vectors via `vector_source`). The /locate ref path
-            // already uses this lighter mode.
+            // Resolve the ref through the locate entry point, which hydrates a
+            // not-yet-imported Git ancestry at artifact-only depth. Scope-for-
+            // retrieval only needs the base_commit's tree state: build_graph_at_ref
+            // below takes the file tree from the imported artifact deltas (or from
+            // the Git tree) and rebuilds the scoped entity set by re-parsing it.
+            // The per-commit semantic replay that depth skips ("Hydrating History:
+            // [n/26747]") re-parses and re-links every ancestor commit — ~10 min on
+            // a deep base_commit — and nothing on this path reads the deltas it
+            // produces; the scoped entity set is ranked with HEAD vectors via
+            // `vector_source`. Callers that do read those deltas — history, blame,
+            // review — resolve through the semantic entry points instead.
             let resolved =
             kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate_with_report(
                 state_clone.graph.as_ref(),
