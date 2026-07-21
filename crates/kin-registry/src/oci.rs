@@ -23,8 +23,11 @@ use axum::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+const SHA256_HEX_LEN: usize = 64;
 
 /// Shared state for the OCI registry routes
 pub struct OciRegistryState {
@@ -59,7 +62,9 @@ async fn check_blob(
     State(state): State<Arc<OciRegistryState>>,
     Path((_name, digest)): Path<(String, String)>,
 ) -> Response {
-    let blob_path = state.blobs_dir.join(digest.replace(':', "_"));
+    let Some(blob_path) = blob_path_for_digest(&state.blobs_dir, &digest) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
     if blob_path.exists() {
         let size = std::fs::metadata(&blob_path).map(|m| m.len()).unwrap_or(0);
         (
@@ -80,7 +85,9 @@ async fn get_blob(
     State(state): State<Arc<OciRegistryState>>,
     Path((_name, digest)): Path<(String, String)>,
 ) -> Response {
-    let blob_path = state.blobs_dir.join(digest.replace(':', "_"));
+    let Some(blob_path) = blob_path_for_digest(&state.blobs_dir, &digest) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
     match std::fs::read(&blob_path) {
         Ok(bytes) => (
             StatusCode::OK,
@@ -139,7 +146,8 @@ async fn complete_upload(
     data.extend_from_slice(&body);
 
     let digest = format!("sha256:{}", sha2_hex(&data));
-    let blob_path = state.blobs_dir.join(digest.replace(':', "_"));
+    let blob_path = blob_path_for_digest(&state.blobs_dir, &digest)
+        .expect("internally generated sha256 digest must be valid");
 
     if let Err(e) = std::fs::write(&blob_path, &data) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
@@ -203,4 +211,132 @@ async fn delete_manifest(
 fn sha2_hex(data: &[u8]) -> String {
     let hash = Sha256::digest(data);
     hex::encode(hash)
+}
+
+/// Map a canonical SHA-256 digest to its on-disk blob filename.
+///
+/// The caller-controlled digest is never joined directly. Only a fixed prefix
+/// plus 64 lowercase hexadecimal bytes can reach the filesystem, so path
+/// separators, dot components, alternate algorithms, and encoded traversal
+/// payloads are rejected before any filesystem operation.
+fn blob_path_for_digest(blobs_dir: &FsPath, digest: &str) -> Option<PathBuf> {
+    let encoded = digest.strip_prefix("sha256:")?;
+    if encoded.len() != SHA256_HEX_LEN
+        || !encoded
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+
+    Some(blobs_dir.join(format!("sha256_{encoded}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn registry_state() -> (tempfile::TempDir, Arc<OciRegistryState>) {
+        let root = tempfile::tempdir().unwrap();
+        let blobs_dir = root.path().join("oci");
+        std::fs::create_dir_all(&blobs_dir).unwrap();
+        let state = Arc::new(OciRegistryState {
+            blobs_dir,
+            manifests: Default::default(),
+            uploads: Default::default(),
+        });
+        (root, state)
+    }
+
+    #[test]
+    fn blob_path_accepts_only_canonical_sha256_digests() {
+        let root = std::path::Path::new("/registry/blobs");
+        let digest = format!("sha256:{}", "a".repeat(SHA256_HEX_LEN));
+        assert_eq!(
+            blob_path_for_digest(root, &digest),
+            Some(root.join(format!("sha256_{}", "a".repeat(SHA256_HEX_LEN))))
+        );
+
+        for invalid in [
+            "sha256:../outside",
+            "sha256:%2e%2e%2foutside",
+            "sha256:ABCDEF",
+            "sha512:abcdef",
+            "sha256:",
+        ] {
+            assert_eq!(blob_path_for_digest(root, invalid), None, "{invalid}");
+        }
+        assert_eq!(
+            blob_path_for_digest(root, &format!("sha256:{}", "a".repeat(63))),
+            None
+        );
+        assert_eq!(
+            blob_path_for_digest(root, &format!("sha256:{}", "a".repeat(65))),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn public_blob_reads_accept_valid_digests_without_authorization() {
+        let (_root, state) = registry_state();
+        let bytes = b"public oci blob";
+        let digest = format!("sha256:{}", sha2_hex(bytes));
+        let blob_path = blob_path_for_digest(&state.blobs_dir, &digest).unwrap();
+        std::fs::write(blob_path, bytes).unwrap();
+
+        let response = oci_routes(state)
+            .oneshot(
+                Request::get(format!("/v2/demo/blobs/{digest}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["docker-content-digest"], digest.as_str());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], bytes);
+    }
+
+    #[tokio::test]
+    async fn blob_routes_reject_noncanonical_digest_paths() {
+        let (_root, state) = registry_state();
+        let outside = state.blobs_dir.parent().unwrap().join("outside");
+        std::fs::write(&outside, b"must not be served").unwrap();
+
+        for method in ["GET", "HEAD"] {
+            let noncanonical = format!("/v2/demo/blobs/sha256:{}", "A".repeat(SHA256_HEX_LEN));
+            let response = oci_routes(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(noncanonical)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+            let response = oci_routes(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/v2/demo/blobs/sha256:..%2Foutside")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_ne!(response.status(), StatusCode::OK);
+        }
+        assert_eq!(std::fs::read(outside).unwrap(), b"must not be served");
+    }
 }
