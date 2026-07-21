@@ -117,36 +117,35 @@ async fn drain_pending_flush(pending: &mut Option<tokio::task::JoinHandle<Result
     }
 }
 
-/// Shutdown-latency bound — how long the daemon may take to actually disappear.
-///
-/// Callers that budget for daemon cleanup (the merge-trust harness attests
-/// against a 45s window) depend on this being bounded rather than generous, so
-/// the terms are stated explicitly:
-///
-/// SIGTERM/SIGINT → process gone:
-/// 1. the signal is observed by the async handler — prompt even mid-hydration,
-///    because hydration runs on the blocking pool and leaves the async workers
-///    schedulable;
-/// 2. `drain_handles` joins the daemon's tasks, bounded at 10s. An in-flight
-///    hydration is a blocking task rather than a drained handle, but the API
-///    server's graceful shutdown waits on in-flight requests, so a hydrating
-///    daemon rides this full 10s;
-/// 3. the final storage flush and endpoint-file removal run (fast on the local
-///    backend);
-/// 4. `runtime.shutdown_timeout(runtime_shutdown_grace())` waits up to 8s for
-///    the blocking pool, then abandons whatever is still running;
-/// 5. the process exits.
-///
-/// That normal path is ~18s. Independently, the escalation watchdog force-exits
-/// [`DEFAULT_SHUTDOWN_ESCALATION_GRACE`] after shutdown is signalled, so the
-/// hard bound is ~25s. Owner death costs at most one
-/// [`OWNER_WATCH_CHECK_INTERVAL`] of detection on top of the same bound: ~27s
-/// from owner exit to process gone, with no signal ever sent.
-///
-/// Both grace periods are configurable — `KIN_DAEMON_SHUTDOWN_GRACE_SECS` and
-/// `KIN_DAEMON_RUNTIME_SHUTDOWN_GRACE_SECS` — so a caller with a tighter cleanup
-/// budget than 45s can lower the bound rather than resorting to SIGKILL.
-///
+// Shutdown-latency bound — how long the daemon may take to actually disappear.
+// Callers that budget for daemon cleanup (the merge-trust harness attests
+// against a 45s window) depend on this being bounded rather than generous, so
+// the terms are stated explicitly.
+//
+// SIGTERM/SIGINT → process gone:
+// 1. the signal is observed by the async handler — prompt even mid-hydration,
+//    because hydration runs on the blocking pool and leaves the async workers
+//    schedulable;
+// 2. `drain_handles` joins the daemon's tasks, bounded at 10s. An in-flight
+//    hydration is a blocking task rather than a drained handle, but the API
+//    server's graceful shutdown waits on in-flight requests, so a hydrating
+//    daemon rides this full 10s;
+// 3. the final storage flush and endpoint-file removal run (fast on the local
+//    backend);
+// 4. `runtime.shutdown_timeout(runtime_shutdown_grace())` waits up to 8s for
+//    the blocking pool, then abandons whatever is still running;
+// 5. the process exits.
+//
+// That normal path is ~18s. Independently, the escalation watchdog force-exits
+// DEFAULT_SHUTDOWN_ESCALATION_GRACE after shutdown is signalled, so the hard
+// bound is ~25s. Owner death costs at most one OWNER_WATCH_CHECK_INTERVAL of
+// detection on top of the same bound: ~27s from owner exit to process gone,
+// with no signal ever sent.
+//
+// Both grace periods are configurable — KIN_DAEMON_SHUTDOWN_GRACE_SECS and
+// KIN_DAEMON_RUNTIME_SHUTDOWN_GRACE_SECS — so a caller with a tighter cleanup
+// budget than 45s can lower the bound rather than resorting to SIGKILL.
+
 /// Default grace the shutdown-escalation watchdog grants — once graceful
 /// shutdown is signalled — before force-exiting the process. Generous enough
 /// for a legitimate final snapshot flush + task drain to win the race on their
