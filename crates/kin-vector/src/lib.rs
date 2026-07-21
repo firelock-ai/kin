@@ -453,8 +453,20 @@ pub struct HnswGraph<Id: VectorId = DefaultId> {
     pub idx_to_id: Vec<Id>,
     /// Indices that were removed and can be reused.
     pub free_list: Vec<usize>,
-    /// Simple u64 state for reproducible-ish level generation.
-    pub rng_state: u64,
+    /// Reserved slot. No code path reads this value.
+    ///
+    /// Layer assignment, tie-breaking, and entry-point selection all derive from
+    /// a stable digest of the node key (see `hnsw_level_for_key` and
+    /// `key_hash`), so the graph contains no pseudorandom generator and no
+    /// generator state. This slot predates that design; it is written at a fixed
+    /// constant and is only ever copied forward, never consumed.
+    ///
+    /// It is retained rather than deleted because `HnswGraph` is persisted with
+    /// `rmp_serde::to_vec`, which encodes a struct as a positional array. Since
+    /// the field carries no name in the serialized bytes, dropping it would
+    /// shift `descriptor` from position 8 to position 7 and every previously
+    /// saved index would fail to deserialize.
+    pub reserved_legacy_slot: u64,
     /// Self-description (model identity + graph provenance) of the vectors in
     /// this graph. Last field + `#[serde(default)]` so legacy snapshots that
     /// predate stamping still deserialize (descriptor decodes to default/`None`).
@@ -493,7 +505,7 @@ impl<Id: VectorId> HnswGraph<Id> {
             id_to_idx: HashMap::new(),
             idx_to_id: Vec::new(),
             free_list: Vec::new(),
-            rng_state: 0x12345678_9abcdef0,
+            reserved_legacy_slot: 0x12345678_9abcdef0,
             descriptor: IndexDescriptor::default(),
             backlinks: Vec::new(),
             canonical_order_dirty: false,
@@ -517,7 +529,7 @@ impl<Id: VectorId> HnswGraph<Id> {
             id_to_idx: self.id_to_idx.clone(),
             idx_to_id: self.idx_to_id.clone(),
             free_list: self.free_list.clone(),
-            rng_state: self.rng_state,
+            reserved_legacy_slot: self.reserved_legacy_slot,
             descriptor: self.descriptor.clone(),
             backlinks: Vec::new(),
             canonical_order_dirty: false,
@@ -945,7 +957,7 @@ impl<Id: VectorId> HnswGraph<Id> {
         }
 
         let dimensions = self.dimensions;
-        let rng_state = self.rng_state;
+        let reserved_legacy_slot = self.reserved_legacy_slot;
         let descriptor = self.descriptor.clone();
         let mut items: Vec<CanonicalOrderItem<Id>> = Vec::with_capacity(self.id_to_idx.len());
 
@@ -972,7 +984,7 @@ impl<Id: VectorId> HnswGraph<Id> {
         items.sort_by(|a, b| Self::canonical_id_cmp(&(a.0, &a.1), &(b.0, &b.1)));
 
         let mut rebuilt = HnswGraph::new(dimensions);
-        rebuilt.rng_state = rng_state;
+        rebuilt.reserved_legacy_slot = reserved_legacy_slot;
         rebuilt.descriptor = descriptor;
         for (_, _, id, vector, level) in items {
             rebuilt.insert_with_level(id, &vector, level)?;
@@ -3555,6 +3567,130 @@ mod tests {
         let graph = try_load_snapshot::<DefaultId>(&bytes).unwrap();
         assert_eq!(graph.dimensions, 8);
         assert_eq!(graph.descriptor, IndexDescriptor::default());
+    }
+
+    /// `reserved_legacy_slot` is written to disk but must have no influence on
+    /// anything. Two snapshots differing ONLY in that slot must produce different
+    /// bytes (so the slot is genuinely part of the persisted format, and this
+    /// test is not vacuous) and yet identical topology and identical search
+    /// results after load (so the slot is genuinely never read).
+    ///
+    /// This is what makes the no-pseudorandom-generator property checkable
+    /// rather than merely asserted: layer assignment, tie-breaking, and
+    /// entry-point selection derive from stable key digests, so a persisted u64
+    /// named or shaped like generator state can be proven inert.
+    #[test]
+    fn reserved_legacy_slot_is_persisted_but_never_read() {
+        let dim = 24;
+        let n: u64 = 400;
+        let idx = VectorIndex::<u64>::new(dim).unwrap();
+        idx.upsert_batch((0..n).map(|k| (k, batch_test_vec(k, dim))).collect())
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idx.hnsw");
+        idx.save(&path).unwrap();
+        let base = std::fs::read(&path).unwrap();
+
+        let reserialize = |slot: u64| -> Vec<u8> {
+            let mut graph = try_load_snapshot::<u64>(&base).unwrap();
+            graph.reserved_legacy_slot = slot;
+            rmp_serde::to_vec(&HnswSnapshot {
+                format_version: HNSW_FORMAT_VERSION,
+                graph,
+            })
+            .unwrap()
+        };
+
+        let lo = reserialize(0);
+        let hi = reserialize(u64::MAX);
+
+        // Persisted: the slot reaches the serialized bytes. Without this the rest
+        // of the test would prove nothing.
+        assert_ne!(
+            lo, hi,
+            "the reserved slot must actually be persisted for this test to mean anything"
+        );
+
+        let g_lo = try_load_snapshot::<u64>(&lo).unwrap();
+        let g_hi = try_load_snapshot::<u64>(&hi).unwrap();
+        assert_eq!(g_lo.reserved_legacy_slot, 0);
+        assert_eq!(g_hi.reserved_legacy_slot, u64::MAX);
+
+        // Never read: identical topology despite the maximally different slot.
+        assert_eq!(g_lo.entry_point, g_hi.entry_point, "entry point");
+        assert_eq!(g_lo.max_level, g_hi.max_level, "max level");
+        assert_eq!(g_lo.idx_to_id, g_hi.idx_to_id, "index to id mapping");
+        assert_eq!(g_lo.free_list, g_hi.free_list, "free list");
+        assert_eq!(g_lo.nodes.len(), g_hi.nodes.len(), "node count");
+        for (i, (a, b)) in g_lo.nodes.iter().zip(g_hi.nodes.iter()).enumerate() {
+            assert_eq!(a.level, b.level, "node {i} level");
+            assert_eq!(a.connections, b.connections, "node {i} connections");
+        }
+
+        // Never read: identical search behavior.
+        for q in 0..32u64 {
+            let query = batch_test_vec(q.wrapping_mul(7).wrapping_add(3), dim);
+            assert_eq!(
+                g_lo.search(&query, 10, None),
+                g_hi.search(&query, 10, None),
+                "search diverged for query {q} on the reserved slot value alone"
+            );
+        }
+    }
+
+    /// Establishes, rather than assumes, that deleting `reserved_legacy_slot`
+    /// outright would be an on-disk format break.
+    ///
+    /// `save` serializes with `rmp_serde::to_vec`, which encodes a struct as a
+    /// positional array with no field names in the bytes. Removing the slot
+    /// would therefore shift `descriptor` from position 8 into position 7, where
+    /// a loader still expects a u64. This test builds a real index with today's
+    /// `save`, then reads those exact bytes with the field layout a
+    /// slot-less build would have, and pins that it fails.
+    #[test]
+    fn dropping_the_reserved_legacy_slot_would_break_the_persisted_format() {
+        let dim = 8;
+        let idx = VectorIndex::<u64>::new(dim).unwrap();
+        idx.upsert_batch((0..16u64).map(|k| (k, batch_test_vec(k, dim))).collect())
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idx.hnsw");
+        idx.save(&path).unwrap();
+        let persisted = std::fs::read(&path).unwrap();
+
+        // Control: today's loader reads a today-written index.
+        try_load_snapshot::<u64>(&persisted)
+            .expect("the current loader must read a currently-written index");
+
+        // The layout a build with the slot deleted would have: identical field
+        // order, minus the slot.
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct SlotlessGraph {
+            nodes: Vec<HnswNode>,
+            entry_point: Option<usize>,
+            max_level: usize,
+            dimensions: usize,
+            id_to_idx: HashMap<u64, usize>,
+            idx_to_id: Vec<u64>,
+            free_list: Vec<usize>,
+            #[serde(default)]
+            descriptor: IndexDescriptor,
+        }
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct SlotlessSnapshot {
+            format_version: u8,
+            graph: SlotlessGraph,
+        }
+
+        assert!(
+            rmp_serde::from_slice::<SlotlessSnapshot>(&persisted).is_err(),
+            "an index persisted with the reserved slot must NOT be readable by a \
+             layout that dropped it; if this ever passes, the positional-layout \
+             rationale documented on the field is wrong and the field could be \
+             deleted outright"
+        );
     }
 
     /// Citable-bar guarantee (strict byte-determinism of the persisted index):
