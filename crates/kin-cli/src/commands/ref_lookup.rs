@@ -879,6 +879,45 @@ mod tests {
         );
     }
 
+    /// Verification-only: this is the FIR-1501 regression assertion expressed
+    /// against the entry points as they exist on this commit. It is expected to
+    /// FAIL here, proving the locate entry point runs the full semantic replay.
+    #[test]
+    fn locate_ref_hydration_must_not_run_the_full_semantic_replay() {
+        let repo = tempfile::tempdir().unwrap();
+        if git_ok(repo.path(), &["init", "-q"]).is_none() {
+            return;
+        }
+        assert!(git_ok(repo.path(), &["config", "user.email", "test@kin.dev"]).is_some());
+        assert!(git_ok(repo.path(), &["config", "user.name", "Kin Test"]).is_some());
+        std::fs::write(
+            repo.path().join("lib.rs"),
+            "pub fn answer() -> i32 {\n    42\n}\n",
+        )
+        .unwrap();
+        assert!(git_ok(repo.path(), &["add", "lib.rs"]).is_some());
+        assert!(git_ok(repo.path(), &["commit", "-q", "-m", "initial"]).is_some());
+        let git_oid = git_ok(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        let imported_id = kin_git::semantic_change_id_from_git_oid_hex(&git_oid).unwrap();
+        let layout = kin_core::init(repo.path()).unwrap().layout;
+        let graph = InMemoryGraph::new();
+
+        let report = resolve_ref_importing_git_if_needed_for_locate_with_report(
+            &graph,
+            &layout,
+            Some(&git_oid),
+        )
+        .unwrap();
+        assert!(report.hydrated_changes > 0, "fixture must actually hydrate");
+
+        let change = graph.get_change(&imported_id).unwrap().unwrap();
+        assert!(
+            change.entity_deltas.is_empty(),
+            "the locate entry point must hydrate at artifact-only depth, but it produced {} entity deltas",
+            change.entity_deltas.len()
+        );
+    }
+
     #[test]
     fn resolve_ref_accepts_imported_git_commit_sha() {
         let graph = InMemoryGraph::new();
