@@ -67,12 +67,16 @@ pub struct ArtifactDelta {
 /// Classification of an artifact delta.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum ArtifactDeltaKind {
-    /// Added regular file without an executable bit.
+    /// Legacy added entry whose exact mode was not recorded.
     Added,
-    /// Modified content whose resulting entry is a regular non-executable file.
+    /// Legacy modified entry whose resulting exact mode was not recorded.
     Modified,
     /// Removed entry of any prior source kind.
     Removed,
+    /// Added regular file without an executable bit.
+    AddedRegularFile,
+    /// Modified content or mode whose resulting entry is a regular non-executable file.
+    ModifiedRegularFile,
     /// Added regular file with at least one executable bit.
     AddedExecutableFile,
     /// Modified content or mode whose resulting entry is an executable file.
@@ -92,29 +96,35 @@ pub enum SourceEntryKind {
 }
 
 impl ArtifactDeltaKind {
-    /// Resulting exact-source entry kind, or `None` for a removal.
+    /// Resulting exact-source entry kind, or `None` for a removal or a legacy
+    /// delta that predates mode capture.
     pub const fn source_entry_kind(self) -> Option<SourceEntryKind> {
         match self {
-            Self::Added | Self::Modified => Some(SourceEntryKind::File { executable: false }),
+            Self::AddedRegularFile | Self::ModifiedRegularFile => {
+                Some(SourceEntryKind::File { executable: false })
+            }
             Self::AddedExecutableFile | Self::ModifiedExecutableFile => {
                 Some(SourceEntryKind::File { executable: true })
             }
             Self::AddedSymlink | Self::ModifiedSymlink => Some(SourceEntryKind::Symlink),
-            Self::Removed => None,
+            Self::Added | Self::Modified | Self::Removed => None,
         }
     }
 
     pub const fn is_added(self) -> bool {
         matches!(
             self,
-            Self::Added | Self::AddedExecutableFile | Self::AddedSymlink
+            Self::Added | Self::AddedRegularFile | Self::AddedExecutableFile | Self::AddedSymlink
         )
     }
 
     pub const fn is_modified(self) -> bool {
         matches!(
             self,
-            Self::Modified | Self::ModifiedExecutableFile | Self::ModifiedSymlink
+            Self::Modified
+                | Self::ModifiedRegularFile
+                | Self::ModifiedExecutableFile
+                | Self::ModifiedSymlink
         )
     }
 
@@ -133,6 +143,8 @@ mod tests {
             ArtifactDeltaKind::Added,
             ArtifactDeltaKind::Modified,
             ArtifactDeltaKind::Removed,
+            ArtifactDeltaKind::AddedRegularFile,
+            ArtifactDeltaKind::ModifiedRegularFile,
             ArtifactDeltaKind::AddedExecutableFile,
             ArtifactDeltaKind::ModifiedExecutableFile,
             ArtifactDeltaKind::AddedSymlink,
@@ -147,7 +159,7 @@ mod tests {
     #[test]
     fn artifact_delta_kind_preserves_resulting_source_mode() {
         assert_eq!(
-            ArtifactDeltaKind::Added.source_entry_kind(),
+            ArtifactDeltaKind::AddedRegularFile.source_entry_kind(),
             Some(SourceEntryKind::File { executable: false })
         );
         assert_eq!(
@@ -165,12 +177,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_regular_artifact_kind_remains_compatible() {
+    fn legacy_artifact_kind_remains_compatible_but_mode_unknown() {
         let parsed: ArtifactDeltaKind = serde_json::from_str("\"Added\"").unwrap();
         assert_eq!(parsed, ArtifactDeltaKind::Added);
-        assert_eq!(
-            parsed.source_entry_kind(),
-            Some(SourceEntryKind::File { executable: false })
-        );
+        assert_eq!(parsed.source_entry_kind(), None);
+        assert!(parsed.is_added());
     }
 }
