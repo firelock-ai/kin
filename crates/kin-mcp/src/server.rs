@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::time::{Duration, Instant};
 
 use crate::daemon_delegate;
 use crate::envelope::{self, Envelope};
@@ -128,16 +129,35 @@ pub async fn run_stdio<G: PersistableMcpStore + 'static>(
     Ok(())
 }
 
-/// Binds the repo daemon from the MCP client's advertised workspace roots.
+/// The repository this MCP process serves: its working directory and the URL of
+/// the daemon that owns its graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundRepo {
+    /// Repository working directory (the parent of its `.kin/`).
+    pub root: PathBuf,
+    /// Daemon endpoint serving that repository.
+    pub daemon_url: String,
+}
+
+/// Binds — or re-binds — the repo daemon from the MCP client's advertised
+/// workspace roots.
 ///
 /// Receives the filesystem paths of the client's roots, binds the daemon for the
 /// first one that is a Kin repository (setting `KIN_DAEMON_URL` as a side
-/// effect), and returns the bound daemon URL — or `None` if none of the roots is
-/// a Kin repository. Supplied by the kin-cli MCP command; when `None`, roots
-/// binding is disabled (a repository was already bound at startup, or the client
-/// cannot serve roots).
-pub type RepoBinder =
-    Box<dyn Fn(Vec<PathBuf>) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync>;
+/// effect), and returns the bound repository — or `None` if none of the roots is
+/// a Kin repository whose daemon can be resolved. Supplied by the kin-cli MCP
+/// command; when `None`, roots binding is disabled (the client cannot serve
+/// roots).
+///
+/// The binder is invoked for every `roots/list` response, not only the first:
+/// an editor that moves its window to another folder announces the change, and
+/// a server that keeps its original binding answers from a repository the user
+/// has left. A `None` return while a repository is already bound is therefore
+/// meaningful — it tells the server to refuse tool calls rather than serve them
+/// from the previous repository's graph.
+pub type RepoBinder = Box<
+    dyn Fn(Vec<PathBuf>) -> Pin<Box<dyn Future<Output = Option<BoundRepo>> + Send>> + Send + Sync,
+>;
 
 /// The JSON-RPC id the server uses for its own `roots/list` request so it can
 /// recognize the matching response coming back from the client.
@@ -169,19 +189,52 @@ pub async fn run_stdio_daemon(
 
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
-    let reader = BufReader::new(stdin);
-    let mut reader = reader;
+    let mut reader = BufReader::new(stdin);
 
+    run_stdio_daemon_over(
+        &mut reader,
+        &mut stdout,
+        config,
+        repo_binder,
+        bound_daemon_url_from_env(),
+    )
+    .await
+}
+
+/// Transport-generic core of [`run_stdio_daemon`].
+///
+/// Split out so the binding lifecycle — the roots request, the response that
+/// completes it, the re-request after a workspace change, and the refusal that
+/// follows a change we cannot follow — is exercised over an in-memory transport
+/// instead of only over the process's real stdin/stdout.
+///
+/// `bound_daemon_url` is the daemon this process was already bound to before the
+/// loop started (from `--repo`/`KIN_MCP_REPO`/cwd), passed in rather than read
+/// from the environment so the loop's binding decisions are a function of its
+/// inputs.
+async fn run_stdio_daemon_over<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    config: McpServerConfig,
+    repo_binder: Option<RepoBinder>,
+    bound_daemon_url: Option<String>,
+) -> Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     tracing::info!("kin-mcp daemon-proxy stdio server starting");
 
-    // MCP `roots` binding state. We only reach out for workspace roots when we
-    // could not bind a repository at startup and the client says it can serve
-    // them. An editor may initialize the shared MCP process before opening a
-    // workspace, so only suppress a request while one is actually in flight.
+    // MCP `roots` binding state. Before a repository is bound we reach out for
+    // workspace roots as soon as the client says it can serve them; afterwards
+    // only a roots *change* triggers another request. An editor may initialize
+    // the shared MCP process before opening a workspace, so only suppress a
+    // request while one is actually in flight.
     let mut client_supports_roots = false;
     let mut roots_request_state = WorkspaceRootsRequestState::default();
+    let mut binding = RepoBindingState::started_with(bound_daemon_url);
 
-    while let Some((message, framed)) = read_stdio_message(&mut reader).await? {
+    while let Some((message, framed)) = read_stdio_message(&mut *reader).await? {
         // Peek at the raw JSON so we can distinguish the client's requests and
         // notifications from the `roots/list` response we may have sent: a
         // response carries no `method`, which the strongly-typed
@@ -193,6 +246,18 @@ pub async fn run_stdio_daemon(
                 client_supports_roots = value.pointer("/params/capabilities/roots").is_some();
             }
 
+            // The client moved to a workspace we could not bind. Refuse every
+            // tool call until a later roots change lands on a Kin repository:
+            // answering from the repository the client left would return a
+            // confident, well-formed result about the wrong codebase.
+            if method == Some("tools/call") && binding.is_mismatched() {
+                if let Some(response) = binding.repo_mismatch_response(&value) {
+                    let response_json = serde_json::to_string(&response).map_err(McpError::Json)?;
+                    write_stdio_message(&mut *writer, &response_json, framed).await?;
+                }
+                continue;
+            }
+
             // Our own `roots/list` response returning from the client: bind the
             // daemon and swallow it (a response is never itself answered).
             if method.is_none()
@@ -200,29 +265,23 @@ pub async fn run_stdio_daemon(
             {
                 roots_request_state.complete();
                 if let Some(binder) = repo_binder.as_ref() {
-                    let roots = parse_workspace_roots(&value);
-                    if roots.is_empty() {
-                        tracing::info!(
-                            "kin-mcp: client returned no workspace roots; repository stays unbound"
-                        );
-                    } else if binder(roots).await.is_none() {
-                        tracing::info!(
-                            "kin-mcp: no Kin repository among the client's workspace roots"
-                        );
-                    }
+                    apply_workspace_roots(binder, parse_workspace_roots(&value), &mut binding)
+                        .await;
                 }
                 continue;
             }
 
-            // Once the client finishes initializing (or asks for the tool list)
-            // and we still have no bound daemon, ask it for its workspace roots.
-            // Retry after an earlier empty response, and honor the MCP roots
-            // change notification used when an editor opens or changes folders.
+            // Ask the client for its workspace roots: while nothing is bound,
+            // as soon as it finishes initializing or asks for the tool list
+            // (retrying after an earlier empty response); and whenever it
+            // reports a roots change, bound or not, because that is how an
+            // editor announces that its window moved to another folder.
             if roots_request_state.begin_if_allowed(
                 method,
                 client_supports_roots,
                 repo_binder.is_some(),
-                daemon_is_unbound(),
+                !binding.is_bound(),
+                Instant::now(),
             ) {
                 let request = serde_json::json!({
                     "jsonrpc": "2.0",
@@ -230,7 +289,7 @@ pub async fn run_stdio_daemon(
                     "method": "roots/list",
                 });
                 let request_json = serde_json::to_string(&request).map_err(McpError::Json)?;
-                write_stdio_message(&mut stdout, &request_json, framed).await?;
+                write_stdio_message(&mut *writer, &request_json, framed).await?;
                 // Fall through: `initialized` has no response, and `tools/list`
                 // is still answered normally below.
             }
@@ -238,7 +297,7 @@ pub async fn run_stdio_daemon(
 
         if let Some(response) = process_daemon_message(&message, &config).await {
             let response_json = serde_json::to_string(&response).map_err(McpError::Json)?;
-            write_stdio_message(&mut stdout, &response_json, framed).await?;
+            write_stdio_message(&mut *writer, &response_json, framed).await?;
         }
     }
 
@@ -246,21 +305,172 @@ pub async fn run_stdio_daemon(
     Ok(())
 }
 
-/// True when no repo daemon has been bound yet (`KIN_DAEMON_URL` unset/empty).
-fn daemon_is_unbound() -> bool {
-    std::env::var("KIN_DAEMON_URL")
-        .map(|value| value.trim().is_empty())
-        .unwrap_or(true)
+/// Feed a `roots/list` response through the binder and record what it means for
+/// this process: a fresh binding, an unchanged one, or a workspace the server
+/// cannot follow.
+async fn apply_workspace_roots(
+    binder: &RepoBinder,
+    roots: Vec<PathBuf>,
+    binding: &mut RepoBindingState,
+) {
+    if roots.is_empty() {
+        // No open folder is not the same as a different folder: there is no
+        // other repository for the client's calls to be about, so an existing
+        // binding is left alone rather than torn down.
+        tracing::info!("kin-mcp: client returned no workspace roots; binding is unchanged");
+        return;
+    }
+
+    let previous_url = binding.daemon_url.clone();
+    match binder(roots.clone()).await {
+        Some(bound) => {
+            if previous_url.as_deref() != Some(bound.daemon_url.as_str()) {
+                // A different daemon serves this process now. Drop the revival
+                // override, which pins delegate calls at a daemon this process
+                // started for the repository it is leaving.
+                daemon_delegate::clear_daemon_url_override();
+                tracing::info!(
+                    repo = %bound.root.display(),
+                    daemon = %bound.daemon_url,
+                    "kin-mcp: bound repo daemon from the client's workspace roots"
+                );
+            }
+            binding.bind(bound);
+        }
+        None if binding.is_bound() => {
+            tracing::warn!(
+                roots = ?roots,
+                "kin-mcp: the client's workspace roots changed to a workspace with no bindable Kin \
+                 repository; refusing tool calls instead of answering from the previous repository"
+            );
+            binding.mark_mismatch(roots);
+        }
+        None => {
+            tracing::info!("kin-mcp: no Kin repository among the client's workspace roots");
+        }
+    }
 }
+
+/// The daemon bound before the stdio loop started (`KIN_DAEMON_URL` unset or
+/// empty means nothing was bound).
+fn bound_daemon_url_from_env() -> Option<String> {
+    std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// What the stdio loop knows about which repository it serves.
+#[derive(Debug, Default)]
+struct RepoBindingState {
+    /// Daemon currently serving this process, if any.
+    daemon_url: Option<String>,
+    /// Repository that daemon serves. Unknown for a binding inherited from
+    /// startup, which arrives as a URL with no accompanying root.
+    repo_root: Option<PathBuf>,
+    /// Set when the client's workspace moved somewhere this server could not
+    /// follow. Cleared by the next successful bind.
+    mismatch: Option<WorkspaceMismatch>,
+}
+
+/// A workspace change the server could not follow: it is still bound to
+/// `bound_repo`, while the client now reports `requested_roots`.
+#[derive(Debug)]
+struct WorkspaceMismatch {
+    bound_repo: Option<PathBuf>,
+    requested_roots: Vec<PathBuf>,
+}
+
+impl RepoBindingState {
+    fn started_with(daemon_url: Option<String>) -> Self {
+        Self {
+            daemon_url,
+            ..Self::default()
+        }
+    }
+
+    fn is_bound(&self) -> bool {
+        self.daemon_url.is_some()
+    }
+
+    fn is_mismatched(&self) -> bool {
+        self.mismatch.is_some()
+    }
+
+    fn bind(&mut self, bound: BoundRepo) {
+        self.daemon_url = Some(bound.daemon_url);
+        self.repo_root = Some(bound.root);
+        self.mismatch = None;
+    }
+
+    fn mark_mismatch(&mut self, requested_roots: Vec<PathBuf>) {
+        self.mismatch = Some(WorkspaceMismatch {
+            bound_repo: self.repo_root.clone(),
+            requested_roots,
+        });
+    }
+
+    /// Structured refusal for a `tools/call` that arrived while the client's
+    /// workspace and this server's binding disagree. `None` for a malformed
+    /// call with no id, which has no response channel — the caller still drops
+    /// the call rather than forwarding it.
+    fn repo_mismatch_response(&self, request: &serde_json::Value) -> Option<JsonRpcResponse> {
+        let mismatch = self.mismatch.as_ref()?;
+        let id = request.get("id").filter(|id| !id.is_null())?.clone();
+        let tool = request
+            .pointer("/params/name")
+            .and_then(|name| name.as_str())
+            .unwrap_or("this tool");
+        let result = ToolCallResult::error(mismatch.message(tool));
+        let enveloped = envelope::finalize(result, Envelope::daemon_unreachable(), tool);
+        Some(JsonRpcResponse::success(
+            Some(id),
+            serde_json::to_value(&enveloped).unwrap_or_default(),
+        ))
+    }
+}
+
+impl WorkspaceMismatch {
+    fn message(&self, tool: &str) -> String {
+        let bound = match &self.bound_repo {
+            Some(root) => root.display().to_string(),
+            None => "the repository bound when this server started".to_string(),
+        };
+        let requested = self
+            .requested_roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "kin-mcp refuses '{tool}': the MCP client's workspace roots changed to [{requested}], \
+             and none of them is a Kin repository this server can bind, so Kin is still bound to \
+             {bound}. Answering would return a confident result about a repository you are no \
+             longer looking at. Run `kin init .` in the new workspace, or restart the MCP server \
+             from it (or with --repo <path> / KIN_MCP_REPO=<path>)."
+        )
+    }
+}
+
+/// How long an unanswered `roots/list` suppresses another one. A client that
+/// advertises the roots capability and then never answers would otherwise wedge
+/// binding — and, after a workspace change, the refusal state — for the life of
+/// the process.
+const ROOTS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 struct WorkspaceRootsRequestState {
-    in_flight: bool,
+    in_flight_since: Option<Instant>,
 }
 
 impl WorkspaceRootsRequestState {
     fn complete(&mut self) {
-        self.in_flight = false;
+        self.in_flight_since = None;
+    }
+
+    fn request_in_flight(&self, now: Instant) -> bool {
+        self.in_flight_since
+            .is_some_and(|started| now.saturating_duration_since(started) < ROOTS_REQUEST_TIMEOUT)
     }
 
     fn begin_if_allowed(
@@ -269,16 +479,17 @@ impl WorkspaceRootsRequestState {
         client_supports_roots: bool,
         has_repo_binder: bool,
         daemon_unbound: bool,
+        now: Instant,
     ) -> bool {
         let should_begin = should_request_workspace_roots(
             method,
             client_supports_roots,
-            self.in_flight,
+            self.request_in_flight(now),
             has_repo_binder,
             daemon_unbound,
         );
         if should_begin {
-            self.in_flight = true;
+            self.in_flight_since = Some(now);
         }
         should_begin
     }
@@ -287,6 +498,12 @@ impl WorkspaceRootsRequestState {
 /// Decide whether an inbound client message should trigger a workspace-roots
 /// request. Kept separate from the stdio loop so the retry semantics remain
 /// deterministic and testable without mutating process-global daemon state.
+///
+/// A roots *change* is honored whether or not a repository is bound: it is the
+/// only signal an editor sends when its window moves to another folder, and
+/// ignoring it once bound is what leaves the server answering from the previous
+/// repository. The other triggers stay gated on an unbound daemon so a settled
+/// session does not re-ask on every `tools/list`.
 fn should_request_workspace_roots(
     method: Option<&str>,
     client_supports_roots: bool,
@@ -294,17 +511,16 @@ fn should_request_workspace_roots(
     has_repo_binder: bool,
     daemon_unbound: bool,
 ) -> bool {
-    client_supports_roots
-        && !request_in_flight
-        && has_repo_binder
-        && daemon_unbound
-        && matches!(
-            method,
-            Some("initialized")
-                | Some("notifications/initialized")
-                | Some("notifications/roots/list_changed")
-                | Some("tools/list")
-        )
+    if !client_supports_roots || request_in_flight || !has_repo_binder {
+        return false;
+    }
+    match method {
+        Some("notifications/roots/list_changed") => true,
+        Some("initialized") | Some("notifications/initialized") | Some("tools/list") => {
+            daemon_unbound
+        }
+        _ => false,
+    }
 }
 
 /// Extract filesystem paths from an MCP `roots/list` response
@@ -1330,17 +1546,39 @@ mod tests {
 
     #[test]
     fn workspace_roots_request_state_reopens_after_completion() {
+        let now = Instant::now();
         let mut state = WorkspaceRootsRequestState::default();
-        assert!(state.begin_if_allowed(Some("initialized"), true, true, true));
+        assert!(state.begin_if_allowed(Some("initialized"), true, true, true, now));
         assert!(!state.begin_if_allowed(
             Some("notifications/roots/list_changed"),
             true,
             true,
             true,
+            now,
         ));
 
         state.complete();
-        assert!(state.begin_if_allowed(Some("notifications/roots/list_changed"), true, true, true,));
+        assert!(state.begin_if_allowed(
+            Some("notifications/roots/list_changed"),
+            true,
+            true,
+            true,
+            now,
+        ));
+    }
+
+    #[test]
+    fn workspace_roots_request_retries_after_an_unanswered_request_times_out() {
+        let start = Instant::now();
+        let mut state = WorkspaceRootsRequestState::default();
+        assert!(state.begin_if_allowed(Some("initialized"), true, true, true, start));
+
+        // A client that advertises roots and never answers must not wedge
+        // binding for the life of the process.
+        let just_before = start + ROOTS_REQUEST_TIMEOUT - Duration::from_millis(1);
+        assert!(!state.begin_if_allowed(Some("tools/list"), true, true, true, just_before));
+        let after = start + ROOTS_REQUEST_TIMEOUT;
+        assert!(state.begin_if_allowed(Some("tools/list"), true, true, true, after));
     }
 
     #[test]
@@ -1362,5 +1600,369 @@ mod tests {
             true,
             true,
         ));
+    }
+
+    #[test]
+    fn workspace_roots_change_is_honored_after_a_repository_is_already_bound() {
+        // The defect this locks down: with a daemon already bound, the roots
+        // change that an editor sends when its window moves to another folder
+        // was dropped, leaving the server answering from the old repository.
+        assert!(should_request_workspace_roots(
+            Some("notifications/roots/list_changed"),
+            true,
+            false,
+            true,
+            false,
+        ));
+        // Everything else stays gated on an unbound daemon so a settled session
+        // does not re-ask on every tools/list.
+        assert!(!should_request_workspace_roots(
+            Some("notifications/initialized"),
+            true,
+            false,
+            true,
+            false,
+        ));
+        // A roots change still needs a binder and the client capability, and
+        // still never overlaps an in-flight request.
+        assert!(!should_request_workspace_roots(
+            Some("notifications/roots/list_changed"),
+            true,
+            true,
+            true,
+            false,
+        ));
+        assert!(!should_request_workspace_roots(
+            Some("notifications/roots/list_changed"),
+            true,
+            false,
+            false,
+            false,
+        ));
+        assert!(!should_request_workspace_roots(
+            Some("notifications/roots/list_changed"),
+            false,
+            false,
+            true,
+            false,
+        ));
+    }
+
+    // ── Workspace-switch integration over the real stdio loop ──────────────
+
+    /// Records every roots list the server hands the binder and replies with a
+    /// scripted outcome per call, so a test can drive a bind and then a switch.
+    struct ScriptedBinder {
+        outcomes: std::sync::Mutex<std::collections::VecDeque<Option<BoundRepo>>>,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<Vec<PathBuf>>>>,
+    }
+
+    impl ScriptedBinder {
+        fn install(
+            outcomes: Vec<Option<BoundRepo>>,
+        ) -> (
+            RepoBinder,
+            std::sync::Arc<std::sync::Mutex<Vec<Vec<PathBuf>>>>,
+        ) {
+            let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let scripted = std::sync::Arc::new(ScriptedBinder {
+                outcomes: std::sync::Mutex::new(outcomes.into()),
+                calls: std::sync::Arc::clone(&calls),
+            });
+            let binder: RepoBinder = Box::new(
+                move |roots: Vec<PathBuf>| -> Pin<Box<dyn Future<Output = Option<BoundRepo>> + Send>> {
+                    let scripted = std::sync::Arc::clone(&scripted);
+                    Box::pin(async move {
+                        scripted.calls.lock().unwrap().push(roots);
+                        let next = scripted.outcomes.lock().unwrap().pop_front();
+                        next.flatten()
+                    })
+                },
+            );
+            (binder, calls)
+        }
+    }
+
+    fn bound_repo(root: &str, daemon_url: &str) -> BoundRepo {
+        BoundRepo {
+            root: PathBuf::from(root),
+            daemon_url: daemon_url.to_string(),
+        }
+    }
+
+    /// Drive the daemon stdio loop over an in-memory transport with a scripted
+    /// client session, and return every message the server wrote back.
+    ///
+    /// The config carries an empty tool allow-list so a `tools/call` that is
+    /// *not* refused for a repo mismatch is answered locally by the allow-list
+    /// branch. That keeps every assertion offline and deterministic: no test
+    /// here ever reaches the daemon delegate, which on a machine with a live
+    /// `KIN_DAEMON_URL` would open a connection and could spawn a daemon.
+    async fn drive_daemon_loop(
+        client_messages: &[serde_json::Value],
+        repo_binder: Option<RepoBinder>,
+        bound_daemon_url: Option<String>,
+    ) -> Vec<serde_json::Value> {
+        let mut input = String::new();
+        for message in client_messages {
+            input.push_str(&message.to_string());
+            input.push('\n');
+        }
+        let mut reader = BufReader::new(input.as_bytes());
+        let mut written: Vec<u8> = Vec::new();
+        let config = McpServerConfig {
+            allowed_tools: Some(HashSet::new()),
+            ..McpServerConfig::default()
+        };
+
+        run_stdio_daemon_over(
+            &mut reader,
+            &mut written,
+            config,
+            repo_binder,
+            bound_daemon_url,
+        )
+        .await
+        .expect("stdio loop must drain the scripted client session");
+
+        String::from_utf8(written)
+            .expect("server output is UTF-8")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("server output is JSON-RPC"))
+            .collect()
+    }
+
+    fn roots_response(roots: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": ROOTS_REQUEST_ID,
+            "result": {
+                "roots": roots
+                    .iter()
+                    .map(|root| serde_json::json!({ "uri": format!("file://{root}") }))
+                    .collect::<Vec<_>>(),
+            },
+        })
+    }
+
+    fn initialize_with_roots_capability() -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "capabilities": { "roots": { "listChanged": true } } },
+        })
+    }
+
+    fn tool_call(id: u32, name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": {} },
+        })
+    }
+
+    fn roots_requests(responses: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+        responses
+            .iter()
+            .filter(|value| value.get("method").and_then(|m| m.as_str()) == Some("roots/list"))
+            .collect()
+    }
+
+    fn tool_error_text(response: &serde_json::Value) -> String {
+        let result: ToolCallResult =
+            serde_json::from_value(response.get("result").cloned().expect("tool result"))
+                .expect("tool result payload");
+        assert_eq!(result.is_error, Some(true), "expected an error result");
+        match result.content.first().expect("error content block") {
+            ContentBlock::Text { text } => text.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn roots_change_after_a_bind_rebinds_to_the_new_workspace() {
+        let (binder, calls) = ScriptedBinder::install(vec![
+            Some(bound_repo("/repo/a", "http://127.0.0.1:4111")),
+            Some(bound_repo("/repo/b", "http://127.0.0.1:4222")),
+        ]);
+
+        let responses = drive_daemon_loop(
+            &[
+                initialize_with_roots_capability(),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+                roots_response(&["/repo/a"]),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/roots/list_changed"}),
+                roots_response(&["/repo/b"]),
+            ],
+            Some(binder),
+            None,
+        )
+        .await;
+
+        // Two `roots/list` requests: the late bind, then the workspace switch.
+        // On the pre-fix server the second never leaves the process.
+        assert_eq!(
+            roots_requests(&responses).len(),
+            2,
+            "a roots change after a successful bind must re-request roots: {responses:#?}"
+        );
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![
+                vec![PathBuf::from("/repo/a")],
+                vec![PathBuf::from("/repo/b")]
+            ],
+            "the binder must be re-invoked with the client's new roots"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_calls_fail_loud_when_the_new_workspace_cannot_be_bound() {
+        // Bind repo A, then switch to a workspace with no bindable Kin repo.
+        let (binder, _calls) = ScriptedBinder::install(vec![
+            Some(bound_repo("/repo/a", "http://127.0.0.1:4111")),
+            None,
+        ]);
+
+        let responses = drive_daemon_loop(
+            &[
+                initialize_with_roots_capability(),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+                roots_response(&["/repo/a"]),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/roots/list_changed"}),
+                roots_response(&["/elsewhere/not-a-kin-repo"]),
+                tool_call(7, "semantic_locate"),
+            ],
+            Some(binder),
+            None,
+        )
+        .await;
+
+        let answer = responses
+            .iter()
+            .find(|value| value.get("id").and_then(|id| id.as_u64()) == Some(7))
+            .expect("the tool call must be answered, not dropped");
+        let text = tool_error_text(answer);
+        assert!(
+            text.contains("semantic_locate") && text.contains("/elsewhere/not-a-kin-repo"),
+            "refusal must name the tool and the workspace the client moved to: {text}"
+        );
+        assert!(
+            text.contains("/repo/a"),
+            "refusal must name the repository still bound: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bindable_workspace_switch_clears_an_earlier_refusal() {
+        // A → unbindable workspace → B: the refusal must not outlive the switch
+        // that resolves it.
+        let (binder, _calls) = ScriptedBinder::install(vec![
+            Some(bound_repo("/repo/a", "http://127.0.0.1:4111")),
+            None,
+            Some(bound_repo("/repo/b", "http://127.0.0.1:4222")),
+        ]);
+
+        let responses = drive_daemon_loop(
+            &[
+                initialize_with_roots_capability(),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+                roots_response(&["/repo/a"]),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/roots/list_changed"}),
+                roots_response(&["/elsewhere/not-a-kin-repo"]),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/roots/list_changed"}),
+                roots_response(&["/repo/b"]),
+                tool_call(9, "semantic_locate"),
+            ],
+            Some(binder),
+            None,
+        )
+        .await;
+
+        let answer = responses
+            .iter()
+            .find(|value| value.get("id").and_then(|id| id.as_u64()) == Some(9))
+            .expect("the tool call must be answered");
+        let text = tool_error_text(answer);
+        assert!(
+            text.contains("not enabled in this MCP profile"),
+            "a successful re-bind must clear the refusal and let the call through: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_startup_bound_server_still_follows_a_workspace_switch() {
+        // The reported shape: a repository bound before the loop starts (from
+        // --repo/KIN_MCP_REPO/cwd) used to suppress roots handling entirely.
+        let (binder, calls) =
+            ScriptedBinder::install(vec![Some(bound_repo("/repo/b", "http://127.0.0.1:4222"))]);
+
+        let responses = drive_daemon_loop(
+            &[
+                initialize_with_roots_capability(),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+                serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/roots/list_changed"}),
+                roots_response(&["/repo/b"]),
+            ],
+            Some(binder),
+            Some("http://127.0.0.1:4111".to_string()),
+        )
+        .await;
+
+        // `initialized` and `tools/list` must stay quiet for an already-bound
+        // server; only the roots change reaches out.
+        let requests = roots_requests(&responses);
+        assert_eq!(
+            requests.len(),
+            1,
+            "only the roots change may re-request roots once bound: {responses:#?}"
+        );
+        assert_eq!(
+            calls.lock().unwrap().clone(),
+            vec![vec![PathBuf::from("/repo/b")]],
+            "the switch must reach the binder even though startup already bound a repo"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_roots_response_leaves_an_existing_binding_alone() {
+        // No open folder is not a different folder: there is no other
+        // repository the client's calls could be about, so a binding survives
+        // and tool calls are not refused.
+        let (binder, calls) =
+            ScriptedBinder::install(vec![Some(bound_repo("/repo/a", "http://127.0.0.1:4111"))]);
+
+        let responses = drive_daemon_loop(
+            &[
+                initialize_with_roots_capability(),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+                roots_response(&["/repo/a"]),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/roots/list_changed"}),
+                roots_response(&[]),
+                tool_call(11, "semantic_locate"),
+            ],
+            Some(binder),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "an empty roots list must not be handed to the binder"
+        );
+        let answer = responses
+            .iter()
+            .find(|value| value.get("id").and_then(|id| id.as_u64()) == Some(11))
+            .expect("the tool call must be answered");
+        let text = tool_error_text(answer);
+        assert!(
+            text.contains("not enabled in this MCP profile"),
+            "an empty roots list must not be treated as a workspace switch: {text}"
+        );
     }
 }
