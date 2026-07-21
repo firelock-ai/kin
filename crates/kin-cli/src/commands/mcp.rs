@@ -28,8 +28,9 @@ pub async fn start(global: bool, repo: Option<PathBuf>) -> Result<()> {
         );
     }
 
-    if let Some(repo_dir) = resolve_repo_override(repo) {
-        if let Err(err) = std::env::set_current_dir(&repo_dir) {
+    let repo_override = resolve_repo_override(repo);
+    if let Some(repo_dir) = &repo_override {
+        if let Err(err) = std::env::set_current_dir(repo_dir) {
             eprintln!(
                 "Kin MCP: --repo/KIN_MCP_REPO path {} could not be used as the working directory \
                  ({err}); continuing from the launch directory.",
@@ -39,10 +40,11 @@ pub async fn start(global: bool, repo: Option<PathBuf>) -> Result<()> {
     }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    match bind_daemon_for_repo_dir(&cwd).await {
+    let bound_at_start = match bind_daemon_for_repo_dir(&cwd).await {
         Ok(daemon_url) => {
             eprintln!("{}", session_authority_notice());
             eprintln!("Kin MCP: forwarding graph tools to repo daemon at {daemon_url}");
+            true
         }
         Err(reason) => {
             eprintln!(
@@ -51,8 +53,9 @@ pub async fn start(global: bool, repo: Option<PathBuf>) -> Result<()> {
                  run `kin init .`, relaunch inside a Kin repository, or pass --repo <path> (or set \
                  KIN_MCP_REPO=<path>)."
             );
+            false
         }
-    }
+    };
 
     let mut config = build_mcp_start_config();
     let profile_tools: Option<&'static [&'static str]> =
@@ -80,9 +83,17 @@ pub async fn start(global: bool, repo: Option<PathBuf>) -> Result<()> {
     // reach the open repo), and again whenever the client reports that its
     // workspace changed, so a window that moves to another folder does not keep
     // being answered from the folder it left.
+    //
+    // An explicit --repo/KIN_MCP_REPO that bound successfully is an operator
+    // decision that workspace roots must not quietly overrule, so that pin never
+    // follows the client to another repository. It still refuses to answer for
+    // one: the binder reports the disagreement and the server fails loud, rather
+    // than serving the pinned repository's graph for a workspace the client
+    // moved away from.
+    let pinned_by_operator = repo_override.is_some() && bound_at_start;
     let repo_binder: Option<kin_mcp::RepoBinder> = Some(Box::new(
-        |roots: Vec<PathBuf>| -> Pin<Box<dyn Future<Output = Option<kin_mcp::BoundRepo>> + Send>> {
-            Box::pin(bind_first_kin_repo(roots))
+        move |roots: Vec<PathBuf>| -> Pin<Box<dyn Future<Output = Option<kin_mcp::BoundRepo>> + Send>> {
+            Box::pin(bind_first_kin_repo(roots, pinned_by_operator))
         },
     ));
 
@@ -105,8 +116,17 @@ pub async fn start(global: bool, repo: Option<PathBuf>) -> Result<()> {
 /// the running daemon; when they name a different one it repoints the process at
 /// it; when nothing there can be bound it returns `None`, which the stdio server
 /// turns into an explicit refusal.
-async fn bind_first_kin_repo(roots: Vec<PathBuf>) -> Option<kin_mcp::BoundRepo> {
-    bind_first_kin_repo_against(roots, bound_repo_working_dir()).await
+///
+/// `pinned_by_operator` marks a binding that came from an explicit
+/// `--repo`/`KIN_MCP_REPO`. That pin is never repointed by the client — it is a
+/// deliberate choice about which repository this server serves — so a workspace
+/// that names a different repository returns `None` and fails loud instead of
+/// following the client or, worse, answering from the pinned repository anyway.
+async fn bind_first_kin_repo(
+    roots: Vec<PathBuf>,
+    pinned_by_operator: bool,
+) -> Option<kin_mcp::BoundRepo> {
+    bind_first_kin_repo_against(roots, bound_repo_working_dir(), pinned_by_operator).await
 }
 
 /// Core of [`bind_first_kin_repo`] with the currently bound repository as an
@@ -116,6 +136,7 @@ async fn bind_first_kin_repo(roots: Vec<PathBuf>) -> Option<kin_mcp::BoundRepo> 
 async fn bind_first_kin_repo_against(
     roots: Vec<PathBuf>,
     bound_repo: Option<PathBuf>,
+    pinned_by_operator: bool,
 ) -> Option<kin_mcp::BoundRepo> {
     for root in roots {
         // Force the real upward walk. `KinLayout::discover` short-circuits to
@@ -134,6 +155,19 @@ async fn bind_first_kin_repo_against(
                 root: working_dir,
                 daemon_url,
             });
+        }
+
+        if pinned_by_operator {
+            // An explicit --repo/KIN_MCP_REPO names a different repository than
+            // the client is looking at. Following the client would overrule a
+            // deliberate operator choice; serving the pinned repository anyway
+            // would answer about a codebase the client left. Report neither.
+            eprintln!(
+                "Kin MCP: the client's workspace root {} is not the repository pinned by \
+                 --repo/KIN_MCP_REPO; refusing tool calls until the workspace and the pin agree.",
+                working_dir.display()
+            );
+            return None;
         }
 
         if bound_repo.is_some() {
@@ -384,10 +418,13 @@ mod tests {
         let repo = kin_repo_fixture();
         let repo_dir = std::fs::canonicalize(repo.path()).unwrap();
 
-        let bound =
-            bind_first_kin_repo_against(vec![repo.path().to_path_buf()], Some(repo_dir.clone()))
-                .await
-                .expect("the bound repository still being open must stay bound");
+        let bound = bind_first_kin_repo_against(
+            vec![repo.path().to_path_buf()],
+            Some(repo_dir.clone()),
+            false,
+        )
+        .await
+        .expect("the bound repository still being open must stay bound");
 
         assert_eq!(bound.root, repo_dir);
         assert_eq!(bound.daemon_url, "http://127.0.0.1:4242");
@@ -414,6 +451,7 @@ mod tests {
         let bound = bind_first_kin_repo_against(
             vec![switched_to.path().to_path_buf()],
             Some(std::fs::canonicalize(previous.path()).unwrap()),
+            false,
         )
         .await;
 
@@ -430,13 +468,62 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn an_operator_pin_is_never_repointed_by_workspace_roots() {
+        // --repo/KIN_MCP_REPO is a deliberate choice about which repository this
+        // server serves. A roots change naming a different repository must
+        // neither follow the client nor keep answering from the pin: it reports
+        // failure so the stdio server refuses.
+        let _daemon_guard = EnvVarGuard::set("KIN_DAEMON_URL", "http://127.0.0.1:4242");
+        let _no_daemon_guard = EnvVarGuard::set("KIN_NO_DAEMON", "1");
+        let pinned = kin_repo_fixture();
+        let other = kin_repo_fixture();
+
+        let bound = bind_first_kin_repo_against(
+            vec![other.path().to_path_buf()],
+            Some(std::fs::canonicalize(pinned.path()).unwrap()),
+            true,
+        )
+        .await;
+
+        assert!(
+            bound.is_none(),
+            "a pinned server must report failure for a workspace it does not serve"
+        );
+        assert_eq!(
+            std::env::var("KIN_DAEMON_URL").ok().as_deref(),
+            Some("http://127.0.0.1:4242"),
+            "the operator's pin must survive a roots change it does not match"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn an_operator_pin_still_binds_when_the_roots_name_it() {
+        let _daemon_guard = EnvVarGuard::set("KIN_DAEMON_URL", "http://127.0.0.1:4242");
+        let pinned = kin_repo_fixture();
+        let pinned_dir = std::fs::canonicalize(pinned.path()).unwrap();
+
+        let bound = bind_first_kin_repo_against(
+            vec![pinned.path().to_path_buf()],
+            Some(pinned_dir.clone()),
+            true,
+        )
+        .await
+        .expect("roots naming the pinned repository must stay bound");
+
+        assert_eq!(bound.root, pinned_dir);
+        assert_eq!(bound.daemon_url, "http://127.0.0.1:4242");
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn roots_with_no_kin_repository_bind_nothing() {
         let _daemon_guard = EnvVarGuard::remove("KIN_DAEMON_URL");
         // No autostart: this test must never spawn a daemon process.
         let _no_daemon_guard = EnvVarGuard::set("KIN_NO_DAEMON", "1");
         let plain = tempfile::tempdir().unwrap();
         assert!(
-            bind_first_kin_repo_against(vec![plain.path().to_path_buf()], None)
+            bind_first_kin_repo_against(vec![plain.path().to_path_buf()], None, false)
                 .await
                 .is_none()
         );
