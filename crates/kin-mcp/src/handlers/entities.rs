@@ -757,6 +757,21 @@ fn cross_repo_repo_id() -> std::result::Result<String, String> {
     }
 }
 
+/// Daemon-owned cross-repository authority for `find_references`.
+///
+/// The daemon constructs this from its resolved repository identity and its
+/// in-process spine. Neither value comes from MCP request arguments or ambient
+/// process configuration, so a caller cannot redirect the authority query.
+pub struct FindReferencesAuthority<'a> {
+    pub repo_id: &'a str,
+    pub spine: Option<&'a dyn kin_spine::SpineBackend>,
+}
+
+enum FindReferencesAuthoritySource<'a> {
+    Environment,
+    Daemon(FindReferencesAuthority<'a>),
+}
+
 fn append_spine_reference_rows(
     rows: &mut Vec<ReferenceRow>,
     repo_id: &str,
@@ -809,6 +824,37 @@ pub async fn handle_find_references<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
+    handle_find_references_with_authority_source(
+        args,
+        store,
+        FindReferencesAuthoritySource::Environment,
+    )
+    .await
+}
+
+/// Serve `find_references` from daemon-owned repository and spine authority.
+///
+/// This avoids an HTTP loop back into the same daemon and, more importantly,
+/// prevents `KIN_REPO_ID`, `KIN_DAEMON_URL`, or request fields from changing
+/// which repository graph the answer is bound to.
+pub async fn handle_find_references_with_authority<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+    authority: FindReferencesAuthority<'_>,
+) -> Result<ToolCallResult> {
+    handle_find_references_with_authority_source(
+        args,
+        store,
+        FindReferencesAuthoritySource::Daemon(authority),
+    )
+    .await
+}
+
+async fn handle_find_references_with_authority_source<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+    authority_source: FindReferencesAuthoritySource<'_>,
+) -> Result<ToolCallResult> {
     let relation_kinds = if let Some(raw_kinds) = get_optional_string_array(args, "relation_kinds")
     {
         if raw_kinds.is_empty() {
@@ -847,7 +893,31 @@ pub async fn handle_find_references<G: GraphStore>(
 
     let mut rows = collect_graph_reference_rows(store, &target.id, &relation_kinds)?;
     // ── Federated Xrefs via Spine ─────────────────────────────────────
-    let cross_repo = match cross_repo_repo_id() {
+    let cross_repo_query = match authority_source {
+        FindReferencesAuthoritySource::Environment => match cross_repo_repo_id() {
+            Ok(repo_id) => {
+                let query = fetch_spine_xref(&repo_id, &target.id).await;
+                Ok((repo_id, query))
+            }
+            Err(reason) => Err(reason),
+        },
+        FindReferencesAuthoritySource::Daemon(authority) => {
+            normalize_cross_repo_repo_id(Some(authority.repo_id)).map(|repo_id| {
+                let query = match authority.spine {
+                    Some(spine) => {
+                        kin_spine::SpineQuery::Found(kin_spine::SpineXrefResponse::from_snapshot(
+                            spine.cross_repo_edges_snapshot(),
+                            &repo_id,
+                            &target.id,
+                        ))
+                    }
+                    None => kin_spine::SpineQuery::NotConfigured,
+                };
+                (repo_id, query)
+            })
+        }
+    };
+    let cross_repo = match cross_repo_query {
         Err(reason) => {
             tracing::warn!(reason = %reason, "cross-repo repository binding unavailable for references enrichment");
             serde_json::json!({
@@ -855,7 +925,7 @@ pub async fn handle_find_references<G: GraphStore>(
                 "reason": reason,
             })
         }
-        Ok(repo_id) => match fetch_spine_xref(&repo_id, &target.id).await {
+        Ok((repo_id, query)) => match query {
             kin_spine::SpineQuery::Found(body) => {
                 let reference_count = append_spine_reference_rows(
                     &mut rows,

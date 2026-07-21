@@ -943,6 +943,18 @@ impl DaemonState {
 
     /// Open an existing .kin/ directory and create daemon state.
     pub fn open(layout: KinLayout) -> Result<Self> {
+        let explicit_repo_id = std::env::var("KIN_REPO_ID")
+            .ok()
+            .or_else(|| std::env::var("KIN_PRIMARY_REPO_ID").ok());
+        Self::open_with_repo_id(layout, explicit_repo_id.as_deref())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_for_test(layout: KinLayout, repo_id: &str) -> Result<Self> {
+        Self::open_with_repo_id(layout, Some(repo_id))
+    }
+
+    fn open_with_repo_id(layout: KinLayout, explicit_repo_id: Option<&str>) -> Result<Self> {
         // Up-front compatibility gate. A repo created by a pre-0.2 kin carries
         // an on-disk graph/index that this build's post-load embed/readiness
         // path cannot serve. Without this gate the daemon loads the snapshot,
@@ -1037,9 +1049,11 @@ impl DaemonState {
         // don't see a reset after daemon restart.
         let persisted_vfs_version = Self::load_persisted_vfs_version(&layout);
 
-        let explicit_repo_id = std::env::var("KIN_REPO_ID").ok();
+        // Resolve the daemon's repository identity once. KIN_PRIMARY_REPO_ID is
+        // retained as the multi-repo compatibility alias, but it feeds the same
+        // cached authority used by graph, MCP, and spine paths.
         let cached_repo_id =
-            kin_core::manifest::resolve_repo_id(&layout, explicit_repo_id.as_deref())
+            kin_core::manifest::resolve_repo_id(&layout, explicit_repo_id)
                 .map_err(DaemonError::from)?;
 
         // Baseline for the shutdown anti-wipe guard: the entity count loaded
@@ -1358,14 +1372,11 @@ impl DaemonState {
                 Vec::new();
 
             // Register the primary (this daemon's) repo.
-            let default_repo = self
-                .layout
-                .working_dir()
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("default");
-            let repo_id_str = std::env::var("KIN_PRIMARY_REPO_ID").unwrap_or_else(|_| default_repo.to_string());
-            let repo_id = repo_id_str.as_str();
+            // This graph's repository identity was resolved once when the
+            // daemon opened. Reuse that binding for spine registration so MCP,
+            // graph, and spine authority cannot diverge through a later ambient
+            // environment change.
+            let repo_id = self.cached_repo_id.as_str();
 
             if let Ok(entities) = self.graph.list_all_entities() {
                 let entries = Self::entities_to_spine_entries(repo_id, &entities);

@@ -6124,15 +6124,27 @@ async fn mcp_tools_call(
             "coordination enforcement rejected transaction before graph apply: {evidence}"
         ))
     } else {
-        match kin_mcp::handlers::handle_tool_call(
-            &request.name,
-            &request.arguments,
-            graph.as_ref(),
-            &sessions,
-            kin_mcp::SessionAuthorityMode::OfflineFallback,
-        )
-        .await
-        {
+        let handled = if request.name == "find_references" {
+            kin_mcp::handlers::entities::handle_find_references_with_authority(
+                &request.arguments,
+                graph.as_ref(),
+                kin_mcp::handlers::entities::FindReferencesAuthority {
+                    repo_id: &state.cached_repo_id,
+                    spine: state.ensure_spine(),
+                },
+            )
+            .await
+        } else {
+            kin_mcp::handlers::handle_tool_call(
+                &request.name,
+                &request.arguments,
+                graph.as_ref(),
+                &sessions,
+                kin_mcp::SessionAuthorityMode::OfflineFallback,
+            )
+            .await
+        };
+        match handled {
             Ok(result) => result,
             Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
         }
@@ -9838,6 +9850,10 @@ mod tests {
     }
 
     fn test_state() -> Arc<DaemonState> {
+        test_state_with_repo_id(None)
+    }
+
+    fn test_state_with_repo_id(repo_id: Option<&str>) -> Arc<DaemonState> {
         install_test_registry_override();
         let dir = std::env::temp_dir().join(format!("kin-daemon-test-state-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -9848,7 +9864,10 @@ mod tests {
         kin_core::manifest::KinManifest::new()
             .save(&layout.manifest_path())
             .unwrap();
-        Arc::new(DaemonState::open(layout).unwrap())
+        Arc::new(match repo_id {
+            Some(repo_id) => DaemonState::open_for_test(layout, repo_id).unwrap(),
+            None => DaemonState::open(layout).unwrap(),
+        })
     }
 
     fn run_hydration_fixture_git(repo: &FsPath, args: &[&str]) -> String {
@@ -14478,7 +14497,9 @@ mod tests {
         let state = test_state();
         let spine = state.ensure_spine().expect("spine enabled in test");
         // Register two repos' metadata so the pass has a non-empty repo set to
-        // iterate over (their graphs are unavailable without a backend).
+        // iterate over (their graphs are unavailable without a backend). The
+        // daemon's own repo is also registered and remains loadable from its
+        // in-process graph.
         spine.register_repo("kin", vec![], "");
         spine.register_repo("kin-db", vec![], "");
         let app = router(state);
@@ -14507,9 +14528,10 @@ mod tests {
             body.get("crossRepoEdges").is_some(),
             "response must carry crossRepoEdges, got {body}"
         );
-        // No backend → no repo graph loadable → nothing refreshed, but a clean
-        // 200 rather than a hard failure.
-        assert_eq!(body["reposRefreshed"], serde_json::json!(0));
+        // No backend means the two foreign repo graphs are unavailable, while
+        // the daemon's own cached repo identity refreshes from its in-process
+        // graph. The partial pass still answers cleanly rather than failing.
+        assert_eq!(body["reposRefreshed"], serde_json::json!(1));
     }
 
     /// One gate proving the cross-repo blast radius is consistent across every
@@ -14557,7 +14579,16 @@ mod tests {
             .expect("run_task entity present")
             .id;
 
-        let state = test_state();
+        // Pin the daemon's canonical graph identity without mutating process
+        // environment shared by concurrently executing tests.
+        let state = test_state_with_repo_id(Some("provider"));
+        assert_eq!(state.cached_repo_id, "provider");
+        let mut provider_entity = test_entity("do_work", "src/lib.rs");
+        provider_entity.id = do_work_id;
+        state.graph.upsert_entity(&provider_entity).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let layout = state.layout.clone();
         {
             let spine = state.ensure_spine().expect("spine enabled in test");
@@ -14648,10 +14679,10 @@ mod tests {
             .await
             .expect("CLI get_spine_xref call")
         {
-            kin_spine::SpineQuery::Found(edges) => edges,
+            kin_spine::SpineQuery::Found(response) => response,
             other => panic!("CLI get_spine_xref expected Found, got {other:?}"),
         };
-        let cli_xref_to_provider = cli_xref.iter().any(|e| e.dst_repo == "provider");
+        let cli_xref_to_provider = cli_xref.edges.iter().any(|e| e.dst_repo == "provider");
         assert!(
             cli_xref_to_provider,
             "kin xref CLI must resolve consumer->provider: {cli_xref:?}"
@@ -14707,22 +14738,25 @@ mod tests {
             "daemon, CLI, and MCP must all resolve the same consumer->provider xref"
         );
 
-        // The agent-facing MCP handler must project that real incoming edge as
-        // a useful external caller. This pins the complete contract, including
-        // edge direction and the metadata sidecar, rather than merely proving
-        // that the transport returned some JSON.
-        let mut provider_entity = test_entity("do_work", "src/lib.rs");
-        provider_entity.id = do_work_id;
-        let local_graph = kin_db::InMemoryGraph::new();
-        local_graph.upsert_entity(&provider_entity).unwrap();
-        std::env::set_var("KIN_REPO_ID", "provider");
-        let args = HashMap::from([(
-            "entity_id".to_string(),
-            serde_json::json!(do_work_id.to_string()),
-        )]);
-        let result = kin_mcp::handlers::entities::handle_find_references(&args, &local_graph)
+        // The agent-facing production route must project that real incoming
+        // edge without looping back through KIN_DAEMON_URL. A foreign request
+        // argument must not override DaemonState's repo binding.
+        std::env::remove_var("KIN_DAEMON_URL");
+        let result: kin_mcp::ToolCallResult = http
+            .post(format!("{base}/mcp/tools/call"))
+            .json(&serde_json::json!({
+                "name": "find_references",
+                "arguments": {
+                    "entity_id": do_work_id.to_string(),
+                    "repo_id": "request-controlled",
+                },
+            }))
+            .send()
             .await
-            .unwrap();
+            .expect("daemon MCP find_references request")
+            .json()
+            .await
+            .expect("daemon MCP find_references response");
         let kin_mcp::types::ContentBlock::Text { text } = result
             .content
             .first()
@@ -14731,6 +14765,10 @@ mod tests {
         assert_eq!(body["cross_repo"]["status"], "available");
         assert_eq!(body["cross_repo"]["reference_count"], 1);
         assert_eq!(body["cross_repo"]["authority_complete"], true);
+        assert_eq!(
+            body["cross_repo"]["authority_anchor"]["repo_id"],
+            "provider"
+        );
         assert!(body["cross_repo"]["authority_revision"]
             .as_str()
             .is_some_and(|revision| revision.starts_with("sha256:")));
@@ -14744,7 +14782,6 @@ mod tests {
             })
         }));
 
-        std::env::remove_var("KIN_REPO_ID");
         std::env::remove_var("KIN_DAEMON_URL");
         server.abort();
     }

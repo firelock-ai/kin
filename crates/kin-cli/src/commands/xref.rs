@@ -70,38 +70,61 @@ pub async fn build_xref_response(
     let repo_id = crate::commands::remote::resolve_repo_id(layout)?;
 
     match crate::backend::get_spine_xref(layout, &repo_id, &target.id).await {
-        Ok(::kin_spine::SpineQuery::Found(edges)) if !edges.is_empty() => {
-            lines.push(format!("  Found {} cross-repo edges:", edges.len()));
-            for edge in edges {
-                lines.push(format!(
-                    "    - Impact: [{}] {} depends on us ([{}] {}) (conf: {:.2})",
-                    edge.src_repo, edge.src_entity, edge.dst_repo, edge.dst_entity, edge.confidence
-                ));
-            }
-        }
-        // Healthy spine, genuinely no edges — an explicit, trustworthy empty.
-        Ok(::kin_spine::SpineQuery::Found(_)) => {
-            lines.push("  No cross-repo references found in the spine.".to_string());
-        }
-        // Spine configured but unreachable/disabled (e.g. HTTP 503) — say so
-        // instead of implying an empty result.
-        Ok(::kin_spine::SpineQuery::Unavailable(reason)) => {
-            lines.push(format!(
-                "  Cross-repo spine unavailable ({reason}) — this is not the same as 'no references found'."
-            ));
-        }
-        // No daemon endpoint configured in this context.
-        Ok(::kin_spine::SpineQuery::NotConfigured) => {
-            lines.push(
-                "  Cross-repo spine not configured (no daemon endpoint available).".to_string(),
-            );
-        }
+        Ok(query) => lines.extend(spine_xref_lines(query, &repo_id, &target.id)),
         Err(e) => {
             lines.push(format!("  Failed to query spine: {}", e));
         }
     }
 
     Ok(XrefResponse { lines })
+}
+
+fn spine_xref_lines(
+    query: ::kin_spine::SpineQuery<::kin_spine::SpineXrefResponse>,
+    repo_id: &str,
+    entity_id: &kin_model::EntityId,
+) -> Vec<String> {
+    match query {
+        ::kin_spine::SpineQuery::Found(response) => {
+            let authority_complete = response.authority_complete_for(repo_id, entity_id);
+            let mut lines = Vec::new();
+            if response.edges.is_empty() {
+                if authority_complete {
+                    lines.push("  No cross-repo references found in the spine.".to_string());
+                } else {
+                    lines.push(
+                        "  The spine returned no cross-repo edges, but its authority is incomplete — this is not the same as 'no references found'."
+                            .to_string(),
+                    );
+                }
+                return lines;
+            }
+
+            lines.push(format!(
+                "  Found {} cross-repo edges:",
+                response.edges.len()
+            ));
+            for edge in response.edges {
+                lines.push(format!(
+                    "    - Impact: [{}] {} depends on us ([{}] {}) (conf: {:.2})",
+                    edge.src_repo, edge.src_entity, edge.dst_repo, edge.dst_entity, edge.confidence
+                ));
+            }
+            if !authority_complete {
+                lines.push(
+                    "  Warning: these are partial results; the spine authority is incomplete and may omit additional references."
+                        .to_string(),
+                );
+            }
+            lines
+        }
+        ::kin_spine::SpineQuery::Unavailable(reason) => vec![format!(
+            "  Cross-repo spine unavailable ({reason}) — this is not the same as 'no references found'."
+        )],
+        ::kin_spine::SpineQuery::NotConfigured => vec![
+            "  Cross-repo spine not configured (no daemon endpoint available).".to_string(),
+        ],
+    }
 }
 
 /// Actionable guidance when `kin xref <symbol>` can't resolve the symbol in the
@@ -131,7 +154,8 @@ fn xref_not_found_guidance(entity: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::xref_not_found_guidance;
+    use super::{spine_xref_lines, xref_not_found_guidance};
+    use kin_model::EntityId;
 
     #[test]
     fn xref_not_found_guidance_keeps_signal_and_explains_anchor_model() {
@@ -150,6 +174,49 @@ mod tests {
         assert!(
             joined.contains("kin import") || joined.contains("kin deps"),
             "should give an actionable next step: {joined}"
+        );
+    }
+
+    #[test]
+    fn incomplete_empty_xref_never_claims_no_references() {
+        let entity_id = EntityId::new();
+        let response = kin_spine::SpineXrefResponse::new(Vec::new(), Vec::new());
+        let lines = spine_xref_lines(
+            kin_spine::SpineQuery::Found(response),
+            "provider",
+            &entity_id,
+        );
+        let joined = lines.join("\n");
+        assert!(!joined.contains("No cross-repo references found"));
+        assert!(joined.contains("authority is incomplete"));
+        assert!(joined.contains("not the same as 'no references found'"));
+    }
+
+    #[test]
+    fn complete_empty_xref_is_the_only_trustworthy_no_references_control() {
+        let entity_id = EntityId::new();
+        let encoded = serde_json::to_vec(&serde_json::json!({
+            "version": kin_spine::SPINE_PAYLOAD_VERSION,
+            "edges": [],
+            "authority_anchor": {
+                "repo_id": "provider",
+                "entity_id": entity_id,
+            },
+            "authority_complete": true,
+            "authority_revision": format!("sha256:{}", "a".repeat(64)),
+            "authority_roots": { "provider": "provider-root" },
+        }))
+        .unwrap();
+        let response =
+            kin_spine::SpineXrefResponse::from_slice_for(&encoded, "provider", &entity_id).unwrap();
+        let lines = spine_xref_lines(
+            kin_spine::SpineQuery::Found(response),
+            "provider",
+            &entity_id,
+        );
+        assert_eq!(
+            lines,
+            vec!["  No cross-repo references found in the spine."]
         );
     }
 }
