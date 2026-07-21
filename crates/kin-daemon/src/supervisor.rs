@@ -36,6 +36,12 @@ const SUPERVISOR_PORT_FILE: &str = "supervisor.port";
 const SUPERVISOR_TOKEN_FILE: &str = "supervisor.token";
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_TTL: Duration = Duration::from_secs(20);
+/// Ceiling for the retry backoff a repo daemon applies while it cannot reach a
+/// supervisor. Bounded rather than terminal: the supervisor is deliberately
+/// transient — it self-terminates once idle and the next CLI call starts a fresh
+/// one on a new port — so "no supervisor answering" is a recoverable condition,
+/// never a reason to stop trying.
+const MAX_REGISTRATION_BACKOFF: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoDaemonRegistration {
@@ -200,22 +206,66 @@ fn remove_supervisor_endpoint_files_if_current_process() {
 }
 
 pub fn supervisor_url_from_files() -> Option<String> {
-    let pid = std::fs::read_to_string(supervisor_pid_path())
+    supervisor_url_from_dir(&supervisor_dir())
+}
+
+/// Endpoint recorded by a live supervisor under `dir`. Returns `None` — and
+/// clears the stale files — when the recorded process is gone.
+fn supervisor_url_from_dir(dir: &Path) -> Option<String> {
+    let pid_path = dir.join(SUPERVISOR_PID_FILE);
+    let port_path = dir.join(SUPERVISOR_PORT_FILE);
+    let pid = std::fs::read_to_string(&pid_path)
         .ok()?
         .trim()
         .parse::<u32>()
         .ok()?;
     if !is_process_alive(pid) {
-        let _ = std::fs::remove_file(supervisor_pid_path());
-        let _ = std::fs::remove_file(supervisor_port_path());
+        let _ = std::fs::remove_file(&pid_path);
+        let _ = std::fs::remove_file(&port_path);
         return None;
     }
-    let port = std::fs::read_to_string(supervisor_port_path())
+    let port = std::fs::read_to_string(&port_path)
         .ok()?
         .trim()
         .parse::<u16>()
         .ok()?;
     Some(format!("http://127.0.0.1:{port}"))
+}
+
+fn supervisor_url_from_env() -> Option<String> {
+    std::env::var("KIN_SUPERVISOR_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Endpoint the registration loop should talk to next, where `failing` is the
+/// endpoint the previous attempt could not reach.
+///
+/// An explicit `KIN_SUPERVISOR_URL` normally wins. It stops winning once it
+/// fails: the CLI sets that variable on every daemon it spawns, and a repo
+/// daemon outlives many supervisors because each one exits on idle and its
+/// successor binds a different port. The inherited value then names a port that
+/// is dead for the rest of the daemon's life, while the endpoint files a live
+/// supervisor rewrites on every start name the successor. Preferring the files
+/// after a failure is what lets a daemon re-register instead of heartbeating a
+/// dead port forever.
+fn resolve_supervisor_url(
+    env_url: Option<String>,
+    dir: &Path,
+    failing: Option<&str>,
+) -> Option<String> {
+    let recorded = supervisor_url_from_dir(dir);
+    if let (Some(failing), Some(recorded)) = (failing, recorded.as_deref()) {
+        if recorded != failing {
+            return Some(recorded.to_string());
+        }
+    }
+    env_url.or(recorded)
+}
+
+fn discover_supervisor_url(failing: Option<&str>) -> Option<String> {
+    resolve_supervisor_url(supervisor_url_from_env(), &supervisor_dir(), failing)
 }
 
 fn is_process_alive(pid: u32) -> bool {
@@ -335,6 +385,132 @@ async fn delete_registration(
     Ok(())
 }
 
+/// How a registration or heartbeat attempt failed, at the granularity the log
+/// state machine treats as "the same condition".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistrationFailure {
+    /// The endpoint never answered: connection refused, timeout, transport
+    /// error. In this topology that usually means the supervisor idled out.
+    Unreachable,
+    /// The supervisor answered and refused the registration.
+    Rejected(u16),
+}
+
+impl RegistrationFailure {
+    fn from_error(error: &reqwest::Error) -> Self {
+        match error.status() {
+            Some(status) => Self::Rejected(status.as_u16()),
+            None => Self::Unreachable,
+        }
+    }
+}
+
+/// Whether an observed failure is new information.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistrationReport {
+    /// First observation of this condition.
+    Transition,
+    /// Same endpoint, same failure as the last reported condition; `repeats`
+    /// identical observations have gone unreported since.
+    Unchanged { repeats: u64 },
+}
+
+impl RegistrationReport {
+    fn repeats(self) -> u64 {
+        match self {
+            Self::Transition => 0,
+            Self::Unchanged { repeats } => repeats,
+        }
+    }
+}
+
+/// Severity a registration failure is reported at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistrationLogLevel {
+    Warn,
+    Info,
+    Debug,
+}
+
+/// The severity decision, isolated so it can be falsified directly.
+///
+/// A transition is worth reporting; an unchanged condition is not, however long
+/// it lasts. A supervisor that answers and refuses is a defect worth a warning;
+/// a supervisor that is simply absent is an ordinary fact of this topology and
+/// reports once at INFO.
+fn registration_log_level(
+    report: RegistrationReport,
+    failure: RegistrationFailure,
+) -> RegistrationLogLevel {
+    match (report, failure) {
+        (RegistrationReport::Unchanged { .. }, _) => RegistrationLogLevel::Debug,
+        (RegistrationReport::Transition, RegistrationFailure::Rejected(_)) => {
+            RegistrationLogLevel::Warn
+        }
+        (RegistrationReport::Transition, RegistrationFailure::Unreachable) => {
+            RegistrationLogLevel::Info
+        }
+    }
+}
+
+/// Reports supervisor registration failures on TRANSITION only.
+///
+/// The attempt runs on a timer, so a condition that persists — the common one
+/// being a supervisor that has idled out — would otherwise re-log at WARN for as
+/// long as the daemon lives. A stream that always warns carries no more
+/// information than one that never warns, and it buries the warnings that do
+/// mean something. This reports entry into a condition and stays quiet while it
+/// holds, so a changed endpoint, a changed failure, or a recovery is still
+/// visible immediately.
+#[derive(Debug, Default)]
+struct RegistrationReporter {
+    current: Option<(String, RegistrationFailure)>,
+    repeats: u64,
+}
+
+impl RegistrationReporter {
+    fn observe_failure(
+        &mut self,
+        endpoint: &str,
+        failure: RegistrationFailure,
+    ) -> RegistrationReport {
+        let unchanged = matches!(
+            &self.current,
+            Some((seen_endpoint, seen_failure))
+                if seen_endpoint.as_str() == endpoint && *seen_failure == failure
+        );
+        if unchanged {
+            self.repeats += 1;
+            return RegistrationReport::Unchanged {
+                repeats: self.repeats,
+            };
+        }
+        self.current = Some((endpoint.to_string(), failure));
+        self.repeats = 0;
+        RegistrationReport::Transition
+    }
+
+    /// Clear the failure state. Returns the number of unreported repeats when
+    /// this success ends a failing streak, so the recovery log carries the
+    /// volume the quiet period hid.
+    fn observe_success(&mut self) -> Option<u64> {
+        let repeats = self.repeats;
+        self.repeats = 0;
+        self.current.take().map(|_| repeats)
+    }
+}
+
+/// Retry backoff, doubled per consecutive failure and capped. Only ever applied
+/// after a failed attempt: a registered daemon keeps heartbeating at
+/// [`DEFAULT_HEARTBEAT_INTERVAL`], well inside the supervisor's
+/// [`HEARTBEAT_TTL`].
+fn next_registration_delay(current: Duration) -> Duration {
+    current
+        .max(DEFAULT_HEARTBEAT_INTERVAL)
+        .saturating_mul(2)
+        .min(MAX_REGISTRATION_BACKOFF)
+}
+
 pub async fn repo_daemon_registration_loop(
     state: Arc<DaemonState>,
     port: u16,
@@ -346,56 +522,102 @@ pub async fn repo_daemon_registration_loop(
         .unwrap_or_else(|_| reqwest::Client::new());
     let mut registered = false;
     let mut payload = repo_registration_payload(&state, port);
-    let mut supervisor_url = std::env::var("KIN_SUPERVISOR_URL")
-        .ok()
-        .or_else(supervisor_url_from_files);
+    let mut supervisor_url = discover_supervisor_url(None);
+    let mut reporter = RegistrationReporter::default();
+    // Sleeping between attempts rather than ticking a fixed-rate interval:
+    // `tokio::time::interval` replays every tick missed while the runtime was
+    // busy, so a daemon starved by a long hydration wakes up and fires the whole
+    // backlog back-to-back. A sleep cannot accumulate one. The first attempt
+    // still runs immediately, matching the interval's immediate first tick.
+    let mut delay = Duration::ZERO;
 
-    let mut interval = tokio::time::interval(DEFAULT_HEARTBEAT_INTERVAL);
     loop {
         tokio::select! {
-            _ = interval.tick() => {
-                payload.graph_entity_count = Some(state.graph.entity_count());
-                if supervisor_url.is_none() {
-                    supervisor_url = std::env::var("KIN_SUPERVISOR_URL")
-                        .ok()
-                        .or_else(supervisor_url_from_files);
-                }
-                let Some(current_supervisor_url) = supervisor_url.as_deref() else {
-                    debug!(repo_id = %payload.repo_id, "no Kin supervisor endpoint found yet; retrying discovery");
-                    continue;
-                };
-
-                let result = if registered {
-                    post_heartbeat(&client, current_supervisor_url, &payload).await
-                } else {
-                    post_registration(&client, current_supervisor_url, &payload).await
-                };
-
-                match result {
-                    Ok(()) => {
-                        if !registered {
-                            info!(repo_id = %payload.repo_id, display_name = %payload.display_name, supervisor_url = %current_supervisor_url, "registered repo daemon with supervisor");
-                        }
-                        registered = true;
-                    }
-                    Err(error) => {
-                        let status = error.status();
-                        warn!(error = %error, repo_id = %payload.repo_id, "supervisor registration heartbeat failed");
-                        if status != Some(reqwest::StatusCode::CONFLICT) {
-                            registered = false;
-                            supervisor_url = std::env::var("KIN_SUPERVISOR_URL")
-                                .ok()
-                                .or_else(supervisor_url_from_files);
-                        }
-                    }
-                }
-            }
+            _ = tokio::time::sleep(delay) => {}
             _ = cancel_rx.changed() => {
                 break;
             }
         }
         if *cancel_rx.borrow() {
             break;
+        }
+
+        payload.graph_entity_count = Some(state.graph.entity_count());
+        if supervisor_url.is_none() {
+            supervisor_url = discover_supervisor_url(None);
+        }
+        let Some(current_supervisor_url) = supervisor_url.clone() else {
+            debug!(repo_id = %payload.repo_id, "no Kin supervisor endpoint found yet; retrying discovery");
+            delay = next_registration_delay(delay);
+            continue;
+        };
+
+        let result = if registered {
+            post_heartbeat(&client, &current_supervisor_url, &payload).await
+        } else {
+            post_registration(&client, &current_supervisor_url, &payload).await
+        };
+
+        match result {
+            Ok(()) => {
+                let recovered = reporter.observe_success();
+                if !registered {
+                    info!(
+                        repo_id = %payload.repo_id,
+                        display_name = %payload.display_name,
+                        supervisor_url = %current_supervisor_url,
+                        unreported_failures = recovered.unwrap_or(0),
+                        "registered repo daemon with supervisor"
+                    );
+                } else if let Some(unreported) = recovered {
+                    info!(
+                        repo_id = %payload.repo_id,
+                        supervisor_url = %current_supervisor_url,
+                        unreported_failures = unreported,
+                        "supervisor heartbeat recovered"
+                    );
+                }
+                registered = true;
+                delay = DEFAULT_HEARTBEAT_INTERVAL;
+            }
+            Err(error) => {
+                let failure = RegistrationFailure::from_error(&error);
+                let report = reporter.observe_failure(&current_supervisor_url, failure);
+                match registration_log_level(report, failure) {
+                    RegistrationLogLevel::Warn => warn!(
+                        error = %error,
+                        repo_id = %payload.repo_id,
+                        supervisor_url = %current_supervisor_url,
+                        "kin supervisor refused repo daemon registration"
+                    ),
+                    RegistrationLogLevel::Info => info!(
+                        error = %error,
+                        repo_id = %payload.repo_id,
+                        supervisor_url = %current_supervisor_url,
+                        "kin supervisor endpoint is not answering; repo daemon will retry with backoff"
+                    ),
+                    RegistrationLogLevel::Debug => debug!(
+                        error = %error,
+                        repo_id = %payload.repo_id,
+                        supervisor_url = %current_supervisor_url,
+                        repeats = report.repeats(),
+                        "supervisor registration condition unchanged"
+                    ),
+                }
+
+                if failure != RegistrationFailure::Rejected(reqwest::StatusCode::CONFLICT.as_u16())
+                {
+                    registered = false;
+                    supervisor_url = discover_supervisor_url(Some(current_supervisor_url.as_str()));
+                }
+                // A different endpoint is a different condition: try it at the
+                // base cadence instead of inheriting the dead one's backoff.
+                delay = if supervisor_url.as_deref() == Some(current_supervisor_url.as_str()) {
+                    next_registration_delay(delay)
+                } else {
+                    DEFAULT_HEARTBEAT_INTERVAL
+                };
+            }
         }
     }
 
@@ -2959,5 +3181,215 @@ mod tests {
 
         std::env::remove_var("KIN_SUPERVISOR_AUTH_TOKEN");
         std::env::remove_var("KIN_SUPERVISOR_REQUIRE_TOKEN");
+    }
+
+    #[test]
+    fn supervisor_unreachable_reports_once_then_stays_quiet() {
+        let mut reporter = RegistrationReporter::default();
+        let endpoint = "http://127.0.0.1:61951";
+
+        // Entering the condition is new information.
+        let first = reporter.observe_failure(endpoint, RegistrationFailure::Unreachable);
+        assert_eq!(first, RegistrationReport::Transition);
+        assert_eq!(
+            registration_log_level(first, RegistrationFailure::Unreachable),
+            RegistrationLogLevel::Info
+        );
+
+        // Staying in it is not: no second report, at any level above debug,
+        // however long an absent supervisor stays absent.
+        for expected_repeats in 1..=5 {
+            let repeat = reporter.observe_failure(endpoint, RegistrationFailure::Unreachable);
+            assert_eq!(
+                repeat,
+                RegistrationReport::Unchanged {
+                    repeats: expected_repeats
+                }
+            );
+            assert_eq!(
+                registration_log_level(repeat, RegistrationFailure::Unreachable),
+                RegistrationLogLevel::Debug
+            );
+        }
+    }
+
+    #[test]
+    fn supervisor_rejection_warns_once_not_on_every_attempt() {
+        let mut reporter = RegistrationReporter::default();
+        let endpoint = "http://127.0.0.1:61951";
+        let rejected = RegistrationFailure::Rejected(401);
+
+        // A supervisor that answers and refuses IS a defect: warn on entry.
+        let first = reporter.observe_failure(endpoint, rejected);
+        assert_eq!(first, RegistrationReport::Transition);
+        assert_eq!(
+            registration_log_level(first, rejected),
+            RegistrationLogLevel::Warn
+        );
+
+        // The second identical failure must not re-log at WARN. This is the
+        // whole point: a warning that repeats on a timer is indistinguishable
+        // from background noise, so a real warning in the same stream is
+        // invisible.
+        let second = reporter.observe_failure(endpoint, rejected);
+        assert_eq!(second, RegistrationReport::Unchanged { repeats: 1 });
+        assert_ne!(
+            registration_log_level(second, rejected),
+            RegistrationLogLevel::Warn
+        );
+        assert_eq!(
+            registration_log_level(second, rejected),
+            RegistrationLogLevel::Debug
+        );
+    }
+
+    #[test]
+    fn supervisor_registration_state_change_is_always_reported() {
+        let mut reporter = RegistrationReporter::default();
+        let dead = "http://127.0.0.1:61951";
+        let successor = "http://127.0.0.1:50596";
+
+        assert_eq!(
+            reporter.observe_failure(dead, RegistrationFailure::Unreachable),
+            RegistrationReport::Transition
+        );
+        assert_eq!(
+            reporter.observe_failure(dead, RegistrationFailure::Unreachable),
+            RegistrationReport::Unchanged { repeats: 1 }
+        );
+
+        // A different endpoint is a different condition, even with the same
+        // failure — suppression must never hide the daemon moving supervisors.
+        assert_eq!(
+            reporter.observe_failure(successor, RegistrationFailure::Unreachable),
+            RegistrationReport::Transition
+        );
+
+        // So is a different failure at the same endpoint: unreachable becoming a
+        // live refusal escalates back to WARN instead of staying suppressed.
+        let refused = RegistrationFailure::Rejected(409);
+        let escalated = reporter.observe_failure(successor, refused);
+        assert_eq!(escalated, RegistrationReport::Transition);
+        assert_eq!(
+            registration_log_level(escalated, refused),
+            RegistrationLogLevel::Warn
+        );
+
+        // And so is a different status from the same endpoint.
+        let server_error = RegistrationFailure::Rejected(500);
+        assert_eq!(
+            reporter.observe_failure(successor, server_error),
+            RegistrationReport::Transition
+        );
+    }
+
+    #[test]
+    fn supervisor_recovery_reports_hidden_volume_and_rearms() {
+        let mut reporter = RegistrationReporter::default();
+        let endpoint = "http://127.0.0.1:61951";
+
+        assert!(
+            reporter.observe_success().is_none(),
+            "a success with no failing streak has nothing to report"
+        );
+
+        reporter.observe_failure(endpoint, RegistrationFailure::Unreachable);
+        for _ in 0..4 {
+            reporter.observe_failure(endpoint, RegistrationFailure::Unreachable);
+        }
+        assert_eq!(
+            reporter.observe_success(),
+            Some(4),
+            "recovery must carry the volume the quiet period hid"
+        );
+        assert!(reporter.observe_success().is_none());
+
+        // After a recovery the same failure is a fresh transition, not a repeat.
+        assert_eq!(
+            reporter.observe_failure(endpoint, RegistrationFailure::Unreachable),
+            RegistrationReport::Transition
+        );
+    }
+
+    #[test]
+    fn supervisor_registration_backoff_grows_and_caps() {
+        // The first failure escalates off the base cadence...
+        assert_eq!(
+            next_registration_delay(Duration::ZERO),
+            DEFAULT_HEARTBEAT_INTERVAL * 2
+        );
+        assert_eq!(
+            next_registration_delay(DEFAULT_HEARTBEAT_INTERVAL),
+            DEFAULT_HEARTBEAT_INTERVAL * 2
+        );
+
+        // ...and consecutive failures keep doubling to a bounded ceiling, so a
+        // daemon never gives up on a supervisor that comes back.
+        let mut delay = DEFAULT_HEARTBEAT_INTERVAL;
+        for _ in 0..10 {
+            delay = next_registration_delay(delay);
+        }
+        assert_eq!(delay, MAX_REGISTRATION_BACKOFF);
+
+        // Backoff only ever applies to failures: a healthy daemon heartbeats at
+        // the base cadence, which must stay inside the supervisor's TTL.
+        assert!(DEFAULT_HEARTBEAT_INTERVAL < HEARTBEAT_TTL);
+    }
+
+    #[test]
+    fn supervisor_url_follows_successor_after_inherited_endpoint_dies() {
+        let dir = std::env::temp_dir().join(format!("kin-supervisor-url-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inherited = "http://127.0.0.1:61951".to_string();
+
+        // No endpoint files recorded: the inherited KIN_SUPERVISOR_URL is all
+        // there is, and a failure against it must not invent an endpoint.
+        assert_eq!(
+            resolve_supervisor_url(Some(inherited.clone()), &dir, None).as_deref(),
+            Some(inherited.as_str())
+        );
+        assert_eq!(
+            resolve_supervisor_url(Some(inherited.clone()), &dir, Some(inherited.as_str()))
+                .as_deref(),
+            Some(inherited.as_str())
+        );
+
+        // A live supervisor records its endpoint. While the inherited endpoint
+        // is healthy it still wins...
+        std::fs::write(
+            dir.join(SUPERVISOR_PID_FILE),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        std::fs::write(dir.join(SUPERVISOR_PORT_FILE), "50596").unwrap();
+        assert_eq!(
+            resolve_supervisor_url(Some(inherited.clone()), &dir, None).as_deref(),
+            Some(inherited.as_str())
+        );
+
+        // ...but once it fails, the daemon follows the live successor instead of
+        // heartbeating an idled-out port for the rest of its life.
+        assert_eq!(
+            resolve_supervisor_url(Some(inherited.clone()), &dir, Some(inherited.as_str()))
+                .as_deref(),
+            Some("http://127.0.0.1:50596")
+        );
+
+        // A recorded supervisor that is no longer alive is not adopted, and its
+        // stale endpoint files are cleared.
+        #[cfg(unix)]
+        {
+            std::fs::write(dir.join(SUPERVISOR_PID_FILE), "999999999").unwrap();
+            std::fs::write(dir.join(SUPERVISOR_PORT_FILE), "50596").unwrap();
+            assert_eq!(
+                resolve_supervisor_url(Some(inherited.clone()), &dir, Some(inherited.as_str()))
+                    .as_deref(),
+                Some(inherited.as_str())
+            );
+            assert!(!dir.join(SUPERVISOR_PID_FILE).exists());
+            assert!(!dir.join(SUPERVISOR_PORT_FILE).exists());
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
