@@ -1269,6 +1269,37 @@ async fn resolve_ref_hydration_graph(
     }
 }
 
+/// Run a synchronous ref-hydration `prepare` step on the blocking pool.
+///
+/// Lazy Git-ref hydration replays history synchronously and runs for minutes on
+/// a deep ref. Called straight from an async handler it parks a tokio worker for
+/// that whole time, which leaves the runtime's ability to observe a shutdown
+/// signal resting on how many cores the host happens to have rather than on the
+/// daemon's design: with every worker parked, the signal future is never polled.
+/// Dispatching here keeps the async workers schedulable no matter how deep the
+/// import is.
+///
+/// The hydration gate is carried through rather than released here. It is moved
+/// into the closure and handed back, so the caller still decides when the gate
+/// drops — `prepare` must not outlive it, and the later explicit `drop` must
+/// still happen where it does today. Returning the guard is deliberate: it makes
+/// "the gate outlives the prepare" a property the compiler enforces instead of
+/// one a reviewer has to notice. Releasing it early would let two deep imports
+/// overlap — roughly 2x peak memory, exactly what the gate exists to prevent —
+/// and would not produce a compile error.
+async fn prepare_on_blocking_pool<T, F>(
+    hydration_gate: Option<tokio::sync::OwnedMutexGuard<()>>,
+    prepare: F,
+) -> Result<(T, Option<tokio::sync::OwnedMutexGuard<()>>), (StatusCode, String)>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || (prepare(), hydration_gate))
+        .await
+        .map_err(internal_error)
+}
+
 async fn ensure_ref_hydration_authority_is_current(
     state: &DaemonState,
     graph: &Arc<kin_db::InMemoryGraph>,
@@ -3898,19 +3929,32 @@ async fn review(
             author,
             json,
         } => {
-            let references = [base.as_str(), head.as_str()];
-            let (graph, authority, hydration_gate) =
-                resolve_ref_hydration_graph(&state, session_id.as_ref(), &references).await;
-            let prepared = kin_cli::commands::review::prepare_shadow_request(
-                &state.layout,
-                graph.as_ref(),
-                base,
-                head,
-                title,
-                source_url,
-                author,
-                json,
-            );
+            // Scoped so the borrows of `base`/`head` end here and both can move
+            // into the blocking closure below.
+            let (graph, authority, hydration_gate) = {
+                let references = [base.as_str(), head.as_str()];
+                resolve_ref_hydration_graph(&state, session_id.as_ref(), &references).await
+            };
+            // Shadow review resolves both refs at full semantic depth, so the
+            // same synchronous multi-minute replay applies. Blocking pool, gate
+            // round-trips out for the drop below.
+            let (prepared, hydration_gate) = {
+                let prepare_state = Arc::clone(&state);
+                let prepare_graph = Arc::clone(&graph);
+                prepare_on_blocking_pool(hydration_gate, move || {
+                    kin_cli::commands::review::prepare_shadow_request(
+                        &prepare_state.layout,
+                        prepare_graph.as_ref(),
+                        base,
+                        head,
+                        title,
+                        source_url,
+                        author,
+                        json,
+                    )
+                })
+                .await?
+            };
             let hydrated_changes = prepared.hydrated_changes();
             ensure_ref_hydration_authority_is_current(
                 &state,
@@ -4220,9 +4264,24 @@ async fn blame(
     let reference = req.reference.as_deref();
     let (graph, authority, hydration_gate) =
         resolve_ref_hydration_graph(&state, session_id.as_ref(), reference.as_slice()).await;
-    let prepared =
-        kin_cli::commands::blame::prepare_blame_request(&state.layout, graph.as_ref(), &req)
-            .map_err(internal_error)?;
+    // Preparing resolves the ref, which hydrates a not-yet-imported ancestry at
+    // full semantic depth — minutes of synchronous replay. Run it on the
+    // blocking pool so it cannot park an async worker; the gate comes back out
+    // so it still drops below, after the authority check.
+    let (prepared, hydration_gate) = {
+        let prepare_state = Arc::clone(&state);
+        let prepare_graph = Arc::clone(&graph);
+        let prepare_req = req.clone();
+        prepare_on_blocking_pool(hydration_gate, move || {
+            kin_cli::commands::blame::prepare_blame_request(
+                &prepare_state.layout,
+                prepare_graph.as_ref(),
+                &prepare_req,
+            )
+        })
+        .await?
+    };
+    let prepared = prepared.map_err(internal_error)?;
     let hydrated_changes = prepared.hydrated_changes();
     ensure_ref_hydration_authority_is_current(
         &state,
@@ -4277,9 +4336,22 @@ async fn history(
     let reference = req.reference.as_deref();
     let (graph, authority, hydration_gate) =
         resolve_ref_hydration_graph(&state, session_id.as_ref(), reference.as_slice()).await;
-    let prepared =
-        kin_cli::commands::history::prepare_history_request(&state.layout, graph.as_ref(), &req)
-            .map_err(internal_error)?;
+    // Same reasoning as blame: full-depth semantic hydration is synchronous and
+    // minutes long, so it runs on the blocking pool and the gate round-trips.
+    let (prepared, hydration_gate) = {
+        let prepare_state = Arc::clone(&state);
+        let prepare_graph = Arc::clone(&graph);
+        let prepare_req = req.clone();
+        prepare_on_blocking_pool(hydration_gate, move || {
+            kin_cli::commands::history::prepare_history_request(
+                &prepare_state.layout,
+                prepare_graph.as_ref(),
+                &prepare_req,
+            )
+        })
+        .await?
+    };
+    let prepared = prepared.map_err(internal_error)?;
     let hydrated_changes = prepared.hydrated_changes();
     ensure_ref_hydration_authority_is_current(
         &state,
@@ -9152,6 +9224,76 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+
+    /// Dispatching the prepare must leave the async worker schedulable.
+    ///
+    /// Pinned to a single worker deliberately. This defect is invisible above
+    /// one core: with several workers a parked one is masked by the others, so
+    /// a green multi-core run cannot demonstrate the fix. One worker makes
+    /// "the prepare parked the only worker" observable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn prepare_on_blocking_pool_leaves_the_async_worker_schedulable() {
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ticker_ticks = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            loop {
+                ticker_ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        });
+
+        // Stands in for the synchronous multi-minute hydration replay.
+        let (value, gate) = prepare_on_blocking_pool(None, || {
+            std::thread::sleep(Duration::from_millis(150));
+            7_u32
+        })
+        .await
+        .expect("blocking prepare joins");
+
+        assert_eq!(value, 7);
+        assert!(gate.is_none());
+        // Run inline on the async worker, that 150ms sleep would have parked the
+        // only worker and this ticker could never have advanced.
+        let observed = ticks.load(std::sync::atomic::Ordering::SeqCst);
+        ticker.abort();
+        assert!(
+            observed > 1,
+            "async worker was starved during the blocking prepare ({observed} ticks)"
+        );
+    }
+
+    /// The hydration gate must stay held for the whole prepare and come back
+    /// still locked, so the caller keeps deciding when it drops.
+    ///
+    /// Releasing it early would let two deep imports overlap — roughly 2x peak
+    /// memory, the thing the gate exists to prevent — and would produce no
+    /// compile error, so the invariant is pinned here rather than left to
+    /// review.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prepare_on_blocking_pool_holds_the_gate_and_hands_it_back_locked() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = Arc::clone(&gate).lock_owned().await;
+        let probe = Arc::clone(&gate);
+
+        let (_, returned) = prepare_on_blocking_pool(Some(guard), move || {
+            assert!(
+                probe.try_lock().is_err(),
+                "gate was released while the prepare was still running"
+            );
+        })
+        .await
+        .expect("blocking prepare joins");
+
+        assert!(
+            gate.try_lock().is_err(),
+            "gate was released before the caller dropped it"
+        );
+        drop(returned);
+        assert!(
+            gate.try_lock().is_ok(),
+            "gate did not release when the caller dropped it"
+        );
+    }
 
     #[test]
     fn semloc_rerank_priority_demotes_and_boosts() {
