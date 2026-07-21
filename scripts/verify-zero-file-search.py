@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+"""Zero File-Search Authority guard.
+
+Kin answers locate/search/context/trace/review/xref/rename queries from
+graph-owned truth, never by consulting raw filesystem contents. This guard
+fails when a raw filesystem read, existence, or traversal primitive appears in
+an answer path outside the justified allowlist.
+
+Usage: verify-zero-file-search.py [repo_root]
+
+The optional repo_root selects the tree to scan (default: the repo containing
+this script). The allowlist always travels with the script — it is the policy,
+not a property of the tree under test — which lets CI point the guard at a
+deliberately poisoned copy and assert that it fails.
+"""
 import os
 import sys
 import json
@@ -7,7 +21,7 @@ from datetime import date
 
 # Resolve paths relative to kin repo root
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-KIN_ROOT = os.path.dirname(SCRIPT_DIR)
+KIN_ROOT = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.dirname(SCRIPT_DIR)
 ALLOWLIST_PATH = os.path.join(SCRIPT_DIR, "zero-file-search-allowlist.json")
 
 # Every allowlist entry must carry these so each exemption has an accountable
@@ -16,11 +30,21 @@ REQUIRED_FIELDS = ("file", "reason", "owner", "expiration")
 
 
 def load_allowlist():
-    """Load and validate the allowlist, returning the set of exempt files.
+    """Load and validate the allowlist, returning {file: allowed_matches}.
 
-    Each entry must declare file, reason, owner, and an ISO `expiration` date.
-    Missing fields, malformed dates, and past-due exemptions fail the guard so
-    exemptions cannot silently accumulate or outlive their justification.
+    Each entry must declare file, reason, owner, and an ISO `expiration` date,
+    and must name a path that actually exists. Missing fields, malformed dates,
+    past-due exemptions, and entries for deleted files all fail the guard, so
+    exemptions cannot silently accumulate, outlive their justification, or sit
+    dormant waiting to auto-exempt a file that gets recreated under the same
+    path.
+
+    `allow_match` is optional. When present it lists exact substrings that are
+    exempt within that file, mirroring `allow_for` in
+    scripts/zero_file_search_guard.sh: the exemption is pinned to the known
+    lines, so a new or different filesystem primitive in the same file still
+    trips the guard. When absent the whole file is exempt, which is only
+    appropriate for files that are an IO boundary end to end.
     """
     try:
         with open(ALLOWLIST_PATH, "r", encoding="utf-8") as f:
@@ -31,7 +55,7 @@ def load_allowlist():
 
     entries = data.get("allowlist", [])
     errors = []
-    files = set()
+    files = {}
     today = date.today()
 
     for i, item in enumerate(entries):
@@ -42,7 +66,28 @@ def load_allowlist():
                 f"field(s): {', '.join(missing)}"
             )
             continue
-        files.add(item["file"])
+
+        if not os.path.exists(os.path.join(KIN_ROOT, item["file"])):
+            errors.append(
+                f"  entry {item['file']} names a path that does not exist "
+                f"(owner: {item['owner']}) — remove the stale exemption; leaving "
+                f"it would silently exempt any file later recreated at that path"
+            )
+            continue
+
+        matches = item.get("allow_match")
+        if matches is not None and (
+            not isinstance(matches, list)
+            or not matches
+            or not all(isinstance(m, str) and m for m in matches)
+        ):
+            errors.append(
+                f"  entry {item['file']} has an invalid allow_match "
+                f"(want a non-empty list of non-empty strings)"
+            )
+            continue
+        files[item["file"]] = set(matches) if matches else None
+
         try:
             exp_date = date.fromisoformat(item["expiration"])
         except ValueError:
@@ -116,7 +161,24 @@ QUERY_COMMANDS = {
     # scanning it keeps that authority path free of any raw source-tree walk.
     "refs.rs",
     # Context-pack assembly is an answer authority, not an IO boundary.
-    "context.rs"
+    "context.rs",
+    # rename derives its edit plan — the answer — from the graph's entity and
+    # reference relations, so it is an authority path even though applying the
+    # plan later writes files.
+    "rename.rs",
+    # deps answers a cross-repo dependency query. Whether it may answer it from
+    # manifests instead of the spine is an open decision; scanning it keeps the
+    # question visible instead of silent.
+    "deps.rs",
+    # Read-only analyses that answer from graph relations, history, and health
+    # records. None of them should need the working tree to produce an answer.
+    "blame.rs",
+    "impact.rs",
+    "dead_code.rs",
+    "overview.rs",
+    # health reports on the local install and graph state. Environment probes
+    # here are a diagnostic boundary, but repo-content reads would not be.
+    "health.rs"
 }
 
 # Query/answer authority handlers that live inside an otherwise IO-boundary
@@ -158,11 +220,28 @@ def is_test_file(rel_path):
     return False
 
 
-# Patterns to scan
+# Patterns to scan.
+#
+# The first group is the raw filesystem read / existence / traversal primitive
+# set shared with scripts/zero_file_search_guard.sh. Answering a semantic query
+# by probing the working tree is the violation the rule exists to stop, and it
+# does not require the `std::fs::` prefix to happen: `path.exists()`,
+# `File::open`, a bare `read_dir(`, or a `WalkDir` traversal all read the tree
+# just as directly. Writes and directory creation stay out of the deny set —
+# materialization is a projection boundary, not answer-by-search.
 PATTERNS = [
+    (re.compile(r'\.is_file\(\)'), "filesystem existence probe (is_file)"),
+    (re.compile(r'\.is_dir\(\)'), "filesystem existence probe (is_dir)"),
+    (re.compile(r'\.exists\(\)'), "filesystem existence probe (exists)"),
+    (re.compile(r'\.canonicalize\(\)'), "filesystem path resolution (canonicalize)"),
+    (re.compile(r'\bsymlink_metadata\b'), "filesystem metadata probe"),
+    (re.compile(r'\bread_link\b'), "filesystem symlink read"),
+    (re.compile(r'\bFile::open\b'), "raw file handle open"),
+    (re.compile(r'\bread_dir\('), "directory traversal (read_dir)"),
+    (re.compile(r'\bWalkDir\b|\bwalkdir::'), "directory traversal (walkdir)"),
+    (re.compile(r'\bglob::glob\b'), "filesystem glob"),
     (re.compile(r'\bstd::fs::[a-zA-Z0-9_]+'), "std::fs API usage"),
-    (re.compile(r'\bfs::(read|read_to_string|read_dir|write|copy|create_dir|create_dir_all|remove_file|remove_dir|remove_dir_all)\b'), "fs API usage"),
-    (re.compile(r'\bwalkdir::WalkDir\b'), "walkdir usage"),
+    (re.compile(r'(?<![_a-z])fs::(read|read_to_string|read_dir|metadata|write|copy|create_dir|create_dir_all|remove_file|remove_dir|remove_dir_all)\b'), "fs API usage"),
     (re.compile(r'Command::new\("git"\).*?"grep"'), "git grep subprocess usage")
 ]
 
@@ -197,7 +276,7 @@ def find_fn_body_ranges(lines, fn_names):
     return ranges
 
 
-def scan_file(filepath, rel_path, query_fn_names=None):
+def scan_file(filepath, rel_path, query_fn_names=None, allowed_matches=None):
     violations = []
 
     with open(filepath, "r", encoding="utf-8") as f:
@@ -259,10 +338,18 @@ def scan_file(filepath, rel_path, query_fn_names=None):
         ):
             continue
 
-        # Scan for patterns
-        for pattern, desc in PATTERNS:
-            if pattern.search(line):
-                violations.append((idx, line.strip(), desc))
+        # Lines pinned by an `allow_match` exemption are a justified IO
+        # boundary. Anything else in the same file still trips the guard.
+        if allowed_matches and any(m in line for m in allowed_matches):
+            continue
+
+        # Scan for patterns. A line can match several primitives at once
+        # (`std::fs::read_dir` is both an fs call and a traversal); report the
+        # line once with every primitive it tripped, so the violation count
+        # tracks offending lines rather than pattern hits.
+        descs = [desc for pattern, desc in PATTERNS if pattern.search(line)]
+        if descs:
+            violations.append((idx, line.strip(), ", ".join(dict.fromkeys(descs))))
 
     return violations
 
@@ -285,17 +372,21 @@ def main():
             filepath = os.path.join(root, file)
             rel_path = os.path.relpath(filepath, KIN_ROOT)
 
-            # Allowed files are exempt regardless of where they live.
+            # Whole-file exemptions (an `allow_match`-less entry) skip the scan
+            # entirely; pinned exemptions still scan, minus their named lines.
+            allowed_matches = None
             if rel_path in allowlist:
-                continue
+                allowed_matches = allowlist[rel_path]
+                if allowed_matches is None:
+                    continue
 
             # Query handlers inside boundary crates are scanned function-scoped;
             # they bypass the boundary skip so their answer paths are covered.
             query_fns = DAEMON_QUERY_HANDLERS.get(rel_path)
-            if query_fns is None and is_test_file(rel_path):
+            if query_fns is None and allowed_matches is None and is_test_file(rel_path):
                 continue
 
-            violations = scan_file(filepath, rel_path, query_fns)
+            violations = scan_file(filepath, rel_path, query_fns, allowed_matches)
             if violations:
                 print(f"\n[VIOLATION] {rel_path} contains forbidden filesystem access:")
                 for line_num, content, desc in violations:
