@@ -289,7 +289,7 @@ where
                 method,
                 client_supports_roots,
                 repo_binder.is_some(),
-                !binding.is_bound(),
+                binding.wants_workspace_roots(),
                 Instant::now(),
             ) {
                 let request = serde_json::json!({
@@ -402,6 +402,15 @@ impl RepoBindingState {
         self.daemon_url.is_some()
     }
 
+    /// Whether the server should still be reaching for workspace roots on the
+    /// ordinary triggers. A refusing server counts as needing one: it is bound
+    /// to a repository the client is not looking at, which is no more useful
+    /// than being unbound, so it keeps trying to bind rather than waiting only
+    /// for the client to announce another change.
+    fn wants_workspace_roots(&self) -> bool {
+        !self.is_bound() || self.is_mismatched()
+    }
+
     fn is_mismatched(&self) -> bool {
         self.mismatch.is_some()
     }
@@ -487,7 +496,7 @@ impl WorkspaceRootsRequestState {
         method: Option<&str>,
         client_supports_roots: bool,
         has_repo_binder: bool,
-        daemon_unbound: bool,
+        wants_binding: bool,
         now: Instant,
     ) -> bool {
         let should_begin = should_request_workspace_roots(
@@ -495,7 +504,7 @@ impl WorkspaceRootsRequestState {
             client_supports_roots,
             self.request_in_flight(now),
             has_repo_binder,
-            daemon_unbound,
+            wants_binding,
         );
         if should_begin {
             self.in_flight_since = Some(now);
@@ -511,14 +520,15 @@ impl WorkspaceRootsRequestState {
 /// A roots *change* is honored whether or not a repository is bound: it is the
 /// only signal an editor sends when its window moves to another folder, and
 /// ignoring it once bound is what leaves the server answering from the previous
-/// repository. The other triggers stay gated on an unbound daemon so a settled
-/// session does not re-ask on every `tools/list`.
+/// repository. The other triggers are gated on `wants_binding` — unbound, or
+/// bound to a repository the client has left — so a settled session does not
+/// re-ask on every `tools/list`, while a refusing one keeps trying.
 fn should_request_workspace_roots(
     method: Option<&str>,
     client_supports_roots: bool,
     request_in_flight: bool,
     has_repo_binder: bool,
-    daemon_unbound: bool,
+    wants_binding: bool,
 ) -> bool {
     if !client_supports_roots || request_in_flight || !has_repo_binder {
         return false;
@@ -526,7 +536,7 @@ fn should_request_workspace_roots(
     match method {
         Some("notifications/roots/list_changed") => true,
         Some("initialized") | Some("notifications/initialized") | Some("tools/list") => {
-            daemon_unbound
+            wants_binding
         }
         _ => false,
     }
@@ -1612,6 +1622,31 @@ mod tests {
     }
 
     #[test]
+    fn a_refusing_binding_still_wants_workspace_roots() {
+        let mut binding = RepoBindingState::default();
+        assert!(
+            binding.wants_workspace_roots(),
+            "unbound wants a repository"
+        );
+
+        binding.bind(bound_repo("/repo/a", "http://127.0.0.1:4111"));
+        assert!(
+            !binding.wants_workspace_roots(),
+            "a settled binding must not re-ask on every trigger"
+        );
+
+        binding.mark_mismatch(vec![PathBuf::from("/elsewhere")]);
+        assert!(
+            binding.wants_workspace_roots(),
+            "bound to a repository the client left is no better than unbound"
+        );
+
+        binding.bind(bound_repo("/repo/b", "http://127.0.0.1:4222"));
+        assert!(!binding.wants_workspace_roots());
+        assert!(!binding.is_mismatched(), "binding again clears the refusal");
+    }
+
+    #[test]
     fn workspace_roots_change_is_honored_after_a_repository_is_already_bound() {
         // The defect this locks down: with a daemon already bound, the roots
         // change that an editor sends when its window moves to another folder
@@ -1899,6 +1934,56 @@ mod tests {
         assert!(
             text.contains("not enabled in this MCP profile"),
             "a successful re-bind must clear the refusal and let the call through: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusing_server_keeps_trying_to_bind_on_ordinary_triggers() {
+        // Bind A, switch to a workspace that cannot be bound, then send only a
+        // plain `tools/list`. A refusing server is no more useful than an
+        // unbound one, so it must reach for roots again instead of waiting for
+        // the client to announce another change — and a bindable answer there
+        // clears the refusal.
+        let (binder, calls) = ScriptedBinder::install(vec![
+            Some(bound_repo("/repo/a", "http://127.0.0.1:4111")),
+            None,
+            Some(bound_repo("/repo/b", "http://127.0.0.1:4222")),
+        ]);
+
+        let responses = drive_daemon_loop(
+            &[
+                initialize_with_roots_capability(),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+                roots_response(&["/repo/a"]),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/roots/list_changed"}),
+                roots_response(&["/elsewhere/not-a-kin-repo"]),
+                serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+                roots_response(&["/repo/b"]),
+                tool_call(13, "semantic_locate"),
+            ],
+            Some(binder),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            roots_requests(&responses).len(),
+            3,
+            "a refusing server must re-request roots on an ordinary trigger: {responses:#?}"
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            3,
+            "the third roots response must reach the binder"
+        );
+        let answer = responses
+            .iter()
+            .find(|value| value.get("id").and_then(|id| id.as_u64()) == Some(13))
+            .expect("the tool call must be answered");
+        let text = tool_error_text(answer);
+        assert!(
+            text.contains("not enabled in this MCP profile"),
+            "binding again must clear the refusal: {text}"
         );
     }
 
