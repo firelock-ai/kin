@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Per-language import/module-edge matrix (FIR-1313).
+//! Per-language import/module-edge matrix.
 //!
 //! Every language with a full adapter must turn an import/use/require/include
 //! statement into a `FileImport` the cross-file linker can key on. All 13

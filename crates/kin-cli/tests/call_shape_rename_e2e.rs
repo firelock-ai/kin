@@ -17,7 +17,7 @@
 //!
 //! Both gate channels are exercised: the inline `signature_change`/`Breaking`
 //! channel (`collect_inline_comments`) AND the SHADOW `downstream_risk` channel
-//! (`derive_shadow_policy`). FIR-1440 shipped because only the inline channel had
+//! (`derive_shadow_policy`). This gap shipped because only the inline channel had
 //! e2e coverage — the shadow gate, which is the real merge-trust verdict,
 //! re-blocked the positional-safe rename with no test to catch it.
 
@@ -207,7 +207,7 @@ fn link_and_review(
 }
 
 /// Drive the SHADOW gate (the `downstream_risk` channel) over the same real
-/// mini-graph. This is the merge-trust verdict the shipped FIR-1440 bug slipped
+/// mini-graph. This is the merge-trust verdict the shipped bug slipped
 /// through: the inline-only assertions above never exercised it. Builds a
 /// `Review` from the real diff + impact + inline comments — reproducing the
 /// exact production seam — and returns the gate verdict with the graph inputs
@@ -848,7 +848,7 @@ fn e2e_review_output_is_deterministic() {
 
 #[test]
 fn e2e_shadow_gate_positional_rename_needs_attention_not_would_block() {
-    // FIR-1440, the shipped blind spot: the inline assertions above pass for this
+    // The shipped blind spot: the inline assertions above pass for this
     // rename, but the real merge-trust verdict is the SHADOW gate. Pre-fix the
     // shadow `downstream_risk` channel re-blocked the positional-safe rename
     // (WouldBlock); post-fix it demotes to attention, matching the inline channel.
@@ -868,7 +868,7 @@ fn e2e_shadow_gate_positional_rename_needs_attention_not_would_block() {
 #[test]
 fn e2e_shadow_gate_keyword_caller_rename_would_block() {
     // A caller names the renamed parameter -> the rename strands it -> the shadow
-    // gate must still block (no over-suppression from the FIR-1440 fix).
+    // gate must still block (no over-suppression from the fix).
     let verdict = link_and_shadow_verdict(
         KEYWORD_CALLER,
         "def target(ext, args)",

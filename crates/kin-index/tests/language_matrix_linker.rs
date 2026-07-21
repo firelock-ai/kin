@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Cross-file linker arm of the language matrix (FIR-1313).
+//! Cross-file linker arm of the language matrix.
 //!
 //! The parser adapters narrow callees to simple names; this file drives the
 //! real linker (`link_cross_file`) to prove those names resolve across files and

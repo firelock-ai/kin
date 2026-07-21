@@ -232,7 +232,7 @@ public:
 }
 
 // ---------------------------------------------------------------------------
-// Cosmetic-stability matrix (FIR-1313): extend the comment-only + whitespace-
+// Cosmetic-stability matrix: extend the comment-only + whitespace-
 // only invariant to every full-adapter language not covered above. Go, C++,
 // Rust, and Python are already exercised earlier in this file; the block below
 // adds TypeScript, JavaScript, Java, C, C#, Ruby, PHP, Kotlin, and Swift. All

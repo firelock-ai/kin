@@ -1220,9 +1220,9 @@ mod equivalence_tests {
         );
     }
 
-    // ---- Protected true positives (FIR-1306 shapes) stay non-equivalent -----
+    // ---- Protected true positives stay non-equivalent -----
 
-    /// FIR-1306 origin shape (cli b9cacbc347): adding a narrowing conjunct to a
+    /// Adding a narrowing conjunct to a
     /// predicate is a real domain change and must stay non-equivalent.
     #[test]
     fn python_added_narrowing_conjunct_is_not_equivalent() {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Per-language entity-extraction matrix (FIR-1313).
+//! Per-language entity-extraction matrix.
 //!
 //! For every language with a full adapter, asserts that functions, methods, and
 //! classes/types are extracted with non-empty canonical signatures, and that a
