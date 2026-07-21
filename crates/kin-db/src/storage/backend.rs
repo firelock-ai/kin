@@ -600,6 +600,7 @@ impl LocalFileBackend {
             .join(format!("{session_id}.bin"))
     }
 
+    #[cfg(test)]
     fn source_blob_path(&self, repo_id: &str, digest: [u8; 32]) -> Result<PathBuf, KinDbError> {
         validate_source_blob_repo_id(repo_id)?;
         let digest = hex::encode(digest);
@@ -610,6 +611,88 @@ impl LocalFileBackend {
             .join("sha256")
             .join(&digest[..2])
             .join(digest))
+    }
+
+    /// Resolve an exact-source object path through real directories below the
+    /// configured storage root. The configured root itself is the trust
+    /// boundary and may be an intentional alias; every component controlled
+    /// by Kin below that root must be a directory entry, never a symlink.
+    fn trusted_source_blob_path(
+        &self,
+        repo_id: &str,
+        digest: [u8; 32],
+        confirm_durability: bool,
+    ) -> Result<PathBuf, KinDbError> {
+        validate_source_blob_repo_id(repo_id)?;
+        std::fs::create_dir_all(&self.base_path).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to create immutable source blob trust root {}: {error}",
+                self.base_path.display()
+            ))
+        })?;
+        let trusted_root = std::fs::canonicalize(&self.base_path).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to resolve immutable source blob trust root {}: {error}",
+                self.base_path.display()
+            ))
+        })?;
+        let root_metadata = std::fs::symlink_metadata(&trusted_root).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to inspect immutable source blob trust root {}: {error}",
+                trusted_root.display()
+            ))
+        })?;
+        if !root_metadata.file_type().is_dir() {
+            return Err(KinDbError::StorageError(format!(
+                "immutable source blob trust root {} is not a real directory",
+                trusted_root.display()
+            )));
+        }
+
+        let digest_hex = hex::encode(digest);
+        let mut directory = trusted_root.clone();
+        for component in [repo_id, "source-blobs", "sha256", &digest_hex[..2]] {
+            directory.push(component);
+            match std::fs::create_dir(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(KinDbError::StorageError(format!(
+                        "failed to create immutable source blob directory {}: {error}",
+                        directory.display()
+                    )))
+                }
+            }
+            let metadata = std::fs::symlink_metadata(&directory).map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to inspect immutable source blob directory {}: {error}",
+                    directory.display()
+                ))
+            })?;
+            if !metadata.file_type().is_dir() {
+                return Err(KinDbError::StorageError(format!(
+                    "refusing symlinked or non-directory immutable source blob ancestor {}",
+                    directory.display()
+                )));
+            }
+            let resolved = std::fs::canonicalize(&directory).map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to resolve immutable source blob directory {}: {error}",
+                    directory.display()
+                ))
+            })?;
+            if !resolved.starts_with(&trusted_root) {
+                return Err(KinDbError::StorageError(format!(
+                    "immutable source blob directory {} escaped trusted root {}",
+                    resolved.display(),
+                    trusted_root.display()
+                )));
+            }
+            if confirm_durability {
+                mmap::sync_parent_dir(&directory)?;
+            }
+        }
+        Ok(directory.join(digest_hex))
     }
 
     fn deltas_dir(&self, repo_id: &str) -> PathBuf {
@@ -1806,8 +1889,14 @@ impl StorageBackend for LocalFileBackend {
         })?;
         validate_source_blob_size(byte_len, &format!("repo {repo_id}"))?;
         verify_source_blob_digest(digest, data, &format!("repo {repo_id}"))?;
+        let prepared_path = self.trusted_source_blob_path(repo_id, digest, true)?;
         let _lock = self.acquire_lock(repo_id)?;
-        let path = self.source_blob_path(repo_id, digest)?;
+        let path = self.trusted_source_blob_path(repo_id, digest, false)?;
+        if path != prepared_path {
+            return Err(KinDbError::StorageError(format!(
+                "immutable source blob trust root changed while acquiring repo {repo_id} lock"
+            )));
+        }
         match std::fs::symlink_metadata(&path) {
             Ok(_) => {
                 let existing = mmap::read_regular_bounded(
@@ -1822,6 +1911,7 @@ impl StorageBackend for LocalFileBackend {
                         path.display()
                     )));
                 }
+                mmap::sync_parent_dir(&path)?;
                 return Ok(());
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1833,23 +1923,17 @@ impl StorageBackend for LocalFileBackend {
             }
         }
 
-        let parent = path.parent().ok_or_else(|| {
-            KinDbError::StorageError(format!(
-                "immutable source blob path {} has no parent",
-                path.display()
-            ))
-        })?;
-        std::fs::create_dir_all(parent).map_err(|error| {
-            KinDbError::StorageError(format!(
-                "failed to create immutable source blob directory {}: {error}",
-                parent.display()
-            ))
-        })?;
         #[cfg(test)]
         if let Some(hook) = self.source_blob_before_publish_hook.lock().take() {
             hook();
         }
-        let _published = mmap::publish_new_file_no_clobber(&path, data, "immutable source blob")?;
+        if self.trusted_source_blob_path(repo_id, digest, false)? != path {
+            return Err(KinDbError::StorageError(format!(
+                "immutable source blob trust root changed before publishing {}",
+                path.display()
+            )));
+        }
+        let published = mmap::publish_new_file_no_clobber(&path, data, "immutable source blob")?;
         let installed = mmap::read_regular_bounded(
             &path,
             "installed immutable source blob",
@@ -1862,6 +1946,12 @@ impl StorageBackend for LocalFileBackend {
                 path.display()
             )));
         }
+        if !published {
+            // A non-cooperating writer may have installed the verified object.
+            // Its directory entry is not acknowledged until we confirm the
+            // directory ourselves.
+            mmap::sync_parent_dir(&path)?;
+        }
         Ok(())
     }
 
@@ -1871,8 +1961,14 @@ impl StorageBackend for LocalFileBackend {
         digest: [u8; 32],
     ) -> Result<Option<Vec<u8>>, KinDbError> {
         validate_source_blob_repo_id(repo_id)?;
+        let prepared_path = self.trusted_source_blob_path(repo_id, digest, false)?;
         let _lock = self.acquire_lock(repo_id)?;
-        let path = self.source_blob_path(repo_id, digest)?;
+        let path = self.trusted_source_blob_path(repo_id, digest, false)?;
+        if path != prepared_path {
+            return Err(KinDbError::StorageError(format!(
+                "immutable source blob trust root changed while acquiring repo {repo_id} lock"
+            )));
+        }
         let data = match std::fs::symlink_metadata(&path) {
             Ok(_) => {
                 mmap::read_regular_bounded(&path, "immutable source blob", MAX_SOURCE_BLOB_BYTES)?
@@ -2574,6 +2670,55 @@ mod tests {
         assert_eq!(std::fs::read(&victim).unwrap(), b"do not replace");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn local_source_blob_rejects_every_symlinked_storage_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let data = b"source";
+        let digest = source_digest(data);
+        let digest_hex = hex::encode(digest);
+        for ancestor in ["repo", "source-blobs", "sha256", "prefix"] {
+            let dir = TempDir::new().unwrap();
+            let outside = TempDir::new().unwrap();
+            let backend = LocalFileBackend::new(dir.path());
+            let repo = dir.path().join("repo-a");
+            let source_blobs = repo.join("source-blobs");
+            let sha256 = source_blobs.join("sha256");
+            let prefix = sha256.join(&digest_hex[..2]);
+            let link_path = match ancestor {
+                "repo" => repo,
+                "source-blobs" => {
+                    std::fs::create_dir(&repo).unwrap();
+                    source_blobs
+                }
+                "sha256" => {
+                    std::fs::create_dir_all(&source_blobs).unwrap();
+                    sha256
+                }
+                "prefix" => {
+                    std::fs::create_dir_all(&sha256).unwrap();
+                    prefix
+                }
+                _ => unreachable!(),
+            };
+            symlink(outside.path(), &link_path).unwrap();
+
+            let error = backend
+                .save_source_blob("repo-a", digest, data)
+                .expect_err("a symlinked object ancestor must fail closed");
+            assert!(
+                error.to_string().contains("symlinked or non-directory"),
+                "unexpected error for {ancestor}: {error}"
+            );
+            assert_eq!(
+                std::fs::read_dir(outside.path()).unwrap().count(),
+                0,
+                "the {ancestor} symlink target must remain untouched"
+            );
+        }
+    }
+
     #[test]
     fn local_source_blob_rejects_oversized_sparse_object_before_reading() {
         let dir = TempDir::new().unwrap();
@@ -2611,6 +2756,74 @@ mod tests {
             .expect_err("a racing different object must be preserved and rejected");
         assert!(error.to_string().contains("digest mismatch"));
         assert_eq!(std::fs::read(path).unwrap(), b"non-cooperating writer");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_source_blob_rejects_ancestor_symlink_substituted_before_publish() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let data = b"expected immutable bytes";
+        let digest = source_digest(data);
+        let path = backend.source_blob_path("repo-a", digest).unwrap();
+        let prefix = path.parent().unwrap().to_path_buf();
+        let raced_prefix = prefix.clone();
+        let outside_path = outside.path().to_path_buf();
+        backend.set_source_blob_before_publish_hook(move || {
+            std::fs::remove_dir(&raced_prefix).unwrap();
+            symlink(outside_path, raced_prefix).unwrap();
+        });
+
+        let error = backend
+            .save_source_blob("repo-a", digest, data)
+            .expect_err("an ancestor swapped after validation must fail closed");
+        assert!(error.to_string().contains("symlinked or non-directory"));
+        assert_eq!(
+            std::fs::read_dir(outside.path()).unwrap().count(),
+            0,
+            "the substituted ancestor target must remain untouched"
+        );
+    }
+
+    #[test]
+    fn local_source_blob_retry_reconfirms_failed_publication_directory_sync() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let data = b"durable immutable source bytes";
+        let digest = source_digest(data);
+        let path = backend.source_blob_path("repo-a", digest).unwrap();
+
+        // Four source-directory ancestors are confirmed before publication;
+        // fail the following sync of the newly linked object entry.
+        mmap::fail_parent_sync_after(4);
+        let first_error = backend
+            .save_source_blob("repo-a", digest, data)
+            .expect_err("an unconfirmed object link must not be acknowledged");
+        assert!(first_error
+            .to_string()
+            .contains("injected parent-directory fsync failure"));
+        assert!(path.exists(), "the failed sync happens after publication");
+
+        // The object exists on retry, but that retry must still perform its
+        // own directory confirmation rather than trusting path existence.
+        mmap::fail_parent_sync_after(4);
+        let retry_error = backend
+            .save_source_blob("repo-a", digest, data)
+            .expect_err("retry must propagate its own directory sync failure");
+        assert!(retry_error
+            .to_string()
+            .contains("injected parent-directory fsync failure"));
+
+        backend
+            .save_source_blob("repo-a", digest, data)
+            .expect("a retry may acknowledge only after directory confirmation");
+        assert_eq!(
+            backend.load_source_blob("repo-a", digest).unwrap(),
+            Some(data.to_vec())
+        );
     }
 
     #[test]
