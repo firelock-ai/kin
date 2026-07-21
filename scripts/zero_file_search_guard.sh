@@ -50,7 +50,7 @@ deny_re='\.is_file\(\)|\.is_dir\(\)|\.exists\(\)|\.canonicalize\(\)|\.metadata\(
 # or different primitive in the same file still trips the guard.
 allow_for() {
   case "$1" in
-    locate.rs)             printf '%s' 'consent_marker_path' ;;
+    locate.rs)             printf '%s' 'let marker_present = tel::consent_marker_path(layout.root()).exists();' ;;
     locate_cursor.rs)      printf '%s' 'std::fs::read_to_string(&path)' ;;
     locate_debug.rs)       printf '%s' 'std::fs::read_to_string(path)' ;;
     contextbench_locate.rs) printf '%s' 'std::fs::read_to_string(&task_file)' ;;
@@ -102,15 +102,37 @@ for rel in "${authority_files[@]}"; do
   allow="$(allow_for "$base")"
   read -r test_start test_end <<<"$(test_module_span "$file")"
 
+  if [[ -n "$allow" ]]; then
+    allow_hits="$(grep -F -o -- "$allow" "$file" || true)"
+    allow_count=0
+    if [[ -n "$allow_hits" ]]; then
+      allow_count="$(printf '%s\n' "$allow_hits" | wc -l | tr -d '[:space:]')"
+    fi
+    if [[ "$allow_count" -ne 1 ]]; then
+      violations+=(
+        "$rel: allowlist expression occurs $allow_count times (want exactly 1): $allow"
+      )
+      continue
+    fi
+  fi
+
   # Everything outside the test module, before it and after it alike, with the
   # original line numbers preserved.
   region="$(awk -v s="$test_start" -v e="$test_end" \
     'NR < s || NR > e { print NR ":" $0 }' "$file")"
-  hits="$(printf '%s\n' "$region" | grep -E "$deny_re" || true)"
-  [[ -n "$hits" ]] || continue
+  scan_region="$region"
   if [[ -n "$allow" ]]; then
-    hits="$(printf '%s\n' "$hits" | grep -vF "$allow" || true)"
+    scan_region="$(printf '%s\n' "$region" | awk -v needle="$allow" '
+      {
+        pos = index($0, needle)
+        if (pos > 0) {
+          $0 = substr($0, 1, pos - 1) substr($0, pos + length(needle))
+        }
+        print
+      }
+    ')"
   fi
+  hits="$(printf '%s\n' "$scan_region" | grep -E "$deny_re" || true)"
   [[ -n "$hits" ]] || continue
   while IFS= read -r hit; do
     [[ -n "$hit" ]] && violations+=("$rel:$hit")

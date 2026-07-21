@@ -81,6 +81,26 @@ fn is_failing(status: &HealthStatus) -> bool {
     matches!(status, HealthStatus::Missing | HealthStatus::Misconfigured)
 }
 
+/// Whether a check prevents the aggregate report from claiming readiness.
+///
+/// Most `Stale` checks describe recoverable local drift and remain advisory,
+/// but semantic readiness is an authority gate: if daemon graph coverage is
+/// stale or cannot be read, the report cannot honestly claim the semantic
+/// query surface is ready.
+fn blocks_readiness(check: &HealthCheck) -> bool {
+    is_failing(&check.status)
+        || (check.id == "semantic_query_readiness" && matches!(check.status, HealthStatus::Stale))
+}
+
+fn assemble_health_report(platform: String, checks: Vec<HealthCheck>) -> HealthReport {
+    let healthy = !checks.iter().any(blocks_readiness);
+    HealthReport {
+        platform,
+        checks,
+        healthy,
+    }
+}
+
 /// A pass/attention/skip tally over a set of checks, used for the one-line
 /// readiness summary printed by `kin doctor` and `kin setup status`.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -137,13 +157,7 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_semantic_query_readiness().await);
     checks.push(check_retrieval_profile());
 
-    let healthy = !checks.iter().any(|c| is_failing(&c.status));
-
-    HealthReport {
-        platform: env::consts::OS.to_string(),
-        checks,
-        healthy,
-    }
+    assemble_health_report(env::consts::OS.to_string(), checks)
 }
 
 fn check_registry_authority() -> HealthCheck {
@@ -1482,6 +1496,37 @@ mod tests {
             summary.passed + summary.attention + summary.skipped,
             report.checks.len(),
             "every check lands in exactly one bucket"
+        );
+    }
+
+    #[test]
+    fn unavailable_semantic_authority_blocks_readiness_without_losing_diagnostics() {
+        let detail = "daemon reachable, but graph embedding status is unavailable";
+        let report = assemble_health_report(
+            "test".to_string(),
+            vec![
+                check_with("kin_binary", HealthStatus::Healthy),
+                HealthCheck::new(
+                    "semantic_query_readiness",
+                    "Semantic query readiness",
+                    HealthStatus::Stale,
+                    detail,
+                )
+                .with_manual_fix("resolve the daemon graph authority error"),
+            ],
+        );
+
+        assert!(
+            !report.healthy,
+            "unknown graph authority must fail aggregate semantic readiness"
+        );
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["healthy"], false);
+        assert_eq!(value["checks"][1]["status"], "stale");
+        assert_eq!(value["checks"][1]["detail"], detail);
+        assert_eq!(
+            value["checks"][1]["manual_fix"],
+            "resolve the daemon graph authority error"
         );
     }
 

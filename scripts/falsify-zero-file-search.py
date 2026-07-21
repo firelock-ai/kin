@@ -60,6 +60,18 @@ def whole_file_exempt(root):
     return {e["file"] for e in data.get("allowlist", []) if not e.get("allow_match")}
 
 
+def pinned_allowlist(root):
+    """Return every expression-pinned exemption keyed by source file."""
+    path = os.path.join(root, "scripts", "zero-file-search-allowlist.json")
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return {
+        entry["file"]: entry["allow_match"]
+        for entry in data.get("allowlist", [])
+        if entry.get("allow_match")
+    }
+
+
 def production_end(lines):
     """Index of the first column-0 `#[cfg(test)]`, or len(lines).
 
@@ -191,6 +203,105 @@ def main():
             with open(path, "w", encoding="utf-8") as f:
                 f.write(original)
         print(f"  {os.path.basename(rel):24} {'  '.join(marks)}")
+
+    # An expression pin must exempt only its own bytes, not the entire source
+    # line. Poison every pinned line while retaining the allowed expression on
+    # that same line. The historical `if allow_match in line: continue` bug
+    # passed this mutation because the poison inherited the neighboring
+    # exemption; the hardened guard must name every affected file.
+    pinned = pinned_allowlist(root)
+    originals = {}
+    setup_failed = False
+    try:
+        for rel, matches in pinned.items():
+            path = os.path.join(root, rel)
+            with open(path, "r", encoding="utf-8") as f:
+                original = f.read()
+            originals[path] = original
+            lines = original.split("\n")
+            poisoned_lines = set()
+            for match in matches:
+                locations = [idx for idx, line in enumerate(lines) if match in line]
+                if len(locations) != 1:
+                    failures.append(
+                        f"{rel}: pinned expression {match!r} occurs "
+                        f"{len(locations)} times (want exactly 1)"
+                    )
+                    setup_failed = True
+                    continue
+                poisoned_lines.add(locations[0])
+            for idx in poisoned_lines:
+                lines[idx] = f"{POISON} {lines[idx]}"
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+
+        if not setup_failed:
+            code, out = run([sys.executable, py_guard, root])
+            if code == 0:
+                failures.append(
+                    "Python guard PASSED when poison shared every pinned allowlist line"
+                )
+            else:
+                for rel in pinned:
+                    if os.path.basename(rel) not in out:
+                        failures.append(
+                            f"{rel}: Python same-line falsification failed but "
+                            "the guard never named the file"
+                        )
+            print(
+                "  pinned same-line poison   "
+                + ("py:ok" if code != 0 else "py:BLIND")
+            )
+    finally:
+        for path, original in originals.items():
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(original)
+
+    # The shell guard has its own pinned allowlist. Its locate expression is
+    # also present in the shared JSON policy, so use that one representative
+    # line to prove the dependency-free guard masks rather than drops it.
+    shell_same_line_rel = f"{CMD_DIR}/locate.rs"
+    shell_matches = pinned.get(shell_same_line_rel, [])
+    shell_path = os.path.join(root, shell_same_line_rel)
+    if len(shell_matches) != 1:
+        failures.append(
+            f"{shell_same_line_rel}: expected exactly one shared shell pin"
+        )
+    else:
+        with open(shell_path, "r", encoding="utf-8") as f:
+            original = f.read()
+        lines = original.split("\n")
+        locations = [
+            idx for idx, line in enumerate(lines) if shell_matches[0] in line
+        ]
+        try:
+            if len(locations) != 1:
+                failures.append(
+                    f"{shell_same_line_rel}: shell pin occurs {len(locations)} "
+                    "times (want exactly 1)"
+                )
+            else:
+                idx = locations[0]
+                lines[idx] = f"{POISON} {lines[idx]}"
+                with open(shell_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines))
+                code, out = run(["bash", sh_guard, root])
+                if code == 0:
+                    failures.append(
+                        "shell guard PASSED when poison shared its pinned locate line"
+                    )
+                elif os.path.basename(shell_same_line_rel) not in out:
+                    failures.append(
+                        f"{shell_same_line_rel}: shell same-line falsification "
+                        "failed but never named the file"
+                    )
+                print(
+                    "  shell same-line poison    "
+                    + ("sh:ok" if code != 0 else "sh:BLIND")
+                )
+        finally:
+            with open(shell_path, "w", encoding="utf-8") as f:
+                f.write(original)
 
     # The broad probe above proves coverage across every claimed module, but
     # one representative read primitive cannot prove the deny sets themselves

@@ -39,12 +39,14 @@ def load_allowlist():
     dormant waiting to auto-exempt a file that gets recreated under the same
     path.
 
-    `allow_match` is optional. When present it lists exact substrings that are
-    exempt within that file, mirroring `allow_for` in
-    scripts/zero_file_search_guard.sh: the exemption is pinned to the known
-    lines, so a new or different filesystem primitive in the same file still
-    trips the guard. When absent the whole file is exempt, which is only
-    appropriate for files that are an IO boundary end to end.
+    `allow_match` is optional. When present it lists exact source expressions
+    that are exempt within that file, mirroring `allow_for` in
+    scripts/zero_file_search_guard.sh. Every expression must occur exactly
+    once: the scanner masks only those bytes and still checks the rest of the
+    line, so neither a same-shaped use elsewhere nor a second primitive beside
+    the allowed one can inherit the exemption. When absent the whole file is
+    exempt, which is only appropriate for files that are an IO boundary end to
+    end.
     """
     try:
         with open(ALLOWLIST_PATH, "r", encoding="utf-8") as f:
@@ -67,7 +69,8 @@ def load_allowlist():
             )
             continue
 
-        if not os.path.exists(os.path.join(KIN_ROOT, item["file"])):
+        source_path = os.path.join(KIN_ROOT, item["file"])
+        if not os.path.exists(source_path):
             errors.append(
                 f"  entry {item['file']} names a path that does not exist "
                 f"(owner: {item['owner']}) — remove the stale exemption; leaving "
@@ -75,17 +78,43 @@ def load_allowlist():
             )
             continue
 
+        if item["file"] in files:
+            errors.append(
+                f"  entry {item['file']} is duplicated — one file must have "
+                "exactly one allowlist policy"
+            )
+            continue
+
         matches = item.get("allow_match")
         if matches is not None and (
             not isinstance(matches, list)
             or not matches
-            or not all(isinstance(m, str) and m for m in matches)
+            or not all(isinstance(m, str) and m and "\n" not in m for m in matches)
         ):
             errors.append(
                 f"  entry {item['file']} has an invalid allow_match "
-                f"(want a non-empty list of non-empty strings)"
+                f"(want a non-empty list of non-empty single-line strings)"
             )
             continue
+        if matches and len(set(matches)) != len(matches):
+            errors.append(
+                f"  entry {item['file']} repeats an allow_match expression"
+            )
+            continue
+        if matches:
+            try:
+                with open(source_path, "r", encoding="utf-8") as source_file:
+                    source = source_file.read()
+            except OSError as error:
+                errors.append(f"  entry {item['file']} could not be read: {error}")
+                continue
+            for match in matches:
+                occurrences = source.count(match)
+                if occurrences != 1:
+                    errors.append(
+                        f"  entry {item['file']} allow_match {match!r} occurs "
+                        f"{occurrences} times (want exactly 1)"
+                    )
         files[item["file"]] = set(matches) if matches else None
 
         try:
@@ -459,16 +488,26 @@ def scan_file(filepath, rel_path, query_fn_names=None, allowed_matches=None):
         ):
             continue
 
-        # Lines pinned by an `allow_match` exemption are a justified IO
-        # boundary. Anything else in the same file still trips the guard.
-        if allowed_matches and any(m in line for m in allowed_matches):
-            continue
+        # Mask only the exact, uniquely validated boundary expression. The
+        # remainder of the line stays authoritative: a second filesystem read
+        # beside an allowed one must still fail rather than inheriting a
+        # whole-line exemption.
+        scan_line = line
+        if allowed_matches:
+            for match in allowed_matches:
+                offset = scan_line.find(match)
+                if offset >= 0:
+                    scan_line = (
+                        scan_line[:offset]
+                        + (" " * len(match))
+                        + scan_line[offset + len(match) :]
+                    )
 
         # Scan for patterns. A line can match several primitives at once
         # (`std::fs::read_dir` is both an fs call and a traversal); report the
         # line once with every primitive it tripped, so the violation count
         # tracks offending lines rather than pattern hits.
-        descs = [desc for pattern, desc in PATTERNS if pattern.search(line)]
+        descs = [desc for pattern, desc in PATTERNS if pattern.search(scan_line)]
         if descs:
             violations.append((idx, line.strip(), ", ".join(dict.fromkeys(descs))))
 

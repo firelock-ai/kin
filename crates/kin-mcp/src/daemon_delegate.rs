@@ -511,9 +511,9 @@ fn find_mcp_daemon_binary() -> Option<std::path::PathBuf> {
             .is_some_and(|name| name == "deps")
         {
             if let Some(target_dir) = exe.parent().and_then(|p| p.parent()) {
-                let sibling = target_dir.join("kin-daemon");
-                if sibling.exists() {
-                    return Some(sibling);
+                let target_sibling = target_dir.join("kin-daemon");
+                if target_sibling.exists() {
+                    return Some(target_sibling);
                 }
             }
         }

@@ -89,6 +89,7 @@
         "std::fs::read_to_string(kin_core::KinLayout::new(kin_dir).kindb_head_generation_path())",
         "if path.exists()",
         "if sibling.exists()",
+        "if target_sibling.exists()",
         "if candidate.exists()"
       ]
     },
@@ -104,7 +105,7 @@
       "owner": "kin-cli",
       "expiration": "2026-12-31",
       "allow_match": [
-        "consent_marker_path"
+        "let marker_present = tel::consent_marker_path(layout.root()).exists();"
       ]
     },
     {
@@ -165,7 +166,8 @@
       "expiration": "2026-12-31",
       "allow_match": [
         "dot_git.is_dir()",
-        "output_path.join(\".git\").exists()"
+        "output_path.join(\".git\").exists()",
+        "output_path.join(\"HEAD\").exists()"
       ]
     },
     {
