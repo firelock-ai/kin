@@ -80,9 +80,17 @@
     },
     {
       "file": "crates/kin-mcp/src/daemon_delegate.rs",
-      "reason": "Auth: reads token from local daemon token file",
+      "reason": "Daemon-reachability boundary: this module forwards MCP tool calls to the daemon, which is the graph authority. Every filesystem touch here is about reaching that authority, never about answering in its place — no tool result derives from any of them. Three classes, each pinned to its whole expression: (1) the loopback bearer token at <kin_dir>/daemon.token, read so the forwarded request can authenticate; (2) repo binding, walking up from the working directory for the .kin layout marker to locate that token, which precedes any graph consult because it decides which daemon to talk to; (3) revival, resolving the kin-daemon executable via KIN_DAEMON_BIN, the current exe's directory, the cargo target dir, and PATH, a `which` equivalent open-coded to avoid the dependency. The head-generation marker is the daemon's own published counter and only keys a within-session memo; a missing marker reads as generation 0, which costs cross-generation invalidation and never substitutes for a graph answer. Pinned rather than whole-file so any newly added filesystem primitive in this module fails the guard",
       "owner": "kin-mcp",
-      "expiration": "2026-12-31"
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "std::fs::read_to_string(token_path).ok()?",
+        "if candidate.is_dir()",
+        "std::fs::read_to_string(kin_core::KinLayout::new(kin_dir).kindb_head_generation_path())",
+        "if path.exists()",
+        "if sibling.exists()",
+        "if candidate.exists()"
+      ]
     },
     {
       "file": "crates/kin-cli/src/retrieval_profile.rs",
@@ -110,9 +118,28 @@
     },
     {
       "file": "crates/kin-cli/src/commands/health.rs",
-      "reason": "Config/diagnostic IO: kin health reports on the local installation, so the environment is its subject, not a source of semantic answers. Every probe targets the install — daemon binary, VFS shim header, shell hook and rc, AI-client MCP config files, editor extensions dir, pending session runs. It must never read repo content to answer a semantic query",
+      "reason": "Install-diagnostic boundary: kin health reports on the local installation, so the environment is its subject rather than a source of semantic answers. The line this pin enforces is that environment probes are a diagnostic boundary while repo-content reads are not, and every pinned expression was checked against it individually. Four classes: (1) install artifacts — the kin-daemon binary beside the current exe or in the cargo target dir, the VFS shim's metadata and its four-byte object header, the shell hook, the editor extensions directory; (2) environment config — the shell rc, and the AI-client MCP configs for Claude, Cursor, Codex and Antigravity, which are read to check the kin server entry and never for their surrounding content; (3) repo binding — the .kin layout marker, resolved so a config's recorded repository argument can be compared against the current one; (4) a projection audit — read_dir over .kin/runs listing session workspaces left materialized. That last one is a filesystem read by necessity rather than by shortcut: it detects materialized state that reconcile has not reclaimed, and a graph that believed those sessions closed would report nothing, which is the exact failure the check exists to catch, so the traversal audits the projection against graph truth instead of standing in for it. No pinned expression reads repository source content. Pinned rather than whole-file so this module is falsifiable at every site and any newly added filesystem primitive fails the guard",
       "owner": "kin-cli",
-      "expiration": "2026-12-31"
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "if sibling.exists()",
+        "if target_sibling.exists()",
+        "std::fs::metadata(lib_path)",
+        "Ok(meta) if meta.is_file() => meta,",
+        "std::fs::File::open(path)?",
+        "std::fs::read_dir(&runs_dir)",
+        "let hook_installed = hook_path.exists();",
+        ".and_then(|rc| std::fs::read_to_string(rc).ok())",
+        "if alt.exists() && !primary.exists()",
+        "std::fs::canonicalize(layout.working_dir()).ok()?",
+        "root.join(\".kin\").is_dir().then_some(root)",
+        "match std::fs::read_to_string(path) {",
+        "path.parent()?.parent()?.canonicalize().ok()?",
+        "std::fs::read(path).ok()?",
+        "match std::fs::read(path) {",
+        ".filter(|c| c.path.exists())",
+        ".and_then(|dir| std::fs::read_dir(dir).ok())"
+      ]
     },
     {
       "file": "crates/kin-mcp/src/handlers/common.rs",

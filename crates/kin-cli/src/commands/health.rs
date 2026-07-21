@@ -709,10 +709,8 @@ pub(crate) fn mcp_client_config_paths() -> Vec<(&'static str, &'static str, Path
 
 fn current_health_repo() -> Option<PathBuf> {
     let cwd = env::current_dir().ok()?;
-    let root = kin_core::KinLayout::discover_with_daemon_url(&cwd, None)?
-        .working_dir()
-        .canonicalize()
-        .ok()?;
+    let layout = kin_core::KinLayout::discover_with_daemon_url(&cwd, None)?;
+    let root = std::fs::canonicalize(layout.working_dir()).ok()?;
     root.join(".kin").is_dir().then_some(root)
 }
 
