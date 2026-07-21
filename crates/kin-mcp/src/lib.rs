@@ -18,8 +18,8 @@ pub use envelope::{
 pub use error::{McpError, Result};
 pub use negative::NEGATIVE_KEY;
 pub use server::{
-    process_daemon_message, process_message, run_stdio, run_stdio_daemon, McpServerConfig,
-    RepoBinder, SessionAuthorityMode,
+    process_daemon_message, process_message, run_stdio, run_stdio_daemon, BoundRepo,
+    McpServerConfig, RepoBinder, SessionAuthorityMode,
 };
 pub use session::{
     AssistantSession, CoordinationEnforcementMode, CoordinationSurfaceCoverage,

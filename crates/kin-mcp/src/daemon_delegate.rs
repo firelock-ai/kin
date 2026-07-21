@@ -30,6 +30,20 @@ static DAEMON_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 /// a process restart.
 static DAEMON_URL_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+/// Drop the revival-path daemon URL override.
+///
+/// The override outranks `KIN_DAEMON_URL` for every delegate call, so a process
+/// that revived a daemon for one repository keeps reaching that daemon even
+/// after `KIN_DAEMON_URL` is repointed. The stdio server clears it when the MCP
+/// client's workspace roots move it to a different repository; without that, a
+/// re-bind would repoint the environment and still forward tool calls to the
+/// repository the client left.
+pub(crate) fn clear_daemon_url_override() {
+    if let Ok(mut guard) = DAEMON_URL_OVERRIDE.lock() {
+        *guard = None;
+    }
+}
+
 /// Base URL for the daemon HTTP API.
 ///
 /// Checks the revival-path override first; falls back to the `KIN_DAEMON_URL`
