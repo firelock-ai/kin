@@ -7,6 +7,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Graph build and update pipeline for Kin"
+repository.workspace = true
 
 [dependencies]
 kin-model = { workspace = true }
