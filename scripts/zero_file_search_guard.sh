@@ -58,22 +58,39 @@ allow_for() {
   esac
 }
 
-# Line number of the inline `#[cfg(test)]` test module (scan stops before it, so
-# test-only filesystem IO is never mistaken for an answer-path leak). Prints the
-# past-the-end line when a file has no such module.
-test_module_line() {
+# First and last line of the inline `#[cfg(test)]` test module, so test-only
+# filesystem IO is never mistaken for an answer-path leak. Prints a span past
+# the end of the file when there is no such module.
+#
+# The span is bounded at both ends deliberately. Skipping from the test module
+# to end-of-file instead left everything after it unscanned — in the largest
+# answer module that was a third of the file, and a raw read appended at the
+# end passed the guard untouched. Production code after a test module is
+# unusual but perfectly legal, and "unusual" is precisely where a leak survives.
+test_module_span() {
   # A `#[cfg(test)]` attribute attaches to the next real item; intervening
   # lines are only other attributes, comments, or blanks. The test module is
   # the first `#[cfg(test)]` whose next real item is a `mod` (a `#[cfg(test)]`
   # on a plain `fn` is a test helper amid production code and is not a boundary).
+  # The module ends at the first `}` in column zero at or after it. Counting
+  # braces instead would need to know which ones sit inside a string or a
+  # comment, and a scanner that guesses at that desynchronises and silently
+  # swallows the rest of the file. `cargo fmt --check` runs in the same job, so
+  # a top-level item's closing brace is reliably unindented.
+  #
+  # If no such line exists the span runs to end of file, which is the old
+  # blind behaviour — but scripts/falsify-zero-file-search.py plants a probe at
+  # end of file in every listed module, so that case fails CI rather than
+  # quietly disabling the guard.
   awk '
-    /^[[:space:]]*#\[cfg\(test\)\]/ { cfg=NR; watching=1; next }
-    watching {
+    !found && /^[[:space:]]*#\[cfg\(test\)\]/ { cfg=NR; watching=1; next }
+    watching && !found {
       if ($0 ~ /^[[:space:]]*(#|\/\/|$)/) next
-      if ($0 ~ /^[[:space:]]*mod /) { print cfg; found=1; exit }
-      watching=0
+      if ($0 ~ /^[[:space:]]*mod /) { found=1; start=cfg }
+      else { watching=0; next }
     }
-    END { if (!found) print NR + 1 }
+    found && NR > start && /^\}[[:space:]]*$/ { print start, NR; done=1; exit }
+    END { if (!done) print (found ? start : NR + 1), NR + 1 }
   ' "$1"
 }
 
@@ -83,11 +100,13 @@ for rel in "${authority_files[@]}"; do
   [[ -f "$file" ]] || continue
   base="$(basename "$rel")"
   allow="$(allow_for "$base")"
-  boundary="$(test_module_line "$file")"
+  read -r test_start test_end <<<"$(test_module_span "$file")"
 
-  # Non-test region only, with line numbers preserved from the original file.
-  region="$(head -n "$((boundary - 1))" "$file")"
-  hits="$(printf '%s\n' "$region" | grep -nE "$deny_re" || true)"
+  # Everything outside the test module, before it and after it alike, with the
+  # original line numbers preserved.
+  region="$(awk -v s="$test_start" -v e="$test_end" \
+    'NR < s || NR > e { print NR ":" $0 }' "$file")"
+  hits="$(printf '%s\n' "$region" | grep -E "$deny_re" || true)"
   [[ -n "$hits" ]] || continue
   if [[ -n "$allow" ]]; then
     hits="$(printf '%s\n' "$hits" | grep -vF "$allow" || true)"

@@ -178,7 +178,12 @@ QUERY_COMMANDS = {
     "overview.rs",
     # health reports on the local install and graph state. Environment probes
     # here are a diagnostic boundary, but repo-content reads would not be.
-    "health.rs"
+    "health.rs",
+    # `kin mcp` is how agents reach Kin. It is a launcher today and carries no
+    # filesystem primitive at all, which is exactly why it belongs here: the
+    # agent-facing entry point should never become the one answer surface that
+    # nothing was watching.
+    "mcp.rs"
 }
 
 # Query/answer authority handlers that live inside an otherwise IO-boundary
@@ -276,6 +281,132 @@ def find_fn_body_ranges(lines, fn_names):
     return ranges
 
 
+class LexState:
+    """Carries lexical context across line boundaries.
+
+    Block comments, string literals and raw strings all span lines in Rust, so
+    a line cannot be classified in isolation.
+    """
+
+    __slots__ = ("block_depth", "string", "raw_hashes")
+
+    def __init__(self):
+        self.block_depth = 0
+        self.string = None
+        self.raw_hashes = 0
+
+
+# `r"`, `r#"`, `br##"`, `b"` -- the raw and byte string openers.
+RAW_OPEN = re.compile(r'(b?)r(#*)"|b"')
+IDENT_CHAR = re.compile(r"[A-Za-z0-9_]")
+
+
+def split_code(line, st):
+    """Split one line into (structure, code), advancing the lexer state.
+
+    `structure` is the line with comments removed AND every literal's contents
+    blanked out. Brace depth and keyword detection read this, so a `{` inside a
+    string, or the word `mod tests` inside one, cannot move the parser.
+
+    `code` is the line with comments removed but literals intact. The violation
+    patterns read this, because some of them legitimately match literal text --
+    `Command::new("git")` is only recognisable with the string still in place.
+
+    Splitting the two is the whole point: structure tracking must ignore
+    literals, and pattern matching must not.
+    """
+    structure = []
+    code = []
+    i, n = 0, len(line)
+
+    while i < n:
+        ch = line[i]
+
+        if st.block_depth > 0:
+            # Rust block comments nest, so `/*` inside one opens another level.
+            if line.startswith("/*", i):
+                st.block_depth += 1
+                i += 2
+            elif line.startswith("*/", i):
+                st.block_depth -= 1
+                i += 2
+            else:
+                i += 1
+            continue
+
+        if st.string == "raw":
+            if ch == '"' and line[i + 1 : i + 1 + st.raw_hashes] == "#" * st.raw_hashes:
+                code.append(line[i : i + 1 + st.raw_hashes])
+                i += 1 + st.raw_hashes
+                st.string = None
+            else:
+                code.append(ch)
+                i += 1
+            continue
+
+        if st.string == "normal":
+            if ch == "\\":
+                code.append(line[i : i + 2])
+                i += 2
+            elif ch == '"':
+                code.append(ch)
+                i += 1
+                st.string = None
+            else:
+                code.append(ch)
+                i += 1
+            continue
+
+        if line.startswith("//", i):
+            break
+
+        if line.startswith("/*", i):
+            st.block_depth = 1
+            i += 2
+            continue
+
+        # A raw or byte string opener, but only where it starts a token --
+        # otherwise the `r` ending an identifier would be mistaken for one.
+        if ch in "rb" and not (i and IDENT_CHAR.match(line[i - 1])):
+            m = RAW_OPEN.match(line, i)
+            if m:
+                code.append(m.group(0))
+                st.string = "raw" if "r" in m.group(0) else "normal"
+                st.raw_hashes = len(m.group(2) or "")
+                i = m.end()
+                continue
+
+        if ch == '"':
+            code.append(ch)
+            st.string = "normal"
+            i += 1
+            continue
+
+        if ch == "'":
+            # A char literal, or a lifetime. `'a'` is a literal; `'static` is
+            # not, and consuming it as one would swallow the rest of the line.
+            if line.startswith("\\", i + 1):
+                j = i + 2
+                while j < n and line[j] != "'":
+                    j += 1
+                code.append(line[i : j + 1])
+                i = j + 1
+            elif i + 2 < n and line[i + 2] == "'":
+                code.append(line[i : i + 3])
+                i += 3
+            else:
+                structure.append(ch)
+                code.append(ch)
+                i += 1
+            continue
+
+        structure.append(ch)
+        code.append(ch)
+        i += 1
+
+    return "".join(structure), "".join(code)
+
+
 def scan_file(filepath, rel_path, query_fn_names=None, allowed_matches=None):
     violations = []
 
@@ -288,30 +419,19 @@ def scan_file(filepath, rel_path, query_fn_names=None, allowed_matches=None):
         find_fn_body_ranges(lines, query_fn_names) if query_fn_names else None
     )
 
-    in_block_comment = False
+    lex = LexState()
     in_test_module = False
     brace_depth = 0
     test_module_brace_depth = -1
 
     for idx, line in enumerate(lines, 1):
-        stripped = line.strip()
-
-        # Track block comments
-        if "/*" in stripped:
-            in_block_comment = True
-        if in_block_comment:
-            if "*/" in stripped:
-                in_block_comment = False
-            continue
-
-        # Ignore single line comments
-        if stripped.startswith("//"):
-            continue
-
-        # Remove trailing comments
-        if "//" in line:
-            line = line.split("//")[0]
-            stripped = line.strip()
+        # Comments and literals are removed lexically rather than by substring
+        # search. A `//` or `/*` inside a string literal used to truncate the
+        # line or latch block-comment mode on to EOF, desynchronising brace
+        # depth so the scanner believed it had entered `mod tests` and quietly
+        # stopped enforcing for the rest of the file.
+        structure, line = split_code(line, lex)
+        stripped = structure.strip()
 
         # Track test module to ignore test code inside source files
         if "mod tests" in stripped or "#[cfg(test)]" in stripped:
