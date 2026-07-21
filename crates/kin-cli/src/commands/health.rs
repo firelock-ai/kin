@@ -710,8 +710,7 @@ pub(crate) fn mcp_client_config_paths() -> Vec<(&'static str, &'static str, Path
 fn current_health_repo() -> Option<PathBuf> {
     let cwd = env::current_dir().ok()?;
     let layout = kin_core::KinLayout::discover_with_daemon_url(&cwd, None)?;
-    let root = std::fs::canonicalize(layout.working_dir()).ok()?;
-    root.join(".kin").is_dir().then_some(root)
+    Some(layout.working_dir().to_path_buf())
 }
 
 /// Inspect a single MCP config file for a `kin` server entry carrying the
@@ -1072,6 +1071,48 @@ async fn check_semantic_query_readiness() -> HealthCheck {
 }
 
 #[cfg(feature = "vector")]
+fn semantic_query_health_from_runtime(
+    daemon_url: &str,
+    runtime: &crate::commands::resources::EmbedRuntimeState,
+) -> HealthCheck {
+    let indexed = runtime.embeddings_indexed;
+    let total = runtime.embeddings_total;
+    let pending = runtime.embeddings_pending;
+    let detail = format!(
+        "daemon graph at {daemon_url} reports {indexed}/{total} embeddings indexed, {pending} pending"
+    );
+
+    if runtime.embed_worker_failed {
+        return HealthCheck::new(
+            "semantic_query_readiness",
+            "Semantic query readiness",
+            HealthStatus::Missing,
+            format!("{detail}; embedding worker failed"),
+        )
+        .with_manual_fix(
+            "inspect the daemon logs, resolve the embedding failure, and restart the daemon",
+        );
+    }
+
+    if total == 0 || (indexed == total && pending == 0) {
+        HealthCheck::new(
+            "semantic_query_readiness",
+            "Semantic query readiness",
+            HealthStatus::Healthy,
+            detail,
+        )
+    } else {
+        HealthCheck::new(
+            "semantic_query_readiness",
+            "Semantic query readiness",
+            HealthStatus::Stale,
+            detail,
+        )
+        .with_manual_fix("allow daemon embedding to finish or run `kin embed`")
+    }
+}
+
+#[cfg(feature = "vector")]
 async fn check_semantic_query_readiness() -> HealthCheck {
     let cwd = env::current_dir().unwrap_or_default();
     let layout = match kin_core::KinLayout::discover(&cwd) {
@@ -1097,31 +1138,40 @@ async fn check_semantic_query_readiness() -> HealthCheck {
         .with_manual_fix("run any `kin` command in the repo to auto-start the daemon");
     };
 
-    let vector_index = layout.kindb_vector_index_path();
-    let indexed = vector_index
-        .metadata()
-        .map(|m| m.len() > 0)
-        .unwrap_or(false);
+    let client = match crate::daemon_client::DaemonClient::from_base_url_for_layout(
+        daemon_url.clone(),
+        &layout,
+    ) {
+        Ok(client) => client,
+        Err(error) => {
+            return HealthCheck::new(
+                "semantic_query_readiness",
+                "Semantic query readiness",
+                HealthStatus::Stale,
+                format!("daemon reachable ({daemon_url}), but its URL is invalid: {error}"),
+            )
+            .with_manual_fix("run `kin status --json` and resolve the reported daemon error");
+        }
+    };
+    let response = match client
+        .command_resources(&crate::commands::resources::CommandResourcesRequest::default())
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return HealthCheck::new(
+                "semantic_query_readiness",
+                "Semantic query readiness",
+                HealthStatus::Stale,
+                format!(
+                    "daemon reachable ({daemon_url}), but graph embedding status is unavailable: {error}"
+                ),
+            )
+            .with_manual_fix("run `kin status --json` and resolve the reported daemon error");
+        }
+    };
 
-    if indexed {
-        HealthCheck::new(
-            "semantic_query_readiness",
-            "Semantic query readiness",
-            HealthStatus::Healthy,
-            format!(
-                "daemon reachable ({daemon_url}); vector index present at {}",
-                vector_index.display()
-            ),
-        )
-    } else {
-        HealthCheck::new(
-            "semantic_query_readiness",
-            "Semantic query readiness",
-            HealthStatus::Stale,
-            format!("daemon reachable ({daemon_url}); no vector index yet — embeddings pending"),
-        )
-        .with_manual_fix("run `kin embed` to build the vector index")
-    }
+    semantic_query_health_from_runtime(&daemon_url, &response.embed_runtime)
 }
 
 /// Report the active retrieval quality profile and the effective lever set,
@@ -1468,6 +1518,48 @@ mod tests {
         assert!(matches!(semantic.status, HealthStatus::Unsupported));
         assert!(!semantic.detail.contains("kin embed"));
         assert!(semantic.manual_fix.is_none());
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn semantic_query_readiness_accepts_complete_daemon_graph_coverage() {
+        let runtime = crate::commands::resources::EmbedRuntimeState {
+            embeddings_indexed: 41,
+            embeddings_total: 41,
+            embeddings_pending: 0,
+            ..Default::default()
+        };
+
+        let semantic = semantic_query_health_from_runtime("http://daemon", &runtime);
+
+        assert!(matches!(semantic.status, HealthStatus::Healthy));
+        assert!(semantic.detail.contains("41/41 embeddings indexed"));
+        assert!(!semantic.detail.contains("graph.kvec"));
+        assert!(semantic.manual_fix.is_none());
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn semantic_query_readiness_reports_daemon_graph_backlog_and_failure() {
+        let pending = crate::commands::resources::EmbedRuntimeState {
+            embeddings_indexed: 40,
+            embeddings_total: 41,
+            embeddings_pending: 1,
+            ..Default::default()
+        };
+        let stale = semantic_query_health_from_runtime("http://daemon", &pending);
+        assert!(matches!(stale.status, HealthStatus::Stale));
+        assert!(stale.detail.contains("40/41 embeddings indexed, 1 pending"));
+        assert!(stale.manual_fix.is_some());
+
+        let failed = crate::commands::resources::EmbedRuntimeState {
+            embed_worker_failed: true,
+            ..pending
+        };
+        let missing = semantic_query_health_from_runtime("http://daemon", &failed);
+        assert!(matches!(missing.status, HealthStatus::Missing));
+        assert!(missing.detail.contains("embedding worker failed"));
+        assert!(missing.manual_fix.is_some());
     }
 
     #[test]

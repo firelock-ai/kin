@@ -26,6 +26,10 @@ import subprocess
 import sys
 
 POISON = "fn __falsification_probe(p: &str) -> String { std::fs::read_to_string(p).unwrap() }"
+METADATA_POISON = (
+    "fn __metadata_falsification_probe(p: &std::path::Path) -> bool { "
+    "p.metadata().is_ok() }"
+)
 CMD_DIR = "crates/kin-cli/src/commands"
 
 
@@ -187,6 +191,62 @@ def main():
             with open(path, "w", encoding="utf-8") as f:
                 f.write(original)
         print(f"  {os.path.basename(rel):24} {'  '.join(marks)}")
+
+    # The broad probe above proves coverage across every claimed module, but
+    # one representative read primitive cannot prove the deny sets themselves
+    # stay complete. In particular, Path::metadata is a bare method call: it
+    # has no `std::fs::` prefix, so a guard that only watches module-qualified
+    # metadata calls misses it. Exercise that spelling explicitly in a module
+    # covered by both guards, once in the middle of production code and once at
+    # EOF so test-module span handling cannot hide either location.
+    metadata_rel = f"{CMD_DIR}/search.rs"
+    metadata_scope = next(
+        (entry for entry in enforced if entry[0] == metadata_rel), None
+    )
+    if metadata_scope is None or not all(metadata_scope[1:]):
+        failures.append(
+            f"{metadata_rel}: bare metadata regression needs coverage from both guards"
+        )
+    else:
+        path = os.path.join(root, metadata_rel)
+        with open(path, "r", encoding="utf-8") as f:
+            original = f.read()
+        lines = original.split("\n")
+        marks = []
+        try:
+            for label, idx in probe_sites(lines):
+                if label not in ("half", "eof"):
+                    continue
+                poisoned = lines[:idx] + [METADATA_POISON] + lines[idx:]
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(poisoned))
+                cell = []
+                for tag, cmd in (
+                    ("py", [sys.executable, py_guard, root]),
+                    ("sh", ["bash", sh_guard, root]),
+                ):
+                    code, out = run(cmd)
+                    if code == 0:
+                        failures.append(
+                            f"{metadata_rel} @ {label}: {tag} guard PASSED "
+                            "on bare Path::metadata"
+                        )
+                        cell.append("BLIND")
+                    elif os.path.basename(metadata_rel) not in out:
+                        failures.append(
+                            f"{metadata_rel} @ {label}: {tag} guard failed but "
+                            "never named the file"
+                        )
+                        cell.append("UNNAMED")
+                    else:
+                        cell.append("ok")
+                marks.append(f"{label}=py:{cell[0]}/sh:{cell[1]}")
+        finally:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(original)
+        print(
+            f"  bare Path::metadata      {'  '.join(marks)}"
+        )
 
     if failures:
         print()

@@ -239,6 +239,7 @@ PATTERNS = [
     (re.compile(r'\.is_dir\(\)'), "filesystem existence probe (is_dir)"),
     (re.compile(r'\.exists\(\)'), "filesystem existence probe (exists)"),
     (re.compile(r'\.canonicalize\(\)'), "filesystem path resolution (canonicalize)"),
+    (re.compile(r'\.metadata\(\)'), "filesystem metadata probe"),
     (re.compile(r'\bsymlink_metadata\b'), "filesystem metadata probe"),
     (re.compile(r'\bread_link\b'), "filesystem symlink read"),
     (re.compile(r'\bFile::open\b'), "raw file handle open"),

@@ -44,7 +44,7 @@ authority_files=(
 )
 
 # Raw filesystem read / existence / traversal primitives.
-deny_re='\.is_file\(\)|\.is_dir\(\)|\.exists\(\)|\.canonicalize\(\)|symlink_metadata|read_link|std::fs::(read|read_to_string|read_dir|metadata|File)|[^_a-z]fs::(read|read_to_string|read_dir|metadata)|File::open|read_dir\(|WalkDir|walkdir::|glob::glob'
+deny_re='\.is_file\(\)|\.is_dir\(\)|\.exists\(\)|\.canonicalize\(\)|\.metadata\(\)|symlink_metadata|read_link|std::fs::(read|read_to_string|read_dir|metadata|File)|[^_a-z]fs::(read|read_to_string|read_dir|metadata)|File::open|read_dir\(|WalkDir|walkdir::|glob::glob'
 
 # Per-file justified allowlist (input/output boundaries, not the answer). A new
 # or different primitive in the same file still trips the guard.
