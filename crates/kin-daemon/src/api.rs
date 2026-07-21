@@ -13999,6 +13999,11 @@ mod tests {
             "/spine/xref payload must carry the spine wire-format version"
         );
         assert_eq!(xbody["authority_complete"], true);
+        assert_eq!(xbody["authority_anchor"]["repo_id"], "consumer");
+        assert_eq!(
+            xbody["authority_anchor"]["entity_id"],
+            serde_json::json!(run_task_id)
+        );
         assert!(xbody["authority_revision"]
             .as_str()
             .is_some_and(|revision| revision.starts_with("sha256:") && revision.len() == 71));
@@ -14865,7 +14870,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn mcp_find_references_treats_legacy_unwatermarked_xref_as_inconclusive() {
+    async fn mcp_find_references_rejects_unanchored_xref_as_inconclusive() {
         async fn legacy_xref() -> Json<serde_json::Value> {
             Json(serde_json::json!({
                 "version": kin_spine::SPINE_PAYLOAD_VERSION,
@@ -14905,16 +14910,14 @@ mod tests {
             .first()
             .expect("find_references text response");
         let body: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(body["cross_repo"]["status"], "available");
-        assert_eq!(body["cross_repo"]["authority_complete"], false);
-        assert_eq!(
-            body["cross_repo"]["authority_revision"],
-            serde_json::Value::Null
-        );
+        assert_eq!(body["cross_repo"]["status"], "unavailable");
+        assert!(body["cross_repo"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("xref response anchor does not match")));
         assert_eq!(body["negative"]["safe_to_conclude_absent"], false);
         assert!(body["negative"]["trust_reason"]
             .as_str()
-            .is_some_and(|reason| reason.contains("cross_repo_authority_incomplete")));
+            .is_some_and(|reason| reason.contains("cross_repo_unavailable")));
 
         std::env::remove_var("KIN_REPO_ID");
         std::env::remove_var("KIN_DAEMON_URL");

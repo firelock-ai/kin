@@ -65,6 +65,17 @@ pub struct CrossRepoEdge {
     pub confidence: f32,
 }
 
+/// The exact repository/entity pair for which an xref response was projected.
+///
+/// Xref payloads may legitimately be empty, so clients cannot infer this anchor
+/// from the returned edges. Echoing it prevents a stale or mis-keyed response
+/// from certifying absence for a different entity in the same repository.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SpineXrefAuthorityAnchor {
+    pub repo_id: RepoId,
+    pub entity_id: EntityId,
+}
+
 /// Versioned wire response for `GET /v1/spine/xref`.
 ///
 /// `edges` remains the canonical topology payload. `entities` is an additive,
@@ -79,6 +90,8 @@ pub struct SpineXrefResponse {
     pub edges: Vec<CrossRepoEdge>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entities: Vec<EntityEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_anchor: Option<SpineXrefAuthorityAnchor>,
     #[serde(default)]
     pub authority_complete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -98,6 +111,7 @@ impl SpineXrefResponse {
             version: crate::SPINE_PAYLOAD_VERSION,
             edges,
             entities,
+            authority_anchor: None,
             authority_complete: false,
             authority_revision: None,
             authority_roots: BTreeMap::new(),
@@ -149,6 +163,10 @@ impl SpineXrefResponse {
             version: crate::SPINE_PAYLOAD_VERSION,
             edges,
             entities,
+            authority_anchor: Some(SpineXrefAuthorityAnchor {
+                repo_id: repo_id.to_string(),
+                entity_id: *entity_id,
+            }),
             authority_complete: complete
                 && roots.contains_key(repo_id)
                 && covered_entities
@@ -161,6 +179,19 @@ impl SpineXrefResponse {
 
     pub fn version(&self) -> u32 {
         self.version
+    }
+
+    /// Whether this payload can certify an answer for the requested anchor.
+    ///
+    /// This is intentionally stricter than the wire-level boolean so callers
+    /// cannot accidentally ignore the response's query binding.
+    pub fn authority_complete_for(&self, repo_id: &str, entity_id: &EntityId) -> bool {
+        self.authority_complete
+            && self
+                .authority_anchor
+                .as_ref()
+                .is_some_and(|anchor| anchor.repo_id == repo_id && anchor.entity_id == *entity_id)
+            && self.authority_roots.contains_key(repo_id)
     }
 
     /// Decode and version-check an xref response as one shared contract.
@@ -177,6 +208,11 @@ impl SpineXrefResponse {
             });
         }
         if response.authority_complete {
+            let valid_anchor = response.authority_anchor.as_ref().is_some_and(|anchor| {
+                !anchor.repo_id.is_empty()
+                    && anchor.repo_id.trim() == anchor.repo_id
+                    && response.authority_roots.contains_key(&anchor.repo_id)
+            });
             let valid_revision = response
                 .authority_revision
                 .as_deref()
@@ -197,13 +233,48 @@ impl SpineXrefResponse {
                 response.authority_roots.contains_key(&edge.src_repo)
                     && response.authority_roots.contains_key(&edge.dst_repo)
             });
-            if !valid_revision || !valid_roots || !endpoints_are_watermarked {
+            if !valid_anchor || !valid_revision || !valid_roots || !endpoints_are_watermarked {
                 return Err(SpineXrefDecodeError::InvalidAuthority(
-                    "complete xref authority requires a canonical revision, non-empty roots, and watermarked edge endpoints"
+                    "complete xref authority requires a query anchor, canonical revision, non-empty roots, and watermarked edge endpoints"
                         .to_string(),
                 ));
             }
         }
+        Ok(response)
+    }
+
+    /// Decode an xref response and bind it to the request that produced it.
+    ///
+    /// Every transport consumer should use this method. Even an incomplete
+    /// response must echo the requested anchor: without it an empty body could
+    /// belong to a different cache key. Returned edges must all be incident to
+    /// that same anchor, otherwise the payload is internally inconsistent.
+    pub fn from_slice_for(
+        bytes: &[u8],
+        repo_id: &str,
+        entity_id: &EntityId,
+    ) -> Result<Self, SpineXrefDecodeError> {
+        let response = Self::from_slice(bytes)?;
+        let anchor_matches = response
+            .authority_anchor
+            .as_ref()
+            .is_some_and(|anchor| anchor.repo_id == repo_id && anchor.entity_id == *entity_id);
+        if !anchor_matches {
+            return Err(SpineXrefDecodeError::InvalidAuthority(format!(
+                "xref response anchor does not match requested repository/entity {repo_id}/{entity_id}"
+            )));
+        }
+
+        let edges_are_incident = response.edges.iter().all(|edge| {
+            (edge.src_repo == repo_id && edge.src_entity == *entity_id)
+                || (edge.dst_repo == repo_id && edge.dst_entity == *entity_id)
+        });
+        if !edges_are_incident {
+            return Err(SpineXrefDecodeError::InvalidAuthority(format!(
+                "xref response contains an edge unrelated to requested repository/entity {repo_id}/{entity_id}"
+            )));
+        }
+
         Ok(response)
     }
 }
@@ -808,6 +879,7 @@ mod tests {
         assert_eq!(decoded.entities.len(), 1);
         assert_eq!(decoded.entities[0].name, "run_task");
         assert!(!decoded.authority_complete);
+        assert!(decoded.authority_anchor.is_none());
         assert!(decoded.authority_revision.is_none());
         assert!(decoded.authority_roots.is_empty());
     }
@@ -832,8 +904,13 @@ mod tests {
         assert_eq!(decoded.edges.len(), 1);
         assert!(decoded.entities.is_empty());
         assert!(!decoded.authority_complete);
+        assert!(decoded.authority_anchor.is_none());
         assert!(decoded.authority_revision.is_none());
         assert!(decoded.authority_roots.is_empty());
+        assert!(matches!(
+            SpineXrefResponse::from_slice_for(&bytes, "provider", &dst),
+            Err(SpineXrefDecodeError::InvalidAuthority(_))
+        ));
     }
 
     #[test]
@@ -868,13 +945,22 @@ mod tests {
             .is_some_and(|revision| revision.starts_with("sha256:")));
         assert_eq!(response.authority_roots["consumer"], "consumer-root");
         assert_eq!(response.authority_roots["provider"], "provider-root");
+        assert_eq!(
+            response.authority_anchor,
+            Some(SpineXrefAuthorityAnchor {
+                repo_id: "provider".to_string(),
+                entity_id: dst,
+            })
+        );
+        assert!(response.authority_complete_for("provider", &dst));
+        assert!(!response.authority_complete_for("provider", &no_refs));
         assert_eq!(response.edges.len(), 1);
         assert_eq!(response.entities.len(), 2);
         assert_eq!(response.entities[0].repo_id, "consumer");
         assert_eq!(response.entities[1].repo_id, "provider");
 
-        let decoded =
-            SpineXrefResponse::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+        let response_bytes = serde_json::to_vec(&response).unwrap();
+        let decoded = SpineXrefResponse::from_slice_for(&response_bytes, "provider", &dst).unwrap();
         assert!(decoded.authority_complete);
         assert_eq!(decoded.authority_revision, response.authority_revision);
 
@@ -889,6 +975,11 @@ mod tests {
         );
         assert!(covered_empty.authority_complete);
         assert!(covered_empty.edges.is_empty());
+        let covered_empty_bytes = serde_json::to_vec(&covered_empty).unwrap();
+        assert!(matches!(
+            SpineXrefResponse::from_slice_for(&covered_empty_bytes, "provider", &dst),
+            Err(SpineXrefDecodeError::InvalidAuthority(_))
+        ));
 
         let unknown_entity = SpineXrefResponse::from_snapshot(
             index.cross_repo_edges_snapshot(),
@@ -896,6 +987,33 @@ mod tests {
             &EntityId::new(),
         );
         assert!(!unknown_entity.authority_complete);
+    }
+
+    #[test]
+    fn xref_bound_decode_rejects_non_incident_edges() {
+        let requested = EntityId::new();
+        let unrelated_src = EntityId::new();
+        let unrelated_dst = EntityId::new();
+        let mut response = SpineXrefResponse::new(
+            vec![CrossRepoEdge {
+                src_repo: "consumer".to_string(),
+                src_entity: unrelated_src,
+                dst_repo: "provider".to_string(),
+                dst_entity: unrelated_dst,
+                confidence: 0.9,
+            }],
+            Vec::new(),
+        );
+        response.authority_anchor = Some(SpineXrefAuthorityAnchor {
+            repo_id: "provider".to_string(),
+            entity_id: requested,
+        });
+
+        let bytes = serde_json::to_vec(&response).unwrap();
+        assert!(matches!(
+            SpineXrefResponse::from_slice_for(&bytes, "provider", &requested),
+            Err(SpineXrefDecodeError::InvalidAuthority(_))
+        ));
     }
 
     #[test]

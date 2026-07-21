@@ -564,6 +564,7 @@ mod tests {
     fn find_references_cross_repo_gap_is_inconclusive_despite_loaded_graph() {
         let payload = json!({
             "focal_entity": { "kind": "function", "name": "do_work" },
+            "relation_kinds": ["calls"],
             "references": [],
             "cross_repo": {
                 "status": "unavailable",
@@ -588,6 +589,7 @@ mod tests {
     fn find_references_incomplete_cross_repo_authority_is_inconclusive() {
         let payload = json!({
             "focal_entity": { "kind": "function", "name": "do_work" },
+            "relation_kinds": ["imports"],
             "references": [],
             "cross_repo": {
                 "status": "available",

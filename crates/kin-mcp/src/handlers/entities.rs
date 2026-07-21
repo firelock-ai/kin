@@ -761,16 +761,9 @@ fn append_spine_reference_rows(
     rows: &mut Vec<ReferenceRow>,
     repo_id: &str,
     target_id: &kin_model::EntityId,
-    relation_kinds: &[RelationKind],
+    _relation_kinds: &[RelationKind],
     response: &kin_spine::SpineXrefResponse,
 ) -> usize {
-    // CrossRepoEdge does not encode a source relation kind. Treat it as the
-    // generic cross-repo reference it is, and do not leak it into a calls-only
-    // or imports-only filtered response.
-    if !relation_kinds.contains(&RelationKind::References) {
-        return 0;
-    }
-
     let before = rows.len();
     for edge in &response.edges {
         if edge.dst_repo != repo_id || edge.dst_entity != *target_id || edge.src_repo == repo_id {
@@ -803,6 +796,12 @@ fn append_spine_reference_rows(
             relation_kinds: vec![RelationKind::References],
         });
     }
+
+    // CrossRepoEdge does not encode whether the dependency originated as a
+    // call, import, or other reference. Keep the generic row even for a narrow
+    // filter: dropping it would let a calls-only/imports-only empty response
+    // certify absence despite a real external dependent. The row's explicit
+    // `references` kind tells clients that the exact subtype is unavailable.
     rows.len() - before
 }
 
@@ -865,13 +864,13 @@ pub async fn handle_find_references<G: GraphStore>(
                     &relation_kinds,
                     &body,
                 );
-                let authority_complete =
-                    body.authority_complete && body.authority_roots.contains_key(&repo_id);
+                let authority_complete = body.authority_complete_for(&repo_id, &target.id);
                 serde_json::json!({
                     "status": "available",
                     "payload_version": body.version(),
                     "reference_count": reference_count,
                     "authority_complete": authority_complete,
+                    "authority_anchor": body.authority_anchor,
                     "authority_revision": body.authority_revision,
                     "authority_roots": body.authority_roots,
                 })
@@ -2215,10 +2214,10 @@ mod tests {
     }
 
     #[test]
-    fn spine_xrefs_respect_direction_and_relation_filter() {
+    fn spine_xrefs_respect_direction_and_preserve_untyped_filtered_dependencies() {
         let target = make_entity("do_work", "src/lib.rs");
         let other = EntityId::new();
-        let response = kin_spine::SpineXrefResponse::new(
+        let outgoing_response = kin_spine::SpineXrefResponse::new(
             vec![kin_spine::CrossRepoEdge {
                 src_repo: "provider".to_string(),
                 src_entity: target.id,
@@ -2236,21 +2235,43 @@ mod tests {
                 "provider",
                 &target.id,
                 &[RelationKind::References],
-                &response,
-            ),
-            0
-        );
-        assert_eq!(
-            append_spine_reference_rows(
-                &mut rows,
-                "consumer",
-                &other,
-                &[RelationKind::Calls],
-                &response,
+                &outgoing_response,
             ),
             0
         );
         assert!(rows.is_empty());
+
+        let source = make_entity("run_task", "src/app.rs");
+        let incoming_response = kin_spine::SpineXrefResponse::new(
+            vec![kin_spine::CrossRepoEdge {
+                src_repo: "consumer".to_string(),
+                src_entity: source.id,
+                dst_repo: "provider".to_string(),
+                dst_entity: target.id,
+                confidence: 0.9,
+            }],
+            Vec::new(),
+        );
+        assert!(!incoming_response.authority_complete_for("provider", &target.id));
+
+        for filter in [RelationKind::Calls, RelationKind::Imports] {
+            let mut filtered_rows = Vec::new();
+            assert_eq!(
+                append_spine_reference_rows(
+                    &mut filtered_rows,
+                    "provider",
+                    &target.id,
+                    &[filter],
+                    &incoming_response,
+                ),
+                1,
+                "a generic federated dependency must survive the {filter:?} filter"
+            );
+            assert_eq!(
+                filtered_rows[0].relation_kinds,
+                vec![RelationKind::References]
+            );
+        }
     }
 
     #[test]

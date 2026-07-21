@@ -227,10 +227,12 @@ pub async fn fetch_spine_xref(
 
     match classify_spine_probe(true, Some(resp.status().as_u16())) {
         SpineProbe::Healthy => match resp.bytes().await {
-            Ok(bytes) => match kin_spine::SpineXrefResponse::from_slice(&bytes) {
-                Ok(body) => SpineQuery::Found(body),
-                Err(e) => SpineQuery::Unavailable(e.to_string()),
-            },
+            Ok(bytes) => {
+                match kin_spine::SpineXrefResponse::from_slice_for(&bytes, repo_id, entity_id) {
+                    Ok(body) => SpineQuery::Found(body),
+                    Err(e) => SpineQuery::Unavailable(e.to_string()),
+                }
+            }
             Err(e) => SpineQuery::Unavailable(format!("failed to read spine response: {e}")),
         },
         SpineProbe::Unavailable(reason) => SpineQuery::Unavailable(reason),
