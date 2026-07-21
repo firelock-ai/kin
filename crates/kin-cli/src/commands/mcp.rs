@@ -138,47 +138,52 @@ async fn bind_first_kin_repo_against(
     bound_repo: Option<PathBuf>,
     pinned_by_operator: bool,
 ) -> Option<kin_mcp::BoundRepo> {
-    for root in roots {
-        // Force the real upward walk. `KinLayout::discover` short-circuits to
-        // `<start>/.kin` whenever `KIN_DAEMON_URL` is set, so once a repository
-        // is bound it would accept any directory — including one with no `.kin/`
-        // at all — as the client's new repository.
-        let Some(layout) = kin_core::KinLayout::discover_with_daemon_url(&root, None) else {
-            continue;
-        };
-        let working_dir = canonical_path(layout.working_dir());
+    // Force the real upward walk. `KinLayout::discover` short-circuits to
+    // `<start>/.kin` whenever `KIN_DAEMON_URL` is set, so once a repository is
+    // bound it would accept any directory — including one with no `.kin/` at
+    // all — as the client's new repository.
+    let candidates: Vec<PathBuf> = roots
+        .iter()
+        .filter_map(|root| kin_core::KinLayout::discover_with_daemon_url(root, None))
+        .map(|layout| canonical_path(layout.working_dir()))
+        .collect();
+    let bound_repo_still_open = bound_repo.as_deref().is_some_and(|bound| {
+        candidates
+            .iter()
+            .any(|candidate| candidate.as_path() == bound)
+    });
 
-        if bound_repo.as_deref() == Some(working_dir.as_path()) {
-            // The client still has the bound repository open. Keep the running
-            // daemon rather than churning it on a redundant roots change.
-            return current_daemon_url().map(|daemon_url| kin_mcp::BoundRepo {
-                root: working_dir,
-                daemon_url,
-            });
-        }
+    if bound_repo_still_open {
+        // The client still has the bound repository open — anywhere in its
+        // workspace, not merely first. Keep the running daemon rather than
+        // churning it because another folder happens to sort ahead of it.
+        return bound_repo
+            .zip(current_daemon_url())
+            .map(|(root, daemon_url)| kin_mcp::BoundRepo { root, daemon_url });
+    }
 
-        if pinned_by_operator {
-            // An explicit --repo/KIN_MCP_REPO names a different repository than
-            // the client is looking at. Following the client would overrule a
-            // deliberate operator choice; serving the pinned repository anyway
-            // would answer about a codebase the client left. Report neither.
-            eprintln!(
-                "Kin MCP: the client's workspace root {} is not the repository pinned by \
-                 --repo/KIN_MCP_REPO; refusing tool calls until the workspace and the pin agree.",
-                working_dir.display()
-            );
-            return None;
-        }
+    if pinned_by_operator {
+        // An explicit --repo/KIN_MCP_REPO names a repository the client is not
+        // looking at. Following the client would overrule a deliberate operator
+        // choice; serving the pinned repository anyway would answer about a
+        // codebase the client left. Report neither, and let the server refuse.
+        eprintln!(
+            "Kin MCP: the repository pinned by --repo/KIN_MCP_REPO is not among the client's \
+             workspace roots; refusing tool calls until the workspace and the pin agree."
+        );
+        return None;
+    }
 
-        if bound_repo.is_some() {
-            // A different repository. Drop the pin so daemon resolution binds
-            // the new repo instead of returning the one being left. Deliberately
-            // not restored if the bind below fails: falling back to the previous
-            // repository is exactly the wrong-repo answer this path prevents, so
-            // failure must leave the process unbound and failing loud.
-            std::env::remove_var("KIN_DAEMON_URL");
-        }
+    if bound_repo.is_some() {
+        // The workspace moved off the bound repository. Drop the pin so daemon
+        // resolution binds the new one instead of returning the one being left.
+        // Deliberately not restored if binding fails below: falling back to the
+        // previous repository is exactly the wrong-repo answer this path
+        // prevents, so failure must leave the process unbound and failing loud.
+        std::env::remove_var("KIN_DAEMON_URL");
+    }
 
+    for working_dir in candidates {
         let Ok(url) = bind_daemon_for_repo_dir(&working_dir).await else {
             continue;
         };
@@ -464,6 +469,29 @@ mod tests {
             None,
             "the previous repository's daemon must not survive the switch"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn the_bound_repo_wins_wherever_it_sits_among_the_roots() {
+        // A second folder opened alongside the bound one is not a switch. Root
+        // order must not move a working binding.
+        let _daemon_guard = EnvVarGuard::set("KIN_DAEMON_URL", "http://127.0.0.1:4242");
+        let _no_daemon_guard = EnvVarGuard::set("KIN_NO_DAEMON", "1");
+        let other = kin_repo_fixture();
+        let bound = kin_repo_fixture();
+        let bound_dir = std::fs::canonicalize(bound.path()).unwrap();
+
+        let result = bind_first_kin_repo_against(
+            vec![other.path().to_path_buf(), bound.path().to_path_buf()],
+            Some(bound_dir.clone()),
+            false,
+        )
+        .await
+        .expect("the bound repository being open anywhere must keep the binding");
+
+        assert_eq!(result.root, bound_dir);
+        assert_eq!(result.daemon_url, "http://127.0.0.1:4242");
     }
 
     #[tokio::test]
