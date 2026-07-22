@@ -33,6 +33,7 @@ use crate::{Ecosystem, ManifestStore, PackageId, PackageVersion};
 pub struct CargoRegistryState {
     pub manifest_store: ManifestStore,
     pub blobs_dir: std::path::PathBuf,
+    blobs_authority: crate::atomic_file::AuthorityRoot,
     pub base_url: String,
     /// Shared secret required to authorize `publish` requests (the write path).
     ///
@@ -52,6 +53,8 @@ pub struct CargoRegistryState {
     publish_gate: RwLock<()>,
     #[cfg(test)]
     fail_next_blob_commit: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    delay_next_blob_commit_ms: std::sync::atomic::AtomicU64,
 }
 
 impl CargoRegistryState {
@@ -61,10 +64,12 @@ impl CargoRegistryState {
         base_url: String,
         publish_token: Option<String>,
     ) -> Self {
-        let blobs_dir = crate::atomic_file::pin_authority_root(&blobs_dir).unwrap_or(blobs_dir);
+        let blobs_authority = crate::atomic_file::AuthorityRoot::new(&blobs_dir);
+        let blobs_dir = blobs_authority.path().to_path_buf();
         Self {
             manifest_store,
             blobs_dir,
+            blobs_authority,
             base_url,
             publish_token: publish_token
                 .map(|token| token.trim().to_string())
@@ -72,6 +77,8 @@ impl CargoRegistryState {
             publish_gate: RwLock::new(()),
             #[cfg(test)]
             fail_next_blob_commit: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            delay_next_blob_commit_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -212,13 +219,18 @@ async fn index_lookup(
     }
 
     let _read_guard = state.publish_gate.read().await;
-    let transaction = match state
-        .manifest_store
-        .read_transaction_async(Ecosystem::Cargo)
-        .await
+    let read_state = Arc::clone(&state);
+    let read_name = name.to_string();
+    let versions = match tokio::task::spawn_blocking(move || {
+        read_state
+            .manifest_store
+            .read_transaction(Ecosystem::Cargo)?
+            .get_versions(&read_name)
+    })
+    .await
     {
-        Ok(transaction) => transaction,
-        Err(error) => {
+        Ok(Ok(versions)) => versions,
+        Ok(Err(error)) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
@@ -227,24 +239,22 @@ async fn index_lookup(
             )
                 .into_response();
         }
-    };
-
-    // The manifest is the sparse index authority. Metadata extraction belongs
-    // to authenticated publish/ingest; a GET must never rebuild or mutate the
-    // index from ambient crate files.
-    let versions = match transaction.get_versions(name) {
-        Ok(v) if v.is_empty() => return StatusCode::NOT_FOUND.into_response(),
-        Ok(v) => v,
         Err(error) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
-                    "error": format!("Cargo index manifest is unreadable: {error}")
+                    "error": format!("Cargo index storage task failed: {error}")
                 })),
             )
                 .into_response();
         }
     };
+    // The manifest is the sparse index authority. Metadata extraction belongs
+    // to authenticated publish/ingest; a GET must never rebuild or mutate the
+    // index from ambient crate files.
+    if versions.is_empty() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
 
     // Cargo expects newline-delimited JSON, one entry per version
     let mut body = String::new();
@@ -291,36 +301,41 @@ async fn download_crate(
         return bad_coordinate(message);
     }
     let _read_guard = state.publish_gate.read().await;
-    let transaction = match state
-        .manifest_store
-        .read_transaction_async(Ecosystem::Cargo)
-        .await
-    {
-        Ok(transaction) => transaction,
+    let relative = match crate_path.strip_prefix(&state.blobs_dir) {
+        Ok(relative) => relative.to_path_buf(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    let versions = match transaction.get_versions(&name) {
-        Ok(v) => v,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
-    };
-
-    let pkg_version = match versions.iter().find(|v| v.version == version) {
-        Some(v) => v,
-        None => return StatusCode::NOT_FOUND.into_response(),
-    };
-
-    // Read the .crate file from blob store
-    match std::fs::read(&crate_path) {
-        Ok(bytes) => (
+    let read_state = Arc::clone(&state);
+    let read_name = name.clone();
+    let read_version = version.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let transaction = read_state
+            .manifest_store
+            .read_transaction(Ecosystem::Cargo)?;
+        let versions = transaction.get_versions(&read_name)?;
+        let Some(pkg_version) = versions.iter().find(|item| item.version == read_version) else {
+            return Ok::<_, crate::RegistryError>(None);
+        };
+        let bytes = match read_state.blobs_authority.read(&relative) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Some((bytes, pkg_version.checksum.clone())))
+    })
+    .await;
+    match result {
+        Ok(Ok(Some((bytes, checksum)))) => (
             StatusCode::OK,
             [
                 ("content-type", "application/x-tar"),
-                ("etag", &format!("\"{}\"", pkg_version.checksum)),
+                ("etag", &format!("\"{checksum}\"")),
             ],
             bytes,
         )
             .into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(_)) | Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
@@ -471,11 +486,6 @@ async fn publish_crate(
     // Compute SHA-256 checksum of the .crate bytes
     let checksum = hex::encode(Sha256::digest(&body));
 
-    let crate_path = match cargo_blob_path(&state.blobs_dir, &params.name, &params.version) {
-        Ok(path) => path,
-        Err(message) => return bad_coordinate(message),
-    };
-
     // Parse metadata before entering the short storage critical section. The
     // write side serializes the subsequent manifest check + blob write +
     // manifest append against every other publish in this registry. Readers
@@ -501,79 +511,34 @@ async fn publish_crate(
         }
     };
     let _write_guard = state.publish_gate.write().await;
-    let transaction = match state
-        .manifest_store
-        .write_transaction_async(Ecosystem::Cargo)
-        .await
-    {
-        Ok(transaction) => transaction,
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("failed to lock Cargo registry storage: {error}")
-                })),
-            )
-                .into_response();
-        }
-    };
+    let commit_state = Arc::clone(&state);
+    let commit_name = params.name.clone();
+    let commit_version = params.version.clone();
+    let commit_checksum = checksum.clone();
+    let commit_body = body.to_vec();
+    let outcome = tokio::task::spawn_blocking(move || {
+        commit_crate(
+            &commit_state,
+            &commit_name,
+            &commit_version,
+            &commit_checksum,
+            metadata,
+            &commit_body,
+        )
+    })
+    .await;
 
-    let existing_versions = match transaction.get_versions(&params.name) {
-        Ok(versions) => versions,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("{e}") })),
-            )
-                .into_response();
-        }
-    };
-
-    if let Some((existing_index, existing)) = existing_versions
-        .iter()
-        .enumerate()
-        .find(|(_, version)| version.version == params.version)
-    {
-        if existing.checksum != checksum {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "version {} of crate {} already exists with a different checksum",
-                        params.version, params.name
-                    )
-                })),
-            )
-                .into_response();
-        }
-
-        if let Err(e) = write_crate_blob(&state, &crate_path, &body) {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("failed to write crate file: {e}") })),
-            )
-                .into_response();
-        }
-
-        // An identical immutable artifact is also the safe recovery path for
-        // manifests written before Cargo dependency metadata became
-        // authoritative. Replace only metadata derived from the same bytes;
-        // preserve publication identity and timestamps.
-        if existing.metadata != metadata {
-            let mut repaired = existing_versions.clone();
-            repaired[existing_index].metadata = metadata.clone();
-            if let Err(error) = transaction.replace_versions(&existing.id, &repaired) {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": format!("failed to repair Cargo index metadata: {error}")
-                    })),
-                )
-                    .into_response();
-            }
-        }
-
-        return (
+    match outcome {
+        Ok(Ok(CargoCommitOutcome::Published)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "name": params.name,
+                "version": params.version,
+                "checksum": checksum,
+            })),
+        )
+            .into_response(),
+        Ok(Ok(CargoCommitOutcome::AlreadyPublished)) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "name": params.name,
@@ -582,60 +547,111 @@ async fn publish_crate(
                 "already_published": true,
             })),
         )
-            .into_response();
-    }
-
-    if let Err(e) = write_crate_blob(&state, &crate_path, &body) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("failed to write crate file: {e}") })),
+            .into_response(),
+        Ok(Err(CargoCommitError::Conflict(message))) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": message })),
         )
-            .into_response();
+            .into_response(),
+        Ok(Err(CargoCommitError::Storage(message))) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": message })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Cargo publication task failed: {error}")
+            })),
+        )
+            .into_response(),
+    }
+}
+
+enum CargoCommitOutcome {
+    Published,
+    AlreadyPublished,
+}
+
+enum CargoCommitError {
+    Conflict(String),
+    Storage(String),
+}
+
+fn commit_crate(
+    state: &CargoRegistryState,
+    name: &str,
+    version: &str,
+    checksum: &str,
+    metadata: serde_json::Value,
+    body: &[u8],
+) -> Result<CargoCommitOutcome, CargoCommitError> {
+    let transaction = state
+        .manifest_store
+        .write_transaction(Ecosystem::Cargo)
+        .map_err(|error| {
+            CargoCommitError::Storage(format!("failed to lock Cargo registry storage: {error}"))
+        })?;
+    let existing_versions = transaction
+        .get_versions(name)
+        .map_err(|error| CargoCommitError::Storage(error.to_string()))?;
+    let crate_path =
+        cargo_blob_path(&state.blobs_dir, name, version).map_err(CargoCommitError::Storage)?;
+
+    if let Some((existing_index, existing)) = existing_versions
+        .iter()
+        .enumerate()
+        .find(|(_, candidate)| candidate.version == version)
+    {
+        if existing.checksum != checksum {
+            return Err(CargoCommitError::Conflict(format!(
+                "version {version} of crate {name} already exists with a different checksum"
+            )));
+        }
+        write_crate_blob(state, &crate_path, body).map_err(|error| {
+            CargoCommitError::Storage(format!("failed to write crate file: {error}"))
+        })?;
+        if existing.metadata != metadata {
+            let mut repaired = existing_versions.clone();
+            repaired[existing_index].metadata = metadata;
+            transaction
+                .replace_versions(&existing.id, &repaired)
+                .map_err(|error| {
+                    CargoCommitError::Storage(format!(
+                        "failed to repair Cargo index metadata: {error}"
+                    ))
+                })?;
+        }
+        return Ok(CargoCommitOutcome::AlreadyPublished);
     }
 
-    // Register the version in the manifest store
-    let pkg_version = PackageVersion {
+    write_crate_blob(state, &crate_path, body).map_err(|error| {
+        CargoCommitError::Storage(format!("failed to write crate file: {error}"))
+    })?;
+    let package_version = PackageVersion {
         id: PackageId {
             ecosystem: Ecosystem::Cargo,
             scope: None,
-            name: params.name.clone(),
+            name: name.to_string(),
         },
-        version: params.version.clone(),
-        blob_hash: checksum.clone(),
+        version: version.to_string(),
+        blob_hash: checksum.to_string(),
         blob_size: body.len() as u64,
-        checksum: checksum.clone(),
+        checksum: checksum.to_string(),
         metadata,
         published_at: Utc::now(),
         published_by: "anonymous".to_string(),
         yanked: false,
     };
-
-    match transaction.add_version(&pkg_version) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "name": params.name,
-                "version": params.version,
-                "checksum": checksum,
-            })),
-        )
-            .into_response(),
-        Err(crate::RegistryError::VersionExists(_, _)) => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": format!(
-                    "version {} of crate {} already exists and cannot be overwritten",
-                    params.version, params.name
-                )
-            })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("{e}") })),
-        )
-            .into_response(),
-    }
+    transaction
+        .add_version(&package_version)
+        .map_err(|error| match error {
+            crate::RegistryError::VersionExists(_, _) => CargoCommitError::Conflict(format!(
+                "version {version} of crate {name} already exists and cannot be overwritten"
+            )),
+            error => CargoCommitError::Storage(error.to_string()),
+        })?;
+    Ok(CargoCommitOutcome::Published)
 }
 
 fn write_crate_blob(
@@ -651,6 +667,16 @@ fn write_crate_blob(
     }
 
     #[cfg(test)]
+    {
+        let delay = state
+            .delay_next_blob_commit_ms
+            .swap(0, std::sync::atomic::Ordering::SeqCst);
+        if delay > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+        }
+    }
+
+    #[cfg(test)]
     if state
         .fail_next_blob_commit
         .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -662,7 +688,13 @@ fn write_crate_blob(
         });
     }
 
-    crate::atomic_file::write(crate_path, body)
+    let relative = crate_path.strip_prefix(&state.blobs_dir).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "crate blob path escaped the configured blob directory",
+        )
+    })?;
+    state.blobs_authority.write(relative, body)
 }
 
 /// Parse and verify the one authoritative Cargo.toml under bounded archive
@@ -672,11 +704,11 @@ fn parse_crate_manifest(
     name: &str,
     version: &str,
 ) -> Result<toml::Value, String> {
-    use flate2::read::GzDecoder;
+    use flate2::bufread::GzDecoder;
     use std::io::Read;
 
     let expected_manifest = format!("{}-{}/Cargo.toml", name, version);
-    let gz = GzDecoder::new(crate_bytes);
+    let gz = GzDecoder::new(std::io::BufReader::new(crate_bytes));
     let mut archive = tar::Archive::new(gz);
 
     let entries = archive
@@ -733,6 +765,14 @@ fn parse_crate_manifest(
                 ));
             }
         }
+    }
+
+    let mut decoder = archive.into_inner();
+    std::io::copy(&mut decoder, &mut std::io::sink())
+        .map_err(|error| format!("crate gzip stream is truncated: {error}"))?;
+    let compressed = decoder.into_inner();
+    if !compressed.buffer().is_empty() || !compressed.get_ref().is_empty() {
+        return Err("crate contains trailing data or more than one gzip member".to_string());
     }
 
     if !manifest_seen {
@@ -1080,6 +1120,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use std::time::Duration;
     use tower::ServiceExt;
 
     fn registry_state() -> (tempfile::TempDir, Arc<CargoRegistryState>) {
@@ -1575,6 +1616,30 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
         assert_eq!(versions[0].version, "0.1.0");
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn delayed_durable_commit_does_not_block_the_async_worker() {
+        let (_root, state) = registry_state_with_token(Some("s3cret"));
+        state
+            .delay_next_blob_commit_ms
+            .store(200, std::sync::atomic::Ordering::SeqCst);
+        let publisher = tokio::spawn(publish(
+            state,
+            "demo",
+            "1.0.0",
+            Some("s3cret"),
+            valid_crate("demo", "1.0.0"),
+        ));
+
+        tokio::time::timeout(Duration::from_millis(75), async {
+            for _ in 0..3 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Tokio heartbeat stalled behind the durable registry commit");
+        assert_eq!(publisher.await.unwrap(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn republishing_existing_version_is_idempotent_for_same_checksum() {
         // (d) Re-publishing the same version with identical bytes repairs the
@@ -1991,6 +2056,53 @@ private = { version = "1", registry = "corp" }
         let body = encoder.finish().unwrap();
         let error = parse_crate_manifest(&body, "demo", "1.0.0").unwrap_err();
         assert!(error.contains("more than one authoritative"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn publish_rejects_a_second_gzip_member_without_mutating_storage() {
+        let (_root, state) = registry_state_with_token(Some("s3cret"));
+        let mut body = valid_crate("demo", "1.0.0");
+        body.extend_from_slice(&valid_crate("demo", "1.0.0"));
+
+        let status = publish(state.clone(), "demo", "1.0.0", Some("s3cret"), body).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(state
+            .manifest_store
+            .get_versions(Ecosystem::Cargo, "demo")
+            .unwrap()
+            .is_empty());
+        assert!(!state.blobs_dir.join("demo-1.0.0.crate").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_cargo_state_cannot_be_redirected_by_root_replacement() {
+        let (root, state) = registry_state_with_token(Some("s3cret"));
+        let original_blobs = root.path().join("cargo-retained");
+        std::fs::rename(&state.blobs_dir, &original_blobs).unwrap();
+        std::fs::create_dir(&state.blobs_dir).unwrap();
+
+        let manifest_path = root.path().join(".kin/packages/manifests");
+        let original_manifests = root.path().join("manifests-retained");
+        std::fs::rename(&manifest_path, &original_manifests).unwrap();
+        std::fs::create_dir(&manifest_path).unwrap();
+
+        assert_eq!(
+            publish(
+                state,
+                "demo",
+                "1.0.0",
+                Some("s3cret"),
+                valid_crate("demo", "1.0.0"),
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert!(original_blobs.join("demo-1.0.0.crate").is_file());
+        assert!(!root.path().join("cargo/demo-1.0.0.crate").exists());
+        assert!(original_manifests.join("cargo/demo").is_file());
+        assert!(!manifest_path.join("cargo/demo").exists());
     }
 
     #[tokio::test]

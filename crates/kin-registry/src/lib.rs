@@ -97,8 +97,10 @@ pub enum RegistryError {
 
 /// In-memory manifest store backed by a JSON file in the .kin directory.
 /// At scale, this would use kin-db entities, but for MVP a simple file works.
+#[derive(Clone)]
 pub struct ManifestStore {
     manifests_dir: std::path::PathBuf,
+    authority: atomic_file::AuthorityRoot,
 }
 
 /// Shared-lock view of one ecosystem's durable manifest authority.
@@ -120,18 +122,23 @@ pub(crate) struct ManifestWriteTransaction<'a> {
 
 impl ManifestStore {
     pub fn new(kin_dir: &std::path::Path) -> Self {
-        let pinned_kin_dir =
-            atomic_file::pin_authority_root(kin_dir).unwrap_or_else(|_| kin_dir.to_path_buf());
-        let manifests_dir = pinned_kin_dir.join("packages").join("manifests");
-        let _ = atomic_file::ensure_directory_durable(&manifests_dir);
-        Self { manifests_dir }
+        let configured = kin_dir.join("packages").join("manifests");
+        let authority = atomic_file::AuthorityRoot::new(&configured);
+        let manifests_dir = authority.path().to_path_buf();
+        Self {
+            manifests_dir,
+            authority,
+        }
     }
 
     pub(crate) fn read_transaction(
         &self,
         ecosystem: Ecosystem,
     ) -> Result<ManifestReadTransaction<'_>, RegistryError> {
-        let lock = storage_lock::StorageLock::shared(&self.transaction_lock_path(ecosystem))?;
+        let lock = storage_lock::StorageLock::shared_at(
+            &self.authority,
+            &self.transaction_lock_relative(ecosystem),
+        )?;
         Ok(ManifestReadTransaction {
             store: self,
             ecosystem,
@@ -143,38 +150,10 @@ impl ManifestStore {
         &self,
         ecosystem: Ecosystem,
     ) -> Result<ManifestWriteTransaction<'_>, RegistryError> {
-        let lock = storage_lock::StorageLock::exclusive(&self.transaction_lock_path(ecosystem))?;
-        Ok(ManifestWriteTransaction {
-            store: self,
-            ecosystem,
-            _lock: lock,
-        })
-    }
-
-    /// Async handler boundary for the same shared transaction lock. The OS
-    /// lock and in-process condition wait run on Tokio's bounded blocking pool
-    /// so a stalled peer process cannot occupy an API worker thread.
-    pub(crate) async fn read_transaction_async(
-        &self,
-        ecosystem: Ecosystem,
-    ) -> Result<ManifestReadTransaction<'_>, RegistryError> {
-        let lock =
-            storage_lock::StorageLock::shared_async(&self.transaction_lock_path(ecosystem)).await?;
-        Ok(ManifestReadTransaction {
-            store: self,
-            ecosystem,
-            _lock: lock,
-        })
-    }
-
-    /// Async handler boundary for the exclusive publication transaction.
-    pub(crate) async fn write_transaction_async(
-        &self,
-        ecosystem: Ecosystem,
-    ) -> Result<ManifestWriteTransaction<'_>, RegistryError> {
-        let lock =
-            storage_lock::StorageLock::exclusive_async(&self.transaction_lock_path(ecosystem))
-                .await?;
+        let lock = storage_lock::StorageLock::exclusive_at(
+            &self.authority,
+            &self.transaction_lock_relative(ecosystem),
+        )?;
         Ok(ManifestWriteTransaction {
             store: self,
             ecosystem,
@@ -202,11 +181,16 @@ impl ManifestStore {
                 "package manifest path escaped its ecosystem directory".to_string(),
             ));
         }
-        let path = self.manifest_path(&id);
-        if !path.exists() {
-            return Ok(vec![]);
-        }
-        let content = std::fs::read_to_string(&path)?;
+        let relative = self.manifest_relative_path(&id);
+        let content = match self.authority.read(&relative) {
+            Ok(content) => String::from_utf8(content).map_err(|error| {
+                RegistryError::InvalidOperation(format!(
+                    "package manifest is not valid UTF-8: {error}"
+                ))
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(error) => return Err(error.into()),
+        };
         let versions: Vec<PackageVersion> = content
             .lines()
             .filter(|l| !l.trim().is_empty())
@@ -245,13 +229,9 @@ impl ManifestStore {
                 "package manifest path escaped its ecosystem directory".to_string(),
             ));
         }
-        let path = self.manifest_path(id);
-        if let Some(parent) = path.parent() {
-            atomic_file::ensure_directory_durable(parent)?;
-        }
-
+        let relative = self.manifest_relative_path(id);
         let contents = serialize_versions(versions)?;
-        atomic_file::write(&path, &contents)?;
+        self.authority.write(&relative, &contents)?;
         Ok(())
     }
 
@@ -321,7 +301,7 @@ impl ManifestStore {
         })
     }
 
-    fn transaction_lock_path(&self, ecosystem: Ecosystem) -> std::path::PathBuf {
+    fn transaction_lock_relative(&self, ecosystem: Ecosystem) -> std::path::PathBuf {
         let name = match ecosystem {
             Ecosystem::Cargo => "cargo.lock",
             Ecosystem::Npm => "npm.lock",
@@ -329,7 +309,23 @@ impl ManifestStore {
             Ecosystem::Go => "go.lock",
             Ecosystem::Raw => "raw.lock",
         };
-        self.manifests_dir.join(".transactions").join(name)
+        std::path::PathBuf::from(".transactions").join(name)
+    }
+
+    fn manifest_relative_path(&self, id: &PackageId) -> std::path::PathBuf {
+        let ecosystem = match id.ecosystem {
+            Ecosystem::Cargo => "cargo",
+            Ecosystem::Npm => "npm",
+            Ecosystem::Oci => "oci",
+            Ecosystem::Go => "go",
+            Ecosystem::Raw => "raw",
+        };
+        match &id.scope {
+            Some(scope) if !scope.is_empty() => std::path::PathBuf::from(ecosystem)
+                .join(format!("@{scope}"))
+                .join(&id.name),
+            _ => std::path::PathBuf::from(ecosystem).join(&id.name),
+        }
     }
 
     fn manifest_path(&self, id: &PackageId) -> std::path::PathBuf {

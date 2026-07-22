@@ -106,31 +106,43 @@ pub(crate) struct StorageLock {
 }
 
 impl StorageLock {
-    pub(crate) fn shared(path: &Path) -> io::Result<Self> {
-        Self::acquire(path, false)
-    }
-
+    #[cfg(test)]
     pub(crate) fn exclusive(path: &Path) -> io::Result<Self> {
         Self::acquire(path, true)
     }
 
-    pub(crate) async fn shared_async(path: &Path) -> io::Result<Self> {
-        Self::acquire_async(path, false).await
+    pub(crate) fn shared_at(
+        root: &crate::atomic_file::AuthorityRoot,
+        relative: &Path,
+    ) -> io::Result<Self> {
+        Self::acquire_file(root.open_lock_file(relative)?, false)
     }
 
-    pub(crate) async fn exclusive_async(path: &Path) -> io::Result<Self> {
-        Self::acquire_async(path, true).await
+    pub(crate) fn exclusive_at(
+        root: &crate::atomic_file::AuthorityRoot,
+        relative: &Path,
+    ) -> io::Result<Self> {
+        Self::acquire_file(root.open_lock_file(relative)?, true)
     }
 
-    async fn acquire_async(path: &Path, exclusive: bool) -> io::Result<Self> {
-        let path = PathBuf::from(path);
-        tokio::task::spawn_blocking(move || Self::acquire(&path, exclusive))
+    pub(crate) async fn exclusive_at_async(
+        root: crate::atomic_file::AuthorityRoot,
+        relative: PathBuf,
+    ) -> io::Result<Self> {
+        tokio::task::spawn_blocking(move || Self::exclusive_at(&root, &relative))
             .await
             .map_err(|error| io::Error::other(format!("registry lock task failed: {error}")))?
     }
 
+    #[cfg(test)]
     fn acquire(path: &Path, exclusive: bool) -> io::Result<Self> {
-        let file = crate::atomic_file::open_lock_file(path)?;
+        Self::acquire_file(crate::atomic_file::open_lock_file(path)?, exclusive)
+    }
+
+    fn acquire_file(
+        file: crate::atomic_file::AnchoredLockFile,
+        exclusive: bool,
+    ) -> io::Result<Self> {
         let process_guard = ProcessGuard::acquire(file.authority_key(), exclusive)?;
         if exclusive {
             FileExt::lock_exclusive(&file.file)?;

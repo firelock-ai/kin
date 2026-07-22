@@ -11,8 +11,9 @@ use std::ffi::OsString;
 use std::fs::File;
 #[cfg(not(unix))]
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Stable in-process identity for one named authority inside a pinned parent.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -25,6 +26,452 @@ pub(crate) enum AuthorityKey {
     },
     #[cfg(not(unix))]
     Path(PathBuf),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ArtifactIdentity {
+    #[cfg(unix)]
+    pub(crate) device: u64,
+    #[cfg(unix)]
+    pub(crate) inode: u64,
+    pub(crate) len: u64,
+}
+
+/// A registry storage root whose identity remains authoritative for the
+/// lifetime of the adapter.
+///
+/// Unix operations walk only relative, normal components from the retained
+/// directory descriptor with `openat(2)` and `O_NOFOLLOW`. Renaming or
+/// replacing the configured pathname therefore cannot redirect a live
+/// registry. Platforms without descriptor-relative filesystem APIs keep the
+/// canonical path and reject reparse points before each operation.
+#[derive(Clone)]
+pub(crate) struct AuthorityRoot {
+    path: PathBuf,
+    inner: Arc<AuthorityRootInner>,
+}
+
+enum AuthorityRootInner {
+    #[cfg(unix)]
+    Unix(File),
+    #[cfg(not(unix))]
+    Path,
+    Failed {
+        kind: io::ErrorKind,
+        message: String,
+    },
+}
+
+impl std::fmt::Debug for AuthorityRoot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorityRoot")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuthorityRoot {
+    /// Pin and create a configured root. Construction stays infallible for the
+    /// existing public state constructors, but any initialization failure is
+    /// retained and makes every later storage operation fail closed.
+    pub(crate) fn new(path: &Path) -> Self {
+        match Self::try_new(path) {
+            Ok(root) => root,
+            Err(error) => Self {
+                path: path.to_path_buf(),
+                inner: Arc::new(AuthorityRootInner::Failed {
+                    kind: error.kind(),
+                    message: error.to_string(),
+                }),
+            },
+        }
+    }
+
+    fn try_new(path: &Path) -> io::Result<Self> {
+        let path = pin_authority_root(path)?;
+        ensure_directory_durable(&path)?;
+        #[cfg(unix)]
+        let inner = AuthorityRootInner::Unix(open_or_create_directory(&path)?.file);
+        #[cfg(not(unix))]
+        let inner = {
+            reject_reparse_components(&path)?;
+            AuthorityRootInner::Path
+        };
+        Ok(Self {
+            path,
+            inner: Arc::new(inner),
+        })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn initialization_error(&self) -> Option<io::Error> {
+        match self.inner.as_ref() {
+            AuthorityRootInner::Failed { kind, message } => {
+                Some(io::Error::new(*kind, message.clone()))
+            }
+            #[cfg(unix)]
+            AuthorityRootInner::Unix(_) => None,
+            #[cfg(not(unix))]
+            AuthorityRootInner::Path => None,
+        }
+    }
+
+    fn validate_relative(relative: &Path, allow_empty: bool) -> io::Result<()> {
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            || (!allow_empty && relative.as_os_str().is_empty())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "registry authority paths must contain only relative normal components",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn unix_root(&self) -> io::Result<&File> {
+        match self.inner.as_ref() {
+            AuthorityRootInner::Unix(file) => Ok(file),
+            AuthorityRootInner::Failed { kind, message } => {
+                Err(io::Error::new(*kind, message.clone()))
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn directory(&self, relative: &Path, create: bool) -> io::Result<File> {
+        Self::validate_relative(relative, true)?;
+        let mut current = self.unix_root()?.try_clone()?;
+        for component in relative.components() {
+            let std::path::Component::Normal(name) = component else {
+                unreachable!("relative path was validated")
+            };
+            let next = match open_directory_at(&current, name) {
+                Ok(next) => next,
+                Err(error) if create && error.kind() == io::ErrorKind::NotFound => {
+                    mkdir_at(&current, name)?;
+                    current.sync_all()?;
+                    open_directory_at(&current, name)?
+                }
+                Err(error) => return Err(error),
+            };
+            current = next;
+        }
+        Ok(current)
+    }
+
+    #[cfg(unix)]
+    fn parent_and_name(&self, relative: &Path, create: bool) -> io::Result<(File, OsString)> {
+        Self::validate_relative(relative, false)?;
+        let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+        let name = relative
+            .file_name()
+            .expect("validated non-empty relative path")
+            .to_os_string();
+        Ok((self.directory(parent, create)?, name))
+    }
+
+    pub(crate) fn ensure_directory(&self, relative: &Path) -> io::Result<()> {
+        if let Some(error) = self.initialization_error() {
+            return Err(error);
+        }
+        Self::validate_relative(relative, true)?;
+        #[cfg(unix)]
+        {
+            let _ = self.directory(relative, true)?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let path = self.path.join(relative);
+            ensure_directory_durable(&path)?;
+            reject_reparse_components(&self.path)?;
+            reject_reparse_components(&path)
+        }
+    }
+
+    pub(crate) fn read(&self, relative: &Path) -> io::Result<Vec<u8>> {
+        if let Some(error) = self.initialization_error() {
+            return Err(error);
+        }
+        Self::validate_relative(relative, false)?;
+        #[cfg(unix)]
+        {
+            let (parent, name) = self.parent_and_name(relative, false)?;
+            let mut file = open_file_at(&parent, &name, libc::O_RDONLY, 0)?;
+            validate_regular_file(&file, "registry artifact")?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        }
+        #[cfg(not(unix))]
+        {
+            reject_reparse_components(&self.path)?;
+            let path = self.path.join(relative);
+            reject_reparse_or_non_file(&path, "registry artifact")?;
+            std::fs::read(path)
+        }
+    }
+
+    pub(crate) fn open_read(&self, relative: &Path) -> io::Result<File> {
+        if let Some(error) = self.initialization_error() {
+            return Err(error);
+        }
+        Self::validate_relative(relative, false)?;
+        #[cfg(unix)]
+        {
+            let (parent, name) = self.parent_and_name(relative, false)?;
+            let file = open_file_at(&parent, &name, libc::O_RDONLY, 0)?;
+            validate_regular_file(&file, "registry artifact")?;
+            Ok(file)
+        }
+        #[cfg(not(unix))]
+        {
+            reject_reparse_components(&self.path)?;
+            let path = self.path.join(relative);
+            reject_reparse_or_non_file(&path, "registry artifact")?;
+            File::open(path)
+        }
+    }
+
+    pub(crate) fn open_append(&self, relative: &Path) -> io::Result<File> {
+        if let Some(error) = self.initialization_error() {
+            return Err(error);
+        }
+        Self::validate_relative(relative, false)?;
+        #[cfg(unix)]
+        {
+            let (parent, name) = self.parent_and_name(relative, false)?;
+            let file = open_file_at(&parent, &name, libc::O_WRONLY | libc::O_APPEND, 0)?;
+            validate_regular_file(&file, "registry upload data")?;
+            Ok(file)
+        }
+        #[cfg(not(unix))]
+        {
+            reject_reparse_components(&self.path)?;
+            let path = self.path.join(relative);
+            reject_reparse_or_non_file(&path, "registry upload data")?;
+            OpenOptions::new().append(true).open(path)
+        }
+    }
+
+    pub(crate) fn open_write(&self, relative: &Path) -> io::Result<File> {
+        if let Some(error) = self.initialization_error() {
+            return Err(error);
+        }
+        Self::validate_relative(relative, false)?;
+        #[cfg(unix)]
+        {
+            let (parent, name) = self.parent_and_name(relative, false)?;
+            let file = open_file_at(&parent, &name, libc::O_WRONLY, 0)?;
+            validate_regular_file(&file, "registry artifact")?;
+            Ok(file)
+        }
+        #[cfg(not(unix))]
+        {
+            reject_reparse_components(&self.path)?;
+            let path = self.path.join(relative);
+            reject_reparse_or_non_file(&path, "registry artifact")?;
+            OpenOptions::new().write(true).open(path)
+        }
+    }
+
+    pub(crate) fn metadata(&self, relative: &Path) -> io::Result<std::fs::Metadata> {
+        self.open_read(relative)?.metadata()
+    }
+
+    pub(crate) fn identity(&self, relative: &Path) -> io::Result<ArtifactIdentity> {
+        let file = self.open_read(relative)?;
+        #[cfg(unix)]
+        {
+            let stat = stat_file(&file)?;
+            Ok(ArtifactIdentity {
+                device: stat.st_dev as u64,
+                inode: stat.st_ino as u64,
+                len: stat.st_size as u64,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(ArtifactIdentity {
+                len: file.metadata()?.len(),
+            })
+        }
+    }
+
+    pub(crate) fn read_dir_names(&self, relative: &Path) -> io::Result<Vec<OsString>> {
+        if let Some(error) = self.initialization_error() {
+            return Err(error);
+        }
+        Self::validate_relative(relative, true)?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::{FromRawFd, IntoRawFd};
+            use std::os::unix::ffi::OsStrExt;
+
+            let directory = self.directory(relative, false)?;
+            let descriptor = directory.into_raw_fd();
+            let stream = unsafe { libc::fdopendir(descriptor) };
+            if stream.is_null() {
+                let error = io::Error::last_os_error();
+                // SAFETY: fdopendir failed without taking ownership of the descriptor.
+                drop(unsafe { File::from_raw_fd(descriptor) });
+                return Err(error);
+            }
+            struct DirectoryStream(*mut libc::DIR);
+            impl Drop for DirectoryStream {
+                fn drop(&mut self) {
+                    // SAFETY: fdopendir returned this live stream exactly once.
+                    unsafe { libc::closedir(self.0) };
+                }
+            }
+            let stream = DirectoryStream(stream);
+            let mut names = Vec::new();
+            loop {
+                // SAFETY: the stream remains live and is accessed by one thread.
+                let entry = unsafe { libc::readdir(stream.0) };
+                if entry.is_null() {
+                    break;
+                }
+                // SAFETY: d_name is NUL-terminated for the lifetime of this entry.
+                let bytes = unsafe {
+                    std::ffi::CStr::from_ptr((*entry).d_name.as_ptr())
+                        .to_bytes()
+                        .to_vec()
+                };
+                if bytes == b"." || bytes == b".." {
+                    continue;
+                }
+                names.push(std::ffi::OsStr::from_bytes(&bytes).to_os_string());
+            }
+            Ok(names)
+        }
+        #[cfg(not(unix))]
+        {
+            reject_reparse_components(&self.path)?;
+            std::fs::read_dir(self.path.join(relative))?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect()
+        }
+    }
+
+    pub(crate) fn write(&self, relative: &Path, bytes: &[u8]) -> io::Result<()> {
+        if let Some(error) = self.initialization_error() {
+            return Err(error);
+        }
+        Self::validate_relative(relative, false)?;
+        #[cfg(unix)]
+        {
+            let (parent, destination_name) = self.parent_and_name(relative, true)?;
+            write_at(&parent, &destination_name, bytes)
+        }
+        #[cfg(not(unix))]
+        {
+            reject_reparse_components(&self.path)?;
+            write(&self.path.join(relative), bytes)?;
+            reject_reparse_components(&self.path)
+        }
+    }
+
+    pub(crate) fn remove_file(&self, relative: &Path) -> io::Result<()> {
+        if let Some(error) = self.initialization_error() {
+            return Err(error);
+        }
+        Self::validate_relative(relative, false)?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let (parent, name) = self.parent_and_name(relative, false)?;
+            match stat_at(&parent, &name) {
+                Ok(stat) => {
+                    validate_regular_stat(&stat, "registry artifact")?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error),
+            }
+            let name = name_cstring(&name)?;
+            // SAFETY: the retained parent descriptor and relative name are valid.
+            if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            parent.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            reject_reparse_components(&self.path)?;
+            let path = self.path.join(relative);
+            match reject_reparse_or_non_file(&path, "registry artifact") {
+                Ok(()) => std::fs::remove_file(path),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+    }
+
+    pub(crate) fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        if let Some(error) = self.initialization_error() {
+            return Err(error);
+        }
+        Self::validate_relative(from, false)?;
+        Self::validate_relative(to, false)?;
+        #[cfg(unix)]
+        {
+            let (from_parent, from_name) = self.parent_and_name(from, false)?;
+            let (to_parent, to_name) = self.parent_and_name(to, true)?;
+            validate_regular_stat(&stat_at(&from_parent, &from_name)?, "registry artifact")?;
+            match stat_at(&to_parent, &to_name) {
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "registry destination already exists",
+                    ))
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            rename_at(&from_parent, &from_name, &to_parent, &to_name)?;
+            to_parent.sync_all()?;
+            let from_identity = stat_file(&from_parent)?;
+            let to_identity = stat_file(&to_parent)?;
+            if from_identity.st_dev != to_identity.st_dev
+                || from_identity.st_ino != to_identity.st_ino
+            {
+                from_parent.sync_all()?;
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            reject_reparse_components(&self.path)?;
+            let from = self.path.join(from);
+            let to = self.path.join(to);
+            reject_reparse_or_non_file(&from, "registry artifact")?;
+            std::fs::rename(from, to)
+        }
+    }
+
+    pub(crate) fn open_lock_file(&self, relative: &Path) -> io::Result<AnchoredLockFile> {
+        if let Some(error) = self.initialization_error() {
+            return Err(error);
+        }
+        Self::validate_relative(relative, false)?;
+        #[cfg(unix)]
+        {
+            let (parent, name) = self.parent_and_name(relative, true)?;
+            open_lock_file_in(parent, name)
+        }
+        #[cfg(not(unix))]
+        {
+            open_lock_file(&self.path.join(relative))
+        }
+    }
 }
 
 /// Resolve the configured authority root once, then retain the resulting
@@ -105,42 +552,12 @@ impl AnchoredLockFile {
     }
 }
 
+#[cfg(any(test, not(unix)))]
 pub(crate) fn open_lock_file(path: &Path) -> io::Result<AnchoredLockFile> {
     #[cfg(unix)]
     {
         let (parent, name) = anchor_named_path(path)?;
-        let file = match open_file_at(
-            &parent.file,
-            &name,
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
-            0o600,
-        ) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                open_file_at(&parent.file, &name, libc::O_RDWR, 0o600)?
-            }
-            Err(error) => return Err(error),
-        };
-        let opened = validate_regular_file(&file, "registry transaction lock")?;
-        let named =
-            validate_regular_stat(&stat_at(&parent.file, &name)?, "registry transaction lock")?;
-        if opened != named {
-            return Err(io::Error::other(
-                "registry transaction lock changed identity while opening",
-            ));
-        }
-        let parent_stat = stat_file(&parent.file)?;
-        let key = AuthorityKey::Unix {
-            parent_device: parent_stat.st_dev as u64,
-            parent_inode: parent_stat.st_ino as u64,
-            name: name.clone(),
-        };
-        Ok(AnchoredLockFile {
-            file,
-            key,
-            parent: parent.file,
-            name,
-        })
+        open_lock_file_in(parent.file, name)
     }
     #[cfg(not(unix))]
     {
@@ -168,11 +585,47 @@ pub(crate) fn open_lock_file(path: &Path) -> io::Result<AnchoredLockFile> {
     }
 }
 
+#[cfg(unix)]
+fn open_lock_file_in(parent: File, name: OsString) -> io::Result<AnchoredLockFile> {
+    let file = match open_file_at(
+        &parent,
+        &name,
+        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+        0o600,
+    ) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            open_file_at(&parent, &name, libc::O_RDWR, 0o600)?
+        }
+        Err(error) => return Err(error),
+    };
+    let opened = validate_regular_file(&file, "registry transaction lock")?;
+    let named = validate_regular_stat(&stat_at(&parent, &name)?, "registry transaction lock")?;
+    if opened != named {
+        return Err(io::Error::other(
+            "registry transaction lock changed identity while opening",
+        ));
+    }
+    let parent_stat = stat_file(&parent)?;
+    let key = AuthorityKey::Unix {
+        parent_device: parent_stat.st_dev as u64,
+        parent_inode: parent_stat.st_ino as u64,
+        name: name.clone(),
+    };
+    Ok(AnchoredLockFile {
+        file,
+        key,
+        parent,
+        name,
+    })
+}
+
+#[cfg(any(test, not(unix)))]
 pub(crate) fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_with_pre_commit(path, bytes, |_| Ok(()))
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn write_with_pre_commit_impl<F>(path: &Path, bytes: &[u8], pre_commit: F) -> io::Result<()>
 where
     F: FnOnce(&Path) -> io::Result<()>,
@@ -219,6 +672,42 @@ where
 
     if result.is_err() {
         let _ = unlink_if_same(&anchor.file, &staged_name, staged_identity);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn write_at(parent: &File, destination_name: &std::ffi::OsStr, bytes: &[u8]) -> io::Result<()> {
+    let (mut staged, staged_name) = create_staged_file(parent)?;
+    let staged_identity = validate_regular_file(&staged, "registry staged artifact")?;
+    let result = (|| {
+        staged.write_all(bytes)?;
+        staged.flush()?;
+        staged.sync_all()?;
+        verify_named_identity(
+            parent,
+            &staged_name,
+            staged_identity,
+            "registry staged artifact",
+        )?;
+        match stat_at(parent, destination_name) {
+            Ok(stat) => {
+                validate_regular_stat(&stat, "existing registry destination")?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        rename_at(parent, &staged_name, parent, destination_name)?;
+        verify_named_identity(
+            parent,
+            destination_name,
+            staged_identity,
+            "published registry artifact",
+        )?;
+        parent.sync_all()
+    })();
+    if result.is_err() {
+        let _ = unlink_if_same(parent, &staged_name, staged_identity);
     }
     result
 }
@@ -333,7 +822,7 @@ struct FileIdentity {
     inode: u64,
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn anchor_named_path(path: &Path) -> io::Result<(DirectoryAnchor, OsString)> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
@@ -674,7 +1163,7 @@ where
     write_with_pre_commit_impl(path, bytes, pre_commit)
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), not(unix)))]
 fn write_with_pre_commit<F>(path: &Path, bytes: &[u8], pre_commit: F) -> io::Result<()>
 where
     F: FnOnce(&Path) -> io::Result<()>,

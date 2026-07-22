@@ -40,7 +40,11 @@ const OCI_UPLOAD_METADATA_VERSION: u32 = 1;
 const BLOB_STREAM_CHUNK_SIZE: usize = 64 * 1024;
 const DEFAULT_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 const DOCKER_MANIFEST_MEDIA_TYPE: &str = "application/vnd.docker.distribution.manifest.v2+json";
-const MAX_MANIFEST_LAYERS: usize = 4096;
+const OCI_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
+const DOCKER_MANIFEST_LIST_MEDIA_TYPE: &str =
+    "application/vnd.docker.distribution.manifest.list.v2+json";
+const MAX_MANIFEST_DESCRIPTORS: usize = 4096;
+const MAX_MANIFEST_VALIDATION_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 static UPLOAD_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -63,6 +67,35 @@ struct ImageManifest {
     media_type: Option<String>,
     config: ImageDescriptor,
     layers: Vec<ImageDescriptor>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageIndex {
+    schema_version: u32,
+    #[serde(default)]
+    media_type: Option<String>,
+    manifests: Vec<ImageDescriptor>,
+}
+
+#[derive(Debug)]
+enum ParsedManifest {
+    Image(ImageManifest),
+    Index(ImageIndex),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ManifestReferenceKind {
+    Blob,
+    Manifest,
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedManifestReference {
+    kind: ManifestReferenceKind,
+    digest: String,
+    media_type: String,
+    identity: crate::atomic_file::ArtifactIdentity,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,46 +148,64 @@ impl Default for OciMetadata {
 /// Shared state for the OCI registry routes.
 pub struct OciRegistryState {
     blobs_dir: PathBuf,
+    authority: crate::atomic_file::AuthorityRoot,
+    #[cfg(test)]
     metadata_path: PathBuf,
-    metadata_lock_path: PathBuf,
     metadata: RwLock<OciMetadata>,
-    uploads_dir: PathBuf,
-    uploads_lock_path: PathBuf,
     /// Serializes this process before the shared storage lock is acquired.
     upload_gate: Mutex<()>,
     max_active_upload_bytes: u64,
     /// OCI-specific secret for writes. `None` disables every mutation.
     write_token: Option<String>,
+    #[cfg(test)]
+    manifest_validation_hook: std::sync::Mutex<Option<Arc<ManifestValidationHook>>>,
+}
+
+#[cfg(test)]
+struct ManifestValidationHook {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[derive(Clone)]
+struct OciDiskState {
+    authority: crate::atomic_file::AuthorityRoot,
+    blobs_dir: PathBuf,
+    max_active_upload_bytes: u64,
 }
 
 impl OciRegistryState {
     pub fn new(blobs_dir: PathBuf, write_token: Option<String>) -> Self {
-        // Pin the storage identity once. macOS temporary paths commonly enter
-        // through `/var` while descriptor-anchored storage resolves them under
-        // `/private/var`; a canonical root keeps every later no-follow boundary
-        // and cross-process lock keyed to the same directory.
-        let blobs_dir = std::fs::canonicalize(&blobs_dir).unwrap_or(blobs_dir);
+        let authority = crate::atomic_file::AuthorityRoot::new(&blobs_dir);
+        let blobs_dir = authority.path().to_path_buf();
+        #[cfg(test)]
         let metadata_path = blobs_dir.join("metadata.json");
-        let metadata_lock_path = blobs_dir.join(".metadata.lock");
-        let uploads_dir = blobs_dir.join("uploads");
-        let uploads_lock_path = blobs_dir.join(".uploads.lock");
         // This cache is only an in-process observation surface. Every request
         // reloads durable authority under a storage-scoped advisory lock, so a
         // corrupt file or another daemon's publication can never be hidden by
         // startup state.
-        let metadata = read_metadata_file(&metadata_path).unwrap_or_default();
+        let metadata = read_metadata_authority(&authority).unwrap_or_default();
         Self {
             blobs_dir,
+            authority,
+            #[cfg(test)]
             metadata_path,
-            metadata_lock_path,
             metadata: RwLock::new(metadata),
-            uploads_dir,
-            uploads_lock_path,
             upload_gate: Mutex::new(()),
             max_active_upload_bytes: MAX_TOTAL_ACTIVE_UPLOAD_BYTES,
             write_token: write_token
                 .map(|token| token.trim().to_string())
                 .filter(|token| !token.is_empty()),
+            #[cfg(test)]
+            manifest_validation_hook: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn disk_state(&self) -> OciDiskState {
+        OciDiskState {
+            authority: self.authority.clone(),
+            blobs_dir: self.blobs_dir.clone(),
+            max_active_upload_bytes: self.max_active_upload_bytes,
         }
     }
 }
@@ -337,11 +388,14 @@ async fn dispatch(
                     repository,
                     upload_id,
                     digest.as_deref(),
+                    content_range.as_deref(),
                     declared_length,
                     request.into_body(),
                 )
                 .await
             }
+            Method::GET => upload_status_inner(&state, repository, upload_id).await,
+            Method::DELETE => cancel_upload_inner(&state, repository, upload_id).await,
             _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
         };
     }
@@ -412,6 +466,7 @@ fn metadata_authority_error(error: &str) -> Response {
     )
 }
 
+#[cfg(test)]
 fn read_metadata_file(path: &FsPath) -> Result<OciMetadata, String> {
     match std::fs::read(path) {
         Ok(bytes) => {
@@ -430,15 +485,42 @@ fn read_metadata_file(path: &FsPath) -> Result<OciMetadata, String> {
     }
 }
 
+fn decode_metadata(bytes: &[u8]) -> Result<OciMetadata, String> {
+    let metadata = serde_json::from_slice::<OciMetadata>(bytes)
+        .map_err(|error| format!("cannot decode OCI metadata: {error}"))?;
+    if metadata.version != OCI_METADATA_VERSION {
+        return Err(format!(
+            "unsupported OCI metadata version {} (expected {OCI_METADATA_VERSION})",
+            metadata.version
+        ));
+    }
+    Ok(metadata)
+}
+
+fn read_metadata_authority(
+    authority: &crate::atomic_file::AuthorityRoot,
+) -> Result<OciMetadata, String> {
+    match authority.read(FsPath::new("metadata.json")) {
+        Ok(bytes) => decode_metadata(&bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(OciMetadata::default()),
+        Err(error) => Err(format!("cannot read OCI metadata: {error}")),
+    }
+}
+
 /// Reload the durable authority for every read. The local write guard prevents
 /// same-process readers from racing a local publisher while the shared file
 /// lock orders this snapshot against publishers in other daemon processes.
 async fn metadata_snapshot(state: &OciRegistryState) -> Result<OciMetadata, String> {
     let mut cache = state.metadata.write().await;
-    let _storage_lock = crate::storage_lock::StorageLock::shared_async(&state.metadata_lock_path)
-        .await
-        .map_err(|error| format!("failed to lock OCI metadata for reading: {error}"))?;
-    let fresh = read_metadata_file(&state.metadata_path)?;
+    let authority = state.authority.clone();
+    let fresh = tokio::task::spawn_blocking(move || {
+        let _storage_lock =
+            crate::storage_lock::StorageLock::shared_at(&authority, FsPath::new(".metadata.lock"))
+                .map_err(|error| format!("failed to lock OCI metadata for reading: {error}"))?;
+        read_metadata_authority(&authority)
+    })
+    .await
+    .map_err(|error| format!("OCI metadata read task failed: {error}"))??;
     *cache = fresh.clone();
     Ok(fresh)
 }
@@ -456,18 +538,43 @@ async fn begin_metadata_write(
     String,
 > {
     let cache = state.metadata.write().await;
-    let storage_lock = crate::storage_lock::StorageLock::exclusive_async(&state.metadata_lock_path)
+    let storage_lock = crate::storage_lock::StorageLock::exclusive_at_async(
+        state.authority.clone(),
+        PathBuf::from(".metadata.lock"),
+    )
+    .await
+    .map_err(|error| format!("failed to lock OCI metadata for writing: {error}"))?;
+    let authority = state.authority.clone();
+    let fresh = tokio::task::spawn_blocking(move || read_metadata_authority(&authority))
         .await
-        .map_err(|error| format!("failed to lock OCI metadata for writing: {error}"))?;
-    let fresh = read_metadata_file(&state.metadata_path)?;
+        .map_err(|error| format!("OCI metadata read task failed: {error}"))??;
     Ok((cache, storage_lock, fresh))
 }
 
+#[cfg(test)]
 fn persist_metadata(state: &OciRegistryState, metadata: &OciMetadata) -> Result<(), String> {
     let bytes = serde_json::to_vec(metadata)
         .map_err(|error| format!("failed to encode OCI metadata: {error}"))?;
-    crate::atomic_file::write(&state.metadata_path, &bytes)
+    state
+        .authority
+        .write(FsPath::new("metadata.json"), &bytes)
         .map_err(|error| format!("failed to persist OCI metadata: {error}"))
+}
+
+async fn persist_metadata_async(
+    state: &OciRegistryState,
+    metadata: &OciMetadata,
+) -> Result<(), String> {
+    let bytes = serde_json::to_vec(metadata)
+        .map_err(|error| format!("failed to encode OCI metadata: {error}"))?;
+    let authority = state.authority.clone();
+    tokio::task::spawn_blocking(move || {
+        authority
+            .write(FsPath::new("metadata.json"), &bytes)
+            .map_err(|error| format!("failed to persist OCI metadata: {error}"))
+    })
+    .await
+    .map_err(|error| format!("OCI metadata persistence task failed: {error}"))?
 }
 
 /// HEAD /v2/{name}/blobs/{digest} -- check if blob exists.
@@ -499,14 +606,12 @@ async fn get_blob_inner(
     if !is_member {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if !std::fs::symlink_metadata(&blob_path)
-        .ok()
-        .is_some_and(|metadata| metadata.file_type().is_file())
-    {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    let file = match tokio::fs::File::open(&blob_path).await {
-        Ok(file) => file,
+    let relative = match blob_path.strip_prefix(&state.blobs_dir) {
+        Ok(relative) => relative.to_path_buf(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let file = match state.authority.open_read(&relative) {
+        Ok(file) => tokio::fs::File::from_std(file),
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
     let size = match file.metadata().await {
@@ -569,23 +674,51 @@ async fn begin_upload_write(
     state: &OciRegistryState,
 ) -> Result<UploadWriteTransaction<'_>, String> {
     let local = state.upload_gate.lock().await;
-    let storage = crate::storage_lock::StorageLock::exclusive_async(&state.uploads_lock_path)
-        .await
-        .map_err(|error| format!("failed to lock OCI uploads: {error}"))?;
-    crate::atomic_file::ensure_directory_durable(&state.uploads_dir)
-        .map_err(|error| format!("failed to create OCI upload storage: {error}"))?;
+    let storage = crate::storage_lock::StorageLock::exclusive_at_async(
+        state.authority.clone(),
+        PathBuf::from(".uploads.lock"),
+    )
+    .await
+    .map_err(|error| format!("failed to lock OCI uploads: {error}"))?;
+    run_upload_disk(state, |disk| {
+        disk.authority
+            .ensure_directory(FsPath::new("uploads"))
+            .map_err(|error| format!("failed to create OCI upload storage: {error}"))
+    })
+    .await?;
     Ok(UploadWriteTransaction {
         _local: local,
         _storage: storage,
     })
 }
 
-fn upload_metadata_path(state: &OciRegistryState, id: &str) -> Option<PathBuf> {
-    valid_upload_id(id).then(|| state.uploads_dir.join(format!("{id}.json")))
+async fn run_upload_disk<T, F>(state: &OciRegistryState, operation: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(OciDiskState) -> Result<T, String> + Send + 'static,
+{
+    let disk = state.disk_state();
+    tokio::task::spawn_blocking(move || operation(disk))
+        .await
+        .map_err(|error| format!("OCI upload storage task failed: {error}"))?
 }
 
+#[cfg(test)]
+fn upload_metadata_path(state: &OciRegistryState, id: &str) -> Option<PathBuf> {
+    upload_metadata_relative(id).map(|relative| state.blobs_dir.join(relative))
+}
+
+#[cfg(test)]
 fn upload_data_path(state: &OciRegistryState, id: &str) -> Option<PathBuf> {
-    valid_upload_id(id).then(|| state.uploads_dir.join(format!("{id}.data")))
+    upload_data_relative(id).map(|relative| state.blobs_dir.join(relative))
+}
+
+fn upload_metadata_relative(id: &str) -> Option<PathBuf> {
+    valid_upload_id(id).then(|| PathBuf::from("uploads").join(format!("{id}.json")))
+}
+
+fn upload_data_relative(id: &str) -> Option<PathBuf> {
+    valid_upload_id(id).then(|| PathBuf::from("uploads").join(format!("{id}.data")))
 }
 
 fn now_unix_secs() -> Result<u64, String> {
@@ -595,13 +728,21 @@ fn now_unix_secs() -> Result<u64, String> {
         .map_err(|error| format!("system clock is before the Unix epoch: {error}"))
 }
 
+#[cfg(test)]
 fn read_upload_session(
     state: &OciRegistryState,
     id: &str,
 ) -> Result<Option<PendingUpload>, String> {
-    let metadata_path = upload_metadata_path(state, id)
-        .ok_or_else(|| "invalid OCI upload identifier".to_string())?;
-    let bytes = match std::fs::read(&metadata_path) {
+    read_upload_session_disk(&state.disk_state(), id)
+}
+
+fn read_upload_session_disk(
+    state: &OciDiskState,
+    id: &str,
+) -> Result<Option<PendingUpload>, String> {
+    let metadata_relative =
+        upload_metadata_relative(id).ok_or_else(|| "invalid OCI upload identifier".to_string())?;
+    let bytes = match state.authority.read(&metadata_relative) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("failed to read OCI upload metadata: {error}")),
@@ -619,15 +760,15 @@ fn read_upload_session(
     {
         return Err("OCI upload metadata failed validation".to_string());
     }
-    let data_path = upload_data_path(state, id).expect("validated upload identifier");
-    match std::fs::symlink_metadata(&data_path) {
-        Ok(metadata) if metadata.file_type().is_file() && metadata.len() == upload.size => {}
-        Ok(metadata) if metadata.file_type().is_file() && metadata.len() > upload.size => {
+    let data_relative = upload_data_relative(id).expect("validated upload identifier");
+    match state.authority.metadata(&data_relative) {
+        Ok(metadata) if metadata.len() == upload.size => {}
+        Ok(metadata) if metadata.len() > upload.size => {
             // The durable metadata offset is the commit point. Bytes beyond it
             // can only be an interrupted PATCH/final PUT and are safe to drop.
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&data_path)
+            let file = state
+                .authority
+                .open_write(&data_relative)
                 .map_err(|error| format!("failed to reopen interrupted OCI upload: {error}"))?;
             file.set_len(upload.size)
                 .map_err(|error| format!("failed to roll back interrupted OCI upload: {error}"))?;
@@ -638,43 +779,50 @@ fn read_upload_session(
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound
                 && upload.expected_digest.as_ref().is_some_and(|digest| {
-                    blob_path_for_digest(&state.blobs_dir, digest)
-                        .and_then(|path| std::fs::symlink_metadata(path).ok())
-                        .is_some_and(|metadata| {
-                            metadata.file_type().is_file() && metadata.len() == upload.size
-                        })
+                    blob_relative_for_digest(digest)
+                        .and_then(|path| state.authority.metadata(&path).ok())
+                        .is_some_and(|metadata| metadata.len() == upload.size)
                 }) => {}
         Err(error) => return Err(format!("failed to inspect OCI upload data: {error}")),
     }
     Ok(Some(upload))
 }
 
+#[cfg(test)]
 fn persist_upload_session(
     state: &OciRegistryState,
     id: &str,
     upload: &PendingUpload,
 ) -> Result<(), String> {
-    let metadata_path = upload_metadata_path(state, id)
-        .ok_or_else(|| "invalid OCI upload identifier".to_string())?;
+    persist_upload_session_disk(&state.disk_state(), id, upload)
+}
+
+fn persist_upload_session_disk(
+    state: &OciDiskState,
+    id: &str,
+    upload: &PendingUpload,
+) -> Result<(), String> {
+    let metadata_path =
+        upload_metadata_relative(id).ok_or_else(|| "invalid OCI upload identifier".to_string())?;
     let bytes = serde_json::to_vec(upload)
         .map_err(|error| format!("failed to encode OCI upload metadata: {error}"))?;
-    crate::atomic_file::write(&metadata_path, &bytes)
+    state
+        .authority
+        .write(&metadata_path, &bytes)
         .map_err(|error| format!("failed to persist OCI upload metadata: {error}"))
 }
 
-fn remove_upload_session(state: &OciRegistryState, id: &str) -> Result<(), String> {
+fn remove_upload_session_disk(state: &OciDiskState, id: &str) -> Result<(), String> {
     for path in [
-        upload_metadata_path(state, id)
-            .ok_or_else(|| "invalid OCI upload identifier".to_string())?,
-        upload_data_path(state, id).ok_or_else(|| "invalid OCI upload identifier".to_string())?,
+        upload_metadata_relative(id).ok_or_else(|| "invalid OCI upload identifier".to_string())?,
+        upload_data_relative(id).ok_or_else(|| "invalid OCI upload identifier".to_string())?,
     ] {
-        match std::fs::remove_file(&path) {
+        match state.authority.remove_file(&path) {
             Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(format!(
                     "failed to remove OCI upload state {}: {error}",
-                    path.display()
+                    state.blobs_dir.join(&path).display()
                 ));
             }
         }
@@ -685,16 +833,21 @@ fn remove_upload_session(state: &OciRegistryState, id: &str) -> Result<(), Strin
 /// Prune expired durable sessions and return (active count, aggregate bytes).
 /// The caller holds the shared-storage upload lock, so all daemon processes
 /// enforce the same count and byte budget.
+#[cfg(test)]
 fn prune_and_measure_uploads(state: &OciRegistryState) -> Result<(usize, u64), String> {
+    prune_and_measure_uploads_disk(&state.disk_state())
+}
+
+fn prune_and_measure_uploads_disk(state: &OciDiskState) -> Result<(usize, u64), String> {
     let now = now_unix_secs()?;
     let mut active_ids = BTreeSet::new();
     let mut active_count = 0usize;
     let mut active_bytes = 0u64;
-    for entry in std::fs::read_dir(&state.uploads_dir)
+    for file_name in state
+        .authority
+        .read_dir_names(FsPath::new("uploads"))
         .map_err(|error| format!("failed to enumerate OCI uploads: {error}"))?
     {
-        let entry = entry.map_err(|error| format!("failed to enumerate OCI uploads: {error}"))?;
-        let file_name = entry.file_name();
         let Some(file_name) = file_name.to_str() else {
             return Err("OCI upload storage contains a non-UTF-8 entry".to_string());
         };
@@ -706,11 +859,11 @@ fn prune_and_measure_uploads(state: &OciRegistryState) -> Result<(usize, u64), S
                 "OCI upload storage contains invalid metadata entry {file_name}"
             ));
         }
-        let Some(upload) = read_upload_session(state, id)? else {
+        let Some(upload) = read_upload_session_disk(state, id)? else {
             continue;
         };
         if now.saturating_sub(upload.updated_at_unix_secs) >= UPLOAD_TTL.as_secs() {
-            remove_upload_session(state, id)?;
+            remove_upload_session_disk(state, id)?;
             continue;
         }
         active_count = active_count
@@ -728,12 +881,11 @@ fn prune_and_measure_uploads(state: &OciRegistryState) -> Result<(usize, u64), S
     // A crash between the empty data write and metadata publication can leave
     // an unowned stage. Remove only canonical unowned stages; every unexpected
     // entry fails closed instead of being omitted from the aggregate budget.
-    for entry in std::fs::read_dir(&state.uploads_dir)
+    for file_name in state
+        .authority
+        .read_dir_names(FsPath::new("uploads"))
         .map_err(|error| format!("failed to enumerate OCI upload data: {error}"))?
     {
-        let entry =
-            entry.map_err(|error| format!("failed to enumerate OCI upload data: {error}"))?;
-        let file_name = entry.file_name();
         let Some(file_name) = file_name.to_str() else {
             return Err("OCI upload storage contains a non-UTF-8 entry".to_string());
         };
@@ -752,9 +904,12 @@ fn prune_and_measure_uploads(state: &OciRegistryState) -> Result<(usize, u64), S
                 ));
             }
             if !active_ids.contains(id) {
-                std::fs::remove_file(entry.path()).map_err(|error| {
-                    format!("failed to prune orphaned OCI upload data: {error}")
-                })?;
+                state
+                    .authority
+                    .remove_file(&PathBuf::from("uploads").join(file_name))
+                    .map_err(|error| {
+                        format!("failed to prune orphaned OCI upload data: {error}")
+                    })?;
             }
             continue;
         }
@@ -775,7 +930,8 @@ async fn rollback_staged_file(file: &mut tokio::fs::File, size: u64) -> Result<(
 }
 
 async fn append_upload_body(
-    path: &FsPath,
+    authority: &crate::atomic_file::AuthorityRoot,
+    relative: &FsPath,
     original_size: u64,
     aggregate_remaining: u64,
     declared_length: Option<u64>,
@@ -787,10 +943,9 @@ async fn append_upload_body(
     if declared_length.is_some_and(|length| length > allowed) {
         return Err(UploadAppendError::Limit);
     }
-    let mut file = tokio::fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .await
+    let mut file = authority
+        .open_append(relative)
+        .map(tokio::fs::File::from_std)
         .map_err(|error| {
             UploadAppendError::Storage(format!("failed to open OCI upload data: {error}"))
         })?;
@@ -850,9 +1005,14 @@ async fn append_upload_body(
     Ok(written)
 }
 
-async fn hash_upload_file(path: &FsPath, expected_size: u64) -> Result<Sha256, String> {
-    let mut file = tokio::fs::File::open(path)
-        .await
+async fn hash_upload_file(
+    authority: &crate::atomic_file::AuthorityRoot,
+    relative: &FsPath,
+    expected_size: u64,
+) -> Result<Sha256, String> {
+    let mut file = authority
+        .open_read(relative)
+        .map(tokio::fs::File::from_std)
         .map_err(|error| format!("failed to open OCI upload data for hashing: {error}"))?;
     let mut hasher = Sha256::new();
     let mut observed_size = 0u64;
@@ -879,45 +1039,12 @@ async fn hash_upload_file(path: &FsPath, expected_size: u64) -> Result<Sha256, S
     Ok(hasher)
 }
 
-fn publish_staged_upload(staged: &FsPath, destination: &FsPath) -> std::io::Result<()> {
-    let staged_parent = staged.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "OCI upload stage has no parent directory",
-        )
-    })?;
-    let destination_parent = destination.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "OCI blob destination has no parent directory",
-        )
-    })?;
-    match std::fs::symlink_metadata(destination) {
-        Ok(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "OCI blob destination already exists",
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    std::fs::rename(staged, destination)?;
-    sync_oci_directory(destination_parent)?;
-    if staged_parent != destination_parent {
-        sync_oci_directory(staged_parent)?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn sync_oci_directory(path: &FsPath) -> std::io::Result<()> {
-    std::fs::File::open(path)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_oci_directory(_path: &FsPath) -> std::io::Result<()> {
-    Ok(())
+fn publish_staged_upload(
+    authority: &crate::atomic_file::AuthorityRoot,
+    staged: &FsPath,
+    destination: &FsPath,
+) -> std::io::Result<()> {
+    authority.rename(staged, destination)
 }
 
 fn upload_progress_response(status: StatusCode, name: &str, id: &str, size: u64) -> Response {
@@ -987,49 +1114,131 @@ async fn initiate_upload_inner(state: &OciRegistryState, name: &str) -> Response
         Ok(transaction) => transaction,
         Err(error) => return metadata_authority_error(&error),
     };
-    let (active_count, active_bytes) = match prune_and_measure_uploads(state) {
-        Ok(measured) => measured,
-        Err(error) => return metadata_authority_error(&error),
-    };
-    if active_count >= MAX_ACTIVE_UPLOADS || active_bytes >= state.max_active_upload_bytes {
-        return oci_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "TOOMANYREQUESTS",
-            "too many active OCI uploads",
-            None,
-        );
-    }
-
     let now = match now_unix_secs() {
         Ok(now) => now,
         Err(error) => return metadata_authority_error(&error),
     };
-    let upload_id = loop {
-        let candidate = new_upload_id(name);
-        let metadata_exists =
-            upload_metadata_path(state, &candidate).is_some_and(|path| path.exists());
-        let data_exists = upload_data_path(state, &candidate).is_some_and(|path| path.exists());
-        if !metadata_exists && !data_exists {
-            break candidate;
+    let repository = name.to_string();
+    let upload_id = match run_upload_disk(state, move |disk| {
+        let (active_count, active_bytes) = prune_and_measure_uploads_disk(&disk)?;
+        if active_count >= MAX_ACTIVE_UPLOADS || active_bytes >= disk.max_active_upload_bytes {
+            return Ok(None);
         }
+        let upload_id = loop {
+            let candidate = new_upload_id(&repository);
+            let metadata_exists = upload_metadata_relative(&candidate)
+                .is_some_and(|path| disk.authority.metadata(&path).is_ok());
+            let data_exists = upload_data_relative(&candidate)
+                .is_some_and(|path| disk.authority.metadata(&path).is_ok());
+            if !metadata_exists && !data_exists {
+                break candidate;
+            }
+        };
+        let data_path = upload_data_relative(&upload_id).expect("generated upload identifier");
+        disk.authority
+            .write(&data_path, &[])
+            .map_err(|error| format!("failed to create OCI upload data: {error}"))?;
+        let upload = PendingUpload {
+            version: OCI_UPLOAD_METADATA_VERSION,
+            repository,
+            created_at_unix_secs: now,
+            updated_at_unix_secs: now,
+            size: 0,
+            expected_digest: None,
+        };
+        if let Err(error) = persist_upload_session_disk(&disk, &upload_id, &upload) {
+            let _ = disk.authority.remove_file(&data_path);
+            return Err(error);
+        }
+        Ok(Some(upload_id))
+    })
+    .await
+    {
+        Ok(Some(upload_id)) => upload_id,
+        Ok(None) => {
+            return oci_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "TOOMANYREQUESTS",
+                "too many active OCI uploads",
+                None,
+            );
+        }
+        Err(error) => return metadata_authority_error(&error),
     };
-    let data_path = upload_data_path(state, &upload_id).expect("generated upload identifier");
-    if let Err(error) = crate::atomic_file::write(&data_path, &[]) {
-        return metadata_authority_error(&format!("failed to create OCI upload data: {error}"));
-    }
-    let upload = PendingUpload {
-        version: OCI_UPLOAD_METADATA_VERSION,
-        repository: name.to_string(),
-        created_at_unix_secs: now,
-        updated_at_unix_secs: now,
-        size: 0,
-        expected_digest: None,
-    };
-    if let Err(error) = persist_upload_session(state, &upload_id, &upload) {
-        let _ = std::fs::remove_file(data_path);
-        return metadata_authority_error(&error);
-    }
     upload_progress_response(StatusCode::ACCEPTED, name, &upload_id, 0)
+}
+
+async fn upload_status_inner(state: &OciRegistryState, name: &str, id: &str) -> Response {
+    let location = upload_location(name, id);
+    if !valid_repository_name(name) || !valid_upload_id(id) {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "BLOB_UPLOAD_INVALID",
+            "invalid OCI upload coordinate",
+            Some(&location),
+        );
+    }
+    let _transaction = match begin_upload_write(state).await {
+        Ok(transaction) => transaction,
+        Err(error) => return metadata_authority_error(&error),
+    };
+    let id_owned = id.to_string();
+    let upload = run_upload_disk(state, move |disk| {
+        prune_and_measure_uploads_disk(&disk)?;
+        read_upload_session_disk(&disk, &id_owned)
+    })
+    .await;
+    match upload {
+        Ok(Some(upload)) if upload.repository == name => {
+            upload_progress_response(StatusCode::NO_CONTENT, name, id, upload.size)
+        }
+        Ok(Some(_)) | Ok(None) => oci_error(
+            StatusCode::NOT_FOUND,
+            "BLOB_UPLOAD_UNKNOWN",
+            "blob upload is unknown or expired",
+            Some(&location),
+        ),
+        Err(error) => metadata_authority_error(&error),
+    }
+}
+
+async fn cancel_upload_inner(state: &OciRegistryState, name: &str, id: &str) -> Response {
+    let location = upload_location(name, id);
+    if !valid_repository_name(name) || !valid_upload_id(id) {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "BLOB_UPLOAD_INVALID",
+            "invalid OCI upload coordinate",
+            Some(&location),
+        );
+    }
+    let _transaction = match begin_upload_write(state).await {
+        Ok(transaction) => transaction,
+        Err(error) => return metadata_authority_error(&error),
+    };
+    let id_owned = id.to_string();
+    let repository = name.to_string();
+    let cancelled = run_upload_disk(state, move |disk| {
+        prune_and_measure_uploads_disk(&disk)?;
+        match read_upload_session_disk(&disk, &id_owned)? {
+            Some(upload) if upload.repository == repository => {
+                remove_upload_session_disk(&disk, &id_owned)?;
+                Ok(true)
+            }
+            Some(_) | None => Ok(false),
+        }
+    })
+    .await;
+    match cancelled {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => oci_error(
+            StatusCode::NOT_FOUND,
+            "BLOB_UPLOAD_UNKNOWN",
+            "blob upload is unknown or expired",
+            Some(&location),
+        ),
+        Err(error) => metadata_authority_error(&error),
+    }
 }
 
 async fn patch_upload_inner(
@@ -1053,13 +1262,19 @@ async fn patch_upload_inner(
         Ok(transaction) => transaction,
         Err(error) => return metadata_authority_error(&error),
     };
-    let (_, active_bytes) = match prune_and_measure_uploads(state) {
+    let id_owned = id.to_string();
+    let measured = run_upload_disk(state, move |disk| {
+        let (_, active_bytes) = prune_and_measure_uploads_disk(&disk)?;
+        Ok((active_bytes, read_upload_session_disk(&disk, &id_owned)?))
+    })
+    .await;
+    let (active_bytes, upload) = match measured {
         Ok(measured) => measured,
         Err(error) => return metadata_authority_error(&error),
     };
-    let mut upload = match read_upload_session(state, id) {
-        Ok(Some(upload)) if upload.repository == name => upload,
-        Ok(Some(_)) | Ok(None) => {
+    let mut upload = match upload {
+        Some(upload) if upload.repository == name => upload,
+        Some(_) | None => {
             return oci_error(
                 StatusCode::NOT_FOUND,
                 "BLOB_UPLOAD_UNKNOWN",
@@ -1067,7 +1282,6 @@ async fn patch_upload_inner(
                 Some(&location),
             );
         }
-        Err(error) => return metadata_authority_error(&error),
     };
     if upload.expected_digest.is_some() {
         return oci_error(
@@ -1113,10 +1327,11 @@ async fn patch_upload_inner(
         Ok(now) => now,
         Err(error) => return metadata_authority_error(&error),
     };
-    let data_path = upload_data_path(state, id).expect("validated upload identifier");
+    let data_relative = upload_data_relative(id).expect("validated upload identifier");
     let aggregate_remaining = state.max_active_upload_bytes.saturating_sub(active_bytes);
     let appended = match append_upload_body(
-        &data_path,
+        &state.authority,
+        &data_relative,
         upload.size,
         aggregate_remaining,
         declared_length,
@@ -1129,12 +1344,9 @@ async fn patch_upload_inner(
         Err(error) => return upload_error(error, &location),
     };
     if expected_range_length.is_some_and(|expected| expected != appended) {
-        match tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(&data_path)
-            .await
-        {
-            Ok(mut file) => {
+        match state.authority.open_write(&data_relative) {
+            Ok(file) => {
+                let mut file = tokio::fs::File::from_std(file);
                 if let Err(error) = rollback_staged_file(&mut file, upload.size).await {
                     return metadata_authority_error(&error);
                 }
@@ -1155,13 +1367,18 @@ async fn patch_upload_inner(
     let previous_size = upload.size;
     upload.size += appended;
     upload.updated_at_unix_secs = updated_at;
-    if let Err(error) = persist_upload_session(state, id, &upload) {
-        match tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(&data_path)
-            .await
-        {
-            Ok(mut file) => {
+    let persisted = {
+        let id = id.to_string();
+        let upload = upload.clone();
+        run_upload_disk(state, move |disk| {
+            persist_upload_session_disk(&disk, &id, &upload)
+        })
+        .await
+    };
+    if let Err(error) = persisted {
+        match state.authority.open_write(&data_relative) {
+            Ok(file) => {
+                let mut file = tokio::fs::File::from_std(file);
                 if let Err(rollback_error) = rollback_staged_file(&mut file, previous_size).await {
                     return metadata_authority_error(&format!(
                         "{error}; additionally {rollback_error}"
@@ -1184,6 +1401,7 @@ async fn complete_upload_inner(
     name: &str,
     id: &str,
     expected_digest: Option<&str>,
+    content_range: Option<&str>,
     declared_length: Option<u64>,
     body: Body,
 ) -> Response {
@@ -1212,13 +1430,19 @@ async fn complete_upload_inner(
         Ok(transaction) => transaction,
         Err(error) => return metadata_authority_error(&error),
     };
-    let (_, active_bytes) = match prune_and_measure_uploads(state) {
+    let id_owned = id.to_string();
+    let measured = run_upload_disk(state, move |disk| {
+        let (_, active_bytes) = prune_and_measure_uploads_disk(&disk)?;
+        Ok((active_bytes, read_upload_session_disk(&disk, &id_owned)?))
+    })
+    .await;
+    let (active_bytes, upload) = match measured {
         Ok(measured) => measured,
         Err(error) => return metadata_authority_error(&error),
     };
-    let mut upload = match read_upload_session(state, id) {
-        Ok(Some(upload)) if upload.repository == name => upload,
-        Ok(Some(_)) | Ok(None) => {
+    let mut upload = match upload {
+        Some(upload) if upload.repository == name => upload,
+        Some(_) | None => {
             return oci_error(
                 StatusCode::NOT_FOUND,
                 "BLOB_UPLOAD_UNKNOWN",
@@ -1226,9 +1450,40 @@ async fn complete_upload_inner(
                 Some(&location),
             );
         }
-        Err(error) => return metadata_authority_error(&error),
     };
-    let data_path = upload_data_path(state, id).expect("validated upload identifier");
+    let expected_range_length = if let Some(value) = content_range {
+        let Some((start, end)) = parse_content_range(value) else {
+            return oci_error(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "BLOB_UPLOAD_INVALID",
+                "Content-Range is invalid",
+                Some(&location),
+            );
+        };
+        let Some(length) = end
+            .checked_sub(start)
+            .and_then(|length| length.checked_add(1))
+        else {
+            return oci_error(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "BLOB_UPLOAD_INVALID",
+                "Content-Range is invalid",
+                Some(&location),
+            );
+        };
+        if start != upload.size || declared_length.is_some_and(|declared| declared != length) {
+            return oci_error(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "BLOB_UPLOAD_INVALID",
+                "Content-Range does not match the persisted upload offset and body length",
+                Some(&location),
+            );
+        }
+        Some(length)
+    } else {
+        None
+    };
+    let data_relative = upload_data_relative(id).expect("validated upload identifier");
     let computed_digest = if let Some(finalizing_digest) = upload.expected_digest.as_deref() {
         if finalizing_digest != expected_digest {
             return digest_invalid(
@@ -1259,14 +1514,16 @@ async fn complete_upload_inner(
             Ok(now) => now,
             Err(error) => return metadata_authority_error(&error),
         };
-        let mut hasher = match hash_upload_file(&data_path, upload.size).await {
+        let mut hasher = match hash_upload_file(&state.authority, &data_relative, upload.size).await
+        {
             Ok(hasher) => hasher,
             Err(error) => return metadata_authority_error(&error),
         };
         let aggregate_remaining = state.max_active_upload_bytes.saturating_sub(active_bytes);
         let original_size = upload.size;
         let appended = match append_upload_body(
-            &data_path,
+            &state.authority,
+            &data_relative,
             original_size,
             aggregate_remaining,
             declared_length,
@@ -1278,14 +1535,32 @@ async fn complete_upload_inner(
             Ok(appended) => appended,
             Err(error) => return upload_error(error, &location),
         };
+        if expected_range_length.is_some_and(|expected| expected != appended) {
+            match state.authority.open_write(&data_relative) {
+                Ok(file) => {
+                    let mut file = tokio::fs::File::from_std(file);
+                    if let Err(error) = rollback_staged_file(&mut file, original_size).await {
+                        return metadata_authority_error(&error);
+                    }
+                }
+                Err(error) => {
+                    return metadata_authority_error(&format!(
+                        "failed to reopen OCI upload after final Content-Range mismatch: {error}"
+                    ));
+                }
+            }
+            return oci_error(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "BLOB_UPLOAD_INVALID",
+                "Content-Range length does not match the streamed body",
+                Some(&location),
+            );
+        }
         let computed_digest = format!("sha256:{}", hex::encode(hasher.finalize()));
         if expected_digest != computed_digest {
-            match tokio::fs::OpenOptions::new()
-                .write(true)
-                .open(&data_path)
-                .await
-            {
-                Ok(mut file) => {
+            match state.authority.open_write(&data_relative) {
+                Ok(file) => {
+                    let mut file = tokio::fs::File::from_std(file);
                     if let Err(error) = rollback_staged_file(&mut file, original_size).await {
                         return metadata_authority_error(&error);
                     }
@@ -1304,13 +1579,18 @@ async fn complete_upload_inner(
         upload.size += appended;
         upload.updated_at_unix_secs = updated_at;
         upload.expected_digest = Some(computed_digest.clone());
-        if let Err(error) = persist_upload_session(state, id, &upload) {
-            match tokio::fs::OpenOptions::new()
-                .write(true)
-                .open(&data_path)
-                .await
-            {
-                Ok(mut file) => {
+        let persisted = {
+            let id = id.to_string();
+            let upload = upload.clone();
+            run_upload_disk(state, move |disk| {
+                persist_upload_session_disk(&disk, &id, &upload)
+            })
+            .await
+        };
+        if let Err(error) = persisted {
+            match state.authority.open_write(&data_relative) {
+                Ok(file) => {
+                    let mut file = tokio::fs::File::from_std(file);
                     if let Err(rollback_error) =
                         rollback_staged_file(&mut file, original_size).await
                     {
@@ -1330,18 +1610,11 @@ async fn complete_upload_inner(
         computed_digest
     };
 
-    let blob_path = blob_path_for_digest(&state.blobs_dir, &computed_digest)
-        .expect("computed sha256 digest is canonical");
-    let data_present = std::fs::symlink_metadata(&data_path)
-        .ok()
-        .is_some_and(|metadata| metadata.file_type().is_file());
-    let blob_metadata = match std::fs::symlink_metadata(&blob_path) {
-        Ok(metadata) if metadata.file_type().is_file() => Some(metadata),
-        Ok(_) => {
-            return metadata_authority_error(
-                "an OCI blob digest path exists but is not a regular file",
-            );
-        }
+    let blob_relative =
+        blob_relative_for_digest(&computed_digest).expect("computed sha256 digest is canonical");
+    let data_present = state.authority.metadata(&data_relative).is_ok();
+    let blob_metadata = match state.authority.metadata(&blob_relative) {
+        Ok(metadata) => Some(metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
             return metadata_authority_error(&format!(
@@ -1351,22 +1624,32 @@ async fn complete_upload_inner(
     };
     if data_present {
         if blob_metadata.is_some() {
-            let existing = match hash_upload_file(&blob_path, upload.size).await {
-                Ok(hasher) => format!("sha256:{}", hex::encode(hasher.finalize())),
-                Err(error) => return metadata_authority_error(&error),
-            };
+            let existing =
+                match hash_upload_file(&state.authority, &blob_relative, upload.size).await {
+                    Ok(hasher) => format!("sha256:{}", hex::encode(hasher.finalize())),
+                    Err(error) => return metadata_authority_error(&error),
+                };
             if existing != computed_digest {
                 return metadata_authority_error(
                     "an OCI blob digest path already contains different content",
                 );
             }
-        } else if let Err(error) = publish_staged_upload(&data_path, &blob_path) {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "UNKNOWN",
-                &format!("failed to atomically publish OCI blob: {error}"),
-                Some(&location),
-            );
+        } else {
+            let staged = data_relative.clone();
+            let destination = blob_relative.clone();
+            if let Err(error) = run_upload_disk(state, move |disk| {
+                publish_staged_upload(&disk.authority, &staged, &destination)
+                    .map_err(|error| format!("failed to atomically publish OCI blob: {error}"))
+            })
+            .await
+            {
+                return oci_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "UNKNOWN",
+                    &error,
+                    Some(&location),
+                );
+            }
         }
     } else {
         if blob_metadata.is_none() {
@@ -1374,7 +1657,7 @@ async fn complete_upload_inner(
                 "durable OCI upload data disappeared before publication",
             );
         }
-        let existing = match hash_upload_file(&blob_path, upload.size).await {
+        let existing = match hash_upload_file(&state.authority, &blob_relative, upload.size).await {
             Ok(hasher) => format!("sha256:{}", hex::encode(hasher.finalize())),
             Err(error) => return metadata_authority_error(&error),
         };
@@ -1396,7 +1679,7 @@ async fn complete_upload_inner(
         .or_default()
         .blobs
         .insert(computed_digest.clone());
-    if let Err(error) = persist_metadata(state, &replacement) {
+    if let Err(error) = persist_metadata_async(state, &replacement).await {
         return oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "UNKNOWN",
@@ -1407,7 +1690,12 @@ async fn complete_upload_inner(
     *metadata_guard = replacement;
     drop(storage_lock);
     drop(metadata_guard);
-    if let Err(error) = remove_upload_session(state, id) {
+    let id_to_remove = id.to_string();
+    if let Err(error) = run_upload_disk(state, move |disk| {
+        remove_upload_session_disk(&disk, &id_to_remove)
+    })
+    .await
+    {
         tracing::warn!(upload_id = id, error = %error, "published OCI blob but could not remove completed upload state");
     }
 
@@ -1448,7 +1736,7 @@ async fn get_manifest_inner(
     let Some(descriptor) = descriptor else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some(path) = manifest_path_for_digest(&state.blobs_dir, &descriptor.digest) else {
+    let Some(path) = manifest_relative_for_digest(&descriptor.digest) else {
         return oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "UNKNOWN",
@@ -1456,8 +1744,8 @@ async fn get_manifest_inner(
             None,
         );
     };
-    let bytes = match tokio::fs::read(path).await {
-        Ok(bytes) => bytes,
+    let mut file = match state.authority.open_read(&path) {
+        Ok(file) => tokio::fs::File::from_std(file),
         Err(error) => {
             return oci_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1467,6 +1755,15 @@ async fn get_manifest_inner(
             );
         }
     };
+    let mut bytes = Vec::new();
+    if let Err(error) = file.read_to_end(&mut bytes).await {
+        return oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "UNKNOWN",
+            &format!("stored OCI manifest is unavailable: {error}"),
+            None,
+        );
+    }
     let length = bytes.len();
     let body = if head_only { Vec::new() } else { bytes };
     let mut response = (StatusCode::OK, body).into_response();
@@ -1492,15 +1789,24 @@ fn supported_manifest_media_type(value: &str) -> Option<&str> {
     let media_type = value.split(';').next()?.trim();
     matches!(
         media_type,
-        DEFAULT_MANIFEST_MEDIA_TYPE | DOCKER_MANIFEST_MEDIA_TYPE
+        DEFAULT_MANIFEST_MEDIA_TYPE
+            | DOCKER_MANIFEST_MEDIA_TYPE
+            | OCI_INDEX_MEDIA_TYPE
+            | DOCKER_MANIFEST_LIST_MEDIA_TYPE
     )
     .then_some(media_type)
 }
 
-fn parse_image_manifest(
+fn valid_descriptor_media_type(media_type: &str) -> bool {
+    !media_type.is_empty()
+        && media_type.len() <= 255
+        && media_type.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+fn parse_manifest(
     media_type: &str,
     body: &[u8],
-) -> Result<ImageManifest, ManifestValidationError> {
+) -> Result<ParsedManifest, ManifestValidationError> {
     let Some(request_media_type) = supported_manifest_media_type(media_type) else {
         return Err(ManifestValidationError {
             status: StatusCode::BAD_REQUEST,
@@ -1508,94 +1814,282 @@ fn parse_image_manifest(
             message: "unsupported OCI manifest Content-Type".to_string(),
         });
     };
-    let manifest =
-        serde_json::from_slice::<ImageManifest>(body).map_err(|error| ManifestValidationError {
-            status: StatusCode::BAD_REQUEST,
-            code: "MANIFEST_INVALID",
-            message: format!("manifest is not a supported OCI/Docker image manifest: {error}"),
+    let invalid = |message: String| ManifestValidationError {
+        status: StatusCode::BAD_REQUEST,
+        code: "MANIFEST_INVALID",
+        message,
+    };
+    if matches!(
+        request_media_type,
+        OCI_INDEX_MEDIA_TYPE | DOCKER_MANIFEST_LIST_MEDIA_TYPE
+    ) {
+        let index = serde_json::from_slice::<ImageIndex>(body).map_err(|error| {
+            invalid(format!(
+                "manifest is not a supported OCI/Docker image index: {error}"
+            ))
         })?;
+        if index.schema_version != 2
+            || index.manifests.len() > MAX_MANIFEST_DESCRIPTORS
+            || index
+                .media_type
+                .as_deref()
+                .is_some_and(|body_media_type| body_media_type != request_media_type)
+        {
+            return Err(ManifestValidationError {
+                status: StatusCode::BAD_REQUEST,
+                code: "MANIFEST_INVALID",
+                message: "manifest index schema, media type, or descriptor count is unsupported"
+                    .to_string(),
+            });
+        }
+        for descriptor in &index.manifests {
+            if !valid_descriptor_media_type(&descriptor.media_type)
+                || supported_manifest_media_type(&descriptor.media_type).is_none()
+                || sha256_hex(&descriptor.digest).is_none()
+                || descriptor.size > MAX_OCI_MANIFEST_SIZE as u64
+            {
+                return Err(invalid(
+                    "manifest index contains an invalid manifest descriptor".to_string(),
+                ));
+            }
+        }
+        return Ok(ParsedManifest::Index(index));
+    }
+
+    let manifest = serde_json::from_slice::<ImageManifest>(body).map_err(|error| {
+        invalid(format!(
+            "manifest is not a supported OCI/Docker image manifest: {error}"
+        ))
+    })?;
     if manifest.schema_version != 2
-        || manifest.layers.len() > MAX_MANIFEST_LAYERS
+        || manifest.layers.len().saturating_add(1) > MAX_MANIFEST_DESCRIPTORS
         || manifest
             .media_type
             .as_deref()
             .is_some_and(|body_media_type| body_media_type != request_media_type)
     {
-        return Err(ManifestValidationError {
-            status: StatusCode::BAD_REQUEST,
-            code: "MANIFEST_INVALID",
-            message: "manifest schema, media type, or layer count is unsupported".to_string(),
-        });
+        return Err(invalid(
+            "manifest schema, media type, or descriptor count is unsupported".to_string(),
+        ));
     }
     for descriptor in std::iter::once(&manifest.config).chain(manifest.layers.iter()) {
-        if descriptor.media_type.is_empty()
-            || descriptor.media_type.len() > 255
-            || !descriptor
-                .media_type
-                .bytes()
-                .all(|byte| byte.is_ascii_graphic())
+        if !valid_descriptor_media_type(&descriptor.media_type)
             || sha256_hex(&descriptor.digest).is_none()
             || descriptor.size > MAX_OCI_BLOB_SIZE as u64
         {
-            return Err(ManifestValidationError {
-                status: StatusCode::BAD_REQUEST,
-                code: "MANIFEST_INVALID",
-                message: "manifest contains an invalid config or layer descriptor".to_string(),
-            });
+            return Err(invalid(
+                "manifest contains an invalid config or layer descriptor".to_string(),
+            ));
         }
     }
-    Ok(manifest)
+    Ok(ParsedManifest::Image(manifest))
 }
 
-async fn validate_manifest_blobs(
+fn manifest_references(
+    manifest: &ParsedManifest,
+) -> Vec<(ManifestReferenceKind, &ImageDescriptor)> {
+    match manifest {
+        ParsedManifest::Image(manifest) => {
+            std::iter::once((ManifestReferenceKind::Blob, &manifest.config))
+                .chain(
+                    manifest
+                        .layers
+                        .iter()
+                        .map(|descriptor| (ManifestReferenceKind::Blob, descriptor)),
+                )
+                .collect()
+        }
+        ParsedManifest::Index(index) => index
+            .manifests
+            .iter()
+            .map(|descriptor| (ManifestReferenceKind::Manifest, descriptor))
+            .collect(),
+    }
+}
+
+fn manifest_reference_is_member(
+    metadata: &OciMetadata,
+    repository_name: &str,
+    kind: ManifestReferenceKind,
+    digest: &str,
+    media_type: &str,
+) -> bool {
+    let Some(repository) = metadata.repositories.get(repository_name) else {
+        return false;
+    };
+    match kind {
+        ManifestReferenceKind::Blob => repository.blobs.contains(digest),
+        ManifestReferenceKind::Manifest => {
+            repository.manifests.get(digest).is_some_and(|descriptor| {
+                descriptor.digest == digest && descriptor.media_type == media_type
+            })
+        }
+    }
+}
+
+fn manifest_reference_path(kind: ManifestReferenceKind, digest: &str) -> Option<PathBuf> {
+    match kind {
+        ManifestReferenceKind::Blob => blob_relative_for_digest(digest),
+        ManifestReferenceKind::Manifest => manifest_relative_for_digest(digest),
+    }
+}
+
+async fn validate_manifest_references(
     state: &OciRegistryState,
     metadata: &OciMetadata,
     repository_name: &str,
-    manifest: &ImageManifest,
-) -> Result<(), ManifestValidationError> {
-    let repository = metadata.repositories.get(repository_name);
-    let mut verified = BTreeSet::new();
-    for descriptor in std::iter::once(&manifest.config).chain(manifest.layers.iter()) {
-        let is_member =
-            repository.is_some_and(|repository| repository.blobs.contains(&descriptor.digest));
-        let Some(blob_path) = blob_path_for_digest(&state.blobs_dir, &descriptor.digest) else {
-            return Err(ManifestValidationError {
-                status: StatusCode::BAD_REQUEST,
-                code: "MANIFEST_INVALID",
-                message: "manifest contains an invalid blob digest".to_string(),
-            });
-        };
-        let file_is_exact = std::fs::symlink_metadata(&blob_path)
-            .ok()
-            .is_some_and(|metadata| {
-                metadata.file_type().is_file() && metadata.len() == descriptor.size
-            });
-        if !is_member || !file_is_exact {
+    manifest: &ParsedManifest,
+) -> Result<Vec<ValidatedManifestReference>, ManifestValidationError> {
+    let references = manifest_references(manifest);
+    if references.len() > MAX_MANIFEST_DESCRIPTORS {
+        return Err(ManifestValidationError {
+            status: StatusCode::BAD_REQUEST,
+            code: "MANIFEST_INVALID",
+            message: "manifest descriptor count exceeds the validation limit".to_string(),
+        });
+    }
+    let mut unique = HashMap::<(ManifestReferenceKind, String), (u64, String)>::new();
+    let mut work_bytes = 0u64;
+    for (kind, descriptor) in references {
+        if !manifest_reference_is_member(
+            metadata,
+            repository_name,
+            kind,
+            &descriptor.digest,
+            &descriptor.media_type,
+        ) {
             return Err(ManifestValidationError {
                 status: StatusCode::NOT_FOUND,
                 code: "MANIFEST_BLOB_UNKNOWN",
-                message: format!("manifest references unavailable blob {}", descriptor.digest),
+                message: format!(
+                    "manifest references unavailable descriptor {}",
+                    descriptor.digest
+                ),
             });
         }
-        if verified.insert(descriptor.digest.clone()) {
-            let observed = hash_upload_file(&blob_path, descriptor.size)
-                .await
-                .map_err(|error| ManifestValidationError {
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
-                    code: "UNKNOWN",
-                    message: error,
-                })?;
-            let observed = format!("sha256:{}", hex::encode(observed.finalize()));
-            if observed != descriptor.digest {
+        let key = (kind, descriptor.digest.clone());
+        if let Some((size, media_type)) = unique.get(&key) {
+            if *size != descriptor.size || media_type != &descriptor.media_type {
                 return Err(ManifestValidationError {
-                    status: StatusCode::NOT_FOUND,
-                    code: "MANIFEST_BLOB_UNKNOWN",
-                    message: format!(
-                        "manifest references blob {} whose content is not trustworthy",
-                        descriptor.digest
-                    ),
+                    status: StatusCode::BAD_REQUEST,
+                    code: "MANIFEST_INVALID",
+                    message: "manifest repeats a digest with conflicting descriptor metadata"
+                        .to_string(),
                 });
             }
+            continue;
+        }
+        work_bytes =
+            work_bytes
+                .checked_add(descriptor.size)
+                .ok_or_else(|| ManifestValidationError {
+                    status: StatusCode::BAD_REQUEST,
+                    code: "MANIFEST_INVALID",
+                    message: "manifest validation byte count overflowed".to_string(),
+                })?;
+        if work_bytes > MAX_MANIFEST_VALIDATION_BYTES {
+            return Err(ManifestValidationError {
+                status: StatusCode::BAD_REQUEST,
+                code: "MANIFEST_INVALID",
+                message: "manifest referenced bytes exceed the validation work limit".to_string(),
+            });
+        }
+        unique.insert(key, (descriptor.size, descriptor.media_type.clone()));
+    }
+
+    let mut validated = Vec::with_capacity(unique.len());
+    #[cfg(test)]
+    let validation_hook = state
+        .manifest_validation_hook
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    #[cfg(test)]
+    if let Some(hook) = validation_hook {
+        hook.started.notify_one();
+        hook.release.notified().await;
+    }
+    for ((kind, digest), (size, media_type)) in unique {
+        let Some(path) = manifest_reference_path(kind, &digest) else {
+            return Err(ManifestValidationError {
+                status: StatusCode::BAD_REQUEST,
+                code: "MANIFEST_INVALID",
+                message: "manifest contains an invalid descriptor digest".to_string(),
+            });
+        };
+        let identity = state
+            .authority
+            .identity(&path)
+            .map_err(|_| ManifestValidationError {
+                status: StatusCode::NOT_FOUND,
+                code: "MANIFEST_BLOB_UNKNOWN",
+                message: format!("manifest references unavailable descriptor {digest}"),
+            })?;
+        if identity.len != size {
+            return Err(ManifestValidationError {
+                status: StatusCode::NOT_FOUND,
+                code: "MANIFEST_BLOB_UNKNOWN",
+                message: format!("manifest descriptor {digest} has an unexpected size"),
+            });
+        }
+        let observed = hash_upload_file(&state.authority, &path, size)
+            .await
+            .map_err(|error| ManifestValidationError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "UNKNOWN",
+                message: error,
+            })?;
+        let observed = format!("sha256:{}", hex::encode(observed.finalize()));
+        if observed != digest {
+            return Err(ManifestValidationError {
+                status: StatusCode::NOT_FOUND,
+                code: "MANIFEST_BLOB_UNKNOWN",
+                message: format!(
+                    "manifest references descriptor {digest} whose content is not trustworthy"
+                ),
+            });
+        }
+        validated.push(ValidatedManifestReference {
+            kind,
+            digest,
+            media_type,
+            identity,
+        });
+    }
+    Ok(validated)
+}
+
+fn revalidate_manifest_references(
+    state: &OciRegistryState,
+    metadata: &OciMetadata,
+    repository_name: &str,
+    validated: &[ValidatedManifestReference],
+) -> Result<(), ManifestValidationError> {
+    for reference in validated {
+        if !manifest_reference_is_member(
+            metadata,
+            repository_name,
+            reference.kind,
+            &reference.digest,
+            &reference.media_type,
+        ) {
+            return Err(ManifestValidationError {
+                status: StatusCode::CONFLICT,
+                code: "MANIFEST_INVALID",
+                message: "manifest references changed during validation; retry publication"
+                    .to_string(),
+            });
+        }
+        let path = manifest_reference_path(reference.kind, &reference.digest)
+            .expect("validated manifest digest remains canonical");
+        if state.authority.identity(&path).ok() != Some(reference.identity) {
+            return Err(ManifestValidationError {
+                status: StatusCode::CONFLICT,
+                code: "MANIFEST_INVALID",
+                message:
+                    "manifest descriptor identity changed during validation; retry publication"
+                        .to_string(),
+            });
         }
     }
     Ok(())
@@ -1629,7 +2123,7 @@ async fn put_manifest_inner(
             None,
         );
     }
-    let manifest = match parse_image_manifest(media_type, &body) {
+    let manifest = match parse_manifest(media_type, &body) {
         Ok(manifest) => manifest,
         Err(error) => return error.response(),
     };
@@ -1643,23 +2137,23 @@ async fn put_manifest_inner(
             None,
         );
     }
-    let manifest_path = manifest_path_for_digest(&state.blobs_dir, &digest)
-        .expect("computed manifest digest is canonical");
+    let manifest_path =
+        manifest_relative_for_digest(&digest).expect("computed manifest digest is canonical");
+    let snapshot = match metadata_snapshot(state).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return metadata_authority_error(&error),
+    };
+    let validated = match validate_manifest_references(state, &snapshot, name, &manifest).await {
+        Ok(validated) => validated,
+        Err(error) => return error.response(),
+    };
     let (mut metadata_guard, storage_lock, mut replacement) =
         match begin_metadata_write(state).await {
             Ok(transaction) => transaction,
             Err(error) => return metadata_authority_error(&error),
         };
-    if let Err(error) = validate_manifest_blobs(state, &replacement, name, &manifest).await {
+    if let Err(error) = revalidate_manifest_references(state, &replacement, name, &validated) {
         return error.response();
-    }
-    if let Err(error) = crate::atomic_file::write(&manifest_path, &body) {
-        return oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "UNKNOWN",
-            &format!("failed to persist OCI manifest: {error}"),
-            None,
-        );
     }
     let descriptor = ManifestDescriptor {
         digest: digest.clone(),
@@ -1673,7 +2167,32 @@ async fn put_manifest_inner(
         .manifests
         .insert(reference.to_string(), descriptor.clone());
     repository.manifests.insert(digest.clone(), descriptor);
-    if let Err(error) = persist_metadata(state, &replacement) {
+    let metadata_bytes = match serde_json::to_vec(&replacement) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UNKNOWN",
+                &format!("failed to encode OCI metadata: {error}"),
+                None,
+            );
+        }
+    };
+    let authority = state.authority.clone();
+    let body = body.to_vec();
+    let persist = tokio::task::spawn_blocking(move || {
+        authority
+            .write(&manifest_path, &body)
+            .map_err(|error| format!("failed to persist OCI manifest: {error}"))?;
+        authority
+            .write(FsPath::new("metadata.json"), &metadata_bytes)
+            .map_err(|error| format!("failed to persist OCI metadata: {error}"))
+    })
+    .await;
+    if let Err(error) = persist
+        .map_err(|error| format!("OCI manifest persistence task failed: {error}"))
+        .and_then(|result| result)
+    {
         return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &error, None);
     }
     *metadata_guard = replacement;
@@ -1722,7 +2241,7 @@ async fn delete_manifest_inner(state: &OciRegistryState, name: &str, reference: 
     } else {
         repository.manifests.remove(reference);
     }
-    if let Err(error) = persist_metadata(state, &replacement) {
+    if let Err(error) = persist_metadata_async(state, &replacement).await {
         return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &error, None);
     }
     *metadata_guard = replacement;
@@ -1809,15 +2328,23 @@ fn sha256_hex(digest: &str) -> Option<&str> {
 /// separators, dot components, alternate algorithms, and encoded traversal
 /// payloads are rejected before any filesystem operation.
 fn blob_path_for_digest(blobs_dir: &FsPath, digest: &str) -> Option<PathBuf> {
-    let encoded = sha256_hex(digest)?;
-    let path = blobs_dir.join(format!("sha256_{encoded}"));
+    let path = blobs_dir.join(blob_relative_for_digest(digest)?);
     (path.parent() == Some(blobs_dir)).then_some(path)
 }
 
-fn manifest_path_for_digest(blobs_dir: &FsPath, digest: &str) -> Option<PathBuf> {
+fn blob_relative_for_digest(digest: &str) -> Option<PathBuf> {
     let encoded = sha256_hex(digest)?;
-    let manifests_dir = blobs_dir.join("manifests");
-    Some(manifests_dir.join(format!("sha256_{encoded}")))
+    Some(PathBuf::from(format!("sha256_{encoded}")))
+}
+
+#[cfg(test)]
+fn manifest_path_for_digest(blobs_dir: &FsPath, digest: &str) -> Option<PathBuf> {
+    Some(blobs_dir.join(manifest_relative_for_digest(digest)?))
+}
+
+fn manifest_relative_for_digest(digest: &str) -> Option<PathBuf> {
+    let encoded = sha256_hex(digest)?;
+    Some(PathBuf::from("manifests").join(format!("sha256_{encoded}")))
 }
 
 fn digest_invalid(message: &str, location: Option<&str>) -> Response {
@@ -2295,6 +2822,130 @@ mod tests {
         assert_eq!(durable_upload_count(&state).await, 0);
         let blob_path = blob_path_for_digest(&state.blobs_dir, &digest).unwrap();
         assert_eq!(std::fs::read(blob_path).unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn upload_status_and_authenticated_cancel_reclaim_durable_quota() {
+        let root = tempfile::tempdir().unwrap();
+        let blobs_dir = root.path().join("oci");
+        std::fs::create_dir_all(&blobs_dir).unwrap();
+        let mut configured = OciRegistryState::new(blobs_dir, Some("registry-secret".to_string()));
+        configured.max_active_upload_bytes = 3;
+        let state = Arc::new(configured);
+        let location = initiate(state.clone()).await;
+        let id = upload_id_from_location(&location).to_string();
+
+        let patched = oci_routes(state.clone())
+            .oneshot(authenticated_request("PATCH", &location, Body::from("abc")))
+            .await
+            .unwrap();
+        assert_eq!(patched.status(), StatusCode::ACCEPTED);
+
+        let status = oci_routes(state.clone())
+            .oneshot(Request::get(&location).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::NO_CONTENT);
+        assert_eq!(status.headers()[header::RANGE], "0-2");
+        assert_eq!(status.headers()["docker-upload-uuid"], id);
+
+        let unauthenticated = oci_routes(state.clone())
+            .oneshot(Request::delete(&location).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        let cancelled = oci_routes(state.clone())
+            .oneshot(authenticated_request("DELETE", &location, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status(), StatusCode::NO_CONTENT);
+        assert_eq!(durable_upload_count(&state).await, 0);
+
+        let replacement = initiate(state).await;
+        assert_ne!(replacement, location);
+    }
+
+    #[tokio::test]
+    async fn final_put_rejects_stale_content_range_without_mutating_upload() {
+        let (_root, state) = registry_state_with_token(Some("registry-secret"));
+        let location = initiate(state.clone()).await;
+        let patched = oci_routes(state.clone())
+            .oneshot(
+                Request::patch(&location)
+                    .header(header::AUTHORIZATION, "Bearer registry-secret")
+                    .header(header::CONTENT_RANGE, "0-4")
+                    .body(Body::from("hello"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(patched.status(), StatusCode::ACCEPTED);
+
+        let complete = b"helloworld";
+        let digest = format!("sha256:{}", sha2_hex(complete));
+        let rejected = oci_routes(state.clone())
+            .oneshot(
+                Request::put(format!("{location}?digest={digest}"))
+                    .header(header::AUTHORIZATION, "Bearer registry-secret")
+                    .header(header::CONTENT_RANGE, "0-4")
+                    .body(Body::from("world"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        let id = upload_id_from_location(&location);
+        assert_eq!(
+            state
+                .authority
+                .read(&upload_data_relative(id).unwrap())
+                .unwrap(),
+            b"hello"
+        );
+        assert_eq!(read_upload_session(&state, id).unwrap().unwrap().size, 5);
+
+        let accepted = oci_routes(state.clone())
+            .oneshot(
+                Request::put(format!("{location}?digest={digest}"))
+                    .header(header::AUTHORIZATION, "Bearer registry-secret")
+                    .header(header::CONTENT_RANGE, "5-9")
+                    .body(Body::from("world"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::CREATED);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_oci_state_cannot_be_redirected_by_root_replacement() {
+        let (root, state) = registry_state_with_token(Some("registry-secret"));
+        let original = root.path().join("oci-retained");
+        std::fs::rename(&state.blobs_dir, &original).unwrap();
+        std::fs::create_dir(&state.blobs_dir).unwrap();
+
+        let location = initiate(state.clone()).await;
+        let body = b"retained-root-blob";
+        let digest = format!("sha256:{}", sha2_hex(body));
+        let completed = oci_routes(state)
+            .oneshot(authenticated_request(
+                "PUT",
+                &format!("{location}?digest={digest}"),
+                Body::from(body.as_slice()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(completed.status(), StatusCode::CREATED);
+        assert_eq!(
+            std::fs::read(original.join(blob_relative_for_digest(&digest).unwrap())).unwrap(),
+            body
+        );
+        assert!(!root
+            .path()
+            .join("oci")
+            .join(blob_relative_for_digest(&digest).unwrap())
+            .exists());
     }
 
     #[tokio::test]
@@ -2946,6 +3597,158 @@ mod tests {
         assert!(state.metadata.read().await.repositories["demo"]
             .manifests
             .contains_key("latest"));
+    }
+
+    #[tokio::test]
+    async fn oci_indexes_and_docker_manifest_lists_validate_and_round_trip() {
+        let (_root, state) = registry_state_with_token(Some("registry-secret"));
+        for (sequence, (index_media_type, child_media_type)) in [
+            (OCI_INDEX_MEDIA_TYPE, DEFAULT_MANIFEST_MEDIA_TYPE),
+            (DOCKER_MANIFEST_LIST_MEDIA_TYPE, DOCKER_MANIFEST_MEDIA_TYPE),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let child_tag = format!("child-{sequence}");
+            let (child_digest, child_body) =
+                seed_valid_manifest(&state, "demo", &child_tag, child_media_type, &child_tag).await;
+            let index_body = serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": index_media_type,
+                "manifests": [{
+                    "mediaType": child_media_type,
+                    "digest": child_digest,
+                    "size": child_body.len(),
+                    "platform": { "architecture": "arm64", "os": "linux" }
+                }]
+            }))
+            .unwrap();
+            let tag = format!("multi-{sequence}");
+            let published = oci_routes(state.clone())
+                .oneshot(
+                    Request::put(format!("/v2/demo/manifests/{tag}"))
+                        .header(header::AUTHORIZATION, "Bearer registry-secret")
+                        .header(header::CONTENT_TYPE, index_media_type)
+                        .body(Body::from(index_body.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                published.status(),
+                StatusCode::CREATED,
+                "{index_media_type}"
+            );
+
+            let fetched = oci_routes(state.clone())
+                .oneshot(
+                    Request::get(format!("/v2/demo/manifests/{tag}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(fetched.status(), StatusCode::OK);
+            assert_eq!(fetched.headers()[header::CONTENT_TYPE], index_media_type);
+            assert_eq!(
+                to_bytes(fetched.into_body(), MAX_OCI_MANIFEST_SIZE)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                index_body.as_slice()
+            );
+        }
+
+        let missing_digest = format!("sha256:{}", "0".repeat(SHA256_HEX_LEN));
+        let missing = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_INDEX_MEDIA_TYPE,
+            "manifests": [{
+                "mediaType": DEFAULT_MANIFEST_MEDIA_TYPE,
+                "digest": missing_digest,
+                "size": 1,
+            }]
+        }))
+        .unwrap();
+        let rejected = oci_routes(state)
+            .oneshot(
+                Request::put("/v2/demo/manifests/missing-child")
+                    .header(header::AUTHORIZATION, "Bearer registry-secret")
+                    .header(header::CONTENT_TYPE, OCI_INDEX_MEDIA_TYPE)
+                    .body(Body::from(missing))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::NOT_FOUND);
+        assert_eq!(error_code(rejected).await, "MANIFEST_BLOB_UNKNOWN");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manifest_reference_validation_does_not_hold_the_metadata_write_lock() {
+        let (_root, state) = registry_state_with_token(Some("registry-secret"));
+        seed_valid_manifest(
+            &state,
+            "demo",
+            "stable",
+            DEFAULT_MANIFEST_MEDIA_TYPE,
+            "stable",
+        )
+        .await;
+        let config = b"new-config";
+        let layer = b"new-layer";
+        let config_digest = seed_blob(&state, "demo", config).await;
+        let layer_digest = seed_blob(&state, "demo", layer).await;
+        let body = image_manifest_body(
+            DEFAULT_MANIFEST_MEDIA_TYPE,
+            &config_digest,
+            config.len(),
+            &layer_digest,
+            layer.len(),
+            "new",
+        );
+        let hook = Arc::new(ManifestValidationHook {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *state
+            .manifest_validation_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook.clone());
+
+        let publisher = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                oci_routes(state)
+                    .oneshot(
+                        Request::put("/v2/demo/manifests/new")
+                            .header(header::AUTHORIZATION, "Bearer registry-secret")
+                            .header(header::CONTENT_TYPE, DEFAULT_MANIFEST_MEDIA_TYPE)
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .status()
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), hook.started.notified())
+            .await
+            .unwrap();
+        let public_read = tokio::time::timeout(
+            Duration::from_secs(1),
+            oci_routes(state.clone()).oneshot(
+                Request::get("/v2/demo/manifests/stable")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(public_read.status(), StatusCode::OK);
+        hook.release.notify_one();
+        assert_eq!(publisher.await.unwrap(), StatusCode::CREATED);
     }
 
     #[tokio::test]

@@ -26,7 +26,7 @@ struct RegistryProcessGates {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct RegistryProcessKey {
     parent: FileIdentity,
-    registry_name: std::ffi::OsString,
+    lock_authority_name: Vec<u8>,
 }
 
 #[cfg(unix)]
@@ -60,8 +60,8 @@ impl Drop for RegistryProcessGuard {
 /// unlink a sibling thread's just-opened registry descriptor (`st_nlink == 0`).
 /// Different registry authorities remain independent; the durable lock file
 /// remains the cross-process authority. Keying on the opened parent identity
-/// collapses prefix aliases such as `/tmp` and `/private/tmp` that lexical path
-/// normalization cannot recognize as one directory.
+/// plus the collision-normalized lock name collapses both prefix aliases such
+/// as `/tmp` and `/private/tmp` and case aliases on default macOS filesystems.
 #[cfg(unix)]
 fn lock_registry_process(path: &Path) -> std::io::Result<RegistryProcessGuard> {
     let anchor = prepare_anchor(path).map_err(|error| {
@@ -73,7 +73,7 @@ fn lock_registry_process(path: &Path) -> std::io::Result<RegistryProcessGuard> {
             device: parent_stat.st_dev as u64,
             inode: parent_stat.st_ino as u64,
         },
-        registry_name: anchor.registry_name,
+        lock_authority_name: collision_normalized_authority_name(&anchor.lock_name),
     };
     let (state, changed) = REGISTRY_PROCESS_GATES.get_or_init(|| {
         (
@@ -650,6 +650,13 @@ fn authority_names_collide(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
     // Conservatively reject ASCII case variants on every Unix platform so a
     // case-insensitive filesystem cannot alias registry data with lock/temp.
     a.as_bytes().eq_ignore_ascii_case(b.as_bytes())
+}
+
+#[cfg(unix)]
+fn collision_normalized_authority_name(name: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
+    name.as_bytes().iter().map(u8::to_ascii_lowercase).collect()
 }
 
 #[cfg(unix)]
@@ -1808,6 +1815,90 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(1))
             .unwrap();
         contender.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_gate_collapses_case_aliases_of_the_named_lock_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let lowercase = root.path().join("registry.toml");
+        let uppercase = root.path().join("REGISTRY.TOML");
+
+        let first = lock_registry_process(&lowercase).unwrap();
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let _guard = lock_registry_process(&uppercase).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        attempted_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            acquired_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(first);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        contender.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn case_alias_updates_preserve_both_writers_on_case_insensitive_filesystems() {
+        use std::sync::{Arc, Barrier};
+
+        let root = tempfile::tempdir().unwrap();
+        let lowercase = root.path().join("registry.toml");
+        let uppercase = root.path().join("REGISTRY.TOML");
+        KinRegistry::default().save_to(&lowercase).unwrap();
+        let Ok(lower_file) = File::open(&lowercase) else {
+            return;
+        };
+        let Ok(upper_file) = File::open(&uppercase) else {
+            return;
+        };
+        let lower_stat = stat_file(&lower_file).unwrap();
+        let upper_stat = stat_file(&upper_file).unwrap();
+        if lower_stat.st_dev != upper_stat.st_dev || lower_stat.st_ino != upper_stat.st_ino {
+            return;
+        }
+
+        let barrier = Arc::new(Barrier::new(2));
+        let writers = [(lowercase.clone(), "lower"), (uppercase, "upper")]
+            .into_iter()
+            .map(|(path, id)| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    KinRegistry::update_at(&path, |registry| {
+                        registry.repos.push(RegisteredRepo {
+                            id: id.to_string(),
+                            path: PathBuf::from(format!("/{id}")),
+                            entities: 1,
+                            last_commit: "now".to_string(),
+                            dependencies: Vec::new(),
+                        });
+                    })
+                    .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        let registry = KinRegistry::load_from(&lowercase).unwrap();
+        let ids = registry
+            .repos
+            .iter()
+            .map(|repo| repo.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids, std::collections::HashSet::from(["lower", "upper"]));
     }
 
     #[test]
