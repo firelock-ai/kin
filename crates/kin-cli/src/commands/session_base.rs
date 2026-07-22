@@ -17,9 +17,13 @@
 //! the workspace on cleanup.
 
 use std::collections::BTreeMap;
+#[cfg(any(unix, windows))]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+#[cfg(any(unix, windows))]
+use cap_fs_ext::DirExt;
 use serde::{Deserialize, Serialize};
 
 /// Workspace-relative directory that holds Kin's session-runtime metadata.
@@ -117,4 +121,49 @@ pub(crate) fn load_base(session_dir: &Path) -> Result<Option<SessionBase>> {
 pub fn record_materialized_base(session_dir: &Path, base_head: Option<String>) -> Result<()> {
     let files = hash_dir(session_dir)?;
     write_base(session_dir, &SessionBase { base_head, files })
+}
+
+#[cfg(any(unix, windows))]
+/// Persist the graph-authoritative base supplied by the materializer through
+/// the retained session-directory capability.
+///
+/// The caller must derive `base.files` from the preflighted graph tree. This
+/// function deliberately does not discover files from the live workspace,
+/// where a concurrent insertion or mutation could otherwise be mistaken for
+/// graph truth.
+pub fn record_preflighted_graph_base_in_dir(
+    session_dir: &cap_std::fs::Dir,
+    base: &SessionBase,
+) -> Result<()> {
+    session_dir.create_dir(META_DIR).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to create capability-rooted session metadata directory: {}",
+            error
+        )
+    })?;
+    let metadata_dir = session_dir.open_dir_nofollow(META_DIR).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to open capability-rooted session metadata directory: {}",
+            error
+        )
+    })?;
+    let json = serde_json::to_vec_pretty(base)
+        .map_err(|error| anyhow::anyhow!("failed to serialize session base: {}", error))?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut base_file = metadata_dir
+        .open_with(BASE_FILE, &options)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to create capability-rooted session base manifest: {}",
+                error
+            )
+        })?;
+    base_file.write_all(&json).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to write capability-rooted session base manifest: {}",
+            error
+        )
+    })?;
+    Ok(())
 }
