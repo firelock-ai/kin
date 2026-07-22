@@ -7,6 +7,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "MCP server for Kin: assistant-neutral integration"
+repository.workspace = true
 
 [dependencies]
 kin-core = { workspace = true }

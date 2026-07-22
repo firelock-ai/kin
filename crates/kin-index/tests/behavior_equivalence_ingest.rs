@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! End-to-end ingest proof for the behavior-equivalence class (FIR-1435).
+//! End-to-end ingest proof for the behavior-equivalence class.
 //!
 //! Drives the real indexing pipeline (parse -> extract -> attach) and asserts
 //! that the graph-owned `SemanticFingerprint.equivalence_hash` is docstring-

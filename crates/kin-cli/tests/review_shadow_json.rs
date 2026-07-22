@@ -647,7 +647,7 @@ fn setup_generated_consumer_repo(repo: &Path) -> (String, String) {
     (base, head)
 }
 
-/// FIR-1267 (687 false would_block), end-to-end: a signature change whose only
+/// End-to-end: a signature change whose only
 /// cross-file consumer is a generated single-header copy must not raise a
 /// blocking breaking finding. This exercises the same `Generated`-consumer
 /// exclusion through the full CLI + graph gate that

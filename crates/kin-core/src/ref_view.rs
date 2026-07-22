@@ -2357,7 +2357,7 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
         }
     }
 
-    /// FIR-1267 (687 false would_block): the historical-ref reconstruction
+    /// The historical-ref reconstruction
     /// replays persisted entities verbatim and is the only stage that
     /// re-canonicalizes their paths, so it must also re-derive `role`. A
     /// single-header amalgamated copy persisted before the `single_include/`
@@ -2402,7 +2402,7 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
             EntityRole::Generated,
             "a single_include/ amalgamated copy persisted as Source must be re-derived to \
              Generated during historical-ref reconstruction so impact.rs excludes it from \
-             consumer_count (the FIR-1267 687 divergence)"
+             consumer_count"
         );
         assert_eq!(
             snapshot.entities[&real_source_id].role,

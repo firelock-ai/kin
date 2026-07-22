@@ -138,7 +138,7 @@ fn call_confidence(relations: &[kin_model::Relation], src: EntityId, dst: Entity
 
 #[test]
 fn inherited_self_call_resolves_to_base_method_cross_file() {
-    // The FIR-1342 / django 0f169098ef shape: Command(BaseCommand) calls
+    // The Django inherited-self-call shape: Command(BaseCommand) calls
     // self.validate(), and validate is defined only on the base class in
     // another file. The edge must exist AND carry verdict-driving confidence
     // (>= 0.6, the review-side strong-consumer floor) — a weak fan-out edge

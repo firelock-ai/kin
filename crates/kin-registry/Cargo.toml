@@ -7,6 +7,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Package registry for Kin: Cargo sparse protocol and multi-ecosystem support"
+repository.workspace = true
 
 [dependencies]
 kin-blobs = { workspace = true }

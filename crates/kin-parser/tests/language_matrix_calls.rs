@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Per-language call-relation matrix (FIR-1313).
+//! Per-language call-relation matrix.
 //!
 //! Three probes per language: (1) a plain same-file call emits a `Calls` edge
 //! whose `dst_name` is a simple, index-matchable identifier; (2) a method call

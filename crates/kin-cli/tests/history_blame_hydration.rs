@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! End-to-end proof that `history` and `blame` report ref hydration honestly
-//! (FIR-1431). Resolving either command at an unimported Git ref lazily walks
+//! End-to-end proof that `history` and `blame` report ref hydration honestly.
+//! Resolving either command at an unimported Git ref lazily walks
 //! and imports that ref's ancestry into the graph. That import must surface as
 //! a truthful `hydrated_changes` count — a cold multi-change import and a warm
 //! no-op are not the same event — instead of the old swallowed boolean. This

@@ -14579,7 +14579,7 @@ mod tests {
     /// The daemon's /spine endpoints serve a TRANSITIVE (2-hop) blast radius and
     /// MULTI-CONSUMER edges through the production refresh path: provider <-
     /// consumer <- downstream, plus a second consumer of provider. This is the
-    /// FIR-1149 transitive/multi-consumer gate on top of the 1-hop fixture; it
+    /// transitive/multi-consumer gate on top of the 1-hop fixture; it
     /// depends on refresh registering each repo's own entities so the next hop
     /// can resolve them.
     #[tokio::test]
@@ -17012,7 +17012,7 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
     }
 
-    // FIR-1180 schema parity: the fused MCP payload IS the `LocateResult` schema
+    // Schema parity: the fused MCP payload IS the `LocateResult` schema
     // `kin locate --json` serializes — it deserializes straight back into the
     // shared type, so a consumer needs one parser across surfaces.
     #[tokio::test]
@@ -17083,7 +17083,7 @@ mod tests {
         );
     }
 
-    // FIR-1232 paging symmetry: the fused arm consumes `page_size`/`cursor` and
+    // Paging symmetry: the fused arm consumes `page_size`/`cursor` and
     // emits `total_ranked`/`page`/`next_cursor` over the graph-native entity
     // ranking, exactly like the cosine arm and `POST /locate`. The cursor is
     // stable — re-issuing it returns the identical next page from cache.
@@ -17165,7 +17165,7 @@ mod tests {
         );
     }
 
-    // FIR-1180: the fused arm's extra top-level fields survive the switch to the
+    // The fused arm's extra top-level fields survive the switch to the
     // shared schema — routing distinguishes the pipeline, and the structured
     // coverage/degradations contract rides alongside the LocateResult body.
     #[tokio::test]

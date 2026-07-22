@@ -6496,10 +6496,10 @@ func prCheckout(cmd *cobra.Command, args []string) error {
 
     #[test]
     fn base_link_anchor_surfaces_untouched_consumer_edge_at_historical_head() {
-        // End-to-end proof of FIR-1267 Fix D: a consumer living in a file NEVER
+        // End-to-end proof that a consumer living in a file NEVER
         // touched inside a truncated import window must still yield a committed
         // inbound relation delta that ref-scoped replay surfaces at a historical
-        // head. Pre-Fix-D the window base linked against a touched-files-only
+        // head. Previously the window base linked against a touched-files-only
         // universe, so the consumer edge existed ONLY in live adjacency and the
         // genesis auto-parse change — both siblings of the historical chain — and
         // blast radius at a historical ref replayed as 0.
@@ -6639,7 +6639,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
 
     #[test]
     fn base_link_cpp_receiver_method_edge_survives_at_historical_head() {
-        // Regression guard for the FIR-1267 (c2) parity fix. A C++ receiver-method
+        // Regression guard for the incremental-linker parity fix. A C++ receiver-method
         // call `w.work()` resolves to a `Type::method` (`Widget::work`) only through
         // the linker's bare-name index. The batch resolver has always had that
         // index; the incremental linker did not, so a base-link built as a

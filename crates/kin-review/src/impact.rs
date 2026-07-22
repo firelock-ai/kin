@@ -1047,7 +1047,7 @@ mod tests {
 
     #[test]
     fn stale_source_amalgamated_consumer_excluded_from_consumer_count_by_path() {
-        // FIR-1267 (687 false would_block): the review evaluates a graph
+        // The review evaluates a graph
         // materialized by resolve_graph_at, which replays persisted entities
         // verbatim and never reparses. A single-header amalgamated copy ingested
         // before the single_include/ rule landed replays with a stale
