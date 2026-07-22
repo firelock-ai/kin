@@ -88,6 +88,7 @@ pub fn create_session_workspace_from_graph(
         scope,
         |_| Ok(()),
         |_| Ok(()),
+        |_| Ok(()),
     )
 }
 
@@ -108,6 +109,7 @@ fn create_session_workspace_from_graph_with_hook(
         scope,
         |_| Ok(()),
         after_root_created,
+        |_| Ok(()),
     )
 }
 
@@ -128,6 +130,28 @@ fn create_session_workspace_from_graph_with_child_hook(
         scope,
         after_child_created,
         |_| Ok(()),
+        |_| Ok(()),
+    )
+}
+
+#[cfg(test)]
+fn create_session_workspace_from_graph_with_base_hook(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    session_dir: &Path,
+    strategy: Option<MaterializeStrategy>,
+    scope: Option<&str>,
+    before_base_recorded: impl FnOnce(&Path) -> Result<()>,
+) -> Result<MaterializedWorkspace> {
+    create_session_workspace_from_graph_with_hooks(
+        layout,
+        graph,
+        session_dir,
+        strategy,
+        scope,
+        |_| Ok(()),
+        |_| Ok(()),
+        before_base_recorded,
     )
 }
 
@@ -139,6 +163,7 @@ fn create_session_workspace_from_graph_with_hooks(
     scope: Option<&str>,
     after_child_created: impl FnOnce(&Path) -> Result<()>,
     after_root_created: impl FnOnce(&Path) -> Result<()>,
+    before_base_recorded: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<MaterializedWorkspace> {
     if let Some(strategy) = strategy {
         if strategy != MaterializeStrategy::Copy {
@@ -176,6 +201,7 @@ fn create_session_workspace_from_graph_with_hooks(
             branch.head.to_string(),
             after_child_created,
             after_root_created,
+            before_base_recorded,
         )
     }
 
@@ -188,6 +214,7 @@ fn create_session_workspace_from_graph_with_hooks(
             branch,
             after_child_created,
             after_root_created,
+            before_base_recorded,
         );
         anyhow::bail!("secure graph-backed session materialization is unsupported on this platform")
     }
@@ -301,6 +328,9 @@ fn validate_portable_relative_path(raw: &str, subject: &str) -> Result<PathBuf> 
             "." => anyhow::bail!("{subject} '{raw}' contains an ambiguous current component"),
             ".." => anyhow::bail!("{subject} '{raw}' contains parent traversal"),
             _ => validate_portable_component(component, subject, raw)?,
+        }
+        if kin_index::should_skip_dir(component) {
+            anyhow::bail!("{subject} '{raw}' contains graph-excluded component '{component}'");
         }
         relative_path.push(component);
     }
@@ -1083,7 +1113,20 @@ fn materialize_preflighted_blob_tree(
     base_head: String,
     after_child_created: impl FnOnce(&Path) -> Result<()>,
     after_root_created: impl FnOnce(&Path) -> Result<()>,
+    before_base_recorded: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<MaterializedWorkspace> {
+    let base = super::session_base::SessionBase {
+        base_head: Some(base_head),
+        files: entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.relative_path.to_string_lossy().into_owned(),
+                    kin_blobs::Hash256(*entry.hash.as_bytes()).to_string(),
+                )
+            })
+            .collect(),
+    };
     let capabilities =
         SessionCapabilities::create(layout, session_dir, session_name, after_child_created)?;
     let result = (|| {
@@ -1131,9 +1174,10 @@ fn materialize_preflighted_blob_tree(
             })?;
         }
 
-        super::session_base::record_materialized_base_from_dir(
+        before_base_recorded(session_dir)?;
+        super::session_base::record_preflighted_graph_base_in_dir(
             capabilities.session_root(),
-            Some(base_head),
+            &base,
         )?;
         let workspace = MaterializedWorkspace::from_existing(
             session_dir.to_path_buf(),
@@ -1429,6 +1473,71 @@ mod tests {
             validate_portable_relative_path("README.md", "graph FilePathId").unwrap(),
             PathBuf::from("README.md")
         );
+    }
+
+    #[test]
+    fn portable_graph_paths_reject_every_graph_excluded_namespace_component() {
+        let excluded_components = kin_index::SKIP_DIRS.iter().copied().chain([
+            ".kin-shadow",
+            ".git-export",
+            ".bench-run",
+        ]);
+
+        for component in excluded_components {
+            let path = format!("prefix/{component}/payload.rs");
+            let error = validate_portable_relative_path(&path, "graph FilePathId")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("graph-excluded component"),
+                "unexpected error for {path:?}: {error}"
+            );
+            assert!(
+                error.contains(component),
+                "error must identify excluded component {component:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn graph_excluded_namespaces_fail_before_session_child_creation() {
+        for (case, graph_path) in [
+            ".kin-shadow/payload.rs",
+            ".git-export/payload.rs",
+            ".bench-run/payload.rs",
+            "target/payload.rs",
+            "node_modules/payload.js",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let layout = init_repo(dir.path()).unwrap().layout;
+            write_native_graph_file(&layout, graph_path, b"must not materialize\n").unwrap();
+            let session_dir = layout
+                .runs_dir()
+                .join(format!("session-excluded-namespace-{case}"));
+            let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
+
+            let error = create_session_workspace_from_graph(
+                &layout,
+                snap.graph().as_ref(),
+                &session_dir,
+                None,
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(
+                error.contains("graph-excluded component"),
+                "unexpected error for {graph_path:?}: {error}"
+            );
+            assert!(
+                !session_dir.exists(),
+                "preflight created a session child for {graph_path:?}"
+            );
+        }
     }
 
     #[test]
@@ -2337,6 +2446,50 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn late_workspace_mutation_and_insertion_never_become_the_graph_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = init_repo(dir.path()).unwrap().layout;
+        let graph_bytes = b"graph truth\n";
+        write_native_graph_file(&layout, "src/lib.rs", graph_bytes).unwrap();
+
+        let session_dir = layout.runs_dir().join("session-late-base-mutation");
+        let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
+        let workspace = create_session_workspace_from_graph_with_base_hook(
+            &layout,
+            snap.graph().as_ref(),
+            &session_dir,
+            None,
+            None,
+            |root| {
+                fs::write(root.join("src/lib.rs"), "late ambient mutation\n")?;
+                fs::write(root.join("ambient-insertion.rs"), "not graph truth\n")?;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let base = super::super::session_base::load_base(&workspace.root)
+            .unwrap()
+            .expect("graph-authoritative base manifest");
+        assert_eq!(
+            base.files.get("src/lib.rs"),
+            Some(&kin_blobs::digest(graph_bytes).to_string()),
+            "a late mutation must not replace the preflighted graph hash"
+        );
+        assert!(
+            !base.files.contains_key("ambient-insertion.rs"),
+            "a late insertion must not be discovered into the graph base"
+        );
+        assert_eq!(base.files.len(), 1);
+        assert_eq!(
+            fs::read_to_string(workspace.root.join("src/lib.rs")).unwrap(),
+            "late ambient mutation\n"
+        );
+        assert!(workspace.root.join("ambient-insertion.rs").is_file());
     }
 
     #[test]
