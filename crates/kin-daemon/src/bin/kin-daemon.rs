@@ -157,10 +157,7 @@ fn create_state(
     repo_id: &str,
 ) -> std::result::Result<DaemonState, Box<dyn std::error::Error>> {
     match storage {
-        StorageMode::Local => {
-            let _ = repo_id;
-            Ok(DaemonState::open(layout)?)
-        }
+        StorageMode::Local => Ok(DaemonState::open_with_repo_id(layout, Some(repo_id))?),
         #[cfg(feature = "gcs")]
         StorageMode::Gcs => {
             let allowed_repo_ids = parse_allowed_repo_ids();

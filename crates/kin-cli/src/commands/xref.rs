@@ -15,6 +15,11 @@ pub struct XrefRequest {
 pub struct XrefResponse {
     #[serde(default)]
     pub lines: Vec<String>,
+    /// Exact daemon/spine payload behind the human rendering. Keeping it in
+    /// the CLI RPC response prevents typed clients from losing incomplete
+    /// authority, revision, roots, and anchor information at this boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spine: Option<::kin_spine::SpineXrefResponse>,
 }
 
 pub async fn run(entity: String) -> Result<()> {
@@ -58,6 +63,7 @@ pub async fn build_xref_response(
     if matches.is_empty() {
         return Ok(XrefResponse {
             lines: xref_not_found_guidance(&request.entity),
+            spine: None,
         });
     }
 
@@ -69,18 +75,24 @@ pub async fn build_xref_response(
 
     let repo_id = crate::commands::remote::resolve_repo_id(layout)?;
 
+    let mut spine = None;
     match crate::backend::get_spine_xref(layout, &repo_id, &target.id).await {
-        Ok(query) => lines.extend(spine_xref_lines(query, &repo_id, &target.id)),
+        Ok(query) => {
+            lines.extend(spine_xref_lines(&query, &repo_id, &target.id));
+            if let ::kin_spine::SpineQuery::Found(response) = query {
+                spine = Some(response);
+            }
+        }
         Err(e) => {
             lines.push(format!("  Failed to query spine: {}", e));
         }
     }
 
-    Ok(XrefResponse { lines })
+    Ok(XrefResponse { lines, spine })
 }
 
 fn spine_xref_lines(
-    query: ::kin_spine::SpineQuery<::kin_spine::SpineXrefResponse>,
+    query: &::kin_spine::SpineQuery<::kin_spine::SpineXrefResponse>,
     repo_id: &str,
     entity_id: &kin_model::EntityId,
 ) -> Vec<String> {
@@ -104,7 +116,7 @@ fn spine_xref_lines(
                 "  Found {} cross-repo edges:",
                 response.edges.len()
             ));
-            for edge in response.edges {
+            for edge in &response.edges {
                 lines.push(format!(
                     "    - Impact: [{}] {} depends on us ([{}] {}) (conf: {:.2})",
                     edge.src_repo, edge.src_entity, edge.dst_repo, edge.dst_entity, edge.confidence
@@ -154,7 +166,7 @@ fn xref_not_found_guidance(entity: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{spine_xref_lines, xref_not_found_guidance};
+    use super::{spine_xref_lines, xref_not_found_guidance, XrefResponse};
     use kin_model::EntityId;
 
     #[test]
@@ -181,11 +193,8 @@ mod tests {
     fn incomplete_empty_xref_never_claims_no_references() {
         let entity_id = EntityId::new();
         let response = kin_spine::SpineXrefResponse::new(Vec::new(), Vec::new());
-        let lines = spine_xref_lines(
-            kin_spine::SpineQuery::Found(response),
-            "provider",
-            &entity_id,
-        );
+        let query = kin_spine::SpineQuery::Found(response);
+        let lines = spine_xref_lines(&query, "provider", &entity_id);
         let joined = lines.join("\n");
         assert!(!joined.contains("No cross-repo references found"));
         assert!(joined.contains("authority is incomplete"));
@@ -209,14 +218,25 @@ mod tests {
         .unwrap();
         let response =
             kin_spine::SpineXrefResponse::from_slice_for(&encoded, "provider", &entity_id).unwrap();
-        let lines = spine_xref_lines(
-            kin_spine::SpineQuery::Found(response),
-            "provider",
-            &entity_id,
-        );
+        let query = kin_spine::SpineQuery::Found(response);
+        let lines = spine_xref_lines(&query, "provider", &entity_id);
         assert_eq!(
             lines,
             vec!["  No cross-repo references found in the spine."]
         );
+    }
+
+    #[test]
+    fn xref_rpc_response_preserves_incomplete_spine_authority() {
+        let response = XrefResponse {
+            lines: vec!["partial".to_string()],
+            spine: Some(kin_spine::SpineXrefResponse::new(Vec::new(), Vec::new())),
+        };
+        let encoded = serde_json::to_vec(&response).unwrap();
+        let decoded: XrefResponse = serde_json::from_slice(&encoded).unwrap();
+        let spine = decoded.spine.expect("typed spine payload must survive RPC");
+        assert!(!spine.authority_complete);
+        assert!(spine.authority_revision.is_none());
+        assert!(spine.authority_roots.is_empty());
     }
 }

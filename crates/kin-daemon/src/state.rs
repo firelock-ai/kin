@@ -954,7 +954,10 @@ impl DaemonState {
         Self::open_with_repo_id(layout, Some(repo_id))
     }
 
-    fn open_with_repo_id(layout: KinLayout, explicit_repo_id: Option<&str>) -> Result<Self> {
+    /// Open local daemon state with a repository identity already resolved by
+    /// the process entrypoint. This keeps CLI flags and manifest-derived
+    /// authority from being discarded in favor of an unrelated ambient value.
+    pub fn open_with_repo_id(layout: KinLayout, explicit_repo_id: Option<&str>) -> Result<Self> {
         // Up-front compatibility gate. A repo created by a pre-0.2 kin carries
         // an on-disk graph/index that this build's post-load embed/readiness
         // path cannot serve. Without this gate the daemon loads the snapshot,
@@ -3905,6 +3908,15 @@ mod tests {
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
         DaemonState::open(init.layout).expect("current-version repo must open");
+    }
+
+    #[test]
+    fn open_with_repo_id_preserves_entrypoint_authority() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = DaemonState::open_with_repo_id(init.layout, Some("entrypoint-repo"))
+            .expect("an entrypoint-resolved repository id must open");
+        assert_eq!(state.cached_repo_id, "entrypoint-repo");
     }
 
     #[cfg(feature = "vector")]
