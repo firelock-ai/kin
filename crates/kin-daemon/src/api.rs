@@ -1130,10 +1130,10 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
     // Go module proxy
     let go_dir = packages_dir.join("go");
     std::fs::create_dir_all(&go_dir).ok();
-    let go_routes = kin_registry::go::go_routes(Arc::new(kin_registry::go::GoProxyState {
-        manifest_store: kin_registry::ManifestStore::new(state.layout.root()),
-        blobs_dir: go_dir,
-    }));
+    let go_routes = kin_registry::go::go_routes(Arc::new(kin_registry::go::GoProxyState::new(
+        kin_registry::ManifestStore::new(state.layout.root()),
+        go_dir,
+    )));
 
     // The package registries (cargo/npm/oci/go) are PUBLIC services with their
     // own per-write gates (Cargo: `KIN_REGISTRY_CARGO_TOKEN`; OCI:

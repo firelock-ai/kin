@@ -623,6 +623,8 @@ impl RegistryAnchor {
             })?
             .to_os_string();
 
+        validate_authority_filename(&registry_name)?;
+
         if authority_names_collide(&registry_name, &lock_name)
             || authority_names_collide(&registry_name, &legacy_tmp_name)
             || authority_names_collide(&lock_name, &legacy_tmp_name)
@@ -650,6 +652,25 @@ fn authority_names_collide(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
     // Conservatively reject ASCII case variants on every Unix platform so a
     // case-insensitive filesystem cannot alias registry data with lock/temp.
     a.as_bytes().eq_ignore_ascii_case(b.as_bytes())
+}
+
+#[cfg(unix)]
+fn validate_authority_filename(name: &std::ffi::OsStr) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    // Filesystems such as default macOS APFS apply Unicode normalization and
+    // case folding that cannot be reproduced from raw OsStr bytes. In
+    // particular, `registry.locK` aliases `registry.lock`, despite the two
+    // names being neither byte-equal nor ASCII-case-equal. Restrict only the
+    // authority filename (parent paths remain fully Unicode-capable) so the
+    // data, lock, and reserved temp names can never alias unexpectedly.
+    if !name.as_bytes().is_ascii() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "registry authority filename must be ASCII to avoid filesystem case-fold aliases",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1598,6 +1619,18 @@ mod tests {
             assert_eq!(mode(&reg_path), 0o600);
             assert_eq!(mode(&reg_path.with_extension("lock")), 0o600);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unicode_case_fold_cannot_alias_registry_and_lock_authorities() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg_path = dir.path().join("registry.locK");
+
+        let error = KinRegistry::default().save_to(&reg_path).unwrap_err();
+
+        assert!(error.to_string().contains("filename must be ASCII"));
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
     }
 
     #[cfg(unix)]

@@ -36,6 +36,9 @@ const MAX_NPM_TARBALL_SIZE: usize = 100 * 1024 * 1024;
 const MAX_NPM_PUBLISH_BODY_SIZE: usize = 140 * 1024 * 1024;
 const MAX_NPM_ARCHIVE_ENTRIES: u64 = 100_000;
 const MAX_NPM_UNPACKED_SIZE: u64 = 1024 * 1024 * 1024;
+const MAX_NPM_ARCHIVE_DECOMPRESSED_SIZE: u64 =
+    MAX_NPM_UNPACKED_SIZE + (MAX_NPM_ARCHIVE_ENTRIES * 1024) + 1024;
+const NPM_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 /// Shared state for the npm registry routes
 pub struct NpmRegistryState {
@@ -323,9 +326,15 @@ fn validate_npm_package(package: &str) -> Result<PackageId, String> {
 }
 
 fn valid_npm_version(version: &str) -> bool {
-    !version.is_empty()
-        && version.len() <= MAX_NPM_VERSION_LEN
-        && semver::Version::parse(version).is_ok()
+    if version.is_empty() || version.len() > MAX_NPM_VERSION_LEN {
+        return false;
+    }
+    let Ok(version) = semver::Version::parse(version) else {
+        return false;
+    };
+    version.major <= NPM_MAX_SAFE_INTEGER
+        && version.minor <= NPM_MAX_SAFE_INTEGER
+        && version.patch <= NPM_MAX_SAFE_INTEGER
 }
 
 fn valid_npm_tarball_name(tarball: &str) -> bool {
@@ -683,19 +692,41 @@ async fn publish_package(
         }
     }
 
-    let shasum = hex::encode(Sha1::digest(&tarball_bytes));
-    let blob_hash = hex::encode(sha2::Sha256::digest(&tarball_bytes));
-    let integrity = format!("sha512-{}", STANDARD.encode(Sha512::digest(&tarball_bytes)));
-    let (file_count, unpacked_size) = match tarball_stats(&tarball_bytes) {
-        Ok(stats) => stats,
-        Err(error) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": error })),
-            )
-                .into_response();
-        }
-    };
+    let parsed_tarball = tokio::task::spawn_blocking(move || {
+        let shasum = hex::encode(Sha1::digest(&tarball_bytes));
+        let blob_hash = hex::encode(sha2::Sha256::digest(&tarball_bytes));
+        let integrity = format!("sha512-{}", STANDARD.encode(Sha512::digest(&tarball_bytes)));
+        let (file_count, unpacked_size) = tarball_stats(&tarball_bytes)?;
+        Ok::<_, String>((
+            tarball_bytes,
+            shasum,
+            blob_hash,
+            integrity,
+            file_count,
+            unpacked_size,
+        ))
+    })
+    .await;
+    let (tarball_bytes, shasum, blob_hash, integrity, file_count, unpacked_size) =
+        match parsed_tarball {
+            Ok(Ok(parsed)) => parsed,
+            Ok(Err(error)) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": error })),
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("npm attachment validation task failed: {error}"),
+                    })),
+                )
+                    .into_response();
+            }
+        };
 
     let (tarball_rel_path, tarball_path) =
         match npm_blob_path(&state.blobs_dir, &package_id, &version) {
@@ -972,9 +1003,19 @@ fn format_npm_time(timestamp: chrono::DateTime<Utc>) -> String {
 }
 
 fn tarball_stats(tarball_bytes: &[u8]) -> Result<(u64, u64), String> {
+    tarball_stats_with_limit(tarball_bytes, MAX_NPM_ARCHIVE_DECOMPRESSED_SIZE)
+}
+
+fn tarball_stats_with_limit(
+    tarball_bytes: &[u8],
+    decompressed_limit: u64,
+) -> Result<(u64, u64), String> {
     use flate2::bufread::GzDecoder;
+    use std::io::Read;
+
     let gz = GzDecoder::new(std::io::BufReader::new(tarball_bytes));
-    let mut archive = tar::Archive::new(gz);
+    let limited = gz.take(decompressed_limit.saturating_add(1));
+    let mut archive = tar::Archive::new(limited);
     let mut file_count = 0u64;
     let mut unpacked_size = 0u64;
 
@@ -1006,9 +1047,15 @@ fn tarball_stats(tarball_bytes: &[u8]) -> Result<(u64, u64), String> {
         }
     }
 
-    let mut decoder = archive.into_inner();
-    std::io::copy(&mut decoder, &mut std::io::sink())
+    let mut limited = archive.into_inner();
+    std::io::copy(&mut limited, &mut std::io::sink())
         .map_err(|error| format!("npm attachment gzip stream is truncated: {error}"))?;
+    if limited.limit() == 0 {
+        return Err(format!(
+            "npm archive exceeds the {decompressed_limit} byte decompressed limit"
+        ));
+    }
+    let decoder = limited.into_inner();
     let compressed = decoder.into_inner();
     if !compressed.buffer().is_empty() || !compressed.get_ref().is_empty() {
         return Err(
@@ -1411,6 +1458,46 @@ mod tests {
         assert!(tarball_stats(&tarball)
             .unwrap_err()
             .contains("more than one gzip member"));
+    }
+
+    #[test]
+    fn archive_stats_bounds_bytes_after_the_tar_end_marker() {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let contents = b"package";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "package/index.js", contents.as_slice())
+            .unwrap();
+        builder.finish().unwrap();
+        let mut uncompressed = builder.into_inner().unwrap();
+        let decompressed_limit = uncompressed.len() as u64 + 64;
+        uncompressed.resize(uncompressed.len() + 4096, 0);
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&uncompressed).unwrap();
+        let tarball = encoder.finish().unwrap();
+        let error = tarball_stats_with_limit(&tarball, decompressed_limit).unwrap_err();
+        assert!(error.contains("decompressed limit"), "{error}");
+    }
+
+    #[test]
+    fn npm_versions_match_node_safe_integer_limits() {
+        assert!(valid_npm_version(
+            "9007199254740991.9007199254740991.9007199254740991"
+        ));
+        for version in [
+            "9007199254740992.0.0",
+            "0.9007199254740992.0",
+            "0.0.9007199254740992",
+        ] {
+            assert!(!valid_npm_version(version), "accepted {version}");
+        }
     }
 
     #[tokio::test]

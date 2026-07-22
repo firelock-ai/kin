@@ -89,6 +89,8 @@ const CRATES_IO_INDEX_URL: &str = "https://github.com/rust-lang/crates.io-index"
 const MAX_CRATE_SIZE: usize = 50 * 1024 * 1024;
 const MAX_CRATE_ARCHIVE_ENTRIES: usize = 4096;
 const MAX_CRATE_ARCHIVE_SCAN_SIZE: u64 = 256 * 1024 * 1024;
+const MAX_CRATE_ARCHIVE_DECOMPRESSED_SIZE: u64 =
+    MAX_CRATE_ARCHIVE_SCAN_SIZE + (MAX_CRATE_ARCHIVE_ENTRIES as u64 * 1024) + 1024;
 const MAX_CRATE_MANIFEST_SIZE: u64 = 1024 * 1024;
 const MAX_CRATE_NAME_LEN: usize = 64;
 
@@ -472,12 +474,28 @@ async fn publish_crate(
     // Cargo.toml budgets. Coordinate verification and sparse-index extraction
     // consume the same parsed manifest so an authorized gzip bomb cannot make
     // the daemon walk an unbounded archive twice.
-    let crate_manifest = match parse_crate_manifest(&body, &params.name, &params.version) {
-        Ok(manifest) => manifest,
-        Err(message) => {
+    let parse_body = body.clone();
+    let parse_name = params.name.clone();
+    let parse_version = params.version.clone();
+    let crate_manifest = match tokio::task::spawn_blocking(move || {
+        parse_crate_manifest(&parse_body, &parse_name, &parse_version)
+    })
+    .await
+    {
+        Ok(Ok(manifest)) => manifest,
+        Ok(Err(message)) => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": message })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("crate validation task failed: {error}"),
+                })),
             )
                 .into_response();
         }
@@ -704,12 +722,27 @@ fn parse_crate_manifest(
     name: &str,
     version: &str,
 ) -> Result<toml::Value, String> {
+    parse_crate_manifest_with_limit(
+        crate_bytes,
+        name,
+        version,
+        MAX_CRATE_ARCHIVE_DECOMPRESSED_SIZE,
+    )
+}
+
+fn parse_crate_manifest_with_limit(
+    crate_bytes: &[u8],
+    name: &str,
+    version: &str,
+    decompressed_limit: u64,
+) -> Result<toml::Value, String> {
     use flate2::bufread::GzDecoder;
     use std::io::Read;
 
     let expected_manifest = format!("{}-{}/Cargo.toml", name, version);
     let gz = GzDecoder::new(std::io::BufReader::new(crate_bytes));
-    let mut archive = tar::Archive::new(gz);
+    let limited = gz.take(decompressed_limit.saturating_add(1));
+    let mut archive = tar::Archive::new(limited);
 
     let entries = archive
         .entries()
@@ -767,9 +800,15 @@ fn parse_crate_manifest(
         }
     }
 
-    let mut decoder = archive.into_inner();
-    std::io::copy(&mut decoder, &mut std::io::sink())
+    let mut limited = archive.into_inner();
+    std::io::copy(&mut limited, &mut std::io::sink())
         .map_err(|error| format!("crate gzip stream is truncated: {error}"))?;
+    if limited.limit() == 0 {
+        return Err(format!(
+            "crate archive exceeds the {decompressed_limit} byte decompressed limit"
+        ));
+    }
+    let decoder = limited.into_inner();
     let compressed = decoder.into_inner();
     if !compressed.buffer().is_empty() || !compressed.get_ref().is_empty() {
         return Err("crate contains trailing data or more than one gzip member".to_string());
@@ -2034,6 +2073,33 @@ private = { version = "1", registry = "corp" }
         let manifest_first_bomb = encoder.finish().unwrap();
         let error = parse_crate_manifest(&manifest_first_bomb, "demo", "1.0.0").unwrap_err();
         assert!(error.contains("scan limit"), "{error}");
+    }
+
+    #[test]
+    fn crate_archive_bounds_bytes_after_the_tar_end_marker() {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+
+        let manifest = b"[package]\nname = \"demo\"\nversion = \"1.0.0\"\n";
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "demo-1.0.0/Cargo.toml", manifest.as_slice())
+            .unwrap();
+        builder.finish().unwrap();
+        let mut uncompressed = builder.into_inner().unwrap();
+        let decompressed_limit = uncompressed.len() as u64 + 64;
+        uncompressed.resize(uncompressed.len() + 4096, 0);
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&uncompressed).unwrap();
+        let body = encoder.finish().unwrap();
+        let error = parse_crate_manifest_with_limit(&body, "demo", "1.0.0", decompressed_limit)
+            .unwrap_err();
+        assert!(error.contains("decompressed limit"), "{error}");
     }
 
     #[test]

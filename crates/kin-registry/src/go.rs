@@ -19,15 +19,30 @@ use axum::{
     Router,
 };
 use sha2::{Digest, Sha256};
-use std::path::{Path as FsPath, PathBuf};
+#[cfg(test)]
+use std::path::Path as FsPath;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::{Ecosystem, ManifestStore};
+use crate::{atomic_file::AuthorityRoot, Ecosystem, ManifestStore, PackageVersion, RegistryError};
 
 /// Shared state for the Go module proxy routes
 pub struct GoProxyState {
     pub manifest_store: ManifestStore,
     pub blobs_dir: std::path::PathBuf,
+    blobs_authority: AuthorityRoot,
+}
+
+impl GoProxyState {
+    pub fn new(manifest_store: ManifestStore, blobs_dir: PathBuf) -> Self {
+        let blobs_authority = AuthorityRoot::new(&blobs_dir);
+        let blobs_dir = blobs_authority.path().to_path_buf();
+        Self {
+            manifest_store,
+            blobs_dir,
+            blobs_authority,
+        }
+    }
 }
 
 const MAX_GO_MODULE_LEN: usize = 255;
@@ -64,7 +79,12 @@ fn valid_go_version(version: &str) -> bool {
         && !version.contains("..")
 }
 
+#[cfg(test)]
 fn go_zip_path(blobs_dir: &FsPath, module: &str, version: &str) -> Option<PathBuf> {
+    go_zip_relative(module, version).map(|relative| blobs_dir.join(relative))
+}
+
+fn go_zip_relative(module: &str, version: &str) -> Option<PathBuf> {
     if !valid_go_module(module) || !valid_go_version(version) {
         return None;
     }
@@ -73,8 +93,7 @@ fn go_zip_path(blobs_dir: &FsPath, module: &str, version: &str) -> Option<PathBu
     // the host filesystem.
     let coordinate = format!("{module}\0{version}");
     let key = hex::encode(Sha256::digest(coordinate.as_bytes()));
-    let path = blobs_dir.join(format!("module_{key}.zip"));
-    (path.parent() == Some(blobs_dir)).then_some(path)
+    Some(PathBuf::from(format!("module_{key}.zip")))
 }
 
 fn invalid_coordinate() -> Response {
@@ -98,7 +117,7 @@ async fn dispatch(State(state): State<Arc<GoProxyState>>, Path(path): Path<Strin
         return invalid_coordinate();
     }
     if version_file == "list" {
-        return list_versions_inner(&state, module);
+        return list_versions_inner(&state, module).await;
     }
     let (version, ext) = match version_file.rsplit_once('.') {
         Some((v, e)) => (v, e),
@@ -108,15 +127,35 @@ async fn dispatch(State(state): State<Arc<GoProxyState>>, Path(path): Path<Strin
         return invalid_coordinate();
     }
     match ext {
-        "info" => version_info_inner(&state, module, version),
-        "mod" => version_mod_inner(&state, module, version),
-        "zip" => version_zip_inner(&state, module, version),
+        "info" => version_info_inner(&state, module, version).await,
+        "mod" => version_mod_inner(&state, module, version).await,
+        "zip" => version_zip_inner(&state, module, version).await,
         _ => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
-fn list_versions_inner(state: &GoProxyState, module: &str) -> Response {
-    let versions = match state.manifest_store.get_versions(Ecosystem::Go, module) {
+async fn read_go_versions(
+    state: &Arc<GoProxyState>,
+    module: &str,
+) -> Result<Vec<PackageVersion>, RegistryError> {
+    let state = Arc::clone(state);
+    let module = module.to_string();
+    tokio::task::spawn_blocking(move || {
+        state
+            .manifest_store
+            .read_transaction(Ecosystem::Go)?
+            .get_versions(&module)
+    })
+    .await
+    .map_err(|error| {
+        RegistryError::Storage(std::io::Error::other(format!(
+            "Go manifest storage task failed: {error}"
+        )))
+    })?
+}
+
+async fn list_versions_inner(state: &Arc<GoProxyState>, module: &str) -> Response {
+    let versions = match read_go_versions(state, module).await {
         Ok(v) => v,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
@@ -128,8 +167,8 @@ fn list_versions_inner(state: &GoProxyState, module: &str) -> Response {
     (StatusCode::OK, [("content-type", "text/plain")], body).into_response()
 }
 
-fn version_info_inner(state: &GoProxyState, module: &str, version: &str) -> Response {
-    let versions = match state.manifest_store.get_versions(Ecosystem::Go, module) {
+async fn version_info_inner(state: &Arc<GoProxyState>, module: &str, version: &str) -> Response {
+    let versions = match read_go_versions(state, module).await {
         Ok(v) => v,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
@@ -143,8 +182,8 @@ fn version_info_inner(state: &GoProxyState, module: &str, version: &str) -> Resp
     }
 }
 
-fn version_mod_inner(state: &GoProxyState, module: &str, version: &str) -> Response {
-    let versions = match state.manifest_store.get_versions(Ecosystem::Go, module) {
+async fn version_mod_inner(state: &Arc<GoProxyState>, module: &str, version: &str) -> Response {
+    let versions = match read_go_versions(state, module).await {
         Ok(v) => v,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
@@ -167,13 +206,17 @@ fn version_mod_inner(state: &GoProxyState, module: &str, version: &str) -> Respo
     }
 }
 
-fn version_zip_inner(state: &GoProxyState, module: &str, version: &str) -> Response {
-    let Some(zip_path) = go_zip_path(&state.blobs_dir, module, version) else {
+async fn version_zip_inner(state: &Arc<GoProxyState>, module: &str, version: &str) -> Response {
+    let Some(zip_relative) = go_zip_relative(module, version) else {
         return invalid_coordinate();
     };
-    match std::fs::read(&zip_path) {
-        Ok(bytes) => (StatusCode::OK, [("content-type", "application/zip")], bytes).into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    let authority = state.blobs_authority.clone();
+    let bytes = tokio::task::spawn_blocking(move || authority.read(&zip_relative)).await;
+    match bytes {
+        Ok(Ok(bytes)) => {
+            (StatusCode::OK, [("content-type", "application/zip")], bytes).into_response()
+        }
+        Ok(Err(_)) | Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -191,10 +234,7 @@ mod tests {
         std::fs::create_dir_all(&blobs_dir).unwrap();
         (
             root,
-            Arc::new(GoProxyState {
-                manifest_store: ManifestStore::new(&kin_dir),
-                blobs_dir,
-            }),
+            Arc::new(GoProxyState::new(ManifestStore::new(&kin_dir), blobs_dir)),
         )
     }
 
@@ -269,6 +309,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(observed.as_ref(), bytes);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_state_keeps_the_pinned_blob_authority_after_root_replacement() {
+        let (root, state) = state();
+        let module = "github.com/firelock-ai/kin";
+        let version = "v1.2.3";
+        let zip_path = go_zip_path(&state.blobs_dir, module, version).unwrap();
+        std::fs::write(&zip_path, b"pinned-authority-bytes").unwrap();
+
+        let displaced = root.path().join("go-original");
+        std::fs::rename(&state.blobs_dir, &displaced).unwrap();
+        std::fs::create_dir(&state.blobs_dir).unwrap();
+        std::fs::write(
+            go_zip_path(&state.blobs_dir, module, version).unwrap(),
+            b"replacement-path-bytes",
+        )
+        .unwrap();
+
+        let response = go_routes(state)
+            .oneshot(
+                Request::get("/registry/go/github.com/firelock-ai/kin/@v/v1.2.3.zip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let observed = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(observed.as_ref(), b"pinned-authority-bytes");
     }
 
     #[tokio::test]

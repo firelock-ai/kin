@@ -20,11 +20,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Mutex, MutexGuard, RwLock, RwLockWriteGuard};
+use tokio::io::AsyncReadExt;
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 const SHA256_HEX_LEN: usize = 64;
 const UPLOAD_ID_HEX_LEN: usize = 32;
@@ -106,6 +106,7 @@ struct ImageDescriptor {
     size: u64,
 }
 
+#[derive(Debug)]
 struct ManifestValidationError {
     status: StatusCode,
     code: &'static str,
@@ -151,14 +152,16 @@ pub struct OciRegistryState {
     authority: crate::atomic_file::AuthorityRoot,
     #[cfg(test)]
     metadata_path: PathBuf,
-    metadata: RwLock<OciMetadata>,
+    metadata: Arc<RwLock<OciMetadata>>,
     /// Serializes this process before the shared storage lock is acquired.
-    upload_gate: Mutex<()>,
+    upload_gate: Arc<Mutex<()>>,
     max_active_upload_bytes: u64,
     /// OCI-specific secret for writes. `None` disables every mutation.
     write_token: Option<String>,
     #[cfg(test)]
     manifest_validation_hook: std::sync::Mutex<Option<Arc<ManifestValidationHook>>>,
+    #[cfg(test)]
+    upload_rollback_hook: std::sync::Mutex<Option<Arc<UploadRollbackHook>>>,
 }
 
 #[cfg(test)]
@@ -166,6 +169,18 @@ struct ManifestValidationHook {
     started: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
+
+#[cfg(test)]
+struct UploadRollbackHook {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+type UploadRollbackHookRef = Option<Arc<UploadRollbackHook>>;
+#[cfg(not(test))]
+#[derive(Clone, Copy)]
+struct UploadRollbackHookRef;
 
 #[derive(Clone)]
 struct OciDiskState {
@@ -190,14 +205,16 @@ impl OciRegistryState {
             authority,
             #[cfg(test)]
             metadata_path,
-            metadata: RwLock::new(metadata),
-            upload_gate: Mutex::new(()),
+            metadata: Arc::new(RwLock::new(metadata)),
+            upload_gate: Arc::new(Mutex::new(())),
             max_active_upload_bytes: MAX_TOTAL_ACTIVE_UPLOAD_BYTES,
             write_token: write_token
                 .map(|token| token.trim().to_string())
                 .filter(|token| !token.is_empty()),
             #[cfg(test)]
             manifest_validation_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            upload_rollback_hook: std::sync::Mutex::new(None),
         }
     }
 
@@ -206,6 +223,17 @@ impl OciRegistryState {
             authority: self.authority.clone(),
             blobs_dir: self.blobs_dir.clone(),
             max_active_upload_bytes: self.max_active_upload_bytes,
+        }
+    }
+
+    fn upload_rollback_hook(&self) -> UploadRollbackHookRef {
+        #[cfg(test)]
+        {
+            self.upload_rollback_hook.lock().unwrap().clone()
+        }
+        #[cfg(not(test))]
+        {
+            UploadRollbackHookRef
         }
     }
 }
@@ -511,70 +539,83 @@ fn read_metadata_authority(
 /// same-process readers from racing a local publisher while the shared file
 /// lock orders this snapshot against publishers in other daemon processes.
 async fn metadata_snapshot(state: &OciRegistryState) -> Result<OciMetadata, String> {
-    let mut cache = state.metadata.write().await;
+    let cache = state.metadata.clone().write_owned().await;
     let authority = state.authority.clone();
-    let fresh = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
+        let mut cache = cache;
         let _storage_lock =
             crate::storage_lock::StorageLock::shared_at(&authority, FsPath::new(".metadata.lock"))
                 .map_err(|error| format!("failed to lock OCI metadata for reading: {error}"))?;
-        read_metadata_authority(&authority)
+        let fresh = read_metadata_authority(&authority)?;
+        *cache = fresh.clone();
+        Ok(fresh)
     })
     .await
-    .map_err(|error| format!("OCI metadata read task failed: {error}"))??;
-    *cache = fresh.clone();
-    Ok(fresh)
+    .map_err(|error| format!("OCI metadata read task failed: {error}"))?
 }
 
-/// Begin a cross-process read/modify/write transaction from the latest durable
-/// metadata. Callers must keep both returned guards alive through persistence.
-async fn begin_metadata_write(
+#[derive(Debug)]
+enum MetadataWriteError {
+    Storage(String),
+    Validation(ManifestValidationError),
+    NotFound,
+}
+
+impl MetadataWriteError {
+    fn response(self) -> Response {
+        match self {
+            Self::Storage(error) => metadata_authority_error(&error),
+            Self::Validation(error) => error.response(),
+            Self::NotFound => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+}
+
+/// Run a cross-process read/modify/write transaction from the latest durable
+/// metadata. The owned local guard and storage lock live in the blocking
+/// closure so cancellation of the async caller cannot expose a half-finished
+/// mutation to another request or process.
+async fn metadata_write_transaction<T, F>(
     state: &OciRegistryState,
-) -> Result<
-    (
-        RwLockWriteGuard<'_, OciMetadata>,
-        crate::storage_lock::StorageLock,
-        OciMetadata,
-    ),
-    String,
-> {
-    let cache = state.metadata.write().await;
-    let storage_lock = crate::storage_lock::StorageLock::exclusive_at_async(
-        state.authority.clone(),
-        PathBuf::from(".metadata.lock"),
-    )
-    .await
-    .map_err(|error| format!("failed to lock OCI metadata for writing: {error}"))?;
-    let authority = state.authority.clone();
-    let fresh = tokio::task::spawn_blocking(move || read_metadata_authority(&authority))
-        .await
-        .map_err(|error| format!("OCI metadata read task failed: {error}"))??;
-    Ok((cache, storage_lock, fresh))
-}
-
-#[cfg(test)]
-fn persist_metadata(state: &OciRegistryState, metadata: &OciMetadata) -> Result<(), String> {
-    let bytes = serde_json::to_vec(metadata)
-        .map_err(|error| format!("failed to encode OCI metadata: {error}"))?;
-    state
-        .authority
-        .write(FsPath::new("metadata.json"), &bytes)
-        .map_err(|error| format!("failed to persist OCI metadata: {error}"))
-}
-
-async fn persist_metadata_async(
-    state: &OciRegistryState,
-    metadata: &OciMetadata,
-) -> Result<(), String> {
-    let bytes = serde_json::to_vec(metadata)
-        .map_err(|error| format!("failed to encode OCI metadata: {error}"))?;
+    operation: F,
+) -> Result<T, MetadataWriteError>
+where
+    T: Send + 'static,
+    F: FnOnce(
+            &crate::atomic_file::AuthorityRoot,
+            &mut OciMetadata,
+        ) -> Result<T, MetadataWriteError>
+        + Send
+        + 'static,
+{
+    let cache = state.metadata.clone().write_owned().await;
     let authority = state.authority.clone();
     tokio::task::spawn_blocking(move || {
+        let mut cache = cache;
+        let _storage_lock = crate::storage_lock::StorageLock::exclusive_at(
+            &authority,
+            FsPath::new(".metadata.lock"),
+        )
+        .map_err(|error| {
+            MetadataWriteError::Storage(format!("failed to lock OCI metadata for writing: {error}"))
+        })?;
+        let mut fresh = read_metadata_authority(&authority).map_err(MetadataWriteError::Storage)?;
+        let output = operation(&authority, &mut fresh)?;
+        let bytes = serde_json::to_vec(&fresh).map_err(|error| {
+            MetadataWriteError::Storage(format!("failed to encode OCI metadata: {error}"))
+        })?;
         authority
             .write(FsPath::new("metadata.json"), &bytes)
-            .map_err(|error| format!("failed to persist OCI metadata: {error}"))
+            .map_err(|error| {
+                MetadataWriteError::Storage(format!("failed to persist OCI metadata: {error}"))
+            })?;
+        *cache = fresh;
+        Ok(output)
     })
     .await
-    .map_err(|error| format!("OCI metadata persistence task failed: {error}"))?
+    .map_err(|error| {
+        MetadataWriteError::Storage(format!("OCI metadata transaction task failed: {error}"))
+    })?
 }
 
 /// HEAD /v2/{name}/blobs/{digest} -- check if blob exists.
@@ -658,8 +699,8 @@ async fn get_blob_inner(
     response
 }
 
-struct UploadWriteTransaction<'a> {
-    _local: MutexGuard<'a, ()>,
+struct UploadWriteTransaction {
+    _local: OwnedMutexGuard<()>,
     _storage: crate::storage_lock::StorageLock,
 }
 
@@ -672,35 +713,44 @@ enum UploadAppendError {
 
 async fn begin_upload_write(
     state: &OciRegistryState,
-) -> Result<UploadWriteTransaction<'_>, String> {
-    let local = state.upload_gate.lock().await;
+) -> Result<Arc<UploadWriteTransaction>, String> {
+    let local = state.upload_gate.clone().lock_owned().await;
     let storage = crate::storage_lock::StorageLock::exclusive_at_async(
         state.authority.clone(),
         PathBuf::from(".uploads.lock"),
     )
     .await
     .map_err(|error| format!("failed to lock OCI uploads: {error}"))?;
-    run_upload_disk(state, |disk| {
+    let transaction = Arc::new(UploadWriteTransaction {
+        _local: local,
+        _storage: storage,
+    });
+    run_upload_disk(state, &transaction, |disk| {
         disk.authority
             .ensure_directory(FsPath::new("uploads"))
             .map_err(|error| format!("failed to create OCI upload storage: {error}"))
     })
     .await?;
-    Ok(UploadWriteTransaction {
-        _local: local,
-        _storage: storage,
-    })
+    Ok(transaction)
 }
 
-async fn run_upload_disk<T, F>(state: &OciRegistryState, operation: F) -> Result<T, String>
+async fn run_upload_disk<T, F>(
+    state: &OciRegistryState,
+    transaction: &Arc<UploadWriteTransaction>,
+    operation: F,
+) -> Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce(OciDiskState) -> Result<T, String> + Send + 'static,
 {
     let disk = state.disk_state();
-    tokio::task::spawn_blocking(move || operation(disk))
-        .await
-        .map_err(|error| format!("OCI upload storage task failed: {error}"))?
+    let transaction = Arc::clone(transaction);
+    tokio::task::spawn_blocking(move || {
+        let _transaction = transaction;
+        operation(disk)
+    })
+    .await
+    .map_err(|error| format!("OCI upload storage task failed: {error}"))?
 }
 
 #[cfg(test)]
@@ -920,44 +970,222 @@ fn prune_and_measure_uploads_disk(state: &OciDiskState) -> Result<(usize, u64), 
     Ok((active_count, active_bytes))
 }
 
-async fn rollback_staged_file(file: &mut tokio::fs::File, size: u64) -> Result<(), String> {
-    file.set_len(size)
+#[derive(Default)]
+struct AppendOperationCompletion {
+    done: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl AppendOperationCompletion {
+    fn finish(&self) {
+        self.done.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.done.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Owns recovery for bytes appended beyond a session's durable metadata
+/// offset. Every blocking file/session operation is tracked before it is
+/// spawned. If the request future is dropped, recovery waits for that exact
+/// operation, then either observes a successful session commit or truncates
+/// and syncs the staged file before releasing the upload transaction.
+struct UploadAppendGuard {
+    file: Arc<StdMutex<std::fs::File>>,
+    transaction: Option<Arc<UploadWriteTransaction>>,
+    original_size: u64,
+    in_flight: Option<Arc<AppendOperationCompletion>>,
+    committed: Arc<AtomicBool>,
+    armed: bool,
+    #[cfg(test)]
+    rollback_hook: UploadRollbackHookRef,
+}
+
+impl UploadAppendGuard {
+    fn new(
+        file: std::fs::File,
+        transaction: Arc<UploadWriteTransaction>,
+        original_size: u64,
+        _rollback_hook: UploadRollbackHookRef,
+    ) -> Self {
+        Self {
+            file: Arc::new(StdMutex::new(file)),
+            transaction: Some(transaction),
+            original_size,
+            in_flight: None,
+            committed: Arc::new(AtomicBool::new(false)),
+            armed: true,
+            #[cfg(test)]
+            rollback_hook: _rollback_hook,
+        }
+    }
+
+    async fn run_tracked_operation<F>(
+        &mut self,
+        marks_session_commit: bool,
+        operation: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce() -> Result<(), String> + Send + 'static,
+    {
+        let completion = Arc::new(AppendOperationCompletion::default());
+        self.in_flight = Some(Arc::clone(&completion));
+        let transaction = Arc::clone(
+            self.transaction
+                .as_ref()
+                .expect("armed upload append guard retains its transaction"),
+        );
+        let committed = Arc::clone(&self.committed);
+        let completion_for_task = Arc::clone(&completion);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let _transaction = transaction;
+                operation()
+            })
+            .await
+            .map_err(|error| format!("OCI upload storage task failed: {error}"))
+            .and_then(|result| result);
+            if marks_session_commit && result.is_ok() {
+                committed.store(true, Ordering::Release);
+            }
+            completion_for_task.finish();
+            let _ = result_tx.send(result);
+        });
+
+        let result = result_rx
+            .await
+            .map_err(|_| "OCI upload storage task ended without a result".to_string())?;
+        self.in_flight = None;
+        result
+    }
+
+    async fn run_file_operation<F>(&mut self, operation: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut std::fs::File) -> Result<(), String> + Send + 'static,
+    {
+        let file = Arc::clone(&self.file);
+        self.run_tracked_operation(false, move || {
+            let mut file = file
+                .lock()
+                .map_err(|_| "OCI upload file lock was poisoned".to_string())?;
+            operation(&mut file)
+        })
         .await
-        .map_err(|error| format!("failed to roll back OCI upload data: {error}"))?;
-    file.sync_all()
-        .await
-        .map_err(|error| format!("failed to sync rolled-back OCI upload data: {error}"))
+    }
+
+    async fn rollback(&mut self) -> Result<(), String> {
+        let original_size = self.original_size;
+        let result = self
+            .run_file_operation(move |file| {
+                file.set_len(original_size)
+                    .map_err(|error| format!("failed to roll back OCI upload data: {error}"))?;
+                file.sync_all()
+                    .map_err(|error| format!("failed to sync rolled-back OCI upload data: {error}"))
+            })
+            .await;
+        if result.is_ok() {
+            self.armed = false;
+        }
+        result
+    }
+
+    fn commit(mut self) {
+        debug_assert!(self.committed.load(Ordering::Acquire));
+        self.armed = false;
+    }
+}
+
+impl Drop for UploadAppendGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(transaction) = self.transaction.take() else {
+            return;
+        };
+        let file = Arc::clone(&self.file);
+        let in_flight = self.in_flight.take();
+        let committed = Arc::clone(&self.committed);
+        let original_size = self.original_size;
+        #[cfg(test)]
+        let rollback_hook = self.rollback_hook.take();
+
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::error!(
+                original_size,
+                "cannot schedule OCI upload cancellation rollback outside a Tokio runtime"
+            );
+            return;
+        };
+        runtime.spawn(async move {
+            if let Some(in_flight) = in_flight {
+                in_flight.wait().await;
+            }
+            if committed.load(Ordering::Acquire) {
+                return;
+            }
+            #[cfg(test)]
+            if let Some(hook) = rollback_hook {
+                hook.started.notify_one();
+                hook.release.notified().await;
+            }
+            let rollback = tokio::task::spawn_blocking(move || {
+                let _transaction = transaction;
+                let file = file
+                    .lock()
+                    .map_err(|_| "OCI upload file lock was poisoned".to_string())?;
+                file.set_len(original_size)
+                    .map_err(|error| format!("failed to roll back OCI upload data: {error}"))?;
+                file.sync_all()
+                    .map_err(|error| format!("failed to sync rolled-back OCI upload data: {error}"))
+            })
+            .await
+            .map_err(|error| format!("OCI upload rollback task failed: {error}"))
+            .and_then(|result| result);
+            if let Err(error) = rollback {
+                tracing::error!(%error, original_size, "failed to recover cancelled OCI upload");
+            }
+        });
+    }
 }
 
 async fn append_upload_body(
     authority: &crate::atomic_file::AuthorityRoot,
+    transaction: &Arc<UploadWriteTransaction>,
     relative: &FsPath,
     original_size: u64,
     aggregate_remaining: u64,
     declared_length: Option<u64>,
     body: Body,
     mut hasher: Option<&mut Sha256>,
-) -> Result<u64, UploadAppendError> {
+    rollback_hook: UploadRollbackHookRef,
+) -> Result<(u64, UploadAppendGuard), UploadAppendError> {
     let session_remaining = (MAX_OCI_BLOB_SIZE as u64).saturating_sub(original_size);
     let allowed = session_remaining.min(aggregate_remaining);
     if declared_length.is_some_and(|length| length > allowed) {
         return Err(UploadAppendError::Limit);
     }
-    let mut file = authority
-        .open_append(relative)
-        .map(tokio::fs::File::from_std)
-        .map_err(|error| {
-            UploadAppendError::Storage(format!("failed to open OCI upload data: {error}"))
-        })?;
+    let file = authority.open_append(relative).map_err(|error| {
+        UploadAppendError::Storage(format!("failed to open OCI upload data: {error}"))
+    })?;
+    let mut guard =
+        UploadAppendGuard::new(file, Arc::clone(transaction), original_size, rollback_hook);
     let mut written = 0u64;
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(error) => {
-                rollback_staged_file(&mut file, original_size)
-                    .await
-                    .map_err(UploadAppendError::Storage)?;
+                guard.rollback().await.map_err(UploadAppendError::Storage)?;
                 return Err(UploadAppendError::Body(format!(
                     "failed to read OCI upload body: {error}"
                 )));
@@ -968,41 +1196,38 @@ async fn append_upload_body(
             .checked_add(chunk_len)
             .is_none_or(|total| total > allowed)
         {
-            rollback_staged_file(&mut file, original_size)
-                .await
-                .map_err(UploadAppendError::Storage)?;
+            guard.rollback().await.map_err(UploadAppendError::Storage)?;
             return Err(UploadAppendError::Limit);
         }
-        if let Err(error) = file.write_all(&chunk).await {
-            rollback_staged_file(&mut file, original_size)
-                .await
-                .map_err(UploadAppendError::Storage)?;
-            return Err(UploadAppendError::Storage(format!(
-                "failed to append OCI upload data: {error}"
-            )));
+        let chunk_for_write = chunk.clone();
+        if let Err(error) = guard
+            .run_file_operation(move |file| {
+                std::io::Write::write_all(file, &chunk_for_write)
+                    .map_err(|error| format!("failed to append OCI upload data: {error}"))
+            })
+            .await
+        {
+            guard.rollback().await.map_err(UploadAppendError::Storage)?;
+            return Err(UploadAppendError::Storage(error));
         }
         if let Some(hasher) = hasher.as_deref_mut() {
             hasher.update(&chunk);
         }
         written += chunk_len;
     }
-    if let Err(error) = file.flush().await {
-        rollback_staged_file(&mut file, original_size)
-            .await
-            .map_err(UploadAppendError::Storage)?;
-        return Err(UploadAppendError::Storage(format!(
-            "failed to flush OCI upload data: {error}"
-        )));
+    if let Err(error) = guard
+        .run_file_operation(|file| {
+            std::io::Write::flush(file)
+                .map_err(|error| format!("failed to flush OCI upload data: {error}"))?;
+            file.sync_all()
+                .map_err(|error| format!("failed to sync OCI upload data: {error}"))
+        })
+        .await
+    {
+        guard.rollback().await.map_err(UploadAppendError::Storage)?;
+        return Err(UploadAppendError::Storage(error));
     }
-    if let Err(error) = file.sync_all().await {
-        rollback_staged_file(&mut file, original_size)
-            .await
-            .map_err(UploadAppendError::Storage)?;
-        return Err(UploadAppendError::Storage(format!(
-            "failed to sync OCI upload data: {error}"
-        )));
-    }
-    Ok(written)
+    Ok((written, guard))
 }
 
 async fn hash_upload_file(
@@ -1110,7 +1335,7 @@ async fn initiate_upload_inner(state: &OciRegistryState, name: &str) -> Response
     if let Err(error) = metadata_snapshot(state).await {
         return metadata_authority_error(&error);
     }
-    let _transaction = match begin_upload_write(state).await {
+    let transaction = match begin_upload_write(state).await {
         Ok(transaction) => transaction,
         Err(error) => return metadata_authority_error(&error),
     };
@@ -1119,7 +1344,7 @@ async fn initiate_upload_inner(state: &OciRegistryState, name: &str) -> Response
         Err(error) => return metadata_authority_error(&error),
     };
     let repository = name.to_string();
-    let upload_id = match run_upload_disk(state, move |disk| {
+    let upload_id = match run_upload_disk(state, &transaction, move |disk| {
         let (active_count, active_bytes) = prune_and_measure_uploads_disk(&disk)?;
         if active_count >= MAX_ACTIVE_UPLOADS || active_bytes >= disk.max_active_upload_bytes {
             return Ok(None);
@@ -1178,12 +1403,12 @@ async fn upload_status_inner(state: &OciRegistryState, name: &str, id: &str) -> 
             Some(&location),
         );
     }
-    let _transaction = match begin_upload_write(state).await {
+    let transaction = match begin_upload_write(state).await {
         Ok(transaction) => transaction,
         Err(error) => return metadata_authority_error(&error),
     };
     let id_owned = id.to_string();
-    let upload = run_upload_disk(state, move |disk| {
+    let upload = run_upload_disk(state, &transaction, move |disk| {
         prune_and_measure_uploads_disk(&disk)?;
         read_upload_session_disk(&disk, &id_owned)
     })
@@ -1212,13 +1437,13 @@ async fn cancel_upload_inner(state: &OciRegistryState, name: &str, id: &str) -> 
             Some(&location),
         );
     }
-    let _transaction = match begin_upload_write(state).await {
+    let transaction = match begin_upload_write(state).await {
         Ok(transaction) => transaction,
         Err(error) => return metadata_authority_error(&error),
     };
     let id_owned = id.to_string();
     let repository = name.to_string();
-    let cancelled = run_upload_disk(state, move |disk| {
+    let cancelled = run_upload_disk(state, &transaction, move |disk| {
         prune_and_measure_uploads_disk(&disk)?;
         match read_upload_session_disk(&disk, &id_owned)? {
             Some(upload) if upload.repository == repository => {
@@ -1258,12 +1483,12 @@ async fn patch_upload_inner(
             Some(&location),
         );
     }
-    let _transaction = match begin_upload_write(state).await {
+    let transaction = match begin_upload_write(state).await {
         Ok(transaction) => transaction,
         Err(error) => return metadata_authority_error(&error),
     };
     let id_owned = id.to_string();
-    let measured = run_upload_disk(state, move |disk| {
+    let measured = run_upload_disk(state, &transaction, move |disk| {
         let (_, active_bytes) = prune_and_measure_uploads_disk(&disk)?;
         Ok((active_bytes, read_upload_session_disk(&disk, &id_owned)?))
     })
@@ -1329,14 +1554,16 @@ async fn patch_upload_inner(
     };
     let data_relative = upload_data_relative(id).expect("validated upload identifier");
     let aggregate_remaining = state.max_active_upload_bytes.saturating_sub(active_bytes);
-    let appended = match append_upload_body(
+    let (appended, mut append_guard) = match append_upload_body(
         &state.authority,
+        &transaction,
         &data_relative,
         upload.size,
         aggregate_remaining,
         declared_length,
         body,
         None,
+        state.upload_rollback_hook(),
     )
     .await
     {
@@ -1344,18 +1571,8 @@ async fn patch_upload_inner(
         Err(error) => return upload_error(error, &location),
     };
     if expected_range_length.is_some_and(|expected| expected != appended) {
-        match state.authority.open_write(&data_relative) {
-            Ok(file) => {
-                let mut file = tokio::fs::File::from_std(file);
-                if let Err(error) = rollback_staged_file(&mut file, upload.size).await {
-                    return metadata_authority_error(&error);
-                }
-            }
-            Err(error) => {
-                return metadata_authority_error(&format!(
-                    "failed to reopen OCI upload after Content-Range mismatch: {error}"
-                ));
-            }
+        if let Err(error) = append_guard.rollback().await {
+            return metadata_authority_error(&error);
         }
         return oci_error(
             StatusCode::RANGE_NOT_SATISFIABLE,
@@ -1364,35 +1581,25 @@ async fn patch_upload_inner(
             Some(&location),
         );
     }
-    let previous_size = upload.size;
     upload.size += appended;
     upload.updated_at_unix_secs = updated_at;
     let persisted = {
+        let disk = state.disk_state();
         let id = id.to_string();
         let upload = upload.clone();
-        run_upload_disk(state, move |disk| {
-            persist_upload_session_disk(&disk, &id, &upload)
-        })
-        .await
+        append_guard
+            .run_tracked_operation(true, move || {
+                persist_upload_session_disk(&disk, &id, &upload)
+            })
+            .await
     };
     if let Err(error) = persisted {
-        match state.authority.open_write(&data_relative) {
-            Ok(file) => {
-                let mut file = tokio::fs::File::from_std(file);
-                if let Err(rollback_error) = rollback_staged_file(&mut file, previous_size).await {
-                    return metadata_authority_error(&format!(
-                        "{error}; additionally {rollback_error}"
-                    ));
-                }
-            }
-            Err(rollback_error) => {
-                return metadata_authority_error(&format!(
-                    "{error}; failed to reopen OCI upload for rollback: {rollback_error}"
-                ));
-            }
+        if let Err(rollback_error) = append_guard.rollback().await {
+            return metadata_authority_error(&format!("{error}; additionally {rollback_error}"));
         }
         return metadata_authority_error(&error);
     }
+    append_guard.commit();
     upload_progress_response(StatusCode::ACCEPTED, name, id, upload.size)
 }
 
@@ -1426,12 +1633,12 @@ async fn complete_upload_inner(
             Some(&location),
         );
     }
-    let _upload_transaction = match begin_upload_write(state).await {
+    let upload_transaction = match begin_upload_write(state).await {
         Ok(transaction) => transaction,
         Err(error) => return metadata_authority_error(&error),
     };
     let id_owned = id.to_string();
-    let measured = run_upload_disk(state, move |disk| {
+    let measured = run_upload_disk(state, &upload_transaction, move |disk| {
         let (_, active_bytes) = prune_and_measure_uploads_disk(&disk)?;
         Ok((active_bytes, read_upload_session_disk(&disk, &id_owned)?))
     })
@@ -1499,6 +1706,14 @@ async fn complete_upload_inner(
                 Some(&location),
             );
         }
+        if expected_range_length.is_some() {
+            return oci_error(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "BLOB_UPLOAD_INVALID",
+                "a finalizing upload cannot be resumed with a non-empty Content-Range",
+                Some(&location),
+            );
+        }
         let mut stream = body.into_data_stream();
         if stream.next().await.is_some() {
             return oci_error(
@@ -1506,6 +1721,28 @@ async fn complete_upload_inner(
                 "BLOB_UPLOAD_INVALID",
                 "a finalizing upload can only be resumed with an empty body",
                 Some(&location),
+            );
+        }
+        let durable_relative = match state.authority.metadata(&data_relative) {
+            Ok(_) => data_relative.clone(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                blob_relative_for_digest(finalizing_digest)
+                    .expect("durable finalization digest is canonical")
+            }
+            Err(error) => {
+                return metadata_authority_error(&format!(
+                    "failed to inspect durable OCI upload data: {error}"
+                ));
+            }
+        };
+        let observed =
+            match hash_upload_file(&state.authority, &durable_relative, upload.size).await {
+                Ok(hasher) => format!("sha256:{}", hex::encode(hasher.finalize())),
+                Err(error) => return metadata_authority_error(&error),
+            };
+        if observed != finalizing_digest {
+            return metadata_authority_error(
+                "the durable finalizing OCI upload does not match its expected digest",
             );
         }
         finalizing_digest.to_string()
@@ -1521,14 +1758,16 @@ async fn complete_upload_inner(
         };
         let aggregate_remaining = state.max_active_upload_bytes.saturating_sub(active_bytes);
         let original_size = upload.size;
-        let appended = match append_upload_body(
+        let (appended, mut append_guard) = match append_upload_body(
             &state.authority,
+            &upload_transaction,
             &data_relative,
             original_size,
             aggregate_remaining,
             declared_length,
             body,
             Some(&mut hasher),
+            state.upload_rollback_hook(),
         )
         .await
         {
@@ -1536,18 +1775,8 @@ async fn complete_upload_inner(
             Err(error) => return upload_error(error, &location),
         };
         if expected_range_length.is_some_and(|expected| expected != appended) {
-            match state.authority.open_write(&data_relative) {
-                Ok(file) => {
-                    let mut file = tokio::fs::File::from_std(file);
-                    if let Err(error) = rollback_staged_file(&mut file, original_size).await {
-                        return metadata_authority_error(&error);
-                    }
-                }
-                Err(error) => {
-                    return metadata_authority_error(&format!(
-                        "failed to reopen OCI upload after final Content-Range mismatch: {error}"
-                    ));
-                }
+            if let Err(error) = append_guard.rollback().await {
+                return metadata_authority_error(&error);
             }
             return oci_error(
                 StatusCode::RANGE_NOT_SATISFIABLE,
@@ -1558,18 +1787,8 @@ async fn complete_upload_inner(
         }
         let computed_digest = format!("sha256:{}", hex::encode(hasher.finalize()));
         if expected_digest != computed_digest {
-            match state.authority.open_write(&data_relative) {
-                Ok(file) => {
-                    let mut file = tokio::fs::File::from_std(file);
-                    if let Err(error) = rollback_staged_file(&mut file, original_size).await {
-                        return metadata_authority_error(&error);
-                    }
-                }
-                Err(error) => {
-                    return metadata_authority_error(&format!(
-                        "failed to reopen OCI upload for digest-mismatch rollback: {error}"
-                    ));
-                }
+            if let Err(error) = append_guard.rollback().await {
+                return metadata_authority_error(&error);
             }
             return digest_invalid(
                 "provided digest does not match uploaded content",
@@ -1580,33 +1799,24 @@ async fn complete_upload_inner(
         upload.updated_at_unix_secs = updated_at;
         upload.expected_digest = Some(computed_digest.clone());
         let persisted = {
+            let disk = state.disk_state();
             let id = id.to_string();
             let upload = upload.clone();
-            run_upload_disk(state, move |disk| {
-                persist_upload_session_disk(&disk, &id, &upload)
-            })
-            .await
+            append_guard
+                .run_tracked_operation(true, move || {
+                    persist_upload_session_disk(&disk, &id, &upload)
+                })
+                .await
         };
         if let Err(error) = persisted {
-            match state.authority.open_write(&data_relative) {
-                Ok(file) => {
-                    let mut file = tokio::fs::File::from_std(file);
-                    if let Err(rollback_error) =
-                        rollback_staged_file(&mut file, original_size).await
-                    {
-                        return metadata_authority_error(&format!(
-                            "{error}; additionally {rollback_error}"
-                        ));
-                    }
-                }
-                Err(rollback_error) => {
-                    return metadata_authority_error(&format!(
-                        "{error}; failed to reopen OCI upload for rollback: {rollback_error}"
-                    ));
-                }
+            if let Err(rollback_error) = append_guard.rollback().await {
+                return metadata_authority_error(&format!(
+                    "{error}; additionally {rollback_error}"
+                ));
             }
             return metadata_authority_error(&error);
         }
+        append_guard.commit();
         computed_digest
     };
 
@@ -1637,7 +1847,7 @@ async fn complete_upload_inner(
         } else {
             let staged = data_relative.clone();
             let destination = blob_relative.clone();
-            if let Err(error) = run_upload_disk(state, move |disk| {
+            if let Err(error) = run_upload_disk(state, &upload_transaction, move |disk| {
                 publish_staged_upload(&disk.authority, &staged, &destination)
                     .map_err(|error| format!("failed to atomically publish OCI blob: {error}"))
             })
@@ -1668,30 +1878,27 @@ async fn complete_upload_inner(
         }
     }
 
-    let (mut metadata_guard, storage_lock, mut replacement) =
-        match begin_metadata_write(state).await {
-            Ok(transaction) => transaction,
-            Err(error) => return metadata_authority_error(&error),
-        };
-    replacement
-        .repositories
-        .entry(name.to_string())
-        .or_default()
-        .blobs
-        .insert(computed_digest.clone());
-    if let Err(error) = persist_metadata_async(state, &replacement).await {
-        return oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "UNKNOWN",
-            &error,
-            Some(&location),
-        );
+    let repository_name = name.to_string();
+    let digest_for_metadata = computed_digest.clone();
+    let upload_transaction_for_metadata = Arc::clone(&upload_transaction);
+    if let Err(error) = metadata_write_transaction(state, move |_authority, replacement| {
+        replacement
+            .repositories
+            .entry(repository_name)
+            .or_default()
+            .blobs
+            .insert(digest_for_metadata);
+        // Returning the guard clone keeps the upload transaction alive through
+        // the helper's subsequent metadata persistence when the caller is
+        // cancelled while awaiting this blocking transaction.
+        Ok(upload_transaction_for_metadata)
+    })
+    .await
+    {
+        return error.response();
     }
-    *metadata_guard = replacement;
-    drop(storage_lock);
-    drop(metadata_guard);
     let id_to_remove = id.to_string();
-    if let Err(error) = run_upload_disk(state, move |disk| {
+    if let Err(error) = run_upload_disk(state, &upload_transaction, move |disk| {
         remove_upload_session_disk(&disk, &id_to_remove)
     })
     .await
@@ -2060,7 +2267,7 @@ async fn validate_manifest_references(
 }
 
 fn revalidate_manifest_references(
-    state: &OciRegistryState,
+    authority: &crate::atomic_file::AuthorityRoot,
     metadata: &OciMetadata,
     repository_name: &str,
     validated: &[ValidatedManifestReference],
@@ -2082,7 +2289,7 @@ fn revalidate_manifest_references(
         }
         let path = manifest_reference_path(reference.kind, &reference.digest)
             .expect("validated manifest digest remains canonical");
-        if state.authority.identity(&path).ok() != Some(reference.identity) {
+        if authority.identity(&path).ok() != Some(reference.identity) {
             return Err(ManifestValidationError {
                 status: StatusCode::CONFLICT,
                 code: "MANIFEST_INVALID",
@@ -2147,57 +2354,34 @@ async fn put_manifest_inner(
         Ok(validated) => validated,
         Err(error) => return error.response(),
     };
-    let (mut metadata_guard, storage_lock, mut replacement) =
-        match begin_metadata_write(state).await {
-            Ok(transaction) => transaction,
-            Err(error) => return metadata_authority_error(&error),
-        };
-    if let Err(error) = revalidate_manifest_references(state, &replacement, name, &validated) {
-        return error.response();
-    }
-    let descriptor = ManifestDescriptor {
-        digest: digest.clone(),
-        media_type: canonical_media_type.to_string(),
-    };
-    let repository = replacement
-        .repositories
-        .entry(name.to_string())
-        .or_default();
-    repository
-        .manifests
-        .insert(reference.to_string(), descriptor.clone());
-    repository.manifests.insert(digest.clone(), descriptor);
-    let metadata_bytes = match serde_json::to_vec(&replacement) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "UNKNOWN",
-                &format!("failed to encode OCI metadata: {error}"),
-                None,
-            );
-        }
-    };
-    let authority = state.authority.clone();
+    let repository_name = name.to_string();
+    let manifest_reference = reference.to_string();
+    let media_type = canonical_media_type.to_string();
+    let digest_for_transaction = digest.clone();
     let body = body.to_vec();
-    let persist = tokio::task::spawn_blocking(move || {
-        authority
-            .write(&manifest_path, &body)
-            .map_err(|error| format!("failed to persist OCI manifest: {error}"))?;
-        authority
-            .write(FsPath::new("metadata.json"), &metadata_bytes)
-            .map_err(|error| format!("failed to persist OCI metadata: {error}"))
+    let transaction = metadata_write_transaction(state, move |authority, replacement| {
+        revalidate_manifest_references(authority, replacement, &repository_name, &validated)
+            .map_err(MetadataWriteError::Validation)?;
+        let descriptor = ManifestDescriptor {
+            digest: digest_for_transaction.clone(),
+            media_type,
+        };
+        let repository = replacement.repositories.entry(repository_name).or_default();
+        repository
+            .manifests
+            .insert(manifest_reference, descriptor.clone());
+        repository
+            .manifests
+            .insert(digest_for_transaction, descriptor);
+        authority.write(&manifest_path, &body).map_err(|error| {
+            MetadataWriteError::Storage(format!("failed to persist OCI manifest: {error}"))
+        })?;
+        Ok(())
     })
     .await;
-    if let Err(error) = persist
-        .map_err(|error| format!("OCI manifest persistence task failed: {error}"))
-        .and_then(|result| result)
-    {
-        return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &error, None);
+    if let Err(error) = transaction {
+        return error.response();
     }
-    *metadata_guard = replacement;
-    drop(storage_lock);
-    drop(metadata_guard);
 
     let mut response = StatusCode::CREATED.into_response();
     insert_header(
@@ -2223,29 +2407,32 @@ async fn delete_manifest_inner(state: &OciRegistryState, name: &str, reference: 
             None,
         );
     }
-    let (mut metadata_guard, storage_lock, mut replacement) =
-        match begin_metadata_write(state).await {
-            Ok(transaction) => transaction,
-            Err(error) => return metadata_authority_error(&error),
-        };
-    let Some(repository) = replacement.repositories.get_mut(name) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let Some(descriptor) = repository.manifests.get(reference).cloned() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    if sha256_hex(reference).is_some() {
-        repository
+    let repository_name = name.to_string();
+    let manifest_reference = reference.to_string();
+    let digest_reference = sha256_hex(reference).is_some();
+    let transaction = metadata_write_transaction(state, move |_authority, replacement| {
+        let repository = replacement
+            .repositories
+            .get_mut(&repository_name)
+            .ok_or(MetadataWriteError::NotFound)?;
+        let descriptor = repository
             .manifests
-            .retain(|_, candidate| candidate.digest != descriptor.digest);
-    } else {
-        repository.manifests.remove(reference);
+            .get(&manifest_reference)
+            .cloned()
+            .ok_or(MetadataWriteError::NotFound)?;
+        if digest_reference {
+            repository
+                .manifests
+                .retain(|_, candidate| candidate.digest != descriptor.digest);
+        } else {
+            repository.manifests.remove(&manifest_reference);
+        }
+        Ok(())
+    })
+    .await;
+    if let Err(error) = transaction {
+        return error.response();
     }
-    if let Err(error) = persist_metadata_async(state, &replacement).await {
-        return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &error, None);
-    }
-    *metadata_guard = replacement;
-    drop(storage_lock);
     StatusCode::ACCEPTED.into_response()
 }
 
@@ -2414,18 +2601,24 @@ mod tests {
 
     async fn seed_blob(state: &OciRegistryState, repository: &str, bytes: &[u8]) -> String {
         let digest = format!("sha256:{}", sha2_hex(bytes));
-        let blob_path = blob_path_for_digest(&state.blobs_dir, &digest).unwrap();
-        let (mut guard, storage_lock, mut replacement) = begin_metadata_write(state).await.unwrap();
-        crate::atomic_file::write(&blob_path, bytes).unwrap();
-        replacement
-            .repositories
-            .entry(repository.to_string())
-            .or_default()
-            .blobs
-            .insert(digest.clone());
-        persist_metadata(state, &replacement).unwrap();
-        *guard = replacement;
-        drop(storage_lock);
+        let blob_relative = blob_relative_for_digest(&digest).unwrap();
+        let repository = repository.to_string();
+        let bytes = bytes.to_vec();
+        let digest_for_transaction = digest.clone();
+        metadata_write_transaction(state, move |authority, replacement| {
+            authority.write(&blob_relative, &bytes).map_err(|error| {
+                MetadataWriteError::Storage(format!("failed to seed OCI blob: {error}"))
+            })?;
+            replacement
+                .repositories
+                .entry(repository)
+                .or_default()
+                .blobs
+                .insert(digest_for_transaction);
+            Ok(())
+        })
+        .await
+        .unwrap();
         digest
     }
 
@@ -2502,6 +2695,29 @@ mod tests {
         prune_and_measure_uploads(state).unwrap().0
     }
 
+    async fn mark_upload_finalizing(
+        state: Arc<OciRegistryState>,
+        location: &str,
+        bytes: &[u8],
+    ) -> String {
+        let patched = oci_routes(state.clone())
+            .oneshot(authenticated_request(
+                "PATCH",
+                location,
+                Body::from(bytes.to_vec()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(patched.status(), StatusCode::ACCEPTED);
+        let digest = format!("sha256:{}", sha2_hex(bytes));
+        let id = upload_id_from_location(location);
+        let _transaction = begin_upload_write(&state).await.unwrap();
+        let mut upload = read_upload_session(&state, id).unwrap().unwrap();
+        upload.expected_digest = Some(digest.clone());
+        persist_upload_session(&state, id, &upload).unwrap();
+        digest
+    }
+
     fn upload_id_from_location(location: &str) -> &str {
         location.rsplit('/').next().unwrap()
     }
@@ -2532,6 +2748,213 @@ mod tests {
             blob_path_for_digest(root, &format!("sha256:{}", "a".repeat(65))),
             None
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_metadata_mutation_retains_local_and_storage_locks() {
+        let (_root, state) = registry_state_with_token(Some("registry-secret"));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            metadata_write_transaction(&first_state, move |_authority, metadata| {
+                let _ = started_tx.send(());
+                release_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| {
+                        MetadataWriteError::Storage(format!(
+                            "metadata cancellation test barrier failed: {error}"
+                        ))
+                    })?;
+                metadata
+                    .repositories
+                    .entry("first".to_string())
+                    .or_default();
+                Ok(())
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert!(state.metadata.try_write().is_err());
+
+        let peer = Arc::new(OciRegistryState::new(
+            state.blobs_dir.clone(),
+            Some("registry-secret".to_string()),
+        ));
+        let peer_state = peer.clone();
+        let mut peer_write = tokio::spawn(async move {
+            metadata_write_transaction(&peer_state, move |_authority, metadata| {
+                metadata
+                    .repositories
+                    .entry("second".to_string())
+                    .or_default();
+                Ok(())
+            })
+            .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut peer_write)
+                .await
+                .is_err()
+        );
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), peer_write)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let durable = read_metadata_authority(&state.authority).unwrap();
+        assert!(durable.repositories.contains_key("first"));
+        assert!(durable.repositories.contains_key("second"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_upload_disk_mutation_retains_local_and_storage_locks() {
+        let (_root, state) = registry_state_with_token(Some("registry-secret"));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            let transaction = begin_upload_write(&first_state).await?;
+            run_upload_disk(&first_state, &transaction, move |disk| {
+                let _ = started_tx.send(());
+                release_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| format!("upload cancellation test barrier failed: {error}"))?;
+                disk.authority
+                    .write(FsPath::new("uploads/cancellation-marker"), b"complete")
+                    .map_err(|error| format!("failed to write cancellation marker: {error}"))
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert!(state.upload_gate.try_lock().is_err());
+
+        let peer = Arc::new(OciRegistryState::new(
+            state.blobs_dir.clone(),
+            Some("registry-secret".to_string()),
+        ));
+        let peer_state = peer.clone();
+        let mut peer_write =
+            tokio::spawn(async move { begin_upload_write(&peer_state).await.map(drop) });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut peer_write)
+                .await
+                .is_err()
+        );
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), peer_write)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state
+                .authority
+                .read(FsPath::new("uploads/cancellation-marker"))
+                .unwrap(),
+            b"complete"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_patch_stream_rolls_back_before_peer_mutation() {
+        let (_root, state) = registry_state_with_token(Some("registry-secret"));
+        let location = initiate(state.clone()).await;
+        let id = upload_id_from_location(&location).to_string();
+        let rollback_hook = Arc::new(UploadRollbackHook {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *state.upload_rollback_hook.lock().unwrap() = Some(Arc::clone(&rollback_hook));
+        let (first_chunk_tx, first_chunk_rx) = tokio::sync::oneshot::channel();
+        let chunks = async_stream::stream! {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"partial"));
+            // The stream is polled for its next item only after append_upload_body
+            // has written the first chunk, so this is a deterministic cancellation
+            // point with an uncommitted tail on disk.
+            let _ = first_chunk_tx.send(());
+            std::future::pending::<()>().await;
+        };
+
+        let first_app = oci_routes(state.clone());
+        let first_location = location.clone();
+        let first = tokio::spawn(async move {
+            first_app
+                .oneshot(
+                    Request::patch(&first_location)
+                        .header(header::AUTHORIZATION, "Bearer registry-secret")
+                        .body(Body::from_stream(chunks))
+                        .unwrap(),
+                )
+                .await
+        });
+        first_chunk_rx.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), rollback_hook.started.notified())
+            .await
+            .unwrap();
+        assert!(state.upload_gate.try_lock().is_err());
+        assert_eq!(
+            state
+                .authority
+                .read(&upload_data_relative(&id).unwrap())
+                .unwrap(),
+            b"partial"
+        );
+        let durable_before_rollback: PendingUpload = serde_json::from_slice(
+            &state
+                .authority
+                .read(&upload_metadata_relative(&id).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(durable_before_rollback.size, 0);
+        *state.upload_rollback_hook.lock().unwrap() = None;
+
+        let second_app = oci_routes(state.clone());
+        let second_location = location.clone();
+        let mut second = tokio::spawn(async move {
+            second_app
+                .oneshot(
+                    Request::patch(&second_location)
+                        .header(header::AUTHORIZATION, "Bearer registry-secret")
+                        .header(header::CONTENT_RANGE, "0-0")
+                        .body(Body::from("!"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second)
+                .await
+                .is_err(),
+            "a competing PATCH escaped while the cancelled stream was still mutating storage"
+        );
+
+        rollback_hook.release.notify_one();
+        let response = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(response.headers()[header::RANGE], "0-0");
+        assert_eq!(
+            state
+                .authority
+                .read(&upload_data_relative(&id).unwrap())
+                .unwrap(),
+            b"!"
+        );
+        assert_eq!(read_upload_session(&state, &id).unwrap().unwrap().size, 1);
     }
 
     #[tokio::test]
@@ -2915,6 +3338,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(accepted.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn resumed_finalization_rejects_same_length_staged_data_tampering() {
+        let (_root, state) = registry_state_with_token(Some("registry-secret"));
+        let location = initiate(state.clone()).await;
+        let trusted = b"trusted";
+        let digest = mark_upload_finalizing(state.clone(), &location, trusted).await;
+        let id = upload_id_from_location(&location);
+        let tampered = b"forged!";
+        assert_eq!(trusted.len(), tampered.len());
+        state
+            .authority
+            .write(&upload_data_relative(id).unwrap(), tampered)
+            .unwrap();
+
+        let rejected = oci_routes(state.clone())
+            .oneshot(authenticated_request(
+                "PUT",
+                &format!("{location}?digest={digest}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error_code(rejected).await, "UNKNOWN");
+        assert!(read_upload_session(&state, id).unwrap().is_some());
+        assert!(state
+            .authority
+            .metadata(&blob_relative_for_digest(&digest).unwrap())
+            .is_err());
+        assert!(!metadata_snapshot(&state)
+            .await
+            .unwrap()
+            .repositories
+            .get("demo")
+            .is_some_and(|repository| repository.blobs.contains(&digest)));
+    }
+
+    #[tokio::test]
+    async fn empty_resumed_finalization_rejects_nonzero_content_range() {
+        let (_root, state) = registry_state_with_token(Some("registry-secret"));
+        let location = initiate(state.clone()).await;
+        let bytes = b"durable";
+        let digest = mark_upload_finalizing(state.clone(), &location, bytes).await;
+        let id = upload_id_from_location(&location);
+
+        let rejected = oci_routes(state.clone())
+            .oneshot(
+                Request::put(format!("{location}?digest={digest}"))
+                    .header(header::AUTHORIZATION, "Bearer registry-secret")
+                    .header(
+                        header::CONTENT_RANGE,
+                        format!("{}-{}", bytes.len(), bytes.len()),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(error_code(rejected).await, "BLOB_UPLOAD_INVALID");
+        assert_eq!(
+            state
+                .authority
+                .read(&upload_data_relative(id).unwrap())
+                .unwrap(),
+            bytes
+        );
+        assert_eq!(
+            read_upload_session(&state, id)
+                .unwrap()
+                .unwrap()
+                .expected_digest
+                .as_deref(),
+            Some(digest.as_str())
+        );
     }
 
     #[cfg(unix)]

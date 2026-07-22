@@ -7,10 +7,17 @@
 //! rewritten. Stage bytes in the destination directory, durably flush them,
 //! and only then replace the destination with one atomic rename.
 
+#[cfg(all(not(unix), windows))]
+use cap_fs_ext::OsMetadataExt as CapabilityOsMetadataExt;
+#[cfg(not(unix))]
+use cap_fs_ext::{
+    FollowSymlinks, MetadataExt as CapabilityMetadataExt, OpenOptionsFollowExt,
+    OpenOptionsMaybeDirExt,
+};
+#[cfg(not(unix))]
+use cap_std::fs::{Dir as CapabilityDir, OpenOptions as CapabilityOpenOptions};
 use std::ffi::OsString;
 use std::fs::File;
-#[cfg(not(unix))]
-use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,14 +32,12 @@ pub(crate) enum AuthorityKey {
         name: OsString,
     },
     #[cfg(not(unix))]
-    Path(PathBuf),
+    Capability { device: u64, inode: u64 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ArtifactIdentity {
-    #[cfg(unix)]
     pub(crate) device: u64,
-    #[cfg(unix)]
     pub(crate) inode: u64,
     pub(crate) len: u64,
 }
@@ -43,8 +48,9 @@ pub(crate) struct ArtifactIdentity {
 /// Unix operations walk only relative, normal components from the retained
 /// directory descriptor with `openat(2)` and `O_NOFOLLOW`. Renaming or
 /// replacing the configured pathname therefore cannot redirect a live
-/// registry. Platforms without descriptor-relative filesystem APIs keep the
-/// canonical path and reject reparse points before each operation.
+/// registry. Windows operations retain a capability directory and resolve
+/// every descendant component from held handles without following reparse
+/// points.
 #[derive(Clone)]
 pub(crate) struct AuthorityRoot {
     path: PathBuf,
@@ -55,7 +61,7 @@ enum AuthorityRootInner {
     #[cfg(unix)]
     Unix(File),
     #[cfg(not(unix))]
-    Path,
+    Capability(CapabilityDir),
     Failed {
         kind: io::ErrorKind,
         message: String,
@@ -89,15 +95,17 @@ impl AuthorityRoot {
     }
 
     fn try_new(path: &Path) -> io::Result<Self> {
-        let path = pin_authority_root(path)?;
-        ensure_directory_durable(&path)?;
         #[cfg(unix)]
-        let inner = AuthorityRootInner::Unix(open_or_create_directory(&path)?.file);
+        let path = pin_authority_root(path)?;
         #[cfg(not(unix))]
+        let path = absolute_capability_authority_path(path)?;
+        #[cfg(unix)]
         let inner = {
-            reject_reparse_components(&path)?;
-            AuthorityRootInner::Path
+            ensure_directory_durable(&path)?;
+            AuthorityRootInner::Unix(open_or_create_directory(&path)?.file)
         };
+        #[cfg(not(unix))]
+        let inner = AuthorityRootInner::Capability(open_or_create_capability_directory(&path)?);
         Ok(Self {
             path,
             inner: Arc::new(inner),
@@ -116,7 +124,7 @@ impl AuthorityRoot {
             #[cfg(unix)]
             AuthorityRootInner::Unix(_) => None,
             #[cfg(not(unix))]
-            AuthorityRootInner::Path => None,
+            AuthorityRootInner::Capability(_) => None,
         }
     }
 
@@ -139,6 +147,16 @@ impl AuthorityRoot {
     fn unix_root(&self) -> io::Result<&File> {
         match self.inner.as_ref() {
             AuthorityRootInner::Unix(file) => Ok(file),
+            AuthorityRootInner::Failed { kind, message } => {
+                Err(io::Error::new(*kind, message.clone()))
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn capability_root(&self) -> io::Result<&CapabilityDir> {
+        match self.inner.as_ref() {
+            AuthorityRootInner::Capability(directory) => Ok(directory),
             AuthorityRootInner::Failed { kind, message } => {
                 Err(io::Error::new(*kind, message.clone()))
             }
@@ -178,6 +196,34 @@ impl AuthorityRoot {
         Ok((self.directory(parent, create)?, name))
     }
 
+    #[cfg(not(unix))]
+    fn capability_directory(&self, relative: &Path, create: bool) -> io::Result<CapabilityDir> {
+        Self::validate_relative(relative, true)?;
+        let mut current = self.capability_root()?.try_clone()?;
+        for component in relative.components() {
+            let std::path::Component::Normal(name) = component else {
+                unreachable!("relative path was validated")
+            };
+            current = open_capability_child_directory(&current, name, create)?;
+        }
+        Ok(current)
+    }
+
+    #[cfg(not(unix))]
+    fn capability_parent_and_name(
+        &self,
+        relative: &Path,
+        create: bool,
+    ) -> io::Result<(CapabilityDir, OsString)> {
+        Self::validate_relative(relative, false)?;
+        let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+        let name = relative
+            .file_name()
+            .expect("validated non-empty relative path")
+            .to_os_string();
+        Ok((self.capability_directory(parent, create)?, name))
+    }
+
     pub(crate) fn ensure_directory(&self, relative: &Path) -> io::Result<()> {
         if let Some(error) = self.initialization_error() {
             return Err(error);
@@ -190,10 +236,8 @@ impl AuthorityRoot {
         }
         #[cfg(not(unix))]
         {
-            let path = self.path.join(relative);
-            ensure_directory_durable(&path)?;
-            reject_reparse_components(&self.path)?;
-            reject_reparse_components(&path)
+            let _ = self.capability_directory(relative, true)?;
+            Ok(())
         }
     }
 
@@ -213,10 +257,10 @@ impl AuthorityRoot {
         }
         #[cfg(not(unix))]
         {
-            reject_reparse_components(&self.path)?;
-            let path = self.path.join(relative);
-            reject_reparse_or_non_file(&path, "registry artifact")?;
-            std::fs::read(path)
+            let mut file = self.open_read(relative)?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            Ok(bytes)
         }
     }
 
@@ -234,10 +278,10 @@ impl AuthorityRoot {
         }
         #[cfg(not(unix))]
         {
-            reject_reparse_components(&self.path)?;
-            let path = self.path.join(relative);
-            reject_reparse_or_non_file(&path, "registry artifact")?;
-            File::open(path)
+            let (parent, name) = self.capability_parent_and_name(relative, false)?;
+            let mut options = CapabilityOpenOptions::new();
+            options.read(true).follow(FollowSymlinks::No);
+            open_capability_regular_file(&parent, &name, &options, "registry artifact")
         }
     }
 
@@ -255,10 +299,10 @@ impl AuthorityRoot {
         }
         #[cfg(not(unix))]
         {
-            reject_reparse_components(&self.path)?;
-            let path = self.path.join(relative);
-            reject_reparse_or_non_file(&path, "registry upload data")?;
-            OpenOptions::new().append(true).open(path)
+            let (parent, name) = self.capability_parent_and_name(relative, false)?;
+            let mut options = CapabilityOpenOptions::new();
+            options.append(true).follow(FollowSymlinks::No);
+            open_capability_regular_file(&parent, &name, &options, "registry upload data")
         }
     }
 
@@ -276,10 +320,10 @@ impl AuthorityRoot {
         }
         #[cfg(not(unix))]
         {
-            reject_reparse_components(&self.path)?;
-            let path = self.path.join(relative);
-            reject_reparse_or_non_file(&path, "registry artifact")?;
-            OpenOptions::new().write(true).open(path)
+            let (parent, name) = self.capability_parent_and_name(relative, false)?;
+            let mut options = CapabilityOpenOptions::new();
+            options.write(true).follow(FollowSymlinks::No);
+            open_capability_regular_file(&parent, &name, &options, "registry artifact")
         }
     }
 
@@ -300,7 +344,10 @@ impl AuthorityRoot {
         }
         #[cfg(not(unix))]
         {
+            let identity = validate_capability_regular_file_from_std(&file, "registry artifact")?;
             Ok(ArtifactIdentity {
+                device: identity.device,
+                inode: identity.inode,
                 len: file.metadata()?.len(),
             })
         }
@@ -355,8 +402,8 @@ impl AuthorityRoot {
         }
         #[cfg(not(unix))]
         {
-            reject_reparse_components(&self.path)?;
-            std::fs::read_dir(self.path.join(relative))?
+            self.capability_directory(relative, false)?
+                .entries()?
                 .map(|entry| entry.map(|entry| entry.file_name()))
                 .collect()
         }
@@ -374,9 +421,8 @@ impl AuthorityRoot {
         }
         #[cfg(not(unix))]
         {
-            reject_reparse_components(&self.path)?;
-            write(&self.path.join(relative), bytes)?;
-            reject_reparse_components(&self.path)
+            let (parent, destination_name) = self.capability_parent_and_name(relative, true)?;
+            write_capability_at(&parent, &destination_name, bytes, |_| Ok(()))
         }
     }
 
@@ -405,10 +451,9 @@ impl AuthorityRoot {
         }
         #[cfg(not(unix))]
         {
-            reject_reparse_components(&self.path)?;
-            let path = self.path.join(relative);
-            match reject_reparse_or_non_file(&path, "registry artifact") {
-                Ok(()) => std::fs::remove_file(path),
+            let (parent, name) = self.capability_parent_and_name(relative, false)?;
+            match validate_capability_named_regular_file(&parent, &name, "registry artifact") {
+                Ok(_) => parent.remove_file(&name),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
                 Err(error) => Err(error),
             }
@@ -449,11 +494,20 @@ impl AuthorityRoot {
         }
         #[cfg(not(unix))]
         {
-            reject_reparse_components(&self.path)?;
-            let from = self.path.join(from);
-            let to = self.path.join(to);
-            reject_reparse_or_non_file(&from, "registry artifact")?;
-            std::fs::rename(from, to)
+            let (from_parent, from_name) = self.capability_parent_and_name(from, false)?;
+            let (to_parent, to_name) = self.capability_parent_and_name(to, true)?;
+            validate_capability_named_regular_file(&from_parent, &from_name, "registry artifact")?;
+            match to_parent.symlink_metadata(&to_name) {
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "registry destination already exists",
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            from_parent.rename(&from_name, &to_parent, &to_name)
         }
     }
 
@@ -469,7 +523,8 @@ impl AuthorityRoot {
         }
         #[cfg(not(unix))]
         {
-            open_lock_file(&self.path.join(relative))
+            let (parent, name) = self.capability_parent_and_name(relative, true)?;
+            open_capability_lock_file(parent, name)
         }
     }
 }
@@ -481,6 +536,7 @@ impl AuthorityRoot {
 /// (a system alias for `/private/var`) without permitting storage operations
 /// to follow symlinks in package-controlled descendants. Missing descendants
 /// are appended only after the nearest existing ancestor is canonicalized.
+#[cfg(unix)]
 pub(crate) fn pin_authority_root(path: &Path) -> io::Result<PathBuf> {
     let mut cursor = path;
     let mut missing = Vec::<OsString>::new();
@@ -522,7 +578,9 @@ pub(crate) struct AnchoredLockFile {
     #[cfg(unix)]
     name: OsString,
     #[cfg(not(unix))]
-    path: PathBuf,
+    capability_parent: CapabilityDir,
+    #[cfg(not(unix))]
+    capability_name: OsString,
 }
 
 impl AnchoredLockFile {
@@ -547,12 +605,346 @@ impl AnchoredLockFile {
         }
         #[cfg(not(unix))]
         {
-            reject_reparse_or_non_file(&self.path, "registry transaction lock")
+            let opened =
+                validate_capability_regular_file_from_std(&self.file, "registry transaction lock")?;
+            let named = validate_capability_named_regular_file(
+                &self.capability_parent,
+                &self.capability_name,
+                "registry transaction lock",
+            )?;
+            if opened != named {
+                return Err(io::Error::other(
+                    "registry transaction lock changed identity during acquisition",
+                ));
+            }
+            Ok(())
         }
     }
 }
 
-#[cfg(any(test, not(unix)))]
+#[cfg(not(unix))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CapabilityFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(not(unix))]
+fn capability_metadata_is_reparse(metadata: &cap_std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        CapabilityOsMetadataExt::file_attributes(metadata) & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+#[cfg(not(unix))]
+fn validate_capability_regular_file(
+    file: &cap_std::fs::File,
+    label: &str,
+) -> io::Result<CapabilityFileIdentity> {
+    let metadata = file.metadata()?;
+    if capability_metadata_is_reparse(&metadata)
+        || !metadata.is_file()
+        || CapabilityMetadataExt::nlink(&metadata) != 1
+    {
+        return Err(io::Error::other(format!(
+            "{label} is not a single-link regular-file authority"
+        )));
+    }
+    Ok(CapabilityFileIdentity {
+        device: CapabilityMetadataExt::dev(&metadata),
+        inode: CapabilityMetadataExt::ino(&metadata),
+    })
+}
+
+#[cfg(not(unix))]
+fn validate_capability_regular_file_from_std(
+    file: &File,
+    label: &str,
+) -> io::Result<CapabilityFileIdentity> {
+    let file = cap_std::fs::File::from_std(file.try_clone()?);
+    validate_capability_regular_file(&file, label)
+}
+
+#[cfg(not(unix))]
+fn open_capability_regular_file(
+    parent: &CapabilityDir,
+    name: &std::ffi::OsStr,
+    options: &CapabilityOpenOptions,
+    label: &str,
+) -> io::Result<File> {
+    let file = parent.open_with(name, options)?;
+    validate_capability_regular_file(&file, label)?;
+    Ok(file.into_std())
+}
+
+#[cfg(not(unix))]
+fn validate_capability_named_regular_file(
+    parent: &CapabilityDir,
+    name: &std::ffi::OsStr,
+    label: &str,
+) -> io::Result<CapabilityFileIdentity> {
+    let mut options = CapabilityOpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let file = parent.open_with(name, &options)?;
+    validate_capability_regular_file(&file, label)
+}
+
+#[cfg(not(unix))]
+fn open_capability_child_directory(
+    parent: &CapabilityDir,
+    name: &std::ffi::OsStr,
+    create: bool,
+) -> io::Result<CapabilityDir> {
+    let open = || {
+        let mut options = CapabilityOpenOptions::new();
+        options
+            .read(true)
+            .follow(FollowSymlinks::No)
+            .maybe_dir(true);
+        let file = parent.open_with(name, &options)?;
+        let metadata = file.metadata()?;
+        if capability_metadata_is_reparse(&metadata) || !metadata.is_dir() {
+            return Err(io::Error::other(format!(
+                "registry directory component is a reparse point or non-directory: {}",
+                name.to_string_lossy()
+            )));
+        }
+        Ok(CapabilityDir::from_std_file(file.into_std()))
+    };
+
+    match open() {
+        Ok(directory) => Ok(directory),
+        Err(error) if create && error.kind() == io::ErrorKind::NotFound => {
+            match parent.create_dir(name) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+            open()
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn capability_ambient_root_and_relative(path: &Path) -> io::Result<(PathBuf, PathBuf)> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "registry capability authority must be absolute",
+        ));
+    }
+    let root = path
+        .ancestors()
+        .last()
+        .filter(|root| !root.as_os_str().is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "registry capability authority has no filesystem root",
+            )
+        })?;
+    let relative = path.strip_prefix(root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "registry capability authority is not beneath its filesystem root",
+        )
+    })?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "registry capability authority contains an unsupported component",
+        ));
+    }
+    Ok((root.to_path_buf(), relative.to_path_buf()))
+}
+
+#[cfg(not(unix))]
+fn absolute_capability_authority_path(path: &Path) -> io::Result<PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "registry capability authority may not contain parent traversal",
+        ));
+    }
+    Ok(path)
+}
+
+#[cfg(not(unix))]
+fn open_or_create_capability_directory(path: &Path) -> io::Result<CapabilityDir> {
+    let (ambient_root, relative) = capability_ambient_root_and_relative(path)?;
+    let mut current = CapabilityDir::open_ambient_dir(&ambient_root, cap_std::ambient_authority())?;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            unreachable!("capability-relative path was built from normal components")
+        };
+        current = open_capability_child_directory(&current, name, true)?;
+    }
+    Ok(current)
+}
+
+#[cfg(all(test, not(unix)))]
+fn ambient_parent_and_name(path: &Path) -> io::Result<(PathBuf, OsString)> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "registry authority path has no parent directory",
+        )
+    })?;
+    let name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "registry authority path has no filename",
+            )
+        })?
+        .to_os_string();
+    Ok((absolute_capability_authority_path(parent)?, name))
+}
+
+#[cfg(not(unix))]
+fn open_capability_lock_file(
+    parent: CapabilityDir,
+    name: OsString,
+) -> io::Result<AnchoredLockFile> {
+    let mut options = CapabilityOpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .follow(FollowSymlinks::No);
+    let file = parent.open_with(&name, &options)?;
+    let identity = validate_capability_regular_file(&file, "registry transaction lock")?;
+    let key = AuthorityKey::Capability {
+        device: identity.device,
+        inode: identity.inode,
+    };
+    Ok(AnchoredLockFile {
+        file: file.into_std(),
+        key,
+        capability_parent: parent,
+        capability_name: name,
+    })
+}
+
+#[cfg(not(unix))]
+fn create_capability_staged_file(
+    parent: &CapabilityDir,
+) -> io::Result<(cap_std::fs::File, OsString)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..100 {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let sequence = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
+        let name = OsString::from(format!(
+            ".kin-registry-stage-{}-{nonce}-{sequence}",
+            std::process::id()
+        ));
+        let mut options = CapabilityOpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        match parent.open_with(&name, &options) {
+            Ok(file) => return Ok((file, name)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique registry staging file",
+    ))
+}
+
+#[cfg(not(unix))]
+fn write_capability_at<F>(
+    parent: &CapabilityDir,
+    destination_name: &std::ffi::OsStr,
+    bytes: &[u8],
+    pre_commit: F,
+) -> io::Result<()>
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+{
+    let (mut staged, staged_name) = create_capability_staged_file(parent)?;
+    let staged_identity = validate_capability_regular_file(&staged, "registry staged artifact")?;
+    let result = (|| {
+        staged.write_all(bytes)?;
+        staged.flush()?;
+        staged.sync_all()?;
+        pre_commit(Path::new(&staged_name))?;
+        let named = validate_capability_named_regular_file(
+            parent,
+            &staged_name,
+            "registry staged artifact",
+        )?;
+        if named != staged_identity {
+            return Err(io::Error::other(
+                "registry staged artifact changed identity during publication",
+            ));
+        }
+        match parent.symlink_metadata(destination_name) {
+            Ok(_) => {
+                validate_capability_named_regular_file(
+                    parent,
+                    destination_name,
+                    "existing registry destination",
+                )?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        parent.rename(&staged_name, parent, destination_name)?;
+        let published = validate_capability_named_regular_file(
+            parent,
+            destination_name,
+            "published registry artifact",
+        )?;
+        if published != staged_identity {
+            return Err(io::Error::other(
+                "published registry artifact changed identity during publication",
+            ));
+        }
+        // cap-std makes the rename capability-relative and atomic, but Windows
+        // has no portable directory-fsync primitive. Flush the published file;
+        // directory-entry crash durability remains bounded by the platform.
+        staged.sync_all()
+    })();
+
+    if result.is_err()
+        && validate_capability_named_regular_file(parent, &staged_name, "registry staged artifact")
+            .is_ok_and(|actual| actual == staged_identity)
+    {
+        let _ = parent.remove_file(&staged_name);
+    }
+    result
+}
+
+#[cfg(test)]
 pub(crate) fn open_lock_file(path: &Path) -> io::Result<AnchoredLockFile> {
     #[cfg(unix)]
     {
@@ -561,27 +953,9 @@ pub(crate) fn open_lock_file(path: &Path) -> io::Result<AnchoredLockFile> {
     }
     #[cfg(not(unix))]
     {
-        let parent = path.parent().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "registry transaction lock has no parent directory",
-            )
-        })?;
-        ensure_directory_durable(parent)?;
-        reject_reparse_components(parent)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
-        reject_reparse_or_non_file(path, "registry transaction lock")?;
-        let key = AuthorityKey::Path(path.canonicalize()?);
-        Ok(AnchoredLockFile {
-            file,
-            key,
-            path: path.to_path_buf(),
-        })
+        let (parent_path, name) = ambient_parent_and_name(path)?;
+        let parent = open_or_create_capability_directory(&parent_path)?;
+        open_capability_lock_file(parent, name)
     }
 }
 
@@ -620,7 +994,7 @@ fn open_lock_file_in(parent: File, name: OsString) -> io::Result<AnchoredLockFil
     })
 }
 
-#[cfg(any(test, not(unix)))]
+#[cfg(test)]
 pub(crate) fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_with_pre_commit(path, bytes, |_| Ok(()))
 }
@@ -712,31 +1086,16 @@ fn write_at(parent: &File, destination_name: &std::ffi::OsStr, bytes: &[u8]) -> 
     result
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn write_with_pre_commit_impl<F>(path: &Path, bytes: &[u8], pre_commit: F) -> io::Result<()>
 where
     F: FnOnce(&Path) -> io::Result<()>,
 {
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "atomic registry destination has no parent directory",
-        )
-    })?;
-    ensure_directory_durable(parent)?;
-    reject_reparse_components(parent)?;
-
-    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
-    staged.write_all(bytes)?;
-    staged.flush()?;
-    staged.as_file().sync_all()?;
-    pre_commit(staged.path())?;
-    reject_reparse_components(parent)?;
-
-    let published = staged.persist(path).map_err(|error| error.error)?;
-    published.sync_all()?;
-    sync_parent(parent)?;
-    Ok(())
+    let (parent_path, destination_name) = ambient_parent_and_name(path)?;
+    let parent = open_or_create_capability_directory(&parent_path)?;
+    write_capability_at(&parent, &destination_name, bytes, |staged_name| {
+        pre_commit(&parent_path.join(staged_name))
+    })
 }
 
 /// Create a directory chain and durably publish each newly-created component.
@@ -746,6 +1105,7 @@ where
 /// from its parent even though the response was already acknowledged. Build
 /// missing components from the first existing ancestor downward and fsync the
 /// parent after every directory entry becomes visible.
+#[cfg(any(unix, test))]
 pub(crate) fn ensure_directory_durable(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -754,58 +1114,7 @@ pub(crate) fn ensure_directory_durable(path: &Path) -> io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let mut cursor = path.to_path_buf();
-        let mut missing: Vec<PathBuf> = Vec::new();
-
-        loop {
-            match std::fs::symlink_metadata(&cursor) {
-                Ok(metadata) if metadata.is_dir() && !metadata_is_reparse(&metadata) => break,
-                Ok(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!(
-                            "registry directory path is not a directory: {}",
-                            cursor.display()
-                        ),
-                    ));
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    missing.push(cursor.clone());
-                    cursor = cursor
-                        .parent()
-                        .ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                "registry directory has no existing ancestor",
-                            )
-                        })?
-                        .to_path_buf();
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        for directory in missing.into_iter().rev() {
-            match std::fs::create_dir(&directory) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    let metadata = std::fs::symlink_metadata(&directory)?;
-                    if !metadata.is_dir() || metadata_is_reparse(&metadata) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::AlreadyExists,
-                            format!(
-                                "registry directory path raced with a non-directory: {}",
-                                directory.display()
-                            ),
-                        ));
-                    }
-                }
-                Err(error) => return Err(error),
-            }
-            if let Some(parent) = directory.parent() {
-                sync_parent(parent)?;
-            }
-        }
+        let _ = open_or_create_capability_directory(path)?;
         Ok(())
     }
 }
@@ -1115,67 +1424,12 @@ fn name_cstring(name: &std::ffi::OsStr) -> io::Result<std::ffi::CString> {
     })
 }
 
-#[cfg(not(unix))]
-fn metadata_is_reparse(metadata: &std::fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        return metadata.file_attributes() & 0x400 != 0;
-    }
-    #[cfg(not(windows))]
-    {
-        metadata.file_type().is_symlink()
-    }
-}
-
-#[cfg(not(unix))]
-fn reject_reparse_or_non_file(path: &Path, label: &str) -> io::Result<()> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata_is_reparse(&metadata) || !metadata.is_file() {
-        return Err(io::Error::other(format!(
-            "{label} is a reparse point or non-file authority"
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn reject_reparse_components(path: &Path) -> io::Result<()> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component.as_os_str());
-        let metadata = std::fs::symlink_metadata(&current)?;
-        if metadata_is_reparse(&metadata) || !metadata.is_dir() {
-            return Err(io::Error::other(format!(
-                "registry directory component is a reparse point or non-directory: {}",
-                current.display()
-            )));
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 pub(crate) fn write_with_pre_commit<F>(path: &Path, bytes: &[u8], pre_commit: F) -> io::Result<()>
 where
     F: FnOnce(&Path) -> io::Result<()>,
 {
     write_with_pre_commit_impl(path, bytes, pre_commit)
-}
-
-#[cfg(all(not(test), not(unix)))]
-fn write_with_pre_commit<F>(path: &Path, bytes: &[u8], pre_commit: F) -> io::Result<()>
-where
-    F: FnOnce(&Path) -> io::Result<()>,
-{
-    write_with_pre_commit_impl(path, bytes, pre_commit)
-}
-
-#[cfg(not(unix))]
-fn sync_parent(_parent: &Path) -> io::Result<()> {
-    // The published file itself is flushed above. Opening directories for a
-    // portable metadata fsync is not supported by std on non-Unix platforms.
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1245,6 +1499,21 @@ mod tests {
         assert_eq!(std::fs::read(destination).unwrap(), b"complete-manifest\n");
     }
 
+    #[test]
+    fn same_length_replacement_changes_artifact_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let authority = AuthorityRoot::new(&root.path().join("authority"));
+        let relative = Path::new("nested/artifact");
+        authority.write(relative, b"first").unwrap();
+        let before = authority.identity(relative).unwrap();
+
+        authority.write(relative, b"other").unwrap();
+        let after = authority.identity(relative).unwrap();
+
+        assert_eq!(before.len, after.len);
+        assert_ne!((before.device, before.inode), (after.device, after.inode));
+    }
+
     #[cfg(unix)]
     #[test]
     fn write_rejects_symlinked_directory_components_and_destinations() {
@@ -1269,5 +1538,57 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn live_capability_authority_blocks_root_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let authority_path = root.path().join("authority");
+        let authority = AuthorityRoot::new(&authority_path);
+        authority
+            .write(Path::new("nested/artifact"), b"pinned")
+            .unwrap();
+
+        let displaced = root.path().join("displaced");
+        assert!(std::fs::rename(&authority_path, &displaced).is_err());
+        assert_eq!(
+            authority.read(Path::new("nested/artifact")).unwrap(),
+            b"pinned"
+        );
+
+        drop(authority);
+        std::fs::rename(&authority_path, &displaced).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn capability_authority_rejects_descendant_junctions() {
+        let root = tempfile::tempdir().unwrap();
+        let authority_path = root.path().join("authority");
+        let authority = AuthorityRoot::new(&authority_path);
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("artifact"), b"outside").unwrap();
+
+        let junction = authority_path.join("junction");
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "failed to create test junction: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(authority.read(Path::new("junction/artifact")).is_err());
+        assert!(authority
+            .write(Path::new("junction/artifact"), b"redirected")
+            .is_err());
+        assert_eq!(std::fs::read(outside.join("artifact")).unwrap(), b"outside");
     }
 }

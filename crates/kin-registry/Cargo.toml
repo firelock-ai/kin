@@ -37,5 +37,9 @@ futures-util = "0.3"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(not(unix))'.dependencies]
+cap-std = "4.0.2"
+cap-fs-ext = "4.0.2"
+
 [dev-dependencies]
 tower = { workspace = true }
