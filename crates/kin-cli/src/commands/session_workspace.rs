@@ -177,6 +177,44 @@ fn validate_session_dir(layout: &kin_core::KinLayout, session_dir: &std::path::P
         );
     }
 
+    // `starts_with` and component validation are lexical. Reject existing
+    // symlink/reparse-point components as well, otherwise a path such as
+    // `runs/session-1` could resolve outside the repository before the runtime
+    // creates directories and writes graph-owned blobs into it.
+    let mut cursor = runs_dir.clone();
+    let mut components = std::iter::once(None).chain(relative.components().map(Some));
+    for component in &mut components {
+        match component {
+            Some(std::path::Component::Normal(name)) => cursor.push(name),
+            Some(std::path::Component::CurDir) => continue,
+            Some(_) => anyhow::bail!(
+                "session workspace contains an unsupported path component under {}",
+                runs_dir.display()
+            ),
+            None => {}
+        }
+
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => anyhow::bail!(
+                "session workspace must not traverse symbolic links under {}",
+                runs_dir.display()
+            ),
+            Ok(metadata) if !metadata.is_dir() => anyhow::bail!(
+                "session workspace path components must be directories under {}",
+                runs_dir.display()
+            ),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "failed to inspect session workspace component {}: {}",
+                    cursor.display(),
+                    error
+                ));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -283,6 +321,26 @@ mod tests {
         assert!(outside_err.contains("must be an absolute path under"));
 
         validate_session_dir(&layout, &layout.root().join("runs/session-1")).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_workspace_path_validation_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = init_repo(dir.path()).unwrap().layout;
+        let runs_dir = layout.root().join("runs");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&runs_dir).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, runs_dir.join("session-1")).unwrap();
+
+        let err = validate_session_dir(&layout, &runs_dir.join("session-1"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("must not traverse symbolic links"));
     }
 
     #[test]
