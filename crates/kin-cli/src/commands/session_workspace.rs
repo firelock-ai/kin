@@ -1023,7 +1023,8 @@ fn open_windows_entry_for_deletion(
     use cap_std::fs::OpenOptionsExt;
     use windows_sys::Win32::Foundation::GENERIC_READ;
     use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
     let mut options = cap_std::fs::OpenOptions::new();
@@ -1033,7 +1034,12 @@ fn open_windows_entry_for_deletion(
     options
         .access_mode(GENERIC_READ | DELETE)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        // Supplying OPEN_REPARSE_POINT explicitly tells cap-std that the
+        // final link-like object itself is the intended handle. Without it,
+        // FollowSymlinks::No deliberately converts a successfully opened
+        // junction into ERROR_STOPPED_ON_SYMLINK before cleanup can delete
+        // the junction object.
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .follow(FollowSymlinks::No);
     parent.open_with(name, &options)
 }
@@ -2193,8 +2199,12 @@ mod tests {
         );
         assert!(!outside.join("nested/payload.txt").exists());
         assert!(!outside.join(".kin-session").exists());
-        assert!(
-            fs::symlink_metadata(&session_dir).unwrap().is_dir(),
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        let replacement = fs::symlink_metadata(&session_dir).unwrap();
+        assert_ne!(
+            replacement.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT,
+            0,
             "the replacement junction must not be touched after capability capture"
         );
         assert!(
@@ -2303,13 +2313,23 @@ mod tests {
             None,
             None,
             |_| {
-                swap_error = Some(fs::rename(&runs_dir, &moved_runs).unwrap_err().kind());
+                swap_error = Some(fs::rename(&runs_dir, &moved_runs).unwrap_err());
                 Ok(())
             },
         )
         .unwrap();
 
-        assert_eq!(swap_error, Some(std::io::ErrorKind::PermissionDenied));
+        let swap_error = swap_error.expect("the retained parent handle must block replacement");
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+        assert!(
+            matches!(
+                swap_error.raw_os_error(),
+                Some(code)
+                    if code == ERROR_ACCESS_DENIED as i32
+                        || code == ERROR_SHARING_VIOLATION as i32
+            ),
+            "Windows must reject parent replacement while its capability is retained: {swap_error}"
+        );
         assert_eq!(
             fs::read_to_string(workspace.root.join("nested/payload.txt")).unwrap(),
             "graph payload\n"
