@@ -251,6 +251,83 @@ fn coverage_percent(indexed: usize, total: usize) -> f64 {
     (indexed as f64 / total as f64) * 100.0
 }
 
+#[derive(Debug, PartialEq)]
+struct SemanticChangePayload {
+    canonical_json: serde_json::Value,
+    exact_float_bits: Vec<u32>,
+}
+
+fn record_change_float(
+    change_id: SemanticChangeId,
+    field: &str,
+    value: f32,
+    bits: &mut Vec<u32>,
+) -> Result<(), KinDbError> {
+    if !value.is_finite() {
+        return Err(KinDbError::StorageError(format!(
+            "semantic change {change_id} contains non-finite {field}; refusing an ambiguous immutable payload"
+        )));
+    }
+    bits.push(value.to_bits());
+    Ok(())
+}
+
+fn record_entity_float_bits(
+    change_id: SemanticChangeId,
+    entity: &Entity,
+    field: &str,
+    bits: &mut Vec<u32>,
+) -> Result<(), KinDbError> {
+    record_change_float(change_id, field, entity.fingerprint.stability_score, bits)
+}
+
+fn semantic_change_payload(change: &SemanticChange) -> Result<SemanticChangePayload, KinDbError> {
+    // JSON Value gives the non-floating structure a map-order-insensitive
+    // structural representation. Track every f32 separately by IEEE-754 bits so
+    // `-0.0` cannot collapse into `0.0`; reject NaN/Infinity before JSON can
+    // lose or refuse them. Together these form a lossless immutable-ID guard.
+    let mut exact_float_bits = Vec::new();
+    for delta in &change.entity_deltas {
+        match delta {
+            EntityDelta::Added(entity) => record_entity_float_bits(
+                change.id,
+                entity,
+                "entity fingerprint stability score",
+                &mut exact_float_bits,
+            )?,
+            EntityDelta::Modified { old, new } => {
+                record_entity_float_bits(
+                    change.id,
+                    old,
+                    "old entity fingerprint stability score",
+                    &mut exact_float_bits,
+                )?;
+                record_entity_float_bits(
+                    change.id,
+                    new,
+                    "new entity fingerprint stability score",
+                    &mut exact_float_bits,
+                )?;
+            }
+            EntityDelta::Removed(_) => {}
+        }
+    }
+    for delta in &change.relation_deltas {
+        if let RelationDelta::Added(relation) = delta {
+            record_change_float(
+                change.id,
+                "relation confidence",
+                relation.confidence,
+                &mut exact_float_bits,
+            )?;
+        }
+    }
+    Ok(SemanticChangePayload {
+        canonical_json: serde_json::to_value(change)?,
+        exact_float_bits,
+    })
+}
+
 fn build_artifact_indexes_from_paths<I>(
     paths: I,
 ) -> (
@@ -7080,7 +7157,16 @@ impl ChangeStore for InMemoryGraph {
     }
 
     fn create_change(&self, change: &SemanticChange) -> Result<(), KinDbError> {
+        let payload = semantic_change_payload(change)?;
         let mut ent = self.entities.write();
+        let mut chg = self.changes.write();
+        if let Some(existing) = chg.changes.get(&change.id) {
+            if semantic_change_payload(existing)? == payload {
+                return Ok(());
+            }
+            return Err(KinDbError::DuplicateChange(change.id.to_string()));
+        }
+
         let superseded_revisions = append_entity_revisions(&mut ent, change);
         #[cfg(feature = "vector")]
         self.note_superseded_vectors(&superseded_revisions);
@@ -7103,10 +7189,6 @@ impl ChangeStore for InMemoryGraph {
         for (entity_id, revisions) in revision_updates {
             self.record_entity_revisions_delta_upsert(entity_id, revisions);
         }
-        drop(ent);
-
-        let mut chg = self.changes.write();
-
         // Register in parent → children index
         for parent in &change.parents {
             let children = chg.change_children.entry(*parent).or_default();
@@ -7297,6 +7379,35 @@ impl InMemoryGraph {
         // import to readers instead of exposing a partially registered DAG.
         let mut ent = self.entities.write();
         let mut chg = self.changes.write();
+
+        // Validate every ID before touching revisions, child indexes, live
+        // changes, or pending deltas. Existing structurally equivalent,
+        // bit-exact payloads are idempotent; a differing payload under the
+        // same content identity is corruption and rejects the whole batch
+        // atomically.
+        let mut unique_changes = Vec::with_capacity(changes.len());
+        let mut batch_payloads = HashMap::new();
+        for change in changes {
+            let payload = semantic_change_payload(&change)?;
+            if let Some(existing) = chg.changes.get(&change.id) {
+                if semantic_change_payload(existing)? == payload {
+                    continue;
+                }
+                return Err(KinDbError::DuplicateChange(change.id.to_string()));
+            }
+            if let Some(existing_payload) = batch_payloads.get(&change.id) {
+                if existing_payload == &payload {
+                    continue;
+                }
+                return Err(KinDbError::DuplicateChange(change.id.to_string()));
+            }
+            batch_payloads.insert(change.id, payload);
+            unique_changes.push(change);
+        }
+        if unique_changes.is_empty() {
+            return Ok(());
+        }
+
         let mut pending = self.pending_delta.lock();
 
         let mut touched_entities = Vec::new();
@@ -7304,9 +7415,9 @@ impl InMemoryGraph {
         let mut touched_parents = Vec::new();
         let mut seen_parents = HashSet::new();
         let mut superseded_revisions = Vec::new();
-        let mut pending_changes = Vec::with_capacity(changes.len());
+        let mut pending_changes = Vec::with_capacity(unique_changes.len());
 
-        for change in changes {
+        for change in unique_changes {
             superseded_revisions.extend(append_entity_revisions(&mut ent, &change));
             for entity_id in change.entity_deltas.iter().map(|delta| match delta {
                 EntityDelta::Added(entity) | EntityDelta::Modified { new: entity, .. } => entity.id,
@@ -9950,6 +10061,242 @@ mod tests {
     }
 
     #[test]
+    fn create_change_is_idempotent_only_for_identical_payload() {
+        let graph = InMemoryGraph::new();
+        let parent = SemanticChangeId::from_hash(Hash256::from_bytes([0x31; 32]));
+        let change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x32; 32])),
+            parents: vec![parent],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("agent"),
+            message: "immutable payload".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+
+        graph.create_change(&change).unwrap();
+        graph
+            .create_change(&change)
+            .expect("identical retry is idempotent");
+        let snapshot = graph.to_snapshot();
+        assert_eq!(snapshot.changes.len(), 1);
+        assert_eq!(
+            snapshot.change_children.get(&parent),
+            Some(&vec![change.id])
+        );
+
+        let mut conflicting = change.clone();
+        conflicting.message = "different payload".to_string();
+        let error = graph
+            .create_change(&conflicting)
+            .expect_err("same id with different payload must be rejected");
+        assert!(matches!(error, KinDbError::DuplicateChange(_)));
+        assert_eq!(
+            graph.get_change(&change.id).unwrap().unwrap().message,
+            "immutable payload"
+        );
+        assert_eq!(
+            graph.to_snapshot().change_children.get(&parent),
+            Some(&vec![change.id])
+        );
+    }
+
+    #[test]
+    fn create_change_immutable_float_comparison_preserves_ieee_bits() {
+        let graph = InMemoryGraph::new();
+        let mut entity = test_entity("float_identity", "src/lib.rs");
+        entity.fingerprint.stability_score = 0.0;
+        let change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x3d; 32])),
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("agent"),
+            message: "exact float payload".to_string(),
+            entity_deltas: vec![EntityDelta::Added(entity)],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+        graph.create_change(&change).unwrap();
+
+        let mut conflicting = change.clone();
+        let EntityDelta::Added(entity) = &mut conflicting.entity_deltas[0] else {
+            unreachable!("fixture contains one added entity")
+        };
+        entity.fingerprint.stability_score = -0.0;
+        let error = graph
+            .create_change(&conflicting)
+            .expect_err("different IEEE-754 payload bits must not be idempotent");
+        assert!(matches!(error, KinDbError::DuplicateChange(_)));
+
+        let stored = graph.get_change(&change.id).unwrap().unwrap();
+        let EntityDelta::Added(entity) = &stored.entity_deltas[0] else {
+            unreachable!("stored fixture contains one added entity")
+        };
+        assert_eq!(
+            entity.fingerprint.stability_score.to_bits(),
+            0.0f32.to_bits()
+        );
+    }
+
+    #[test]
+    fn create_change_rejects_non_finite_float_before_mutation() {
+        let graph = InMemoryGraph::new();
+        let mut entity = test_entity("non_finite", "src/lib.rs");
+        entity.fingerprint.stability_score = f32::NAN;
+        let change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x3e; 32])),
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("agent"),
+            message: "invalid float payload".to_string(),
+            entity_deltas: vec![EntityDelta::Added(entity)],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+
+        let error = graph
+            .create_change(&change)
+            .expect_err("non-finite immutable payloads must fail closed");
+        assert!(error.to_string().contains("non-finite"));
+        assert!(graph.to_snapshot().changes.is_empty());
+        assert!(!graph.has_pending_delta());
+    }
+
+    #[test]
+    fn create_changes_rejects_conflicting_batch_before_any_mutation() {
+        let graph = InMemoryGraph::new();
+        let entity = test_entity("must_not_land", "src/lib.rs");
+        let id = SemanticChangeId::from_hash(Hash256::from_bytes([0x41; 32]));
+        let first = SemanticChange {
+            id,
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("agent"),
+            message: "first".to_string(),
+            entity_deltas: vec![EntityDelta::Added(entity)],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+        let mut conflicting = first.clone();
+        conflicting.message = "conflict".to_string();
+
+        let error = graph
+            .create_changes(vec![first, conflicting])
+            .expect_err("conflicting duplicate must reject the whole batch");
+        assert!(matches!(error, KinDbError::DuplicateChange(_)));
+        let snapshot = graph.to_snapshot();
+        assert!(snapshot.changes.is_empty());
+        assert!(snapshot.entity_revisions.is_empty());
+        assert!(snapshot.change_children.is_empty());
+        assert!(!graph.has_pending_delta());
+    }
+
+    #[test]
+    fn create_changes_float_conflict_rejects_the_whole_batch() {
+        let graph = InMemoryGraph::new();
+        let mut entity = test_entity("batch_float_identity", "src/lib.rs");
+        entity.fingerprint.stability_score = 0.0;
+        let first = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32])),
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("agent"),
+            message: "batch exact float payload".to_string(),
+            entity_deltas: vec![EntityDelta::Added(entity)],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+        let mut conflicting = first.clone();
+        let EntityDelta::Added(entity) = &mut conflicting.entity_deltas[0] else {
+            unreachable!("fixture contains one added entity")
+        };
+        entity.fingerprint.stability_score = -0.0;
+
+        let error = graph
+            .create_changes(vec![first, conflicting])
+            .expect_err("bit-distinct floats under one ID must reject the whole batch");
+        assert!(matches!(error, KinDbError::DuplicateChange(_)));
+        let snapshot = graph.to_snapshot();
+        assert!(snapshot.changes.is_empty());
+        assert!(snapshot.entity_revisions.is_empty());
+        assert!(!graph.has_pending_delta());
+    }
+
+    #[test]
+    fn create_changes_non_finite_payload_rejects_prior_valid_entries_atomically() {
+        let graph = InMemoryGraph::new();
+        let valid = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x43; 32])),
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("agent"),
+            message: "valid first entry".to_string(),
+            entity_deltas: vec![EntityDelta::Added(test_entity("valid", "src/valid.rs"))],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+        let source = test_entity("source", "src/source.rs");
+        let target = test_entity("target", "src/target.rs");
+        let mut relation = test_relation(source.id, target.id, RelationKind::Calls);
+        relation.confidence = f32::INFINITY;
+        let invalid = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x44; 32])),
+            parents: vec![valid.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("agent"),
+            message: "invalid later entry".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![RelationDelta::Added(relation)],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+
+        let error = graph
+            .create_changes(vec![valid, invalid])
+            .expect_err("a later non-finite payload must reject the batch before mutation");
+        assert!(error.to_string().contains("non-finite relation confidence"));
+        let snapshot = graph.to_snapshot();
+        assert!(snapshot.changes.is_empty());
+        assert!(snapshot.entity_revisions.is_empty());
+        assert!(!graph.has_pending_delta());
+    }
+
+    #[test]
     fn create_changes_batch_matches_sequential_state_and_delta_bytes() {
         let sequential = InMemoryGraph::new();
         let batched = InMemoryGraph::new();
@@ -12096,7 +12443,11 @@ mod tests {
     /// `EntityRevision` per entity (mirrors `kin init`, whose change id is seeded
     /// with a timestamp so every re-init mints new revision keys).
     #[cfg(feature = "vector")]
-    fn apply_init_change(graph: &InMemoryGraph, change_byte: u8, entities: &[Entity]) {
+    fn apply_init_change(
+        graph: &InMemoryGraph,
+        change_byte: u8,
+        entities: &[Entity],
+    ) -> SemanticChange {
         let change = SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([change_byte; 32])),
             parents: vec![],
@@ -12117,6 +12468,7 @@ mod tests {
         };
         graph.create_change(&change).unwrap();
         graph.batch_upsert_entities(entities).unwrap();
+        change
     }
 
     /// Synthetically "embed" every current graph-truth retrievable key by
@@ -12218,12 +12570,15 @@ mod tests {
             ent.entity_revisions.values().map(|v| v.len()).sum()
         };
 
-        apply_init_change(&graph, 0x01, &entities);
+        let first_change = apply_init_change(&graph, 0x01, &entities);
         assert_eq!(rev_count(&graph), 1);
         assert_eq!(graph.graph_truth_retrievable_keys().len(), 2);
 
-        // Same change id (same-second re-init) — no new revision.
-        apply_init_change(&graph, 0x01, &entities);
+        // Retrying the exact same change payload is idempotent and does not
+        // append a revision. Reusing the ID for a different payload is rejected
+        // by the immutable-change guard.
+        graph.create_change(&first_change).unwrap();
+        graph.batch_upsert_entities(&entities).unwrap();
         assert_eq!(rev_count(&graph), 1, "same-id re-init must not duplicate");
 
         // Fresh change id (re-init seconds later) — still unchanged content, so

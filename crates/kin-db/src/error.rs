@@ -6,11 +6,17 @@ use thiserror::Error;
 /// Errors returned by KinDB operations.
 #[derive(Debug, Error)]
 pub enum KinDbError {
+    #[error(transparent)]
+    Model(#[from] kin_model::ModelError),
+
     #[error("entity not found: {0}")]
     NotFound(String),
 
     #[error("duplicate entity: {0}")]
     DuplicateEntity(String),
+
+    #[error("semantic change id already exists with a different payload: {0}")]
+    DuplicateChange(String),
 
     #[error("storage error: {0}")]
     StorageError(String),
@@ -68,3 +74,21 @@ impl KinDbError {
 }
 
 pub type Result<T> = std::result::Result<T, KinDbError>;
+
+#[cfg(test)]
+mod tests {
+    use super::KinDbError;
+
+    #[test]
+    fn model_history_errors_preserve_their_typed_cause() {
+        let error = KinDbError::from(kin_model::ModelError::ChangeNotFound(
+            "missing-parent".to_string(),
+        ));
+
+        assert!(matches!(
+            error,
+            KinDbError::Model(kin_model::ModelError::ChangeNotFound(id))
+                if id == "missing-parent"
+        ));
+    }
+}

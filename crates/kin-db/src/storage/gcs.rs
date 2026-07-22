@@ -11,6 +11,7 @@
 //! Object layout in the bucket:
 //! ```text
 //! {prefix}/{repo_id}/graph.kndb              — checksummed full-authority snapshot envelope
+//! {prefix}/{repo_id}/source-blobs/sha256/HH/HASH — immutable exact source bytes
 //! {prefix}/{repo_id}/overlays/{session_id}.bin — overlay state
 //! ```
 
@@ -19,13 +20,16 @@ use std::sync::OnceLock;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path as ObjectPath;
 use object_store::{
-    ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
+    GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
+    UpdateVersion,
 };
 use sha2::{Digest, Sha256};
 
 use crate::error::KinDbError;
 use crate::storage::backend::{
-    Generation, SnapshotAuthority, SnapshotRecoveryState, StorageBackend, GENERATION_INIT,
+    validate_source_blob_repo_id, validate_source_blob_size, verify_source_blob_digest, Generation,
+    SnapshotAuthority, SnapshotRecoveryState, StorageBackend, GENERATION_INIT,
+    MAX_SOURCE_BLOB_BYTES,
 };
 
 const GCS_FULL_AUTHORITY_MAGIC: [u8; 8] = *b"KNGCSF02";
@@ -92,6 +96,17 @@ impl GcsBackend {
                 self.prefix
             ))
         }
+    }
+
+    fn source_blob_path(&self, repo_id: &str, digest: [u8; 32]) -> Result<ObjectPath, KinDbError> {
+        validate_source_blob_repo_id(repo_id)?;
+        let digest = hex::encode(digest);
+        let suffix = format!("{repo_id}/source-blobs/sha256/{}/{}", &digest[..2], digest);
+        Ok(if self.prefix.is_empty() {
+            ObjectPath::from(suffix)
+        } else {
+            ObjectPath::from(format!("{}/{suffix}", self.prefix))
+        })
     }
 
     fn deltas_prefix(&self, repo_id: &str) -> ObjectPath {
@@ -322,6 +337,112 @@ impl StorageBackend for GcsBackend {
         Ok(self
             .load_snapshot_authority(repo_id)?
             .map(|authority| (authority.snapshot_bytes, authority.snapshot_generation)))
+    }
+
+    fn save_source_blob(
+        &self,
+        repo_id: &str,
+        digest: [u8; 32],
+        data: &[u8],
+    ) -> Result<(), KinDbError> {
+        validate_source_blob_repo_id(repo_id)?;
+        let byte_len = u64::try_from(data.len()).map_err(|_| {
+            KinDbError::StorageError(format!(
+                "immutable source blob for repo {repo_id} does not fit the size boundary"
+            ))
+        })?;
+        validate_source_blob_size(byte_len, &format!("repo {repo_id}"))?;
+        verify_source_blob_digest(digest, data, &format!("repo {repo_id}"))?;
+        let path = self.source_blob_path(repo_id, digest)?;
+        let result = self.block_on(self.store.put_opts(
+            &path,
+            PutPayload::from(data.to_vec()),
+            PutOptions {
+                mode: PutMode::Create,
+                ..PutOptions::default()
+            },
+        ));
+
+        if let Err(write_error) = result {
+            return match self.load_source_blob(repo_id, digest) {
+                Ok(Some(existing)) if existing == data => Ok(()),
+                Ok(Some(_)) => Err(KinDbError::StorageError(format!(
+                    "immutable GCS source blob collision at {path}; create failed: {write_error}"
+                ))),
+                Ok(None) => Err(KinDbError::StorageError(format!(
+                    "GCS source blob create failed for {path}: {write_error}"
+                ))),
+                Err(read_error) => Err(KinDbError::StorageError(format!(
+                    "GCS source blob create failed for {path}: {write_error}; retry verification failed: {read_error}"
+                ))),
+            };
+        }
+
+        let installed = self.load_source_blob(repo_id, digest)?.ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "GCS acknowledged immutable source blob create but {path} is missing"
+            ))
+        })?;
+        if installed != data {
+            return Err(KinDbError::StorageError(format!(
+                "immutable GCS source blob changed while installing {path}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn load_source_blob(
+        &self,
+        repo_id: &str,
+        digest: [u8; 32],
+    ) -> Result<Option<Vec<u8>>, KinDbError> {
+        validate_source_blob_repo_id(repo_id)?;
+        let path = self.source_blob_path(repo_id, digest)?;
+        let metadata = match self.block_on(self.store.head(&path)) {
+            Ok(metadata) => metadata,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => {
+                return Err(KinDbError::StorageError(format!(
+                    "GCS source blob metadata load failed for {path}: {error}"
+                )))
+            }
+        };
+        validate_source_blob_size(metadata.size, path.as_ref())?;
+        // Object stores commonly reject a bounded 0..N range request for an
+        // existing zero-byte object. Its HEAD metadata is authoritative enough
+        // to avoid that invalid range; the digest still verifies the identity.
+        if metadata.size == 0 {
+            let data = Vec::new();
+            verify_source_blob_digest(digest, &data, path.as_ref())?;
+            return Ok(Some(data));
+        }
+        let get_result = match self.block_on(self.store.get_opts(
+            &path,
+            GetOptions {
+                range: Some(GetRange::Bounded(
+                    0..MAX_SOURCE_BLOB_BYTES.saturating_add(1),
+                )),
+                ..GetOptions::default()
+            },
+        )) {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => {
+                return Err(KinDbError::StorageError(format!(
+                    "GCS source blob load failed for {path}: {error}"
+                )))
+            }
+        };
+        validate_source_blob_size(get_result.meta.size, path.as_ref())?;
+        let bytes = self.block_on(get_result.bytes()).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "GCS source blob read bytes failed for {path}: {error}"
+            ))
+        })?;
+        let data = bytes.to_vec();
+        validate_source_blob_size(data.len() as u64, path.as_ref())?;
+        verify_source_blob_digest(digest, &data, path.as_ref())?;
+        Ok(Some(data))
     }
 
     fn load_snapshot_authority(
@@ -582,8 +703,8 @@ mod tests {
     use futures_util::StreamExt;
     use object_store::memory::InMemory;
     use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions,
-        PutResult, Result as ObjectStoreResult,
+        CopyOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions, PutResult,
+        Result as ObjectStoreResult,
     };
     use std::collections::HashMap;
     use std::fmt;
@@ -602,6 +723,7 @@ mod tests {
         inner: InMemory,
         state: Arc<tokio::sync::Mutex<VersionState>>,
         fail_next_delete: Arc<AtomicBool>,
+        report_next_get_as_oversized: Arc<AtomicBool>,
     }
 
     impl VersionedMemoryStore {
@@ -613,11 +735,17 @@ mod tests {
                     versions: HashMap::new(),
                 })),
                 fail_next_delete: Arc::new(AtomicBool::new(false)),
+                report_next_get_as_oversized: Arc::new(AtomicBool::new(false)),
             }
         }
 
         fn fail_next_delete(&self) {
             self.fail_next_delete.store(true, Ordering::SeqCst);
+        }
+
+        fn report_next_get_as_oversized(&self) {
+            self.report_next_get_as_oversized
+                .store(true, Ordering::SeqCst);
         }
 
         fn precondition_error(path: &ObjectPath, message: String) -> object_store::Error {
@@ -695,6 +823,12 @@ mod tests {
             let mut result = self.inner.get_opts(location, options).await?;
             let state = self.state.lock().await;
             Self::apply_version(&mut result.meta, &state);
+            if self
+                .report_next_get_as_oversized
+                .swap(false, Ordering::SeqCst)
+            {
+                result.meta.size = MAX_SOURCE_BLOB_BYTES + 1;
+            }
             Ok(result)
         }
 
@@ -778,6 +912,107 @@ mod tests {
 
     fn test_backend() -> GcsBackend {
         GcsBackend::from_store(Box::new(InMemory::new()), "test")
+    }
+
+    fn source_digest(data: &[u8]) -> [u8; 32] {
+        Sha256::digest(data).into()
+    }
+
+    #[test]
+    fn gcs_source_blob_roundtrips_retries_and_reports_missing() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        let data = b"immutable cloud source bytes";
+        let digest = source_digest(data);
+
+        assert!(backend
+            .load_source_blob("repo-a", digest)
+            .unwrap()
+            .is_none());
+        backend.save_source_blob("repo-a", digest, data).unwrap();
+        backend.save_source_blob("repo-a", digest, data).unwrap();
+        drop(backend);
+        let reopened = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        assert_eq!(
+            reopened.load_source_blob("repo-a", digest).unwrap(),
+            Some(data.to_vec())
+        );
+        assert!(reopened
+            .load_source_blob("repo-b", digest)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn gcs_source_blob_roundtrips_zero_length_object() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        let data = b"";
+        let digest = source_digest(data);
+
+        backend.save_source_blob("repo-a", digest, data).unwrap();
+        assert_eq!(
+            backend.load_source_blob("repo-a", digest).unwrap(),
+            Some(Vec::new())
+        );
+        backend
+            .save_source_blob("repo-a", digest, data)
+            .expect("zero-byte immutable retry remains idempotent");
+    }
+
+    #[test]
+    fn gcs_source_blob_rejects_wrong_digest_corruption_and_unsafe_repo_id() {
+        let backend = test_backend();
+        let data = b"expected";
+        let digest = source_digest(data);
+
+        let wrong_digest_error = backend
+            .save_source_blob("repo-a", source_digest(b"different"), data)
+            .expect_err("write identity must bind exact bytes");
+        assert!(wrong_digest_error.to_string().contains("digest mismatch"));
+        for repo_id in ["", ".", "..", "../escape", "owner/repo"] {
+            let error = backend
+                .load_source_blob(repo_id, digest)
+                .expect_err("repo id must not control a GCS object path");
+            assert!(error.to_string().contains("invalid repo id"));
+        }
+
+        let path = backend.source_blob_path("repo-a", digest).unwrap();
+        backend
+            .block_on(
+                backend
+                    .store
+                    .put(&path, PutPayload::from(b"corrupt".to_vec())),
+            )
+            .unwrap();
+        let read_error = backend
+            .load_source_blob("repo-a", digest)
+            .expect_err("corrupt immutable object must fail closed");
+        assert!(read_error.to_string().contains("digest mismatch"));
+        let retry_error = backend
+            .save_source_blob("repo-a", digest, data)
+            .expect_err("create retry must not replace corrupt authority");
+        assert!(retry_error
+            .to_string()
+            .contains("retry verification failed"));
+    }
+
+    #[test]
+    fn gcs_source_blob_rejects_oversized_metadata_before_body_read() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        let data = b"small payload with hostile reported size";
+        let digest = source_digest(data);
+        let path = backend.source_blob_path("repo-a", digest).unwrap();
+        backend
+            .block_on(backend.store.put(&path, PutPayload::from(data.to_vec())))
+            .unwrap();
+        store.report_next_get_as_oversized();
+
+        let error = backend
+            .load_source_blob("repo-a", digest)
+            .expect_err("oversized object metadata must fail before body allocation");
+        assert!(error.to_string().contains("safety limit"));
     }
 
     #[test]

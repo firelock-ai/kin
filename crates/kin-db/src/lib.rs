@@ -36,6 +36,7 @@ pub use storage::{
 pub use storage::{
     load_recovered_snapshot, Generation, LocalFileBackend, PersistedDelta, RecoveredSnapshot,
     SnapshotAuthority, SnapshotRecoveryState, StorageBackend, GENERATION_INIT,
+    MAX_SOURCE_BLOB_BYTES,
 };
 pub use storage::{LoadStrategy, SystemMemInfo, TieredConfig, TieredGraph};
 pub use storage::{

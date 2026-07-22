@@ -15,6 +15,8 @@ use crate::storage::format::{GraphSnapshot, LocateGraphSnapshot};
 #[cfg(test)]
 std::thread_local! {
     static PARENT_SYNC_FAILURE_COUNTDOWN: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static READ_REGULAR_AFTER_METADATA_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static PROMOTION_AFTER_VALIDATION_HOOK:
         std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static CONFIRM_BEFORE_MARKER_CLAIM_HOOK:
@@ -27,6 +29,23 @@ std::thread_local! {
 pub(crate) fn fail_parent_sync_after(successful_syncs: usize) {
     PARENT_SYNC_FAILURE_COUNTDOWN.with(|countdown| countdown.set(Some(successful_syncs)));
 }
+
+#[cfg(test)]
+pub(crate) fn set_read_regular_after_metadata_hook(hook: impl FnOnce() + 'static) {
+    READ_REGULAR_AFTER_METADATA_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_read_regular_after_metadata_hook() {
+    READ_REGULAR_AFTER_METADATA_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_read_regular_after_metadata_hook() {}
 
 #[cfg(test)]
 fn set_promotion_after_validation_hook(hook: impl FnOnce() + 'static) {
@@ -192,6 +211,30 @@ fn normalized_parent(path: &Path) -> Option<&Path> {
 }
 
 pub(crate) fn sync_parent_dir(path: &Path) -> Result<(), KinDbError> {
+    let Some(parent) = normalized_parent(path) else {
+        return Ok(());
+    };
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        let dir = File::open(parent).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to open parent directory {} for fsync: {error}",
+                parent.display()
+            ))
+        })?;
+        sync_directory_handle(&dir, parent)
+    }
+}
+
+/// Fsync an already-pinned directory handle. Capability-style storage paths
+/// use this instead of reopening a path after validation, which would
+/// reintroduce an ancestor-swap race.
+pub(crate) fn sync_directory_handle(dir: &File, display_path: &Path) -> Result<(), KinDbError> {
     #[cfg(test)]
     let inject_failure = PARENT_SYNC_FAILURE_COUNTDOWN.with(|countdown| match countdown.get() {
         Some(0) => {
@@ -209,29 +252,20 @@ pub(crate) fn sync_parent_dir(path: &Path) -> Result<(), KinDbError> {
     if inject_failure {
         return Err(KinDbError::StorageError(format!(
             "injected parent-directory fsync failure for {}",
-            path.display()
+            display_path.display()
         )));
     }
-    let Some(parent) = normalized_parent(path) else {
-        return Ok(());
-    };
     #[cfg(not(unix))]
     {
-        let _ = parent;
+        let _ = (dir, display_path);
         Ok(())
     }
     #[cfg(unix)]
     {
-        let dir = File::open(parent).map_err(|error| {
-            KinDbError::StorageError(format!(
-                "failed to open parent directory {} for fsync: {error}",
-                parent.display()
-            ))
-        })?;
         dir.sync_all().map_err(|error| {
             KinDbError::StorageError(format!(
                 "failed to fsync parent directory {}: {error}",
-                parent.display()
+                display_path.display()
             ))
         })
     }
@@ -290,7 +324,7 @@ pub(crate) fn read_regular_bounded(
     role: &str,
     max_bytes: u64,
 ) -> Result<Vec<u8>, KinDbError> {
-    let file = open_regular_nofollow(path, role)?;
+    let mut file = open_regular_nofollow(path, role)?;
     let len = file
         .metadata()
         .map_err(|error| {
@@ -306,22 +340,52 @@ pub(crate) fn read_regular_bounded(
             path.display()
         )));
     }
+    run_read_regular_after_metadata_hook();
     let capacity = usize::try_from(len).map_err(|_| {
         KinDbError::StorageError(format!(
             "{role} {} length does not fit in memory",
             path.display()
         ))
     })?;
-    let mut bytes = Vec::with_capacity(capacity);
-    file.take(max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|error| {
-            KinDbError::StorageError(format!("failed to read {role} {}: {error}", path.display()))
-        })?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(KinDbError::StorageError(format!(
-            "{role} {} grew above the {max_bytes}-byte safety limit while reading",
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to reserve {len} bytes for {role} {}: {error}",
             path.display()
+        ))
+    })?;
+    bytes.resize(capacity, 0);
+    file.read_exact(&mut bytes).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "{role} {} changed length while reading {len} bytes: {error}",
+            path.display()
+        ))
+    })?;
+
+    // Probe growth separately instead of asking `read_to_end` for max + 1
+    // bytes. `read_to_end` may geometrically over-allocate before reporting
+    // the boundary; this keeps the heap allocation fixed at the validated
+    // pre-read length, which is already known to be at most `max_bytes`.
+    let mut trailing = [0u8; 1];
+    let trailing_len = file.read(&mut trailing).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to verify the final length of {role} {}: {error}",
+            path.display()
+        ))
+    })?;
+    let final_len = file
+        .metadata()
+        .map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to reinspect {role} {} after reading: {error}",
+                path.display()
+            ))
+        })?
+        .len();
+    if trailing_len != 0 || final_len != len {
+        return Err(KinDbError::StorageError(format!(
+            "{role} {} changed length while reading: expected {len} bytes, found at least {final_len}; the {max_bytes}-byte allocation safety limit remains enforced",
+            path.display(),
         )));
     }
     Ok(bytes)
@@ -1109,6 +1173,23 @@ mod tests {
         atomic_write(&path, &snap).unwrap();
         let loaded = MmapReader::open(&path).unwrap();
         assert_eq!(loaded.version, GraphSnapshot::CURRENT_VERSION);
+    }
+
+    #[test]
+    fn bounded_read_rejects_concurrent_growth_without_allocating_past_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bounded");
+        std::fs::write(&path, b"12345678").unwrap();
+        let growing_path = path.clone();
+        set_read_regular_after_metadata_hook(move || {
+            let mut file = OpenOptions::new().append(true).open(growing_path).unwrap();
+            file.write_all(b"9").unwrap();
+        });
+
+        let error = read_regular_bounded(&path, "bounded test object", 8)
+            .expect_err("growth after metadata must fail without a ninth heap byte");
+        assert!(error.to_string().contains("allocation safety limit"));
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 9);
     }
 
     #[test]
