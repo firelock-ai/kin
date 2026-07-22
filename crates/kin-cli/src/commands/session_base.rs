@@ -17,9 +17,13 @@
 //! the workspace on cleanup.
 
 use std::collections::BTreeMap;
+#[cfg(any(unix, windows))]
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+#[cfg(any(unix, windows))]
+use cap_fs_ext::{DirExt, OpenOptionsFollowExt};
 use serde::{Deserialize, Serialize};
 
 /// Workspace-relative directory that holds Kin's session-runtime metadata.
@@ -117,4 +121,124 @@ pub(crate) fn load_base(session_dir: &Path) -> Result<Option<SessionBase>> {
 pub fn record_materialized_base(session_dir: &Path, base_head: Option<String>) -> Result<()> {
     let files = hash_dir(session_dir)?;
     write_base(session_dir, &SessionBase { base_head, files })
+}
+
+#[cfg(any(unix, windows))]
+pub fn record_materialized_base_from_dir(
+    session_dir: &cap_std::fs::Dir,
+    base_head: Option<String>,
+) -> Result<()> {
+    let mut files = BTreeMap::new();
+    hash_capability_dir(session_dir, Path::new(""), &mut files)?;
+
+    session_dir.create_dir(META_DIR).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to create capability-rooted session metadata directory: {}",
+            error
+        )
+    })?;
+    let metadata_dir = session_dir.open_dir_nofollow(META_DIR).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to open capability-rooted session metadata directory: {}",
+            error
+        )
+    })?;
+    let json = serde_json::to_vec_pretty(&SessionBase { base_head, files })
+        .map_err(|error| anyhow::anyhow!("failed to serialize session base: {}", error))?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut base_file = metadata_dir
+        .open_with(BASE_FILE, &options)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to create capability-rooted session base manifest: {}",
+                error
+            )
+        })?;
+    base_file.write_all(&json).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to write capability-rooted session base manifest: {}",
+            error
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+fn hash_capability_dir(
+    dir: &cap_std::fs::Dir,
+    relative_dir: &Path,
+    manifest: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    let entries = dir.entries().map_err(|error| {
+        anyhow::anyhow!(
+            "failed to enumerate capability-rooted session directory '{}': {}",
+            relative_dir.display(),
+            error
+        )
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            anyhow::anyhow!(
+                "failed to inspect capability-rooted session directory '{}': {}",
+                relative_dir.display(),
+                error
+            )
+        })?;
+        let name = entry.file_name();
+        let name_display = name.to_string_lossy();
+        if kin_index::should_skip_dir(&name_display) {
+            continue;
+        }
+
+        let relative_path = relative_dir.join(&name);
+        let file_type = entry.file_type().map_err(|error| {
+            anyhow::anyhow!(
+                "failed to inspect capability-rooted session entry '{}': {}",
+                relative_path.display(),
+                error
+            )
+        })?;
+        if file_type.is_dir() {
+            let child = dir.open_dir_nofollow(&name).map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to open capability-rooted session directory '{}': {}",
+                    relative_path.display(),
+                    error
+                )
+            })?;
+            hash_capability_dir(&child, &relative_path, manifest)?;
+        } else if file_type.is_file() {
+            let mut options = cap_std::fs::OpenOptions::new();
+            options.read(true);
+            options.follow(cap_fs_ext::FollowSymlinks::No);
+            let mut file = dir.open_with(&name, &options).map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to open capability-rooted session file '{}': {}",
+                    relative_path.display(),
+                    error
+                )
+            })?;
+            let mut content = Vec::new();
+            file.read_to_end(&mut content).map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to read capability-rooted session file '{}': {}",
+                    relative_path.display(),
+                    error
+                )
+            })?;
+            manifest.insert(
+                relative_path.to_string_lossy().into_owned(),
+                kin_blobs::digest(&content).to_string(),
+            );
+        } else {
+            anyhow::bail!(
+                "session base hashing rejected special entry '{}'",
+                relative_path.display()
+            );
+        }
+    }
+
+    Ok(())
 }
