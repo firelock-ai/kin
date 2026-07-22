@@ -301,7 +301,11 @@ impl AuthorityRoot {
         {
             let (parent, name) = self.capability_parent_and_name(relative, false)?;
             let mut options = CapabilityOpenOptions::new();
-            options.append(true).follow(FollowSymlinks::No);
+            // Windows requires generic write access for `set_len`, which the
+            // upload rollback path uses after a rejected or cancelled append.
+            // Append-only access is sufficient on Unix but cannot truncate a
+            // Windows handle back to the durable metadata offset.
+            options.write(true).append(true).follow(FollowSymlinks::No);
             open_capability_regular_file(&parent, &name, &options, "registry upload data")
         }
     }
@@ -1512,6 +1516,22 @@ mod tests {
 
         assert_eq!(before.len, after.len);
         assert_ne!((before.device, before.inode), (after.device, after.inode));
+    }
+
+    #[test]
+    fn append_handle_can_rollback_to_the_durable_offset() {
+        let root = tempfile::tempdir().unwrap();
+        let authority = AuthorityRoot::new(&root.path().join("authority"));
+        let relative = Path::new("uploads/session.data");
+        authority.write(relative, b"durable").unwrap();
+
+        let mut file = authority.open_append(relative).unwrap();
+        file.write_all(b"-uncommitted").unwrap();
+        file.set_len(b"durable".len() as u64).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        assert_eq!(authority.read(relative).unwrap(), b"durable");
     }
 
     #[cfg(unix)]
