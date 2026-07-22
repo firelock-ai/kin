@@ -6,7 +6,7 @@ use std::path::Path;
 
 use gix::objs::tree::{Entry, EntryKind, EntryMode};
 use gix::objs::{Commit, Tree};
-use gix::refs::transaction::PreviousValue;
+use gix::refs::{transaction::PreviousValue, Target};
 use kin_blobs::BlobStore;
 use kin_model::{ArtifactDeltaKind, BranchName, GraphStore, SemanticChange, SemanticChangeId};
 use tracing::{debug, info, warn};
@@ -164,7 +164,7 @@ pub fn export_changes(
     // Update the branch ref to point to the latest commit.
     let mut branches_updated = 0;
     if let Some(head_id) = last_commit_id {
-        update_branch_ref(&git_repo, branch_name, head_id)?;
+        update_branch_ref(&git_repo, branch_name, existing_head, head_id)?;
         branches_updated = 1;
     }
 
@@ -442,17 +442,23 @@ fn find_branch_head(repo: &gix::Repository, branch_name: &BranchName) -> Option<
         .map(|r| r.id().detach())
 }
 
-/// Update (or create) a branch ref to point to the given commit.
+/// Update (or create) a branch ref to point to the given commit, provided its
+/// value still matches the value observed before export began.
 fn update_branch_ref(
     repo: &gix::Repository,
     branch_name: &BranchName,
+    expected_head: Option<gix::ObjectId>,
     commit_id: gix::ObjectId,
 ) -> Result<()> {
     let ref_name = format!("refs/heads/{}", branch_name.0);
+    let expected = match expected_head {
+        Some(expected_head) => PreviousValue::MustExistAndMatch(Target::Object(expected_head)),
+        None => PreviousValue::MustNotExist,
+    };
     repo.reference(
         ref_name,
         commit_id,
-        PreviousValue::Any,
+        expected,
         format!("kin export: update {}", branch_name.0),
     )
     .map_err(|e| GitError::Git(e.to_string()))?;
@@ -1538,6 +1544,62 @@ mod tests {
             .try_find_reference("refs/heads/main")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn branch_ref_update_accepts_the_observed_prior_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = gix::init_bare(tmp.path()).unwrap();
+        let branch_name = BranchName::new("main");
+        let first = repo.write_blob(b"first").unwrap().detach();
+        let second = repo.write_blob(b"second").unwrap().detach();
+
+        update_branch_ref(&repo, &branch_name, None, first).unwrap();
+        update_branch_ref(&repo, &branch_name, Some(first), second).unwrap();
+
+        assert_eq!(find_branch_head(&repo, &branch_name), Some(second));
+    }
+
+    #[test]
+    fn branch_ref_update_rejects_a_concurrent_creation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = gix::init_bare(tmp.path()).unwrap();
+        let branch_name = BranchName::new("main");
+        let concurrent = repo.write_blob(b"concurrent").unwrap().detach();
+        let exported = repo.write_blob(b"exported").unwrap().detach();
+
+        repo.reference(
+            "refs/heads/main",
+            concurrent,
+            PreviousValue::MustNotExist,
+            "concurrent create",
+        )
+        .unwrap();
+
+        assert!(update_branch_ref(&repo, &branch_name, None, exported).is_err());
+        assert_eq!(find_branch_head(&repo, &branch_name), Some(concurrent));
+    }
+
+    #[test]
+    fn branch_ref_update_rejects_a_concurrent_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = gix::init_bare(tmp.path()).unwrap();
+        let branch_name = BranchName::new("main");
+        let observed = repo.write_blob(b"observed").unwrap().detach();
+        let concurrent = repo.write_blob(b"concurrent").unwrap().detach();
+        let exported = repo.write_blob(b"exported").unwrap().detach();
+
+        update_branch_ref(&repo, &branch_name, None, observed).unwrap();
+        repo.reference(
+            "refs/heads/main",
+            concurrent,
+            PreviousValue::MustExistAndMatch(Target::Object(observed)),
+            "concurrent move",
+        )
+        .unwrap();
+
+        assert!(update_branch_ref(&repo, &branch_name, Some(observed), exported).is_err());
+        assert_eq!(find_branch_head(&repo, &branch_name), Some(concurrent));
     }
 
     #[test]
