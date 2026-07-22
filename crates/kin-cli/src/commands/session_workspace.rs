@@ -1360,6 +1360,25 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(windows)]
+    fn create_windows_junction(link: &Path, target: &Path) -> anyhow::Result<()> {
+        // Pass each mklink token separately. Supplying the whole command as one
+        // quoted `/C` argument makes cmd.exe strip the outer quotes and reject
+        // otherwise valid absolute paths on hosted Windows runners.
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "failed to create test junction: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
     #[test]
     fn native_mode_rejects_non_copy_strategies_before_file_authority_fallback() {
         let dir = tempfile::tempdir().unwrap();
@@ -2107,7 +2126,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn nested_junction_injected_after_root_creation_cannot_escape_and_is_cleaned_up() {
+    fn windows_nested_junction_injected_after_root_creation_cannot_escape_and_is_cleaned_up() {
         let dir = tempfile::tempdir().unwrap();
         let layout = init_repo(dir.path()).unwrap().layout;
         let outside = dir.path().join("outside");
@@ -2123,22 +2142,7 @@ mod tests {
             &session_dir,
             None,
             None,
-            |root| {
-                let command = format!(
-                    "mklink /J \"{}\" \"{}\"",
-                    root.join("nested").display(),
-                    outside.display()
-                );
-                let output = std::process::Command::new("cmd")
-                    .args(["/C", &command])
-                    .output()?;
-                anyhow::ensure!(
-                    output.status.success(),
-                    "failed to create test junction: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                Ok(())
-            },
+            |root| create_windows_junction(&root.join("nested"), &outside),
         )
         .unwrap_err()
         .to_string();
@@ -2155,7 +2159,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn replaced_session_child_junction_cannot_redirect_validation_or_cleanup() {
+    fn windows_replaced_session_child_junction_cannot_redirect_validation_or_cleanup() {
         let dir = tempfile::tempdir().unwrap();
         let layout = init_repo(dir.path()).unwrap().layout;
         let outside = dir.path().join("outside-session-child");
@@ -2176,20 +2180,7 @@ mod tests {
             None,
             move |child| {
                 fs::rename(child, &attack_moved_session)?;
-                let command = format!(
-                    "mklink /J \"{}\" \"{}\"",
-                    child.display(),
-                    attack_outside.display()
-                );
-                let output = std::process::Command::new("cmd")
-                    .args(["/C", &command])
-                    .output()?;
-                anyhow::ensure!(
-                    output.status.success(),
-                    "failed to create test junction: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                Ok(())
+                create_windows_junction(child, &attack_outside)
             },
         )
         .unwrap_err()
@@ -2215,7 +2206,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn direct_directory_substitution_after_capture_preserves_the_replacement() {
+    fn windows_direct_directory_substitution_after_capture_preserves_the_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let layout = init_repo(dir.path()).unwrap().layout;
         write_native_graph_file(&layout, "nested/payload.txt", b"graph payload\n").unwrap();
@@ -2265,7 +2256,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn create_to_open_nonempty_substitution_fails_without_recursive_cleanup() {
+    fn windows_create_to_open_nonempty_substitution_fails_without_recursive_cleanup() {
         let dir = tempfile::tempdir().unwrap();
         let runs = dir.path().join("runs");
         let session = runs.join("session-raced");
@@ -2295,7 +2286,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn held_parent_capability_blocks_parent_swap_until_materialization_finishes() {
+    fn windows_held_parent_capability_blocks_parent_swap_until_materialization_finishes() {
         let dir = tempfile::tempdir().unwrap();
         let layout = init_repo(dir.path()).unwrap().layout;
         let runs_dir = layout.runs_dir();
@@ -2372,20 +2363,7 @@ mod tests {
         fs::write(outside.join("sentinel.txt"), "outside\n").unwrap();
         fs::write(session.join("payload.txt"), "payload\n").unwrap();
         let junction = session.join("junction");
-        let command = format!(
-            "mklink /J \"{}\" \"{}\"",
-            junction.display(),
-            outside.display()
-        );
-        let output = std::process::Command::new("cmd")
-            .args(["/C", &command])
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "failed to create test junction: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        create_windows_junction(&junction, &outside).unwrap();
         let runs_root =
             cap_std::fs::Dir::open_ambient_dir(&runs, cap_std::ambient_authority()).unwrap();
         let session_root =
