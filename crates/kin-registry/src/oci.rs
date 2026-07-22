@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::AsyncReadExt;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, RwLockWriteGuard};
 
 const SHA256_HEX_LEN: usize = 64;
 const UPLOAD_ID_HEX_LEN: usize = 32;
@@ -76,9 +76,8 @@ impl Default for OciMetadata {
 pub struct OciRegistryState {
     blobs_dir: PathBuf,
     metadata_path: PathBuf,
+    metadata_lock_path: PathBuf,
     metadata: RwLock<OciMetadata>,
-    /// A malformed durable index is an authority failure, never an empty registry.
-    load_error: Option<String>,
     /// upload ID -> bounded, expiring partial data
     uploads: RwLock<HashMap<String, PendingUpload>>,
     /// OCI-specific secret for writes. `None` disables every mutation.
@@ -88,34 +87,17 @@ pub struct OciRegistryState {
 impl OciRegistryState {
     pub fn new(blobs_dir: PathBuf, write_token: Option<String>) -> Self {
         let metadata_path = blobs_dir.join("metadata.json");
-        let (metadata, load_error) = match std::fs::read(&metadata_path) {
-            Ok(bytes) => match serde_json::from_slice::<OciMetadata>(&bytes) {
-                Ok(metadata) if metadata.version == OCI_METADATA_VERSION => (metadata, None),
-                Ok(metadata) => (
-                    OciMetadata::default(),
-                    Some(format!(
-                        "unsupported OCI metadata version {} (expected {OCI_METADATA_VERSION})",
-                        metadata.version
-                    )),
-                ),
-                Err(error) => (
-                    OciMetadata::default(),
-                    Some(format!("cannot decode OCI metadata: {error}")),
-                ),
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                (OciMetadata::default(), None)
-            }
-            Err(error) => (
-                OciMetadata::default(),
-                Some(format!("cannot read OCI metadata: {error}")),
-            ),
-        };
+        let metadata_lock_path = blobs_dir.join(".metadata.lock");
+        // This cache is only an in-process observation surface. Every request
+        // reloads durable authority under a storage-scoped advisory lock, so a
+        // corrupt file or another daemon's publication can never be hidden by
+        // startup state.
+        let metadata = read_metadata_file(&metadata_path).unwrap_or_default();
         Self {
             blobs_dir,
             metadata_path,
+            metadata_lock_path,
             metadata: RwLock::new(metadata),
-            load_error,
             uploads: RwLock::new(HashMap::new()),
             write_token: write_token
                 .map(|token| token.trim().to_string())
@@ -342,15 +324,62 @@ fn query_parameter(query: &str, wanted: &str) -> Option<String> {
     })
 }
 
-fn metadata_error(state: &OciRegistryState) -> Option<Response> {
-    state.load_error.as_ref().map(|error| {
-        oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "UNKNOWN",
-            &format!("OCI metadata authority is unavailable: {error}"),
-            None,
-        )
-    })
+fn metadata_authority_error(error: &str) -> Response {
+    oci_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "UNKNOWN",
+        &format!("OCI metadata authority is unavailable: {error}"),
+        None,
+    )
+}
+
+fn read_metadata_file(path: &FsPath) -> Result<OciMetadata, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let metadata = serde_json::from_slice::<OciMetadata>(&bytes)
+                .map_err(|error| format!("cannot decode OCI metadata: {error}"))?;
+            if metadata.version != OCI_METADATA_VERSION {
+                return Err(format!(
+                    "unsupported OCI metadata version {} (expected {OCI_METADATA_VERSION})",
+                    metadata.version
+                ));
+            }
+            Ok(metadata)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(OciMetadata::default()),
+        Err(error) => Err(format!("cannot read OCI metadata: {error}")),
+    }
+}
+
+/// Reload the durable authority for every read. The local write guard prevents
+/// same-process readers from racing a local publisher while the shared file
+/// lock orders this snapshot against publishers in other daemon processes.
+async fn metadata_snapshot(state: &OciRegistryState) -> Result<OciMetadata, String> {
+    let mut cache = state.metadata.write().await;
+    let _storage_lock = crate::storage_lock::StorageLock::shared(&state.metadata_lock_path)
+        .map_err(|error| format!("failed to lock OCI metadata for reading: {error}"))?;
+    let fresh = read_metadata_file(&state.metadata_path)?;
+    *cache = fresh.clone();
+    Ok(fresh)
+}
+
+/// Begin a cross-process read/modify/write transaction from the latest durable
+/// metadata. Callers must keep both returned guards alive through persistence.
+async fn begin_metadata_write(
+    state: &OciRegistryState,
+) -> Result<
+    (
+        RwLockWriteGuard<'_, OciMetadata>,
+        crate::storage_lock::StorageLock,
+        OciMetadata,
+    ),
+    String,
+> {
+    let cache = state.metadata.write().await;
+    let storage_lock = crate::storage_lock::StorageLock::exclusive(&state.metadata_lock_path)
+        .map_err(|error| format!("failed to lock OCI metadata for writing: {error}"))?;
+    let fresh = read_metadata_file(&state.metadata_path)?;
+    Ok((cache, storage_lock, fresh))
 }
 
 fn persist_metadata(state: &OciRegistryState, metadata: &OciMetadata) -> Result<(), String> {
@@ -367,9 +396,6 @@ async fn get_blob_inner(
     digest: &str,
     head_only: bool,
 ) -> Response {
-    if let Some(error) = metadata_error(state) {
-        return error;
-    }
     if !valid_repository_name(name) {
         return oci_error(
             StatusCode::BAD_REQUEST,
@@ -381,10 +407,11 @@ async fn get_blob_inner(
     let Some(blob_path) = blob_path_for_digest(&state.blobs_dir, digest) else {
         return digest_invalid("invalid non-canonical blob digest", None);
     };
-    let is_member = state
-        .metadata
-        .read()
-        .await
+    let metadata = match metadata_snapshot(state).await {
+        Ok(metadata) => metadata,
+        Err(error) => return metadata_authority_error(&error),
+    };
+    let is_member = metadata
         .repositories
         .get(name)
         .is_some_and(|repository| repository.blobs.contains(digest));
@@ -440,9 +467,6 @@ async fn get_blob_inner(
 }
 
 async fn initiate_upload_inner(state: &OciRegistryState, name: &str) -> Response {
-    if let Some(error) = metadata_error(state) {
-        return error;
-    }
     if !valid_repository_name(name) {
         return oci_error(
             StatusCode::BAD_REQUEST,
@@ -450,6 +474,9 @@ async fn initiate_upload_inner(state: &OciRegistryState, name: &str) -> Response
             "invalid OCI repository name",
             None,
         );
+    }
+    if let Err(error) = metadata_snapshot(state).await {
+        return metadata_authority_error(&error);
     }
 
     let upload_id = new_upload_id(name);
@@ -486,9 +513,6 @@ async fn complete_upload_inner(
     expected_digest: Option<&str>,
     body: Bytes,
 ) -> Response {
-    if let Some(error) = metadata_error(state) {
-        return error;
-    }
     let location = upload_location(name, id);
     if !valid_repository_name(name) || !valid_upload_id(id) {
         return oci_error(
@@ -509,6 +533,9 @@ async fn complete_upload_inner(
             "completion digest must be canonical lowercase sha256",
             Some(&location),
         );
+    }
+    if let Err(error) = metadata_snapshot(state).await {
+        return metadata_authority_error(&error);
     }
 
     let mut uploads = state.uploads.write().await;
@@ -566,6 +593,15 @@ async fn complete_upload_inner(
 
     let blob_path = blob_path_for_digest(&state.blobs_dir, &computed_digest)
         .expect("computed sha256 digest is canonical");
+    let (mut metadata_guard, storage_lock, mut replacement) =
+        match begin_metadata_write(state).await {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                pending.data.truncate(partial_len);
+                state.uploads.write().await.insert(id.to_string(), pending);
+                return metadata_authority_error(&error);
+            }
+        };
     // Stage beside the digest path, fsync the complete bytes, and atomically
     // rename them into place. Public GET/HEAD requests therefore see either no
     // blob (or the prior complete blob) or the complete replacement, never a
@@ -574,6 +610,8 @@ async fn complete_upload_inner(
     if let Err(error) = write_result {
         // Preserve the pre-completion upload state so the same final request
         // can be retried after the storage failure without duplicating bytes.
+        drop(storage_lock);
+        drop(metadata_guard);
         pending.data.truncate(partial_len);
         state.uploads.write().await.insert(id.to_string(), pending);
         return oci_error(
@@ -588,8 +626,6 @@ async fn complete_upload_inner(
     // to the repository that completed the upload. Persist membership before
     // acknowledging the write; an orphaned content file after a crash is safe
     // because reads consult this durable authority first.
-    let mut metadata_guard = state.metadata.write().await;
-    let mut replacement = metadata_guard.clone();
     replacement
         .repositories
         .entry(name.to_string())
@@ -597,6 +633,8 @@ async fn complete_upload_inner(
         .blobs
         .insert(computed_digest.clone());
     if let Err(error) = persist_metadata(state, &replacement) {
+        drop(storage_lock);
+        drop(metadata_guard);
         pending.data.truncate(partial_len);
         state.uploads.write().await.insert(id.to_string(), pending);
         return oci_error(
@@ -607,6 +645,7 @@ async fn complete_upload_inner(
         );
     }
     *metadata_guard = replacement;
+    drop(storage_lock);
     drop(metadata_guard);
 
     let blob_location = format!("/v2/{name}/blobs/{computed_digest}");
@@ -626,9 +665,6 @@ async fn get_manifest_inner(
     reference: &str,
     head_only: bool,
 ) -> Response {
-    if let Some(error) = metadata_error(state) {
-        return error;
-    }
     if !valid_repository_name(name) || !valid_manifest_reference(reference) {
         return oci_error(
             StatusCode::BAD_REQUEST,
@@ -637,10 +673,11 @@ async fn get_manifest_inner(
             None,
         );
     }
-    let descriptor = state
-        .metadata
-        .read()
-        .await
+    let metadata = match metadata_snapshot(state).await {
+        Ok(metadata) => metadata,
+        Err(error) => return metadata_authority_error(&error),
+    };
+    let descriptor = metadata
         .repositories
         .get(name)
         .and_then(|repository| repository.manifests.get(reference))
@@ -696,9 +733,6 @@ async fn put_manifest_inner(
     media_type: &str,
     body: Bytes,
 ) -> Response {
-    if let Some(error) = metadata_error(state) {
-        return error;
-    }
     if !valid_repository_name(name) || !valid_manifest_reference(reference) {
         return oci_error(
             StatusCode::BAD_REQUEST,
@@ -742,6 +776,11 @@ async fn put_manifest_inner(
     }
     let manifest_path = manifest_path_for_digest(&state.blobs_dir, &digest)
         .expect("computed manifest digest is canonical");
+    let (mut metadata_guard, storage_lock, mut replacement) =
+        match begin_metadata_write(state).await {
+            Ok(transaction) => transaction,
+            Err(error) => return metadata_authority_error(&error),
+        };
     if let Err(error) = crate::atomic_file::write(&manifest_path, &body) {
         return oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -754,8 +793,6 @@ async fn put_manifest_inner(
         digest: digest.clone(),
         media_type: media_type.to_string(),
     };
-    let mut metadata_guard = state.metadata.write().await;
-    let mut replacement = metadata_guard.clone();
     let repository = replacement
         .repositories
         .entry(name.to_string())
@@ -768,6 +805,7 @@ async fn put_manifest_inner(
         return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &error, None);
     }
     *metadata_guard = replacement;
+    drop(storage_lock);
     drop(metadata_guard);
 
     let mut response = StatusCode::CREATED.into_response();
@@ -786,9 +824,6 @@ async fn put_manifest_inner(
 
 /// DELETE /v2/{name}/manifests/{reference} -- delete a manifest.
 async fn delete_manifest_inner(state: &OciRegistryState, name: &str, reference: &str) -> Response {
-    if let Some(error) = metadata_error(state) {
-        return error;
-    }
     if !valid_repository_name(name) || !valid_manifest_reference(reference) {
         return oci_error(
             StatusCode::BAD_REQUEST,
@@ -797,8 +832,11 @@ async fn delete_manifest_inner(state: &OciRegistryState, name: &str, reference: 
             None,
         );
     }
-    let mut metadata_guard = state.metadata.write().await;
-    let mut replacement = metadata_guard.clone();
+    let (mut metadata_guard, storage_lock, mut replacement) =
+        match begin_metadata_write(state).await {
+            Ok(transaction) => transaction,
+            Err(error) => return metadata_authority_error(&error),
+        };
     let Some(repository) = replacement.repositories.get_mut(name) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -816,6 +854,7 @@ async fn delete_manifest_inner(state: &OciRegistryState, name: &str, reference: 
         return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &error, None);
     }
     *metadata_guard = replacement;
+    drop(storage_lock);
     StatusCode::ACCEPTED.into_response()
 }
 
@@ -981,9 +1020,8 @@ mod tests {
     async fn seed_blob(state: &OciRegistryState, repository: &str, bytes: &[u8]) -> String {
         let digest = format!("sha256:{}", sha2_hex(bytes));
         let blob_path = blob_path_for_digest(&state.blobs_dir, &digest).unwrap();
+        let (mut guard, storage_lock, mut replacement) = begin_metadata_write(state).await.unwrap();
         crate::atomic_file::write(&blob_path, bytes).unwrap();
-        let mut guard = state.metadata.write().await;
-        let mut replacement = guard.clone();
         replacement
             .repositories
             .entry(repository.to_string())
@@ -992,6 +1030,7 @@ mod tests {
             .insert(digest.clone());
         persist_metadata(state, &replacement).unwrap();
         *guard = replacement;
+        drop(storage_lock);
         digest
     }
 
@@ -1355,7 +1394,7 @@ mod tests {
         assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(state.uploads.read().await.len(), 1);
         assert!(blob_path.is_dir());
-        assert_eq!(std::fs::read_dir(&state.blobs_dir).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&state.blobs_dir).unwrap().count(), 2);
 
         // The retained upload can be retried after the storage fault clears.
         std::fs::remove_dir(&blob_path).unwrap();
@@ -1370,7 +1409,7 @@ mod tests {
         assert_eq!(retried.status(), StatusCode::CREATED);
         assert!(state.uploads.read().await.is_empty());
         assert_eq!(std::fs::read(&blob_path).unwrap(), body);
-        assert_eq!(std::fs::read_dir(&state.blobs_dir).unwrap().count(), 2);
+        assert_eq!(std::fs::read_dir(&state.blobs_dir).unwrap().count(), 3);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1444,7 +1483,7 @@ mod tests {
         reader.await.unwrap();
         let blob_path = blob_path_for_digest(&state.blobs_dir, &digest).unwrap();
         assert_eq!(std::fs::read(blob_path).unwrap(), body);
-        assert_eq!(std::fs::read_dir(&state.blobs_dir).unwrap().count(), 2);
+        assert_eq!(std::fs::read_dir(&state.blobs_dir).unwrap().count(), 3);
     }
 
     #[tokio::test]
@@ -1570,6 +1609,86 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn independent_states_merge_writes_and_observe_fresh_durable_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let blobs_dir = root.path().join("oci");
+        std::fs::create_dir_all(&blobs_dir).unwrap();
+        // Both long-lived states start from the same empty snapshot. A
+        // startup-cached implementation would let the second publication
+        // erase the first.
+        let first = Arc::new(OciRegistryState::new(
+            blobs_dir.clone(),
+            Some("registry-secret".to_string()),
+        ));
+        let second = Arc::new(OciRegistryState::new(
+            blobs_dir,
+            Some("registry-secret".to_string()),
+        ));
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+
+        let publish = |state: Arc<OciRegistryState>,
+                       repository: &'static str,
+                       tag: &'static str,
+                       marker: &'static str,
+                       start: Arc<tokio::sync::Barrier>| {
+            tokio::spawn(async move {
+                start.wait().await;
+                put_manifest_inner(
+                    &state,
+                    repository,
+                    tag,
+                    DEFAULT_MANIFEST_MEDIA_TYPE,
+                    Bytes::from(format!(r#"{{"schemaVersion":2,"marker":"{marker}"}}"#)),
+                )
+                .await
+                .status()
+            })
+        };
+        let left = publish(
+            first.clone(),
+            "team/first",
+            "stable",
+            "first",
+            start.clone(),
+        );
+        let right = publish(
+            second.clone(),
+            "team/second",
+            "latest",
+            "second",
+            start.clone(),
+        );
+        start.wait().await;
+        assert_eq!(left.await.unwrap(), StatusCode::CREATED);
+        assert_eq!(right.await.unwrap(), StatusCode::CREATED);
+
+        let durable = read_metadata_file(&first.metadata_path).unwrap();
+        assert!(durable.repositories.contains_key("team/first"));
+        assert!(durable.repositories.contains_key("team/second"));
+
+        // Each pre-existing process must see the other process's publication
+        // without a restart.
+        let observed_by_first = oci_routes(first)
+            .oneshot(
+                Request::get("/v2/team/second/manifests/latest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(observed_by_first.status(), StatusCode::OK);
+        let observed_by_second = oci_routes(second)
+            .oneshot(
+                Request::get("/v2/team/first/manifests/stable")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(observed_by_second.status(), StatusCode::OK);
     }
 
     #[tokio::test]

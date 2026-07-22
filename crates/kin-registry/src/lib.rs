@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 mod atomic_file;
+mod storage_lock;
 
 /// Package ecosystem identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +91,8 @@ pub enum RegistryError {
     Storage(#[from] std::io::Error),
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("invalid registry operation: {0}")]
+    InvalidOperation(String),
 }
 
 /// In-memory manifest store backed by a JSON file in the .kin directory.
@@ -98,11 +101,52 @@ pub struct ManifestStore {
     manifests_dir: std::path::PathBuf,
 }
 
+/// Shared-lock view of one ecosystem's durable manifest authority.
+pub(crate) struct ManifestReadTransaction<'a> {
+    store: &'a ManifestStore,
+    ecosystem: Ecosystem,
+    _lock: storage_lock::StorageLock,
+}
+
+/// Exclusive-lock view used for blob + manifest publication transactions.
+///
+/// Protocol adapters must keep this value alive from their immutable-version
+/// preflight through blob publication and the final manifest replacement.
+pub(crate) struct ManifestWriteTransaction<'a> {
+    store: &'a ManifestStore,
+    ecosystem: Ecosystem,
+    _lock: storage_lock::StorageLock,
+}
+
 impl ManifestStore {
     pub fn new(kin_dir: &std::path::Path) -> Self {
         let manifests_dir = kin_dir.join("packages").join("manifests");
-        std::fs::create_dir_all(&manifests_dir).ok();
+        let _ = atomic_file::ensure_directory_durable(&manifests_dir);
         Self { manifests_dir }
+    }
+
+    pub(crate) fn read_transaction(
+        &self,
+        ecosystem: Ecosystem,
+    ) -> Result<ManifestReadTransaction<'_>, RegistryError> {
+        let lock = storage_lock::StorageLock::shared(&self.transaction_lock_path(ecosystem))?;
+        Ok(ManifestReadTransaction {
+            store: self,
+            ecosystem,
+            _lock: lock,
+        })
+    }
+
+    pub(crate) fn write_transaction(
+        &self,
+        ecosystem: Ecosystem,
+    ) -> Result<ManifestWriteTransaction<'_>, RegistryError> {
+        let lock = storage_lock::StorageLock::exclusive(&self.transaction_lock_path(ecosystem))?;
+        Ok(ManifestWriteTransaction {
+            store: self,
+            ecosystem,
+            _lock: lock,
+        })
     }
 
     /// Get all versions of a package
@@ -111,7 +155,20 @@ impl ManifestStore {
         ecosystem: Ecosystem,
         package: &str,
     ) -> Result<Vec<PackageVersion>, RegistryError> {
+        self.read_transaction(ecosystem)?.get_versions(package)
+    }
+
+    fn get_versions_unlocked(
+        &self,
+        ecosystem: Ecosystem,
+        package: &str,
+    ) -> Result<Vec<PackageVersion>, RegistryError> {
         let id = PackageId::from_registry_name(ecosystem, package);
+        if !self.manifest_path_is_contained(&id) {
+            return Err(RegistryError::InvalidOperation(
+                "package manifest path escaped its ecosystem directory".to_string(),
+            ));
+        }
         let path = self.manifest_path(&id);
         if !path.exists() {
             return Ok(vec![]);
@@ -131,20 +188,8 @@ impl ManifestStore {
     /// write transaction. Replacing the complete newline-delimited manifest
     /// keeps readers from ever observing a torn append after a crash.
     pub fn add_version(&self, version: &PackageVersion) -> Result<(), RegistryError> {
-        let canonical_name = version.id.canonical_name();
-
-        // Check for duplicate
-        let existing = self.get_versions(version.id.ecosystem, &canonical_name)?;
-        if existing.iter().any(|v| v.version == version.version) {
-            return Err(RegistryError::VersionExists(
-                canonical_name,
-                version.version.clone(),
-            ));
-        }
-
-        let mut replacement = existing;
-        replacement.push(version.clone());
-        self.replace_versions(&version.id, &replacement)
+        self.write_transaction(version.id.ecosystem)?
+            .add_version(version)
     }
 
     /// Rewrite the full version list for a package.
@@ -153,9 +198,23 @@ impl ManifestStore {
         id: &PackageId,
         versions: &[PackageVersion],
     ) -> Result<(), RegistryError> {
+        self.write_transaction(id.ecosystem)?
+            .replace_versions(id, versions)
+    }
+
+    fn replace_versions_unlocked(
+        &self,
+        id: &PackageId,
+        versions: &[PackageVersion],
+    ) -> Result<(), RegistryError> {
+        if !self.manifest_path_is_contained(id) {
+            return Err(RegistryError::InvalidOperation(
+                "package manifest path escaped its ecosystem directory".to_string(),
+            ));
+        }
         let path = self.manifest_path(id);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            atomic_file::ensure_directory_durable(parent)?;
         }
 
         let contents = serialize_versions(versions)?;
@@ -175,7 +234,7 @@ impl ManifestStore {
     {
         let path = self.manifest_path(id);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            atomic_file::ensure_directory_durable(parent)?;
         }
         let contents = serialize_versions(versions)?;
         atomic_file::write_with_pre_commit(&path, &contents, pre_commit)?;
@@ -186,15 +245,37 @@ impl ManifestStore {
     /// its ecosystem directory. Protocol adapters use this after validating a
     /// caller-controlled package name and before any manifest IO.
     pub(crate) fn manifest_path_is_direct_child(&self, id: &PackageId) -> bool {
-        let mut components = std::path::Path::new(&id.name).components();
-        let is_one_normal_segment = matches!(
-            components.next(),
-            Some(std::path::Component::Normal(segment)) if segment == std::ffi::OsStr::new(&id.name)
-        ) && components.next().is_none();
+        let is_one_normal_segment = is_one_normal_path_segment(&id.name);
         let base = self.ecosystem_manifests_dir(id.ecosystem);
         id.scope.is_none()
             && is_one_normal_segment
             && self.manifest_path(id).parent() == Some(base.as_path())
+    }
+
+    fn manifest_path_is_contained(&self, id: &PackageId) -> bool {
+        let base = self.ecosystem_manifests_dir(id.ecosystem);
+        let shape_is_valid = match id.ecosystem {
+            Ecosystem::Npm => match id.scope.as_deref() {
+                Some(scope) if !scope.is_empty() && is_one_normal_path_segment(scope) => {
+                    is_one_normal_path_segment(&id.name)
+                }
+                Some(_) => false,
+                None => is_one_normal_path_segment(&id.name),
+            },
+            // Go module names are intentionally multi-segment. Validate every
+            // segment lexically before projecting the logical coordinate to
+            // the manifest hierarchy.
+            Ecosystem::Go => id.scope.is_none() && is_safe_relative_path(&id.name),
+            Ecosystem::Cargo | Ecosystem::Oci | Ecosystem::Raw => {
+                id.scope.is_none() && is_one_normal_path_segment(&id.name)
+            }
+        };
+        if !shape_is_valid {
+            return false;
+        }
+
+        let path = self.manifest_path(id);
+        path != base && path.starts_with(&base)
     }
 
     fn ecosystem_manifests_dir(&self, ecosystem: Ecosystem) -> std::path::PathBuf {
@@ -207,12 +288,84 @@ impl ManifestStore {
         })
     }
 
+    fn transaction_lock_path(&self, ecosystem: Ecosystem) -> std::path::PathBuf {
+        let name = match ecosystem {
+            Ecosystem::Cargo => "cargo.lock",
+            Ecosystem::Npm => "npm.lock",
+            Ecosystem::Oci => "oci.lock",
+            Ecosystem::Go => "go.lock",
+            Ecosystem::Raw => "raw.lock",
+        };
+        self.manifests_dir.join(".transactions").join(name)
+    }
+
     fn manifest_path(&self, id: &PackageId) -> std::path::PathBuf {
         let base = self.ecosystem_manifests_dir(id.ecosystem);
         match &id.scope {
             Some(scope) if !scope.is_empty() => base.join(format!("@{scope}")).join(&id.name),
             _ => base.join(&id.name),
         }
+    }
+}
+
+fn is_one_normal_path_segment(value: &str) -> bool {
+    let mut components = std::path::Path::new(value).components();
+    matches!(
+        components.next(),
+        Some(std::path::Component::Normal(segment)) if segment == std::ffi::OsStr::new(value)
+    ) && components.next().is_none()
+}
+
+fn is_safe_relative_path(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .split('/')
+            .all(|segment| !segment.is_empty() && is_one_normal_path_segment(segment))
+}
+
+impl ManifestReadTransaction<'_> {
+    pub(crate) fn get_versions(&self, package: &str) -> Result<Vec<PackageVersion>, RegistryError> {
+        self.store.get_versions_unlocked(self.ecosystem, package)
+    }
+}
+
+impl ManifestWriteTransaction<'_> {
+    pub(crate) fn get_versions(&self, package: &str) -> Result<Vec<PackageVersion>, RegistryError> {
+        self.store.get_versions_unlocked(self.ecosystem, package)
+    }
+
+    pub(crate) fn add_version(&self, version: &PackageVersion) -> Result<(), RegistryError> {
+        if version.id.ecosystem != self.ecosystem {
+            return Err(RegistryError::InvalidOperation(
+                "manifest transaction ecosystem does not match package".to_string(),
+            ));
+        }
+        let canonical_name = version.id.canonical_name();
+        let mut existing = self.get_versions(&canonical_name)?;
+        if existing
+            .iter()
+            .any(|candidate| candidate.version == version.version)
+        {
+            return Err(RegistryError::VersionExists(
+                canonical_name,
+                version.version.clone(),
+            ));
+        }
+        existing.push(version.clone());
+        self.store.replace_versions_unlocked(&version.id, &existing)
+    }
+
+    pub(crate) fn replace_versions(
+        &self,
+        id: &PackageId,
+        versions: &[PackageVersion],
+    ) -> Result<(), RegistryError> {
+        if id.ecosystem != self.ecosystem {
+            return Err(RegistryError::InvalidOperation(
+                "manifest transaction ecosystem does not match package".to_string(),
+            ));
+        }
+        self.store.replace_versions_unlocked(id, versions)
     }
 }
 

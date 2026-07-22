@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use url::Url;
 
 use crate::{Ecosystem, ManifestStore, PackageId, PackageVersion};
 
@@ -78,6 +79,9 @@ const CRATES_IO_INDEX_URL: &str = "https://github.com/rust-lang/crates.io-index"
 
 /// Maximum accepted `.crate` upload size (50 MiB), matching crates.io's cap.
 const MAX_CRATE_SIZE: usize = 50 * 1024 * 1024;
+const MAX_CRATE_ARCHIVE_ENTRIES: usize = 4096;
+const MAX_CRATE_ARCHIVE_SCAN_SIZE: u64 = 256 * 1024 * 1024;
+const MAX_CRATE_MANIFEST_SIZE: u64 = 1024 * 1024;
 const MAX_CRATE_NAME_LEN: usize = 64;
 
 /// Validate a Cargo registry package name before it can reach either the blob
@@ -207,11 +211,23 @@ async fn index_lookup(
     }
 
     let _read_guard = state.publish_gate.read().await;
+    let transaction = match state.manifest_store.read_transaction(Ecosystem::Cargo) {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("Cargo index storage lock failed: {error}")
+                })),
+            )
+                .into_response();
+        }
+    };
 
     // The manifest is the sparse index authority. Metadata extraction belongs
     // to authenticated publish/ingest; a GET must never rebuild or mutate the
     // index from ambient crate files.
-    let versions = match state.manifest_store.get_versions(Ecosystem::Cargo, name) {
+    let versions = match transaction.get_versions(name) {
         Ok(v) if v.is_empty() => return StatusCode::NOT_FOUND.into_response(),
         Ok(v) => v,
         Err(error) => {
@@ -270,7 +286,11 @@ async fn download_crate(
         return bad_coordinate(message);
     }
     let _read_guard = state.publish_gate.read().await;
-    let versions = match state.manifest_store.get_versions(Ecosystem::Cargo, &name) {
+    let transaction = match state.manifest_store.read_transaction(Ecosystem::Cargo) {
+        Ok(transaction) => transaction,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let versions = match transaction.get_versions(&name) {
         Ok(v) => v,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
@@ -424,17 +444,20 @@ async fn publish_crate(
             .into_response();
     }
 
-    // Verify the uploaded bytes are a valid gzip-tar whose embedded Cargo.toml
-    // declares a `[package]` name/version matching the query params. This
-    // prevents publishing arbitrary/garbage bytes or claiming a coordinate that
-    // disagrees with the crate's own manifest.
-    if let Err(message) = verify_crate_coordinates(&body, &params.name, &params.version) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": message })),
-        )
-            .into_response();
-    }
+    // Parse the archive exactly once under explicit decompression, entry, and
+    // Cargo.toml budgets. Coordinate verification and sparse-index extraction
+    // consume the same parsed manifest so an authorized gzip bomb cannot make
+    // the daemon walk an unbounded archive twice.
+    let crate_manifest = match parse_crate_manifest(&body, &params.name, &params.version) {
+        Ok(manifest) => manifest,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response();
+        }
+    };
 
     // Compute SHA-256 checksum of the .crate bytes
     let checksum = hex::encode(Sha256::digest(&body));
@@ -448,7 +471,17 @@ async fn publish_crate(
     // write side serializes the subsequent manifest check + blob write +
     // manifest append against every other publish in this registry. Readers
     // hold the read side across their corresponding manifest/blob reads.
-    let metadata = match extract_crate_metadata(&body, &params.name, &params.version) {
+    let configured_index = match configured_sparse_index_url(&state.base_url) {
+        Ok(index) => index,
+        Err(message) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response();
+        }
+    };
+    let metadata = match extract_crate_metadata(&crate_manifest, &configured_index) {
         Ok(metadata) => metadata,
         Err(message) => {
             return (
@@ -459,11 +492,20 @@ async fn publish_crate(
         }
     };
     let _write_guard = state.publish_gate.write().await;
+    let transaction = match state.manifest_store.write_transaction(Ecosystem::Cargo) {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("failed to lock Cargo registry storage: {error}")
+                })),
+            )
+                .into_response();
+        }
+    };
 
-    let existing_versions = match state
-        .manifest_store
-        .get_versions(Ecosystem::Cargo, &params.name)
-    {
+    let existing_versions = match transaction.get_versions(&params.name) {
         Ok(versions) => versions,
         Err(e) => {
             return (
@@ -474,9 +516,10 @@ async fn publish_crate(
         }
     };
 
-    if let Some(existing) = existing_versions
+    if let Some((existing_index, existing)) = existing_versions
         .iter()
-        .find(|version| version.version == params.version)
+        .enumerate()
+        .find(|(_, version)| version.version == params.version)
     {
         if existing.checksum != checksum {
             return (
@@ -497,6 +540,24 @@ async fn publish_crate(
                 Json(serde_json::json!({ "error": format!("failed to write crate file: {e}") })),
             )
                 .into_response();
+        }
+
+        // An identical immutable artifact is also the safe recovery path for
+        // manifests written before Cargo dependency metadata became
+        // authoritative. Replace only metadata derived from the same bytes;
+        // preserve publication identity and timestamps.
+        if existing.metadata != metadata {
+            let mut repaired = existing_versions.clone();
+            repaired[existing_index].metadata = metadata.clone();
+            if let Err(error) = transaction.replace_versions(&existing.id, &repaired) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("failed to repair Cargo index metadata: {error}")
+                    })),
+                )
+                    .into_response();
+            }
         }
 
         return (
@@ -536,7 +597,7 @@ async fn publish_crate(
         yanked: false,
     };
 
-    match state.manifest_store.add_version(&pkg_version) {
+    match transaction.add_version(&pkg_version) {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -591,15 +652,13 @@ fn write_crate_blob(
     crate::atomic_file::write(crate_path, body)
 }
 
-/// Verify an uploaded `.crate` blob is a well-formed gzip-tar whose embedded
-/// manifest matches the published coordinates.
-///
-/// `.crate` files are gzipped tarballs that must contain
-/// `{name}-{version}/Cargo.toml`; the manifest's `[package] name` and `version`
-/// must equal `name`/`version`. Returns `Err(message)` describing the first
-/// problem found (bad gzip/tar, missing manifest, unparseable TOML, or a
-/// name/version mismatch) so the caller can surface a `400`.
-fn verify_crate_coordinates(crate_bytes: &[u8], name: &str, version: &str) -> Result<(), String> {
+/// Parse and verify the one authoritative Cargo.toml under bounded archive
+/// traversal. The returned value is reused for sparse-index extraction.
+fn parse_crate_manifest(
+    crate_bytes: &[u8],
+    name: &str,
+    version: &str,
+) -> Result<toml::Value, String> {
     use flate2::read::GzDecoder;
     use std::io::Read;
 
@@ -612,25 +671,52 @@ fn verify_crate_coordinates(crate_bytes: &[u8], name: &str, version: &str) -> Re
         .map_err(|e| format!("crate is not a valid gzip-tar archive: {e}"))?;
 
     let mut cargo_toml_content = String::new();
-    let mut found_manifest = false;
-    for entry in entries {
+    let mut scanned_size = 0u64;
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_CRATE_ARCHIVE_ENTRIES {
+            return Err(format!(
+                "crate archive exceeds the {MAX_CRATE_ARCHIVE_ENTRIES} entry scan limit"
+            ));
+        }
         // A malformed tar stream surfaces here (e.g. truncated/non-gzip body).
-        let mut entry = entry.map_err(|e| format!("crate is not a valid gzip-tar archive: {e}"))?;
+        let entry = entry.map_err(|e| format!("crate is not a valid gzip-tar archive: {e}"))?;
+        let entry_size = entry
+            .header()
+            .size()
+            .map_err(|error| format!("crate contains an invalid entry size: {error}"))?;
+        scanned_size = scanned_size
+            .checked_add(entry_size)
+            .ok_or_else(|| "crate archive scan size overflowed".to_string())?;
+        if scanned_size > MAX_CRATE_ARCHIVE_SCAN_SIZE {
+            return Err(format!(
+                "crate archive exceeds the {MAX_CRATE_ARCHIVE_SCAN_SIZE} byte scan limit"
+            ));
+        }
         let is_manifest = entry
             .path()
             .ok()
             .map(|path| path.to_str() == Some(&expected_manifest))
             .unwrap_or(false);
         if is_manifest {
+            if entry_size > MAX_CRATE_MANIFEST_SIZE {
+                return Err(format!(
+                    "crate Cargo.toml exceeds the {MAX_CRATE_MANIFEST_SIZE} byte limit"
+                ));
+            }
             entry
+                .take(MAX_CRATE_MANIFEST_SIZE + 1)
                 .read_to_string(&mut cargo_toml_content)
                 .map_err(|e| format!("failed to read {expected_manifest} from crate: {e}"))?;
-            found_manifest = true;
+            if cargo_toml_content.len() as u64 > MAX_CRATE_MANIFEST_SIZE {
+                return Err(format!(
+                    "crate Cargo.toml exceeds the {MAX_CRATE_MANIFEST_SIZE} byte limit"
+                ));
+            }
             break;
         }
     }
 
-    if !found_manifest {
+    if cargo_toml_content.is_empty() {
         return Err(format!("crate does not contain {expected_manifest}"));
     }
 
@@ -662,54 +748,44 @@ fn verify_crate_coordinates(crate_bytes: &[u8], name: &str, version: &str) -> Re
         ));
     }
 
-    Ok(())
+    Ok(toml_value)
 }
 
-/// Extract features and dependencies from a .crate tarball.
-///
-/// .crate files are gzipped tarballs containing `{name}-{version}/Cargo.toml`.
-/// We parse this to extract features (for feature resolution) and dependencies
-/// (for the sparse index).
+fn normalize_registry_index_url(value: &str) -> Result<String, String> {
+    let (prefix, raw) = match value.strip_prefix("sparse+") {
+        Some(raw) => ("sparse+", raw),
+        None => ("", value),
+    };
+    let mut parsed = Url::parse(raw)
+        .map_err(|error| format!("registry index URL {value:?} is invalid: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(format!(
+            "registry index URL {value:?} must be an http(s) URL without credentials, query, or fragment"
+        ));
+    }
+    let normalized_path = format!("{}/", parsed.path().trim_end_matches('/'));
+    parsed.set_path(&normalized_path);
+    Ok(format!("{prefix}{parsed}"))
+}
+
+fn configured_sparse_index_url(base_url: &str) -> Result<String, String> {
+    normalize_registry_index_url(&format!(
+        "sparse+{}/registry/cargo/",
+        base_url.trim_end_matches('/')
+    ))
+    .map_err(|error| format!("configured Cargo registry base URL is invalid: {error}"))
+}
+
+/// Extract features and dependencies from the already verified Cargo.toml.
 fn extract_crate_metadata(
-    crate_bytes: &[u8],
-    name: &str,
-    version: &str,
+    toml_value: &toml::Value,
+    configured_index: &str,
 ) -> Result<serde_json::Value, String> {
-    use flate2::read::GzDecoder;
-    use std::io::Read;
-
-    let expected_manifest = format!("{}-{}/Cargo.toml", name, version);
-    let gz = GzDecoder::new(crate_bytes);
-    let mut archive = tar::Archive::new(gz);
-
-    let mut cargo_toml_content = String::new();
-    let entries = archive
-        .entries()
-        .map_err(|error| format!("crate is not a valid gzip-tar archive: {error}"))?;
-    for entry in entries {
-        let mut entry =
-            entry.map_err(|error| format!("crate is not a valid gzip-tar archive: {error}"))?;
-        let path = entry
-            .path()
-            .map_err(|error| format!("crate contains an invalid path: {error}"))?;
-        if path.to_str() == Some(&expected_manifest) {
-            entry
-                .read_to_string(&mut cargo_toml_content)
-                .map_err(|error| format!("failed to read {expected_manifest}: {error}"))?;
-            break;
-        }
-    }
-
-    if cargo_toml_content.is_empty() {
-        return Err(format!("crate does not contain {expected_manifest}"));
-    }
-
-    // Parse Cargo.toml to extract features and deps. This metadata is the
-    // sparse-index authority, so an extraction failure must never be recorded
-    // as an authoritative empty dependency list.
-    let toml_value: toml::Value = toml::from_str(&cargo_toml_content)
-        .map_err(|error| format!("crate {expected_manifest} is not valid TOML: {error}"))?;
-
     let mut metadata = serde_json::json!({
         "cargo_index_format": 1,
         "features": {},
@@ -732,7 +808,8 @@ fn extract_crate_metadata(
         dep_value: &toml::Value,
         target: Option<&str>,
         kind: &str,
-    ) -> Option<serde_json::Value> {
+        configured_index: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
         let (req, optional, default_features, dep_features, registry, package) = match dep_value {
             toml::Value::String(version_str) => (
                 version_str.clone(),
@@ -745,7 +822,7 @@ fn extract_crate_metadata(
             toml::Value::Table(t) => {
                 // Skip path-only deps without a version (workspace-internal deps)
                 if t.get("path").is_some() && t.get("version").is_none() {
-                    return None;
+                    return Ok(None);
                 }
                 let req = t
                     .get("version")
@@ -773,15 +850,18 @@ fn extract_crate_metadata(
                     match reg {
                         "" | "crates-io" => Some(CRATES_IO_INDEX_URL.to_string()),
                         "kin" => None,
-                        other => Some(other.to_string()),
+                        other => {
+                            return Err(format!(
+                                "dependency {dep_name:?} uses unresolved named registry {other:?}"
+                            ));
+                        }
                     }
                 } else if let Some(idx) = t.get("registry-index").and_then(|v| v.as_str()) {
-                    // registry-index contains the full index URL; if it points
-                    // to this registry (kinlab.ai), treat it as the kin registry.
-                    if idx.contains("kinlab.ai") {
+                    let normalized = normalize_registry_index_url(idx)?;
+                    if normalized == configured_index {
                         None
                     } else {
-                        Some(idx.to_string())
+                        Some(normalized)
                     }
                 } else {
                     Some(CRATES_IO_INDEX_URL.to_string())
@@ -789,10 +869,10 @@ fn extract_crate_metadata(
                 let package = t.get("package").and_then(|v| v.as_str()).map(String::from);
                 (req, optional, default_features, features, registry, package)
             }
-            _ => return None,
+            _ => return Ok(None),
         };
 
-        Some(serde_json::json!({
+        Ok(Some(serde_json::json!({
             "name": dep_name,
             "req": req,
             "features": dep_features,
@@ -802,13 +882,15 @@ fn extract_crate_metadata(
             "kind": kind,
             "registry": registry,
             "package": package,
-        }))
+        })))
     }
 
     // [dependencies]
     if let Some(dep_table) = toml_value.get("dependencies").and_then(|d| d.as_table()) {
         for (dep_name, dep_value) in dep_table {
-            if let Some(entry) = extract_dep_entry(dep_name, dep_value, None, "normal") {
+            if let Some(entry) =
+                extract_dep_entry(dep_name, dep_value, None, "normal", configured_index)?
+            {
                 deps.push(entry);
             }
         }
@@ -820,7 +902,9 @@ fn extract_crate_metadata(
         .and_then(|d| d.as_table())
     {
         for (dep_name, dep_value) in dep_table {
-            if let Some(entry) = extract_dep_entry(dep_name, dep_value, None, "dev") {
+            if let Some(entry) =
+                extract_dep_entry(dep_name, dep_value, None, "dev", configured_index)?
+            {
                 deps.push(entry);
             }
         }
@@ -832,7 +916,9 @@ fn extract_crate_metadata(
         .and_then(|d| d.as_table())
     {
         for (dep_name, dep_value) in dep_table {
-            if let Some(entry) = extract_dep_entry(dep_name, dep_value, None, "build") {
+            if let Some(entry) =
+                extract_dep_entry(dep_name, dep_value, None, "build", configured_index)?
+            {
                 deps.push(entry);
             }
         }
@@ -843,9 +929,13 @@ fn extract_crate_metadata(
         for (target_spec, target_value) in target_table {
             if let Some(target_deps) = target_value.get("dependencies").and_then(|d| d.as_table()) {
                 for (dep_name, dep_value) in target_deps {
-                    if let Some(entry) =
-                        extract_dep_entry(dep_name, dep_value, Some(target_spec), "normal")
-                    {
+                    if let Some(entry) = extract_dep_entry(
+                        dep_name,
+                        dep_value,
+                        Some(target_spec),
+                        "normal",
+                        configured_index,
+                    )? {
                         deps.push(entry);
                     }
                 }
@@ -855,9 +945,13 @@ fn extract_crate_metadata(
                 .and_then(|d| d.as_table())
             {
                 for (dep_name, dep_value) in target_deps {
-                    if let Some(entry) =
-                        extract_dep_entry(dep_name, dep_value, Some(target_spec), "dev")
-                    {
+                    if let Some(entry) = extract_dep_entry(
+                        dep_name,
+                        dep_value,
+                        Some(target_spec),
+                        "dev",
+                        configured_index,
+                    )? {
                         deps.push(entry);
                     }
                 }
@@ -867,9 +961,13 @@ fn extract_crate_metadata(
                 .and_then(|d| d.as_table())
             {
                 for (dep_name, dep_value) in target_deps {
-                    if let Some(entry) =
-                        extract_dep_entry(dep_name, dep_value, Some(target_spec), "build")
-                    {
+                    if let Some(entry) = extract_dep_entry(
+                        dep_name,
+                        dep_value,
+                        Some(target_spec),
+                        "build",
+                        configured_index,
+                    )? {
                         deps.push(entry);
                     }
                 }
@@ -1099,7 +1197,11 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
                 blob_hash: "hash".to_string(),
                 blob_size: first_body.len() as u64,
                 checksum: "checksum".to_string(),
-                metadata: extract_crate_metadata(&first_body, "demo", "0.1.0").unwrap(),
+                metadata: extract_crate_metadata(
+                    &parse_crate_manifest(&first_body, "demo", "0.1.0").unwrap(),
+                    &configured_sparse_index_url(&state.base_url).unwrap(),
+                )
+                .unwrap(),
                 published_at: Utc::now(),
                 published_by: "legacy-test".to_string(),
                 yanked: false,
@@ -1663,6 +1765,167 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
             .await
             .unwrap();
         assert_eq!(downloaded.as_ref(), committed_body.as_slice());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn independent_states_preserve_concurrent_versions_and_matching_blobs() {
+        let root = tempfile::tempdir().unwrap();
+        let kin_dir = root.path().join(".kin");
+        let blobs_dir = root.path().join("cargo");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        let make_state = || {
+            Arc::new(CargoRegistryState::new(
+                ManifestStore::new(&kin_dir),
+                blobs_dir.clone(),
+                "https://kinlab.ai".to_string(),
+                Some("s3cret".to_string()),
+            ))
+        };
+        let first_state = make_state();
+        let second_state = make_state();
+        let first_body = valid_crate("demo", "1.0.0");
+        let second_body = valid_crate("demo", "2.0.0");
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+
+        let first = {
+            let start = start.clone();
+            let body = first_body.clone();
+            tokio::spawn(async move {
+                start.wait().await;
+                publish(first_state, "demo", "1.0.0", Some("s3cret"), body).await
+            })
+        };
+        let second = {
+            let start = start.clone();
+            let body = second_body.clone();
+            tokio::spawn(async move {
+                start.wait().await;
+                publish(second_state, "demo", "2.0.0", Some("s3cret"), body).await
+            })
+        };
+        start.wait().await;
+        assert_eq!(first.await.unwrap(), StatusCode::OK);
+        assert_eq!(second.await.unwrap(), StatusCode::OK);
+
+        let versions = ManifestStore::new(&kin_dir)
+            .get_versions(Ecosystem::Cargo, "demo")
+            .unwrap();
+        assert_eq!(versions.len(), 2);
+        for (version, expected) in [("1.0.0", first_body), ("2.0.0", second_body)] {
+            let entry = versions
+                .iter()
+                .find(|candidate| candidate.version == version)
+                .unwrap();
+            let stored = std::fs::read(blobs_dir.join(format!("demo-{version}.crate"))).unwrap();
+            assert_eq!(stored, expected);
+            assert_eq!(entry.checksum, hex::encode(Sha256::digest(&stored)));
+        }
+    }
+
+    #[tokio::test]
+    async fn identical_republish_repairs_legacy_metadata_without_changing_identity() {
+        let (_root, state) = registry_state_with_token(Some("s3cret"));
+        let body = build_test_crate(
+            "demo",
+            "1.0.0",
+            "[package]\nname = \"demo\"\nversion = \"1.0.0\"\n\n[dependencies]\nserde = \"1\"\n",
+        );
+        assert_eq!(
+            publish(state.clone(), "demo", "1.0.0", Some("s3cret"), body.clone(),).await,
+            StatusCode::OK
+        );
+        let mut legacy = state
+            .manifest_store
+            .get_versions(Ecosystem::Cargo, "demo")
+            .unwrap();
+        let published_at = legacy[0].published_at;
+        let published_by = legacy[0].published_by.clone();
+        legacy[0].metadata = serde_json::json!({});
+        state
+            .manifest_store
+            .replace_versions(&legacy[0].id, &legacy)
+            .unwrap();
+
+        assert_eq!(
+            publish(state.clone(), "demo", "1.0.0", Some("s3cret"), body).await,
+            StatusCode::OK
+        );
+        let repaired = state
+            .manifest_store
+            .get_versions(Ecosystem::Cargo, "demo")
+            .unwrap();
+        assert_eq!(repaired.len(), 1);
+        assert_eq!(repaired[0].published_at, published_at);
+        assert_eq!(repaired[0].published_by, published_by);
+        assert_eq!(repaired[0].metadata["cargo_index_format"], 1);
+        assert_eq!(repaired[0].metadata["deps"][0]["name"], "serde");
+    }
+
+    #[test]
+    fn dependency_registry_urls_are_classified_by_exact_normalized_authority() {
+        let configured = configured_sparse_index_url("https://kinlab.ai").unwrap();
+        let manifest: toml::Value = toml::from_str(
+            r#"
+[package]
+name = "demo"
+version = "1.0.0"
+
+[dependencies]
+local = { version = "1", registry-index = "sparse+https://kinlab.ai/registry/cargo" }
+attacker = { version = "1", registry-index = "sparse+https://kinlab.ai.evil/registry/cargo" }
+"#,
+        )
+        .unwrap();
+        let metadata = extract_crate_metadata(&manifest, &configured).unwrap();
+        let deps = metadata["deps"].as_array().unwrap();
+        assert_eq!(deps[0]["name"], "attacker");
+        assert_eq!(
+            deps[0]["registry"],
+            "sparse+https://kinlab.ai.evil/registry/cargo/"
+        );
+        assert_eq!(deps[1]["name"], "local");
+        assert!(deps[1]["registry"].is_null());
+
+        let unresolved: toml::Value = toml::from_str(
+            r#"
+[package]
+name = "demo"
+version = "1.0.0"
+[dependencies]
+private = { version = "1", registry = "corp" }
+"#,
+        )
+        .unwrap();
+        assert!(extract_crate_metadata(&unresolved, &configured).is_err());
+    }
+
+    #[test]
+    fn crate_archive_budgets_reject_declared_bombs_before_decompression() {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+
+        let archive_with_declared_entry = |path: &str, size: u64| {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(path).unwrap();
+            header.set_size(size);
+            header.set_mode(0o644);
+            header.set_cksum();
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(header.as_bytes()).unwrap();
+            encoder.finish().unwrap()
+        };
+        let oversized_manifest =
+            archive_with_declared_entry("demo-1.0.0/Cargo.toml", MAX_CRATE_MANIFEST_SIZE + 1);
+        let error = parse_crate_manifest(&oversized_manifest, "demo", "1.0.0").unwrap_err();
+        assert!(
+            error.contains("Cargo.toml") && error.contains("limit"),
+            "{error}"
+        );
+
+        let oversized_scan =
+            archive_with_declared_entry("demo-1.0.0/padding", MAX_CRATE_ARCHIVE_SCAN_SIZE + 1);
+        let error = parse_crate_manifest(&oversized_scan, "demo", "1.0.0").unwrap_err();
+        assert!(error.contains("scan limit"), "{error}");
     }
 
     #[tokio::test]

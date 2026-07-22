@@ -3086,6 +3086,7 @@ version = "0.2.28"
 dependencies = [
  "async-stream",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "flate2",
  "fs2",
@@ -3430,6 +3431,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "flate2",
+ "fs2",
  "futures-util",
  "hex",
  "kin-blobs",
@@ -3447,6 +3449,7 @@ dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "tower",
  "tracing",
+ "url",
 ]
 
 [[package]]

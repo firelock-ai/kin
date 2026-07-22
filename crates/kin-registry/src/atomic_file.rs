@@ -8,7 +8,7 @@
 //! and only then replace the destination with one atomic rename.
 
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub(crate) fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_with_pre_commit(path, bytes, |_| Ok(()))
@@ -24,7 +24,7 @@ where
             "atomic registry destination has no parent directory",
         )
     })?;
-    std::fs::create_dir_all(parent)?;
+    ensure_directory_durable(parent)?;
 
     // tempfile::NamedTempFile::persist performs an atomic, replacing rename on
     // Unix and Windows. Because the stage lives in `parent`, the rename cannot
@@ -38,6 +38,68 @@ where
     let published = staged.persist(path).map_err(|error| error.error)?;
     published.sync_all()?;
     sync_parent(parent)?;
+    Ok(())
+}
+
+/// Create a directory chain and durably publish each newly-created component.
+///
+/// Syncing only the final file and its immediate parent is insufficient on a
+/// first write: after a power loss, the new parent directory itself can vanish
+/// from its parent even though the response was already acknowledged. Build
+/// missing components from the first existing ancestor downward and fsync the
+/// parent after every directory entry becomes visible.
+pub(crate) fn ensure_directory_durable(path: &Path) -> io::Result<()> {
+    let mut cursor = path.to_path_buf();
+    let mut missing: Vec<PathBuf> = Vec::new();
+
+    loop {
+        match std::fs::metadata(&cursor) {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "registry directory path is not a directory: {}",
+                        cursor.display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(cursor.clone());
+                cursor = cursor
+                    .parent()
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "registry directory has no existing ancestor",
+                        )
+                    })?
+                    .to_path_buf();
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    for directory in missing.into_iter().rev() {
+        match std::fs::create_dir(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if !std::fs::metadata(&directory)?.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!(
+                            "registry directory path raced with a non-directory: {}",
+                            directory.display()
+                        ),
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        if let Some(parent) = directory.parent() {
+            sync_parent(parent)?;
+        }
+    }
     Ok(())
 }
 
@@ -115,5 +177,20 @@ mod tests {
         .unwrap();
 
         assert_eq!(std::fs::read(&destination).unwrap(), b"new-complete-bytes");
+    }
+
+    #[test]
+    fn first_write_durably_creates_nested_parent_chain() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root
+            .path()
+            .join("packages")
+            .join("manifests")
+            .join("cargo")
+            .join("demo");
+
+        write(&destination, b"complete-manifest\n").unwrap();
+
+        assert_eq!(std::fs::read(destination).unwrap(), b"complete-manifest\n");
     }
 }

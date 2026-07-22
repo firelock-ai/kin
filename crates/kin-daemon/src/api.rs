@@ -14962,6 +14962,22 @@ mod tests {
         builder.into_inner().unwrap().finish().unwrap()
     }
 
+    fn build_valid_npm_tarball() -> Vec<u8> {
+        use flate2::{write::GzEncoder, Compression};
+
+        let contents = b"module.exports = 'kin';\n";
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "package/index.js", contents.as_slice())
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
     #[tokio::test]
     async fn registry_routes_public_even_with_daemon_auth_token() {
         // With a daemon auth token configured, the cargo registry's read routes
@@ -15222,7 +15238,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn npm_registry_writes_fail_closed_without_auth_configuration() {
+        let state = test_state();
+        let app = npm_registry_routes(
+            &state,
+            &test_packages_dir(&state),
+            "https://kinlab.ai",
+            None,
+        );
+
+        let read = app
+            .clone()
+            .oneshot(
+                Request::get("/registry/npm/@kin%2Fboundary-contracts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::NOT_FOUND);
+
+        let write = app
+            .oneshot(
+                Request::put("/registry/npm/@kin%2Fboundary-contracts")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(write.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
     async fn npm_publish_records_authenticated_publisher() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
         let state = test_state();
         let (auth_url, auth_server) = spawn_registry_auth_server(
             StatusCode::OK,
@@ -15250,6 +15301,7 @@ mod tests {
             })),
         );
 
+        let tarball = build_valid_npm_tarball();
         let publish_payload = serde_json::json!({
             "_id": "@kin/boundary-contracts",
             "name": "@kin/boundary-contracts",
@@ -15263,8 +15315,8 @@ mod tests {
             "_attachments": {
                 "@kin/boundary-contracts-0.1.0.tgz": {
                     "content_type": "application/octet-stream",
-                    "data": "ZmFrZS10YXJiYWxs",
-                    "length": 12
+                    "data": STANDARD.encode(&tarball),
+                    "length": tarball.len()
                 }
             }
         });
