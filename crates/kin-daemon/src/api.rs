@@ -1236,6 +1236,247 @@ async fn resolve_session_graph(
     state.graph_for_request(session_id).await
 }
 
+const XREF_STABLE_READ_ATTEMPTS: usize = 3;
+
+/// One optimistic, point-in-time graph authority used by xref-style reads.
+///
+/// Both authorities are detached through one entity/relation snapshot so the
+/// handler's multi-call read cannot straddle a mutation. HEAD additionally
+/// pairs the snapshot's semantic root with the daemon's monotonic mutation
+/// version. Session-scope graphs do not participate in that HEAD version, so
+/// their selected graph pointer and exact live root are revalidated instead.
+struct XrefGraphReadAttempt {
+    graph: Arc<kin_db::InMemoryGraph>,
+    root: String,
+    head_version: Option<u64>,
+    mutation_epoch: u64,
+}
+
+fn prepare_xref_graph_read(
+    state: &DaemonState,
+    selected_graph: &Arc<kin_db::InMemoryGraph>,
+    authority: RequestGraphAuthority,
+) -> Option<XrefGraphReadAttempt> {
+    let mutation_epoch = state.stable_graph_authority_epoch()?;
+    match authority {
+        RequestGraphAuthority::Head => {
+            let version_before = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+            // Query a detached entity/relation domain even for HEAD. The
+            // version is published at the end of a graph mutation, so merely
+            // stamping the live graph would still allow several handler reads
+            // to observe different intermediate lock-points before that bump.
+            let snapshot = selected_graph.to_snapshot();
+            let root_hash = kin_db::compute_graph_root_hash(&snapshot);
+            let root = hex::encode(root_hash);
+            let live_root = hex::encode(selected_graph.compute_root_hash());
+            let version_after = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+            (version_before == version_after
+                && root == live_root
+                && state.graph_authority_epoch_is_current(mutation_epoch))
+            .then(|| XrefGraphReadAttempt {
+                graph: Arc::new(
+                    kin_db::InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
+                        snapshot, root_hash,
+                    ),
+                ),
+                root,
+                head_version: Some(version_after),
+                mutation_epoch,
+            })
+        }
+        RequestGraphAuthority::SessionScope => {
+            // `to_snapshot` clones the entity/relation store under one graph
+            // read lock. Build the query graph from that detached state so a
+            // private ref-hydration cannot interleave the handler's entity and
+            // relation reads. A live-root check below still rejects a snapshot
+            // that was already superseded before the attempt began.
+            let snapshot = selected_graph.to_snapshot();
+            let root_hash = kin_db::compute_graph_root_hash(&snapshot);
+            let root = hex::encode(root_hash);
+            if root != hex::encode(selected_graph.compute_root_hash()) {
+                return None;
+            }
+            if !state.graph_authority_epoch_is_current(mutation_epoch) {
+                return None;
+            }
+            Some(XrefGraphReadAttempt {
+                graph: Arc::new(
+                    kin_db::InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
+                        snapshot, root_hash,
+                    ),
+                ),
+                root,
+                head_version: None,
+                mutation_epoch,
+            })
+        }
+    }
+}
+
+async fn xref_graph_read_is_still_current(
+    state: &DaemonState,
+    session_id: Option<&SessionId>,
+    selected_graph: &Arc<kin_db::InMemoryGraph>,
+    authority: RequestGraphAuthority,
+    attempt: &XrefGraphReadAttempt,
+) -> bool {
+    if !state.graph_authority_epoch_is_current(attempt.mutation_epoch) {
+        return false;
+    }
+    match authority {
+        RequestGraphAuthority::Head => {
+            let Some(expected_version) = attempt.head_version else {
+                return false;
+            };
+            let version_before = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+            if version_before != expected_version {
+                return false;
+            }
+            let root_after = hex::encode(selected_graph.compute_root_hash());
+            let version_after = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+            version_after == expected_version
+                && root_after == attempt.root
+                && state.graph_authority_epoch_is_current(attempt.mutation_epoch)
+        }
+        RequestGraphAuthority::SessionScope => {
+            if hex::encode(selected_graph.compute_root_hash()) != attempt.root
+                || !state
+                    .ref_hydration_authority_is_current(session_id, selected_graph, authority)
+                    .await
+            {
+                return false;
+            }
+            state.graph_authority_epoch_is_current(attempt.mutation_epoch)
+        }
+    }
+}
+
+async fn command_xref_with_stable_authority<F>(
+    state: &DaemonState,
+    session_id: Option<&SessionId>,
+    selected_graph: Arc<kin_db::InMemoryGraph>,
+    authority: RequestGraphAuthority,
+    request: &kin_cli::commands::xref::XrefRequest,
+    mut after_root: F,
+) -> Result<kin_cli::commands::xref::XrefResponse, (StatusCode, String)>
+where
+    F: FnMut(usize),
+{
+    // Initialize once outside the stamped interval: lazy spine hydration and
+    // registration can be expensive, but it is not part of the graph read.
+    let spine = state.ensure_spine();
+    for attempt_number in 0..XREF_STABLE_READ_ATTEMPTS {
+        let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
+            continue;
+        };
+        after_root(attempt_number);
+        let response = kin_cli::commands::xref::build_xref_response(
+            attempt.graph.as_ref(),
+            request,
+            &state.cached_repo_id,
+            &attempt.root,
+            spine,
+        )
+        .await;
+        if xref_graph_read_is_still_current(state, session_id, &selected_graph, authority, &attempt)
+            .await
+        {
+            return response.map_err(internal_error);
+        }
+        tracing::warn!(
+            attempt = attempt_number + 1,
+            "graph authority changed during command xref; retrying"
+        );
+    }
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "graph authority changed repeatedly during command xref; retry".to_string(),
+    ))
+}
+
+async fn mcp_find_references_with_stable_authority<F>(
+    state: &DaemonState,
+    session_id: Option<&SessionId>,
+    selected_graph: Arc<kin_db::InMemoryGraph>,
+    authority: RequestGraphAuthority,
+    arguments: &HashMap<String, serde_json::Value>,
+    mut after_root: F,
+) -> kin_mcp::Result<kin_mcp::ToolCallResult>
+where
+    F: FnMut(usize),
+{
+    let spine = state.ensure_spine();
+    for attempt_number in 0..XREF_STABLE_READ_ATTEMPTS {
+        let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
+            continue;
+        };
+        after_root(attempt_number);
+        let result = kin_mcp::handlers::entities::handle_find_references_with_authority(
+            arguments,
+            attempt.graph.as_ref(),
+            kin_mcp::handlers::entities::FindReferencesAuthority {
+                repo_id: &state.cached_repo_id,
+                graph_root: &attempt.root,
+                spine,
+            },
+        )
+        .await;
+        if xref_graph_read_is_still_current(state, session_id, &selected_graph, authority, &attempt)
+            .await
+        {
+            return result;
+        }
+        tracing::warn!(
+            attempt = attempt_number + 1,
+            "graph authority changed during MCP find_references; retrying"
+        );
+    }
+    Err(kin_mcp::McpError::Other(
+        "graph authority changed repeatedly during find_references; retry".to_string(),
+    ))
+}
+
+async fn mcp_bulk_check_references_with_stable_authority<F>(
+    state: &DaemonState,
+    session_id: Option<&SessionId>,
+    selected_graph: Arc<kin_db::InMemoryGraph>,
+    authority: RequestGraphAuthority,
+    arguments: &HashMap<String, serde_json::Value>,
+    mut after_root: F,
+) -> kin_mcp::Result<kin_mcp::ToolCallResult>
+where
+    F: FnMut(usize),
+{
+    let spine = state.ensure_spine();
+    for attempt_number in 0..XREF_STABLE_READ_ATTEMPTS {
+        let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
+            continue;
+        };
+        after_root(attempt_number);
+        let result = kin_mcp::handlers::entities::handle_bulk_check_references_with_authority(
+            arguments,
+            attempt.graph.as_ref(),
+            kin_mcp::handlers::entities::FindReferencesAuthority {
+                repo_id: &state.cached_repo_id,
+                graph_root: &attempt.root,
+                spine,
+            },
+        );
+        if xref_graph_read_is_still_current(state, session_id, &selected_graph, authority, &attempt)
+            .await
+        {
+            return result;
+        }
+        tracing::warn!(
+            attempt = attempt_number + 1,
+            "graph authority changed during MCP bulk_check_references; retrying"
+        );
+    }
+    Err(kin_mcp::McpError::Other(
+        "graph authority changed repeatedly during bulk_check_references; retry".to_string(),
+    ))
+}
+
 /// Resolve the graph together with the authority that owns ref hydration.
 ///
 /// A request may wait a long time for the serialized hydration gate. Resolve
@@ -1655,9 +1896,13 @@ async fn set_scope(
     } else {
         None
     };
+    let graph_mutation = hydration_gate
+        .as_ref()
+        .map(|_| state.begin_graph_authority_mutation());
     let scope_task = tokio::task::spawn_blocking(
         move || -> std::result::Result<_, (StatusCode, String)> {
             let _hydration_gate = hydration_gate;
+            let _graph_mutation = graph_mutation;
             // Resolve the ref through the locate entry point, which hydrates a
             // not-yet-imported Git ancestry at artifact-only depth. Scope-for-
             // retrieval only needs the base_commit's tree state: build_graph_at_ref
@@ -1876,6 +2121,7 @@ async fn graph_commit(
         }
     }
 
+    let graph_mutation = state.begin_graph_authority_mutation();
     for delta in &request.change.entity_deltas {
         match delta {
             EntityDelta::Added(e) => {
@@ -1935,6 +2181,7 @@ async fn graph_commit(
 
     // Broadcast root hash change and compact the delta journal at the commit boundary.
     state.bump_version();
+    drop(graph_mutation);
     state.save_snapshot_full().map_err(internal_error)?;
     state.emit_event(DaemonEvent::GraphRootChanged {
         old_root_hash: None,
@@ -2346,11 +2593,18 @@ async fn command_xref(
     }
 
     let session_id = extract_session_id_from_headers(&headers)?;
-    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let response =
-        kin_cli::commands::xref::build_xref_response(&state.layout, graph.as_ref(), &request)
-            .await
-            .map_err(internal_error)?;
+    let (graph, authority) = state
+        .graph_for_request_with_authority(session_id.as_ref())
+        .await;
+    let response = command_xref_with_stable_authority(
+        &state,
+        session_id.as_ref(),
+        graph,
+        authority,
+        &request,
+        |_| {},
+    )
+    .await?;
     Ok(Json(response))
 }
 
@@ -3499,6 +3753,9 @@ async fn locate(
         } else {
             None
         };
+        let _graph_mutation = _hydration_gate
+            .as_ref()
+            .map(|_| state.begin_graph_authority_mutation());
         let resolved = kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate_with_report(
             state.graph.as_ref(),
             &state.layout,
@@ -3938,6 +4195,9 @@ async fn review(
                 let references = [base.as_str(), head.as_str()];
                 resolve_ref_hydration_graph(&state, session_id.as_ref(), &references).await
             };
+            let graph_mutation = hydration_gate
+                .as_ref()
+                .map(|_| state.begin_graph_authority_mutation());
             // Shadow review resolves both refs at full semantic depth, so the
             // same synchronous multi-minute replay applies. Blocking pool, gate
             // round-trips out for the drop below.
@@ -3975,6 +4235,7 @@ async fn review(
                 "review",
                 "review-hydration",
             )?;
+            drop(graph_mutation);
             drop(hydration_gate);
 
             let response =
@@ -4267,6 +4528,9 @@ async fn blame(
     let reference = req.reference.as_deref();
     let (graph, authority, hydration_gate) =
         resolve_ref_hydration_graph(&state, session_id.as_ref(), reference.as_slice()).await;
+    let graph_mutation = hydration_gate
+        .as_ref()
+        .map(|_| state.begin_graph_authority_mutation());
     // Preparing resolves the ref, which hydrates a not-yet-imported ancestry at
     // full semantic depth — minutes of synchronous replay. Run it on the
     // blocking pool so it cannot park an async worker; the gate comes back out
@@ -4302,6 +4566,7 @@ async fn blame(
         "blame",
         "blame-hydration",
     )?;
+    drop(graph_mutation);
     drop(hydration_gate);
 
     let response =
@@ -4339,6 +4604,9 @@ async fn history(
     let reference = req.reference.as_deref();
     let (graph, authority, hydration_gate) =
         resolve_ref_hydration_graph(&state, session_id.as_ref(), reference.as_slice()).await;
+    let graph_mutation = hydration_gate
+        .as_ref()
+        .map(|_| state.begin_graph_authority_mutation());
     // Same reasoning as blame: full-depth semantic hydration is synchronous and
     // minutes long, so it runs on the blocking pool and the gate round-trips.
     let (prepared, hydration_gate) = {
@@ -4372,6 +4640,7 @@ async fn history(
         "history",
         "history-hydration",
     )?;
+    drop(graph_mutation);
     drop(hydration_gate);
 
     let response =
@@ -4384,6 +4653,18 @@ async fn history(
                 }
             })?;
     Ok(Json(response))
+}
+
+/// Hold graph authority unstable for one logical writer transaction.
+///
+/// The guard deliberately spans durable acknowledgement as well as in-memory
+/// mutations so xref readers cannot certify an intermediate batch or a graph
+/// state whose generation has not yet been persisted.
+fn with_graph_authority_mutation<T>(state: &DaemonState, operation: impl FnOnce() -> T) -> T {
+    let mutation = state.begin_graph_authority_mutation();
+    let result = operation();
+    drop(mutation);
+    result
 }
 
 /// POST /verify/run — execute and persist a verification run in daemon state.
@@ -4403,18 +4684,20 @@ async fn verify_run(
 
     let state_for_verify = Arc::clone(&state);
     let response = tokio::task::spawn_blocking(move || {
-        let response = kin_cli::commands::verify::execute_verify_run(
-            &state_for_verify.layout,
-            state_for_verify.graph.as_ref(),
-            &req,
-        )
-        .map_err(|error| error.to_string())?;
-        state_for_verify.bump_version();
-        state_for_verify
-            .save_snapshot()
+        with_graph_authority_mutation(state_for_verify.as_ref(), || {
+            let response = kin_cli::commands::verify::execute_verify_run(
+                &state_for_verify.layout,
+                state_for_verify.graph.as_ref(),
+                &req,
+            )
             .map_err(|error| error.to_string())?;
-        state_for_verify.mark_clean();
-        Ok::<_, String>(response)
+            state_for_verify.bump_version();
+            state_for_verify
+                .save_snapshot()
+                .map_err(|error| error.to_string())?;
+            state_for_verify.mark_clean();
+            Ok::<_, String>(response)
+        })
     })
     .await
     .map_err(internal_error)?
@@ -4495,32 +4778,36 @@ async fn reconcile(
             }
         };
         tokio::task::spawn_blocking(move || {
-            kin_cli::commands::reconcile::execute_reconcile_session_dir_scoped(
-                &state_for_reconcile.layout,
-                scoped_graph.as_ref(),
-                &req.session_dir,
-            )
-            .map_err(|error| error.to_string())
+            with_graph_authority_mutation(state_for_reconcile.as_ref(), || {
+                kin_cli::commands::reconcile::execute_reconcile_session_dir_scoped(
+                    &state_for_reconcile.layout,
+                    scoped_graph.as_ref(),
+                    &req.session_dir,
+                )
+                .map_err(|error| error.to_string())
+            })
         })
         .await
         .map_err(internal_error)?
         .map_err(internal_error)?
     } else {
         tokio::task::spawn_blocking(move || {
-            kin_cli::commands::reconcile::execute_reconcile_session_dir_with_persist(
-                &state_for_reconcile.layout,
-                state_for_reconcile.graph.as_ref(),
-                &req.session_dir,
-                || {
-                    state_for_reconcile.bump_version();
-                    state_for_reconcile.save_snapshot().map_err(|error| {
-                        std::io::Error::new(std::io::ErrorKind::Other, error.to_string())
-                    })?;
-                    state_for_reconcile.mark_clean();
-                    Ok(())
-                },
-            )
-            .map_err(|error| error.to_string())
+            with_graph_authority_mutation(state_for_reconcile.as_ref(), || {
+                kin_cli::commands::reconcile::execute_reconcile_session_dir_with_persist(
+                    &state_for_reconcile.layout,
+                    state_for_reconcile.graph.as_ref(),
+                    &req.session_dir,
+                    || {
+                        state_for_reconcile.bump_version();
+                        state_for_reconcile.save_snapshot().map_err(|error| {
+                            std::io::Error::new(std::io::ErrorKind::Other, error.to_string())
+                        })?;
+                        state_for_reconcile.mark_clean();
+                        Ok(())
+                    },
+                )
+                .map_err(|error| error.to_string())
+            })
         })
         .await
         .map_err(internal_error)?
@@ -5748,10 +6035,12 @@ async fn mcp_tools_call(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let mutates = mcp_tool_mutates_graph(&request.name);
-    let graph = if mutates {
-        Arc::clone(&state.graph)
+    let (graph, graph_authority) = if mutates {
+        (Arc::clone(&state.graph), RequestGraphAuthority::Head)
     } else {
-        resolve_session_graph(&state, session_id.as_ref()).await
+        state
+            .graph_for_request_with_authority(session_id.as_ref())
+            .await
     };
 
     if matches!(
@@ -6113,6 +6402,7 @@ async fn mcp_tools_call(
         )?;
     }
 
+    let graph_mutation = mutates.then(|| state.begin_graph_authority_mutation());
     let mut result = if transaction_preflight
         .as_ref()
         .is_some_and(|preflight| !preflight.allowed)
@@ -6127,15 +6417,37 @@ async fn mcp_tools_call(
             "coordination enforcement rejected transaction before graph apply: {evidence}"
         ))
     } else {
-        match kin_mcp::handlers::handle_tool_call(
-            &request.name,
-            &request.arguments,
-            graph.as_ref(),
-            &sessions,
-            kin_mcp::SessionAuthorityMode::OfflineFallback,
-        )
-        .await
-        {
+        let handled = if request.name == "find_references" {
+            mcp_find_references_with_stable_authority(
+                &state,
+                session_id.as_ref(),
+                Arc::clone(&graph),
+                graph_authority,
+                &request.arguments,
+                |_| {},
+            )
+            .await
+        } else if request.name == "bulk_check_references" {
+            mcp_bulk_check_references_with_stable_authority(
+                &state,
+                session_id.as_ref(),
+                Arc::clone(&graph),
+                graph_authority,
+                &request.arguments,
+                |_| {},
+            )
+            .await
+        } else {
+            kin_mcp::handlers::handle_tool_call(
+                &request.name,
+                &request.arguments,
+                graph.as_ref(),
+                &sessions,
+                kin_mcp::SessionAuthorityMode::OfflineFallback,
+            )
+            .await
+        };
+        match handled {
             Ok(result) => result,
             Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
         }
@@ -6332,6 +6644,7 @@ async fn mcp_tools_call(
         )?;
     }
 
+    drop(graph_mutation);
     Ok(Json(result))
 }
 
@@ -7978,6 +8291,7 @@ async fn vfs_file_changed(
 
     let mut reconciler = state.reconciler.write().await;
     let mut wc = state.working_copy.write().await;
+    let graph_mutation = state.begin_graph_authority_mutation();
 
     // Temporarily adopt the caller's session so the reconciler's own collision
     // check excludes the caller's intents (parity with /vfs/write-notify); the
@@ -8080,6 +8394,9 @@ async fn vfs_file_changed(
             // VFS reads serve updated FileLayouts.
             if !projection_changed.is_empty() {
                 state.bump_version(); // marks dirty for background persistence
+            }
+            drop(graph_mutation);
+            if !projection_changed.is_empty() {
                 if let Err(e) = state.refresh_projection(&projection_changed).await {
                     tracing::warn!(error = %e, "failed to refresh projection after write-back");
                 }
@@ -8171,6 +8488,7 @@ async fn vfs_write_notify(
 
     let mut reconciler = state.reconciler.write().await;
     let mut wc = state.working_copy.write().await;
+    let graph_mutation = state.begin_graph_authority_mutation();
 
     // If the caller supplies a session_id, temporarily set it on the
     // reconciler so check_scopes() excludes the caller's own intents.
@@ -8270,6 +8588,9 @@ async fn vfs_write_notify(
 
             if !projection_changed.is_empty() {
                 state.bump_version(); // marks dirty for background persistence
+            }
+            drop(graph_mutation);
+            if !projection_changed.is_empty() {
                 if let Err(e) = state.refresh_projection(&projection_changed).await {
                     tracing::warn!(error = %e, "failed to refresh projection after write-notify");
                 }
@@ -8517,10 +8838,8 @@ async fn spine_xref(
     })?;
 
     let entity_id = parse_entity_id_hex(&params.entity)?;
-    let edges = spine.cross_repo_edges_for(&params.repo, &entity_id);
-
     Ok(Json(
-        json!({ "version": kin_spine::SPINE_PAYLOAD_VERSION, "edges": edges }),
+        spine.cross_repo_xref_response(&params.repo, &entity_id),
     ))
 }
 
@@ -9825,7 +10144,9 @@ mod tests {
                 .join(format!("kin-daemon-test-registry-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&root).unwrap();
             let path = root.join("registry.toml");
-            std::fs::write(&path, "repos = []\n").unwrap();
+            kin_core::registry::KinRegistry { repos: Vec::new() }
+                .save_to(&path)
+                .unwrap();
             path
         });
 
@@ -9839,6 +10160,10 @@ mod tests {
     }
 
     fn test_state() -> Arc<DaemonState> {
+        test_state_with_repo_id(None)
+    }
+
+    fn test_state_with_repo_id(repo_id: Option<&str>) -> Arc<DaemonState> {
         install_test_registry_override();
         let dir = std::env::temp_dir().join(format!("kin-daemon-test-state-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -9849,7 +10174,10 @@ mod tests {
         kin_core::manifest::KinManifest::new()
             .save(&layout.manifest_path())
             .unwrap();
-        Arc::new(DaemonState::open(layout).unwrap())
+        Arc::new(match repo_id {
+            Some(repo_id) => DaemonState::open_for_test(layout, repo_id).unwrap(),
+            None => DaemonState::open(layout).unwrap(),
+        })
     }
 
     fn run_hydration_fixture_git(repo: &FsPath, args: &[&str]) -> String {
@@ -13999,6 +14327,21 @@ mod tests {
             serde_json::json!(kin_spine::SPINE_PAYLOAD_VERSION),
             "/spine/xref payload must carry the spine wire-format version"
         );
+        assert_eq!(xbody["authority_complete"], true);
+        assert_eq!(xbody["authority_anchor"]["repo_id"], "consumer");
+        assert_eq!(
+            xbody["authority_anchor"]["entity_id"],
+            serde_json::json!(run_task_id)
+        );
+        assert!(xbody["authority_revision"]
+            .as_str()
+            .is_some_and(|revision| revision.starts_with("sha256:") && revision.len() == 71));
+        assert_eq!(xbody["authority_roots"]["consumer"], "consumer-root");
+        assert_eq!(xbody["authority_roots"]["provider"], "provider-root");
+        assert!(xbody["entities"].as_array().is_some_and(|entities| {
+            entities.iter().any(|entity| entity["name"] == "run_task")
+                && entities.iter().any(|entity| entity["name"] == "do_work")
+        }));
 
         let snapshot = app
             .clone()
@@ -14057,6 +14400,85 @@ mod tests {
             serde_json::json!(kin_spine::SPINE_PAYLOAD_VERSION),
             "/spine/impact payload must carry the spine wire-format version"
         );
+    }
+
+    #[tokio::test]
+    async fn spine_xref_fails_closed_while_topology_is_dirty_then_exposes_complete_watermark() {
+        let consumer_id = EntityId::new();
+        let provider_id = EntityId::new();
+        let state = test_state();
+        let spine = state.ensure_spine().expect("spine enabled in test");
+        spine.register_repo(
+            "consumer",
+            vec![spine_test_entry_with_id(
+                "consumer",
+                consumer_id,
+                "run_task",
+            )],
+            "consumer-root",
+        );
+        spine.register_repo(
+            "provider",
+            vec![spine_test_entry_with_id("provider", provider_id, "do_work")],
+            "provider-root",
+        );
+        spine.add_cross_repo_edge(kin_spine::CrossRepoEdge {
+            src_repo: "consumer".to_string(),
+            src_entity: consumer_id,
+            dst_repo: "provider".to_string(),
+            dst_entity: provider_id,
+            confidence: 0.9,
+        });
+
+        let app = router(state.clone());
+        let read_xref = |app: Router| async move {
+            let response = app
+                .oneshot(
+                    Request::get(format!(
+                        "/spine/xref?repo=provider&entity={}",
+                        provider_id.0
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            serde_json::from_slice::<serde_json::Value>(
+                &axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+
+        let dirty = read_xref(app.clone()).await;
+        assert_eq!(dirty["authority_complete"], false);
+        assert!(dirty["authority_revision"]
+            .as_str()
+            .is_some_and(|revision| revision.starts_with("sha256:")));
+        assert_eq!(dirty["authority_roots"]["provider"], "provider-root");
+        assert_eq!(dirty["edges"].as_array().map(Vec::len), Some(1));
+        assert_eq!(dirty["entities"].as_array().map(Vec::len), Some(2));
+
+        let mut repos = state
+            .ensure_spine()
+            .expect("spine enabled in test")
+            .registered_repo_ids()
+            .into_iter()
+            .collect::<Vec<_>>();
+        repos.sort();
+        for repo in &repos {
+            state
+                .ensure_spine()
+                .expect("spine enabled in test")
+                .refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+        let complete = read_xref(app).await;
+        assert_eq!(complete["authority_complete"], true);
+        assert_eq!(complete["authority_roots"], dirty["authority_roots"]);
+        assert_ne!(complete["authority_revision"], dirty["authority_revision"]);
+        assert!(complete["edges"].as_array().is_some_and(Vec::is_empty));
     }
 
     #[tokio::test]
@@ -14385,10 +14807,21 @@ mod tests {
         let state = test_state();
         let spine = state.ensure_spine().expect("spine enabled in test");
         // Register two repos' metadata so the pass has a non-empty repo set to
-        // iterate over (their graphs are unavailable without a backend).
-        spine.register_repo("kin", vec![], "");
-        spine.register_repo("kin-db", vec![], "");
-        let app = router(state);
+        // iterate over (their graphs are unavailable without a backend). The
+        // daemon's own repo is also registered and remains loadable from its
+        // in-process graph.
+        spine.register_repo("kin", vec![], "kin-root");
+        spine.register_repo("kin-db", vec![], "kin-db-root");
+        let mut repos = spine.registered_repo_ids().into_iter().collect::<Vec<_>>();
+        repos.sort();
+        for repo in &repos {
+            spine.refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+        assert!(
+            spine.cross_repo_edges_snapshot().complete,
+            "fixture starts complete so skipped loads test invalidation"
+        );
+        let app = router(Arc::clone(&state));
 
         let response = app
             .oneshot(
@@ -14414,9 +14847,19 @@ mod tests {
             body.get("crossRepoEdges").is_some(),
             "response must carry crossRepoEdges, got {body}"
         );
-        // No backend → no repo graph loadable → nothing refreshed, but a clean
-        // 200 rather than a hard failure.
+        // No backend means the two foreign repo graphs are unavailable. The
+        // two-phase pass must not certify a partial registry by refreshing only
+        // the daemon's in-process repo, so zero repos are reported refreshed
+        // and the prior complete watermark remains revoked.
         assert_eq!(body["reposRefreshed"], serde_json::json!(0));
+        assert!(
+            !state
+                .ensure_spine()
+                .expect("spine remains enabled")
+                .cross_repo_edges_snapshot()
+                .complete,
+            "skipped registered repos must revoke the old complete watermark"
+        );
     }
 
     /// One gate proving the cross-repo blast radius is consistent across every
@@ -14464,17 +14907,42 @@ mod tests {
             .expect("run_task entity present")
             .id;
 
-        let state = test_state();
+        // Pin the daemon's canonical graph identity without mutating process
+        // environment shared by concurrently executing tests.
+        let state = test_state_with_repo_id(Some("provider"));
+        assert_eq!(state.cached_repo_id, "provider");
+        let mut provider_entity = test_entity("do_work", "src/lib.rs");
+        provider_entity.id = do_work_id;
+        state.graph.upsert_entity(&provider_entity).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let layout = state.layout.clone();
+        let provider_root = hex::encode(state.graph.compute_root_hash());
         {
             let spine = state.ensure_spine().expect("spine enabled in test");
-            spine.register_repo("provider", vec![provider_entry], "");
-            spine.refresh_cross_repo_edges(
+            spine.register_repo("provider", vec![provider_entry], &provider_root);
+            spine.register_repo(
                 "consumer",
-                &consumer_entities,
-                &consumer_relations,
-                &["provider".to_string()],
+                consumer_entities
+                    .iter()
+                    .map(|entity| spine_test_entry("consumer", entity))
+                    .collect(),
+                "consumer-root",
             );
+            let mut registry = spine.registered_repo_ids().into_iter().collect::<Vec<_>>();
+            registry.sort();
+            for repo in &registry {
+                match repo.as_str() {
+                    "consumer" => spine.refresh_cross_repo_edges(
+                        repo,
+                        &consumer_entities,
+                        &consumer_relations,
+                        &registry,
+                    ),
+                    _ => spine.refresh_cross_repo_edges(repo, &[], &[], &registry),
+                }
+            }
             assert!(
                 spine.edge_count() >= 1,
                 "fixture must materialize a cross-repo edge (parse -> link -> spine)"
@@ -14540,10 +15008,10 @@ mod tests {
             .await
             .expect("CLI get_spine_xref call")
         {
-            kin_spine::SpineQuery::Found(edges) => edges,
+            kin_spine::SpineQuery::Found(response) => response,
             other => panic!("CLI get_spine_xref expected Found, got {other:?}"),
         };
-        let cli_xref_to_provider = cli_xref.iter().any(|e| e.dst_repo == "provider");
+        let cli_xref_to_provider = cli_xref.edges.iter().any(|e| e.dst_repo == "provider");
         assert!(
             cli_xref_to_provider,
             "kin xref CLI must resolve consumer->provider: {cli_xref:?}"
@@ -14568,13 +15036,13 @@ mod tests {
             kin_spine::SpineQuery::Found(body) => body,
             other => panic!("MCP fetch_spine_xref expected Found, got {other:?}"),
         };
-        let mcp_xref_to_provider = mcp_xref["edges"]
-            .as_array()
-            .map(|edges| edges.iter().any(|e| e["dst_repo"] == "provider"))
-            .unwrap_or(false);
+        let mcp_xref_to_provider = mcp_xref
+            .edges
+            .iter()
+            .any(|edge| edge.dst_repo == "provider");
         assert!(
             mcp_xref_to_provider,
-            "MCP fetch_spine_xref must resolve consumer->provider: {mcp_xref}"
+            "MCP fetch_spine_xref must resolve consumer->provider: {mcp_xref:?}"
         );
 
         let mcp_impact = match fetch_spine_impact_typed("provider", &do_work_id, 5).await {
@@ -14599,8 +15067,361 @@ mod tests {
             "daemon, CLI, and MCP must all resolve the same consumer->provider xref"
         );
 
+        // The agent-facing production route must project that real incoming
+        // edge without looping back through KIN_DAEMON_URL. A foreign request
+        // argument must not override DaemonState's repo binding.
+        std::env::remove_var("KIN_DAEMON_URL");
+        let result: kin_mcp::ToolCallResult = http
+            .post(format!("{base}/mcp/tools/call"))
+            .json(&serde_json::json!({
+                "name": "find_references",
+                "arguments": {
+                    "entity_id": do_work_id.to_string(),
+                    "repo_id": "request-controlled",
+                },
+            }))
+            .send()
+            .await
+            .expect("daemon MCP find_references request")
+            .json()
+            .await
+            .expect("daemon MCP find_references response");
+        let kin_mcp::types::ContentBlock::Text { text } = result
+            .content
+            .first()
+            .expect("find_references text response");
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["cross_repo"]["status"], "available");
+        assert_eq!(body["cross_repo"]["reference_count"], 1);
+        assert_eq!(body["cross_repo"]["authority_complete"], true);
+        assert_eq!(
+            body["cross_repo"]["authority_anchor"]["repo_id"],
+            "provider"
+        );
+        assert!(body["cross_repo"]["authority_revision"]
+            .as_str()
+            .is_some_and(|revision| revision.starts_with("sha256:")));
+        assert_eq!(
+            body["cross_repo"]["authority_roots"]["provider"],
+            provider_root
+        );
+        assert!(body["references"].as_array().is_some_and(|references| {
+            references.iter().any(|reference| {
+                reference["name"] == "run_task" && reference["file_path"] == "[consumer] src/app.rs"
+            })
+        }));
+
         std::env::remove_var("KIN_DAEMON_URL");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn daemon_mcp_bulk_reachability_uses_exact_federated_authority() {
+        let state = test_state_with_repo_id(Some("provider"));
+        let target = test_entity("target", "src/lib.rs");
+        let source = test_entity("caller", "src/app.rs");
+        state.graph.upsert_entity(&target).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let spine = state.ensure_spine().expect("spine enabled in test");
+        let provider_root = hex::encode(state.graph.compute_root_hash());
+        assert_eq!(
+            spine.root_hash("provider").as_deref(),
+            Some(provider_root.as_str())
+        );
+        spine.register_repo(
+            "consumer",
+            vec![spine_test_entry("consumer", &source)],
+            "consumer-root",
+        );
+        let mut repos = spine.registered_repo_ids().into_iter().collect::<Vec<_>>();
+        repos.sort();
+        for repo in &repos {
+            spine.refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+        spine.add_cross_repo_edge(kin_spine::CrossRepoEdge {
+            src_repo: "consumer".to_string(),
+            src_entity: source.id,
+            dst_repo: "provider".to_string(),
+            dst_entity: target.id,
+            confidence: 0.9,
+        });
+
+        let result = mcp_call(
+            router(Arc::clone(&state)),
+            "bulk_check_references",
+            serde_json::json!({
+                "entity_ids": [target.id.to_string()],
+                "relation_kind": "Any",
+            }),
+        )
+        .await;
+        let result = kin_mcp::finalize_with_envelope(
+            result,
+            kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+                "initialized": true,
+                "graph_loaded": true,
+                "graph_generation": 12,
+            })),
+            "bulk_check_references",
+        );
+        let body: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+        assert_eq!(body["results"][0]["has_references"], true);
+        assert_eq!(body["results"][0]["federated_reference_count"], 1);
+        assert_eq!(body["cross_repo"]["authority_complete"], true);
+        assert_eq!(
+            body["cross_repo"]["authority_roots"]["provider"],
+            provider_root
+        );
+        assert_eq!(body["negative"]["safe_to_conclude_absent"], true);
+    }
+
+    #[tokio::test]
+    async fn xref_reads_retry_when_head_mutates_between_root_and_read_even_after_aba() {
+        let state = test_state_with_repo_id(Some("provider"));
+        let target = test_entity("target", "src/lib.rs");
+        state.graph.upsert_entity(&target).unwrap();
+        let stable_root = state.graph.compute_root_hash();
+        let stable_root_hex = hex::encode(stable_root);
+
+        // Initialize a complete spine at the same semantic root. Every hook
+        // below inserts and removes a transient entity after the root stamp,
+        // returning the graph to this exact root. Root-only validation would
+        // accept the first attempt; the monotonic HEAD version must force one
+        // retry while each handler reads its detached snapshot.
+        let spine = state.ensure_spine().expect("spine enabled in test");
+        assert_eq!(
+            spine.root_hash("provider").as_deref(),
+            Some(stable_root_hex.as_str())
+        );
+        assert!(
+            spine.cross_repo_edges_snapshot().complete,
+            "stable primary initialization must publish complete local spine authority"
+        );
+
+        let command_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let command_hook_state = Arc::clone(&state);
+        let command_hook_attempts = Arc::clone(&command_attempts);
+        let command_transient = test_entity("command_transient", "src/transient.rs");
+        let command = command_xref_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &kin_cli::commands::xref::XrefRequest {
+                entity: target.name.clone(),
+            },
+            move |attempt| {
+                command_hook_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    command_hook_state
+                        .graph
+                        .upsert_entity(&command_transient)
+                        .unwrap();
+                    command_hook_state
+                        .graph
+                        .remove_entity(&command_transient.id)
+                        .unwrap();
+                    command_hook_state.bump_version();
+                }
+            },
+        )
+        .await
+        .expect("command xref retries onto stable authority");
+        assert_eq!(
+            command_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert_eq!(state.graph.compute_root_hash(), stable_root);
+        assert!(command
+            .spine
+            .as_ref()
+            .is_some_and(|body| body.authority_complete_for("provider", &target.id)));
+
+        let arguments = serde_json::from_value::<HashMap<String, serde_json::Value>>(json!({
+            "entity_id": target.id.to_string(),
+        }))
+        .unwrap();
+        let find_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let find_hook_state = Arc::clone(&state);
+        let find_hook_attempts = Arc::clone(&find_attempts);
+        let find_transient = test_entity("find_transient", "src/transient.rs");
+        let find = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            move |attempt| {
+                find_hook_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    find_hook_state
+                        .graph
+                        .upsert_entity(&find_transient)
+                        .unwrap();
+                    find_hook_state
+                        .graph
+                        .remove_entity(&find_transient.id)
+                        .unwrap();
+                    find_hook_state.bump_version();
+                }
+            },
+        )
+        .await
+        .expect("find_references retries onto stable authority");
+        assert_eq!(find_attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let find_body: serde_json::Value = serde_json::from_str(&mcp_result_text(&find)).unwrap();
+        assert_eq!(find_body["cross_repo"]["status"], "available");
+        assert_eq!(find_body["cross_repo"]["authority_complete"], true);
+
+        let arguments = serde_json::from_value::<HashMap<String, serde_json::Value>>(json!({
+            "entity_ids": [target.id.to_string()],
+            "relation_kind": "Any",
+        }))
+        .unwrap();
+        let bulk_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let bulk_hook_state = Arc::clone(&state);
+        let bulk_hook_attempts = Arc::clone(&bulk_attempts);
+        let bulk_transient = test_entity("bulk_transient", "src/transient.rs");
+        let bulk = mcp_bulk_check_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            move |attempt| {
+                bulk_hook_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    bulk_hook_state
+                        .graph
+                        .upsert_entity(&bulk_transient)
+                        .unwrap();
+                    bulk_hook_state
+                        .graph
+                        .remove_entity(&bulk_transient.id)
+                        .unwrap();
+                    bulk_hook_state.bump_version();
+                }
+            },
+        )
+        .await
+        .expect("bulk_check_references retries onto stable authority");
+        assert_eq!(bulk_attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let bulk_body: serde_json::Value = serde_json::from_str(&mcp_result_text(&bulk)).unwrap();
+        assert_eq!(bulk_body["cross_repo"]["status"], "available");
+        assert_eq!(bulk_body["cross_repo"]["authority_complete"], true);
+        assert_eq!(state.graph.compute_root_hash(), stable_root);
+    }
+
+    #[test]
+    fn mutation_wrapper_blocks_xref_during_stalled_head_and_session_batches() {
+        let state = test_state_with_repo_id(Some("provider"));
+        let head_target = test_entity("head_target", "src/head.rs");
+        state.graph.upsert_entity(&head_target).unwrap();
+
+        let head_started = Arc::new(std::sync::Barrier::new(2));
+        let head_release = Arc::new(std::sync::Barrier::new(2));
+        let head_state = Arc::clone(&state);
+        let head_started_worker = Arc::clone(&head_started);
+        let head_release_worker = Arc::clone(&head_release);
+        let head_writer = std::thread::spawn(move || {
+            with_graph_authority_mutation(head_state.as_ref(), || {
+                let transient = test_entity("head_mid_batch", "src/transient.rs");
+                head_state.graph.upsert_entity(&transient).unwrap();
+                head_started_worker.wait();
+                head_release_worker.wait();
+                head_state.graph.remove_entity(&transient.id).unwrap();
+                head_state.bump_version();
+            });
+        });
+
+        head_started.wait();
+        assert!(
+            prepare_xref_graph_read(&state, &state.graph, RequestGraphAuthority::Head).is_none(),
+            "HEAD must not detach an intermediate graph while a writer is stalled"
+        );
+        head_release.wait();
+        head_writer.join().unwrap();
+        assert!(
+            prepare_xref_graph_read(&state, &state.graph, RequestGraphAuthority::Head).is_some()
+        );
+
+        let scoped_graph = Arc::new(kin_db::InMemoryGraph::new());
+        let scoped_target = test_entity("scoped_target", "src/scoped.rs");
+        scoped_graph.upsert_entity(&scoped_target).unwrap();
+        let scope_started = Arc::new(std::sync::Barrier::new(2));
+        let scope_release = Arc::new(std::sync::Barrier::new(2));
+        let scope_state = Arc::clone(&state);
+        let scope_graph_worker = Arc::clone(&scoped_graph);
+        let scope_started_worker = Arc::clone(&scope_started);
+        let scope_release_worker = Arc::clone(&scope_release);
+        let scope_writer = std::thread::spawn(move || {
+            with_graph_authority_mutation(scope_state.as_ref(), || {
+                let transient = test_entity("scope_mid_batch", "src/transient.rs");
+                scope_graph_worker.upsert_entity(&transient).unwrap();
+                scope_started_worker.wait();
+                scope_release_worker.wait();
+                scope_graph_worker.remove_entity(&transient.id).unwrap();
+            });
+        });
+
+        scope_started.wait();
+        assert!(
+            prepare_xref_graph_read(&state, &scoped_graph, RequestGraphAuthority::SessionScope,)
+                .is_none(),
+            "session scope must not detach an intermediate hydration graph"
+        );
+        scope_release.wait();
+        scope_writer.join().unwrap();
+        assert!(prepare_xref_graph_read(
+            &state,
+            &scoped_graph,
+            RequestGraphAuthority::SessionScope,
+        )
+        .is_some());
+    }
+
+    #[tokio::test]
+    async fn scoped_xref_fails_closed_when_selected_scope_is_replaced_mid_read() {
+        let state = test_state_with_repo_id(Some("provider"));
+        let scoped_graph = Arc::new(kin_db::InMemoryGraph::new());
+        let target = test_entity("historical_target", "src/lib.rs");
+        scoped_graph.upsert_entity(&target).unwrap();
+        let session_id = SessionId::new();
+        state
+            .set_session_scope(
+                &session_id,
+                "git:historical".to_string(),
+                kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([7; 32])),
+                Arc::clone(&scoped_graph),
+            )
+            .await;
+
+        let hook_state = Arc::clone(&state);
+        let error = command_xref_with_stable_authority(
+            &state,
+            Some(&session_id),
+            scoped_graph,
+            RequestGraphAuthority::SessionScope,
+            &kin_cli::commands::xref::XrefRequest {
+                entity: target.name,
+            },
+            move |attempt| {
+                if attempt == 0 {
+                    hook_state
+                        .session_scopes
+                        .try_write()
+                        .expect("xref does not hold the session scope lock")
+                        .remove(&session_id);
+                }
+            },
+        )
+        .await
+        .expect_err("an orphaned session graph must never be certified");
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.1.contains("changed repeatedly"));
     }
 
     /// Fail-loud contract: when a spine endpoint IS configured but the daemon
@@ -14671,6 +15492,157 @@ mod tests {
 
         std::env::remove_var("KIN_DAEMON_URL");
         server.abort();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mcp_find_references_reports_legacy_xref_payload_as_unavailable() {
+        async fn legacy_xref() -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "version": kin_spine::SPINE_PAYLOAD_VERSION,
+                "edges": [{
+                    "repo_id": "consumer",
+                    "from_name": "run_task",
+                    "to_repo_id": "provider",
+                    "kind": "calls",
+                }],
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, Router::new().fallback(legacy_xref)).await;
+        });
+        std::env::set_var("KIN_DAEMON_URL", format!("http://{addr}"));
+        std::env::set_var("KIN_REPO_ID", "provider");
+
+        let target = test_entity("do_work", "src/lib.rs");
+        let graph = kin_db::InMemoryGraph::new();
+        graph.upsert_entity(&target).unwrap();
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let result = kin_mcp::handlers::entities::handle_find_references(&args, &graph)
+            .await
+            .unwrap();
+        let kin_mcp::types::ContentBlock::Text { text } = result
+            .content
+            .first()
+            .expect("find_references text response");
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["cross_repo"]["status"], "unavailable");
+        assert!(body["cross_repo"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("malformed spine xref response")));
+        assert_eq!(body["total_upstream"], 0);
+
+        std::env::remove_var("KIN_REPO_ID");
+        std::env::remove_var("KIN_DAEMON_URL");
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mcp_find_references_rejects_unanchored_xref_as_inconclusive() {
+        async fn legacy_xref() -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "version": kin_spine::SPINE_PAYLOAD_VERSION,
+                "edges": [],
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, Router::new().fallback(legacy_xref)).await;
+        });
+        std::env::set_var("KIN_DAEMON_URL", format!("http://{addr}"));
+        std::env::set_var("KIN_REPO_ID", "provider");
+
+        let target = test_entity("do_work", "src/lib.rs");
+        let graph = kin_db::InMemoryGraph::new();
+        graph.upsert_entity(&target).unwrap();
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let result = kin_mcp::handlers::entities::handle_find_references(&args, &graph)
+            .await
+            .unwrap();
+        let result = kin_mcp::finalize_with_envelope(
+            result,
+            kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+                "initialized": true,
+                "graph_loaded": true,
+                "graph_generation": 12,
+            })),
+            "find_references",
+        );
+        let kin_mcp::types::ContentBlock::Text { text } = result
+            .content
+            .first()
+            .expect("find_references text response");
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["cross_repo"]["status"], "unavailable");
+        assert!(body["cross_repo"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("xref response anchor does not match")));
+        assert_eq!(body["negative"]["safe_to_conclude_absent"], false);
+        assert!(body["negative"]["trust_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("cross_repo_unavailable")));
+
+        std::env::remove_var("KIN_REPO_ID");
+        std::env::remove_var("KIN_DAEMON_URL");
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mcp_find_references_requires_nonblank_repo_binding() {
+        let target = test_entity("do_work", "src/lib.rs");
+        let graph = kin_db::InMemoryGraph::new();
+        graph.upsert_entity(&target).unwrap();
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+
+        for repo_id in [None, Some("   ")] {
+            match repo_id {
+                Some(value) => std::env::set_var("KIN_REPO_ID", value),
+                None => std::env::remove_var("KIN_REPO_ID"),
+            }
+            let result = kin_mcp::handlers::entities::handle_find_references(&args, &graph)
+                .await
+                .unwrap();
+            let result = kin_mcp::finalize_with_envelope(
+                result,
+                kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+                    "initialized": true,
+                    "graph_loaded": true,
+                    "graph_generation": 12,
+                })),
+                "find_references",
+            );
+            let kin_mcp::types::ContentBlock::Text { text } = result
+                .content
+                .first()
+                .expect("find_references text response");
+            let body: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(body["cross_repo"]["status"], "unavailable");
+            assert!(body["cross_repo"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("KIN_REPO_ID is missing or blank")));
+            assert_eq!(body["negative"]["safe_to_conclude_absent"], false);
+            assert!(body["negative"]["trust_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("cross_repo_unavailable")));
+        }
+
+        std::env::remove_var("KIN_REPO_ID");
     }
 
     // -----------------------------------------------------------------------

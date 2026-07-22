@@ -7,7 +7,7 @@
 //! registered repos. Provides name-based resolution with fingerprint
 //! disambiguation for common names like Config, Error, init.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use hashbrown::HashMap;
 use kin_model::{Entity, EntityId, EntityKind, EntityRole, Relation, SemanticFingerprint};
@@ -34,6 +34,25 @@ pub struct EntityEntry {
     pub role: Option<EntityRole>,
 }
 
+impl PartialEq for EntityEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.repo_id == other.repo_id
+            && self.entity_id == other.entity_id
+            && self.name == other.name
+            && self.kind == other.kind
+            && self.signature == other.signature
+            && self.fingerprint.algorithm == other.fingerprint.algorithm
+            && self.fingerprint.ast_hash == other.fingerprint.ast_hash
+            && self.fingerprint.signature_hash == other.fingerprint.signature_hash
+            && self.fingerprint.behavior_hash == other.fingerprint.behavior_hash
+            && self.fingerprint.equivalence_hash == other.fingerprint.equivalence_hash
+            && self.fingerprint.stability_score.to_bits()
+                == other.fingerprint.stability_score.to_bits()
+            && self.file_path == other.file_path
+            && self.role == other.role
+    }
+}
+
 /// Cross-repo edge linking two entities across repo boundaries.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CrossRepoEdge {
@@ -44,6 +63,250 @@ pub struct CrossRepoEdge {
     /// Confidence in the edge (0.0 - 1.0). Name-only matches get lower
     /// confidence than fingerprint-verified matches.
     pub confidence: f32,
+}
+
+/// The exact repository/entity pair for which an xref response was projected.
+///
+/// Xref payloads may legitimately be empty, so clients cannot infer this anchor
+/// from the returned edges. Echoing it prevents a stale or mis-keyed response
+/// from certifying absence for a different entity in the same repository.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SpineXrefAuthorityAnchor {
+    pub repo_id: RepoId,
+    pub entity_id: EntityId,
+}
+
+/// Versioned wire response for `GET /v1/spine/xref`.
+///
+/// `edges` remains the canonical topology payload. `entities` is an additive,
+/// metadata-only sidecar that lets clients render useful cross-repo references
+/// without inventing field names or reading another repository's files.
+/// `authority_*` carries the exact graph-authority watermark against which the
+/// topology was answered. Older version-1 daemons omitted the additive sidecar
+/// and authority fields, so they decode conservatively as incomplete.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SpineXrefResponse {
+    version: u32,
+    pub edges: Vec<CrossRepoEdge>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<EntityEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_anchor: Option<SpineXrefAuthorityAnchor>,
+    #[serde(default)]
+    pub authority_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub authority_roots: BTreeMap<RepoId, String>,
+}
+
+impl SpineXrefResponse {
+    /// Construct an unwatermarked response.
+    ///
+    /// This remains available for patch-compatible callers that only have an
+    /// edge collection, but it deliberately cannot certify an empty result.
+    /// Production daemon routes should use [`Self::from_snapshot`].
+    pub fn new(edges: Vec<CrossRepoEdge>, entities: Vec<EntityEntry>) -> Self {
+        Self {
+            version: crate::SPINE_PAYLOAD_VERSION,
+            edges,
+            entities,
+            authority_anchor: None,
+            authority_complete: false,
+            authority_revision: None,
+            authority_roots: BTreeMap::new(),
+        }
+    }
+
+    /// Project one entity's xrefs from a single atomic authority snapshot.
+    ///
+    /// Both topology and the metadata sidecar come from the same spine read.
+    /// Completeness also requires that the requested repository belongs to the
+    /// snapshot's root watermark; a typo or stale binding must not certify an
+    /// empty result against some unrelated repository universe.
+    pub fn from_snapshot(
+        snapshot: CrossRepoEdgesSnapshot,
+        repo_id: &str,
+        entity_id: &EntityId,
+    ) -> Self {
+        let CrossRepoEdgesSnapshot {
+            complete,
+            revision,
+            roots,
+            edges,
+            entities,
+            covered_entities,
+            ..
+        } = snapshot;
+        let edges = edges
+            .into_iter()
+            .filter(|edge| {
+                (edge.src_repo == repo_id && edge.src_entity == *entity_id)
+                    || (edge.dst_repo == repo_id && edge.dst_entity == *entity_id)
+            })
+            .collect::<Vec<_>>();
+        let entity_keys = edges
+            .iter()
+            .flat_map(|edge| {
+                [
+                    (edge.src_repo.clone(), edge.src_entity),
+                    (edge.dst_repo.clone(), edge.dst_entity),
+                ]
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let entities = entities
+            .into_iter()
+            .filter(|entity| entity_keys.contains(&(entity.repo_id.clone(), entity.entity_id)))
+            .collect();
+
+        Self {
+            version: crate::SPINE_PAYLOAD_VERSION,
+            edges,
+            entities,
+            authority_anchor: Some(SpineXrefAuthorityAnchor {
+                repo_id: repo_id.to_string(),
+                entity_id: *entity_id,
+            }),
+            authority_complete: complete
+                && roots.contains_key(repo_id)
+                && covered_entities
+                    .get(repo_id)
+                    .is_some_and(|entities| entities.contains(entity_id)),
+            authority_revision: Some(revision),
+            authority_roots: roots,
+        }
+    }
+
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// Whether this payload can certify an answer for the requested anchor.
+    ///
+    /// This is intentionally stricter than the wire-level boolean so callers
+    /// cannot accidentally ignore the response's query binding.
+    pub fn authority_complete_for(&self, repo_id: &str, entity_id: &EntityId) -> bool {
+        self.authority_complete
+            && self
+                .authority_anchor
+                .as_ref()
+                .is_some_and(|anchor| anchor.repo_id == repo_id && anchor.entity_id == *entity_id)
+            && self.authority_roots.contains_key(repo_id)
+    }
+
+    /// Whether the response's primary-repo watermark is the exact graph root
+    /// held by the caller. A complete spine rooted at an older live/session
+    /// graph is stale authority, including for positive rows.
+    pub fn authority_root_matches(&self, repo_id: &str, expected_root: &str) -> bool {
+        self.authority_roots
+            .get(repo_id)
+            .is_some_and(|root| root == expected_root)
+    }
+
+    /// Decode and version-check an xref response as one shared contract.
+    ///
+    /// Callers must not index ad-hoc JSON fields: required topology fields and
+    /// entity IDs are validated by Serde, while an unsupported version fails
+    /// explicitly instead of degrading to an empty cross-repo result.
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, SpineXrefDecodeError> {
+        let response: Self = serde_json::from_slice(bytes)?;
+        if response.version != crate::SPINE_PAYLOAD_VERSION {
+            return Err(SpineXrefDecodeError::UnsupportedVersion {
+                actual: response.version,
+                supported: crate::SPINE_PAYLOAD_VERSION,
+            });
+        }
+        if response.authority_complete {
+            let valid_anchor = response.authority_anchor.as_ref().is_some_and(|anchor| {
+                !anchor.repo_id.is_empty()
+                    && anchor.repo_id.trim() == anchor.repo_id
+                    && response.authority_roots.contains_key(&anchor.repo_id)
+            });
+            let valid_revision = response
+                .authority_revision
+                .as_deref()
+                .is_some_and(|revision| {
+                    revision.len() == 71
+                        && revision.strip_prefix("sha256:").is_some_and(|digest| {
+                            digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        })
+                });
+            let valid_roots = !response.authority_roots.is_empty()
+                && response.authority_roots.iter().all(|(repo, root)| {
+                    !repo.is_empty()
+                        && repo.trim() == repo
+                        && !root.is_empty()
+                        && root.trim() == root
+                });
+            let endpoints_are_watermarked = response.edges.iter().all(|edge| {
+                response.authority_roots.contains_key(&edge.src_repo)
+                    && response.authority_roots.contains_key(&edge.dst_repo)
+            });
+            if !valid_anchor || !valid_revision || !valid_roots || !endpoints_are_watermarked {
+                return Err(SpineXrefDecodeError::InvalidAuthority(
+                    "complete xref authority requires a query anchor, canonical revision, non-empty roots, and watermarked edge endpoints"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(response)
+    }
+
+    /// Decode an xref response and bind it to the request that produced it.
+    ///
+    /// Every transport consumer should use this method. Empty responses must
+    /// echo the requested anchor; the sole compatibility exception is a
+    /// pre-authority v1 payload with non-empty typed edges, which is accepted
+    /// only when every edge is incident to the requested anchor and is forced
+    /// incomplete. Any unrelated edge is internally inconsistent.
+    pub fn from_slice_for(
+        bytes: &[u8],
+        repo_id: &str,
+        entity_id: &EntityId,
+    ) -> Result<Self, SpineXrefDecodeError> {
+        let mut response = Self::from_slice(bytes)?;
+        let anchor_matches = response
+            .authority_anchor
+            .as_ref()
+            .is_some_and(|anchor| anchor.repo_id == repo_id && anchor.entity_id == *entity_id);
+        let legacy_incident_positive = response.authority_anchor.is_none()
+            && !response.edges.is_empty()
+            && !response.authority_complete;
+        if !anchor_matches && !legacy_incident_positive {
+            return Err(SpineXrefDecodeError::InvalidAuthority(format!(
+                "xref response anchor does not match requested repository/entity {repo_id}/{entity_id}"
+            )));
+        }
+
+        let edges_are_incident = response.edges.iter().all(|edge| {
+            (edge.src_repo == repo_id && edge.src_entity == *entity_id)
+                || (edge.dst_repo == repo_id && edge.dst_entity == *entity_id)
+        });
+        if !edges_are_incident {
+            return Err(SpineXrefDecodeError::InvalidAuthority(format!(
+                "xref response contains an edge unrelated to requested repository/entity {repo_id}/{entity_id}"
+            )));
+        }
+
+        // Pre-authority v1 payloads can still carry a useful typed positive.
+        // Preserve only non-empty incident edges and force them incomplete;
+        // an unanchored empty can never certify which query it answered.
+        if legacy_incident_positive {
+            response.authority_complete = false;
+        }
+
+        Ok(response)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SpineXrefDecodeError {
+    #[error("malformed spine xref response: {0}")]
+    Malformed(#[from] serde_json::Error),
+    #[error("unsupported spine xref response version {actual}; supported version is {supported}")]
+    UnsupportedVersion { actual: u32, supported: u32 },
+    #[error("invalid spine xref authority: {0}")]
+    InvalidAuthority(String),
 }
 
 /// One atomic, graph-authoritative view of every cross-repo edge in the spine.
@@ -60,6 +323,16 @@ pub struct CrossRepoEdgesSnapshot {
     pub repos: Vec<RepoId>,
     pub roots: BTreeMap<RepoId, String>,
     pub edges: Vec<CrossRepoEdge>,
+    /// Metadata for the returned edge endpoints, captured under the same lock.
+    /// This is an internal authority sidecar; the bulk edge route intentionally
+    /// projects only topology and watermarks onto its public wire response.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<EntityEntry>,
+    /// Entity IDs covered by the same registered root snapshot. Kept off the
+    /// serialized bulk payload; xref projection uses it to ensure the queried
+    /// anchor itself belongs to the watermarked graph before certifying absence.
+    #[serde(skip)]
+    covered_entities: BTreeMap<RepoId, BTreeSet<EntityId>>,
 }
 
 impl Default for CrossRepoEdgesSnapshot {
@@ -72,6 +345,8 @@ impl Default for CrossRepoEdgesSnapshot {
             repos: Vec::new(),
             roots,
             edges,
+            entities: Vec::new(),
+            covered_entities: BTreeMap::new(),
         }
     }
 }
@@ -99,6 +374,17 @@ struct SpineInner {
     /// Cross-repo edges (precomputed from import analysis).
     cross_repo_edges: Vec<CrossRepoEdge>,
 
+    /// Incident-edge index for bounded single-anchor xref reads. The full edge
+    /// vector remains the canonical bulk topology, while this projection lets
+    /// one entity query avoid cloning or scanning the entire organization.
+    cross_repo_edges_by_anchor: HashMap<(RepoId, EntityId), Vec<CrossRepoEdge>>,
+
+    /// Cached validation/revision metadata maintained on the write path. Xref
+    /// reads use these values under the same read lock as the incident-edge
+    /// projection, so certifying one anchor never requires a global edge scan.
+    edge_authority_is_closed: bool,
+    authority_revision: String,
+
     /// Graph root hash per repo (for cache coherence).
     root_hashes: HashMap<RepoId, String>,
 
@@ -114,6 +400,12 @@ struct SpineInner {
     /// Number of edge refreshes currently replacing a repo's outgoing set.
     /// A snapshot taken while this is non-zero is atomic but not complete.
     active_edge_refreshes: usize,
+
+    /// Epoch of the one all-repo refresh pass currently in flight. Per-source
+    /// refreshes may install topology during this lease, but they cannot clear
+    /// dirty authority or expose completeness; only the pass-wide final CAS can
+    /// publish the captured root set atomically.
+    active_full_refresh_epoch: Option<u64>,
 }
 
 struct EdgeRefreshGuard<'a> {
@@ -132,7 +424,10 @@ impl EdgeRefreshGuard<'_> {
 impl Drop for EdgeRefreshGuard<'_> {
     fn drop(&mut self) {
         let mut inner = self.index.inner.write();
-        if self.succeeded && inner.authority_epoch == self.authority_epoch {
+        if self.succeeded
+            && inner.authority_epoch == self.authority_epoch
+            && inner.active_full_refresh_epoch.is_none()
+        {
             inner.dirty_edge_repos.remove(&self.repo_id);
         }
         inner.active_edge_refreshes = inner
@@ -155,10 +450,14 @@ impl SpineIndex {
                 by_name: HashMap::new(),
                 by_id: HashMap::new(),
                 cross_repo_edges: Vec::new(),
+                cross_repo_edges_by_anchor: HashMap::new(),
+                edge_authority_is_closed: true,
+                authority_revision: cross_repo_snapshot_revision(&BTreeMap::new(), &[]),
                 root_hashes: HashMap::new(),
                 dirty_edge_repos: HashSet::new(),
                 authority_epoch: 0,
                 active_edge_refreshes: 0,
+                active_full_refresh_epoch: None,
             }),
             edge_refresh_serialization: Mutex::new(()),
         }
@@ -204,6 +503,62 @@ impl SpineIndex {
         // resolution. Adding or changing one target therefore invalidates every
         // registered source, not just the repo whose metadata changed.
         inner.dirty_edge_repos = inner.root_hashes.keys().cloned().collect();
+        Self::recompute_cross_repo_metadata(inner);
+    }
+
+    /// Rebuild the bounded xref projection and global authority metadata after
+    /// a topology/root mutation. This deliberately runs on the write path;
+    /// read-side single-anchor queries stay proportional to repo roots plus the
+    /// queried entity's incident edges.
+    fn recompute_cross_repo_metadata(inner: &mut SpineInner) {
+        let mut by_anchor = HashMap::<(RepoId, EntityId), Vec<CrossRepoEdge>>::new();
+        let mut closed = true;
+        for edge in &inner.cross_repo_edges {
+            closed &= inner.root_hashes.contains_key(&edge.src_repo)
+                && inner.root_hashes.contains_key(&edge.dst_repo)
+                && inner
+                    .by_id
+                    .contains_key(&(edge.src_repo.clone(), edge.src_entity))
+                && inner
+                    .by_id
+                    .contains_key(&(edge.dst_repo.clone(), edge.dst_entity));
+            by_anchor
+                .entry((edge.src_repo.clone(), edge.src_entity))
+                .or_default()
+                .push(edge.clone());
+            by_anchor
+                .entry((edge.dst_repo.clone(), edge.dst_entity))
+                .or_default()
+                .push(edge.clone());
+        }
+        for edges in by_anchor.values_mut() {
+            edges.sort_by(cross_repo_edge_order);
+            edges.dedup_by(|left, right| cross_repo_edge_identity_order(left, right).is_eq());
+        }
+
+        let roots = inner
+            .root_hashes
+            .iter()
+            .map(|(repo, root)| (repo.clone(), root.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut canonical_edges = inner.cross_repo_edges.clone();
+        canonical_edges.sort_by(cross_repo_edge_order);
+        canonical_edges.dedup_by(|left, right| cross_repo_edge_identity_order(left, right).is_eq());
+
+        inner.cross_repo_edges_by_anchor = by_anchor;
+        inner.edge_authority_is_closed = closed;
+        inner.authority_revision = cross_repo_snapshot_revision(&roots, &canonical_edges);
+    }
+
+    fn authority_complete(inner: &SpineInner, roots: &BTreeMap<RepoId, String>) -> bool {
+        inner.active_edge_refreshes == 0
+            && inner.active_full_refresh_epoch.is_none()
+            && inner.dirty_edge_repos.is_empty()
+            && !roots.is_empty()
+            && roots
+                .values()
+                .all(|root| !root.is_empty() && root.trim() == root)
+            && inner.edge_authority_is_closed
     }
 
     /// Resolve an entity by name and kind across all repos.
@@ -283,47 +638,112 @@ impl SpineIndex {
     /// authority serialize to identical bytes. No projection or filesystem
     /// surface participates in this read.
     pub fn cross_repo_edges_snapshot(&self) -> CrossRepoEdgesSnapshot {
-        let (complete, roots, mut edges) = {
+        let (complete, revision, roots, mut edges, mut entities, covered_entities) = {
             let inner = self.inner.read();
             let roots = inner
                 .root_hashes
                 .iter()
                 .map(|(repo, root)| (repo.clone(), root.clone()))
                 .collect::<BTreeMap<_, _>>();
-            let edge_authority_is_closed = inner.cross_repo_edges.iter().all(|edge| {
-                inner.root_hashes.contains_key(&edge.src_repo)
-                    && inner.root_hashes.contains_key(&edge.dst_repo)
-                    && inner
-                        .by_id
-                        .contains_key(&(edge.src_repo.clone(), edge.src_entity))
-                    && inner
-                        .by_id
-                        .contains_key(&(edge.dst_repo.clone(), edge.dst_entity))
-            });
+            let entities = inner
+                .cross_repo_edges
+                .iter()
+                .flat_map(|edge| {
+                    [
+                        (edge.src_repo.clone(), edge.src_entity),
+                        (edge.dst_repo.clone(), edge.dst_entity),
+                    ]
+                })
+                .filter_map(|key| inner.by_id.get(&key).cloned())
+                .collect::<Vec<_>>();
+            let mut covered_entities = BTreeMap::<RepoId, BTreeSet<EntityId>>::new();
+            for (repo_id, entity_id) in inner.by_id.keys() {
+                covered_entities
+                    .entry(repo_id.clone())
+                    .or_default()
+                    .insert(*entity_id);
+            }
             (
-                inner.active_edge_refreshes == 0
-                    && inner.dirty_edge_repos.is_empty()
-                    && !roots.is_empty()
-                    && roots
-                        .values()
-                        .all(|root| !root.is_empty() && root.trim() == root)
-                    && edge_authority_is_closed,
+                Self::authority_complete(&inner, &roots),
+                inner.authority_revision.clone(),
                 roots,
                 inner.cross_repo_edges.clone(),
+                entities,
+                covered_entities,
             )
         };
 
         edges.sort_by(cross_repo_edge_order);
         edges.dedup_by(|a, b| cross_repo_edge_identity_order(a, b).is_eq());
+        entities.sort_by(|left, right| {
+            left.repo_id
+                .cmp(&right.repo_id)
+                .then_with(|| left.entity_id.cmp(&right.entity_id))
+        });
+        entities.dedup_by(|left, right| {
+            left.repo_id == right.repo_id && left.entity_id == right.entity_id
+        });
 
         let repos = roots.keys().cloned().collect::<Vec<_>>();
-        let revision = cross_repo_snapshot_revision(&roots, &edges);
         CrossRepoEdgesSnapshot {
             complete,
             revision,
             repos,
             roots,
             edges,
+            entities,
+            covered_entities,
+        }
+    }
+
+    /// Atomically project one entity's xref response without cloning/scanning
+    /// the global edge and entity collections. Roots, completeness, incident
+    /// edges, endpoint metadata, and direct anchor coverage all come from one
+    /// read-lock acquisition.
+    pub fn cross_repo_xref_response(
+        &self,
+        repo_id: &str,
+        entity_id: &EntityId,
+    ) -> SpineXrefResponse {
+        let inner = self.inner.read();
+        let roots = inner
+            .root_hashes
+            .iter()
+            .map(|(repo, root)| (repo.clone(), root.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let edges = inner
+            .cross_repo_edges_by_anchor
+            .get(&(repo_id.to_string(), *entity_id))
+            .cloned()
+            .unwrap_or_default();
+        let endpoint_keys = edges
+            .iter()
+            .flat_map(|edge| {
+                [
+                    (edge.src_repo.clone(), edge.src_entity),
+                    (edge.dst_repo.clone(), edge.dst_entity),
+                ]
+            })
+            .collect::<BTreeSet<_>>();
+        let entities = endpoint_keys
+            .into_iter()
+            .filter_map(|key| inner.by_id.get(&key).cloned())
+            .collect();
+        let anchor_covered = inner.by_id.contains_key(&(repo_id.to_string(), *entity_id));
+
+        SpineXrefResponse {
+            version: crate::SPINE_PAYLOAD_VERSION,
+            edges,
+            entities,
+            authority_anchor: Some(SpineXrefAuthorityAnchor {
+                repo_id: repo_id.to_string(),
+                entity_id: *entity_id,
+            }),
+            authority_complete: Self::authority_complete(&inner, &roots)
+                && roots.contains_key(repo_id)
+                && anchor_covered,
+            authority_revision: Some(inner.authority_revision.clone()),
+            authority_roots: roots,
         }
     }
 
@@ -334,12 +754,108 @@ impl SpineIndex {
     /// resolver bug or stale durable row from making an intra-repo reference
     /// look like hosted cross-repo proof.
     pub fn add_cross_repo_edge(&self, edge: CrossRepoEdge) -> bool {
-        if edge.src_repo == edge.dst_repo {
+        self.add_cross_repo_edges(std::iter::once(edge)) == 1
+    }
+
+    /// Install a batch of cross-repo edges with one metadata rebuild.
+    ///
+    /// Durable-cache hydration can contain thousands of rows. Recomputing the
+    /// global anchor projection and canonical revision after every row turns
+    /// that linear load into O(E^2 log E). This path validates every candidate
+    /// but defers the projection/revision rebuild until the full batch is in
+    /// memory. Incremental callers can continue using `add_cross_repo_edge`.
+    pub fn add_cross_repo_edges<I>(&self, edges: I) -> usize
+    where
+        I: IntoIterator<Item = CrossRepoEdge>,
+    {
+        let mut inner = self.inner.write();
+        let mut accepted = 0usize;
+        for edge in edges {
+            if edge.src_repo == edge.dst_repo {
+                continue;
+            }
+            inner.cross_repo_edges.push(edge);
+            accepted += 1;
+        }
+        if accepted == 0 {
+            return 0;
+        }
+        Self::recompute_cross_repo_metadata(&mut inner);
+        accepted
+    }
+
+    /// Mark one source repo's cross-repo materialization stale without
+    /// discarding its last known positive edges. The authority epoch bump also
+    /// prevents an older in-flight refresh from clearing this invalidation.
+    pub fn invalidate_cross_repo_edges(&self, repo_id: &str) {
+        let mut inner = self.inner.write();
+        inner.dirty_edge_repos.insert(repo_id.to_string());
+        inner.authority_epoch = inner
+            .authority_epoch
+            .checked_add(1)
+            .expect("spine authority epoch exhausted");
+    }
+
+    /// Start the one pass-wide cross-repo refresh lease.
+    ///
+    /// Returns `None` when another full pass is already active or the caller's
+    /// captured root set no longer matches registered spine authority. Either
+    /// failure leaves all registered sources dirty and therefore incomplete.
+    pub fn begin_cross_repo_refresh_pass(
+        &self,
+        authority_roots: &BTreeMap<RepoId, String>,
+    ) -> Option<u64> {
+        let mut inner = self.inner.write();
+        let registered_roots = inner
+            .root_hashes
+            .iter()
+            .map(|(repo, root)| (repo.clone(), root.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if inner.active_full_refresh_epoch.is_some() || registered_roots != *authority_roots {
+            inner.dirty_edge_repos = inner.root_hashes.keys().cloned().collect();
+            return None;
+        }
+
+        inner.authority_epoch = inner
+            .authority_epoch
+            .checked_add(1)
+            .expect("spine authority epoch exhausted");
+        let token = inner.authority_epoch;
+        inner.active_full_refresh_epoch = Some(token);
+        inner.dirty_edge_repos = authority_roots.keys().cloned().collect();
+        Some(token)
+    }
+
+    /// Finish a full refresh and publish completeness with one authority CAS.
+    ///
+    /// The dirty set and pass lease are cleared under the same write lock only
+    /// when no registration/invalidation advanced the epoch and the registered
+    /// repo/root map still exactly equals the caller's captured authority.
+    pub fn finish_cross_repo_refresh_pass(
+        &self,
+        token: u64,
+        authority_roots: &BTreeMap<RepoId, String>,
+        success: bool,
+    ) -> bool {
+        let mut inner = self.inner.write();
+        if inner.active_full_refresh_epoch != Some(token) {
             return false;
         }
-        let mut inner = self.inner.write();
-        inner.cross_repo_edges.push(edge);
-        true
+
+        let registered_roots = inner
+            .root_hashes
+            .iter()
+            .map(|(repo, root)| (repo.clone(), root.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let committed = success
+            && inner.authority_epoch == token
+            && registered_roots == *authority_roots
+            && inner.active_edge_refreshes == 0;
+        if committed {
+            inner.dirty_edge_repos.clear();
+        }
+        inner.active_full_refresh_epoch = None;
+        committed
     }
 
     /// Look up an entity by (repo_id, entity_id).
@@ -428,6 +944,7 @@ impl SpineIndex {
         let mut inner = self.inner.write();
         inner.cross_repo_edges.retain(|e| e.src_repo != repo_id);
         inner.cross_repo_edges.extend(replacement);
+        Self::recompute_cross_repo_metadata(&mut inner);
         drop(inner);
         refresh.mark_succeeded();
     }
@@ -569,6 +1086,254 @@ mod tests {
         let mut entry = test_entry(repo, name, EntityKind::Function);
         entry.entity_id = id;
         entry
+    }
+
+    #[test]
+    fn xref_wire_response_round_trips_typed_edges_and_metadata() {
+        let src = EntityId::new();
+        let dst = EntityId::new();
+        let response = SpineXrefResponse::new(
+            vec![CrossRepoEdge {
+                src_repo: "consumer".to_string(),
+                src_entity: src,
+                dst_repo: "provider".to_string(),
+                dst_entity: dst,
+                confidence: 0.9,
+            }],
+            vec![test_entry_with_id("consumer", src, "run_task")],
+        );
+
+        let bytes = serde_json::to_vec(&response).unwrap();
+        let decoded = SpineXrefResponse::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.version(), crate::SPINE_PAYLOAD_VERSION);
+        assert_eq!(decoded.edges.len(), 1);
+        assert_eq!(decoded.edges[0].src_repo, "consumer");
+        assert_eq!(decoded.entities.len(), 1);
+        assert_eq!(decoded.entities[0].name, "run_task");
+        assert!(!decoded.authority_complete);
+        assert!(decoded.authority_anchor.is_none());
+        assert!(decoded.authority_revision.is_none());
+        assert!(decoded.authority_roots.is_empty());
+    }
+
+    #[test]
+    fn xref_wire_response_accepts_legacy_version_one_as_incomplete() {
+        let src = EntityId::new();
+        let dst = EntityId::new();
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "version": crate::SPINE_PAYLOAD_VERSION,
+            "edges": [{
+                "src_repo": "consumer",
+                "src_entity": src,
+                "dst_repo": "provider",
+                "dst_entity": dst,
+                "confidence": 0.9,
+            }],
+        }))
+        .unwrap();
+
+        let decoded = SpineXrefResponse::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.edges.len(), 1);
+        assert!(decoded.entities.is_empty());
+        assert!(!decoded.authority_complete);
+        assert!(decoded.authority_anchor.is_none());
+        assert!(decoded.authority_revision.is_none());
+        assert!(decoded.authority_roots.is_empty());
+        let bound = SpineXrefResponse::from_slice_for(&bytes, "provider", &dst).unwrap();
+        assert_eq!(bound.edges.len(), 1);
+        assert!(!bound.authority_complete);
+        assert!(bound.authority_anchor.is_none());
+
+        let empty_unanchored = serde_json::to_vec(&serde_json::json!({
+            "version": crate::SPINE_PAYLOAD_VERSION,
+            "edges": [],
+        }))
+        .unwrap();
+        assert!(matches!(
+            SpineXrefResponse::from_slice_for(&empty_unanchored, "provider", &dst),
+            Err(SpineXrefDecodeError::InvalidAuthority(_))
+        ));
+    }
+
+    #[test]
+    fn xref_wire_response_projects_complete_atomic_snapshot() {
+        let src = EntityId::new();
+        let dst = EntityId::new();
+        let no_refs = EntityId::new();
+        let consumer = test_entry_with_id("consumer", src, "run_task");
+        let provider = test_entry_with_id("provider", dst, "do_work");
+        let unused = test_entry_with_id("provider", no_refs, "unused");
+        let index = SpineIndex::new();
+        index.register_repo("consumer", vec![consumer], "consumer-root");
+        index.register_repo("provider", vec![provider, unused], "provider-root");
+        let repos = vec!["consumer".to_string(), "provider".to_string()];
+        for repo in &repos {
+            index.refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+        index.add_cross_repo_edge(CrossRepoEdge {
+            src_repo: "consumer".to_string(),
+            src_entity: src,
+            dst_repo: "provider".to_string(),
+            dst_entity: dst,
+            confidence: 0.9,
+        });
+
+        let response = index.cross_repo_xref_response("provider", &dst);
+        assert!(response.authority_complete);
+        assert!(response
+            .authority_revision
+            .as_deref()
+            .is_some_and(|revision| revision.starts_with("sha256:")));
+        assert_eq!(response.authority_roots["consumer"], "consumer-root");
+        assert_eq!(response.authority_roots["provider"], "provider-root");
+        assert_eq!(
+            response.authority_anchor,
+            Some(SpineXrefAuthorityAnchor {
+                repo_id: "provider".to_string(),
+                entity_id: dst,
+            })
+        );
+        assert!(response.authority_complete_for("provider", &dst));
+        assert!(!response.authority_complete_for("provider", &no_refs));
+        assert_eq!(response.edges.len(), 1);
+        assert_eq!(response.entities.len(), 2);
+        assert_eq!(response.entities[0].repo_id, "consumer");
+        assert_eq!(response.entities[1].repo_id, "provider");
+
+        let response_bytes = serde_json::to_vec(&response).unwrap();
+        let decoded = SpineXrefResponse::from_slice_for(&response_bytes, "provider", &dst).unwrap();
+        assert!(decoded.authority_complete);
+        assert_eq!(decoded.authority_revision, response.authority_revision);
+
+        let wrong_repo = index.cross_repo_xref_response("unknown", &dst);
+        assert!(!wrong_repo.authority_complete);
+
+        let covered_empty = index.cross_repo_xref_response("provider", &no_refs);
+        assert!(covered_empty.authority_complete);
+        assert!(covered_empty.edges.is_empty());
+        let covered_empty_bytes = serde_json::to_vec(&covered_empty).unwrap();
+        assert!(matches!(
+            SpineXrefResponse::from_slice_for(&covered_empty_bytes, "provider", &dst),
+            Err(SpineXrefDecodeError::InvalidAuthority(_))
+        ));
+
+        let unknown_entity = index.cross_repo_xref_response("provider", &EntityId::new());
+        assert!(!unknown_entity.authority_complete);
+    }
+
+    #[test]
+    fn anchor_xref_projection_excludes_unrelated_topology() {
+        let index = SpineIndex::new();
+        let target = EntityId::new();
+        let caller = EntityId::new();
+        let unrelated_target = EntityId::new();
+        let unrelated_caller = EntityId::new();
+        index.register_repo(
+            "provider",
+            vec![
+                test_entry_with_id("provider", target, "target"),
+                test_entry_with_id("provider", unrelated_target, "other_target"),
+            ],
+            "provider-root",
+        );
+        index.register_repo(
+            "consumer",
+            vec![
+                test_entry_with_id("consumer", caller, "caller"),
+                test_entry_with_id("consumer", unrelated_caller, "other_caller"),
+            ],
+            "consumer-root",
+        );
+        let repos = vec!["consumer".to_string(), "provider".to_string()];
+        for repo in &repos {
+            index.refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+        for (src_entity, dst_entity) in [(caller, target), (unrelated_caller, unrelated_target)] {
+            index.add_cross_repo_edge(CrossRepoEdge {
+                src_repo: "consumer".to_string(),
+                src_entity,
+                dst_repo: "provider".to_string(),
+                dst_entity,
+                confidence: 0.9,
+            });
+        }
+
+        let response = index.cross_repo_xref_response("provider", &target);
+        assert!(response.authority_complete);
+        assert_eq!(response.edges.len(), 1);
+        assert_eq!(response.edges[0].src_entity, caller);
+        assert_eq!(response.entities.len(), 2);
+        assert!(response
+            .entities
+            .iter()
+            .all(|entity| entity.entity_id != unrelated_caller
+                && entity.entity_id != unrelated_target));
+    }
+
+    #[test]
+    fn xref_bound_decode_rejects_non_incident_edges() {
+        let requested = EntityId::new();
+        let unrelated_src = EntityId::new();
+        let unrelated_dst = EntityId::new();
+        let mut response = SpineXrefResponse::new(
+            vec![CrossRepoEdge {
+                src_repo: "consumer".to_string(),
+                src_entity: unrelated_src,
+                dst_repo: "provider".to_string(),
+                dst_entity: unrelated_dst,
+                confidence: 0.9,
+            }],
+            Vec::new(),
+        );
+        response.authority_anchor = Some(SpineXrefAuthorityAnchor {
+            repo_id: "provider".to_string(),
+            entity_id: requested,
+        });
+
+        let bytes = serde_json::to_vec(&response).unwrap();
+        assert!(matches!(
+            SpineXrefResponse::from_slice_for(&bytes, "provider", &requested),
+            Err(SpineXrefDecodeError::InvalidAuthority(_))
+        ));
+    }
+
+    #[test]
+    fn xref_wire_response_rejects_legacy_field_names_and_versions() {
+        let legacy = serde_json::to_vec(&serde_json::json!({
+            "version": crate::SPINE_PAYLOAD_VERSION,
+            "edges": [{
+                "repo_id": "consumer",
+                "from_name": "run_task",
+                "to_repo_id": "provider",
+                "kind": "calls",
+            }],
+        }))
+        .unwrap();
+        assert!(matches!(
+            SpineXrefResponse::from_slice(&legacy),
+            Err(SpineXrefDecodeError::Malformed(_))
+        ));
+
+        let unsupported = serde_json::to_vec(&serde_json::json!({
+            "version": crate::SPINE_PAYLOAD_VERSION + 1,
+            "edges": [],
+        }))
+        .unwrap();
+        assert!(matches!(
+            SpineXrefResponse::from_slice(&unsupported),
+            Err(SpineXrefDecodeError::UnsupportedVersion { .. })
+        ));
+
+        let unwatermarked_complete = serde_json::to_vec(&serde_json::json!({
+            "version": crate::SPINE_PAYLOAD_VERSION,
+            "edges": [],
+            "authority_complete": true,
+        }))
+        .unwrap();
+        assert!(matches!(
+            SpineXrefResponse::from_slice(&unwatermarked_complete),
+            Err(SpineXrefDecodeError::InvalidAuthority(_))
+        ));
     }
 
     fn test_entity(id: EntityId, name: &str) -> Entity {
@@ -714,6 +1479,47 @@ mod tests {
         assert_eq!(edges[0].dst_repo, "repo-b");
 
         assert_eq!(index.edge_count(), 1);
+    }
+
+    #[test]
+    fn bulk_edge_install_filters_invalid_rows_and_builds_anchor_projection() {
+        let index = SpineIndex::new();
+        let caller = test_entry("repo-a", "caller", EntityKind::Function);
+        let callee = test_entry("repo-b", "callee", EntityKind::Function);
+        index.register_repo("repo-a", vec![caller.clone()], "hash-a");
+        index.register_repo("repo-b", vec![callee.clone()], "hash-b");
+        let repos = vec!["repo-a".to_string(), "repo-b".to_string()];
+        for repo in &repos {
+            index.refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+
+        let accepted = index.add_cross_repo_edges([
+            CrossRepoEdge {
+                src_repo: "repo-a".to_string(),
+                src_entity: caller.entity_id,
+                dst_repo: "repo-b".to_string(),
+                dst_entity: callee.entity_id,
+                confidence: 0.95,
+            },
+            CrossRepoEdge {
+                src_repo: "repo-a".to_string(),
+                src_entity: caller.entity_id,
+                dst_repo: "repo-a".to_string(),
+                dst_entity: caller.entity_id,
+                confidence: 0.5,
+            },
+        ]);
+
+        assert_eq!(accepted, 1);
+        assert_eq!(index.edge_count(), 1);
+        let response = index.cross_repo_xref_response("repo-b", &callee.entity_id);
+        assert_eq!(response.edges.len(), 1);
+        assert_eq!(response.edges[0].src_entity, caller.entity_id);
+        assert!(response.authority_complete_for("repo-b", &callee.entity_id));
+        assert!(response
+            .authority_revision
+            .as_deref()
+            .is_some_and(|revision| revision.starts_with("sha256:")));
     }
 
     #[test]
@@ -874,6 +1680,101 @@ mod tests {
             index.cross_repo_edges_snapshot().complete,
             "the snapshot becomes complete only after every dirty repo refreshes"
         );
+    }
+
+    #[test]
+    fn all_repo_pass_stays_incomplete_through_the_final_validation_window() {
+        let index = SpineIndex::new();
+        let repos = vec!["alpha".to_string(), "beta".to_string()];
+        index.register_repo("alpha", vec![], "root-a");
+        index.register_repo("beta", vec![], "root-b");
+        for repo in &repos {
+            index.refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+        assert!(index.cross_repo_edges_snapshot().complete);
+
+        let roots = BTreeMap::from([
+            ("alpha".to_string(), "root-a".to_string()),
+            ("beta".to_string(), "root-b".to_string()),
+        ]);
+        let token = index
+            .begin_cross_repo_refresh_pass(&roots)
+            .expect("first full pass owns the lease");
+        assert!(
+            index.begin_cross_repo_refresh_pass(&roots).is_none(),
+            "a concurrent full pass must not overlap the active lease"
+        );
+
+        for repo in &repos {
+            index.refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+        assert!(
+            !index.cross_repo_edges_snapshot().complete,
+            "the last source install must not expose completeness before final validation"
+        );
+
+        assert!(index.finish_cross_repo_refresh_pass(token, &roots, true));
+        assert!(index.cross_repo_edges_snapshot().complete);
+    }
+
+    #[test]
+    fn all_repo_pass_cannot_commit_after_concurrent_authority_change() {
+        let index = SpineIndex::new();
+        let repos = vec!["alpha".to_string(), "beta".to_string()];
+        index.register_repo("alpha", vec![], "root-a");
+        index.register_repo("beta", vec![], "root-b");
+        for repo in &repos {
+            index.refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+
+        let roots = BTreeMap::from([
+            ("alpha".to_string(), "root-a".to_string()),
+            ("beta".to_string(), "root-b".to_string()),
+        ]);
+        let token = index.begin_cross_repo_refresh_pass(&roots).unwrap();
+        for repo in &repos {
+            index.refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+        index.register_repo("beta", vec![], "root-b-next");
+
+        assert!(!index.finish_cross_repo_refresh_pass(token, &roots, true));
+        assert!(
+            !index.cross_repo_edges_snapshot().complete,
+            "a newer root registration must win the pass epoch CAS"
+        );
+    }
+
+    #[test]
+    fn explicit_refresh_invalidation_preserves_edges_but_revokes_completeness() {
+        let index = SpineIndex::new();
+        let source = test_entry("consumer", "caller", EntityKind::Function);
+        let target = test_entry("provider", "target", EntityKind::Function);
+        index.register_repo("consumer", vec![source.clone()], "consumer-root");
+        index.register_repo("provider", vec![target.clone()], "provider-root");
+        let repos = vec!["consumer".to_string(), "provider".to_string()];
+        for repo in &repos {
+            index.refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+        index.add_cross_repo_edge(CrossRepoEdge {
+            src_repo: "consumer".to_string(),
+            src_entity: source.entity_id,
+            dst_repo: "provider".to_string(),
+            dst_entity: target.entity_id,
+            confidence: 0.9,
+        });
+        assert!(index.cross_repo_edges_snapshot().complete);
+
+        index.invalidate_cross_repo_edges("consumer");
+        let invalidated = index.cross_repo_xref_response("provider", &target.entity_id);
+        assert!(!invalidated.authority_complete);
+        assert_eq!(
+            invalidated.edges.len(),
+            1,
+            "known positives remain advisory"
+        );
+
+        index.refresh_cross_repo_edges("consumer", &[], &[], &repos);
+        assert!(index.cross_repo_edges_snapshot().complete);
     }
 
     #[test]

@@ -532,7 +532,7 @@ pub async fn get_spine_xref(
     layout: &kin_core::KinLayout,
     repo_id: &str,
     entity_id: &kin_model::EntityId,
-) -> anyhow::Result<::kin_spine::SpineQuery<Vec<::kin_spine::CrossRepoEdge>>> {
+) -> anyhow::Result<::kin_spine::SpineQuery<::kin_spine::SpineXrefResponse>> {
     use ::kin_spine::{classify_spine_probe, SpineProbe, SpineQuery};
 
     let Some(daemon_url) = crate::daemon_client::resolve_daemon_url(layout).await? else {
@@ -556,9 +556,9 @@ pub async fn get_spine_xref(
 
     match classify_spine_probe(true, status) {
         SpineProbe::Healthy => {
-            let body: serde_json::Value = resp?.json().await?;
-            let edges = serde_json::from_value(body["edges"].clone())?;
-            Ok(SpineQuery::Found(edges))
+            let bytes = resp?.bytes().await?;
+            let body = ::kin_spine::SpineXrefResponse::from_slice_for(&bytes, repo_id, entity_id)?;
+            Ok(SpineQuery::Found(body))
         }
         SpineProbe::Unavailable(reason) => Ok(SpineQuery::Unavailable(reason)),
         SpineProbe::NotConfigured => Ok(SpineQuery::Unavailable(

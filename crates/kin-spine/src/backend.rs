@@ -8,12 +8,14 @@
 //! - `FirestoreSpineBackend`: Firestore REST API (cloud, stateless daemon pool)
 //! - `CachedSpineBackend<B>`: LRU cache wrapper for any backend
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use kin_model::{Entity, EntityId, EntityKind, Relation, SemanticFingerprint};
 
 use crate::federation::{self, FederatedImpact};
-use crate::index::{CrossRepoEdge, CrossRepoEdgesSnapshot, EntityEntry, SpineIndex};
+use crate::index::{
+    CrossRepoEdge, CrossRepoEdgesSnapshot, EntityEntry, SpineIndex, SpineXrefResponse,
+};
 
 /// Error type for spine backend operations.
 #[derive(Debug, thiserror::Error)]
@@ -66,6 +68,15 @@ pub trait SpineBackend: Send + Sync {
         CrossRepoEdgesSnapshot::default()
     }
 
+    /// Atomically project xrefs for one repository/entity anchor.
+    ///
+    /// The compatibility default remains fail-closed because the default bulk
+    /// snapshot is incomplete. Built-in backends override this with a bounded
+    /// incident-edge projection that does not clone the organization graph.
+    fn cross_repo_xref_response(&self, repo_id: &str, entity_id: &EntityId) -> SpineXrefResponse {
+        SpineXrefResponse::from_snapshot(self.cross_repo_edges_snapshot(), repo_id, entity_id)
+    }
+
     /// Add a cross-repo edge.
     fn add_cross_repo_edge(&self, edge: CrossRepoEdge);
 
@@ -92,6 +103,27 @@ pub trait SpineBackend: Send + Sync {
         relations: &[Relation],
         registry_repo_ids: &[String],
     );
+
+    /// Fail closed after a refresh/load failure while preserving last-known
+    /// positive edges for advisory use. This is required rather than a no-op
+    /// default so a backend cannot advertise complete snapshots while silently
+    /// ignoring a failed refresh.
+    fn invalidate_cross_repo_edges(&self, repo_id: &str);
+
+    /// Acquire one all-repo refresh lease against an exact registered root set.
+    /// While active, per-source refreshes cannot advertise completeness.
+    fn begin_cross_repo_refresh_pass(
+        &self,
+        authority_roots: &BTreeMap<String, String>,
+    ) -> Option<u64>;
+
+    /// Atomically publish (or abort) the all-repo pass after final validation.
+    fn finish_cross_repo_refresh_pass(
+        &self,
+        token: u64,
+        authority_roots: &BTreeMap<String, String>,
+        success: bool,
+    ) -> bool;
 
     /// Compute federated impact by BFS through cross-repo edges.
     fn federated_impact(
@@ -156,6 +188,10 @@ impl SpineBackend for InMemorySpineBackend {
         self.index.cross_repo_edges_snapshot()
     }
 
+    fn cross_repo_xref_response(&self, repo_id: &str, entity_id: &EntityId) -> SpineXrefResponse {
+        self.index.cross_repo_xref_response(repo_id, entity_id)
+    }
+
     fn add_cross_repo_edge(&self, edge: CrossRepoEdge) {
         self.index.add_cross_repo_edge(edge);
     }
@@ -189,6 +225,27 @@ impl SpineBackend for InMemorySpineBackend {
     ) {
         self.index
             .refresh_cross_repo_edges(repo_id, entities, relations, registry_repo_ids);
+    }
+
+    fn invalidate_cross_repo_edges(&self, repo_id: &str) {
+        self.index.invalidate_cross_repo_edges(repo_id);
+    }
+
+    fn begin_cross_repo_refresh_pass(
+        &self,
+        authority_roots: &BTreeMap<String, String>,
+    ) -> Option<u64> {
+        self.index.begin_cross_repo_refresh_pass(authority_roots)
+    }
+
+    fn finish_cross_repo_refresh_pass(
+        &self,
+        token: u64,
+        authority_roots: &BTreeMap<String, String>,
+        success: bool,
+    ) -> bool {
+        self.index
+            .finish_cross_repo_refresh_pass(token, authority_roots, success)
     }
 
     fn federated_impact(
@@ -251,6 +308,21 @@ mod tests {
         }
 
         fn refresh_cross_repo_edges(&self, _: &str, _: &[Entity], _: &[Relation], _: &[String]) {}
+
+        fn invalidate_cross_repo_edges(&self, _: &str) {}
+
+        fn begin_cross_repo_refresh_pass(&self, _: &BTreeMap<String, String>) -> Option<u64> {
+            None
+        }
+
+        fn finish_cross_repo_refresh_pass(
+            &self,
+            _: u64,
+            _: &BTreeMap<String, String>,
+            _: bool,
+        ) -> bool {
+            false
+        }
 
         fn federated_impact(&self, _: &str, _: &EntityId, _: u32) -> FederatedImpact {
             panic!("not used by compatibility test")

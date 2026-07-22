@@ -282,6 +282,7 @@ pub async fn run_loop(
         let mut projection_changed = ProjectionChangedSet::default();
 
         let mut lsp_changed: Vec<(PathBuf, Vec<kin_model::EntityId>)> = Vec::new();
+        let graph_mutation = state.begin_graph_authority_mutation();
 
         for event in &batch {
             match reconciler.reconcile_file_change(
@@ -425,6 +426,7 @@ pub async fn run_loop(
                 }
             }
         }
+        drop(graph_mutation);
 
         // Drop write locks before rebuilding projection (it takes its own locks).
         drop(working_copy);
@@ -908,6 +910,7 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
     let mut working_copy = state.working_copy.write().await;
     let mut graph_changed = false;
     let mut projection_changed = ProjectionChangedSet::default();
+    let graph_mutation = state.begin_graph_authority_mutation();
 
     for event in events {
         match reconciler.reconcile_file_change(
@@ -974,6 +977,10 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
     if graph_changed {
         state.mark_dirty();
         state.bump_version();
+    }
+    drop(graph_mutation);
+
+    if graph_changed {
         let projection_result = if projection_changed.is_empty() {
             state.rebuild_projection().await
         } else {

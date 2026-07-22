@@ -12917,6 +12917,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    #[serial]
     fn macos_current_home_namespace_acl_is_transactable() {
         let home = directories::BaseDirs::new()
             .unwrap()
