@@ -242,18 +242,18 @@ fn missing_source_root_ancestors(base_path: &Path) -> Result<Vec<PathBuf>, KinDb
 fn prepare_source_trust_root(
     base_path: &Path,
     confirm_durability: bool,
-    pending_confirmation: &parking_lot::Mutex<Vec<PathBuf>>,
+    confirmed_for_process: &parking_lot::Mutex<bool>,
 ) -> Result<(), KinDbError> {
-    // Keep the pending set across failed calls. `create_dir_all` can leave every
-    // component present even when one parent fsync fails, so rediscovering only
-    // absent paths on a retry would incorrectly treat the whole chain as
-    // durable. Serializing creation and confirmation on this mutex lets the
-    // retry replay every parent confirmation before acknowledging any object.
-    let mut pending = pending_confirmation.lock();
-    for path in missing_source_root_ancestors(base_path)? {
-        if !pending.contains(&path) {
-            pending.push(path);
-        }
+    // A failed `create_dir_all` durability confirmation leaves every component
+    // visible even though one or more parent entries may not survive a crash.
+    // In-memory pending paths are insufficient because a restarted process can
+    // no longer distinguish that state from an old, durable tree. Therefore
+    // every backend process conservatively confirms the complete resolved root
+    // chain before its first source-object acknowledgement. Later calls reuse
+    // that proof unless the root has to be recreated in this process.
+    let mut confirmed = confirmed_for_process.lock();
+    if !missing_source_root_ancestors(base_path)?.is_empty() {
+        *confirmed = false;
     }
     std::fs::create_dir_all(base_path).map_err(|error| {
         KinDbError::StorageError(format!(
@@ -262,11 +262,27 @@ fn prepare_source_trust_root(
         ))
     })?;
 
-    if confirm_durability {
-        for path in pending.iter() {
+    if confirm_durability && !*confirmed {
+        let resolved = std::fs::canonicalize(base_path).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to resolve immutable source blob trust root {} for durability confirmation: {error}",
+                base_path.display()
+            ))
+        })?;
+        let mut chain = Vec::new();
+        let mut cursor = resolved;
+        while let Some(parent) = cursor.parent() {
+            if parent == cursor {
+                break;
+            }
+            chain.push(cursor.clone());
+            cursor = parent.to_path_buf();
+        }
+        chain.reverse();
+        for path in &chain {
             mmap::sync_parent_dir(path)?;
         }
-        pending.clear();
+        *confirmed = true;
     }
     Ok(())
 }
@@ -278,11 +294,11 @@ fn open_source_blob_capability(
     digest: [u8; 32],
     create: bool,
     confirm_durability: bool,
-    pending_root_confirmation: &parking_lot::Mutex<Vec<PathBuf>>,
+    root_confirmed_for_process: &parking_lot::Mutex<bool>,
 ) -> Result<SourceBlobCapability, KinDbError> {
     validate_source_blob_repo_id(repo_id)?;
     if create {
-        prepare_source_trust_root(base_path, confirm_durability, pending_root_confirmation)?;
+        prepare_source_trust_root(base_path, confirm_durability, root_confirmed_for_process)?;
     }
     let trusted_root = std::fs::canonicalize(base_path).map_err(|error| {
         KinDbError::StorageError(format!(
@@ -339,6 +355,33 @@ fn same_directory(left: &std::fs::File, right: &std::fs::File) -> Result<bool, K
         .metadata()
         .map_err(|error| KinDbError::StorageError(error.to_string()))?;
     Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(unix)]
+fn confirm_source_blob_namespace(
+    base_path: &Path,
+    repo_id: &str,
+    digest: [u8; 32],
+    capability: &SourceBlobCapability,
+    root_confirmed_for_process: &parking_lot::Mutex<bool>,
+) -> Result<(), KinDbError> {
+    let current = open_source_blob_capability(
+        base_path,
+        repo_id,
+        digest,
+        false,
+        false,
+        root_confirmed_for_process,
+    )?;
+    if !same_directory(&capability.repo_dir, &current.repo_dir)?
+        || !same_directory(&capability.leaf_dir, &current.leaf_dir)?
+    {
+        return Err(KinDbError::StorageError(format!(
+            "immutable source blob trust root changed while accessing {}",
+            capability.leaf_path.display()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -919,7 +962,7 @@ pub trait StorageBackend: Send + Sync {
 pub struct LocalFileBackend {
     base_path: PathBuf,
     #[cfg(unix)]
-    source_root_pending_confirmation: parking_lot::Mutex<Vec<PathBuf>>,
+    source_root_confirmed_for_process: parking_lot::Mutex<bool>,
     #[cfg(test)]
     fail_before_authority_commit: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -1002,7 +1045,7 @@ impl LocalFileBackend {
         Self {
             base_path: base_path.into(),
             #[cfg(unix)]
-            source_root_pending_confirmation: parking_lot::Mutex::new(Vec::new()),
+            source_root_confirmed_for_process: parking_lot::Mutex::new(false),
             #[cfg(test)]
             fail_before_authority_commit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -2295,7 +2338,7 @@ impl StorageBackend for LocalFileBackend {
                 digest,
                 true,
                 true,
-                &self.source_root_pending_confirmation,
+                &self.source_root_confirmed_for_process,
             )?;
             #[cfg(test)]
             if let Some(hook) = self.source_blob_before_lock_hook.lock().take() {
@@ -2316,6 +2359,13 @@ impl StorageBackend for LocalFileBackend {
                         capability.leaf_path.display()
                     )));
                 }
+                confirm_source_blob_namespace(
+                    &self.base_path,
+                    repo_id,
+                    digest,
+                    &capability,
+                    &self.source_root_confirmed_for_process,
+                )?;
                 sync_source_file_for_ack(&existing.file, &capability.leaf_path.join(&digest_hex))?;
                 mmap::sync_directory_handle(&capability.leaf_dir, &capability.leaf_path)?;
                 return Ok(());
@@ -2329,20 +2379,13 @@ impl StorageBackend for LocalFileBackend {
             // Re-walk without creating anything and compare the directory
             // identity to the pinned handle. A substituted ancestor is rejected
             // before publication; all writes remain relative to the old handle.
-            let confirmed = open_source_blob_capability(
+            confirm_source_blob_namespace(
                 &self.base_path,
                 repo_id,
                 digest,
-                false,
-                false,
-                &self.source_root_pending_confirmation,
+                &capability,
+                &self.source_root_confirmed_for_process,
             )?;
-            if !same_directory(&capability.leaf_dir, &confirmed.leaf_dir)? {
-                return Err(KinDbError::StorageError(format!(
-                    "immutable source blob trust root changed before publishing below {}",
-                    capability.leaf_path.display()
-                )));
-            }
 
             let _published = publish_source_file_at(&capability.leaf_dir, &digest_hex, data)?;
             let installed =
@@ -2396,7 +2439,7 @@ impl StorageBackend for LocalFileBackend {
                 digest,
                 true,
                 false,
-                &self.source_root_pending_confirmation,
+                &self.source_root_confirmed_for_process,
             )?;
             let _lock = acquire_source_blob_lock(&capability.repo_dir)?;
             let digest_hex = hex::encode(digest);
@@ -3309,6 +3352,37 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn local_source_blob_existing_retry_rejects_displaced_namespace() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let data = b"existing pinned source";
+        let digest = source_digest(data);
+        backend.save_source_blob("repo-a", digest, data).unwrap();
+
+        let repo = dir.path().join("repo-a");
+        let displaced_repo = dir.path().join("repo-a-displaced");
+        let outside_path = outside.path().to_path_buf();
+        backend.set_source_blob_before_lock_hook(move || {
+            std::fs::rename(&repo, &displaced_repo).unwrap();
+            symlink(outside_path, repo).unwrap();
+        });
+
+        let error = backend
+            .save_source_blob("repo-a", digest, data)
+            .expect_err("existing-object retry must revalidate its configured namespace");
+        assert!(error.to_string().contains("symlinked or non-directory"));
+        assert_eq!(
+            std::fs::read_dir(outside.path()).unwrap().count(),
+            0,
+            "an existing-object acknowledgement must not accept substituted authority"
+        );
+    }
+
     #[test]
     fn local_source_blob_confirms_new_trust_root_parent_directory() {
         let dir = TempDir::new().unwrap();
@@ -3352,20 +3426,15 @@ mod tests {
             .save_source_blob("repo-a", digest, data)
             .expect_err("the first failed ancestor confirmation must abort publication");
 
-        // All three paths now exist, but the retry must retain and replay the
-        // complete unconfirmed chain. Failing after two successful fsyncs must
-        // therefore fail on the deepest trust-root parent, before repo layout
-        // creation begins.
+        // All three paths now exist, but the retry must replay a complete root
+        // confirmation rather than treating path visibility as durability.
         mmap::fail_parent_sync_after(2);
         let retry_error = backend
             .save_source_blob("repo-a", digest, data)
             .expect_err("retry must reconfirm every previously-created ancestor");
-        assert!(retry_error.to_string().contains(
-            base.parent()
-                .expect("nested base has a parent")
-                .to_string_lossy()
-                .as_ref()
-        ));
+        assert!(retry_error
+            .to_string()
+            .contains("injected parent-directory fsync failure"));
 
         backend
             .save_source_blob("repo-a", digest, data)
@@ -3374,6 +3443,33 @@ mod tests {
             backend.load_source_blob("repo-a", digest).unwrap(),
             Some(data.to_vec())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_trust_root_reconfirms_visible_ancestors_after_process_restart() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("restart-root-one").join("restart-root-two");
+
+        let first_process_confirmation = parking_lot::Mutex::new(false);
+        mmap::fail_parent_sync_after(0);
+        prepare_source_trust_root(&base, true, &first_process_confirmation)
+            .expect_err("the first process leaves visible but unconfirmed directories");
+        assert!(base.is_dir());
+
+        // A new backend process has no in-memory retry ledger. It must still
+        // attempt a complete ancestry confirmation before acknowledging data.
+        let restarted_process_confirmation = parking_lot::Mutex::new(false);
+        mmap::fail_parent_sync_after(0);
+        let restarted_error =
+            prepare_source_trust_root(&base, true, &restarted_process_confirmation)
+                .expect_err("restart must not infer durability from path existence");
+        assert!(restarted_error
+            .to_string()
+            .contains("injected parent-directory fsync failure"));
+
+        prepare_source_trust_root(&base, true, &restarted_process_confirmation)
+            .expect("restart confirms the complete visible ancestry on retry");
     }
 
     #[cfg(unix)]
@@ -3413,6 +3509,11 @@ mod tests {
         let data = b"durable immutable source bytes";
         let digest = source_digest(data);
         let path = backend.source_blob_path("repo-a", digest).unwrap();
+
+        // Keep this test focused on the object-entry confirmation after the
+        // once-per-process trust-root ancestry proof.
+        prepare_source_trust_root(dir.path(), true, &backend.source_root_confirmed_for_process)
+            .unwrap();
 
         // Four source-directory ancestors are confirmed before publication;
         // fail the following sync of the newly linked object entry.
