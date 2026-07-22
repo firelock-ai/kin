@@ -1,18 +1,19 @@
 # Kin
 
-> **AI writes code. Kin proves the change.**
+> **Software that remembers itself.**
 >
-> The **system of record for AI-written software**.
+> Exact context, not more.
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Latest release](https://img.shields.io/badge/release-latest-6E56CF.svg)](https://github.com/firelock-ai/kin/releases/latest)
 [![kinlab.ai](https://img.shields.io/badge/hosted-kinlab.ai-111111.svg)](https://kinlab.ai)
 
-AI agents can write a change faster than a team can establish what it touches,
-whether it reverses an earlier fix, and how far its blast radius reaches. Git
-records files and line history. Kin records the software itself as a graph of
-entities, relations, changes, and provenance, then gives humans and agents one
-semantic authority to query and review.
+Kin is the system of record for AI-written software. AI agents can write a
+change faster than a team can establish what it touches, whether it reverses
+an earlier fix, and how far its blast radius reaches. Git records files and
+line history. Kin records the software itself as a graph of entities,
+relations, changes, and provenance, then gives humans and agents one semantic
+authority to query and review.
 
 Kin is a public alpha. It is usable today as a local CLI, daemon, MCP server,
 review surface, and graph-backed filesystem projection. It is pre-1.0, so expect
@@ -112,6 +113,8 @@ Run `kin embed` to add local vector similarity, then confirm coverage with
 
 ## Review an AI-written change
 
+**AI writes code. Kin proves the change.**
+
 Run `kin init` on the branch you want to review so the relevant Git history is in
 the graph, then pass explicit commit SHAs to the report-only shadow gate:
 
@@ -175,11 +178,10 @@ that every distribution, tool, or repository shape is already covered.
 
 ## Proof posture
 
-The published preregistered Multi-SWE-Bench Go proof package reports
-bit-identical replay on 26 of 26 tasks versus 3 of 26 for its lexical baseline,
-with symbol and line retrieval improvements and file retrieval at a statistical
-tie. The package is pinned to an older build, not the moving latest release, and
-does not establish a broad speed, token-savings, or category-win claim.
+The published preregistered Multi-SWE-Bench Go proof package is pinned to an
+older build, not the moving latest release, and does not establish a broad
+speed, token-savings, or category-win claim. Comparative results are withheld
+here pending independent verification.
 
 Read the methodology, task set, build identity, and artifacts in the
 [public proof package](https://firelock.ai/labs/kin-proof). Treat claims outside
