@@ -49,9 +49,11 @@ async fn run_daemon_xref(
 }
 
 pub async fn build_xref_response(
-    layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,
     request: &XrefRequest,
+    repo_id: &str,
+    graph_root: &str,
+    spine_backend: Option<&dyn kin_spine::SpineBackend>,
 ) -> Result<XrefResponse> {
     // Find the entity by name
     let filter = EntityFilter {
@@ -73,19 +75,23 @@ pub async fn build_xref_response(
         target.name
     )];
 
-    let repo_id = crate::commands::remote::resolve_repo_id(layout)?;
-
     let mut spine = None;
-    match crate::backend::get_spine_xref(layout, &repo_id, &target.id).await {
-        Ok(query) => {
-            lines.extend(spine_xref_lines(&query, &repo_id, &target.id));
-            if let ::kin_spine::SpineQuery::Found(response) = query {
-                spine = Some(response);
+    let query = match spine_backend {
+        Some(backend) => {
+            let response = backend.cross_repo_xref_response(repo_id, &target.id);
+            if response.authority_root_matches(repo_id, graph_root) {
+                ::kin_spine::SpineQuery::Found(response)
+            } else {
+                ::kin_spine::SpineQuery::Unavailable(format!(
+                    "spine root mismatch for repository {repo_id}: live/session graph root {graph_root} is not the registered spine root"
+                ))
             }
         }
-        Err(e) => {
-            lines.push(format!("  Failed to query spine: {}", e));
-        }
+        None => ::kin_spine::SpineQuery::NotConfigured,
+    };
+    lines.extend(spine_xref_lines(&query, repo_id, &target.id));
+    if let ::kin_spine::SpineQuery::Found(response) = query {
+        spine = Some(response);
     }
 
     Ok(XrefResponse { lines, spine })
@@ -166,8 +172,60 @@ fn xref_not_found_guidance(entity: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{spine_xref_lines, xref_not_found_guidance, XrefResponse};
-    use kin_model::EntityId;
+    use super::{
+        build_xref_response, spine_xref_lines, xref_not_found_guidance, XrefRequest, XrefResponse,
+    };
+    use kin_model::entity::{
+        Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint,
+        Visibility,
+    };
+    use kin_model::graph::EntityStore as _;
+    use kin_model::{EntityId, FilePathId, Hash256, LanguageId};
+    use kin_spine::SpineBackend as _;
+
+    fn entity(name: &str) -> Entity {
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([1; 32]),
+                signature_hash: Hash256::from_bytes([2; 32]),
+                behavior_hash: Hash256::from_bytes([3; 32]),
+                equivalence_hash: Hash256::from_bytes([4; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new("src/lib.rs")),
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn entry(repo_id: &str, entity: &Entity) -> kin_spine::EntityEntry {
+        kin_spine::EntityEntry {
+            repo_id: repo_id.to_string(),
+            entity_id: entity.id,
+            name: entity.name.clone(),
+            kind: entity.kind,
+            signature: entity.signature.clone(),
+            fingerprint: entity.fingerprint.clone(),
+            file_path: entity.file_origin.as_ref().map(|path| path.0.clone()),
+            role: Some(entity.role),
+        }
+    }
+
+    fn graph_root(graph: &kin_db::InMemoryGraph) -> String {
+        hex::encode(graph.compute_root_hash())
+    }
 
     #[test]
     fn xref_not_found_guidance_keeps_signal_and_explains_anchor_model() {
@@ -238,5 +296,42 @@ mod tests {
         assert!(!spine.authority_complete);
         assert!(spine.authority_revision.is_none());
         assert!(spine.authority_roots.is_empty());
+    }
+
+    #[tokio::test]
+    async fn daemon_xref_uses_explicit_cached_repo_binding() {
+        let graph = kin_db::InMemoryGraph::new();
+        let target = entity("target");
+        graph.upsert_entity(&target).unwrap();
+        let root = graph_root(&graph);
+        let spine = kin_spine::InMemorySpineBackend::new();
+        spine.register_repo("daemon-X", vec![entry("daemon-X", &target)], &root);
+        spine.register_repo("manifest-Y", Vec::new(), "manifest-root");
+        let repos = vec!["daemon-X".to_string(), "manifest-Y".to_string()];
+        for repo in &repos {
+            spine.refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+
+        let response = build_xref_response(
+            &graph,
+            &XrefRequest {
+                entity: "target".to_string(),
+            },
+            "daemon-X",
+            &root,
+            Some(&spine),
+        )
+        .await
+        .unwrap();
+        let payload = response.spine.expect("typed spine response");
+        assert_eq!(
+            payload
+                .authority_anchor
+                .as_ref()
+                .expect("explicit anchor")
+                .repo_id,
+            "daemon-X"
+        );
+        assert!(payload.authority_complete_for("daemon-X", &target.id));
     }
 }

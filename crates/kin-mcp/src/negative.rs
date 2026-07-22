@@ -265,11 +265,79 @@ fn cross_repo_references_gap(payload: &Value) -> Option<String> {
             let anchor_is_bound = anchor_repo
                 .is_some_and(|repo_id| roots.is_some_and(|roots| roots.contains_key(repo_id)))
                 && anchor_entity == focal_entity;
-            if authority_complete && revision.is_some() && anchor_is_bound {
+            let relation_subtype_complete = cross_repo
+                .get("relation_subtype_complete")
+                .and_then(Value::as_bool)
+                != Some(false);
+            if authority_complete
+                && revision.is_some()
+                && anchor_is_bound
+                && relation_subtype_complete
+            {
                 None
             } else {
                 Some(format!(
-                    "cross_repo_authority_incomplete: spine topology is incomplete at revision {}",
+                    "cross_repo_authority_incomplete: spine topology or requested relation subtype is incomplete at revision {}",
+                    revision.unwrap_or("unwatermarked")
+                ))
+            }
+        }
+        Some("not_configured") => {
+            Some("cross_repo_not_configured: cross-repo authority did not answer".to_string())
+        }
+        Some(status) => Some(format!(
+            "cross_repo_authority_unknown: unrecognized cross-repo authority status '{status}'"
+        )),
+        None => {
+            Some("cross_repo_authority_missing: cross-repo authority status is missing".to_string())
+        }
+    }
+}
+
+fn cross_repo_bulk_gap(payload: &Value) -> Option<String> {
+    let Some(cross_repo) = payload.get("cross_repo") else {
+        return Some(
+            "cross_repo_authority_missing: bulk reachability did not report cross-repo authority"
+                .to_string(),
+        );
+    };
+    match cross_repo.get("status").and_then(Value::as_str) {
+        Some("unavailable") => Some(format!(
+            "cross_repo_unavailable: {}",
+            cross_repo
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("the cross-repo spine could not answer")
+        )),
+        Some("available") => {
+            let authority_complete = cross_repo
+                .get("authority_complete")
+                .and_then(Value::as_bool)
+                == Some(true);
+            let revision = cross_repo
+                .get("authority_revision")
+                .and_then(Value::as_str)
+                .filter(|revision| !revision.is_empty());
+            let roots_complete = cross_repo
+                .get("authority_roots")
+                .and_then(Value::as_object)
+                .is_some_and(|roots| !roots.is_empty());
+            let subtype_complete = cross_repo
+                .get("relation_subtype_complete")
+                .and_then(Value::as_bool)
+                == Some(true);
+            let verdicts_complete =
+                cross_repo.get("verdicts_complete").and_then(Value::as_bool) == Some(true);
+            if authority_complete
+                && revision.is_some()
+                && roots_complete
+                && subtype_complete
+                && verdicts_complete
+            {
+                None
+            } else {
+                Some(format!(
+                    "cross_repo_authority_incomplete: bulk topology or requested relation subtype is incomplete at revision {}",
                     revision.unwrap_or("unwatermarked")
                 ))
             }
@@ -323,6 +391,13 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
     // inconclusive so agents cannot read the gap as safe-to-delete proof.
     if tool == "find_references" {
         if let Some(reason) = cross_repo_references_gap(payload) {
+            trustworthy = false;
+            trust_reason = reason;
+        }
+    }
+
+    if tool == "bulk_check_references" {
+        if let Some(reason) = cross_repo_bulk_gap(payload) {
             trustworthy = false;
             trust_reason = reason;
         }

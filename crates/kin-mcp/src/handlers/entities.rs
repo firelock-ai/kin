@@ -762,8 +762,11 @@ fn cross_repo_repo_id() -> std::result::Result<String, String> {
 /// The daemon constructs this from its resolved repository identity and its
 /// in-process spine. Neither value comes from MCP request arguments or ambient
 /// process configuration, so a caller cannot redirect the authority query.
+#[derive(Clone, Copy)]
 pub struct FindReferencesAuthority<'a> {
     pub repo_id: &'a str,
+    /// Exact root of the concrete live/session graph serving this request.
+    pub graph_root: &'a str,
     pub spine: Option<&'a dyn kin_spine::SpineBackend>,
 }
 
@@ -772,14 +775,12 @@ enum FindReferencesAuthoritySource<'a> {
     Daemon(FindReferencesAuthority<'a>),
 }
 
-fn append_spine_reference_rows(
-    rows: &mut Vec<ReferenceRow>,
+fn spine_reference_rows(
     repo_id: &str,
     target_id: &kin_model::EntityId,
-    _relation_kinds: &[RelationKind],
     response: &kin_spine::SpineXrefResponse,
-) -> usize {
-    let before = rows.len();
+) -> Vec<ReferenceRow> {
+    let mut rows = Vec::new();
     for edge in &response.edges {
         if edge.dst_repo != repo_id || edge.dst_entity != *target_id || edge.src_repo == repo_id {
             continue;
@@ -808,16 +809,58 @@ fn append_spine_reference_rows(
             start_line: None,
             signature: source.map(|entity| entity.signature.clone()),
             snippet: None,
-            relation_kinds: vec![RelationKind::References],
+            // CrossRepoEdge proves a dependency but does not retain whether
+            // the source relation was Calls/Imports/References.
+            relation_kinds: Vec::new(),
         });
     }
 
-    // CrossRepoEdge does not encode whether the dependency originated as a
-    // call, import, or other reference. Keep the generic row even for a narrow
-    // filter: dropping it would let a calls-only/imports-only empty response
-    // certify absence despite a real external dependent. The row's explicit
-    // `references` kind tells clients that the exact subtype is unavailable.
-    rows.len() - before
+    rows
+}
+
+fn reference_filter_covers_unknown_subtypes(relation_kinds: &[RelationKind]) -> bool {
+    let defaults = default_reference_kinds();
+    relation_kinds.len() == defaults.len()
+        && defaults.iter().all(|kind| relation_kinds.contains(kind))
+}
+
+fn reference_row_json(row: ReferenceRow) -> serde_json::Value {
+    serde_json::json!({
+        "entity_id": row.entity_id,
+        "name": row.name,
+        "kind": row.kind,
+        "file_path": row.file_path,
+        "start_line": row.start_line,
+        "signature": row.signature,
+        "snippet": row.snippet,
+        "relation_kinds": row
+            .relation_kinds
+            .into_iter()
+            .map(relation_kind_name)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn daemon_spine_xref(
+    authority: FindReferencesAuthority<'_>,
+    target_id: &kin_model::EntityId,
+) -> std::result::Result<(String, kin_spine::SpineQuery<kin_spine::SpineXrefResponse>), String> {
+    let repo_id = normalize_cross_repo_repo_id(Some(authority.repo_id))?;
+    let query = match authority.spine {
+        Some(spine) => {
+            let body = spine.cross_repo_xref_response(&repo_id, target_id);
+            if body.authority_root_matches(&repo_id, authority.graph_root) {
+                kin_spine::SpineQuery::Found(body)
+            } else {
+                kin_spine::SpineQuery::Unavailable(format!(
+                    "spine root mismatch for repository {repo_id}: live/session graph root {} is not the registered spine root",
+                    authority.graph_root
+                ))
+            }
+        }
+        None => kin_spine::SpineQuery::NotConfigured,
+    };
+    Ok((repo_id, query))
 }
 
 pub async fn handle_find_references<G: GraphStore>(
@@ -902,19 +945,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
             Err(reason) => Err(reason),
         },
         FindReferencesAuthoritySource::Daemon(authority) => {
-            normalize_cross_repo_repo_id(Some(authority.repo_id)).map(|repo_id| {
-                let query = match authority.spine {
-                    Some(spine) => {
-                        kin_spine::SpineQuery::Found(kin_spine::SpineXrefResponse::from_snapshot(
-                            spine.cross_repo_edges_snapshot(),
-                            &repo_id,
-                            &target.id,
-                        ))
-                    }
-                    None => kin_spine::SpineQuery::NotConfigured,
-                };
-                (repo_id, query)
-            })
+            daemon_spine_xref(authority, &target.id)
         }
     };
     let cross_repo = match cross_repo_query {
@@ -927,18 +958,28 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         }
         Ok((repo_id, query)) => match query {
             kin_spine::SpineQuery::Found(body) => {
-                let reference_count = append_spine_reference_rows(
-                    &mut rows,
-                    &repo_id,
-                    &target.id,
-                    &relation_kinds,
-                    &body,
-                );
+                let federated_rows = spine_reference_rows(&repo_id, &target.id, &body);
+                let relation_subtype_complete =
+                    reference_filter_covers_unknown_subtypes(&relation_kinds)
+                        || federated_rows.is_empty();
+                let reference_count = if relation_subtype_complete {
+                    rows.extend(federated_rows.iter().cloned());
+                    federated_rows.len()
+                } else {
+                    0
+                };
+                let federated_references = federated_rows
+                    .into_iter()
+                    .map(reference_row_json)
+                    .collect::<Vec<_>>();
                 let authority_complete = body.authority_complete_for(&repo_id, &target.id);
                 serde_json::json!({
                     "status": "available",
                     "payload_version": body.version(),
                     "reference_count": reference_count,
+                    "federated_reference_count": federated_references.len(),
+                    "federated_references": federated_references,
+                    "relation_subtype_complete": relation_subtype_complete,
                     "authority_complete": authority_complete,
                     "authority_anchor": body.authority_anchor,
                     "authority_revision": body.authority_revision,
@@ -967,27 +1008,9 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
             .then_with(|| left.name.cmp(&right.name))
     });
 
-    let references = rows
-        .into_iter()
-        .map(|row| {
-            serde_json::json!({
-                // `entity_id` is the keystone: it lets the agent drill this
-                // reference straight to the caller's body
-                // (`get_entity_source`/`get_context_pack`) with no name
-                // re-resolution and no filesystem fallback. `snippet` carries the
-                // caller's bounded body inline so the common drill needs no
-                // second round-trip.
-                "entity_id": row.entity_id,
-                "name": row.name,
-                "kind": row.kind,
-                "file_path": row.file_path,
-                "start_line": row.start_line,
-                "signature": row.signature,
-                "snippet": row.snippet,
-                "relation_kinds": row.relation_kinds.into_iter().map(relation_kind_name).collect::<Vec<_>>(),
-            })
-        })
-        .collect::<Vec<_>>();
+    // `entity_id` remains the local drill-through keystone. Federated rows use
+    // repo-qualified paths and carry no local entity id.
+    let references = rows.into_iter().map(reference_row_json).collect::<Vec<_>>();
 
     let result = serde_json::json!({
         "focal_entity": {
@@ -1015,6 +1038,11 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
 ///
 /// Returns one row per requested entity_id with `has_references`, `reference_count`,
 /// and (in non-compact mode) the matching relation kinds and entity metadata.
+/// Unknown entities or authority gaps carry `has_references: null` and
+/// `verdict_complete: false`; they are never counted as unreferenced. A numeric
+/// total is emitted only with `reference_count_complete: true`; otherwise
+/// `known_reference_count` is the explicit lower bound and `reference_count`
+/// is null.
 /// Designed for reachability / dead-code / count-callers workloads where calling
 /// `find_references` per entity blows up token budgets.
 pub const BULK_CHECK_REFERENCES_DESC: &str = "\
@@ -1032,11 +1060,32 @@ list of callers, find_references is the right tool; for finding dead code from a
 concept rather than a known ID set, find_dead_code_seeded combines the search and the \
 classification. Each `has_references:false` row is qualified by the response's additive \
 `negative` object — consult `safe_to_conclude_absent` before treating a false verdict as \
-\"safe to delete\", since an incomplete or stale index can report a false negative.";
+\"safe to delete\". Unknown entities, stale authority, and unclassified federated relation \
+subtypes return `has_references:null` with `verdict_complete:false`, never a false verdict. \
+When total count authority is incomplete, `reference_count` is null and \
+`known_reference_count` is only a lower bound.";
 
 pub fn handle_bulk_check_references<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
+) -> Result<ToolCallResult> {
+    handle_bulk_check_references_with_authority_source(args, store, None)
+}
+
+/// Serve the batched reachability tool from the same exact daemon graph/spine
+/// authority as `find_references`.
+pub fn handle_bulk_check_references_with_authority<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+    authority: FindReferencesAuthority<'_>,
+) -> Result<ToolCallResult> {
+    handle_bulk_check_references_with_authority_source(args, store, Some(authority))
+}
+
+fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+    authority: Option<FindReferencesAuthority<'_>>,
 ) -> Result<ToolCallResult> {
     const MAX_BULK_ENTITIES: usize = 200;
 
@@ -1066,8 +1115,17 @@ pub fn handle_bulk_check_references<G: GraphStore>(
     let compact = get_optional_bool(args, "compact", true);
 
     let allowed: std::collections::HashSet<RelationKind> = relation_kinds.iter().copied().collect();
+    let relation_subtype_complete = reference_filter_covers_unknown_subtypes(&relation_kinds);
     let mut results = Vec::with_capacity(entity_ids_raw.len());
-    let mut with_references = 0usize;
+    let mut cross_repo_checked = 0usize;
+    let mut cross_repo_authority_complete = true;
+    let mut cross_repo_revision = None;
+    let mut cross_repo_roots = serde_json::Map::new();
+    let mut cross_repo_watermark_initialized = false;
+    let mut cross_repo_watermark_complete = true;
+    let mut cross_repo_unavailable = None;
+    let mut federated_reference_count = 0usize;
+    let mut saw_unknown_federated_subtype = false;
 
     for raw_id in &entity_ids_raw {
         let entity_id = match parse_entity_id(raw_id) {
@@ -1076,10 +1134,14 @@ pub fn handle_bulk_check_references<G: GraphStore>(
                 let mut row = serde_json::json!({
                     "entity_id": raw_id,
                     "error": "invalid entity_id (not a UUID)",
+                    "has_references": null,
+                    "reference_count": null,
+                    "known_reference_count": null,
+                    "reference_count_complete": false,
+                    "verdict_complete": false,
                 });
                 if !compact {
-                    row["has_references"] = serde_json::json!(false);
-                    row["reference_count"] = serde_json::json!(0);
+                    row["federated_reference_count"] = serde_json::Value::Null;
                 }
                 results.push(row);
                 continue;
@@ -1091,14 +1153,18 @@ pub fn handle_bulk_check_references<G: GraphStore>(
             let mut row = serde_json::json!({
                 "entity_id": raw_id,
                 "error": "entity not found",
-                "has_references": false,
-                "reference_count": 0,
+                "has_references": null,
+                "reference_count": null,
+                "known_reference_count": null,
+                "reference_count_complete": false,
+                "verdict_complete": false,
             });
             if !compact {
                 row["name"] = serde_json::Value::Null;
                 row["kind"] = serde_json::Value::Null;
                 row["file_path"] = serde_json::Value::Null;
                 row["matched_kinds"] = serde_json::json!([]);
+                row["federated_reference_count"] = serde_json::Value::Null;
             }
             results.push(row);
             continue;
@@ -1128,39 +1194,193 @@ pub fn handle_bulk_check_references<G: GraphStore>(
             }
         }
 
-        let has_references = reference_count > 0;
-        if has_references {
-            with_references += 1;
+        let mut entity_federated_reference_count = 0usize;
+        // Local-only execution may prove a positive, but it has no authority
+        // to classify a zero or numeric count as the cross-repo total.
+        let mut entity_cross_repo_authority_complete = false;
+        if let Some(authority) = authority {
+            match daemon_spine_xref(authority, &entity_id) {
+                Ok((repo_id, kin_spine::SpineQuery::Found(body))) => {
+                    cross_repo_checked += 1;
+                    entity_cross_repo_authority_complete =
+                        body.authority_complete_for(&repo_id, &entity_id);
+                    cross_repo_authority_complete &= entity_cross_repo_authority_complete;
+                    let body_roots = body
+                        .authority_roots
+                        .iter()
+                        .map(|(repo, root)| (repo.clone(), serde_json::Value::String(root.clone())))
+                        .collect::<serde_json::Map<_, _>>();
+                    if !cross_repo_watermark_initialized {
+                        cross_repo_revision = body.authority_revision.clone();
+                        cross_repo_roots = body_roots;
+                        cross_repo_watermark_initialized = true;
+                    } else if body.authority_revision != cross_repo_revision
+                        || body_roots != cross_repo_roots
+                    {
+                        // A topology mutation raced this batch. Known positives
+                        // remain useful, but no false row spans one atomic
+                        // authority watermark, so the batch cannot certify
+                        // absence.
+                        cross_repo_authority_complete = false;
+                        cross_repo_watermark_complete = false;
+                    }
+                    entity_federated_reference_count = body
+                        .edges
+                        .iter()
+                        .filter(|edge| {
+                            edge.dst_repo == repo_id
+                                && edge.dst_entity == entity_id
+                                && edge.src_repo != repo_id
+                        })
+                        .count();
+                    federated_reference_count += entity_federated_reference_count;
+                    if relation_subtype_complete && entity_federated_reference_count > 0 {
+                        reference_count += entity_federated_reference_count;
+                    }
+                }
+                Ok((_, kin_spine::SpineQuery::Unavailable(reason))) => {
+                    cross_repo_unavailable.get_or_insert(reason);
+                    cross_repo_authority_complete = false;
+                }
+                Ok((_, kin_spine::SpineQuery::NotConfigured)) => {
+                    cross_repo_unavailable
+                        .get_or_insert_with(|| "cross-repo spine is not configured".to_string());
+                    cross_repo_authority_complete = false;
+                }
+                Err(reason) => {
+                    cross_repo_unavailable.get_or_insert(reason);
+                    cross_repo_authority_complete = false;
+                }
+            }
         }
 
+        let known_positive = reference_count > 0;
+        let federated_count_incomplete =
+            !relation_subtype_complete && entity_federated_reference_count > 0;
+        saw_unknown_federated_subtype |= federated_count_incomplete;
+        let federated_subtype_unknown = federated_count_incomplete && !known_positive;
+        let reference_count_complete =
+            entity_cross_repo_authority_complete && !federated_count_incomplete;
+        let has_references = if known_positive {
+            Some(true)
+        } else if reference_count_complete {
+            Some(false)
+        } else {
+            None
+        };
+        let verdict_complete = has_references.is_some();
+        let reported_reference_count = reference_count_complete.then_some(reference_count);
+        let verdict_reason = if federated_subtype_unknown {
+            Some("federated relation subtype unavailable")
+        } else if !entity_cross_repo_authority_complete && !known_positive {
+            Some("cross-repo authority incomplete")
+        } else {
+            None
+        };
+
         if compact {
-            results.push(serde_json::json!({
+            let mut row = serde_json::json!({
                 "entity_id": entity_id,
                 "has_references": has_references,
-                "reference_count": reference_count,
-            }));
+                "reference_count": reported_reference_count,
+                "known_reference_count": reference_count,
+                "reference_count_complete": reference_count_complete,
+                "federated_reference_count": entity_federated_reference_count,
+                "verdict_complete": verdict_complete,
+            });
+            if let Some(reason) = verdict_reason {
+                row["verdict_reason"] = serde_json::json!(reason);
+            }
+            results.push(row);
         } else {
             matched_kinds.sort_by_key(|kind| relation_kind_rank(kind));
-            results.push(serde_json::json!({
+            let mut row = serde_json::json!({
                 "entity_id": entity_id,
                 "name": entity.name,
                 "kind": format!("{:?}", entity.kind),
                 "file_path": entity.file_origin.as_ref().map(|p| p.to_string()),
                 "has_references": has_references,
-                "reference_count": reference_count,
+                "reference_count": reported_reference_count,
+                "known_reference_count": reference_count,
+                "reference_count_complete": reference_count_complete,
+                "federated_reference_count": entity_federated_reference_count,
+                "verdict_complete": verdict_complete,
                 "matched_kinds": matched_kinds
                     .into_iter()
                     .map(relation_kind_name)
                     .collect::<Vec<_>>(),
-            }));
+            });
+            if let Some(reason) = verdict_reason {
+                row["verdict_reason"] = serde_json::json!(reason);
+            }
+            results.push(row);
+        }
+    }
+
+    // If the topology watermark changed between rows, every negative row in
+    // this batch becomes inconclusive. Preserve known positives, but never
+    // leave a boolean `false` that spans two authority revisions.
+    if !cross_repo_watermark_complete {
+        for row in &mut results {
+            if row
+                .get("has_references")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            {
+                row["has_references"] = serde_json::Value::Null;
+                row["verdict_complete"] = serde_json::json!(false);
+                row["verdict_reason"] =
+                    serde_json::json!("cross-repo authority changed during batch");
+            }
+            if row.get("error").is_none() {
+                row["reference_count"] = serde_json::Value::Null;
+                row["reference_count_complete"] = serde_json::json!(false);
+            }
         }
     }
 
     let total_checked = entity_ids_raw.len();
-    let result = serde_json::json!({
+    let classified_count = results
+        .iter()
+        .filter(|row| {
+            row.get("has_references")
+                .is_some_and(serde_json::Value::is_boolean)
+        })
+        .count();
+    let error_count = results
+        .iter()
+        .filter(|row| row.get("error").is_some())
+        .count();
+    let with_references = results
+        .iter()
+        .filter(|row| {
+            row.get("has_references")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        })
+        .count();
+    let without_references = results
+        .iter()
+        .filter(|row| {
+            row.get("has_references")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+        })
+        .count();
+    let incomplete_verdict_count = total_checked
+        .saturating_sub(classified_count)
+        .saturating_sub(error_count);
+    let verdicts_complete =
+        classified_count == total_checked && error_count == 0 && cross_repo_watermark_complete;
+    let relation_subtype_verdicts_complete =
+        relation_subtype_complete || !saw_unknown_federated_subtype;
+    let mut result = serde_json::json!({
         "total_checked": total_checked,
+        "classified_count": classified_count,
+        "error_count": error_count,
+        "incomplete_verdict_count": incomplete_verdict_count,
         "with_references": with_references,
-        "without_references": total_checked - with_references,
+        "without_references": without_references,
         "relation_kinds": relation_kinds
             .iter()
             .copied()
@@ -1169,6 +1389,28 @@ pub fn handle_bulk_check_references<G: GraphStore>(
         "compact": compact,
         "results": results,
     });
+
+    if authority.is_some() {
+        result["cross_repo"] = if let Some(reason) = cross_repo_unavailable {
+            serde_json::json!({
+                "status": "unavailable",
+                "reason": reason,
+                "checked_entities": cross_repo_checked,
+                "relation_subtype_complete": false,
+            })
+        } else {
+            serde_json::json!({
+                "status": "available",
+                "checked_entities": cross_repo_checked,
+                "authority_complete": cross_repo_authority_complete && verdicts_complete,
+                "authority_revision": cross_repo_revision,
+                "authority_roots": cross_repo_roots,
+                "federated_reference_count": federated_reference_count,
+                "relation_subtype_complete": relation_subtype_verdicts_complete,
+                "verdicts_complete": verdicts_complete,
+            })
+        };
+    }
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -2156,6 +2398,7 @@ mod tests {
     use kin_model::graph::EntityStore as _;
     use kin_model::ids::{EntityId, FilePathId, Hash256, LanguageId, RelationId};
     use kin_model::relation::{GraphNodeId, Relation, RelationKind, RelationOrigin};
+    use kin_spine::SpineBackend as _;
 
     fn make_entity(name: &str, file: &str) -> Entity {
         Entity {
@@ -2196,6 +2439,35 @@ mod tests {
             import_source: None,
             evidence: Vec::new(),
         }
+    }
+
+    fn graph_root(graph: &InMemoryGraph) -> String {
+        graph
+            .compute_root_hash()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn spine_entry(repo_id: &str, entity: &Entity) -> kin_spine::EntityEntry {
+        kin_spine::EntityEntry {
+            repo_id: repo_id.to_string(),
+            entity_id: entity.id,
+            name: entity.name.clone(),
+            kind: entity.kind,
+            signature: entity.signature.clone(),
+            fingerprint: entity.fingerprint.clone(),
+            file_path: entity.file_origin.as_ref().map(|path| path.0.clone()),
+            role: Some(entity.role),
+        }
+    }
+
+    fn structurally_ready_envelope() -> crate::Envelope {
+        crate::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_generation": 12,
+        }))
     }
 
     fn parsed_response(result: &ToolCallResult) -> serde_json::Value {
@@ -2264,27 +2536,18 @@ mod tests {
                 role: Some(source.role),
             }],
         );
-        let mut rows = Vec::new();
+        let rows = spine_reference_rows("provider", &target.id, &response);
 
-        let appended = append_spine_reference_rows(
-            &mut rows,
-            "provider",
-            &target.id,
-            &[RelationKind::References],
-            &response,
-        );
-
-        assert_eq!(appended, 1);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "run_task");
         assert_eq!(rows[0].kind.as_deref(), Some("Function"));
         assert_eq!(rows[0].file_path.as_deref(), Some("[consumer] src/app.rs"));
         assert_eq!(rows[0].signature.as_deref(), Some("fn run_task()"));
-        assert_eq!(rows[0].relation_kinds, vec![RelationKind::References]);
+        assert!(rows[0].relation_kinds.is_empty());
     }
 
     #[test]
-    fn spine_xrefs_respect_direction_and_preserve_untyped_filtered_dependencies() {
+    fn spine_xrefs_respect_direction_and_keep_subtype_unknown() {
         let target = make_entity("do_work", "src/lib.rs");
         let other = EntityId::new();
         let outgoing_response = kin_spine::SpineXrefResponse::new(
@@ -2297,18 +2560,7 @@ mod tests {
             }],
             Vec::new(),
         );
-        let mut rows = Vec::new();
-
-        assert_eq!(
-            append_spine_reference_rows(
-                &mut rows,
-                "provider",
-                &target.id,
-                &[RelationKind::References],
-                &outgoing_response,
-            ),
-            0
-        );
+        let rows = spine_reference_rows("provider", &target.id, &outgoing_response);
         assert!(rows.is_empty());
 
         let source = make_entity("run_task", "src/app.rs");
@@ -2324,24 +2576,9 @@ mod tests {
         );
         assert!(!incoming_response.authority_complete_for("provider", &target.id));
 
-        for filter in [RelationKind::Calls, RelationKind::Imports] {
-            let mut filtered_rows = Vec::new();
-            assert_eq!(
-                append_spine_reference_rows(
-                    &mut filtered_rows,
-                    "provider",
-                    &target.id,
-                    &[filter],
-                    &incoming_response,
-                ),
-                1,
-                "a generic federated dependency must survive the {filter:?} filter"
-            );
-            assert_eq!(
-                filtered_rows[0].relation_kinds,
-                vec![RelationKind::References]
-            );
-        }
+        let incoming = spine_reference_rows("provider", &target.id, &incoming_response);
+        assert_eq!(incoming.len(), 1);
+        assert!(incoming[0].relation_kinds.is_empty());
     }
 
     #[test]
@@ -2542,8 +2779,11 @@ mod tests {
         let compact = handle_bulk_check_references(&args, &store).unwrap();
         let body = parsed_response(&compact);
         assert_eq!(body["total_checked"], 2);
+        assert_eq!(body["classified_count"], 1);
+        assert_eq!(body["error_count"], 0);
+        assert_eq!(body["incomplete_verdict_count"], 1);
         assert_eq!(body["with_references"], 1);
-        assert_eq!(body["without_references"], 1);
+        assert_eq!(body["without_references"], 0);
         assert_eq!(body["compact"], true);
         let rows = body["results"].as_array().unwrap();
         assert_eq!(rows.len(), 2);
@@ -2552,7 +2792,10 @@ mod tests {
             .find(|r| r["entity_id"] == serde_json::json!(live_id))
             .unwrap();
         assert_eq!(live_row["has_references"], true);
-        assert_eq!(live_row["reference_count"], 2);
+        assert!(live_row["reference_count"].is_null());
+        assert_eq!(live_row["known_reference_count"], 2);
+        assert_eq!(live_row["reference_count_complete"], false);
+        assert_eq!(live_row["verdict_complete"], true);
         assert!(
             live_row.get("name").is_none(),
             "compact mode must omit name"
@@ -2561,8 +2804,18 @@ mod tests {
             .iter()
             .find(|r| r["entity_id"] == serde_json::json!(dead_id))
             .unwrap();
-        assert_eq!(dead_row["has_references"], false);
-        assert_eq!(dead_row["reference_count"], 0);
+        assert!(
+            dead_row["has_references"].is_null(),
+            "a local-only zero is not a total reachability verdict"
+        );
+        assert!(dead_row["reference_count"].is_null());
+        assert_eq!(dead_row["known_reference_count"], 0);
+        assert_eq!(dead_row["reference_count_complete"], false);
+        assert_eq!(dead_row["verdict_complete"], false);
+        assert_eq!(
+            dead_row["verdict_reason"],
+            "cross-repo authority incomplete"
+        );
 
         args.insert("compact".to_string(), serde_json::json!(false));
         let verbose = handle_bulk_check_references(&args, &store).unwrap();
@@ -2604,13 +2857,23 @@ mod tests {
         args.insert("relation_kind".to_string(), serde_json::json!("Calls"));
         let calls_resp = parsed_response(&handle_bulk_check_references(&args, &store).unwrap());
         assert_eq!(calls_resp["with_references"], 0);
-        assert_eq!(calls_resp["results"][0]["reference_count"], 0);
+        assert_eq!(calls_resp["without_references"], 0);
+        assert!(calls_resp["results"][0]["has_references"].is_null());
+        assert!(calls_resp["results"][0]["reference_count"].is_null());
+        assert_eq!(calls_resp["results"][0]["known_reference_count"], 0);
+        assert_eq!(calls_resp["results"][0]["reference_count_complete"], false);
 
         // Asking for Imports — should match.
         args.insert("relation_kind".to_string(), serde_json::json!("Imports"));
         let imports_resp = parsed_response(&handle_bulk_check_references(&args, &store).unwrap());
         assert_eq!(imports_resp["with_references"], 1);
-        assert_eq!(imports_resp["results"][0]["reference_count"], 1);
+        assert_eq!(imports_resp["results"][0]["has_references"], true);
+        assert!(imports_resp["results"][0]["reference_count"].is_null());
+        assert_eq!(imports_resp["results"][0]["known_reference_count"], 1);
+        assert_eq!(
+            imports_resp["results"][0]["reference_count_complete"],
+            false
+        );
     }
 
     #[test]
@@ -2636,6 +2899,21 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["error"], "invalid entity_id (not a UUID)");
         assert_eq!(rows[1]["error"], "entity not found");
+        assert_eq!(resp["classified_count"], 0);
+        assert_eq!(resp["error_count"], 2);
+        assert_eq!(resp["incomplete_verdict_count"], 0);
+        assert_eq!(resp["with_references"], 0);
+        assert_eq!(resp["without_references"], 0);
+        for row in rows {
+            assert!(
+                row["has_references"].is_null(),
+                "an invalid or missing entity is not a false reachability verdict: {row}"
+            );
+            assert!(row["reference_count"].is_null());
+            assert!(row["known_reference_count"].is_null());
+            assert_eq!(row["reference_count_complete"], false);
+            assert_eq!(row["verdict_complete"], false);
+        }
     }
 
     #[tokio::test]
@@ -2689,6 +2967,287 @@ mod tests {
         let body = parsed_response(&handle_find_references(&args, &store).await.unwrap());
         assert_eq!(body["total_upstream"], 0);
         assert!(body["references"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn daemon_find_references_requires_exact_live_graph_root() {
+        let graph = InMemoryGraph::new();
+        let target = make_entity("target", "src/lib.rs");
+        graph.upsert_entity(&target).unwrap();
+        let registered_root = graph_root(&graph);
+
+        let spine = kin_spine::InMemorySpineBackend::new();
+        spine.register_repo(
+            "provider",
+            vec![spine_entry("provider", &target)],
+            &registered_root,
+        );
+        spine.refresh_cross_repo_edges("provider", &[], &[], &["provider".to_string()]);
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let matching = handle_find_references_with_authority(
+            &args,
+            &graph,
+            FindReferencesAuthority {
+                repo_id: "provider",
+                graph_root: &registered_root,
+                spine: Some(&spine),
+            },
+        )
+        .await
+        .unwrap();
+        let matching = crate::finalize_with_envelope(
+            matching,
+            structurally_ready_envelope(),
+            "find_references",
+        );
+        let matching = parsed_response(&matching);
+        assert_eq!(matching["cross_repo"]["authority_complete"], true);
+        assert_eq!(matching["negative"]["safe_to_conclude_absent"], true);
+
+        graph
+            .upsert_entity(&make_entity("session_only", "src/session.rs"))
+            .unwrap();
+        let live_root = graph_root(&graph);
+        assert_ne!(live_root, registered_root);
+        let mismatched = handle_find_references_with_authority(
+            &args,
+            &graph,
+            FindReferencesAuthority {
+                repo_id: "provider",
+                graph_root: &live_root,
+                spine: Some(&spine),
+            },
+        )
+        .await
+        .unwrap();
+        let mismatched = crate::finalize_with_envelope(
+            mismatched,
+            structurally_ready_envelope(),
+            "find_references",
+        );
+        let mismatched = parsed_response(&mismatched);
+        assert_eq!(mismatched["cross_repo"]["status"], "unavailable");
+        assert!(mismatched["cross_repo"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("root mismatch")));
+        assert_eq!(mismatched["negative"]["safe_to_conclude_absent"], false);
+        assert!(mismatched["references"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn filtered_find_references_keeps_unknown_federated_subtype_advisory() {
+        let graph = InMemoryGraph::new();
+        let target = make_entity("target", "src/lib.rs");
+        let source = make_entity("caller", "src/app.rs");
+        graph.upsert_entity(&target).unwrap();
+        let provider_root = graph_root(&graph);
+
+        let spine = kin_spine::InMemorySpineBackend::new();
+        spine.register_repo(
+            "provider",
+            vec![spine_entry("provider", &target)],
+            &provider_root,
+        );
+        spine.register_repo(
+            "consumer",
+            vec![spine_entry("consumer", &source)],
+            "consumer-root",
+        );
+        let repos = vec!["consumer".to_string(), "provider".to_string()];
+        for repo in &repos {
+            spine.refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+        spine.add_cross_repo_edge(kin_spine::CrossRepoEdge {
+            src_repo: "consumer".to_string(),
+            src_entity: source.id,
+            dst_repo: "provider".to_string(),
+            dst_entity: target.id,
+            confidence: 0.9,
+        });
+
+        let args = HashMap::from([
+            (
+                "entity_id".to_string(),
+                serde_json::json!(target.id.to_string()),
+            ),
+            ("relation_kinds".to_string(), serde_json::json!(["calls"])),
+        ]);
+        let filtered = handle_find_references_with_authority(
+            &args,
+            &graph,
+            FindReferencesAuthority {
+                repo_id: "provider",
+                graph_root: &provider_root,
+                spine: Some(&spine),
+            },
+        )
+        .await
+        .unwrap();
+        let filtered = crate::finalize_with_envelope(
+            filtered,
+            structurally_ready_envelope(),
+            "find_references",
+        );
+        let filtered = parsed_response(&filtered);
+        assert_eq!(filtered["total_upstream"], 0);
+        assert!(filtered["references"].as_array().unwrap().is_empty());
+        assert_eq!(filtered["cross_repo"]["federated_reference_count"], 1);
+        assert_eq!(filtered["cross_repo"]["relation_subtype_complete"], false);
+        assert_eq!(filtered["negative"]["safe_to_conclude_absent"], false);
+
+        let default_args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let unfiltered = parsed_response(
+            &handle_find_references_with_authority(
+                &default_args,
+                &graph,
+                FindReferencesAuthority {
+                    repo_id: "provider",
+                    graph_root: &provider_root,
+                    spine: Some(&spine),
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(unfiltered["total_upstream"], 1);
+        assert_eq!(unfiltered["references"][0]["name"], "caller");
+    }
+
+    #[tokio::test]
+    async fn filtered_find_references_certifies_complete_federated_zero() {
+        let graph = InMemoryGraph::new();
+        let target = make_entity("target", "src/lib.rs");
+        graph.upsert_entity(&target).unwrap();
+        let provider_root = graph_root(&graph);
+
+        let spine = kin_spine::InMemorySpineBackend::new();
+        spine.register_repo(
+            "provider",
+            vec![spine_entry("provider", &target)],
+            &provider_root,
+        );
+        spine.refresh_cross_repo_edges("provider", &[], &[], &["provider".to_string()]);
+
+        let args = HashMap::from([
+            (
+                "entity_id".to_string(),
+                serde_json::json!(target.id.to_string()),
+            ),
+            ("relation_kinds".to_string(), serde_json::json!(["calls"])),
+        ]);
+        let result = handle_find_references_with_authority(
+            &args,
+            &graph,
+            FindReferencesAuthority {
+                repo_id: "provider",
+                graph_root: &provider_root,
+                spine: Some(&spine),
+            },
+        )
+        .await
+        .unwrap();
+        let result =
+            crate::finalize_with_envelope(result, structurally_ready_envelope(), "find_references");
+        let result = parsed_response(&result);
+
+        assert!(result["references"].as_array().unwrap().is_empty());
+        assert_eq!(result["cross_repo"]["authority_complete"], true);
+        assert_eq!(
+            result["cross_repo"]["relation_subtype_complete"], true,
+            "a complete empty incoming edge set excludes every unknown subtype"
+        );
+        assert_eq!(result["negative"]["safe_to_conclude_absent"], true);
+    }
+
+    #[test]
+    fn daemon_bulk_reachability_includes_complete_federated_edges() {
+        let graph = InMemoryGraph::new();
+        let target = make_entity("target", "src/lib.rs");
+        let source = make_entity("caller", "src/app.rs");
+        graph.upsert_entity(&target).unwrap();
+        let provider_root = graph_root(&graph);
+
+        let spine = kin_spine::InMemorySpineBackend::new();
+        spine.register_repo(
+            "provider",
+            vec![spine_entry("provider", &target)],
+            &provider_root,
+        );
+        spine.register_repo(
+            "consumer",
+            vec![spine_entry("consumer", &source)],
+            "consumer-root",
+        );
+        let repos = vec!["consumer".to_string(), "provider".to_string()];
+        for repo in &repos {
+            spine.refresh_cross_repo_edges(repo, &[], &[], &repos);
+        }
+        spine.add_cross_repo_edge(kin_spine::CrossRepoEdge {
+            src_repo: "consumer".to_string(),
+            src_entity: source.id,
+            dst_repo: "provider".to_string(),
+            dst_entity: target.id,
+            confidence: 0.9,
+        });
+
+        let mut args = HashMap::from([(
+            "entity_ids".to_string(),
+            serde_json::json!([target.id.to_string()]),
+        )]);
+        let authority = FindReferencesAuthority {
+            repo_id: "provider",
+            graph_root: &provider_root,
+            spine: Some(&spine),
+        };
+        let any = handle_bulk_check_references_with_authority(&args, &graph, authority).unwrap();
+        let any = crate::finalize_with_envelope(
+            any,
+            structurally_ready_envelope(),
+            "bulk_check_references",
+        );
+        let any = parsed_response(&any);
+        assert_eq!(any["results"][0]["has_references"], true);
+        assert_eq!(any["results"][0]["reference_count"], 1);
+        assert_eq!(any["results"][0]["known_reference_count"], 1);
+        assert_eq!(any["results"][0]["reference_count_complete"], true);
+        assert_eq!(any["results"][0]["federated_reference_count"], 1);
+        assert_eq!(any["cross_repo"]["authority_complete"], true);
+        assert_eq!(any["negative"]["safe_to_conclude_absent"], true);
+
+        args.insert("relation_kind".to_string(), serde_json::json!("Calls"));
+        let calls = handle_bulk_check_references_with_authority(&args, &graph, authority).unwrap();
+        let calls = crate::finalize_with_envelope(
+            calls,
+            structurally_ready_envelope(),
+            "bulk_check_references",
+        );
+        let calls = parsed_response(&calls);
+        assert!(
+            calls["results"][0]["has_references"].is_null(),
+            "an untyped federated edge cannot be classified as Calls=false"
+        );
+        assert!(calls["results"][0]["reference_count"].is_null());
+        assert_eq!(calls["results"][0]["known_reference_count"], 0);
+        assert_eq!(calls["results"][0]["reference_count_complete"], false);
+        assert_eq!(calls["results"][0]["federated_reference_count"], 1);
+        assert_eq!(calls["results"][0]["verdict_complete"], false);
+        assert_eq!(
+            calls["results"][0]["verdict_reason"],
+            "federated relation subtype unavailable"
+        );
+        assert_eq!(calls["classified_count"], 0);
+        assert_eq!(calls["incomplete_verdict_count"], 1);
+        assert_eq!(calls["without_references"], 0);
+        assert_eq!(calls["cross_repo"]["relation_subtype_complete"], false);
+        assert_eq!(calls["cross_repo"]["verdicts_complete"], false);
+        assert_eq!(calls["negative"]["safe_to_conclude_absent"], false);
     }
 
     #[test]
