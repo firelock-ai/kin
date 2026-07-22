@@ -148,12 +148,35 @@ pub fn materialize_session_workspace(
 
 fn validate_session_dir(layout: &kin_core::KinLayout, session_dir: &std::path::Path) -> Result<()> {
     let runs_dir = layout.root().join("runs");
-    if !session_dir.is_absolute() || !session_dir.starts_with(&runs_dir) {
+    if !session_dir.is_absolute() {
         anyhow::bail!(
             "session workspace must be an absolute path under {}",
             runs_dir.display()
         );
     }
+
+    let relative = session_dir.strip_prefix(&runs_dir).map_err(|_| {
+        anyhow::anyhow!(
+            "session workspace must be an absolute path under {}",
+            runs_dir.display()
+        )
+    })?;
+    if relative.as_os_str().is_empty() {
+        anyhow::bail!(
+            "session workspace must name a child directory under {}",
+            runs_dir.display()
+        );
+    }
+    if relative
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        anyhow::bail!(
+            "session workspace must not contain parent traversal outside {}",
+            runs_dir.display()
+        );
+    }
+
     Ok(())
 }
 
@@ -229,6 +252,37 @@ mod tests {
         .to_string();
 
         assert!(err.contains("only supports `copy`"));
+    }
+
+    #[test]
+    fn session_workspace_path_validation_rejects_parent_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = init_repo(dir.path()).unwrap().layout;
+        let escaped = layout.root().join("runs/session-1/../../outside");
+
+        let err = validate_session_dir(&layout, &escaped)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("must not contain parent traversal"));
+    }
+
+    #[test]
+    fn session_workspace_path_validation_requires_a_child_of_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = init_repo(dir.path()).unwrap().layout;
+
+        let root_err = validate_session_dir(&layout, &layout.root().join("runs"))
+            .unwrap_err()
+            .to_string();
+        assert!(root_err.contains("must name a child directory"));
+
+        let outside_err = validate_session_dir(&layout, &layout.root().join("outside"))
+            .unwrap_err()
+            .to_string();
+        assert!(outside_err.contains("must be an absolute path under"));
+
+        validate_session_dir(&layout, &layout.root().join("runs/session-1")).unwrap();
     }
 
     #[test]
