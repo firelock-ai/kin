@@ -3436,6 +3436,7 @@ dependencies = [
  "hex",
  "kin-blobs",
  "kin-model",
+ "libc",
  "percent-encoding",
  "semver",
  "serde",

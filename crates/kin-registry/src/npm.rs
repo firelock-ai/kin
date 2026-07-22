@@ -10,9 +10,10 @@
 //! - PUT /registry/npm/{package}
 
 use axum::{
-    body::Bytes,
-    extract::{DefaultBodyLimit, Extension, OriginalUri, State},
-    http::{StatusCode, Uri},
+    body::{Body, Bytes},
+    extract::{DefaultBodyLimit, Extension, OriginalUri, Request, State},
+    http::{header, Method, StatusCode, Uri},
+    middleware::{self, Next},
     response::{IntoResponse, Json, Response},
     routing::get,
     Router,
@@ -43,6 +44,21 @@ pub struct NpmRegistryState {
     pub base_url: String,
 }
 
+impl NpmRegistryState {
+    pub fn new(
+        manifest_store: ManifestStore,
+        blobs_dir: std::path::PathBuf,
+        base_url: String,
+    ) -> Self {
+        let blobs_dir = crate::atomic_file::pin_authority_root(&blobs_dir).unwrap_or(blobs_dir);
+        Self {
+            manifest_store,
+            blobs_dir,
+            base_url,
+        }
+    }
+}
+
 /// Authenticated caller metadata injected by the daemon-side registry auth
 /// middleware when KinLab token enforcement is enabled.
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
@@ -68,7 +84,45 @@ pub fn npm_routes(state: Arc<NpmRegistryState>) -> Router {
     Router::new()
         .route("/registry/npm/{*path}", get(handle_get).put(handle_put))
         .layer(DefaultBodyLimit::max(MAX_NPM_PUBLISH_BODY_SIZE))
+        .route_layer(middleware::from_fn(authorize_npm_publish))
         .with_state(state)
+}
+
+/// Refuse writes without the daemon-injected identity before Axum polls the
+/// request body. This keeps a disabled or unauthenticated registry from
+/// buffering the 140 MiB publish envelope merely to return a 503.
+async fn authorize_npm_publish(request: Request<Body>, next: Next) -> Response {
+    if request.method() != Method::PUT {
+        return next.run(request).await;
+    }
+    if request
+        .extensions()
+        .get::<RegistryAccessIdentity>()
+        .is_none()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "npm publishing is disabled: no authenticated registry identity",
+            })),
+        )
+            .into_response();
+    }
+    let declared = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if declared.is_some_and(|length| length > MAX_NPM_PUBLISH_BODY_SIZE as u64) {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": "npm publish body exceeds the configured size limit",
+            })),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 async fn handle_get(
@@ -85,19 +139,19 @@ async fn handle_get(
             if validate_npm_package(&package).is_err() {
                 return invalid_npm_coordinate();
             }
-            package_metadata(&state, &package)
+            package_metadata(&state, &package).await
         }
         ParsedRoute::VersionMetadata { package, version } => {
             if validate_npm_package(&package).is_err() || !valid_npm_version(&version) {
                 return invalid_npm_coordinate();
             }
-            version_metadata(&state, &package, &version)
+            version_metadata(&state, &package, &version).await
         }
         ParsedRoute::Tarball { package, tarball } => {
             if validate_npm_package(&package).is_err() || !valid_npm_tarball_name(&tarball) {
                 return invalid_npm_coordinate();
             }
-            download_tarball(&state, &package, &tarball)
+            download_tarball(&state, &package, &tarball).await
         }
     }
 }
@@ -135,7 +189,7 @@ async fn handle_put(
         return invalid_npm_coordinate();
     }
 
-    publish_package(&state, &package, identity, body)
+    publish_package(&state, &package, identity, body).await
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,8 +342,16 @@ fn invalid_npm_coordinate() -> Response {
         .into_response()
 }
 
-fn package_metadata(state: &NpmRegistryState, package: &str) -> Response {
-    let versions = match state.manifest_store.get_versions(Ecosystem::Npm, package) {
+async fn package_metadata(state: &NpmRegistryState, package: &str) -> Response {
+    let transaction = match state
+        .manifest_store
+        .read_transaction_async(Ecosystem::Npm)
+        .await
+    {
+        Ok(transaction) => transaction,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let versions = match transaction.get_versions(package) {
         Ok(v) if v.is_empty() => return StatusCode::NOT_FOUND.into_response(),
         Ok(v) => v,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -376,8 +438,16 @@ fn package_metadata(state: &NpmRegistryState, package: &str) -> Response {
     Json(response).into_response()
 }
 
-fn version_metadata(state: &NpmRegistryState, package: &str, version: &str) -> Response {
-    let versions = match state.manifest_store.get_versions(Ecosystem::Npm, package) {
+async fn version_metadata(state: &NpmRegistryState, package: &str, version: &str) -> Response {
+    let transaction = match state
+        .manifest_store
+        .read_transaction_async(Ecosystem::Npm)
+        .await
+    {
+        Ok(transaction) => transaction,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let versions = match transaction.get_versions(package) {
         Ok(v) => v,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
@@ -391,8 +461,12 @@ fn version_metadata(state: &NpmRegistryState, package: &str, version: &str) -> R
     }
 }
 
-fn download_tarball(state: &NpmRegistryState, package: &str, tarball: &str) -> Response {
-    let transaction = match state.manifest_store.read_transaction(Ecosystem::Npm) {
+async fn download_tarball(state: &NpmRegistryState, package: &str, tarball: &str) -> Response {
+    let transaction = match state
+        .manifest_store
+        .read_transaction_async(Ecosystem::Npm)
+        .await
+    {
         Ok(transaction) => transaction,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
@@ -464,7 +538,7 @@ struct NpmAttachment {
     length: Option<u64>,
 }
 
-fn publish_package(
+async fn publish_package(
     state: &NpmRegistryState,
     package: &str,
     identity: RegistryAccessIdentity,
@@ -620,7 +694,11 @@ fn publish_package(
                     .into_response();
             }
         };
-    let transaction = match state.manifest_store.write_transaction(Ecosystem::Npm) {
+    let transaction = match state
+        .manifest_store
+        .write_transaction_async(Ecosystem::Npm)
+        .await
+    {
         Ok(transaction) => transaction,
         Err(error) => {
             return (
@@ -984,11 +1062,11 @@ mod tests {
     fn registry_state() -> (tempfile::TempDir, Arc<NpmRegistryState>) {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".kin")).unwrap();
-        let state = Arc::new(NpmRegistryState {
-            manifest_store: ManifestStore::new(&root.path().join(".kin")),
-            blobs_dir: root.path().join("npm"),
-            base_url: "https://kinlab.ai".to_string(),
-        });
+        let state = Arc::new(NpmRegistryState::new(
+            ManifestStore::new(&root.path().join(".kin")),
+            root.path().join("npm"),
+            "https://kinlab.ai".to_string(),
+        ));
         (root, state)
     }
 
@@ -1241,6 +1319,28 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    #[tokio::test]
+    async fn unauthenticated_publish_is_rejected_without_polling_the_body() {
+        use std::task::Poll;
+
+        let (_root, state) = registry_state();
+        let body = Body::from_stream(futures_util::stream::poll_fn(
+            |_| -> Poll<Option<Result<Bytes, std::io::Error>>> {
+                panic!("unauthenticated npm request body was polled")
+            },
+        ));
+        let response = npm_routes(state)
+            .oneshot(
+                Request::put("/registry/npm/demo")
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     #[test]
     fn stored_tarball_metadata_cannot_redirect_reads_outside_the_blob_root() {
         let root = tempfile::tempdir().unwrap();
@@ -1293,11 +1393,11 @@ mod tests {
         let blobs_dir = root.path().join("npm");
         std::fs::create_dir_all(&kin_dir).unwrap();
         let make_state = || {
-            Arc::new(NpmRegistryState {
-                manifest_store: ManifestStore::new(&kin_dir),
-                blobs_dir: blobs_dir.clone(),
-                base_url: "https://kinlab.ai".to_string(),
-            })
+            Arc::new(NpmRegistryState::new(
+                ManifestStore::new(&kin_dir),
+                blobs_dir.clone(),
+                "https://kinlab.ai".to_string(),
+            ))
         };
         let first_state = make_state();
         let second_state = make_state();

@@ -33,6 +33,9 @@ async-stream = "0.3"
 fs2 = { workspace = true }
 url = "2"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tower = { workspace = true }
 futures-util = "0.3"

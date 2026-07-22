@@ -61,6 +61,7 @@ impl CargoRegistryState {
         base_url: String,
         publish_token: Option<String>,
     ) -> Self {
+        let blobs_dir = crate::atomic_file::pin_authority_root(&blobs_dir).unwrap_or(blobs_dir);
         Self {
             manifest_store,
             blobs_dir,
@@ -211,7 +212,11 @@ async fn index_lookup(
     }
 
     let _read_guard = state.publish_gate.read().await;
-    let transaction = match state.manifest_store.read_transaction(Ecosystem::Cargo) {
+    let transaction = match state
+        .manifest_store
+        .read_transaction_async(Ecosystem::Cargo)
+        .await
+    {
         Ok(transaction) => transaction,
         Err(error) => {
             return (
@@ -286,7 +291,11 @@ async fn download_crate(
         return bad_coordinate(message);
     }
     let _read_guard = state.publish_gate.read().await;
-    let transaction = match state.manifest_store.read_transaction(Ecosystem::Cargo) {
+    let transaction = match state
+        .manifest_store
+        .read_transaction_async(Ecosystem::Cargo)
+        .await
+    {
         Ok(transaction) => transaction,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
@@ -492,7 +501,11 @@ async fn publish_crate(
         }
     };
     let _write_guard = state.publish_gate.write().await;
-    let transaction = match state.manifest_store.write_transaction(Ecosystem::Cargo) {
+    let transaction = match state
+        .manifest_store
+        .write_transaction_async(Ecosystem::Cargo)
+        .await
+    {
         Ok(transaction) => transaction,
         Err(error) => {
             return (
@@ -671,6 +684,7 @@ fn parse_crate_manifest(
         .map_err(|e| format!("crate is not a valid gzip-tar archive: {e}"))?;
 
     let mut cargo_toml_content = String::new();
+    let mut manifest_seen = false;
     let mut scanned_size = 0u64;
     for (index, entry) in entries.enumerate() {
         if index >= MAX_CRATE_ARCHIVE_ENTRIES {
@@ -698,6 +712,12 @@ fn parse_crate_manifest(
             .map(|path| path.to_str() == Some(&expected_manifest))
             .unwrap_or(false);
         if is_manifest {
+            if manifest_seen {
+                return Err(format!(
+                    "crate contains more than one authoritative {expected_manifest}"
+                ));
+            }
+            manifest_seen = true;
             if entry_size > MAX_CRATE_MANIFEST_SIZE {
                 return Err(format!(
                     "crate Cargo.toml exceeds the {MAX_CRATE_MANIFEST_SIZE} byte limit"
@@ -712,11 +732,10 @@ fn parse_crate_manifest(
                     "crate Cargo.toml exceeds the {MAX_CRATE_MANIFEST_SIZE} byte limit"
                 ));
             }
-            break;
         }
     }
 
-    if cargo_toml_content.is_empty() {
+    if !manifest_seen {
         return Err(format!("crate does not contain {expected_manifest}"));
     }
 
@@ -1926,6 +1945,52 @@ private = { version = "1", registry = "corp" }
             archive_with_declared_entry("demo-1.0.0/padding", MAX_CRATE_ARCHIVE_SCAN_SIZE + 1);
         let error = parse_crate_manifest(&oversized_scan, "demo", "1.0.0").unwrap_err();
         assert!(error.contains("scan limit"), "{error}");
+
+        let manifest = b"[package]\nname = \"demo\"\nversion = \"1.0.0\"\n";
+        let mut uncompressed = Vec::new();
+        let mut manifest_header = tar::Header::new_gnu();
+        manifest_header.set_path("demo-1.0.0/Cargo.toml").unwrap();
+        manifest_header.set_size(manifest.len() as u64);
+        manifest_header.set_mode(0o644);
+        manifest_header.set_cksum();
+        uncompressed.extend_from_slice(manifest_header.as_bytes());
+        uncompressed.extend_from_slice(manifest);
+        uncompressed.resize(uncompressed.len().next_multiple_of(512), 0);
+        let mut trailing_header = tar::Header::new_gnu();
+        trailing_header
+            .set_path("demo-1.0.0/trailing-bomb")
+            .unwrap();
+        trailing_header.set_size(MAX_CRATE_ARCHIVE_SCAN_SIZE + 1);
+        trailing_header.set_mode(0o644);
+        trailing_header.set_cksum();
+        uncompressed.extend_from_slice(trailing_header.as_bytes());
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&uncompressed).unwrap();
+        let manifest_first_bomb = encoder.finish().unwrap();
+        let error = parse_crate_manifest(&manifest_first_bomb, "demo", "1.0.0").unwrap_err();
+        assert!(error.contains("scan limit"), "{error}");
+    }
+
+    #[test]
+    fn crate_archive_rejects_duplicate_authoritative_manifests() {
+        use flate2::{write::GzEncoder, Compression};
+
+        let manifest = b"[package]\nname = \"demo\"\nversion = \"1.0.0\"\n";
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        for _ in 0..2 {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(manifest.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "demo-1.0.0/Cargo.toml", manifest.as_slice())
+                .unwrap();
+        }
+        let encoder = builder.into_inner().unwrap();
+        let body = encoder.finish().unwrap();
+        let error = parse_crate_manifest(&body, "demo", "1.0.0").unwrap_err();
+        assert!(error.contains("more than one authoritative"), "{error}");
     }
 
     #[tokio::test]

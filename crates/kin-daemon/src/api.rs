@@ -930,11 +930,11 @@ fn npm_registry_routes(
     let npm_dir = packages_dir.join("npm");
     std::fs::create_dir_all(&npm_dir).ok();
 
-    let router = kin_registry::npm::npm_routes(Arc::new(kin_registry::npm::NpmRegistryState {
-        manifest_store: kin_registry::ManifestStore::new(state.layout.root()),
-        blobs_dir: npm_dir,
-        base_url: base_url.to_string(),
-    }));
+    let router = kin_registry::npm::npm_routes(Arc::new(kin_registry::npm::NpmRegistryState::new(
+        kin_registry::ManifestStore::new(state.layout.root()),
+        npm_dir,
+        base_url.to_string(),
+    )));
 
     match auth_state {
         Some(auth_state) => router.route_layer(middleware::from_fn_with_state(

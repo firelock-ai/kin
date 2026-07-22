@@ -9,12 +9,100 @@
 //! the shared storage path itself.
 
 use fs2::FileExt;
-use std::fs::{File, OpenOptions};
+use std::collections::HashMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+
+#[derive(Default)]
+struct GateState {
+    readers: usize,
+    writer: bool,
+    waiting_writers: usize,
+}
+
+#[derive(Default)]
+struct ProcessGate {
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+
+struct ProcessGuard {
+    gate: Arc<ProcessGate>,
+    exclusive: bool,
+}
+
+impl ProcessGuard {
+    fn acquire(key: crate::atomic_file::AuthorityKey, exclusive: bool) -> io::Result<Self> {
+        static GATES: OnceLock<
+            Mutex<HashMap<crate::atomic_file::AuthorityKey, Weak<ProcessGate>>>,
+        > = OnceLock::new();
+
+        let gate = {
+            let mut gates = GATES
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .map_err(|_| io::Error::other("registry process-lock map is poisoned"))?;
+            gates.retain(|_, gate| gate.strong_count() > 0);
+            match gates.get(&key).and_then(Weak::upgrade) {
+                Some(gate) => gate,
+                None => {
+                    let gate = Arc::new(ProcessGate::default());
+                    gates.insert(key, Arc::downgrade(&gate));
+                    gate
+                }
+            }
+        };
+
+        let mut state = gate
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("registry process lock is poisoned"))?;
+        if exclusive {
+            state.waiting_writers += 1;
+            while state.writer || state.readers > 0 {
+                state = gate
+                    .changed
+                    .wait(state)
+                    .map_err(|_| io::Error::other("registry process lock is poisoned"))?;
+            }
+            state.waiting_writers -= 1;
+            state.writer = true;
+        } else {
+            // Give a queued writer priority so a continuous stream of public reads cannot
+            // starve package publication forever.
+            while state.writer || state.waiting_writers > 0 {
+                state = gate
+                    .changed
+                    .wait(state)
+                    .map_err(|_| io::Error::other("registry process lock is poisoned"))?;
+            }
+            state.readers += 1;
+        }
+        drop(state);
+        Ok(Self { gate, exclusive })
+    }
+}
+
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.exclusive {
+            state.writer = false;
+        } else {
+            state.readers = state.readers.saturating_sub(1);
+        }
+        self.gate.changed.notify_all();
+    }
+}
 
 pub(crate) struct StorageLock {
-    file: File,
+    file: crate::atomic_file::AnchoredLockFile,
+    _process_guard: ProcessGuard,
 }
 
 impl StorageLock {
@@ -26,31 +114,93 @@ impl StorageLock {
         Self::acquire(path, true)
     }
 
+    pub(crate) async fn shared_async(path: &Path) -> io::Result<Self> {
+        Self::acquire_async(path, false).await
+    }
+
+    pub(crate) async fn exclusive_async(path: &Path) -> io::Result<Self> {
+        Self::acquire_async(path, true).await
+    }
+
+    async fn acquire_async(path: &Path, exclusive: bool) -> io::Result<Self> {
+        let path = PathBuf::from(path);
+        tokio::task::spawn_blocking(move || Self::acquire(&path, exclusive))
+            .await
+            .map_err(|error| io::Error::other(format!("registry lock task failed: {error}")))?
+    }
+
     fn acquire(path: &Path, exclusive: bool) -> io::Result<Self> {
-        let parent = path.parent().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "registry transaction lock has no parent directory",
-            )
-        })?;
-        crate::atomic_file::ensure_directory_durable(parent)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
+        let file = crate::atomic_file::open_lock_file(path)?;
+        let process_guard = ProcessGuard::acquire(file.authority_key(), exclusive)?;
         if exclusive {
-            FileExt::lock_exclusive(&file)?;
+            FileExt::lock_exclusive(&file.file)?;
         } else {
-            FileExt::lock_shared(&file)?;
+            FileExt::lock_shared(&file.file)?;
         }
-        Ok(Self { file })
+        file.verify_named()?;
+        Ok(Self {
+            file,
+            _process_guard: process_guard,
+        })
     }
 }
 
 impl Drop for StorageLock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+        let _ = FileExt::unlock(&self.file.file);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn same_process_exclusive_locks_are_serialized_by_authority_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().canonicalize().unwrap().join("registry.lock");
+        let first = StorageLock::exclusive(&path).unwrap();
+        let (attempted_tx, attempted_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let contender_path = path.clone();
+        let contender = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let _lock = StorageLock::exclusive(&contender_path).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        attempted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            acquired_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(first);
+        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        contender.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_parent_aliases_share_one_process_gate() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let real = root_path.join("real");
+        let alias = root_path.join("alias");
+        std::fs::create_dir(&real).unwrap();
+        symlink(&real, &alias).unwrap();
+
+        // Registry storage rejects symlink traversal instead of assigning a second lock
+        // identity to the same underlying authority.
+        let error = StorageLock::exclusive(&alias.join("registry.lock"))
+            .err()
+            .expect("symlinked registry parent must be rejected");
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(code) if code == libc::ELOOP || code == libc::ENOTDIR
+        ));
     }
 }

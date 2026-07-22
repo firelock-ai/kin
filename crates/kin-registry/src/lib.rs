@@ -120,7 +120,9 @@ pub(crate) struct ManifestWriteTransaction<'a> {
 
 impl ManifestStore {
     pub fn new(kin_dir: &std::path::Path) -> Self {
-        let manifests_dir = kin_dir.join("packages").join("manifests");
+        let pinned_kin_dir =
+            atomic_file::pin_authority_root(kin_dir).unwrap_or_else(|_| kin_dir.to_path_buf());
+        let manifests_dir = pinned_kin_dir.join("packages").join("manifests");
         let _ = atomic_file::ensure_directory_durable(&manifests_dir);
         Self { manifests_dir }
     }
@@ -142,6 +144,37 @@ impl ManifestStore {
         ecosystem: Ecosystem,
     ) -> Result<ManifestWriteTransaction<'_>, RegistryError> {
         let lock = storage_lock::StorageLock::exclusive(&self.transaction_lock_path(ecosystem))?;
+        Ok(ManifestWriteTransaction {
+            store: self,
+            ecosystem,
+            _lock: lock,
+        })
+    }
+
+    /// Async handler boundary for the same shared transaction lock. The OS
+    /// lock and in-process condition wait run on Tokio's bounded blocking pool
+    /// so a stalled peer process cannot occupy an API worker thread.
+    pub(crate) async fn read_transaction_async(
+        &self,
+        ecosystem: Ecosystem,
+    ) -> Result<ManifestReadTransaction<'_>, RegistryError> {
+        let lock =
+            storage_lock::StorageLock::shared_async(&self.transaction_lock_path(ecosystem)).await?;
+        Ok(ManifestReadTransaction {
+            store: self,
+            ecosystem,
+            _lock: lock,
+        })
+    }
+
+    /// Async handler boundary for the exclusive publication transaction.
+    pub(crate) async fn write_transaction_async(
+        &self,
+        ecosystem: Ecosystem,
+    ) -> Result<ManifestWriteTransaction<'_>, RegistryError> {
+        let lock =
+            storage_lock::StorageLock::exclusive_async(&self.transaction_lock_path(ecosystem))
+                .await?;
         Ok(ManifestWriteTransaction {
             store: self,
             ecosystem,

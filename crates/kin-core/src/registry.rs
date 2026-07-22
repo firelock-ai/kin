@@ -19,7 +19,14 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 #[derive(Default)]
 struct RegistryProcessGates {
-    active: std::collections::HashSet<PathBuf>,
+    active: std::collections::HashSet<RegistryProcessKey>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RegistryProcessKey {
+    parent: FileIdentity,
+    registry_name: std::ffi::OsString,
 }
 
 #[cfg(unix)]
@@ -30,7 +37,7 @@ static REGISTRY_PROCESS_GATES: std::sync::OnceLock<(
 
 #[cfg(unix)]
 struct RegistryProcessGuard {
-    key: PathBuf,
+    key: RegistryProcessKey,
 }
 
 #[cfg(unix)]
@@ -52,10 +59,22 @@ impl Drop for RegistryProcessGuard {
 /// gate around the preflight + OS-lock transaction so an atomic rename cannot
 /// unlink a sibling thread's just-opened registry descriptor (`st_nlink == 0`).
 /// Different registry authorities remain independent; the durable lock file
-/// remains the cross-process authority.
+/// remains the cross-process authority. Keying on the opened parent identity
+/// collapses prefix aliases such as `/tmp` and `/private/tmp` that lexical path
+/// normalization cannot recognize as one directory.
 #[cfg(unix)]
 fn lock_registry_process(path: &Path) -> std::io::Result<RegistryProcessGuard> {
-    let key = lexical_absolute_path(path)?;
+    let anchor = prepare_anchor(path).map_err(|error| {
+        std::io::Error::other(format!("failed to anchor registry process lock: {error}"))
+    })?;
+    let parent_stat = stat_file(&anchor.parent)?;
+    let key = RegistryProcessKey {
+        parent: FileIdentity {
+            device: parent_stat.st_dev as u64,
+            inode: parent_stat.st_ino as u64,
+        },
+        registry_name: anchor.registry_name,
+    };
     let (state, changed) = REGISTRY_PROCESS_GATES.get_or_init(|| {
         (
             std::sync::Mutex::new(RegistryProcessGates::default()),
@@ -72,28 +91,6 @@ fn lock_registry_process(path: &Path) -> std::io::Result<RegistryProcessGuard> {
     }
     state.active.insert(key.clone());
     Ok(RegistryProcessGuard { key })
-}
-
-#[cfg(unix)]
-fn lexical_absolute_path(path: &Path) -> std::io::Result<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            std::path::Component::RootDir => normalized.push(Path::new("/")),
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            std::path::Component::Normal(part) => normalized.push(part),
-            std::path::Component::Prefix(_) => unreachable!("Unix paths have no prefix"),
-        }
-    }
-    Ok(normalized)
 }
 
 /// Read-only classification of one local registry-authority path.
@@ -551,7 +548,7 @@ pub fn initialize_registry_authority_at(
 }
 
 #[cfg(unix)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct FileIdentity {
     device: u64,
     inode: u64,
@@ -1309,7 +1306,7 @@ fn validate_regular_stat(stat: &libc::stat, label: &str) -> std::io::Result<File
     }
     Ok(FileIdentity {
         device: stat.st_dev as u64,
-        inode: stat.st_ino as u64,
+        inode: stat.st_ino,
     })
 }
 
@@ -1774,6 +1771,43 @@ mod tests {
             .unwrap();
         writer.join().unwrap();
         assert_eq!(stat_file(&opened_before_rename).unwrap().st_nlink, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_gate_collapses_symlinked_prefix_aliases_by_parent_identity() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let real_root = root.path().join("real");
+        let nested = real_root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let alias_root = root.path().join("alias");
+        symlink(&real_root, &alias_root).unwrap();
+        let real_registry = nested.join("registry.toml");
+        let aliased_registry = alias_root.join("nested").join("registry.toml");
+
+        let first = lock_registry_process(&real_registry).unwrap();
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let _guard = lock_registry_process(&aliased_registry).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        attempted_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            acquired_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(first);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        contender.join().unwrap();
     }
 
     #[test]
