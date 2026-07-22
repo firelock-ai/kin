@@ -5,12 +5,14 @@ use std::env;
 use std::path::PathBuf;
 use std::process::{exit, Command};
 
+use kin_mcp::handlers::bench::BENCHMARK_BOUNDARY_NOTICE;
+
 /// Proxy `kin bench` to external benchmark binaries.
 ///
 /// - `kin bench prep ...` → dispatches to `kin-bench-prep`
 /// - `kin bench ...`      → dispatches to `kin-bench`
 ///
-/// Each binary is optional. If not found, install instructions are shown.
+/// Each binary is optional. If not found, its distribution boundary is shown.
 pub fn bench_proxy(args: &[String]) -> ! {
     match args.first().map(|a| a.as_str()) {
         Some("prep") => dispatch("kin-bench-prep", &args[1..]),
@@ -49,17 +51,20 @@ fn dispatch(bin_name: &str, args: &[String]) -> ! {
             }
         }
         None => {
-            eprintln!("{bin_name} is not installed.");
-            eprintln!();
-            eprintln!("Install it:");
-            eprintln!();
-            eprintln!("  cd kin-bench && cargo build --release -p {bin_name}");
-            eprintln!("  cp target/release/{bin_name} ~/.kin/bin/");
-            eprintln!();
-            eprintln!("Once installed, `kin bench` will find it automatically.");
+            eprint!("{}", missing_binary_guidance(bin_name));
             exit(1);
         }
     }
+}
+
+fn missing_binary_guidance(bin_name: &str) -> String {
+    format!(
+        "{bin_name} is not installed.\n\n\
+         {BENCHMARK_BOUNDARY_NOTICE}\n\n\
+         Authorized internal operators can place `{bin_name}` on PATH or in `~/.kin/bin/`. \
+         This command provides no public clone or install path. Treat only separately published, \
+         versioned proof artifacts as independently reproducible evidence.\n"
+    )
 }
 
 fn find_bin(name: &str) -> Option<PathBuf> {
@@ -91,4 +96,34 @@ fn find_bin(name: &str) -> Option<PathBuf> {
                 Some(PathBuf::from(p))
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_binary_guidance_preserves_private_harness_boundary() {
+        let guidance = missing_binary_guidance("kin-bench-eval");
+
+        for required in [
+            "kin-bench-eval is not installed",
+            BENCHMARK_BOUNDARY_NOTICE,
+            "Authorized internal operators",
+            "on PATH or in `~/.kin/bin/`",
+            "no public clone or install path",
+            "separately published, versioned proof artifacts",
+        ] {
+            assert!(
+                guidance.contains(required),
+                "missing boundary text: {required}"
+            );
+        }
+        for forbidden in ["github.com/", "cargo install", "cd "] {
+            assert!(
+                !guidance.contains(forbidden),
+                "public CLI exposes private install guidance: {forbidden}"
+            );
+        }
+    }
 }
