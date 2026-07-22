@@ -846,6 +846,16 @@ where
         }
     }
 
+    // The canonical genesis ID is the admitted boundary for every imported Git
+    // root, but a request-scoped or freshly constructed graph may not have had
+    // repository bootstrap applied. Graph replay requires every reachable
+    // parent record, so materialize the deterministic boundary before
+    // inserting children instead of leaving an accepted but unresolvable
+    // ancestry.
+    if graph.get_change(&genesis_id)?.is_none() {
+        graph.create_change(&kin_core::build_genesis_change())?;
+    }
+
     let mut pending: HashSet<SemanticChangeId> = absent.iter().copied().collect();
     let mut inserted = 0usize;
     for imported_change in &imported {

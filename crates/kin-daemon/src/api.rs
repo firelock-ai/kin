@@ -15,7 +15,7 @@ use crate::state::{
 };
 
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -23,16 +23,64 @@ use axum::{Json, Router};
 use kin_model::session::{Intent, IntentScope, IntentSummary, LockType};
 use kin_model::{
     Branch, BranchName, ChangeStore, ContractId, EntityId, EntityStore, FileLayout, FilePathId,
-    GraphNodeId, IntentId, ProvenanceStore, SessionCapabilities, SessionId, SessionStore,
-    SessionTransport, WorkStore,
+    GraphNodeId, IntentId, ProvenanceStore, ResolvedSourceEntry, SessionCapabilities, SessionId,
+    SessionStore, SessionTransport, SourceEntryKind, SourceTreeResolution, WorkStore,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, Socket, Type};
 use tracing::info;
 use uuid::Uuid;
 
 static BOOTSTRAP_EXPORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+static EXACT_SOURCE_ARCHIVE_EXPORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
+fn exact_source_archive_exports() -> Arc<tokio::sync::Semaphore> {
+    Arc::clone(
+        EXACT_SOURCE_ARCHIVE_EXPORTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1))),
+    )
+}
+
+fn hold_exact_source_archive_permit<T, E>(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    work: impl FnOnce() -> Result<T, E>,
+) -> Result<(T, tokio::sync::OwnedSemaphorePermit), E> {
+    let output = work()?;
+    Ok((output, permit))
+}
+
+/// Own the archive bytes and their memory-admission permit together. `Bytes`
+/// retains this owner across response-body and hyper socket-buffer clones, so
+/// admission cannot reopen while any copy still keeps the allocation alive.
+struct ExactSourceArchiveAllocation {
+    archive: Vec<u8>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl ExactSourceArchiveAllocation {
+    fn new(archive: Vec<u8>, permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+        Self {
+            archive,
+            _permit: permit,
+        }
+    }
+}
+
+impl AsRef<[u8]> for ExactSourceArchiveAllocation {
+    fn as_ref(&self) -> &[u8] {
+        &self.archive
+    }
+}
+
+fn exact_source_archive_body(
+    archive: Vec<u8>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> axum::body::Body {
+    axum::body::Body::from(axum::body::Bytes::from_owner(
+        ExactSourceArchiveAllocation::new(archive, permit),
+    ))
+}
 
 /// Acquire a `std::sync::Mutex`, recovering the guard if the lock was poisoned
 /// by a panic in a prior holder.
@@ -527,12 +575,157 @@ pub struct DaemonCommitRequest {
     pub audit_event: Option<kin_model::provenance::AuditEvent>,
     #[serde(default)]
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub release_policy: Option<DaemonReleasePolicy>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DaemonReleasePolicy {
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub require_proof: bool,
+    #[serde(default)]
+    pub require_approval: bool,
+}
+
+fn release_policy_failure(gate: &str, fields: serde_json::Value) -> (StatusCode, String) {
+    let mut body = serde_json::json!({
+        "error": "release_policy_failed",
+        "gate": gate,
+        "mutation_applied": false,
+    });
+    if let (Some(body), Some(fields)) = (body.as_object_mut(), fields.as_object()) {
+        body.extend(fields.clone());
+    }
+    (StatusCode::CONFLICT, body.to_string())
+}
+
+fn canonical_release_entity_count(message: &str) -> Option<usize> {
+    let (tag, snapshot) = message
+        .strip_prefix("release: ")
+        .and_then(|message| message.rsplit_once(" ("))?;
+    let entity_count = snapshot.strip_suffix(" entities snapshot)")?;
+    if tag.trim().is_empty() || tag != tag.trim() || tag.chars().any(char::is_control) {
+        return None;
+    }
+    entity_count.parse::<usize>().ok()
+}
+
+fn release_change_reachable_from(
+    graph: &kin_db::InMemoryGraph,
+    target: &kin_model::SemanticChangeId,
+    head: &kin_model::SemanticChangeId,
+) -> Result<bool, (StatusCode, String)> {
+    let mut pending = vec![*head];
+    let mut visited = HashSet::new();
+    while let Some(change_id) = pending.pop() {
+        if change_id == *target {
+            return Ok(true);
+        }
+        if !visited.insert(change_id) {
+            continue;
+        }
+        let change = graph
+            .get_change(&change_id)
+            .map_err(internal_error)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("branch history at {head} references missing change {change_id}"),
+                )
+            })?;
+        pending.extend(change.parents);
+    }
+    Ok(false)
+}
+
+/// Enforce daemon release policy against the immutable source authority named
+/// by the release marker's sole parent.
+///
+/// The live graph can contain overlays, later branch heads, and verification
+/// runs created after this source state. Rebuilding a historical evidence graph
+/// keeps entity/coverage/approval decisions anchored to `source_head`. Because
+/// VerificationRun does not yet carry an immutable source-change or manifest
+/// binding, `release_evidence_graph_at` intentionally admits no current run as
+/// proof; strict proof therefore fails closed whenever the historical head has
+/// entities.
+fn enforce_daemon_release_policy(
+    graph: &kin_db::InMemoryGraph,
+    source_head: &kin_model::SemanticChangeId,
+    marker_entity_count: usize,
+    policy: &DaemonReleasePolicy,
+) -> Result<(), (StatusCode, String)> {
+    let frozen_snapshot = graph.to_snapshot();
+    let frozen_root = kin_db::compute_graph_root_hash(&frozen_snapshot);
+    let frozen_graph = kin_db::InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
+        frozen_snapshot.clone(),
+        frozen_root,
+    );
+    let (evidence_graph, _) =
+        release_evidence_graph_at(&frozen_graph, &frozen_snapshot, source_head)?;
+    let source_entity_count = evidence_graph
+        .list_all_entities()
+        .map_err(internal_error)?
+        .len();
+    if marker_entity_count != source_entity_count {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "error": "invalid_release_snapshot_count",
+                "mutation_applied": false,
+                "marker_entity_count": marker_entity_count,
+                "source_entity_count": source_entity_count,
+                "source_head": source_head.to_string(),
+                "message": "release marker entity count does not match its immutable source",
+            })
+            .to_string(),
+        ));
+    }
+    let coverage =
+        kin_review::source_bound_release_proof_coverage(&evidence_graph).map_err(internal_error)?;
+
+    if coverage.coverage_ratio < 0.5 && !policy.force {
+        return Err(release_policy_failure(
+            "coverage",
+            serde_json::json!({
+                "coverage_ratio": coverage.coverage_ratio,
+                "source_head": source_head.to_string(),
+                "message": "immutable source-bound release coverage is below the 50% threshold",
+            }),
+        ));
+    }
+    if policy.require_proof && !coverage.missing_proof.is_empty() {
+        return Err(release_policy_failure(
+            "proof",
+            serde_json::json!({
+                "missing_proof": coverage.missing_proof.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "source_head": source_head.to_string(),
+                "message": "release contains entities without immutable source-bound passing proof; current verification runs do not carry source authority",
+            }),
+        ));
+    }
+    if policy.require_approval {
+        let unapproved = kin_review::unapproved_changes(&evidence_graph, source_head, usize::MAX)
+            .map_err(internal_error)?;
+        if !unapproved.is_empty() {
+            return Err(release_policy_failure(
+                "approval",
+                serde_json::json!({
+                    "unapproved_changes": unapproved.iter().map(|change| change.change_id.to_string()).collect::<Vec<_>>(),
+                    "source_head": source_head.to_string(),
+                    "message": "release contains non-root changes without human approval reachable from its immutable parent",
+                }),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The current API version number, returned in the `X-Kin-API-Version` header.
-pub const API_VERSION: &str = "1";
+pub const API_VERSION: &str = "2";
 
-/// Axum middleware that adds `X-Kin-API-Version: 1` to every response.
+/// Axum middleware that adds the current `X-Kin-API-Version` to every response.
 async fn api_version_header(
     request: axum::http::Request<axum::body::Body>,
     next: Next,
@@ -755,7 +948,13 @@ fn auth_error(status: StatusCode, message: &str) -> Response {
 }
 
 /// Build the core route set (without state or middleware).
-fn api_routes() -> Router<Arc<DaemonState>> {
+fn api_routes(retire_v1_branch_head_update: bool) -> Router<Arc<DaemonState>> {
+    let branch_head_update: axum::routing::MethodRouter<Arc<DaemonState>> =
+        if retire_v1_branch_head_update {
+            put(graph_update_branch_head_v1_retired)
+        } else {
+            put(graph_update_branch_head)
+        };
     Router::new()
         .route("/health", get(health))
         .route("/readiness", get(readiness))
@@ -826,7 +1025,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
             get(graph_list_branches).post(graph_create_branch),
         )
         .route("/graph/branches/{name}", delete(graph_delete_branch))
-        .route("/graph/branches/{name}/head", put(graph_update_branch_head))
+        .route("/graph/branches/{name}/head", branch_head_update)
         .route("/mcp/tools/call", post(mcp_tools_call))
         // Multi-repo endpoints — list and query lazily-loaded repo graphs
         .route("/repos", get(list_repos))
@@ -836,6 +1035,14 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/repos/{repo_id}/refs", get(repo_refs))
         .route("/repos/{repo_id}/history", get(repo_history))
         .route("/repos/{repo_id}/compare", get(repo_compare))
+        .route(
+            "/repos/{repo_id}/archive/tar/{source_change_id}",
+            get(repo_exact_source_tar_gz),
+        )
+        .route(
+            "/repos/{repo_id}/release/evidence/{source_change_id}",
+            get(repo_release_evidence),
+        )
         // Provenance endpoints — Merkle DAG proof lineage
         .route(
             "/repos/{repo_id}/provenance/entity/{entity_id}",
@@ -1077,14 +1284,17 @@ fn npm_registry_auth_error(status: StatusCode, message: &str) -> Response {
 
 /// Build the axum router with all daemon API routes.
 ///
-/// Routes are served at both `/` (backward compat) and `/v1/` prefixes.
-/// All responses include the `X-Kin-API-Version: 1` header.
+/// Routes are served at `/`, `/v2/`, and the legacy `/v1/` read-compatibility
+/// prefix. The unsafe v1 branch-head mutation is explicitly retired instead
+/// of silently accepting the v2 CAS contract. All responses identify the
+/// effective API contract in the `X-Kin-API-Version` header.
 pub fn router(state: Arc<DaemonState>) -> Router {
     router_with_auth(state, None)
 }
 
 fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Router {
-    let routes = api_routes();
+    let routes = api_routes(false);
+    let legacy_v1_routes = api_routes(true);
     let activity_state = Arc::clone(&state);
 
     // Package registry — all ecosystems share the same packages dir and manifest store
@@ -1155,7 +1365,8 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
     // `validate_host_and_origin`) still apply to EVERYTHING, registry included.
     let daemon_routes = Router::new()
         .merge(routes.clone())
-        .nest("/v1", routes)
+        .nest("/v1", legacy_v1_routes)
+        .nest("/v2", routes)
         .layer(middleware::from_fn_with_state(
             DaemonAuthState { auth_token },
             daemon_auth,
@@ -2060,7 +2271,186 @@ async fn graph_commit(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     use kin_model::{EntityDelta, RelationDelta};
 
+    // Serialize caller-supplied history publication so the same-ID check and
+    // insertion are one authority operation. `create_change` is an overwrite
+    // primitive internally, so the API must enforce immutable IDs itself.
+    let _mutation_guard = state.coordination_gate.lock().await;
     let graph = &*state.graph;
+    let live_branch = graph
+        .get_branch(&request.branch_name)
+        .map_err(internal_error)?;
+    let change_already_exists = match graph
+        .get_change(&request.change.id)
+        .map_err(internal_error)?
+    {
+        Some(existing) => {
+            let existing = serde_json::to_value(&existing).map_err(internal_error)?;
+            let incoming = serde_json::to_value(&request.change).map_err(internal_error)?;
+            if existing != incoming {
+                return Err((
+                    StatusCode::CONFLICT,
+                    serde_json::json!({
+                        "error": "semantic_change_id_collision",
+                        "change_id": request.change.id.to_string(),
+                        "mutation_applied": false,
+                        "message": "semantic change ID already exists with a different immutable payload",
+                    })
+                    .to_string(),
+                ));
+            }
+            true
+        }
+        None => false,
+    };
+
+    let release_author = request.change.author.to_string() == "kin-release";
+    let release_message_signal = request.change.message.starts_with("release: ");
+    let release_entity_count = canonical_release_entity_count(&request.change.message);
+    let release_marker = release_author && release_entity_count.is_some();
+    if release_author != release_message_signal
+        || (release_message_signal && release_entity_count.is_none())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "error": "invalid_release_marker",
+                "mutation_applied": false,
+                "message": "release markers must use both the canonical kin-release author and release: message prefix",
+            })
+            .to_string(),
+        ));
+    }
+    let release_shape_is_empty = request.change.parents.len() == 1
+        && request.change.entity_deltas.is_empty()
+        && request.change.relation_deltas.is_empty()
+        && request.change.artifact_deltas.is_empty()
+        && request.change.projected_files.is_empty()
+        && request.shallow_files.is_empty()
+        && request.shallow_clears.is_empty()
+        && request.audit_event.is_none()
+        && request.change.authored_on.as_ref() == Some(&request.branch_name);
+
+    if release_marker && request.release_policy.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "error": "release_policy_required",
+                "mutation_applied": false,
+                "message": "release changes must carry daemon-enforced release policy",
+            })
+            .to_string(),
+        ));
+    }
+
+    if request.release_policy.is_some() {
+        if live_branch.is_none() {
+            return Err((
+                StatusCode::CONFLICT,
+                serde_json::json!({
+                    "error": "release_branch_missing",
+                    "branch": request.branch_name.to_string(),
+                    "change_id": request.change.id.to_string(),
+                    "change_materialized": change_already_exists,
+                    "mutation_applied": false,
+                    "message": "release requires an existing branch authority",
+                })
+                .to_string(),
+            ));
+        }
+        if !release_marker || !release_shape_is_empty {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "error": "invalid_release_change_shape",
+                    "mutation_applied": false,
+                    "message": "release commits must be empty-delta marker changes with exactly one live parent",
+                })
+                .to_string(),
+            ));
+        }
+    }
+
+    let exact_release_retry = release_marker
+        && release_shape_is_empty
+        && request.release_policy.is_some()
+        && change_already_exists
+        && match &live_branch {
+            Some(branch) => release_change_reachable_from(graph, &request.change.id, &branch.head)?,
+            None => false,
+        };
+
+    // Compare-and-swap the caller's observed parent against the live branch
+    // while holding the same gate used for the eventual head mutation. Merge
+    // commits may carry additional parents, but their first parent is the
+    // target branch authority they were constructed against. An exact release
+    // recovery is the only exception: its branch already points at the marker
+    // or at a descendant that retained the marker. Policy is still evaluated
+    // against the marker's immutable parent.
+    if !exact_release_retry {
+        if let Some(branch) = &live_branch {
+            let expected_head = request.change.parents.first().copied();
+            if expected_head != Some(branch.head) {
+                return Err((
+                    StatusCode::CONFLICT,
+                    serde_json::json!({
+                        "error": "stale_branch_head",
+                        "branch": request.branch_name.to_string(),
+                        "expected_head": expected_head.map(|head| head.to_string()),
+                        "actual_head": branch.head.to_string(),
+                        "change_id": request.change.id.to_string(),
+                        "change_materialized": change_already_exists,
+                        "mutation_applied": false,
+                        "message": "semantic change parent does not match the current branch head",
+                    })
+                    .to_string(),
+                ));
+            }
+        }
+    }
+
+    if let Some(policy) = &request.release_policy {
+        // Both first publication and an identical recovery retry evaluate the
+        // same immutable parent. Never substitute the live branch head here:
+        // on retry it is the release marker itself, while ambient overlays can
+        // otherwise add or remove entities without changing history.
+        enforce_daemon_release_policy(
+            graph,
+            &request.change.parents[0],
+            release_entity_count.expect("validated release policy has a canonical marker"),
+            policy,
+        )?;
+        state
+            .preflight_exact_source_tree(graph, &request.change.parents[0])
+            .map_err(|error| {
+                (
+                    StatusCode::FAILED_DEPENDENCY,
+                    serde_json::json!({
+                        "error": "release_source_not_exact",
+                        "source_head": request.change.parents[0].to_string(),
+                        "mutation_applied": false,
+                        "message": error.to_string(),
+                    })
+                    .to_string(),
+                )
+            })?;
+    }
+
+    // An identical retry already reachable from the branch must not reapply
+    // graph mutations. This also reconciles a durable journal after later
+    // branch progress: the marker remains release authority even though it is
+    // no longer the tip. General commits still fail closed on stale parents.
+    if exact_release_retry {
+        state
+            .retry_snapshot_authority_with_event(DaemonEvent::GraphRootChanged {
+                old_root_hash: None,
+                new_root_hash: live_branch
+                    .as_ref()
+                    .map(|branch| branch.head.to_string())
+                    .unwrap_or_else(|| request.change.id.to_string()),
+            })
+            .map_err(internal_error)?;
+        return Ok(Json(serde_json::json!({"status": "ok"})));
+    }
 
     // --- Lease enforcement gate ---
     // Collect the entity scopes touched by this commit and check for hard
@@ -2121,6 +2511,16 @@ async fn graph_commit(
         }
     }
 
+    // Release admission already validated the marker parent's complete exact
+    // tree above. The marker has no artifact deltas, so resolving it produces
+    // that identical tree; reading every source object again here only doubles
+    // release latency and peak backend traffic without adding authority.
+    if request.release_policy.is_none() {
+        state
+            .preflight_exact_source_change(graph, &request.change)
+            .map_err(internal_error)?;
+    }
+
     let graph_mutation = state.begin_graph_authority_mutation();
     for delta in &request.change.entity_deltas {
         match delta {
@@ -2155,14 +2555,12 @@ async fn graph_commit(
         graph.upsert_shallow_file(sf).map_err(internal_error)?;
     }
 
-    graph
-        .create_change(&request.change)
-        .map_err(internal_error)?;
-    if graph
-        .get_branch(&request.branch_name)
-        .map_err(internal_error)?
-        .is_some()
-    {
+    if !change_already_exists {
+        graph
+            .create_change(&request.change)
+            .map_err(internal_error)?;
+    }
+    if live_branch.is_some() {
         graph
             .update_branch_head(&request.branch_name, &request.change.id)
             .map_err(internal_error)?;
@@ -2182,11 +2580,12 @@ async fn graph_commit(
     // Broadcast root hash change and compact the delta journal at the commit boundary.
     state.bump_version();
     drop(graph_mutation);
-    state.save_snapshot_full().map_err(internal_error)?;
-    state.emit_event(DaemonEvent::GraphRootChanged {
-        old_root_hash: None,
-        new_root_hash: request.change.id.to_string(),
-    });
+    state
+        .save_snapshot_full_with_event(DaemonEvent::GraphRootChanged {
+            old_root_hash: None,
+            new_root_hash: request.change.id.to_string(),
+        })
+        .map_err(internal_error)?;
 
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
@@ -2739,6 +3138,14 @@ async fn command_branch(
         ));
     }
 
+    let requires_authority_gate =
+        !matches!(&request, kin_cli::commands::branch::BranchRequest::List);
+    let _coordination = if requires_authority_gate {
+        Some(state.coordination_gate.lock().await)
+    } else {
+        None
+    };
+
     let response = kin_cli::commands::branch::execute_branch_request(
         &state.layout,
         state.graph.as_ref(),
@@ -2771,6 +3178,7 @@ async fn command_checkout(
         ));
     }
 
+    let _coordination = state.coordination_gate.lock().await;
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
 
@@ -2919,7 +3327,13 @@ async fn command_commit(
 
     // Force a filesystem sync to guarantee the daemon has reconciled all offline changes
     // before building the commit deltas.
-    let _ = crate::loop_runner::sync_filesystem_with_graph(&state).await;
+    crate::loop_runner::sync_filesystem_with_graph(&state)
+        .await
+        .map_err(internal_error)?;
+
+    // Serialize the branch read, change construction, and head publication
+    // with `/graph/commit` release CAS operations.
+    let _coordination = state.coordination_gate.lock().await;
 
     let graph = &*state.graph;
 
@@ -3036,10 +3450,8 @@ async fn command_commit(
     }
 
     // Create the semantic change.
-    let content_id =
-        kin_core::content_identity_from_deltas(&entity_deltas, &relation_deltas, &artifact_deltas);
-    let change = kin_model::SemanticChange {
-        id: kin_core::compute_change_id(&request.message, &branch.head, &content_id),
+    let mut change = kin_model::SemanticChange {
+        id: kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0; 32])),
         parents: vec![branch.head],
         author: kin_model::AuthorId::new(kin_core::whoami()),
         message: request.message,
@@ -3053,8 +3465,17 @@ async fn command_commit(
         risk_summary: None,
         authored_on: None,
     };
+    change.id = kin_core::compute_semantic_change_id(&change).map_err(internal_error)?;
 
     let change_id = change.id;
+
+    // `/commands/commit` constructs the change in-process, but it publishes
+    // through the same immutable graph authority as `/graph/commit`. Keep the
+    // exact-source gate identical across both entry points and run it before
+    // any change or branch mutation.
+    state
+        .preflight_exact_source_change(graph, &change)
+        .map_err(internal_error)?;
 
     graph.create_change(&change).map_err(internal_error)?;
     graph
@@ -3139,10 +3560,31 @@ async fn graph_create_branch(
 
     use kin_model::{Branch, BranchName, Hash256, SemanticChangeId};
 
+    let _coordination = state.coordination_gate.lock().await;
+
     let head_hash = Hash256::from_hex(&request.head).map_err(bad_request)?;
+    let head = SemanticChangeId::from_hash(head_hash);
+    if state
+        .graph
+        .get_change(&head)
+        .map_err(internal_error)?
+        .is_none()
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            serde_json::json!({
+                "error": "branch_head_not_found",
+                "branch": request.name,
+                "head": head.to_string(),
+                "mutation_applied": false,
+                "message": "branch head must name an existing semantic change",
+            })
+            .to_string(),
+        ));
+    }
     let branch = Branch {
         name: BranchName::new(&request.name),
-        head: SemanticChangeId::from_hash(head_hash),
+        head,
     };
 
     state.graph.create_branch(&branch).map_err(internal_error)?;
@@ -3169,6 +3611,7 @@ async fn graph_delete_branch(
     }
 
     use kin_model::BranchName;
+    let _coordination = state.coordination_gate.lock().await;
     state
         .graph
         .delete_branch(&BranchName::new(&name))
@@ -3181,6 +3624,19 @@ async fn graph_delete_branch(
 #[derive(Debug, Deserialize)]
 struct UpdateBranchHeadRequest {
     head: String,
+    expected_head: String,
+}
+
+async fn graph_update_branch_head_v1_retired(Path(name): Path<String>) -> impl IntoResponse {
+    (
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "error": "v1_branch_head_update_retired",
+            "branch": name,
+            "mutation_applied": false,
+            "message": "PUT branch head moved to /v2 and requires expected_head for atomic fast-forward CAS",
+        })),
+    )
 }
 
 async fn graph_update_branch_head(
@@ -3201,13 +3657,69 @@ async fn graph_update_branch_head(
     use kin_model::{BranchName, Hash256, SemanticChangeId};
 
     let head_hash = Hash256::from_hex(&request.head).map_err(bad_request)?;
+    let expected_head_hash = Hash256::from_hex(&request.expected_head).map_err(bad_request)?;
+    let branch_name = BranchName::new(&name);
+    let expected_head = SemanticChangeId::from_hash(expected_head_hash);
+    let _coordination = state.coordination_gate.lock().await;
+    let branch = state
+        .graph
+        .get_branch(&branch_name)
+        .map_err(internal_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("branch '{name}' not found")))?;
+    if branch.head != expected_head {
+        return Err((
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "error": "stale_branch_head",
+                "branch": name,
+                "expected_head": expected_head.to_string(),
+                "actual_head": branch.head.to_string(),
+                "mutation_applied": false,
+                "message": "branch head changed before update",
+            })
+            .to_string(),
+        ));
+    }
+
+    let new_head = SemanticChangeId::from_hash(head_hash);
+    if state
+        .graph
+        .get_change(&new_head)
+        .map_err(internal_error)?
+        .is_none()
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            serde_json::json!({
+                "error": "branch_head_not_found",
+                "branch": name,
+                "head": new_head.to_string(),
+                "mutation_applied": false,
+                "message": "branch head must name an existing semantic change",
+            })
+            .to_string(),
+        ));
+    }
+    let ancestry = kin_review::ref_graph::collect_ancestry(state.graph.as_ref(), &new_head)
+        .map_err(internal_error)?;
+    if !ancestry.contains(&expected_head) {
+        return Err((
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "error": "non_fast_forward_branch_update",
+                "branch": name,
+                "expected_head": expected_head.to_string(),
+                "new_head": new_head.to_string(),
+                "mutation_applied": false,
+                "message": "branch updates must advance to a descendant of the current head",
+            })
+            .to_string(),
+        ));
+    }
 
     state
         .graph
-        .update_branch_head(
-            &BranchName::new(&name),
-            &SemanticChangeId::from_hash(head_hash),
-        )
+        .update_branch_head(&branch_name, &new_head)
         .map_err(internal_error)?;
 
     // Broadcast root hash change. bump_version() marks dirty for background persistence.
@@ -4681,6 +5193,11 @@ async fn verify_run(
             "daemon not fully initialized".to_string(),
         ));
     }
+
+    // Release authorization reads verification coverage while holding this
+    // same gate. Keep a verification run's graph writes and durable snapshot
+    // indivisible with respect to that decision.
+    let _coordination = state.coordination_gate.lock().await;
 
     let state_for_verify = Arc::clone(&state);
     let response = tokio::task::spawn_blocking(move || {
@@ -7587,8 +8104,6 @@ fn build_vfs_tree_snapshot(
     state: &DaemonState,
     key: VfsTreeCacheKey,
 ) -> Result<VfsTreeSnapshot, (StatusCode, String)> {
-    use kin_model::ArtifactDeltaKind;
-
     let Some(head_id) = key.head.clone() else {
         return Ok(VfsTreeSnapshot {
             key,
@@ -7607,17 +8122,14 @@ fn build_vfs_tree_snapshot(
     for change in &changes {
         let epoch_secs = change.timestamp.0.timestamp() as u64;
         for delta in &change.artifact_deltas {
-            match delta.kind {
-                ArtifactDeltaKind::Added | ArtifactDeltaKind::Modified => {
-                    if let Some(hash) = delta.new_hash {
-                        files.insert(delta.file_id.clone(), hash);
-                    }
-                    timestamps.insert(delta.file_id.clone(), epoch_secs);
+            if delta.kind.is_removed() {
+                files.remove(&delta.file_id);
+                timestamps.remove(&delta.file_id);
+            } else {
+                if let Some(hash) = delta.new_hash {
+                    files.insert(delta.file_id.clone(), hash);
                 }
-                ArtifactDeltaKind::Removed => {
-                    files.remove(&delta.file_id);
-                    timestamps.remove(&delta.file_id);
-                }
+                timestamps.insert(delta.file_id.clone(), epoch_secs);
             }
         }
     }
@@ -9150,6 +9662,972 @@ fn primary_repo_id(state: &DaemonState) -> String {
 }
 
 /// Derive a short repo name from the daemon's working directory.
+const EXACT_SOURCE_MAX_ENTRIES: usize = 100_000;
+const EXACT_SOURCE_MAX_EXPANDED_BYTES: u64 = 256 * 1024 * 1024;
+const EXACT_SOURCE_MAX_ARCHIVE_BYTES: usize = 128 * 1024 * 1024;
+const EXACT_SOURCE_ROOT: &str = "kin-source";
+
+fn try_acquire_exact_source_archive_slot(
+    semaphore: Arc<tokio::sync::Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, (StatusCode, String)> {
+    semaphore.try_acquire_owned().map_err(|_| {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            "an exact source archive or release-evidence job is already running; retry after it completes"
+                .to_string(),
+        )
+    })
+}
+
+#[derive(Debug)]
+struct ExactSourceArchiveLimitExceeded;
+
+impl std::fmt::Display for ExactSourceArchiveLimitExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("exact source archive exceeds the compressed byte limit")
+    }
+}
+
+impl std::error::Error for ExactSourceArchiveLimitExceeded {}
+
+/// A `Vec<u8>` writer that enforces the compressed archive limit before an
+/// allocation or write can cross it. Checking only after `GzEncoder::finish`
+/// would allow a low-compressibility source tree to allocate more than the
+/// advertised ceiling first.
+struct BoundedArchiveWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedArchiveWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl Write for BoundedArchiveWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.limit.saturating_sub(self.bytes.len());
+        if buffer.len() > remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                ExactSourceArchiveLimitExceeded,
+            ));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn exact_source_archive_write_error(context: &str, error: std::io::Error) -> (StatusCode, String) {
+    if error
+        .get_ref()
+        .is_some_and(|source| source.is::<ExactSourceArchiveLimitExceeded>())
+        || error
+            .to_string()
+            .contains("exact source archive exceeds the compressed byte limit")
+    {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "exact source archive exceeds the compressed byte limit".to_string(),
+        );
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("{context}: {error}"),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExactSourceEntry {
+    File {
+        path: String,
+        data: Arc<[u8]>,
+        executable: bool,
+    },
+    Symlink {
+        path: String,
+        target: Arc<str>,
+    },
+}
+
+impl ExactSourceEntry {
+    fn path(&self) -> &str {
+        match self {
+            Self::File { path, .. } | Self::Symlink { path, .. } => path,
+        }
+    }
+}
+
+fn parse_exact_source_change_id(
+    source_change_id: &str,
+) -> Result<kin_model::SemanticChangeId, (StatusCode, String)> {
+    if source_change_id.len() != 64
+        || !source_change_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "source_change_id must be a canonical 64-character hexadecimal semantic change ID"
+                .to_string(),
+        ));
+    }
+    let decoded = hex::decode(source_change_id).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid source_change_id: {error}"),
+        )
+    })?;
+    let bytes: [u8; 32] = decoded.try_into().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "source_change_id must decode to 32 bytes".to_string(),
+        )
+    })?;
+    Ok(kin_model::SemanticChangeId::from_hash(
+        kin_model::Hash256::from_bytes(bytes),
+    ))
+}
+
+fn resolve_exact_source_tree(
+    graph: &kin_db::InMemoryGraph,
+    requested_change: &kin_model::SemanticChangeId,
+) -> Result<HashMap<FilePathId, ResolvedSourceEntry>, (StatusCode, String)> {
+    match graph
+        .resolve_source_tree_at(requested_change)
+        .map_err(internal_error)?
+    {
+        SourceTreeResolution::Exact { entries } => Ok(entries),
+        SourceTreeResolution::Incomplete { gaps } => {
+            let gap_summary = gaps
+                .iter()
+                .map(|gap| format!("{}@{}:{:?}", gap.file_id, gap.change_id, gap.reason))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err((
+                StatusCode::FAILED_DEPENDENCY,
+                format!(
+                    "exact source history is incomplete for {requested_change}: {gap_summary}; no fallback was attempted"
+                ),
+            ))
+        }
+    }
+}
+
+fn validate_exact_source_path(path: &str) -> Result<(), (StatusCode, String)> {
+    kin_core::validate_portable_source_paths(std::iter::once(path)).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("graph contains an unsafe exact-source path {path:?}: {error}"),
+        )
+    })
+}
+
+fn validate_exact_source_symlink(path: &str, target: &str) -> Result<(), (StatusCode, String)> {
+    kin_core::validate_portable_source_symlink(path, target).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("exact-source symlink {path:?} has an unsafe target {target:?}: {error}"),
+        )
+    })
+}
+
+fn canonical_exact_source_manifest(
+    entries: &[ExactSourceEntry],
+) -> Result<Vec<u8>, (StatusCode, String)> {
+    kin_core::validate_portable_source_paths(entries.iter().map(ExactSourceEntry::path)).map_err(
+        |error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("graph contains conflicting or unportable exact-source paths: {error}"),
+            )
+        },
+    )?;
+    let all_paths: HashSet<&str> = entries.iter().map(ExactSourceEntry::path).collect();
+    let mut ordered: Vec<&ExactSourceEntry> = entries.iter().collect();
+    ordered.sort_by(|left, right| left.path().cmp(right.path()));
+    let mut manifest = Vec::new();
+    manifest.extend_from_slice(b"kin-exact-source-manifest-v2\0");
+    manifest.extend_from_slice(
+        &u64::try_from(ordered.len())
+            .map_err(|_| {
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "exact source manifest entry count exceeds u64".to_string(),
+                )
+            })?
+            .to_le_bytes(),
+    );
+    let mut previous_path: Option<&str> = None;
+    for entry in ordered {
+        let path = entry.path();
+        validate_exact_source_path(path)?;
+        if let ExactSourceEntry::Symlink { target, .. } = entry {
+            validate_exact_source_symlink(path, target.as_ref())?;
+        }
+        if previous_path == Some(path) {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("graph contains duplicate exact-source path {path:?}"),
+            ));
+        }
+        for (index, byte) in path.bytes().enumerate() {
+            if byte == b'/' && all_paths.contains(&path[..index]) {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "graph contains conflicting exact-source paths {:?} and {path:?}",
+                        &path[..index]
+                    ),
+                ));
+            }
+        }
+        previous_path = Some(path);
+        append_exact_source_manifest_field(&mut manifest, path.as_bytes())?;
+        match entry {
+            ExactSourceEntry::File {
+                data, executable, ..
+            } => {
+                manifest.push(0);
+                manifest.push(u8::from(*executable));
+                manifest.extend_from_slice(&Sha256::digest(data.as_ref()));
+            }
+            ExactSourceEntry::Symlink { target, .. } => {
+                manifest.push(1);
+                append_exact_source_manifest_field(&mut manifest, target.as_bytes())?;
+            }
+        }
+    }
+    Ok(manifest)
+}
+
+fn append_exact_source_manifest_field(
+    manifest: &mut Vec<u8>,
+    value: &[u8],
+) -> Result<(), (StatusCode, String)> {
+    let len = u64::try_from(value.len()).map_err(|_| {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "exact source manifest field length exceeds u64".to_string(),
+        )
+    })?;
+    manifest.extend_from_slice(&len.to_le_bytes());
+    manifest.extend_from_slice(value);
+    Ok(())
+}
+
+fn build_exact_source_tar_gz(
+    mut entries: Vec<ExactSourceEntry>,
+) -> Result<(Vec<u8>, String), (StatusCode, String)> {
+    entries.sort_by(|left, right| left.path().cmp(right.path()));
+    let archive_entry_count = entries.len().checked_add(1).ok_or_else(|| {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "exact source archive entry count overflow".to_string(),
+        )
+    })?;
+    if archive_entry_count > EXACT_SOURCE_MAX_ENTRIES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "exact source tree exceeds the archive entry limit".to_string(),
+        ));
+    }
+    let expanded_bytes = entries.iter().try_fold(0_u64, |total, entry| {
+        let len = match entry {
+            ExactSourceEntry::File { data, .. } => data.len(),
+            ExactSourceEntry::Symlink { target, .. } => target.len(),
+        };
+        total.checked_add(u64::try_from(len).unwrap_or(u64::MAX))
+    });
+    if expanded_bytes.is_none_or(|bytes| bytes > EXACT_SOURCE_MAX_EXPANDED_BYTES) {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "exact source tree exceeds the expanded byte limit".to_string(),
+        ));
+    }
+
+    let manifest = canonical_exact_source_manifest(&entries)?;
+    let manifest_hash = hex::encode(Sha256::digest(&manifest));
+    let gzip = flate2::GzBuilder::new().mtime(0).write(
+        BoundedArchiveWriter::new(EXACT_SOURCE_MAX_ARCHIVE_BYTES),
+        flate2::Compression::fast(),
+    );
+    let mut archive = tar::Builder::new(gzip);
+    archive.mode(tar::HeaderMode::Deterministic);
+
+    let mut root_header = tar::Header::new_gnu();
+    root_header.set_uid(0);
+    root_header.set_gid(0);
+    root_header.set_mtime(0);
+    root_header.set_entry_type(tar::EntryType::Directory);
+    root_header.set_mode(0o755);
+    root_header.set_size(0);
+    root_header.set_cksum();
+    archive
+        .append_data(
+            &mut root_header,
+            format!("{EXACT_SOURCE_ROOT}/"),
+            std::io::empty(),
+        )
+        .map_err(|error| {
+            exact_source_archive_write_error("exact source tar root write failed", error)
+        })?;
+
+    for entry in &entries {
+        let archive_path = format!("{EXACT_SOURCE_ROOT}/{}", entry.path());
+        let mut header = tar::Header::new_gnu();
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        match entry {
+            ExactSourceEntry::File {
+                data, executable, ..
+            } => {
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_mode(if *executable { 0o755 } else { 0o644 });
+                header.set_size(data.len() as u64);
+                header.set_cksum();
+                archive
+                    .append_data(&mut header, &archive_path, data.as_ref())
+                    .map_err(|error| {
+                        exact_source_archive_write_error("exact source tar write failed", error)
+                    })?;
+            }
+            ExactSourceEntry::Symlink { target, .. } => {
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_mode(0o777);
+                header.set_size(0);
+                header.set_link_name(target.as_ref()).map_err(|error| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("exact source tar link write failed: {error}"),
+                    )
+                })?;
+                header.set_cksum();
+                archive
+                    .append_data(&mut header, &archive_path, std::io::empty())
+                    .map_err(|error| {
+                        exact_source_archive_write_error("exact source tar write failed", error)
+                    })?;
+            }
+        }
+    }
+
+    let gzip = archive.into_inner().map_err(|error| {
+        exact_source_archive_write_error("exact source tar finish failed", error)
+    })?;
+    let bytes = gzip
+        .finish()
+        .map_err(|error| {
+            exact_source_archive_write_error("exact source gzip finish failed", error)
+        })?
+        .into_inner();
+    Ok((bytes, manifest_hash))
+}
+
+fn load_exact_source_entries(
+    state: &DaemonState,
+    repo_id: &str,
+    tree: std::collections::HashMap<FilePathId, ResolvedSourceEntry>,
+) -> Result<Vec<ExactSourceEntry>, (StatusCode, String)> {
+    let backend = state.storage_backend.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "exact source export requires immutable backend source storage".to_string(),
+        )
+    })?;
+    load_exact_source_entries_with(tree, |file_id, digest, remaining_bytes| {
+        backend
+            .load_source_blob_bounded(repo_id, digest, remaining_bytes)
+            .map_err(|error| {
+                let status = if matches!(
+                    &error,
+                    kin_db::KinDbError::SourceBlobReadLimitExceeded { .. }
+                ) {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                (
+                    status,
+                    format!(
+                        "immutable source blob load failed for {} at {}: {error}",
+                        file_id.0,
+                        hex::encode(digest)
+                    ),
+                )
+            })
+    })
+}
+
+fn load_exact_source_entries_with(
+    tree: std::collections::HashMap<FilePathId, ResolvedSourceEntry>,
+    mut load_blob: impl FnMut(
+        &FilePathId,
+        [u8; 32],
+        u64,
+    ) -> Result<Option<Vec<u8>>, (StatusCode, String)>,
+) -> Result<Vec<ExactSourceEntry>, (StatusCode, String)> {
+    let mut files: Vec<_> = tree.into_iter().collect();
+    files.sort_by(|left, right| left.0 .0.cmp(&right.0 .0));
+    let archive_entry_count = files.len().checked_add(1).ok_or_else(|| {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "exact source archive entry count overflow".to_string(),
+        )
+    })?;
+    if archive_entry_count > EXACT_SOURCE_MAX_ENTRIES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "exact source tree exceeds the archive entry limit".to_string(),
+        ));
+    }
+    kin_core::validate_portable_source_paths(files.iter().map(|(file_id, _)| file_id.0.as_str()))
+        .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("graph contains conflicting or unportable exact-source paths: {error}"),
+        )
+    })?;
+    files.sort_by(|left, right| {
+        left.1
+            .hash
+            .as_bytes()
+            .cmp(right.1.hash.as_bytes())
+            .then_with(|| left.0 .0.cmp(&right.0 .0))
+    });
+    let mut entries = Vec::with_capacity(files.len());
+    let mut expanded_bytes = 0_u64;
+    let mut remaining_load_bytes = EXACT_SOURCE_MAX_EXPANDED_BYTES as u64;
+    let mut start = 0;
+    while start < files.len() {
+        let source_hash = files[start].1.hash;
+        let mut end = start + 1;
+        while end < files.len() && files[end].1.hash == source_hash {
+            end += 1;
+        }
+        let digest = *source_hash.as_bytes();
+        let data: Arc<[u8]> = load_blob(&files[start].0, digest, remaining_load_bytes)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::FAILED_DEPENDENCY,
+                    format!(
+                        "exact source bytes are unavailable for {} at {}; no fallback was attempted",
+                        files[start].0 .0,
+                        hex::encode(digest)
+                    ),
+                )
+            })?
+            .into();
+        let loaded_bytes = u64::try_from(data.len()).map_err(|_| {
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "exact source blob length does not fit the allocation limit".to_string(),
+            )
+        })?;
+        remaining_load_bytes = remaining_load_bytes
+            .checked_sub(loaded_bytes)
+            .ok_or_else(|| {
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "exact source tree exceeds the source allocation limit".to_string(),
+                )
+            })?;
+        let logical_group_bytes = u64::try_from(data.len())
+            .unwrap_or(u64::MAX)
+            .checked_mul(u64::try_from(end - start).unwrap_or(u64::MAX))
+            .ok_or_else(|| {
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "exact source tree expanded byte count overflow".to_string(),
+                )
+            })?;
+        expanded_bytes = expanded_bytes
+            .checked_add(logical_group_bytes)
+            .ok_or_else(|| {
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "exact source tree expanded byte count overflow".to_string(),
+                )
+            })?;
+        if expanded_bytes > EXACT_SOURCE_MAX_EXPANDED_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "exact source tree exceeds the expanded byte limit".to_string(),
+            ));
+        }
+        let actual: [u8; 32] = Sha256::digest(data.as_ref()).into();
+        if actual != digest {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "immutable source blob digest mismatch for {}: requested {}, found {}",
+                    files[start].0 .0,
+                    hex::encode(digest),
+                    hex::encode(actual)
+                ),
+            ));
+        }
+        let mut symlink_target: Option<Arc<str>> = None;
+        for (file_id, source) in &files[start..end] {
+            match source.kind {
+                SourceEntryKind::File { executable } => entries.push(ExactSourceEntry::File {
+                    path: file_id.0.clone(),
+                    data: Arc::clone(&data),
+                    executable,
+                }),
+                SourceEntryKind::Symlink => {
+                    let target = if let Some(target) = &symlink_target {
+                        Arc::clone(target)
+                    } else {
+                        let target = std::str::from_utf8(data.as_ref())
+                            .map(Arc::<str>::from)
+                            .map_err(|_| {
+                                (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    format!(
+                                        "exact-source symlink target bytes are not UTF-8 for {} at {}",
+                                        file_id.0,
+                                        hex::encode(digest)
+                                    ),
+                                )
+                            })?;
+                        symlink_target = Some(Arc::clone(&target));
+                        target
+                    };
+                    validate_exact_source_symlink(&file_id.0, target.as_ref())?;
+                    entries.push(ExactSourceEntry::Symlink {
+                        path: file_id.0.clone(),
+                        target,
+                    });
+                }
+            }
+        }
+        start = end;
+    }
+    Ok(entries)
+}
+
+/// GET /repos/{repo_id}/archive/tar/{source_change_id} — export one exact
+/// semantic change from graph-owned history and immutable backend source bytes.
+async fn repo_exact_source_tar_gz(
+    Path((repo_id, source_change_id)): Path<(String, String)>,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // The current backend API returns whole blobs and the HTTP response is a
+    // complete in-memory archive. Serialize this bounded path until backend
+    // streaming lands so concurrent requests cannot multiply peak RSS.
+    let archive_permit = try_acquire_exact_source_archive_slot(exact_source_archive_exports())?;
+    let requested_change = parse_exact_source_change_id(&source_change_id)?;
+    let graph = state
+        .get_repo_graph(&repo_id)
+        .await
+        .map_err(internal_error)?;
+    if graph
+        .get_change(&requested_change)
+        .map_err(internal_error)?
+        .is_none()
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("semantic change {requested_change} was not found in repo {repo_id}"),
+        ));
+    }
+
+    let tree = resolve_exact_source_tree(graph.as_ref(), &requested_change)?;
+    let state_for_archive = Arc::clone(&state);
+    let repo_for_archive = repo_id.clone();
+    let ((archive, manifest_hash), archive_permit) = tokio::task::spawn_blocking(move || {
+        hold_exact_source_archive_permit(archive_permit, || {
+            let entries = load_exact_source_entries(&state_for_archive, &repo_for_archive, tree)?;
+            build_exact_source_tar_gz(entries)
+        })
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("exact source archive worker failed: {error}"),
+        )
+    })??;
+
+    let canonical_change = requested_change.to_string();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/gzip"),
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!(
+            "attachment; filename=\"kin-source-{canonical_change}.tar.gz\""
+        ))
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("exact source response filename is invalid: {error}"),
+            )
+        })?,
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, immutable, max-age=31536000"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-kin-source-change-id"),
+        HeaderValue::from_str(&canonical_change).map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("exact source change response header is invalid: {error}"),
+            )
+        })?,
+    );
+    headers.insert(
+        HeaderName::from_static("x-kin-source-manifest-sha256"),
+        HeaderValue::from_str(&manifest_hash).map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("exact source manifest response header is invalid: {error}"),
+            )
+        })?,
+    );
+    let body = exact_source_archive_body(archive, archive_permit);
+    Ok((headers, body))
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct RepoReleaseCheckEvidence {
+    pass: bool,
+    blockers: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct RepoCoverageEvidence {
+    total_entities: usize,
+    covered_entities: usize,
+    coverage_ratio: f64,
+    missing_proof_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct RepoSecurityEvidence {
+    finding_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct RepoReleaseEvidenceResponse {
+    source_change_id: String,
+    authority_anchor: String,
+    source_manifest_sha256: String,
+    release_check: RepoReleaseCheckEvidence,
+    coverage: RepoCoverageEvidence,
+    security: RepoSecurityEvidence,
+}
+
+fn reachable_change_ids(
+    snapshot: &kin_db::GraphSnapshot,
+    head: &kin_model::SemanticChangeId,
+) -> Result<HashSet<kin_model::SemanticChangeId>, (StatusCode, String)> {
+    let mut reachable = HashSet::new();
+    let mut pending = vec![*head];
+    while let Some(change_id) = pending.pop() {
+        if !reachable.insert(change_id) {
+            continue;
+        }
+        let change = snapshot.changes.get(&change_id).ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("graph history for {head} references missing semantic change {change_id}"),
+            )
+        })?;
+        pending.extend(change.parents.iter().copied());
+    }
+    Ok(reachable)
+}
+
+fn release_evidence_graph_at(
+    frozen_graph: &kin_db::InMemoryGraph,
+    frozen_snapshot: &kin_db::GraphSnapshot,
+    head: &kin_model::SemanticChangeId,
+) -> Result<(kin_db::InMemoryGraph, [u8; 32]), (StatusCode, String)> {
+    let reachable = reachable_change_ids(frozen_snapshot, head)?;
+    let resolved = frozen_graph
+        .resolve_graph_at(head)
+        .map_err(internal_error)?;
+    let mut snapshot = kin_db::GraphSnapshot::empty();
+    snapshot.entities = resolved.entities;
+    snapshot.relations = resolved.relations;
+    snapshot.entity_revisions = resolved.entity_revisions;
+    snapshot.entity_tombstones = resolved.entity_tombstones;
+    snapshot.relation_tombstones = resolved.relation_tombstones;
+    snapshot.file_hashes = resolved
+        .file_tree
+        .into_iter()
+        .map(|(file_id, hash)| (file_id.0, *hash.as_bytes()))
+        .collect();
+
+    for change_id in &reachable {
+        let change = frozen_snapshot.changes.get(change_id).ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("reachable semantic change {change_id} disappeared from frozen history"),
+            )
+        })?;
+        snapshot.changes.insert(*change_id, change.clone());
+        for parent in &change.parents {
+            if reachable.contains(parent) {
+                snapshot
+                    .change_children
+                    .entry(*parent)
+                    .or_default()
+                    .push(*change_id);
+            }
+        }
+    }
+    for children in snapshot.change_children.values_mut() {
+        children.sort_by_key(ToString::to_string);
+        children.dedup();
+    }
+    let evidence_branch = BranchName::new("release-evidence");
+    snapshot.branches.insert(
+        evidence_branch.clone(),
+        Branch {
+            name: evidence_branch,
+            head: *head,
+        },
+    );
+
+    // Verification runs, test cases, assertions, contracts, mock hints, and
+    // coverage mappings currently have no immutable source-change/manifest
+    // binding. Grafting their current values into a historical graph lets
+    // later tests change an older release's proof, security findings, graph
+    // root, and authority anchor. Fail closed: retain only relations already
+    // reconstructed by `resolve_graph_at(head)` from source-bound history and
+    // admit no current structural verification metadata until the model binds
+    // it to immutable source authority.
+
+    snapshot.actors = frozen_snapshot.actors.clone();
+    snapshot.approvals = frozen_snapshot
+        .approvals
+        .iter()
+        .filter(|approval| reachable.contains(&approval.change_id))
+        .cloned()
+        .collect();
+
+    let graph_root = kin_db::compute_graph_root_hash(&snapshot);
+    Ok((
+        kin_db::InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
+            snapshot, graph_root,
+        ),
+        graph_root,
+    ))
+}
+
+fn append_anchor_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(value);
+}
+
+fn release_evidence_anchor(
+    repo_id: &str,
+    source_change_id: &str,
+    source_manifest_hash: &str,
+    graph_root: [u8; 32],
+    release_check: &RepoReleaseCheckEvidence,
+    coverage: &RepoCoverageEvidence,
+    security: &RepoSecurityEvidence,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kin-release-evidence-v1\0");
+    append_anchor_field(&mut hasher, repo_id.as_bytes());
+    append_anchor_field(&mut hasher, source_change_id.as_bytes());
+    append_anchor_field(&mut hasher, source_manifest_hash.as_bytes());
+    append_anchor_field(&mut hasher, &graph_root);
+    hasher.update([u8::from(release_check.pass)]);
+    for blocker in &release_check.blockers {
+        append_anchor_field(&mut hasher, blocker.as_bytes());
+    }
+    hasher.update(
+        u64::try_from(coverage.total_entities)
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    hasher.update(
+        u64::try_from(coverage.covered_entities)
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    hasher.update(coverage.coverage_ratio.to_bits().to_le_bytes());
+    hasher.update(
+        u64::try_from(coverage.missing_proof_count)
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    hasher.update(
+        u64::try_from(security.finding_count)
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    hex::encode(hasher.finalize())
+}
+
+fn build_repo_release_evidence(
+    state: &DaemonState,
+    repo_id: &str,
+    source_change_id: kin_model::SemanticChangeId,
+    frozen_snapshot: kin_db::GraphSnapshot,
+) -> Result<RepoReleaseEvidenceResponse, (StatusCode, String)> {
+    let frozen_root = kin_db::compute_graph_root_hash(&frozen_snapshot);
+    let frozen_graph = kin_db::InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
+        frozen_snapshot.clone(),
+        frozen_root,
+    );
+    if frozen_graph
+        .get_change(&source_change_id)
+        .map_err(internal_error)?
+        .is_none()
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("semantic change {source_change_id} was not found in repo {repo_id}"),
+        ));
+    }
+
+    let source_tree = resolve_exact_source_tree(&frozen_graph, &source_change_id)?;
+    let source_entries = load_exact_source_entries(state, repo_id, source_tree)?;
+    let source_manifest = canonical_exact_source_manifest(&source_entries)?;
+    let source_manifest_hash = hex::encode(Sha256::digest(&source_manifest));
+
+    let (evidence_graph, evidence_root) =
+        release_evidence_graph_at(&frozen_graph, &frozen_snapshot, &source_change_id)?;
+    let coverage_summary = kin_review::source_bound_release_proof_coverage(&evidence_graph)
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("source-bound release proof scan failed: {error}"),
+            )
+        })?;
+    let mut unapproved =
+        kin_review::unapproved_changes(&evidence_graph, &source_change_id, usize::MAX).map_err(
+            |error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("source-bound release approval scan failed: {error}"),
+                )
+            },
+        )?;
+    unapproved.sort_by_key(|change| change.change_id.to_string());
+
+    let mut blockers = Vec::new();
+    if !coverage_summary.missing_proof.is_empty() {
+        blockers.push(format!(
+            "{} entities missing test proof",
+            coverage_summary.missing_proof.len()
+        ));
+    }
+    if !unapproved.is_empty() {
+        let detail = unapproved
+            .iter()
+            .map(|change| format!("{} ({})", change.change_id, change.author))
+            .collect::<Vec<_>>()
+            .join(", ");
+        blockers.push(format!(
+            "{} non-root change(s) lack human approval: {detail}",
+            unapproved.len()
+        ));
+    }
+    let release_check = RepoReleaseCheckEvidence {
+        pass: blockers.is_empty(),
+        blockers,
+    };
+    let coverage = RepoCoverageEvidence {
+        total_entities: coverage_summary.total_entities,
+        covered_entities: coverage_summary.covered_entities,
+        coverage_ratio: coverage_summary.coverage_ratio,
+        missing_proof_count: coverage_summary.missing_proof.len(),
+    };
+    let security = RepoSecurityEvidence {
+        finding_count: kin_review::security_findings(&evidence_graph, true)
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("source-bound security scan failed: {error}"),
+                )
+            })?
+            .len(),
+    };
+    let canonical_change = source_change_id.to_string();
+    let authority_anchor = release_evidence_anchor(
+        repo_id,
+        &canonical_change,
+        &source_manifest_hash,
+        evidence_root,
+        &release_check,
+        &coverage,
+        &security,
+    );
+
+    Ok(RepoReleaseEvidenceResponse {
+        source_change_id: canonical_change,
+        authority_anchor,
+        source_manifest_sha256: source_manifest_hash,
+        release_check,
+        coverage,
+        security,
+    })
+}
+
+/// GET /repos/{repo_id}/release/evidence/{source_change_id} — compute Kin's
+/// release, proof-coverage, and security gates against one immutable source
+/// change. The exact source manifest and historical graph root are bound into
+/// the returned authority anchor.
+async fn repo_release_evidence(
+    Path((repo_id, source_change_id)): Path<(String, String)>,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<Json<RepoReleaseEvidenceResponse>, (StatusCode, String)> {
+    // Evidence computes the same exact-source manifest as archive export and
+    // currently reads whole backend blobs. Share the process-wide singleton so
+    // an evidence request cannot multiply archive export's bounded peak RSS.
+    let archive_permit = try_acquire_exact_source_archive_slot(exact_source_archive_exports())?;
+    let requested_change = parse_exact_source_change_id(&source_change_id)?;
+    let graph = state
+        .get_repo_graph(&repo_id)
+        .await
+        .map_err(internal_error)?;
+    let frozen_snapshot = graph.to_snapshot();
+    let state_for_evidence = Arc::clone(&state);
+    let repo_for_evidence = repo_id.clone();
+    let evidence = tokio::task::spawn_blocking(move || {
+        let _archive_permit = archive_permit;
+        build_repo_release_evidence(
+            &state_for_evidence,
+            &repo_for_evidence,
+            requested_change,
+            frozen_snapshot,
+        )
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("source-bound release evidence worker failed: {error}"),
+        )
+    })??;
+    Ok(Json(evidence))
+}
+
 fn repo_name(state: &DaemonState) -> String {
     primary_repo_id(state)
 }
@@ -9546,6 +11024,891 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+
+    #[test]
+    fn bounded_archive_writer_rejects_before_crossing_limit() {
+        let mut writer = BoundedArchiveWriter::new(4);
+        writer.write_all(b"abc").unwrap();
+        let error = writer.write_all(b"de").unwrap_err();
+        assert!(error
+            .get_ref()
+            .is_some_and(|source| source.is::<ExactSourceArchiveLimitExceeded>()));
+        assert_eq!(writer.into_inner(), b"abc");
+    }
+
+    #[tokio::test]
+    async fn exact_source_archive_generation_is_single_flight_for_response_lifetime() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = try_acquire_exact_source_archive_slot(Arc::clone(&semaphore)).unwrap();
+        let mut body = exact_source_archive_body(vec![0_u8; 16], permit);
+        let error = try_acquire_exact_source_archive_slot(Arc::clone(&semaphore)).unwrap_err();
+        assert_eq!(error.0, StatusCode::TOO_MANY_REQUESTS);
+
+        // Hyper can drop an exhausted Body as soon as it has polled the data
+        // frame, while retaining the Bytes in its socket/write buffer. The
+        // frame owner—not merely the Body—must therefore keep admission.
+        let frame = std::future::poll_fn(|cx| {
+            http_body::Body::poll_frame(std::pin::Pin::new(&mut body), cx)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let data = frame.into_data().unwrap();
+        drop(body);
+        let error = try_acquire_exact_source_archive_slot(Arc::clone(&semaphore)).unwrap_err();
+        assert_eq!(error.0, StatusCode::TOO_MANY_REQUESTS);
+        drop(data);
+        assert!(try_acquire_exact_source_archive_slot(semaphore).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_archive_request_cannot_release_a_running_worker_permit() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = try_acquire_exact_source_archive_slot(Arc::clone(&semaphore)).unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let result = hold_exact_source_archive_permit(permit, || {
+                started_tx.send(()).unwrap();
+                resume_rx.blocking_recv().unwrap();
+                Ok::<_, ()>(())
+            });
+            drop(result);
+            done_tx.send(()).unwrap();
+        });
+        started_rx.await.unwrap();
+
+        // Dropping a request's JoinHandle does not abort spawn_blocking. The
+        // worker, not the request future, must therefore retain admission.
+        drop(worker);
+        let error = try_acquire_exact_source_archive_slot(Arc::clone(&semaphore)).unwrap_err();
+        assert_eq!(error.0, StatusCode::TOO_MANY_REQUESTS);
+
+        resume_tx.send(()).unwrap();
+        done_rx.await.unwrap();
+        assert!(try_acquire_exact_source_archive_slot(semaphore).is_ok());
+    }
+
+    #[test]
+    fn archive_and_evidence_use_the_same_process_wide_memory_slot() {
+        assert!(Arc::ptr_eq(
+            &exact_source_archive_exports(),
+            &exact_source_archive_exports()
+        ));
+    }
+
+    #[test]
+    fn exact_source_loader_fetches_and_retains_one_allocation_per_content_hash() {
+        let bytes = b"shared archive payload\n";
+        let digest: [u8; 32] = Sha256::digest(bytes).into();
+        let hash = Hash256::from_bytes(digest);
+        let tree = HashMap::from([
+            (
+                FilePathId::new("src/first.rs"),
+                ResolvedSourceEntry {
+                    hash,
+                    kind: SourceEntryKind::File { executable: false },
+                },
+            ),
+            (
+                FilePathId::new("src/second.rs"),
+                ResolvedSourceEntry {
+                    hash,
+                    kind: SourceEntryKind::File { executable: true },
+                },
+            ),
+        ]);
+        let mut loads = 0;
+        let entries = load_exact_source_entries_with(tree, |_, requested, max_bytes| {
+            loads += 1;
+            assert_eq!(requested, digest);
+            assert_eq!(max_bytes, EXACT_SOURCE_MAX_EXPANDED_BYTES as u64);
+            Ok(Some(bytes.to_vec()))
+        })
+        .unwrap();
+
+        assert_eq!(loads, 1);
+        let ExactSourceEntry::File { data: first, .. } = &entries[0] else {
+            panic!("expected regular source entry")
+        };
+        let ExactSourceEntry::File { data: second, .. } = &entries[1] else {
+            panic!("expected regular source entry")
+        };
+        assert!(Arc::ptr_eq(first, second));
+    }
+
+    #[test]
+    fn exact_source_loader_reduces_the_backend_limit_before_each_distinct_allocation() {
+        let first = b"first immutable payload\n";
+        let second = b"second immutable payload with a different length\n";
+        let first_digest: [u8; 32] = Sha256::digest(first).into();
+        let second_digest: [u8; 32] = Sha256::digest(second).into();
+        let tree = HashMap::from([
+            (
+                FilePathId::new("src/first.rs"),
+                ResolvedSourceEntry {
+                    hash: Hash256::from_bytes(first_digest),
+                    kind: SourceEntryKind::File { executable: false },
+                },
+            ),
+            (
+                FilePathId::new("src/second.rs"),
+                ResolvedSourceEntry {
+                    hash: Hash256::from_bytes(second_digest),
+                    kind: SourceEntryKind::File { executable: false },
+                },
+            ),
+        ]);
+        let mut expected = [
+            (first_digest, first.as_slice()),
+            (second_digest, second.as_slice()),
+        ];
+        expected.sort_by_key(|(digest, _)| *digest);
+        let mut observed = Vec::new();
+
+        load_exact_source_entries_with(tree, |_, requested, max_bytes| {
+            observed.push((requested, max_bytes));
+            let bytes = expected
+                .iter()
+                .find_map(|(digest, bytes)| (*digest == requested).then_some(*bytes))
+                .expect("the loader must request a tree-owned digest");
+            Ok(Some(bytes.to_vec()))
+        })
+        .unwrap();
+
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].0, expected[0].0);
+        assert_eq!(observed[0].1, EXACT_SOURCE_MAX_EXPANDED_BYTES as u64);
+        assert_eq!(observed[1].0, expected[1].0);
+        assert_eq!(
+            observed[1].1,
+            EXACT_SOURCE_MAX_EXPANDED_BYTES as u64 - expected[0].1.len() as u64
+        );
+    }
+
+    #[test]
+    fn historical_release_evidence_omits_unbound_later_verification_runs() {
+        use kin_model::VerificationStore;
+
+        let graph = kin_db::InMemoryGraph::new();
+        let root = kin_core::build_genesis_change();
+        graph.create_change(&root).unwrap();
+        let entity = test_entity("source_bound", "src/lib.rs");
+        let mut source_change = root.clone();
+        source_change.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x85; 32]));
+        source_change.parents = vec![root.id];
+        source_change.message = "historical source".to_string();
+        source_change.entity_deltas = vec![kin_model::EntityDelta::Added(entity.clone())];
+        graph.create_change(&source_change).unwrap();
+        graph.upsert_entity(&entity).unwrap();
+
+        let run = kin_model::VerificationRun {
+            run_id: kin_model::VerificationRunId::new(),
+            test_ids: vec![],
+            status: kin_model::VerificationStatus::Passing,
+            runner: kin_model::TestRunner::Cargo,
+            started_at: Timestamp::now(),
+            finished_at: Some(Timestamp::now()),
+            duration_ms: Some(1),
+            evidence_blob: None,
+            exit_code: Some(0),
+        };
+        graph.create_verification_run(&run).unwrap();
+        graph
+            .link_run_proves_entity(&run.run_id, &entity.id)
+            .unwrap();
+        assert_eq!(
+            kin_review::passing_proof_coverage(&graph)
+                .unwrap()
+                .covered_entities,
+            1,
+            "the current unbound run is a false-green without historical filtering"
+        );
+
+        let snapshot = graph.to_snapshot();
+        let (historical, _) =
+            release_evidence_graph_at(&graph, &snapshot, &source_change.id).unwrap();
+        let coverage = kin_review::passing_proof_coverage(&historical).unwrap();
+        assert_eq!(coverage.total_entities, 1);
+        assert_eq!(coverage.covered_entities, 0);
+        assert_eq!(coverage.missing_proof, vec![entity.id]);
+    }
+
+    #[test]
+    fn later_unbound_tests_cannot_rewrite_historical_security_or_anchor() {
+        use kin_model::{EntityStore, VerificationStore};
+
+        let graph = kin_db::InMemoryGraph::new();
+        let root = kin_core::build_genesis_change();
+        graph.create_change(&root).unwrap();
+        let mut entity = test_entity("historical_endpoint", "src/api.rs");
+        entity.kind = EntityKind::ApiEndpoint;
+        let mut source_change = root.clone();
+        source_change.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x86; 32]));
+        source_change.parents = vec![root.id];
+        source_change.message = "historical endpoint source".to_string();
+        source_change.entity_deltas = vec![kin_model::EntityDelta::Added(entity.clone())];
+        graph.create_change(&source_change).unwrap();
+        graph.upsert_entity(&entity).unwrap();
+
+        let before_snapshot = graph.to_snapshot();
+        let (before_graph, before_root) =
+            release_evidence_graph_at(&graph, &before_snapshot, &source_change.id).unwrap();
+        let before_security_count = kin_review::security_findings(&before_graph, true)
+            .unwrap()
+            .len();
+        assert!(before_security_count > 0);
+
+        let release_check = RepoReleaseCheckEvidence {
+            pass: false,
+            blockers: vec!["fixed historical blocker".to_string()],
+        };
+        let coverage = RepoCoverageEvidence {
+            total_entities: 1,
+            covered_entities: 0,
+            coverage_ratio: 0.0,
+            missing_proof_count: 1,
+        };
+        let before_security = RepoSecurityEvidence {
+            finding_count: before_security_count,
+        };
+        let before_anchor = release_evidence_anchor(
+            "repo",
+            &source_change.id.to_string(),
+            "fixed-manifest",
+            before_root,
+            &release_check,
+            &coverage,
+            &before_security,
+        );
+
+        let test = kin_model::TestCase {
+            test_id: kin_model::TestId::new(),
+            name: "later_endpoint_test".to_string(),
+            language: "rust".to_string(),
+            kind: kin_model::TestKind::Unit,
+            scopes: vec![kin_model::WorkScope::Entity(entity.id)],
+            runner: kin_model::TestRunner::Cargo,
+            file_origin: Some(FilePathId::new("tests/later.rs")),
+        };
+        graph.create_test_case(&test).unwrap();
+        graph
+            .create_assertion(&kin_model::Assertion {
+                assertion_id: kin_model::AssertionId::new(),
+                summary: "later assertion".to_string(),
+                expected_behavior: "later behavior".to_string(),
+                target_scope: kin_model::WorkScope::Entity(entity.id),
+            })
+            .unwrap();
+        graph
+            .create_contract(&kin_model::Contract {
+                id: EntityId::new(),
+                kind: kin_model::ContractKind::OpenApi,
+                name: "later contract".to_string(),
+                schema_hash: Hash256::from_bytes([0x87; 32]),
+                producers: vec![entity.id],
+                consumers: vec![],
+                version: None,
+            })
+            .unwrap();
+        graph
+            .create_mock_hint(&kin_model::MockHint {
+                hint_id: kin_model::MockHintId::new(),
+                test_id: test.test_id,
+                dependency_scope: kin_model::WorkScope::Entity(entity.id),
+                strategy: kin_model::MockStrategy::Stub,
+            })
+            .unwrap();
+        graph
+            .upsert_relation(&kin_model::Relation {
+                id: kin_model::RelationId::new(),
+                kind: RelationKind::Tests,
+                // The release scanner's entity relation API currently admits
+                // only entity-to-entity edges. This uncommitted overlay edge
+                // has the exact shape that the former historical graft copied
+                // and that can false-green `untested-api`.
+                src: GraphNodeId::Entity(entity.id),
+                dst: GraphNodeId::Entity(entity.id),
+                confidence: 1.0,
+                origin: kin_model::RelationOrigin::Inferred,
+                created_in: None,
+                import_source: None,
+                evidence: vec![],
+            })
+            .unwrap();
+        assert!(
+            kin_review::security_findings(&graph, true).unwrap().len() < before_security_count,
+            "the later unbound Tests relation must demonstrate the false-green current graph"
+        );
+
+        let mut after_snapshot = graph.to_snapshot();
+        after_snapshot
+            .test_covers_entity
+            .push((test.test_id, entity.id));
+        assert!(!after_snapshot.test_cases.is_empty());
+        assert!(!after_snapshot.assertions.is_empty());
+        assert!(!after_snapshot.contracts.is_empty());
+        assert!(!after_snapshot.mock_hints.is_empty());
+        assert!(!after_snapshot.test_covers_entity.is_empty());
+        assert!(after_snapshot
+            .relations
+            .values()
+            .any(|relation| matches!(relation.kind, RelationKind::Tests | RelationKind::Covers)));
+
+        let after_snapshot_root = kin_db::compute_graph_root_hash(&after_snapshot);
+        let after_frozen = kin_db::InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
+            after_snapshot.clone(),
+            after_snapshot_root,
+        );
+        let (after_graph, after_root) =
+            release_evidence_graph_at(&after_frozen, &after_snapshot, &source_change.id).unwrap();
+        let historical_snapshot = after_graph.to_snapshot();
+        assert!(historical_snapshot.test_cases.is_empty());
+        assert!(historical_snapshot.assertions.is_empty());
+        assert!(historical_snapshot.contracts.is_empty());
+        assert!(historical_snapshot.mock_hints.is_empty());
+        assert!(historical_snapshot.test_covers_entity.is_empty());
+        assert!(!historical_snapshot
+            .relations
+            .values()
+            .any(|relation| matches!(relation.kind, RelationKind::Tests | RelationKind::Covers)));
+
+        let after_security_count = kin_review::security_findings(&after_graph, true)
+            .unwrap()
+            .len();
+        let after_security = RepoSecurityEvidence {
+            finding_count: after_security_count,
+        };
+        let after_anchor = release_evidence_anchor(
+            "repo",
+            &source_change.id.to_string(),
+            "fixed-manifest",
+            after_root,
+            &release_check,
+            &coverage,
+            &after_security,
+        );
+
+        assert_eq!(after_security_count, before_security_count);
+        assert_eq!(after_root, before_root);
+        assert_eq!(after_anchor, before_anchor);
+    }
+
+    #[test]
+    fn exact_source_archive_is_deterministic_mode_faithful_and_manifest_bound() {
+        use std::io::Read;
+
+        let entries = vec![
+            ExactSourceEntry::File {
+                path: "README.md".to_string(),
+                data: b"Kin\n".to_vec().into(),
+                executable: false,
+            },
+            ExactSourceEntry::Symlink {
+                path: "current".to_string(),
+                target: "bin/run".to_string().into(),
+            },
+            ExactSourceEntry::File {
+                path: "bin/run".to_string(),
+                data: b"#!/bin/sh\n".to_vec().into(),
+                executable: true,
+            },
+        ];
+        let (first, first_manifest_hash) = build_exact_source_tar_gz(entries.clone()).unwrap();
+        let (second, second_manifest_hash) = build_exact_source_tar_gz(entries.clone()).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first_manifest_hash, second_manifest_hash);
+
+        let manifest = canonical_exact_source_manifest(&entries).unwrap();
+        assert_eq!(first_manifest_hash, hex::encode(Sha256::digest(&manifest)));
+
+        let decoder = flate2::read::GzDecoder::new(first.as_slice());
+        let mut archive = tar::Archive::new(decoder);
+        let mut observed = Vec::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().into_owned();
+            let kind = entry.header().entry_type();
+            let mode = entry.header().mode().unwrap();
+            let link = entry
+                .link_name()
+                .unwrap()
+                .map(|target| target.to_string_lossy().into_owned());
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data).unwrap();
+            observed.push((path, kind, mode, link, data));
+        }
+
+        assert_eq!(observed.len(), 4);
+        assert_eq!(observed[0].0, "kin-source/");
+        assert!(observed[0].1.is_dir());
+        assert_eq!(observed[1].0, "kin-source/README.md");
+        assert!(observed[1].1.is_file());
+        assert_eq!(observed[1].2, 0o644);
+        assert_eq!(observed[1].4, b"Kin\n");
+        assert_eq!(observed[2].0, "kin-source/bin/run");
+        assert!(observed[2].1.is_file());
+        assert_eq!(observed[2].2, 0o755);
+        assert_eq!(observed[2].4, b"#!/bin/sh\n");
+        assert_eq!(observed[3].0, "kin-source/current");
+        assert!(observed[3].1.is_symlink());
+        assert_eq!(observed[3].2, 0o777);
+        assert_eq!(observed[3].3.as_deref(), Some("bin/run"));
+
+        let mut mutated = entries;
+        if let ExactSourceEntry::File { data, .. } = &mut mutated[0] {
+            Arc::make_mut(data)[0] = b'!';
+        }
+        let (_, mutated_manifest_hash) = build_exact_source_tar_gz(mutated).unwrap();
+        assert_ne!(first_manifest_hash, mutated_manifest_hash);
+    }
+
+    #[test]
+    fn exact_source_manifest_is_order_independent_and_rejects_conflicts() {
+        let first = ExactSourceEntry::File {
+            path: "z.txt".to_string(),
+            data: b"z".to_vec().into(),
+            executable: false,
+        };
+        let second = ExactSourceEntry::File {
+            path: "a.txt".to_string(),
+            data: b"a".to_vec().into(),
+            executable: false,
+        };
+        assert_eq!(
+            canonical_exact_source_manifest(&[first.clone(), second.clone()]).unwrap(),
+            canonical_exact_source_manifest(&[second, first]).unwrap()
+        );
+
+        let conflict = canonical_exact_source_manifest(&[
+            ExactSourceEntry::File {
+                path: "src".to_string(),
+                data: Vec::new().into(),
+                executable: false,
+            },
+            ExactSourceEntry::File {
+                path: "src/lib.rs".to_string(),
+                data: Vec::new().into(),
+                executable: false,
+            },
+        ])
+        .unwrap_err();
+        assert_eq!(conflict.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(conflict.1.contains("conflicting"));
+    }
+
+    #[test]
+    fn exact_source_manifest_rejects_cross_platform_path_aliases() {
+        for (first, second) in [
+            ("src/Foo.rs", "src/foo.rs"),
+            ("src/caf\u{e9}.rs", "src/cafe\u{301}.rs"),
+        ] {
+            let error = canonical_exact_source_manifest(&[
+                ExactSourceEntry::File {
+                    path: first.to_string(),
+                    data: b"first".to_vec().into(),
+                    executable: false,
+                },
+                ExactSourceEntry::File {
+                    path: second.to_string(),
+                    data: b"second".to_vec().into(),
+                    executable: false,
+                },
+            ])
+            .expect_err("portable archives must reject paths that alias on Windows or macOS");
+            assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(error.1.contains("conflicting or unportable"));
+        }
+    }
+
+    #[test]
+    fn exact_source_manifest_rejects_newline_bearing_fields_for_portability() {
+        for entries in [
+            vec![ExactSourceEntry::Symlink {
+                path: "line\nbreak".to_string(),
+                target: "ordinary".to_string().into(),
+            }],
+            vec![ExactSourceEntry::Symlink {
+                path: "link".to_string(),
+                target: "line\nbreak".to_string().into(),
+            }],
+        ] {
+            let error = canonical_exact_source_manifest(&entries)
+                .expect_err("portable archives must reject control characters");
+            assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    #[test]
+    fn exact_source_paths_and_symlinks_fail_closed() {
+        for path in [
+            "",
+            "/etc/passwd",
+            "../secret",
+            "src\\lib.rs",
+            ".git/config",
+            ".GiT/config",
+            ".kin/config.toml",
+            ".KIN/config.toml",
+            "nested/.kin/graph.kndb",
+            "nested/.KiN/graph.kndb",
+            ".kin-session/base.json",
+            ".KIN-SESSION/base.json",
+            "nested/.kin-session/base.json",
+            "nested/.KiN-SeSsIoN/base.json",
+            "NUL",
+            "src/COM1.rs",
+            "src/trailing.",
+            "src/trailing ",
+            "src/alternate:stream",
+        ] {
+            assert!(
+                validate_exact_source_path(path).is_err(),
+                "accepted {path:?}"
+            );
+        }
+        assert!(validate_exact_source_symlink("dir/link", "../../secret").is_err());
+        assert!(validate_exact_source_symlink("link", "/etc/passwd").is_err());
+        assert!(validate_exact_source_symlink("dir/link", "../.kin-session/base.json").is_err());
+        assert!(validate_exact_source_symlink("dir/link", "../.KiN-SeSsIoN/base.json").is_err());
+        assert!(validate_exact_source_symlink("dir/link", "../README.md").is_ok());
+    }
+
+    fn exact_source_backend_state(repo_id: &str) -> Arc<DaemonState> {
+        install_test_registry_override();
+        let directory =
+            std::env::temp_dir().join(format!("kin-daemon-exact-source-{}", uuid::Uuid::new_v4()));
+        let kin_dir = directory.join(".kin");
+        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
+        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
+        let layout = kin_core::KinLayout::new(kin_dir);
+        kin_core::manifest::KinManifest::new()
+            .save(&layout.manifest_path())
+            .unwrap();
+        let backend = directory.join("backend");
+        std::fs::create_dir_all(&backend).unwrap();
+        Arc::new(
+            DaemonState::open_with_backend(
+                layout,
+                Box::new(kin_db::LocalFileBackend::new(backend)),
+                repo_id,
+                None,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn exact_source_delta(
+        state: &DaemonState,
+        path: &str,
+        kind: ArtifactDeltaKind,
+        old_hash: Option<Hash256>,
+        data: &[u8],
+    ) -> ArtifactDelta {
+        let blob_hash = state.blobs.write(data).unwrap();
+        ArtifactDelta {
+            file_id: FilePathId::new(path),
+            kind,
+            old_hash,
+            new_hash: Some(blob_hash),
+        }
+    }
+
+    fn install_two_change_exact_source_history(
+        state: &DaemonState,
+    ) -> (SemanticChangeId, SemanticChangeId) {
+        let branch_name = BranchName::new("main");
+        let old_readme = state.blobs.write(b"old source\n").unwrap();
+        let first_entity = test_entity("first_source_entity", "src/first.rs");
+        state.graph.upsert_entity(&first_entity).unwrap();
+        let first = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([81; 32])),
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("human-test"),
+            message: "first exact source".to_string(),
+            entity_deltas: vec![EntityDelta::Added(first_entity)],
+            relation_deltas: vec![],
+            artifact_deltas: vec![
+                ArtifactDelta {
+                    file_id: FilePathId::new("README.md"),
+                    kind: ArtifactDeltaKind::AddedRegularFile,
+                    old_hash: None,
+                    new_hash: Some(old_readme),
+                },
+                exact_source_delta(
+                    state,
+                    "bin/run",
+                    ArtifactDeltaKind::AddedExecutableFile,
+                    None,
+                    b"#!/bin/sh\necho old\n",
+                ),
+                exact_source_delta(
+                    state,
+                    "current",
+                    ArtifactDeltaKind::AddedSymlink,
+                    None,
+                    b"bin/run",
+                ),
+            ],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(branch_name.clone()),
+        };
+        state.graph.create_change(&first).unwrap();
+        state
+            .graph
+            .create_branch(&Branch {
+                name: branch_name.clone(),
+                head: first.id,
+            })
+            .unwrap();
+
+        let second_entity = test_entity("second_source_entity", "src/second.rs");
+        state.graph.upsert_entity(&second_entity).unwrap();
+        let second = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([82; 32])),
+            parents: vec![first.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("human-test"),
+            message: "newer exact source".to_string(),
+            entity_deltas: vec![EntityDelta::Added(second_entity)],
+            relation_deltas: vec![],
+            artifact_deltas: vec![exact_source_delta(
+                state,
+                "README.md",
+                ArtifactDeltaKind::ModifiedRegularFile,
+                Some(old_readme),
+                b"new source\n",
+            )],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(branch_name.clone()),
+        };
+        state.graph.create_change(&second).unwrap();
+        state
+            .graph
+            .update_branch_head(&branch_name, &second.id)
+            .unwrap();
+        state.save_snapshot_full().unwrap();
+        (first.id, second.id)
+    }
+
+    async fn exact_source_get(
+        app: Router,
+        path: String,
+        authenticated: bool,
+    ) -> axum::response::Response {
+        let mut request = Request::get(path);
+        if authenticated {
+            request = request.header(header::AUTHORIZATION, "Bearer exact-source-token");
+        }
+        app.oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    fn read_exact_source_tar_entry(
+        archive: &[u8],
+        wanted: &str,
+    ) -> (u32, bool, Option<String>, Vec<u8>) {
+        use std::io::Read;
+
+        let decoder = flate2::read::GzDecoder::new(archive);
+        let mut archive = tar::Archive::new(decoder);
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().as_ref() != FsPath::new(wanted) {
+                continue;
+            }
+            let mode = entry.header().mode().unwrap();
+            let is_symlink = entry.header().entry_type().is_symlink();
+            let link = entry
+                .link_name()
+                .unwrap()
+                .map(|target| target.to_string_lossy().into_owned());
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data).unwrap();
+            return (mode, is_symlink, link, data);
+        }
+        panic!("archive entry {wanted:?} was not found")
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn exact_source_routes_are_authenticated_historical_and_file_independent() {
+        let repo_id = "exact-route-repo";
+        let state = exact_source_backend_state(repo_id);
+        let (old_change, new_change) = install_two_change_exact_source_history(&state);
+        let app = router_with_auth(Arc::clone(&state), Some("exact-source-token".to_string()));
+        let old_path = format!("/repos/{repo_id}/archive/tar/{old_change}");
+
+        let rejected = exact_source_get(app.clone(), old_path.clone(), false).await;
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+        let old_response = exact_source_get(app.clone(), old_path.clone(), true).await;
+        assert_eq!(old_response.status(), StatusCode::OK);
+        assert_eq!(
+            old_response.headers()["x-kin-source-change-id"],
+            old_change.to_string()
+        );
+        let old_manifest = old_response.headers()["x-kin-source-manifest-sha256"].clone();
+        let old_archive_frame = axum::body::to_bytes(old_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        // Tower's in-process transport hands the server-owned Bytes directly
+        // to the test client. Copy into client-owned storage and release that
+        // server allocation, matching a real network write completing.
+        let old_archive = old_archive_frame.to_vec();
+        drop(old_archive_frame);
+        assert_eq!(
+            read_exact_source_tar_entry(&old_archive, "kin-source/README.md"),
+            (0o644, false, None, b"old source\n".to_vec())
+        );
+        assert_eq!(
+            read_exact_source_tar_entry(&old_archive, "kin-source/bin/run"),
+            (0o755, false, None, b"#!/bin/sh\necho old\n".to_vec())
+        );
+        assert_eq!(
+            read_exact_source_tar_entry(&old_archive, "kin-source/current"),
+            (0o777, true, Some("bin/run".to_string()), Vec::new())
+        );
+
+        // A newer branch head and a decoy working-tree file cannot change the
+        // bytes returned for the explicitly requested historical source ID.
+        std::fs::write(state.layout.working_dir().join("README.md"), b"raw decoy\n").unwrap();
+        let repeated = exact_source_get(app.clone(), old_path, true).await;
+        assert_eq!(repeated.status(), StatusCode::OK);
+        assert_eq!(
+            repeated.headers()["x-kin-source-manifest-sha256"],
+            old_manifest
+        );
+        let repeated_archive_frame = axum::body::to_bytes(repeated.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let repeated_archive = repeated_archive_frame.to_vec();
+        drop(repeated_archive_frame);
+        assert_eq!(old_archive, repeated_archive);
+
+        let new_response = exact_source_get(
+            app.clone(),
+            format!("/repos/{repo_id}/archive/tar/{new_change}"),
+            true,
+        )
+        .await;
+        assert_eq!(new_response.status(), StatusCode::OK);
+        let new_manifest = new_response.headers()["x-kin-source-manifest-sha256"].clone();
+        assert_ne!(old_manifest, new_manifest);
+        let new_archive_frame = axum::body::to_bytes(new_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let new_archive = new_archive_frame.to_vec();
+        drop(new_archive_frame);
+        assert_eq!(
+            read_exact_source_tar_entry(&new_archive, "kin-source/README.md").3,
+            b"new source\n"
+        );
+
+        let old_evidence = exact_source_get(
+            app.clone(),
+            format!("/repos/{repo_id}/release/evidence/{old_change}"),
+            true,
+        )
+        .await;
+        assert_eq!(old_evidence.status(), StatusCode::OK);
+        let old_evidence: RepoReleaseEvidenceResponse = serde_json::from_slice(
+            &axum::body::to_bytes(old_evidence.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let new_evidence = exact_source_get(
+            app,
+            format!("/repos/{repo_id}/release/evidence/{new_change}"),
+            true,
+        )
+        .await;
+        assert_eq!(new_evidence.status(), StatusCode::OK);
+        let new_evidence: RepoReleaseEvidenceResponse = serde_json::from_slice(
+            &axum::body::to_bytes(new_evidence.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(old_evidence.source_change_id, old_change.to_string());
+        assert_eq!(new_evidence.source_change_id, new_change.to_string());
+        assert_eq!(old_evidence.coverage.total_entities, 1);
+        assert_eq!(new_evidence.coverage.total_entities, 2);
+        assert_eq!(old_evidence.coverage.missing_proof_count, 1);
+        assert_eq!(new_evidence.coverage.missing_proof_count, 2);
+        assert_ne!(old_evidence.authority_anchor, new_evidence.authority_anchor);
+        assert_eq!(
+            old_evidence.source_manifest_sha256,
+            old_manifest.to_str().unwrap()
+        );
+        assert_eq!(
+            new_evidence.source_manifest_sha256,
+            new_manifest.to_str().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn exact_source_archive_fails_closed_on_legacy_mode_gap() {
+        let repo_id = "legacy-source-gap";
+        let state = exact_source_backend_state(repo_id);
+        let content = state.blobs.write(b"local compatibility bytes\n").unwrap();
+        let change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([83; 32])),
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("human-test"),
+            message: "legacy source".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![ArtifactDelta {
+                file_id: FilePathId::new("legacy.txt"),
+                kind: ArtifactDeltaKind::Added,
+                old_hash: None,
+                new_hash: Some(content),
+            }],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+        state.graph.create_change(&change).unwrap();
+        state.save_snapshot_full().unwrap();
+        std::fs::write(
+            state.layout.working_dir().join("legacy.txt"),
+            b"filesystem fallback must not be served\n",
+        )
+        .unwrap();
+
+        let response = exact_source_get(
+            router_with_auth(state, Some("exact-source-token".to_string())),
+            format!("/repos/{repo_id}/archive/tar/{}", change.id),
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("exact source history is incomplete"));
+        assert!(body.contains("no fallback was attempted"));
+    }
 
     /// Dispatching the prepare must leave the async worker schedulable.
     ///
@@ -10123,12 +12486,13 @@ mod tests {
     }
     use axum::routing::get as axum_get;
     use kin_model::{
-        AgentSession, AnnotationFilter, ArtifactDelta, ArtifactDeltaKind, AuthorId, Branch,
-        BranchName, Entity, EntityDelta, EntityId, EntityKind, EntityRole, FilePathId,
-        FingerprintAlgorithm, Hash256, IdentityRef, ImportSection, IntentScope, LanguageId,
-        Priority, SemanticChange, SemanticChangeId, SemanticFingerprint, SourceRegion, SourceSpan,
-        TestCase, TestKind, TestRunner, Timestamp, Visibility, WorkItem, WorkKind, WorkScope,
-        WorkStatus, WorkStore,
+        Actor, ActorId, ActorKind, AgentSession, AnnotationFilter, Approval, ApprovalDecision,
+        ApprovalId, ArtifactDelta, ArtifactDeltaKind, AuditEventId, AuthorId, Branch, BranchName,
+        Entity, EntityDelta, EntityId, EntityKind, EntityRole, FilePathId, FingerprintAlgorithm,
+        Hash256, IdentityRef, ImportSection, IntentScope, LanguageId, Priority, RelationKind,
+        SemanticChange, SemanticChangeId, SemanticFingerprint, SourceRegion, SourceSpan, TestCase,
+        TestKind, TestRunner, Timestamp, Visibility, WorkItem, WorkKind, WorkScope, WorkStatus,
+        WorkStore,
     };
     use kin_model::{ReviewStore, VerificationStore};
     use kin_registry::Ecosystem;
@@ -10203,6 +12567,14 @@ mod tests {
     /// Create a real Git commit outside graph truth. A ref query against the
     /// returned oid must therefore take the daemon's cold hydration path.
     fn setup_daemon_hydration_fixture(state: &DaemonState) -> String {
+        // `is_initialized = true` means the canonical Kin boundary root is
+        // already durable in production. Keep the synthetic daemon fixture
+        // faithful to that invariant so strict temporal traversal does not
+        // mistake its intentionally bare test graph for a valid repository.
+        let genesis = kin_core::build_genesis_change();
+        if state.graph.get_change(&genesis.id).unwrap().is_none() {
+            state.graph.create_change(&genesis).unwrap();
+        }
         let repo = state.layout.working_dir();
         std::fs::create_dir_all(repo.join("src")).unwrap();
         std::fs::write(
@@ -10351,6 +12723,198 @@ mod tests {
             })
             .unwrap();
         kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
+    }
+
+    fn install_release_test_branch(state: &Arc<DaemonState>) -> SemanticChangeId {
+        let genesis = kin_core::build_genesis_change();
+        state.graph.create_change(&genesis).unwrap();
+        state
+            .graph
+            .create_branch(&Branch {
+                name: BranchName::new("main"),
+                head: genesis.id,
+            })
+            .unwrap();
+        genesis.id
+    }
+
+    fn install_release_entity_head(
+        state: &Arc<DaemonState>,
+        entity: &Entity,
+        id_byte: u8,
+    ) -> SemanticChange {
+        let genesis = kin_core::build_genesis_change();
+        state.graph.create_change(&genesis).unwrap();
+        let change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
+            parents: vec![genesis.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("agent-test"),
+            message: "add release entity".to_string(),
+            entity_deltas: vec![EntityDelta::Added(entity.clone())],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(BranchName::new("main")),
+        };
+        state.graph.upsert_entity(entity).unwrap();
+        state.graph.create_change(&change).unwrap();
+        state
+            .graph
+            .create_branch(&Branch {
+                name: BranchName::new("main"),
+                head: change.id,
+            })
+            .unwrap();
+        change
+    }
+
+    fn release_test_change(parent: SemanticChangeId, id_byte: u8) -> SemanticChange {
+        release_test_change_with_count(parent, id_byte, 0)
+    }
+
+    fn release_test_change_with_count(
+        parent: SemanticChangeId,
+        id_byte: u8,
+        entity_count: usize,
+    ) -> SemanticChange {
+        SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
+            parents: vec![parent],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("kin-release"),
+            message: format!("release: test ({entity_count} entities snapshot)"),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(BranchName::new("main")),
+        }
+    }
+
+    fn release_test_payload(change: &SemanticChange) -> serde_json::Value {
+        serde_json::json!({
+            "change": change,
+            "branch_name": "main",
+            "release_policy": {
+                "force": true,
+                "require_proof": false,
+                "require_approval": false,
+            },
+        })
+    }
+
+    fn exact_source_test_change(
+        parent: SemanticChangeId,
+        id_byte: u8,
+        file_id: &str,
+        kind: ArtifactDeltaKind,
+        hash: Hash256,
+    ) -> SemanticChange {
+        SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
+            parents: vec![parent],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("exact-source-api-test"),
+            message: "exact source API fixture".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![ArtifactDelta {
+                file_id: FilePathId::new(file_id),
+                kind,
+                old_hash: None,
+                new_hash: Some(hash),
+            }],
+            projected_files: vec![FilePathId::new(file_id)],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(BranchName::new("main")),
+        }
+    }
+
+    fn install_source_test_head(state: &Arc<DaemonState>, change: &SemanticChange) {
+        state.graph.create_change(change).unwrap();
+        state
+            .graph
+            .update_branch_head(&BranchName::new("main"), &change.id)
+            .unwrap();
+    }
+
+    fn api_local_object_path(state: &DaemonState, hash: Hash256) -> PathBuf {
+        let encoded = hash.to_string();
+        state
+            .layout
+            .objects_dir()
+            .join(&encoded[..2])
+            .join(&encoded[2..])
+    }
+
+    fn install_exact_checkout_branches(
+        state: &Arc<DaemonState>,
+    ) -> (SemanticChange, SemanticChange) {
+        let genesis = kin_core::build_genesis_change();
+        state.graph.create_change(&genesis).unwrap();
+        let main_blob = state.blobs.write(b"main checkout bytes\n").unwrap();
+        let main = exact_source_test_change(
+            genesis.id,
+            0xbc,
+            "src/shared.rs",
+            ArtifactDeltaKind::AddedRegularFile,
+            Hash256::from_bytes(main_blob.0),
+        );
+        state.graph.create_change(&main).unwrap();
+        state
+            .graph
+            .create_branch(&Branch {
+                name: BranchName::new("main"),
+                head: main.id,
+            })
+            .unwrap();
+
+        let feature_blob = state.blobs.write(b"feature checkout bytes\n").unwrap();
+        let feature = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0xbd; 32])),
+            parents: vec![main.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("exact-checkout-api-test"),
+            message: "feature checkout fixture".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![ArtifactDelta {
+                file_id: FilePathId::new("src/shared.rs"),
+                kind: ArtifactDeltaKind::ModifiedRegularFile,
+                old_hash: main.artifact_deltas[0].new_hash,
+                new_hash: Some(Hash256::from_bytes(feature_blob.0)),
+            }],
+            projected_files: vec![FilePathId::new("src/shared.rs")],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(BranchName::new("feature")),
+        };
+        state.graph.create_change(&feature).unwrap();
+        state
+            .graph
+            .create_branch(&Branch {
+                name: BranchName::new("feature"),
+                head: feature.id,
+            })
+            .unwrap();
+        kin_core::write_current_branch(&state.layout, &BranchName::new("main")).unwrap();
+        std::fs::create_dir_all(state.layout.working_dir().join("src")).unwrap();
+        std::fs::write(
+            state.layout.working_dir().join("src/shared.rs"),
+            b"main checkout bytes\n",
+        )
+        .unwrap();
+        (main, feature)
     }
 
     fn advance_branch_with_file(
@@ -10637,6 +13201,1190 @@ mod tests {
         assert_eq!(refs.branch_name.as_deref(), Some("main"));
         assert_eq!(refs.head_ref.as_deref(), Some(change_id_string.as_str()));
         assert_eq!(state.graph.entity_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn graph_commit_rejects_same_id_with_different_payload_before_mutation() {
+        let state = test_state();
+        let mut existing = kin_core::build_genesis_change();
+        existing.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x84; 32]));
+        existing.message = "immutable original".to_string();
+        state.graph.create_change(&existing).unwrap();
+
+        let entity = test_entity("must_not_land", "src/lib.rs");
+        let mut conflicting = existing.clone();
+        conflicting.message = "conflicting replacement".to_string();
+        conflicting.entity_deltas = vec![kin_model::EntityDelta::Added(entity)];
+        let payload = serde_json::json!({
+            "change": conflicting,
+            "branch_name": "main",
+        });
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(state.graph.entity_count(), 0);
+        assert_eq!(
+            state
+                .graph
+                .get_change(&existing.id)
+                .unwrap()
+                .unwrap()
+                .message,
+            "immutable original"
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_commit_stale_parent_returns_409_before_any_mutation() {
+        let state = test_state();
+        let live_head = install_release_test_branch(&state);
+        let entity = test_entity("must_not_land", "src/stale.rs");
+        let candidate_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x91; 32]));
+        let candidate = SemanticChange {
+            id: candidate_id,
+            parents: vec![SemanticChangeId::from_hash(Hash256::from_bytes([0x90; 32]))],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("tester"),
+            message: "stale candidate".to_string(),
+            entity_deltas: vec![EntityDelta::Added(entity)],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(BranchName::new("main")),
+        };
+        let root_before = state.graph.compute_root_hash();
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "change": candidate, "branch_name": "main" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "stale_branch_head");
+        assert_eq!(json["mutation_applied"], false);
+        assert_eq!(json["change_materialized"], false);
+        assert_eq!(json["actual_head"], live_head.to_string());
+        assert!(state.graph.get_change(&candidate_id).unwrap().is_none());
+        assert_eq!(state.graph.entity_count(), 0);
+        assert_eq!(state.graph.compute_root_hash(), root_before);
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation_before
+        );
+
+        // The same stale response is not absence proof when the immutable
+        // change already exists but is detached from this branch.
+        state.graph.create_change(&candidate).unwrap();
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "change": candidate, "branch_name": "main" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "stale_branch_head");
+        assert_eq!(json["mutation_applied"], false);
+        assert_eq!(json["change_materialized"], true);
+    }
+
+    #[tokio::test]
+    async fn graph_commit_local_exact_source_preflight_is_atomic_and_accepts_valid_cas() {
+        let valid_state = test_state();
+        let valid_parent = install_release_test_branch(&valid_state);
+        let valid_blob = valid_state.blobs.write(b"verified source\n").unwrap();
+        let valid_change = exact_source_test_change(
+            valid_parent,
+            0xb0,
+            "src/lib.rs",
+            ArtifactDeltaKind::AddedRegularFile,
+            Hash256::from_bytes(valid_blob.0),
+        );
+        let valid_response = router(Arc::clone(&valid_state))
+            .oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "change": valid_change, "branch_name": "main" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(valid_response.status(), StatusCode::OK);
+        assert!(valid_state
+            .graph
+            .get_change(&valid_change.id)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            valid_state
+                .graph
+                .get_branch(&BranchName::new("main"))
+                .unwrap()
+                .unwrap()
+                .head,
+            valid_change.id
+        );
+
+        for case in ["missing", "corrupt", "unsafe_path", "unsafe_symlink"] {
+            let state = test_state();
+            let parent = install_release_test_branch(&state);
+            let (file_id, kind, hash) = match case {
+                "missing" => (
+                    "src/missing.rs",
+                    ArtifactDeltaKind::AddedRegularFile,
+                    Hash256::from_bytes(kin_blobs::digest_bytes(b"missing source")),
+                ),
+                "corrupt" => {
+                    let blob = state.blobs.write(b"expected source").unwrap();
+                    let hash = Hash256::from_bytes(blob.0);
+                    std::fs::write(api_local_object_path(&state, hash), b"corrupt source").unwrap();
+                    ("src/corrupt.rs", ArtifactDeltaKind::AddedRegularFile, hash)
+                }
+                "unsafe_path" => {
+                    let blob = state.blobs.write(b"control overwrite").unwrap();
+                    (
+                        ".kin/authority",
+                        ArtifactDeltaKind::AddedRegularFile,
+                        Hash256::from_bytes(blob.0),
+                    )
+                }
+                "unsafe_symlink" => {
+                    let blob = state.blobs.write(b"../../outside").unwrap();
+                    (
+                        "src/escape",
+                        ArtifactDeltaKind::AddedSymlink,
+                        Hash256::from_bytes(blob.0),
+                    )
+                }
+                _ => unreachable!(),
+            };
+            let change = exact_source_test_change(parent, 0xb1, file_id, kind, hash);
+            let root_before = state.graph.compute_root_hash();
+            let generation_before = state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst);
+
+            let response = router(Arc::clone(&state))
+                .oneshot(
+                    Request::post("/graph/commit")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({ "change": change, "branch_name": "main" }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{case} must fail exact-source admission"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&body).contains("exact source"),
+                "unexpected {case} response: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert!(state.graph.get_change(&change.id).unwrap().is_none());
+            assert_eq!(
+                state
+                    .graph
+                    .get_branch(&BranchName::new("main"))
+                    .unwrap()
+                    .unwrap()
+                    .head,
+                parent
+            );
+            assert_eq!(state.graph.compute_root_hash(), root_before);
+            assert_eq!(
+                state
+                    .snapshot_generation
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                generation_before
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn release_admission_rejects_nonexact_or_unmaterializable_source_tree_atomically() {
+        for case in [
+            "legacy_mode",
+            "missing",
+            "corrupt",
+            "unsafe_path",
+            "unsafe_symlink",
+        ] {
+            let state = test_state();
+            let parent = install_release_test_branch(&state);
+            let (file_id, kind, hash) = match case {
+                "legacy_mode" => (
+                    "src/legacy.rs",
+                    ArtifactDeltaKind::Added,
+                    Hash256::from_bytes(kin_blobs::digest_bytes(b"legacy source")),
+                ),
+                "missing" => (
+                    "src/missing.rs",
+                    ArtifactDeltaKind::AddedRegularFile,
+                    Hash256::from_bytes(kin_blobs::digest_bytes(b"missing source")),
+                ),
+                "corrupt" => {
+                    let blob = state.blobs.write(b"expected release source").unwrap();
+                    let hash = Hash256::from_bytes(blob.0);
+                    std::fs::write(api_local_object_path(&state, hash), b"corrupt source").unwrap();
+                    ("src/corrupt.rs", ArtifactDeltaKind::AddedRegularFile, hash)
+                }
+                "unsafe_path" => {
+                    let blob = state.blobs.write(b"control overwrite").unwrap();
+                    (
+                        ".kin/release",
+                        ArtifactDeltaKind::AddedRegularFile,
+                        Hash256::from_bytes(blob.0),
+                    )
+                }
+                "unsafe_symlink" => {
+                    let blob = state.blobs.write(b"../../outside").unwrap();
+                    (
+                        "src/escape",
+                        ArtifactDeltaKind::AddedSymlink,
+                        Hash256::from_bytes(blob.0),
+                    )
+                }
+                _ => unreachable!(),
+            };
+            let source = exact_source_test_change(parent, 0xb2, file_id, kind, hash);
+            install_source_test_head(&state, &source);
+            let release = release_test_change(source.id, 0xb3);
+            let root_before = state.graph.compute_root_hash();
+            let generation_before = state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst);
+
+            let response = router(Arc::clone(&state))
+                .oneshot(
+                    Request::post("/graph/commit")
+                        .header("content-type", "application/json")
+                        .body(Body::from(release_test_payload(&release).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::FAILED_DEPENDENCY,
+                "{case} release source must fail closed"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"], "release_source_not_exact");
+            assert_eq!(body["source_head"], source.id.to_string());
+            assert_eq!(body["mutation_applied"], false);
+            assert!(state.graph.get_change(&release.id).unwrap().is_none());
+            assert_eq!(
+                state
+                    .graph
+                    .get_branch(&BranchName::new("main"))
+                    .unwrap()
+                    .unwrap()
+                    .head,
+                source.id
+            );
+            assert_eq!(state.graph.compute_root_hash(), root_before);
+            assert_eq!(
+                state
+                    .snapshot_generation
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                generation_before
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn release_admission_accepts_materializable_exact_local_source_tree() {
+        let state = test_state();
+        let parent = install_release_test_branch(&state);
+        let blob = state.blobs.write(b"release exact source\n").unwrap();
+        let source = exact_source_test_change(
+            parent,
+            0xb4,
+            "src/release.rs",
+            ArtifactDeltaKind::AddedRegularFile,
+            Hash256::from_bytes(blob.0),
+        );
+        install_source_test_head(&state, &source);
+        let release = release_test_change(source.id, 0xb5);
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(release_test_payload(&release).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.graph.get_change(&release.id).unwrap().is_some());
+        assert_eq!(
+            state
+                .graph
+                .get_branch(&BranchName::new("main"))
+                .unwrap()
+                .unwrap()
+                .head,
+            release.id
+        );
+    }
+
+    #[tokio::test]
+    async fn release_admission_rejects_noncanonical_one_sided_markers() {
+        for case in ["author_only", "message_only"] {
+            let state = test_state();
+            let parent = install_release_test_branch(&state);
+            let mut candidate = release_test_change(parent, 0xb8);
+            match case {
+                "author_only" => candidate.message = "ordinary commit".to_string(),
+                "message_only" => candidate.author = AuthorId::new("ordinary-author"),
+                _ => unreachable!(),
+            }
+            let root_before = state.graph.compute_root_hash();
+
+            let response = router(Arc::clone(&state))
+                .oneshot(
+                    Request::post("/graph/commit")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({ "change": candidate, "branch_name": "main" }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{case}");
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"], "invalid_release_marker", "{case}");
+            assert_eq!(body["mutation_applied"], false, "{case}");
+            assert!(state.graph.get_change(&candidate.id).unwrap().is_none());
+            assert_eq!(state.graph.compute_root_hash(), root_before);
+        }
+    }
+
+    #[tokio::test]
+    async fn release_admission_rejects_marker_count_not_bound_to_source() {
+        let state = test_state();
+        let parent = install_release_test_branch(&state);
+        let mut candidate = release_test_change(parent, 0xb9);
+        candidate.message = "release: test (1 entities snapshot)".to_string();
+        let root_before = state.graph.compute_root_hash();
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(release_test_payload(&candidate).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "invalid_release_snapshot_count");
+        assert_eq!(body["marker_entity_count"], 1);
+        assert_eq!(body["source_entity_count"], 0);
+        assert_eq!(body["mutation_applied"], false);
+        assert!(state.graph.get_change(&candidate.id).unwrap().is_none());
+        assert_eq!(state.graph.compute_root_hash(), root_before);
+    }
+
+    #[tokio::test]
+    async fn release_admission_rejects_exact_file_directory_collision() {
+        let state = test_state();
+        let parent = install_release_test_branch(&state);
+        let file_hash = Hash256::from_bytes(state.blobs.write(b"file bytes").unwrap().0);
+        let child_hash = Hash256::from_bytes(state.blobs.write(b"child bytes").unwrap().0);
+        let mut source = exact_source_test_change(
+            parent,
+            0xb6,
+            "pkg",
+            ArtifactDeltaKind::AddedRegularFile,
+            file_hash,
+        );
+        source.artifact_deltas.push(ArtifactDelta {
+            file_id: FilePathId::new("pkg/lib.rs"),
+            kind: ArtifactDeltaKind::AddedRegularFile,
+            old_hash: None,
+            new_hash: Some(child_hash),
+        });
+        install_source_test_head(&state, &source);
+        let release = release_test_change(source.id, 0xb7);
+        let root_before = state.graph.compute_root_hash();
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(release_test_payload(&release).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
+        assert!(state.graph.get_change(&release.id).unwrap().is_none());
+        assert_eq!(
+            state
+                .graph
+                .get_branch(&BranchName::new("main"))
+                .unwrap()
+                .unwrap()
+                .head,
+            source.id
+        );
+        assert_eq!(state.graph.compute_root_hash(), root_before);
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation_before
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_release_observes_competing_head_and_returns_409() {
+        let state = test_state();
+        let original_head = install_release_test_branch(&state);
+        let release = release_test_change(original_head, 0x92);
+        let release_id = release.id;
+        let payload = release_test_payload(&release);
+
+        let guard = state.coordination_gate.lock().await;
+        let app = router(Arc::clone(&state));
+        let request = tokio::spawn(async move {
+            app.oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        });
+        tokio::task::yield_now().await;
+
+        let mut competing = kin_core::build_genesis_change();
+        competing.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x93; 32]));
+        competing.parents = vec![original_head];
+        competing.message = "competing branch advance".to_string();
+        state.graph.create_change(&competing).unwrap();
+        state
+            .graph
+            .update_branch_head(&BranchName::new("main"), &competing.id)
+            .unwrap();
+        drop(guard);
+
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "stale_branch_head");
+        assert_eq!(json["actual_head"], competing.id.to_string());
+        assert!(state.graph.get_change(&release_id).unwrap().is_none());
+        assert_eq!(
+            state
+                .graph
+                .get_branch(&BranchName::new("main"))
+                .unwrap()
+                .unwrap()
+                .head,
+            competing.id
+        );
+    }
+
+    #[tokio::test]
+    async fn live_overlay_deletion_cannot_make_strict_release_green() {
+        let state = test_state();
+        let entity = test_entity("historical_entity", "src/live.rs");
+        let source = install_release_entity_head(&state, &entity, 0x93);
+        let release = release_test_change_with_count(source.id, 0x94, 1);
+        let release_id = release.id;
+        let payload = json!({
+            "change": release,
+            "branch_name": "main",
+            "release_policy": {
+                "force": true,
+                "require_proof": true,
+                "require_approval": false,
+            },
+        });
+
+        let guard = state.coordination_gate.lock().await;
+        let app = router(Arc::clone(&state));
+        let request = tokio::spawn(async move {
+            app.oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        });
+        tokio::task::yield_now().await;
+
+        // This ambient/live deletion is not a semantic change and therefore
+        // cannot alter policy for the immutable release parent.
+        state.graph.remove_entity(&entity.id).unwrap();
+        drop(guard);
+
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "release_policy_failed");
+        assert_eq!(json["gate"], "proof");
+        assert_eq!(json["source_head"], source.id.to_string());
+        assert_eq!(
+            json["missing_proof"],
+            serde_json::json!([entity.id.to_string()])
+        );
+        assert!(state.graph.get_change(&release_id).unwrap().is_none());
+        assert_eq!(
+            state
+                .graph
+                .get_branch(&BranchName::new("main"))
+                .unwrap()
+                .unwrap()
+                .head,
+            source.id
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_stable_id_entity_cannot_reuse_an_unbound_old_run() {
+        let state = test_state();
+        let old = test_entity("stable_entity", "src/stable.rs");
+        let first = install_release_entity_head(&state, &old, 0xa0);
+
+        let old_run = kin_model::VerificationRun {
+            run_id: kin_model::VerificationRunId::new(),
+            test_ids: vec![],
+            status: kin_model::VerificationStatus::Passing,
+            runner: kin_model::TestRunner::Cargo,
+            started_at: Timestamp::now(),
+            finished_at: Some(Timestamp::now()),
+            duration_ms: Some(1),
+            evidence_blob: None,
+            exit_code: Some(0),
+        };
+        state.graph.create_verification_run(&old_run).unwrap();
+        state
+            .graph
+            .link_run_proves_entity(&old_run.run_id, &old.id)
+            .unwrap();
+
+        let mut changed = old.clone();
+        changed.signature = "def stable_entity(required)".to_string();
+        changed.fingerprint.signature_hash = Hash256::from_bytes([0x44; 32]);
+        let second = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0xa1; 32])),
+            parents: vec![first.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("agent-test"),
+            message: "change stable entity".to_string(),
+            entity_deltas: vec![EntityDelta::Modified {
+                old: old.clone(),
+                new: changed.clone(),
+            }],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(BranchName::new("main")),
+        };
+        state.graph.upsert_entity(&changed).unwrap();
+        state.graph.create_change(&second).unwrap();
+        state
+            .graph
+            .update_branch_head(&BranchName::new("main"), &second.id)
+            .unwrap();
+
+        let release = release_test_change_with_count(second.id, 0xa2, 1);
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "change": release,
+                            "branch_name": "main",
+                            "release_policy": {
+                                "force": true,
+                                "require_proof": true,
+                                "require_approval": false,
+                            },
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["gate"], "proof");
+        assert_eq!(json["source_head"], second.id.to_string());
+        assert_eq!(
+            json["missing_proof"],
+            serde_json::json!([changed.id.to_string()])
+        );
+    }
+
+    #[test]
+    fn release_approval_scope_keeps_reachable_and_rejects_unrelated_approvals() {
+        let state = test_state();
+        let entity = test_entity("approved_entity", "src/approved.rs");
+        let source = install_release_entity_head(&state, &entity, 0xa3);
+        let root = source.parents[0];
+        let approver = ActorId::from_hash(Hash256::from_bytes([0xa4; 32]));
+        state
+            .graph
+            .create_actor(&Actor {
+                actor_id: approver,
+                kind: ActorKind::Human,
+                display_name: "release reviewer".to_string(),
+                external_refs: vec![],
+            })
+            .unwrap();
+
+        let mut unrelated = kin_core::build_genesis_change();
+        unrelated.id = SemanticChangeId::from_hash(Hash256::from_bytes([0xa5; 32]));
+        unrelated.parents = vec![root];
+        unrelated.author = AuthorId::new("agent-unrelated");
+        unrelated.message = "unrelated change".to_string();
+        state.graph.create_change(&unrelated).unwrap();
+        state
+            .graph
+            .create_approval(&Approval {
+                approval_id: ApprovalId::new(),
+                change_id: unrelated.id,
+                approver,
+                decision: ApprovalDecision::Approved,
+                reason: "not authority for the release source".to_string(),
+                timestamp: Timestamp::now(),
+            })
+            .unwrap();
+
+        let policy = DaemonReleasePolicy {
+            force: true,
+            require_proof: false,
+            require_approval: true,
+        };
+        let error = enforce_daemon_release_policy(&state.graph, &source.id, 1, &policy)
+            .expect_err("an unrelated approval must not authorize the source history");
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        let body: serde_json::Value = serde_json::from_str(&error.1).unwrap();
+        assert_eq!(body["gate"], "approval");
+        assert_eq!(body["unapproved_changes"], json!([source.id.to_string()]));
+
+        state
+            .graph
+            .create_approval(&Approval {
+                approval_id: ApprovalId::new(),
+                change_id: source.id,
+                approver,
+                decision: ApprovalDecision::Approved,
+                reason: "reviewed immutable release source".to_string(),
+                timestamp: Timestamp::now(),
+            })
+            .unwrap();
+        enforce_daemon_release_policy(&state.graph, &source.id, 1, &policy)
+            .expect("the reachable human approval must satisfy the gate");
+    }
+
+    #[tokio::test]
+    async fn strict_release_retry_rechecks_parent_without_generation_or_event() {
+        let state = test_state();
+        let entity = test_entity("strict_retry", "src/retry.rs");
+        let source = install_release_entity_head(&state, &entity, 0xa6);
+        let release = release_test_change_with_count(source.id, 0xa7, 1);
+        let app = router(Arc::clone(&state));
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(release_test_payload(&release).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let generation = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let mut events = state.event_tx.subscribe();
+
+        let strict_retry = app
+            .oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "change": release,
+                            "branch_name": "main",
+                            "release_policy": {
+                                "force": true,
+                                "require_proof": true,
+                                "require_approval": false,
+                            },
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(strict_retry.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation,
+            "failed policy retry must not create a generation"
+        );
+        assert_eq!(
+            state
+                .graph
+                .get_branch(&BranchName::new("main"))
+                .unwrap()
+                .unwrap()
+                .head,
+            release.id
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_release_retry_is_idempotent() {
+        let state = test_state();
+        let head = install_release_test_branch(&state);
+        let release = release_test_change(head, 0x95);
+        let payload = release_test_payload(&release);
+        let app = router(Arc::clone(&state));
+
+        let mut committed_generation = None;
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/graph/commit")
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let generation = state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if let Some(committed_generation) = committed_generation {
+                assert_eq!(
+                    generation, committed_generation,
+                    "an already-finalized retry must not create another authority generation"
+                );
+            } else {
+                committed_generation = Some(generation);
+            }
+        }
+        assert_eq!(
+            state
+                .graph
+                .get_branch(&BranchName::new("main"))
+                .unwrap()
+                .unwrap()
+                .head,
+            release.id
+        );
+        let release_markers = state
+            .graph
+            .to_snapshot()
+            .changes
+            .values()
+            .filter(|change| change.author.to_string() == "kin-release")
+            .count();
+        assert_eq!(release_markers, 1, "retry created a second release marker");
+    }
+
+    #[tokio::test]
+    async fn exact_release_retry_reconciles_after_branch_advances() {
+        let state = test_state();
+        let head = install_release_test_branch(&state);
+        let release = release_test_change(head, 0x96);
+        let payload = release_test_payload(&release);
+        let app = router(Arc::clone(&state));
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let descendant = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x97; 32])),
+            parents: vec![release.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("later-human"),
+            message: "advance after release".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(BranchName::new("main")),
+        };
+        state.graph.create_change(&descendant).unwrap();
+        state
+            .graph
+            .update_branch_head(&BranchName::new("main"), &descendant.id)
+            .unwrap();
+
+        let retry = app
+            .oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+        assert_eq!(
+            state
+                .graph
+                .get_branch(&BranchName::new("main"))
+                .unwrap()
+                .unwrap()
+                .head,
+            descendant.id,
+            "reconciling an older release marker must not rewind the branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_commit_retry_persists_after_pre_authority_save_failure() {
+        let state = test_state();
+        let head = install_release_test_branch(&state);
+        let release = release_test_change(head, 0x9a);
+        let payload = release_test_payload(&release);
+        let app = router(Arc::clone(&state));
+        let mut events = state.event_tx.subscribe();
+        state.fail_next_snapshot_save_for_test();
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(first.into_body(), 4096).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("injected pre-authority snapshot save failure")
+        );
+        assert_eq!(
+            state
+                .graph
+                .get_branch(&BranchName::new("main"))
+                .unwrap()
+                .unwrap()
+                .head,
+            release.id,
+            "the failed request has already advanced in-memory authority"
+        );
+        assert!(state.graph.has_unpersisted_changes());
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        let retry = app
+            .oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+        assert!(!state.graph.has_unpersisted_changes());
+
+        let snapshot =
+            kin_db::SnapshotManager::open_read_only(state.layout.kindb_snapshot_path()).unwrap();
+        assert!(snapshot.graph().get_change(&release.id).unwrap().is_some());
+        assert_eq!(
+            snapshot
+                .graph()
+                .get_branch(&BranchName::new("main"))
+                .unwrap()
+                .unwrap()
+                .head,
+            release.id
+        );
+        match events.try_recv().expect("the durable retry must emit once") {
+            DaemonEvent::GraphRootChanged { new_root_hash, .. } => {
+                assert_eq!(new_root_hash, release.id.to_string())
+            }
+            other => panic!("retry emitted the wrong event: {other:?}"),
+        }
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn graph_commit_retry_finalizes_committed_generation_without_recommit() {
+        let state = test_state();
+        let head = install_release_test_branch(&state);
+        let release = release_test_change(head, 0x9b);
+        let payload = release_test_payload(&release);
+        let app = router(Arc::clone(&state));
+        let mut events = state.event_tx.subscribe();
+        state.fail_next_finalization_for_test();
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let committed_generation = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(committed_generation > kin_db::GENERATION_INIT);
+        assert_eq!(DaemonState::read_generation_marker(&state.layout), 0);
+        assert!(!state.graph.has_unpersisted_changes());
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        let retry = app
+            .oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            committed_generation,
+            "finalization retry must not recommit graph authority"
+        );
+        assert_eq!(
+            DaemonState::read_generation_marker(&state.layout),
+            committed_generation
+        );
+        match events
+            .try_recv()
+            .expect("finalization retry must release the queued event")
+        {
+            DaemonEvent::GraphRootChanged { new_root_hash, .. } => {
+                assert_eq!(new_root_hash, release.id.to_string())
+            }
+            other => panic!("finalization retry emitted the wrong event: {other:?}"),
+        }
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn identical_non_release_retry_with_missing_audit_effect_fails_closed() {
+        let state = test_state();
+        let head = install_release_test_branch(&state);
+        let mut change = kin_core::build_genesis_change();
+        change.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x9c; 32]));
+        change.parents = vec![head];
+        change.author = AuthorId::new("non-release-client");
+        change.message = "ordinary commit with audit".to_string();
+        change.authored_on = Some(BranchName::new("main"));
+        state.graph.create_change(&change).unwrap();
+        state
+            .graph
+            .update_branch_head(&BranchName::new("main"), &change.id)
+            .unwrap();
+
+        let audit = kin_model::provenance::AuditEvent {
+            event_id: AuditEventId::new(),
+            actor_id: ActorId::new(),
+            action: "ordinary_commit".to_string(),
+            target_scope: None,
+            timestamp: Timestamp::now(),
+            details: Some("must not be silently skipped".to_string()),
+        };
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "change": change,
+                            "branch_name": "main",
+                            "audit_event": audit,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "stale_branch_head");
+        assert_eq!(json["mutation_applied"], false);
+        assert!(state.graph.query_audit_events(None, 10).unwrap().is_empty());
+        assert!(state.graph.has_unpersisted_changes());
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            kin_db::GENERATION_INIT,
+            "the retry must not persist a head missing its requested audit effect"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_policy_rejects_nonempty_change_before_mutation() {
+        let state = test_state();
+        let head = install_release_test_branch(&state);
+        let entity = test_entity("must_not_release", "src/release.rs");
+        let entity_id = entity.id;
+        let mut release = release_test_change(head, 0x96);
+        release.entity_deltas.push(EntityDelta::Added(entity));
+        let release_id = release.id;
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(release_test_payload(&release).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(state.graph.get_change(&release_id).unwrap().is_none());
+        assert!(state.graph.get_entity(&entity_id).unwrap().is_none());
+        assert_eq!(
+            state
+                .graph
+                .get_branch(&BranchName::new("main"))
+                .unwrap()
+                .unwrap()
+                .head,
+            head
+        );
     }
 
     #[tokio::test]
@@ -11944,6 +15692,391 @@ mod tests {
             .get_branch(&BranchName::new("feature"))
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn graph_branch_mutations_reject_unknown_heads_without_authority_changes() {
+        let state = test_state();
+        let genesis = kin_core::build_genesis_change();
+        state.graph.create_change(&genesis).unwrap();
+        state
+            .graph
+            .create_branch(&Branch {
+                name: BranchName::new("main"),
+                head: genesis.id,
+            })
+            .unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let missing = SemanticChangeId::from_hash(Hash256::from_bytes([0xbe; 32]));
+        let stale = SemanticChangeId::from_hash(Hash256::from_bytes([0xbf; 32]));
+        let root_before = state.graph.compute_root_hash();
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let app = router(Arc::clone(&state));
+
+        let create = app
+            .clone()
+            .oneshot(
+                Request::post("/graph/branches")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "name": "unknown", "head": missing.to_string() }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(create.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "branch_head_not_found");
+        assert_eq!(body["mutation_applied"], false);
+        assert!(state
+            .graph
+            .get_branch(&BranchName::new("unknown"))
+            .unwrap()
+            .is_none());
+
+        let update = app
+            .clone()
+            .oneshot(
+                Request::put("/graph/branches/main/head")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "head": missing.to_string(),
+                            "expected_head": genesis.id.to_string(),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(update.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "branch_head_not_found");
+        assert_eq!(body["mutation_applied"], false);
+
+        let stale_update = app
+            .oneshot(
+                Request::put("/graph/branches/main/head")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "head": missing.to_string(),
+                            "expected_head": stale.to_string(),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_update.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(stale_update.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "stale_branch_head");
+        assert_eq!(body["mutation_applied"], false);
+
+        assert_eq!(
+            state
+                .graph
+                .get_branch(&BranchName::new("main"))
+                .unwrap()
+                .unwrap()
+                .head,
+            genesis.id
+        );
+        assert_eq!(state.graph.compute_root_hash(), root_before);
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation_before
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_branch_head_update_rejects_backward_and_sideways_moves() {
+        let state = test_state();
+        let genesis = kin_core::build_genesis_change();
+        let mut child = genesis.clone();
+        child.id = SemanticChangeId::from_hash(Hash256::from_bytes([0xc1; 32]));
+        child.parents = vec![genesis.id];
+        child.message = "child".to_string();
+        let mut sibling = child.clone();
+        sibling.id = SemanticChangeId::from_hash(Hash256::from_bytes([0xc2; 32]));
+        sibling.message = "sibling".to_string();
+        state.graph.create_change(&genesis).unwrap();
+        state.graph.create_change(&child).unwrap();
+        state.graph.create_change(&sibling).unwrap();
+        state
+            .graph
+            .create_branch(&Branch {
+                name: BranchName::new("main"),
+                head: genesis.id,
+            })
+            .unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(Arc::clone(&state));
+
+        let forward = app
+            .clone()
+            .oneshot(
+                Request::put("/graph/branches/main/head")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "head": child.id.to_string(),
+                            "expected_head": genesis.id.to_string(),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forward.status(), StatusCode::OK);
+
+        for rejected in [genesis.id, sibling.id] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::put("/graph/branches/main/head")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "head": rejected.to_string(),
+                                "expected_head": child.id.to_string(),
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"], "non_fast_forward_branch_update");
+            assert_eq!(body["mutation_applied"], false);
+        }
+        assert_eq!(
+            state
+                .graph
+                .get_branch(&BranchName::new("main"))
+                .unwrap()
+                .unwrap()
+                .head,
+            child.id
+        );
+    }
+
+    #[tokio::test]
+    async fn v1_branch_head_mutation_is_explicitly_retired() {
+        let response = router(test_state())
+            .oneshot(
+                Request::put("/v1/graph/branches/main/head")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "head": "legacy" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GONE);
+        assert_eq!(response.headers()["X-Kin-API-Version"], API_VERSION);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "v1_branch_head_update_retired");
+        assert_eq!(body["mutation_applied"], false);
+    }
+
+    #[tokio::test]
+    async fn checkout_requests_are_serialized_by_the_authority_gate() {
+        let state = test_state();
+        let (main, feature) = install_exact_checkout_branches(&state);
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let guard = state.coordination_gate.lock().await;
+        let app = router(Arc::clone(&state));
+        let mut first = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::post("/commands/checkout")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "path": "src/shared.rs",
+                                "change_id": feature.id.to_string(),
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut first)
+                .await
+                .is_err(),
+            "first checkout must wait for the authority gate"
+        );
+        let mut second = tokio::spawn(async move {
+            app.oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "path": "src/shared.rs",
+                            "change_id": main.id.to_string(),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut second)
+                .await
+                .is_err(),
+            "second checkout must queue behind the same authority gate"
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/shared.rs")).unwrap(),
+            b"main checkout bytes\n"
+        );
+
+        drop(guard);
+        assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(second.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/shared.rs")).unwrap(),
+            b"main checkout bytes\n",
+            "FIFO checkout A/B must leave the second target fully materialized"
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_switch_and_head_update_wait_for_the_authority_gate() {
+        let state = test_state();
+        let (_main, feature) = install_exact_checkout_branches(&state);
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let advanced = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0xc0; 32])),
+            parents: vec![feature.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("branch-gate-test"),
+            message: "advance feature after switch barrier".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(BranchName::new("feature")),
+        };
+        state.graph.create_change(&advanced).unwrap();
+        let guard = state.coordination_gate.lock().await;
+        let app = router(Arc::clone(&state));
+        let mut switch = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::post("/commands/branch")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({ "command": "switch", "name": "feature" }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut switch)
+                .await
+                .is_err(),
+            "branch switch must wait for the authority gate"
+        );
+        let mut update = tokio::spawn(async move {
+            app.oneshot(
+                Request::put("/graph/branches/feature/head")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "head": advanced.id.to_string(),
+                            "expected_head": feature.id.to_string(),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut update)
+                .await
+                .is_err(),
+            "branch head update must wait for the same authority gate"
+        );
+        assert_eq!(
+            kin_core::read_current_branch(&state.layout).unwrap(),
+            BranchName::new("main")
+        );
+        assert_eq!(
+            state
+                .graph
+                .get_branch(&BranchName::new("feature"))
+                .unwrap()
+                .unwrap()
+                .head,
+            feature.id
+        );
+
+        drop(guard);
+        assert_eq!(switch.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(update.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            kin_core::read_current_branch(&state.layout).unwrap(),
+            BranchName::new("feature")
+        );
+        assert_eq!(
+            state
+                .graph
+                .get_branch(&BranchName::new("feature"))
+                .unwrap()
+                .unwrap()
+                .head,
+            advanced.id
+        );
     }
 
     #[tokio::test]
@@ -15749,7 +19882,10 @@ mod tests {
             .oneshot(Request::get("/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(response.headers().get("X-Kin-API-Version").unwrap(), "1");
+        assert_eq!(
+            response.headers().get("X-Kin-API-Version").unwrap(),
+            API_VERSION
+        );
     }
 
     #[tokio::test]
@@ -15761,7 +19897,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers().get("X-Kin-API-Version").unwrap(), "1");
+        assert_eq!(
+            response.headers().get("X-Kin-API-Version").unwrap(),
+            API_VERSION
+        );
     }
 
     #[tokio::test]
@@ -15862,7 +20001,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(accepted.status(), StatusCode::OK);
-        assert_eq!(accepted.headers()["X-Kin-API-Version"], "1");
+        assert_eq!(accepted.headers()["X-Kin-API-Version"], API_VERSION);
     }
 
     #[tokio::test]

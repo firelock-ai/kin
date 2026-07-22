@@ -9,13 +9,36 @@ use chrono::TimeZone;
 use kin_blobs::BlobStore;
 use kin_model::{
     ArtifactDelta, ArtifactDeltaKind, AuthorId, BranchName, FilePathId, Hash256, SemanticChange,
-    SemanticChangeId, Timestamp,
+    SemanticChangeId, SourceEntryKind, Timestamp,
 };
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
 use crate::error::{GitError, Result};
+
+const MAX_BASE_LINK_ANCHORS: usize = 64;
+const MAX_BASE_LINK_TREE_ENTRIES: usize = 100_000;
+const MAX_BASE_LINK_EXPANDED_BYTES: u64 = 256 * 1024 * 1024;
+
+fn enforce_base_link_budget(anchors: usize, entries: usize, expanded_bytes: u64) -> Result<()> {
+    if anchors > MAX_BASE_LINK_ANCHORS {
+        return Err(GitError::Other(format!(
+            "truncated Git history requires {anchors} boundary anchors; limit is {MAX_BASE_LINK_ANCHORS}"
+        )));
+    }
+    if entries > MAX_BASE_LINK_TREE_ENTRIES {
+        return Err(GitError::Other(format!(
+            "truncated Git history boundary contains {entries} source entries; limit is {MAX_BASE_LINK_TREE_ENTRIES}"
+        )));
+    }
+    if expanded_bytes > MAX_BASE_LINK_EXPANDED_BYTES {
+        return Err(GitError::Other(format!(
+            "truncated Git history boundary contains {expanded_bytes} source bytes; limit is {MAX_BASE_LINK_EXPANDED_BYTES}"
+        )));
+    }
+    Ok(())
+}
 
 fn open_repo(path: &Path) -> std::result::Result<gix::Repository, gix::open::Error> {
     let dot_git = path.join(".git");
@@ -26,11 +49,22 @@ fn open_repo(path: &Path) -> std::result::Result<gix::Repository, gix::open::Err
     }
 }
 
+fn shallow_boundary_ids(repo: &gix::Repository) -> Result<HashSet<gix::ObjectId>> {
+    let commits = repo
+        .shallow_commits()
+        .map_err(|error| GitError::Git(format!("read shallow boundary: {error}")))?;
+    Ok(commits
+        .as_ref()
+        .map(|commits| commits.iter().copied().collect())
+        .unwrap_or_default())
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CommitFileDelta {
     pub path: String,
     pub old_blob_id: Option<gix::ObjectId>,
     pub new_blob_id: Option<gix::ObjectId>,
+    pub new_entry_kind: Option<SourceEntryKind>,
 }
 
 /// Options for importing Git history into Kin.
@@ -68,6 +102,18 @@ fn change_id_from_git_oid(oid: &gix::ObjectId) -> SemanticChangeId {
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(&result);
     SemanticChangeId::from_hash(Hash256::from_bytes(bytes))
+}
+
+fn timestamp_from_git_seconds(seconds: i64, oid: &gix::ObjectId) -> Result<Timestamp> {
+    chrono::Utc
+        .timestamp_opt(seconds, 0)
+        .single()
+        .map(Timestamp::from)
+        .ok_or_else(|| {
+            GitError::Git(format!(
+                "Git commit {oid} has author timestamp {seconds} outside Kin's supported range"
+            ))
+        })
 }
 
 /// Compute the deterministic imported SemanticChangeId for a Git commit hash.
@@ -408,6 +454,59 @@ pub(crate) fn select_history_oids_from_head(
     Ok(selected)
 }
 
+/// Select a deterministic HEAD-rooted history window without first walking or
+/// retaining the repository's full reachable history. Only selected commits
+/// and their immediate frontier parents are inspected.
+pub(crate) fn select_bounded_history_oids_from_head(
+    repo: &gix::Repository,
+    head_id: gix::ObjectId,
+    max_commits: usize,
+) -> Result<Vec<gix::ObjectId>> {
+    debug_assert!(max_commits > 0);
+    let commit_time = |oid: gix::ObjectId| -> Result<i64> {
+        repo.find_commit(oid)
+            .map_err(|error| GitError::CommitNotFound(format!("{oid}: {error}")))?
+            .time()
+            .map(|time| time.seconds)
+            .map_err(|error| GitError::Git(error.to_string()))
+    };
+    let shallow_boundaries = shallow_boundary_ids(repo)?;
+    let mut frontier = BTreeSet::from([(Reverse(commit_time(head_id)?), head_id)]);
+    let mut selected = Vec::with_capacity(max_commits);
+    let mut selected_set = HashSet::new();
+
+    while selected.len() < max_commits {
+        let Some(candidate) = frontier.iter().next().copied() else {
+            break;
+        };
+        frontier.remove(&candidate);
+        let oid = candidate.1;
+        if !selected_set.insert(oid) {
+            continue;
+        }
+        selected.push(oid);
+        if selected.len() == max_commits {
+            break;
+        }
+        if shallow_boundaries.contains(&oid) {
+            continue;
+        }
+
+        let commit = repo
+            .find_commit(oid)
+            .map_err(|error| GitError::CommitNotFound(format!("{oid}: {error}")))?;
+        for parent in commit.parent_ids().map(|parent| parent.detach()) {
+            if selected_set.contains(&parent)
+                || frontier.iter().any(|(_, candidate)| *candidate == parent)
+            {
+                continue;
+            }
+            frontier.insert((Reverse(commit_time(parent)?), parent));
+        }
+    }
+    Ok(selected)
+}
+
 /// Full history import: walk commits in deterministic topological order.
 fn import_full(
     repo: &gix::Repository,
@@ -424,24 +523,23 @@ fn import_full(
     )
     .entered();
 
-    // Walk commits by commit time (approximates parent-before-child order).
-    let walk = repo
-        .rev_walk([head_id])
-        .sorting(gix::revision::walk::Sorting::ByCommitTime(
-            Default::default(),
-        ))
-        .all()
-        .map_err(|e| GitError::Git(e.to_string()))?;
-
-    // Phase 1: collect every commit as (commit time, oid), then select a
-    // deterministic ancestry-connected window by expanding from HEAD. A raw
-    // `ByCommitTime` walk leaves equal-timestamp commits in a process-dependent
-    // order, while global oid truncation can drop HEAD or disconnect the chosen
-    // set. Selection order is not emission order: once the set is fixed, a
-    // deterministic Kahn pass below emits every selected parent before its
-    // selected children, using oid order only among simultaneously ready nodes.
-    let oids: Vec<gix::ObjectId> = {
+    // Phase 1: bounded mode expands a deterministic ancestry-connected window
+    // directly from HEAD; unlimited mode collects the complete walk. Selection
+    // order is not emission order: once the set is fixed, a deterministic Kahn
+    // pass emits every selected parent before its selected children, using oid
+    // order only among simultaneously ready nodes.
+    let oids: Vec<gix::ObjectId> = if max_commits > 0 {
+        let selected = select_bounded_history_oids_from_head(repo, head_id, max_commits)?;
+        order_selected_oids_parent_first(repo, selected)?
+    } else {
         let _span = tracing::info_span!("kin.git.import_full.collect_oids").entered();
+        let walk = repo
+            .rev_walk([head_id])
+            .sorting(gix::revision::walk::Sorting::ByCommitTime(
+                Default::default(),
+            ))
+            .all()
+            .map_err(|e| GitError::Git(e.to_string()))?;
         let timed: Vec<(i64, gix::ObjectId)> = walk
             .map(|r| {
                 r.map(|info| (info.commit_time.unwrap_or(0), info.id().detach()))
@@ -451,6 +549,7 @@ fn import_full(
         let selected = select_history_oids_from_head(repo, head_id, timed, max_commits)?;
         order_selected_oids_parent_first(repo, selected)?
     };
+    let shallow_boundaries = shallow_boundary_ids(repo)?;
 
     // Phase 2: map each commit to an ImportedChange in parallel. Each commit's
     // mapping is independent (deterministic change_id from its OID, parents from
@@ -493,7 +592,7 @@ fn import_full(
                         .map_err(|e| GitError::Git(e.to_string()))?,
                 }
                 .into_commit();
-                let is_root = commit.parent_ids().count() == 0;
+                let is_root = commit.parent_ids().count() == 0 || shallow_boundaries.contains(oid);
                 let change = commit_to_change(&local, &commit, genesis_id, is_root, blob_store)?;
                 let oid_str = oid.to_string();
                 debug!(git_oid = %oid_str, kin_id = %change.id, parents = change.parents.len(), "imported commit");
@@ -542,13 +641,14 @@ fn import_full_serial(
         .collect::<Result<Vec<_>>>()?;
     let selected = select_history_oids_from_head(repo, head_id, timed, max_commits)?;
     let oids = order_selected_oids_parent_first(repo, selected)?;
+    let shallow_boundaries = shallow_boundary_ids(repo)?;
 
     for oid in &oids {
         let commit = repo
             .find_object(*oid)
             .map_err(|e| GitError::Git(e.to_string()))?
             .into_commit();
-        let is_root = commit.parent_ids().count() == 0;
+        let is_root = commit.parent_ids().count() == 0 || shallow_boundaries.contains(oid);
         let change = commit_to_change(repo, &commit, genesis_id, is_root, blob_store)?;
         changes.push(ImportedChange {
             change,
@@ -636,11 +736,7 @@ fn commit_to_change(
     let git_time = author_sig
         .time()
         .map_err(|e| GitError::Git(e.to_string()))?;
-    let dt = chrono::Utc
-        .timestamp_opt(git_time.seconds, 0)
-        .single()
-        .unwrap_or_else(chrono::Utc::now);
-    let timestamp = Timestamp::from(dt);
+    let timestamp = timestamp_from_git_seconds(git_time.seconds, &oid)?;
 
     // Extract commit message.
     let message = commit
@@ -648,11 +744,18 @@ fn commit_to_change(
         .map_err(|e| GitError::Git(e.to_string()))?
         .to_string();
 
-    // Compute artifact deltas by examining the commit's tree.
-    // For a full import, we'd diff against parent trees. For now, we record
-    // file paths from the tree as artifact deltas (the indexing pipeline
-    // will later enrich these with entity extraction).
-    let artifact_deltas = extract_artifact_deltas(repo, commit, blob_store)?;
+    // A synthetic import root (shallow import or a real Git root) must carry
+    // the complete tree. A merge must also carry a full correction relative
+    // to the union of all direct-parent trees: semantic history replays the
+    // complete DAG, while a Git merge diff against only its first parent can
+    // otherwise leak second-parent content that the merge did not select.
+    let artifact_deltas = if is_root {
+        extract_full_tree_artifact_deltas(repo, commit, blob_store)?
+    } else if commit.parent_ids().count() > 1 {
+        extract_merge_artifact_deltas(repo, commit, blob_store)?
+    } else {
+        extract_artifact_deltas(repo, commit, blob_store)?
+    };
 
     let authored_on = if is_root {
         Some(BranchName::new("main"))
@@ -681,6 +784,46 @@ fn commit_to_change(
 ///
 /// For root commits (no parents), all files in the tree are "Added".
 /// For non-root commits, we diff against the first parent's tree.
+fn source_entry_kind(mode: gix::objs::tree::EntryMode) -> Result<Option<SourceEntryKind>> {
+    use gix::objs::tree::EntryKind;
+
+    match mode.kind() {
+        EntryKind::Blob => Ok(Some(SourceEntryKind::File { executable: false })),
+        EntryKind::BlobExecutable => Ok(Some(SourceEntryKind::File { executable: true })),
+        EntryKind::Link => Ok(Some(SourceEntryKind::Symlink)),
+        EntryKind::Tree => Ok(None),
+        EntryKind::Commit => Err(GitError::Other(
+            "exact Git import does not yet support gitlink/submodule entries; import refused rather than silently omitting source state"
+                .to_string(),
+        )),
+    }
+}
+
+fn utf8_git_path(path: &[u8]) -> Result<String> {
+    std::str::from_utf8(path).map(str::to_owned).map_err(|_| {
+        GitError::Other(
+            "exact Git import encountered a non-UTF-8 path; import refused rather than recording a lossy source identity"
+                .to_string(),
+        )
+    })
+}
+
+fn added_artifact_kind(kind: SourceEntryKind) -> ArtifactDeltaKind {
+    match kind {
+        SourceEntryKind::File { executable: false } => ArtifactDeltaKind::AddedRegularFile,
+        SourceEntryKind::File { executable: true } => ArtifactDeltaKind::AddedExecutableFile,
+        SourceEntryKind::Symlink => ArtifactDeltaKind::AddedSymlink,
+    }
+}
+
+fn modified_artifact_kind(kind: SourceEntryKind) -> ArtifactDeltaKind {
+    match kind {
+        SourceEntryKind::File { executable: false } => ArtifactDeltaKind::ModifiedRegularFile,
+        SourceEntryKind::File { executable: true } => ArtifactDeltaKind::ModifiedExecutableFile,
+        SourceEntryKind::Symlink => ArtifactDeltaKind::ModifiedSymlink,
+    }
+}
+
 fn extract_artifact_deltas(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
@@ -688,11 +831,11 @@ fn extract_artifact_deltas(
 ) -> Result<Vec<ArtifactDelta>> {
     let mut deltas = Vec::new();
     for delta in commit_file_deltas(repo, commit)? {
-        let kind = match (delta.old_blob_id, delta.new_blob_id) {
-            (None, Some(_)) => ArtifactDeltaKind::Added,
-            (Some(_), None) => ArtifactDeltaKind::Removed,
-            (Some(_), Some(_)) => ArtifactDeltaKind::Modified,
-            (None, None) => continue,
+        let kind = match (delta.old_blob_id, delta.new_blob_id, delta.new_entry_kind) {
+            (None, Some(_), Some(entry_kind)) => added_artifact_kind(entry_kind),
+            (Some(_), None, None) => ArtifactDeltaKind::Removed,
+            (Some(_), Some(_), Some(entry_kind)) => modified_artifact_kind(entry_kind),
+            _ => continue,
         };
 
         let old_hash = match delta.old_blob_id {
@@ -712,6 +855,91 @@ fn extract_artifact_deltas(
         });
     }
 
+    Ok(deltas)
+}
+
+fn extract_full_tree_artifact_deltas(
+    repo: &gix::Repository,
+    commit: &gix::Commit<'_>,
+    blob_store: Option<&BlobStore>,
+) -> Result<Vec<ArtifactDelta>> {
+    let tree = commit
+        .tree()
+        .map_err(|error| GitError::Git(error.to_string()))?;
+    full_tree_blob_entries(repo, &tree)?
+        .into_iter()
+        .map(|(path, blob_id, kind)| {
+            Ok(ArtifactDelta {
+                file_id: FilePathId::new(path),
+                kind: added_artifact_kind(kind),
+                old_hash: None,
+                new_hash: Some(blob_hash(repo, blob_id, blob_store)?),
+            })
+        })
+        .collect()
+}
+
+/// Encode a merge as a complete correction over the union of its direct
+/// parent trees. This makes the semantic DAG replay converge on the exact Git
+/// merge tree regardless of sibling topological order.
+fn extract_merge_artifact_deltas(
+    repo: &gix::Repository,
+    commit: &gix::Commit<'_>,
+    blob_store: Option<&BlobStore>,
+) -> Result<Vec<ArtifactDelta>> {
+    let current_tree = commit
+        .tree()
+        .map_err(|error| GitError::Git(error.to_string()))?;
+    let current: BTreeMap<String, (gix::ObjectId, SourceEntryKind)> =
+        full_tree_blob_entries(repo, &current_tree)?
+            .into_iter()
+            .map(|(path, id, kind)| (path, (id, kind)))
+            .collect();
+
+    // Parent order is Git-authoritative. Keep the first occurrence of a path
+    // only to provide deterministic old_hash metadata; replay correctness is
+    // supplied by the complete remove/upsert correction below.
+    let mut parent_union: BTreeMap<String, (gix::ObjectId, SourceEntryKind)> = BTreeMap::new();
+    for parent_id in commit.parent_ids() {
+        let parent = repo
+            .find_commit(parent_id.detach())
+            .map_err(|error| GitError::Git(error.to_string()))?;
+        let parent_tree = parent
+            .tree()
+            .map_err(|error| GitError::Git(error.to_string()))?;
+        for (path, id, kind) in full_tree_blob_entries(repo, &parent_tree)? {
+            parent_union.entry(path).or_insert((id, kind));
+        }
+    }
+
+    let mut deltas = Vec::with_capacity(current.len() + parent_union.len());
+    for (path, (old_id, _)) in &parent_union {
+        if !current.contains_key(path) {
+            deltas.push(ArtifactDelta {
+                file_id: FilePathId::new(path),
+                kind: ArtifactDeltaKind::Removed,
+                old_hash: Some(blob_hash(repo, *old_id, blob_store)?),
+                new_hash: None,
+            });
+        }
+    }
+    for (path, (new_id, new_kind)) in current {
+        let old_hash = parent_union
+            .get(&path)
+            .map(|(old_id, _)| blob_hash(repo, *old_id, blob_store))
+            .transpose()?;
+        deltas.push(ArtifactDelta {
+            file_id: FilePathId::new(path),
+            kind: if old_hash.is_some() {
+                modified_artifact_kind(new_kind)
+            } else {
+                added_artifact_kind(new_kind)
+            },
+            old_hash,
+            new_hash: Some(blob_hash(repo, new_id, blob_store)?),
+        });
+    }
+    deltas.sort_by(|left, right| left.file_id.0.cmp(&right.file_id.0));
     Ok(deltas)
 }
 
@@ -743,33 +971,51 @@ pub(crate) fn commit_file_deltas(
                 entry_mode,
                 id,
                 ..
-            } if entry_mode.is_blob() => deltas.push(CommitFileDelta {
-                path: location.to_string(),
-                old_blob_id: None,
-                new_blob_id: Some(id),
-            }),
+            } => {
+                let path = utf8_git_path(location.as_ref())?;
+                if let Some(new_entry_kind) = source_entry_kind(entry_mode)? {
+                    deltas.push(CommitFileDelta {
+                        path,
+                        old_blob_id: None,
+                        new_blob_id: Some(id),
+                        new_entry_kind: Some(new_entry_kind),
+                    });
+                }
+            }
             gix::object::tree::diff::ChangeDetached::Deletion {
                 location,
                 entry_mode,
                 id,
                 ..
-            } if entry_mode.is_blob() => deltas.push(CommitFileDelta {
-                path: location.to_string(),
-                old_blob_id: Some(id),
-                new_blob_id: None,
-            }),
+            } => {
+                let path = utf8_git_path(location.as_ref())?;
+                if source_entry_kind(entry_mode)?.is_some() {
+                    deltas.push(CommitFileDelta {
+                        path,
+                        old_blob_id: Some(id),
+                        new_blob_id: None,
+                        new_entry_kind: None,
+                    });
+                }
+            }
             gix::object::tree::diff::ChangeDetached::Modification {
                 location,
                 previous_entry_mode,
                 previous_id,
                 entry_mode,
                 id,
-            } if previous_entry_mode.is_blob() || entry_mode.is_blob() => {
-                deltas.push(CommitFileDelta {
-                    path: location.to_string(),
-                    old_blob_id: Some(previous_id),
-                    new_blob_id: Some(id),
-                })
+            } => {
+                let path = utf8_git_path(location.as_ref())?;
+                let old_entry_kind = source_entry_kind(previous_entry_mode)?;
+                let new_entry_kind = source_entry_kind(entry_mode)?;
+                if old_entry_kind.is_some() || new_entry_kind.is_some() {
+                    deltas.push(CommitFileDelta {
+                        path,
+                        old_blob_id: old_entry_kind.map(|_| previous_id),
+                        new_blob_id: new_entry_kind.map(|_| id),
+                        new_entry_kind,
+                    });
+                }
             }
             _ => {}
         }
@@ -809,7 +1055,18 @@ fn base_link_change_id_from_git_oid(oid: &gix::ObjectId) -> SemanticChangeId {
     SemanticChangeId::from_hash(Hash256::from_bytes(bytes))
 }
 
-/// Enumerate every blob in a tree as `(path, blob_oid)`, sorted by path.
+/// Recompute the deterministic synthetic base-link ID used by pre-0.3
+/// truncated imports. This is exposed only so an owning graph migration can
+/// recognize and replace that exact historical parent substitution when it
+/// widens the import to canonical full ancestry.
+pub fn base_link_change_id_from_git_oid_hex(oid: &str) -> Result<SemanticChangeId> {
+    let oid = gix::ObjectId::from_hex(oid.as_bytes())
+        .map_err(|error| GitError::Git(format!("invalid git oid '{oid}': {error}")))?;
+    Ok(base_link_change_id_from_git_oid(&oid))
+}
+
+/// Enumerate every source entry in a tree as `(path, blob_oid, kind)`, sorted
+/// by path.
 ///
 /// Implemented as a diff of the tree against the empty tree (`None`), which
 /// yields one Addition per blob — the same machinery `commit_file_deltas` uses
@@ -818,7 +1075,7 @@ fn base_link_change_id_from_git_oid(oid: &gix::ObjectId) -> SemanticChangeId {
 fn full_tree_blob_entries(
     repo: &gix::Repository,
     tree: &gix::Tree<'_>,
-) -> Result<Vec<(String, gix::ObjectId)>> {
+) -> Result<Vec<(String, gix::ObjectId, SourceEntryKind)>> {
     let options = gix::diff::Options::default().with_rewrites(None);
     let changes = repo
         .diff_tree_to_tree(None, Some(tree), Some(options))
@@ -833,8 +1090,9 @@ fn full_tree_blob_entries(
             ..
         } = change
         {
-            if entry_mode.is_blob() {
-                entries.push((location.to_string(), id));
+            let path = utf8_git_path(location.as_ref())?;
+            if let Some(kind) = source_entry_kind(entry_mode)? {
+                entries.push((path, id, kind));
             }
         }
     }
@@ -842,8 +1100,73 @@ fn full_tree_blob_entries(
     Ok(entries)
 }
 
-/// Anchor a (possibly truncated) imported history at a synthetic "base-link"
-/// change carrying the FULL file universe present at the import window's base.
+/// Enumerate at most `max_entries` source entries without first materializing
+/// the complete tree diff. This is used at the truncated-history boundary,
+/// where an adversarial or unexpectedly large parent tree must fail before its
+/// full path set is retained in memory.
+fn bounded_full_tree_blob_entries(
+    repo: &gix::Repository,
+    tree: &gix::Tree<'_>,
+    max_entries: usize,
+) -> Result<Vec<(String, gix::ObjectId, SourceEntryKind)>> {
+    let empty_tree = repo.empty_tree();
+    let mut changes = empty_tree
+        .changes()
+        .map_err(|error| GitError::Git(error.to_string()))?;
+    changes.options(|options| {
+        options.track_rewrites(None);
+    });
+
+    let mut entries = Vec::with_capacity(max_entries.min(4_096));
+    let mut callback_error = None;
+    let mut over_limit = false;
+    let traversal_result = changes.for_each_to_obtain_tree(tree, |change| {
+        if let gix::object::tree::diff::Change::Addition {
+            location,
+            entry_mode,
+            id,
+            ..
+        } = change
+        {
+            let path = match utf8_git_path(location) {
+                Ok(path) => path,
+                Err(error) => {
+                    callback_error = Some(error);
+                    return Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Break(()));
+                }
+            };
+            let kind = match source_entry_kind(entry_mode) {
+                Ok(Some(kind)) => kind,
+                Ok(None) => return Ok(std::ops::ControlFlow::Continue(())),
+                Err(error) => {
+                    callback_error = Some(error);
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+            };
+            if entries.len() == max_entries {
+                over_limit = true;
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
+            entries.push((path, id.detach(), kind));
+        }
+        Ok(std::ops::ControlFlow::Continue(()))
+    });
+
+    if let Some(error) = callback_error {
+        return Err(error);
+    }
+    if over_limit {
+        return Err(GitError::Other(format!(
+            "truncated Git history boundary exceeds the remaining source-entry budget of {max_entries}"
+        )));
+    }
+    traversal_result.map_err(|error| GitError::Git(error.to_string()))?;
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(entries)
+}
+
+/// Anchor every omitted parent edge in a truncated import at a synthetic
+/// "base-link" change carrying that parent's FULL file universe.
 ///
 /// # Why
 ///
@@ -862,29 +1185,27 @@ fn full_tree_blob_entries(
 ///
 /// # What
 ///
-/// This walks the complete Git tree at the window base's first parent — the
-/// state the window was built on — and inserts one root change carrying every
-/// base file as an Addition (`parents = [genesis_id]`), then re-points the
-/// window base's dangling first parent from `genesis_id` to this change. The
-/// subsequent semantic-enrichment pass (in `kin-cli`) then parses and links the
-/// whole base universe into the base-link change exactly as it does a true root
-/// commit, and forks each windowed commit's baseline from it,
-/// so every imported head inherits the base-era inbound edges and each commit's
-/// delta only records what it actually changed.
+/// This walks the actual Git parents of every imported commit. For each distinct
+/// parent omitted by the history window it inserts one root change carrying
+/// every file in that parent's tree as an Addition (`parents = [genesis_id]`),
+/// then rebuilds the child's parent list in original Git order with the
+/// corresponding base-link id. Sharing one anchor for repeated edges to the
+/// same omitted commit preserves diamond provenance. It also avoids collapsing
+/// two omitted merge parents into one genesis edge, which loses the independent
+/// parent trees needed to replay a merge exactly.
 ///
 /// `changes` must be oldest-first, as returned by `import_git_history_*`.
 ///
-/// Returns the inserted base-link change id, or `None` when no anchoring is
-/// needed: an empty import, or a full import whose oldest commit is a true Git
-/// root (its own artifact deltas already carry the entire tree).
+/// Returns the first inserted base-link change id in deterministic Git-OID
+/// order, or `None` when no anchoring is needed. A linear window has exactly
+/// one anchor, preserving the original API behavior; a truncated merge may
+/// prepend several anchors.
 ///
 /// # Determinism
 ///
-/// The window base is found by a first-parent walk from the newest change (a
-/// pure function of the already-deterministic imported DAG). The base id is a
-/// hash of the base commit's parent OID. The base-link's artifact deltas are
-/// built in sorted-path order with content-addressed blob hashes, and its
-/// author/timestamp come from Git commit content, never wall-clock. The output
+/// Base ids are hashes of omitted parent OIDs. Anchors are emitted in OID order,
+/// artifact deltas in path order, and author/timestamp come from Git commit
+/// content, never wall-clock. Parent order continues to match Git. The output
 /// is therefore byte-identical across runs for identical history + window.
 pub fn anchor_imported_history_at_base_link(
     repo_path: &Path,
@@ -896,133 +1217,207 @@ pub fn anchor_imported_history_at_base_link(
         return Ok(None);
     }
 
-    // Map change id -> slice position so the first-parent walk stays in-set.
-    let index_by_id: HashMap<SemanticChangeId, usize> = changes
+    let repo = open_repo(repo_path).map_err(|e| GitError::Git(e.to_string()))?;
+    let shallow_boundaries = shallow_boundary_ids(&repo)?;
+    let imported_ids: HashSet<SemanticChangeId> =
+        changes.iter().map(|entry| entry.change.id).collect();
+    let mut git_parent_oids = Vec::with_capacity(changes.len());
+    let mut omitted_parents = BTreeSet::new();
+
+    // `close_truncated_history_dag` intentionally makes the public raw import
+    // self-contained by collapsing missing parents to genesis. Recover the
+    // authoritative edge identities from each Git commit before anchoring so
+    // no merge-parent provenance is lost at that compatibility boundary.
+    for imported in changes.iter() {
+        let oid = gix::ObjectId::from_hex(imported.git_oid.as_bytes())
+            .map_err(|e| GitError::Git(format!("invalid git oid '{}': {}", imported.git_oid, e)))?;
+        let commit = repo
+            .find_commit(oid)
+            .map_err(|e| GitError::CommitNotFound(format!("{oid}: {e}")))?;
+        let mut parents = Vec::new();
+        if !shallow_boundaries.contains(&oid) {
+            for parent in commit.parent_ids() {
+                if parents.len() == MAX_BASE_LINK_ANCHORS {
+                    return Err(GitError::Other(format!(
+                        "Git commit {oid} has more than {MAX_BASE_LINK_ANCHORS} direct parents; refusing an unbounded truncated-history boundary"
+                    )));
+                }
+                let parent = parent.detach();
+                if !imported_ids.contains(&change_id_from_git_oid(&parent))
+                    && omitted_parents.insert(parent)
+                {
+                    // Enforce as the set grows so an adversarial octopus commit
+                    // cannot be fully retained before the boundary is rejected.
+                    enforce_base_link_budget(omitted_parents.len(), 0, 0)?;
+                }
+                parents.push(parent);
+            }
+        }
+        git_parent_oids.push(parents);
+    }
+
+    if omitted_parents.is_empty() {
+        return Ok(None);
+    }
+    let anchor_ids: BTreeMap<gix::ObjectId, SemanticChangeId> = omitted_parents
         .iter()
-        .enumerate()
-        .map(|(i, ic)| (ic.change.id, i))
+        .map(|oid| (*oid, base_link_change_id_from_git_oid(oid)))
         .collect();
 
-    // Window base = the oldest commit reachable from the import head (the newest
-    // change, last in oldest-first order) by following the FIRST parent while it
-    // stays inside the imported set. `close_truncated_history_dag` has already
-    // re-pointed the base's out-of-window first parent to `genesis_id`, so the
-    // walk halts there (or at a true root, whose first parent is also genesis).
-    let mut cursor = changes.len() - 1;
-    loop {
-        match changes[cursor].change.parents.first().copied() {
-            Some(pid) if pid != genesis_id => match index_by_id.get(&pid) {
-                Some(&next) => cursor = next,
-                // Dangling parent (should not occur post-close): treat as base.
-                None => break,
-            },
-            // First parent is genesis (re-pointed horizon or true root) or none.
-            _ => break,
+    // Compute every replacement parent vector without mutating caller-owned
+    // history. Anchor construction below is fallible (missing/corrupt Git
+    // objects and blob persistence can fail), so publication must be atomic:
+    // either every anchor and edge is ready, or `changes` stays byte-identical.
+    let replacement_parents: Vec<Vec<SemanticChangeId>> = git_parent_oids
+        .iter()
+        .map(|parents| {
+            if parents.is_empty() {
+                vec![genesis_id]
+            } else {
+                parents
+                    .iter()
+                    .map(|parent| {
+                        let imported_id = change_id_from_git_oid(parent);
+                        if imported_ids.contains(&imported_id) {
+                            imported_id
+                        } else {
+                            anchor_ids[parent]
+                        }
+                    })
+                    .collect()
+            }
+        })
+        .collect();
+
+    let mut anchors = Vec::with_capacity(anchor_ids.len());
+    let mut aggregate_entries = 0_usize;
+    let mut aggregate_expanded_bytes = 0_u64;
+    let mut blob_cache = HashMap::<gix::ObjectId, (Hash256, u64)>::new();
+    for (parent_oid, base_id) in &anchor_ids {
+        let parent_commit = repo
+            .find_commit(*parent_oid)
+            .map_err(|e| GitError::CommitNotFound(format!("{parent_oid}: {e}")))?;
+        let parent_tree = parent_commit
+            .tree()
+            .map_err(|e| GitError::Git(e.to_string()))?;
+
+        // Full parent universe as Added artifact deltas, in stable path order.
+        // Materialize every blob so exact checkout/archive consumers have the
+        // bytes corresponding to the graph-owned content identities.
+        let remaining_entries = MAX_BASE_LINK_TREE_ENTRIES
+            .checked_sub(aggregate_entries)
+            .ok_or_else(|| GitError::Other("base-link entry count exceeds limit".to_string()))?;
+        let entries = bounded_full_tree_blob_entries(&repo, &parent_tree, remaining_entries)?;
+        aggregate_entries = aggregate_entries
+            .checked_add(entries.len())
+            .ok_or_else(|| GitError::Other("base-link entry count overflow".to_string()))?;
+        enforce_base_link_budget(
+            anchor_ids.len(),
+            aggregate_entries,
+            aggregate_expanded_bytes,
+        )?;
+        let mut artifact_deltas = Vec::with_capacity(entries.len());
+        for (path, blob_id, entry_kind) in entries {
+            let (new_hash, byte_len) = if let Some(cached) = blob_cache.get(&blob_id) {
+                *cached
+            } else {
+                let header = repo
+                    .find_header(blob_id)
+                    .map_err(|error| GitError::Git(error.to_string()))?;
+                if header.kind() != gix::objs::Kind::Blob {
+                    return Err(GitError::Git(format!(
+                        "source entry {path:?} points to non-blob Git object {blob_id} ({:?})",
+                        header.kind()
+                    )));
+                }
+                let byte_len = header.size();
+                let prospective_bytes =
+                    aggregate_expanded_bytes
+                        .checked_add(byte_len)
+                        .ok_or_else(|| {
+                            GitError::Other("base-link source byte count overflow".into())
+                        })?;
+                enforce_base_link_budget(anchor_ids.len(), aggregate_entries, prospective_bytes)?;
+
+                let mut blob = repo
+                    .find_blob(blob_id)
+                    .map_err(|error| GitError::Git(error.to_string()))?;
+                let content = blob.take_data();
+                let loaded_len = u64::try_from(content.len()).unwrap_or(u64::MAX);
+                if loaded_len != byte_len {
+                    return Err(GitError::Git(format!(
+                        "Git blob {blob_id} changed size while loading: header={byte_len}, loaded={loaded_len}"
+                    )));
+                }
+                let hash = Hash256::from_bytes(kin_blobs::digest(&content).0);
+                if let Some(store) = blob_store {
+                    store.write(&content)?;
+                }
+                blob_cache.insert(blob_id, (hash, byte_len));
+                (hash, byte_len)
+            };
+            aggregate_expanded_bytes = aggregate_expanded_bytes
+                .checked_add(byte_len)
+                .ok_or_else(|| GitError::Other("base-link source byte count overflow".into()))?;
+            enforce_base_link_budget(
+                anchor_ids.len(),
+                aggregate_entries,
+                aggregate_expanded_bytes,
+            )?;
+            artifact_deltas.push(ArtifactDelta {
+                file_id: FilePathId::new(path),
+                kind: added_artifact_kind(entry_kind),
+                old_hash: None,
+                new_hash: Some(new_hash),
+            });
         }
-    }
-    let window_base_idx = cursor;
 
-    let repo = open_repo(repo_path).map_err(|e| GitError::Git(e.to_string()))?;
+        let author_sig = parent_commit
+            .author()
+            .map_err(|e| GitError::Git(e.to_string()))?;
+        let author = AuthorId::new(format!("{} <{}>", author_sig.name, author_sig.email));
+        let git_time = author_sig
+            .time()
+            .map_err(|e| GitError::Git(e.to_string()))?;
+        let timestamp = timestamp_from_git_seconds(git_time.seconds, parent_oid)?;
 
-    let base_git_oid = gix::ObjectId::from_hex(changes[window_base_idx].git_oid.as_bytes())
-        .map_err(|e| {
-            GitError::Git(format!(
-                "invalid git oid '{}': {}",
-                changes[window_base_idx].git_oid, e
-            ))
-        })?;
-    let base_commit = repo
-        .find_commit(base_git_oid)
-        .map_err(|e| GitError::CommitNotFound(format!("{base_git_oid}: {e}")))?;
-
-    // The state the window was built on is the base commit's FIRST parent tree.
-    // No first parent means this is a true Git root: a full import whose own
-    // deltas already carry the whole tree, so there is nothing to anchor.
-    let parent_oid = match base_commit.parent_ids().next() {
-        Some(pid) => pid.detach(),
-        None => return Ok(None),
-    };
-    let parent_commit = repo
-        .find_commit(parent_oid)
-        .map_err(|e| GitError::CommitNotFound(format!("{parent_oid}: {e}")))?;
-    let parent_tree = parent_commit
-        .tree()
-        .map_err(|e| GitError::Git(e.to_string()))?;
-
-    // Full base universe as Added artifact deltas, in stable path order. Blobs
-    // are materialized into the store so the semantic pass can read and parse
-    // them (mirrors how imported commits materialize their changed blobs).
-    let entries = full_tree_blob_entries(&repo, &parent_tree)?;
-    let mut artifact_deltas = Vec::with_capacity(entries.len());
-    for (path, blob_id) in entries {
-        let new_hash = blob_hash(&repo, blob_id, blob_store)?;
-        artifact_deltas.push(ArtifactDelta {
-            file_id: FilePathId::new(path),
-            kind: ArtifactDeltaKind::Added,
-            old_hash: None,
-            new_hash: Some(new_hash),
+        anchors.push(ImportedChange {
+            change: SemanticChange {
+                id: *base_id,
+                parents: vec![genesis_id],
+                timestamp,
+                author,
+                // Preserve the original linear-anchor payload for existing
+                // deterministic IDs while extending it to every boundary edge.
+                message: "kin import: base-link (window base universe)".to_string(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas,
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: Some(BranchName::new("main")),
+            },
+            git_oid: parent_oid.to_string(),
         });
     }
 
-    // Author/timestamp come from the base parent commit so the synthetic change
-    // is a pure function of Git content (no wall-clock), matching how
-    // `commit_to_change` derives them for every real imported commit.
-    let author_sig = parent_commit
-        .author()
-        .map_err(|e| GitError::Git(e.to_string()))?;
-    let author = AuthorId::new(format!("{} <{}>", author_sig.name, author_sig.email));
-    let git_time = author_sig
-        .time()
-        .map_err(|e| GitError::Git(e.to_string()))?;
-    let timestamp = Timestamp::from(
-        chrono::Utc
-            .timestamp_opt(git_time.seconds, 0)
-            .single()
-            .unwrap_or_else(chrono::Utc::now),
-    );
-
-    let base_id = base_link_change_id_from_git_oid(&parent_oid);
-    let base_change = SemanticChange {
-        id: base_id,
-        parents: vec![genesis_id],
-        timestamp,
-        author,
-        message: "kin import: base-link (window base universe)".to_string(),
-        entity_deltas: vec![],   // populated by the semantic enrichment pass
-        relation_deltas: vec![], // populated by the semantic enrichment pass
-        artifact_deltas,
-        projected_files: vec![],
-        spec_link: None,
-        evidence: vec![],
-        risk_summary: None,
-        authored_on: Some(BranchName::new("main")),
-    };
-
-    // Re-point the window base's first parent from genesis to the base-link so
-    // every head's first-parent ancestry now flows through the base universe.
-    if let Some(first) = changes[window_base_idx].change.parents.first_mut() {
-        if *first == genesis_id {
-            *first = base_id;
-        }
+    let first_anchor = anchors.first().map(|anchor| anchor.change.id);
+    for (imported, parents) in changes.iter_mut().zip(replacement_parents) {
+        imported.change.parents = parents;
     }
-
-    // Prepend: created before its child, and processed first by the topological
-    // enrichment pass (its own parent, genesis, is out of the imported set).
-    changes.insert(
-        0,
-        ImportedChange {
-            change: base_change,
-            git_oid: parent_oid.to_string(),
-        },
-    );
-
-    Ok(Some(base_id))
+    // All roots precede every imported child. OID sorting above makes the
+    // multi-anchor prefix deterministic without disturbing Git parent order.
+    changes.splice(0..0, anchors);
+    Ok(first_anchor)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
 
     #[test]
     fn test_open_repo_resolves_git_suffix_directories() {
@@ -1053,6 +1448,10 @@ mod tests {
                     .args(["config", "gc.auto", "0"])
                     .current_dir(dir)
                     .output();
+                let _ = Command::new("git")
+                    .args(["config", "core.hooksPath", ".git/no-hooks"])
+                    .current_dir(dir)
+                    .output();
                 true
             }
             _ => false,
@@ -1068,12 +1467,147 @@ mod tests {
     }
 
     #[test]
+    fn truncated_history_boundary_budget_fails_closed_at_each_dimension() {
+        assert!(enforce_base_link_budget(
+            MAX_BASE_LINK_ANCHORS,
+            MAX_BASE_LINK_TREE_ENTRIES,
+            MAX_BASE_LINK_EXPANDED_BYTES,
+        )
+        .is_ok());
+        for error in [
+            enforce_base_link_budget(MAX_BASE_LINK_ANCHORS + 1, 0, 0).unwrap_err(),
+            enforce_base_link_budget(1, MAX_BASE_LINK_TREE_ENTRIES + 1, 0).unwrap_err(),
+            enforce_base_link_budget(1, 1, MAX_BASE_LINK_EXPANDED_BYTES + 1).unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("limit"));
+        }
+    }
+
+    #[test]
+    fn bounded_tree_enumeration_stops_at_entry_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo(dir.path()) {
+            eprintln!("git not available, skipping bounded tree test");
+            return;
+        }
+        std::fs::write(dir.path().join("a.txt"), b"a\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"b\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "a.txt", "b.txt"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-m", "two files"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+
+        let repo = open_repo(dir.path()).unwrap();
+        let tree = repo.head_commit().unwrap().tree().unwrap();
+        assert_eq!(
+            bounded_full_tree_blob_entries(&repo, &tree, 2)
+                .unwrap()
+                .len(),
+            2
+        );
+        let error = bounded_full_tree_blob_entries(&repo, &tree, 1).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("remaining source-entry budget of 1"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn different_oids_produce_different_ids() {
         let oid1 = gix::ObjectId::from_hex(b"aabbccddee00112233445566778899aabbccddee").unwrap();
         let oid2 = gix::ObjectId::from_hex(b"00112233445566778899aabbccddeeff00112233").unwrap();
         let id1 = change_id_from_git_oid(&oid1);
         let id2 = change_id_from_git_oid(&oid2);
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn git_import_rejects_out_of_range_author_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo(dir.path()) {
+            eprintln!("git not available, skipping invalid timestamp test");
+            return;
+        }
+
+        std::fs::write(dir.path().join("owned.txt"), "owned\n").unwrap();
+        let add = Command::new("git")
+            .args(["add", "owned.txt"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(add.status.success());
+        let tree = Command::new("git")
+            .args(["write-tree"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(tree.status.success());
+        let tree_oid = String::from_utf8(tree.stdout).unwrap();
+        let raw_commit = format!(
+            "tree {}\nauthor Test <test@test.com> {} +0000\ncommitter Test <test@test.com> {} +0000\n\nout of range\n",
+            tree_oid.trim(),
+            i64::MAX,
+            i64::MAX
+        );
+        let mut hash = Command::new("git")
+            .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+            .current_dir(dir.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        hash.stdin
+            .take()
+            .unwrap()
+            .write_all(raw_commit.as_bytes())
+            .unwrap();
+        let hash = hash.wait_with_output().unwrap();
+        assert!(
+            hash.status.success(),
+            "git rejected raw commit fixture: {}",
+            String::from_utf8_lossy(&hash.stderr)
+        );
+        let commit_oid = String::from_utf8(hash.stdout).unwrap();
+        let update = Command::new("git")
+            .args(["update-ref", "HEAD", commit_oid.trim()])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(update.status.success());
+
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x24; 32]));
+        let first = import_git_history(
+            dir.path(),
+            genesis_id,
+            &ImportOptions {
+                shallow: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let second = import_git_history(
+            dir.path(),
+            genesis_id,
+            &ImportOptions {
+                shallow: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(first.to_string().contains("outside Kin's supported range"));
+        assert_eq!(first.to_string(), second.to_string());
     }
 
     #[test]
@@ -1128,6 +1662,191 @@ mod tests {
         assert_eq!(stored, content);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn import_preserves_regular_executable_symlink_and_mode_only_changes() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo(dir.path()) {
+            eprintln!("git not available, skipping source mode import test");
+            return;
+        }
+
+        let regular_path = dir.path().join("plain.txt");
+        let executable_path = dir.path().join("run.sh");
+        std::fs::write(&regular_path, b"plain\n").unwrap();
+        std::fs::write(&executable_path, b"#!/bin/sh\necho exact\n").unwrap();
+        let mut executable_permissions = std::fs::metadata(&executable_path).unwrap().permissions();
+        executable_permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable_path, executable_permissions).unwrap();
+        symlink("plain.txt", dir.path().join("plain-link")).unwrap();
+        let initial = Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(initial.success());
+        let initial = Command::new("git")
+            .args(["commit", "-m", "exact source modes"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(initial.success());
+
+        let mut regular_permissions = std::fs::metadata(&regular_path).unwrap().permissions();
+        regular_permissions.set_mode(0o755);
+        std::fs::set_permissions(&regular_path, regular_permissions).unwrap();
+        let mode_change = Command::new("git")
+            .args(["add", "plain.txt"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(mode_change.success());
+        let mode_change = Command::new("git")
+            .args(["commit", "-m", "make plain executable"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(mode_change.success());
+
+        let blob_store = BlobStore::new(dir.path().join("kin-blobs")).unwrap();
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x12; 32]));
+        let imported = import_git_history_with_blobs(
+            dir.path(),
+            genesis_id,
+            &ImportOptions::default(),
+            Some(&blob_store),
+        )
+        .expect("git import should preserve source modes");
+        assert_eq!(imported.len(), 2);
+
+        let initial_kinds: std::collections::BTreeMap<_, _> = imported[0]
+            .change
+            .artifact_deltas
+            .iter()
+            .map(|delta| (delta.file_id.0.as_str(), delta.kind))
+            .collect();
+        assert_eq!(
+            initial_kinds.get("plain.txt"),
+            Some(&ArtifactDeltaKind::AddedRegularFile)
+        );
+        assert_eq!(
+            initial_kinds.get("run.sh"),
+            Some(&ArtifactDeltaKind::AddedExecutableFile)
+        );
+        assert_eq!(
+            initial_kinds.get("plain-link"),
+            Some(&ArtifactDeltaKind::AddedSymlink)
+        );
+        let link_delta = imported[0]
+            .change
+            .artifact_deltas
+            .iter()
+            .find(|delta| delta.file_id.0 == "plain-link")
+            .unwrap();
+        let link_target = blob_store
+            .read(&kin_blobs::Hash256(link_delta.new_hash.unwrap().0))
+            .unwrap();
+        assert_eq!(link_target, b"plain.txt");
+
+        assert_eq!(imported[1].change.artifact_deltas.len(), 1);
+        let mode_delta = &imported[1].change.artifact_deltas[0];
+        assert_eq!(mode_delta.file_id.0, "plain.txt");
+        assert_eq!(mode_delta.kind, ArtifactDeltaKind::ModifiedExecutableFile);
+        assert_eq!(mode_delta.old_hash, mode_delta.new_hash);
+    }
+
+    #[test]
+    fn exact_import_rejects_gitlinks_instead_of_omitting_them() {
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo(dir.path()) {
+            eprintln!("git not available, skipping gitlink rejection test");
+            return;
+        }
+
+        std::fs::write(dir.path().join("seed.txt"), "seed\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "seed.txt"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-m", "seed"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        let head = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        let head = String::from_utf8(head.stdout).unwrap();
+        let cache_info = format!("160000,{},vendor/sub", head.trim());
+        assert!(Command::new("git")
+            .args(["update-index", "--add", "--cacheinfo", &cache_info])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-m", "add gitlink"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x13; 32]));
+        let error = import_git_history(dir.path(), genesis_id, &ImportOptions::default())
+            .expect_err("an exact import must not silently omit gitlinks");
+        assert!(error.to_string().contains("gitlink/submodule"));
+    }
+
+    #[test]
+    fn exact_import_path_decoder_rejects_non_utf8_bytes() {
+        let error = utf8_git_path(b"invalid-\xff.rs")
+            .expect_err("an exact import must not record a lossy path identity");
+        assert!(error.to_string().contains("non-UTF-8 path"));
+    }
+
+    // Linux filesystems accept arbitrary non-NUL path bytes. macOS's filesystem
+    // APIs reject this fixture at creation time, so the end-to-end repository
+    // case belongs on Linux while the decoder unit test above runs everywhere.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_import_rejects_non_utf8_paths_instead_of_lossy_identity() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo(dir.path()) {
+            eprintln!("git not available, skipping non-UTF-8 path rejection test");
+            return;
+        }
+
+        let name = std::ffi::OsString::from_vec(b"invalid-\xff.rs".to_vec());
+        std::fs::write(dir.path().join(name), "fn invalid() {}\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-m", "non utf8 path"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x14; 32]));
+        let error = import_git_history(dir.path(), genesis_id, &ImportOptions::default())
+            .expect_err("an exact import must not record a lossy path identity");
+        assert!(error.to_string().contains("non-UTF-8 path"));
+    }
+
     #[test]
     fn import_tracks_only_changed_files_for_non_root_commits() {
         let dir = tempfile::tempdir().unwrap();
@@ -1174,7 +1893,10 @@ mod tests {
 
         assert_eq!(
             paths,
-            vec![("alpha.txt".to_string(), ArtifactDeltaKind::Modified)]
+            vec![(
+                "alpha.txt".to_string(),
+                ArtifactDeltaKind::ModifiedRegularFile,
+            )]
         );
     }
 
@@ -1265,8 +1987,8 @@ mod tests {
         assert_eq!(
             base_paths,
             vec![
-                ("alpha.txt".to_string(), ArtifactDeltaKind::Added),
-                ("beta.txt".to_string(), ArtifactDeltaKind::Added),
+                ("alpha.txt".to_string(), ArtifactDeltaKind::AddedRegularFile,),
+                ("beta.txt".to_string(), ArtifactDeltaKind::AddedRegularFile,),
             ],
             "base-link must carry the full base universe as sorted Additions"
         );
@@ -1333,6 +2055,76 @@ mod tests {
             before,
             "no synthetic change should be added"
         );
+    }
+
+    #[test]
+    fn anchor_base_link_failure_leaves_imported_history_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo(dir.path()) {
+            eprintln!("git not available, skipping base-link atomic failure test");
+            return;
+        }
+
+        for (index, contents) in ["one\n", "two\n"].into_iter().enumerate() {
+            std::fs::write(dir.path().join("alpha.txt"), contents).unwrap();
+            let _ = Command::new("git")
+                .args(["add", "alpha.txt"])
+                .current_dir(dir.path())
+                .output();
+            let stamp = format!("{} +0000", 1_000_000_000 + index as i64);
+            let output = Command::new("git")
+                .args(["commit", "-m", &format!("c{}", index + 1)])
+                .env("GIT_AUTHOR_DATE", &stamp)
+                .env("GIT_COMMITTER_DATE", &stamp)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        }
+
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x45; 32]));
+        let mut imported = import_git_history(
+            dir.path(),
+            genesis_id,
+            &ImportOptions {
+                max_commits: 1,
+                ..Default::default()
+            },
+        )
+        .expect("truncated import should succeed before object corruption");
+        let before: Vec<_> = imported
+            .iter()
+            .map(|entry| (entry.git_oid.clone(), format!("{:?}", entry.change)))
+            .collect();
+
+        let parent_oid = Command::new("git")
+            .args(["rev-parse", "HEAD^"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(parent_oid.status.success());
+        let parent_oid = String::from_utf8(parent_oid.stdout).unwrap();
+        let parent_oid = parent_oid.trim();
+        let parent_object = dir
+            .path()
+            .join(".git/objects")
+            .join(&parent_oid[..2])
+            .join(&parent_oid[2..]);
+        std::fs::remove_file(&parent_object).expect("fixture parent commit must be loose");
+
+        let error =
+            anchor_imported_history_at_base_link(dir.path(), &mut imported, genesis_id, None)
+                .expect_err("missing boundary parent object must fail anchoring");
+        assert!(
+            error.to_string().contains(parent_oid),
+            "error must identify the missing parent: {error}"
+        );
+
+        let after: Vec<_> = imported
+            .iter()
+            .map(|entry| (entry.git_oid.clone(), format!("{:?}", entry.change)))
+            .collect();
+        assert_eq!(after, before, "failed anchoring must not reparent history");
     }
 
     #[test]
@@ -1517,6 +2309,57 @@ mod tests {
         Some(dir)
     }
 
+    fn build_truncated_merge_correction_repo() -> Option<tempfile::TempDir> {
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo(dir.path()) {
+            return None;
+        }
+        let _ = Command::new("git")
+            .args(["config", "core.hooksPath", "/dev/null"])
+            .current_dir(dir.path())
+            .output();
+        let fixed_date = "1112911993 +0000";
+
+        run_dated_git(
+            dir.path(),
+            &["symbolic-ref", "HEAD", "refs/heads/main"],
+            fixed_date,
+        );
+        std::fs::write(
+            dir.path().join("gone.txt"),
+            "retained only by second parent\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("conflict.txt"), "base\n").unwrap();
+        std::fs::write(dir.path().join("mode.sh"), "#!/bin/sh\necho stable\n").unwrap();
+        run_dated_git(dir.path(), &["add", "."], fixed_date);
+        run_dated_git(dir.path(), &["commit", "-m", "base"], fixed_date);
+
+        run_dated_git(dir.path(), &["switch", "-c", "feature"], fixed_date);
+        std::fs::write(dir.path().join("conflict.txt"), "feature content\n").unwrap();
+        std::fs::write(dir.path().join("feature-only.txt"), "feature\n").unwrap();
+        run_dated_git(dir.path(), &["add", "."], fixed_date);
+        run_dated_git(dir.path(), &["commit", "-m", "feature"], fixed_date);
+
+        run_dated_git(dir.path(), &["switch", "main"], fixed_date);
+        std::fs::remove_file(dir.path().join("gone.txt")).unwrap();
+        std::fs::write(dir.path().join("conflict.txt"), "main content\n").unwrap();
+        run_dated_git(dir.path(), &["add", "-A"], fixed_date);
+        run_dated_git(
+            dir.path(),
+            &["update-index", "--chmod=+x", "mode.sh"],
+            fixed_date,
+        );
+        run_dated_git(dir.path(), &["commit", "-m", "main"], fixed_date);
+        run_dated_git(
+            dir.path(),
+            &["merge", "--no-ff", "-X", "ours", "feature", "-m", "merge"],
+            fixed_date,
+        );
+
+        Some(dir)
+    }
+
     fn assert_import_order_is_parent_first(changes: &[ImportedChange]) {
         let positions: HashMap<SemanticChangeId, usize> = changes
             .iter()
@@ -1671,6 +2514,206 @@ mod tests {
             bounded_head.parents.contains(&genesis_id),
             "the omitted merge parent must close at the history boundary"
         );
+    }
+
+    #[test]
+    fn truncated_merge_anchors_every_boundary_parent_and_replays_exact_archive() {
+        use kin_model::{ChangeStore, SourceTreeResolution};
+
+        let Some(dir) = build_equal_timestamp_merge_repo() else {
+            eprintln!("git not available, skipping merge-boundary anchor test");
+            return;
+        };
+        let repo = open_repo(dir.path()).expect("open repo");
+        let head_id = repo
+            .head_ref()
+            .expect("head_ref")
+            .expect("non-empty repo")
+            .id()
+            .detach();
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x68; 32]));
+        let blob_store = BlobStore::new(dir.path().join("boundary-blobs")).unwrap();
+
+        // Keep only the merge. Both sides of the root -> {main, feature} ->
+        // merge diamond cross the truncation boundary independently.
+        let mut imported = import_full(&repo, head_id, genesis_id, 1, Some(&blob_store))
+            .expect("bounded merge import");
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].change.parents, vec![genesis_id]);
+
+        anchor_imported_history_at_base_link(
+            dir.path(),
+            &mut imported,
+            genesis_id,
+            Some(&blob_store),
+        )
+        .expect("anchor every omitted merge parent")
+        .expect("truncated merge must create boundary anchors");
+
+        assert_eq!(
+            imported.len(),
+            3,
+            "two full-tree roots must precede the one imported merge"
+        );
+        let merge = imported.last().expect("merge remains the imported head");
+        assert_eq!(merge.change.parents.len(), 2);
+        assert!(merge
+            .change
+            .parents
+            .iter()
+            .all(|parent| *parent != genesis_id));
+
+        // Parent order and identity remain the original Git provenance, rather
+        // than two boundary edges collapsing into one anonymous genesis edge.
+        let anchor_oid_by_id: HashMap<_, _> = imported[..2]
+            .iter()
+            .map(|anchor| (anchor.change.id, anchor.git_oid.clone()))
+            .collect();
+        let git_merge = repo.find_commit(head_id).expect("find merge commit");
+        let expected_parent_oids: Vec<_> = git_merge
+            .parent_ids()
+            .map(|parent| parent.to_string())
+            .collect();
+        let replay_parent_oids: Vec<_> = merge
+            .change
+            .parents
+            .iter()
+            .map(|parent| anchor_oid_by_id[parent].clone())
+            .collect();
+        assert_eq!(replay_parent_oids, expected_parent_oids);
+
+        // Each synthetic boundary node is independently exact and carries its
+        // omitted parent's complete tree, not merely files touched in-window.
+        for anchor in &imported[..2] {
+            assert_eq!(anchor.change.parents, vec![genesis_id]);
+            let parent_oid = gix::ObjectId::from_hex(anchor.git_oid.as_bytes()).unwrap();
+            let parent_tree = repo.find_commit(parent_oid).unwrap().tree().unwrap();
+            let expected_paths: Vec<_> = full_tree_blob_entries(&repo, &parent_tree)
+                .unwrap()
+                .into_iter()
+                .map(|(path, _, kind)| (path, added_artifact_kind(kind)))
+                .collect();
+            let anchor_paths: Vec<_> = anchor
+                .change
+                .artifact_deltas
+                .iter()
+                .map(|delta| (delta.file_id.0.clone(), delta.kind))
+                .collect();
+            assert_eq!(anchor_paths, expected_paths);
+        }
+
+        let graph = kin_db::InMemoryGraph::new();
+        let genesis = bare_change(genesis_id, vec![]).change;
+        graph.create_change(&genesis).unwrap();
+        for change in &imported {
+            graph.create_change(&change.change).unwrap();
+        }
+        let SourceTreeResolution::Exact { entries } =
+            graph.resolve_source_tree_at(&merge.change.id).unwrap()
+        else {
+            panic!("anchored truncated merge must resolve to an exact source tree")
+        };
+
+        // Compare an archive-shaped manifest (path, mode, bytes) against the
+        // authoritative Git merge tree. This proves both graph identities and
+        // persisted object bytes are sufficient to reproduce the exact archive.
+        let head_tree = git_merge.tree().unwrap();
+        let expected_entries = full_tree_blob_entries(&repo, &head_tree).unwrap();
+        let mut expected_archive = Vec::new();
+        for (path, blob_oid, kind) in expected_entries {
+            let bytes = repo.find_blob(blob_oid).unwrap().take_data();
+            expected_archive.push((path, kind, bytes));
+        }
+        let mut replay_archive = Vec::new();
+        let mut resolved: Vec<_> = entries.into_iter().collect();
+        resolved.sort_by(|left, right| left.0 .0.cmp(&right.0 .0));
+        for (path, entry) in resolved {
+            let bytes = blob_store
+                .read(&kin_blobs::Hash256(*entry.hash.as_bytes()))
+                .unwrap();
+            replay_archive.push((path.0, entry.kind, bytes));
+        }
+        assert_eq!(replay_archive, expected_archive);
+    }
+
+    #[test]
+    fn truncated_merge_correction_preserves_deletion_content_and_mode_choices() {
+        use kin_model::{ChangeStore, SourceTreeResolution};
+
+        let Some(dir) = build_truncated_merge_correction_repo() else {
+            eprintln!("git not available, skipping merge-correction test");
+            return;
+        };
+        let repo = open_repo(dir.path()).expect("open repo");
+        let head_id = repo
+            .head_ref()
+            .expect("head_ref")
+            .expect("non-empty repo")
+            .id()
+            .detach();
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x69; 32]));
+        let blob_store = BlobStore::new(dir.path().join("correction-blobs")).unwrap();
+
+        let mut imported = import_full(&repo, head_id, genesis_id, 1, Some(&blob_store))
+            .expect("bounded merge import");
+        anchor_imported_history_at_base_link(
+            dir.path(),
+            &mut imported,
+            genesis_id,
+            Some(&blob_store),
+        )
+        .expect("anchor omitted merge parents")
+        .expect("truncated merge must create anchors");
+
+        let merge = imported.last().expect("merge remains imported head");
+        let by_path: HashMap<_, _> = merge
+            .change
+            .artifact_deltas
+            .iter()
+            .map(|delta| (delta.file_id.0.as_str(), delta.kind))
+            .collect();
+        assert_eq!(by_path["gone.txt"], ArtifactDeltaKind::Removed);
+        assert_eq!(
+            by_path["conflict.txt"],
+            ArtifactDeltaKind::ModifiedRegularFile
+        );
+        assert_eq!(
+            by_path["mode.sh"],
+            ArtifactDeltaKind::ModifiedExecutableFile
+        );
+
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .create_change(&bare_change(genesis_id, vec![]).change)
+            .unwrap();
+        for change in &imported {
+            graph.create_change(&change.change).unwrap();
+        }
+        let SourceTreeResolution::Exact { entries } =
+            graph.resolve_source_tree_at(&merge.change.id).unwrap()
+        else {
+            panic!("truncated merge correction must resolve exactly")
+        };
+
+        let git_merge = repo.find_commit(head_id).unwrap();
+        let expected_entries = full_tree_blob_entries(&repo, &git_merge.tree().unwrap()).unwrap();
+        let mut expected_archive = Vec::new();
+        for (path, blob_oid, kind) in expected_entries {
+            expected_archive.push((path, kind, repo.find_blob(blob_oid).unwrap().take_data()));
+        }
+        let mut replay_archive = Vec::new();
+        let mut resolved: Vec<_> = entries.into_iter().collect();
+        resolved.sort_by(|left, right| left.0 .0.cmp(&right.0 .0));
+        for (path, entry) in resolved {
+            replay_archive.push((
+                path.0,
+                entry.kind,
+                blob_store
+                    .read(&kin_blobs::Hash256(*entry.hash.as_bytes()))
+                    .unwrap(),
+            ));
+        }
+        assert_eq!(replay_archive, expected_archive);
     }
 
     /// A SemanticChange carrying only an id and parents — enough to exercise the
@@ -1922,6 +2965,77 @@ mod tests {
             .env("GIT_COMMITTER_DATE", &date)
             .current_dir(repo)
             .output();
+    }
+
+    #[test]
+    fn shallow_boundary_is_a_full_tree_semantic_root_without_missing_parent_anchors() {
+        let source = tempfile::tempdir().unwrap();
+        if !init_git_repo(source.path()) {
+            eprintln!("git not available, skipping shallow-boundary test");
+            return;
+        }
+        commit_file(source.path(), "a.txt", "one\n", "one", "1000000000");
+        commit_file(source.path(), "b.txt", "two\n", "two", "1000000100");
+        commit_file(source.path(), "a.txt", "three\n", "three", "1000000200");
+
+        let clone_parent = tempfile::tempdir().unwrap();
+        let shallow = clone_parent.path().join("shallow");
+        let clone = Command::new("git")
+            .args([
+                "clone",
+                "--depth",
+                "1",
+                &format!("file://{}", source.path().display()),
+                shallow.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            clone.status.success(),
+            "shallow clone failed: {}",
+            String::from_utf8_lossy(&clone.stderr)
+        );
+
+        let genesis = SemanticChangeId::from_hash(Hash256::from_bytes([0xa7; 32]));
+        let recent_store = BlobStore::new(clone_parent.path().join("recent-objects")).unwrap();
+        let full_store = BlobStore::new(clone_parent.path().join("full-objects")).unwrap();
+        let mut recent = import_git_history_with_blobs(
+            &shallow,
+            genesis,
+            &ImportOptions {
+                max_commits: 50,
+                ..Default::default()
+            },
+            Some(&recent_store),
+        )
+        .unwrap();
+        let mut full = import_git_history_with_blobs(
+            &shallow,
+            genesis,
+            &ImportOptions::default(),
+            Some(&full_store),
+        )
+        .unwrap();
+
+        assert_eq!(recent.len(), 1);
+        assert_eq!(format!("{recent:?}"), format!("{full:?}"));
+        assert_eq!(recent[0].change.parents, vec![genesis]);
+        assert_eq!(recent[0].change.artifact_deltas.len(), 2);
+        assert_eq!(
+            anchor_imported_history_at_base_link(
+                &shallow,
+                &mut recent,
+                genesis,
+                Some(&recent_store),
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            anchor_imported_history_at_base_link(&shallow, &mut full, genesis, Some(&full_store),)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

@@ -315,6 +315,20 @@ impl KinLayout {
         self.root.join("merge_state.json")
     }
 
+    /// `.kin/pending-release.json` — exact serialized daemon release request
+    /// retained until the daemon reports durable success or definitive
+    /// rejection. This lets a later CLI process resume an uncertain timeout or
+    /// transport failure without constructing a second release marker.
+    pub fn pending_release_path(&self) -> PathBuf {
+        self.root.join("pending-release.json")
+    }
+
+    /// `.kin/pending-release.lock` — cross-process serialization for release
+    /// recovery, policy preflight, and marker construction.
+    pub fn pending_release_lock_path(&self) -> PathBuf {
+        self.root.join("pending-release.lock")
+    }
+
     /// All directories that must exist inside `.kin/`.
     ///
     pub fn all_dirs(&self) -> Vec<PathBuf> {

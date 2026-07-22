@@ -9,8 +9,8 @@ use std::time::Duration;
 use gix::objs::tree::{Entry, EntryKind, EntryMode};
 use gix::objs::{Commit, Tree};
 use kin_blobs::BlobStore;
-use kin_model::{ArtifactDeltaKind, BranchName, GraphStore, SemanticChange, SemanticChangeId};
-use tracing::{debug, info, warn};
+use kin_model::{BranchName, GraphStore, SemanticChange, SemanticChangeId, SourceEntryKind};
+use tracing::{debug, info};
 
 use crate::error::{GitError, Result};
 use crate::genesis::is_genesis_change;
@@ -126,8 +126,11 @@ pub fn export_changes(
 
     let mut commits_exported = 0usize;
     let commits_skipped = 0usize;
-    // Track the cumulative file state across all changes for tree building.
-    let mut file_state: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    // Track one immutable file state per semantic change. A single cumulative
+    // map contaminates sibling branches: exporting sibling B after sibling A
+    // would incorrectly include A-only files in B's Git tree.
+    let mut file_states: HashMap<SemanticChangeId, BTreeMap<String, SourceFileState>> =
+        HashMap::new();
     let mut last_commit_id: Option<gix::ObjectId> = existing_head;
 
     for change in changes {
@@ -137,8 +140,18 @@ pub fn export_changes(
             continue;
         }
 
-        // Apply artifact deltas to our file state.
-        apply_artifact_deltas(change, blob_store, &mut file_state);
+        // Reconstruct this change from its own parent states. Parent order is
+        // deterministic; later parents fill/replace paths before the change's
+        // own deltas apply. Exact imported merges carry a full correction.
+        let mut file_state = BTreeMap::new();
+        for parent in &change.parents {
+            if let Some(parent_state) = file_states.get(parent) {
+                for (path, source) in parent_state {
+                    file_state.insert(path.clone(), source.clone());
+                }
+            }
+        }
+        apply_artifact_deltas(change, blob_store, &mut file_state)?;
 
         // Build the Git tree from the current file state.
         let tree_id = build_tree(&git_repo, &file_state)?;
@@ -158,6 +171,7 @@ pub fn export_changes(
         );
 
         change_to_commit.insert(change.id, commit_id);
+        file_states.insert(change.id, file_state);
         last_commit_id = Some(commit_id);
         commits_exported += 1;
     }
@@ -188,32 +202,36 @@ pub fn export_changes(
 fn apply_artifact_deltas(
     change: &SemanticChange,
     blob_store: &BlobStore,
-    file_state: &mut BTreeMap<String, Vec<u8>>,
-) {
+    file_state: &mut BTreeMap<String, SourceFileState>,
+) -> Result<()> {
     for delta in &change.artifact_deltas {
-        match delta.kind {
-            ArtifactDeltaKind::Removed => {
-                file_state.remove(&delta.file_id.0);
-            }
-            ArtifactDeltaKind::Added | ArtifactDeltaKind::Modified => {
-                if let Some(hash) = &delta.new_hash {
-                    match blob_store.read(&kin_blobs::Hash256(hash.0)) {
-                        Ok(content) => {
-                            file_state.insert(delta.file_id.0.clone(), content);
-                        }
-                        Err(e) => {
-                            warn!(
-                                hash = %hash,
-                                file = %delta.file_id,
-                                error = %e,
-                                "blob not found for artifact delta, skipping"
-                            );
-                        }
-                    }
-                }
-            }
+        if delta.kind.is_removed() {
+            file_state.remove(&delta.file_id.0);
+            continue;
         }
+        let kind = delta.kind.source_entry_kind().ok_or_else(|| {
+            GitError::Other(format!(
+                "cannot export legacy mode-unknown artifact delta for {} in change {}; exact source mode backfill is required",
+                delta.file_id, change.id
+            ))
+        })?;
+        let hash = delta.new_hash.ok_or_else(|| {
+            GitError::Other(format!(
+                "cannot export artifact delta for {} in change {} without an exact content identity",
+                delta.file_id, change.id
+            ))
+        })?;
+        let content = blob_store
+            .read(&kin_blobs::Hash256(hash.0))
+            .map_err(|error| {
+                GitError::Other(format!(
+                    "cannot export exact source blob {} for {} in change {}: {error}",
+                    hash, delta.file_id, change.id
+                ))
+            })?;
+        file_state.insert(delta.file_id.0.clone(), SourceFileState { content, kind });
     }
+    Ok(())
 }
 
 /// Build a Git tree object from a flat map of file paths to contents.
@@ -221,7 +239,7 @@ fn apply_artifact_deltas(
 /// Handles nested directory structures by creating intermediate tree objects.
 fn build_tree(
     repo: &gix::Repository,
-    file_state: &BTreeMap<String, Vec<u8>>,
+    file_state: &BTreeMap<String, SourceFileState>,
 ) -> Result<gix::ObjectId> {
     if file_state.is_empty() {
         // Return the well-known empty tree hash.
@@ -233,17 +251,20 @@ fn build_tree(
     let mut dir_entries: BTreeMap<String, Vec<(String, DirEntry)>> = BTreeMap::new();
 
     // First pass: write all blobs and record them with their directory.
-    for (path, content) in file_state {
+    for (path, source) in file_state {
         let blob_id = repo
-            .write_blob(content)
+            .write_blob(&source.content)
             .map_err(|e| GitError::Git(e.to_string()))?
             .detach();
 
         let (dir, filename) = split_path(path);
-        dir_entries
-            .entry(dir)
-            .or_default()
-            .push((filename, DirEntry::Blob(blob_id)));
+        dir_entries.entry(dir).or_default().push((
+            filename,
+            DirEntry::Source {
+                id: blob_id,
+                kind: source.kind,
+            },
+        ));
     }
 
     // Build trees bottom-up: process deepest directories first.
@@ -298,9 +319,15 @@ fn build_tree(
         if let Some(file_entries) = dir_entries.get(dir) {
             for (name, entry) in file_entries {
                 match entry {
-                    DirEntry::Blob(id) => {
+                    DirEntry::Source { id, kind } => {
                         entries.push(Entry {
-                            mode: EntryMode::from(EntryKind::Blob),
+                            mode: EntryMode::from(match kind {
+                                SourceEntryKind::File { executable: false } => EntryKind::Blob,
+                                SourceEntryKind::File { executable: true } => {
+                                    EntryKind::BlobExecutable
+                                }
+                                SourceEntryKind::Symlink => EntryKind::Link,
+                            }),
                             filename: name.clone().into(),
                             oid: *id,
                         });
@@ -340,9 +367,18 @@ fn build_tree(
         .ok_or_else(|| GitError::Other("failed to build root tree".to_string()))
 }
 
+#[derive(Debug, Clone)]
+struct SourceFileState {
+    content: Vec<u8>,
+    kind: SourceEntryKind,
+}
+
 #[derive(Debug)]
 enum DirEntry {
-    Blob(gix::ObjectId),
+    Source {
+        id: gix::ObjectId,
+        kind: SourceEntryKind,
+    },
 }
 
 /// Split a path into (directory, filename).
@@ -1483,6 +1519,21 @@ mod tests {
         object.data.clone()
     }
 
+    fn entry_kind_from_commit(
+        repo_path: &Path,
+        commit_oid: gix::ObjectId,
+        path: &str,
+    ) -> EntryKind {
+        let repo = gix::open(repo_path).unwrap();
+        let commit = repo.find_commit(commit_oid).unwrap();
+        let tree = commit.tree().unwrap();
+        tree.lookup_entry_by_path(path)
+            .unwrap()
+            .expect("entry not found")
+            .mode()
+            .kind()
+    }
+
     // -- Tests --
 
     #[test]
@@ -1525,7 +1576,7 @@ mod tests {
             "add greeting",
             vec![make_delta(
                 "hello.txt",
-                ArtifactDeltaKind::Added,
+                ArtifactDeltaKind::AddedRegularFile,
                 Some(hash),
             )],
         );
@@ -1558,6 +1609,102 @@ mod tests {
     }
 
     #[test]
+    fn export_preserves_regular_executable_and_symlink_modes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob_store = make_blob_store(tmp.path());
+        let genesis = make_genesis();
+        let regular_hash = store_blob(&blob_store, b"plain\n");
+        let executable_hash = store_blob(&blob_store, b"#!/bin/sh\necho exact\n");
+        let symlink_hash = store_blob(&blob_store, b"plain.txt");
+        let change = make_change(
+            1,
+            vec![genesis.id],
+            "add exact source modes",
+            vec![
+                make_delta(
+                    "plain.txt",
+                    ArtifactDeltaKind::AddedRegularFile,
+                    Some(regular_hash),
+                ),
+                make_delta(
+                    "run.sh",
+                    ArtifactDeltaKind::AddedExecutableFile,
+                    Some(executable_hash),
+                ),
+                make_delta(
+                    "plain-link",
+                    ArtifactDeltaKind::AddedSymlink,
+                    Some(symlink_hash),
+                ),
+            ],
+        );
+        let branch_name = BranchName::new("main");
+        let graph = MockGraph::with_branch_and_changes("main", change.id, vec![genesis, change]);
+        let git_path = tmp.path().join("repo.git");
+        export_to_git(
+            &graph,
+            &blob_store,
+            make_genesis().id,
+            &branch_name,
+            &git_path,
+        )
+        .unwrap();
+
+        let repo = gix::open(&git_path).unwrap();
+        let head = repo
+            .find_reference("refs/heads/main")
+            .unwrap()
+            .id()
+            .detach();
+        assert_eq!(
+            entry_kind_from_commit(&git_path, head, "plain.txt"),
+            EntryKind::Blob
+        );
+        assert_eq!(
+            entry_kind_from_commit(&git_path, head, "run.sh"),
+            EntryKind::BlobExecutable
+        );
+        assert_eq!(
+            entry_kind_from_commit(&git_path, head, "plain-link"),
+            EntryKind::Link
+        );
+        assert_eq!(
+            read_file_from_commit(&git_path, head, "plain-link"),
+            b"plain.txt"
+        );
+    }
+
+    #[test]
+    fn export_rejects_legacy_mode_unknown_deltas() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob_store = make_blob_store(tmp.path());
+        let genesis = make_genesis();
+        let hash = store_blob(&blob_store, b"legacy\n");
+        let change = make_change(
+            1,
+            vec![genesis.id],
+            "legacy source",
+            vec![make_delta(
+                "legacy.txt",
+                ArtifactDeltaKind::Added,
+                Some(hash),
+            )],
+        );
+        let branch_name = BranchName::new("main");
+        let graph =
+            MockGraph::with_branch_and_changes("main", change.id, vec![genesis.clone(), change]);
+        let error = export_to_git(
+            &graph,
+            &blob_store,
+            genesis.id,
+            &branch_name,
+            &tmp.path().join("repo.git"),
+        )
+        .expect_err("legacy mode-unknown history must not be normalized during export");
+        assert!(error.to_string().contains("mode-unknown"));
+    }
+
+    #[test]
     fn export_multi_change_chain() {
         let tmp = tempfile::tempdir().unwrap();
         let blob_store = make_blob_store(tmp.path());
@@ -1570,7 +1717,7 @@ mod tests {
             "initial file",
             vec![make_delta(
                 "file.txt",
-                ArtifactDeltaKind::Added,
+                ArtifactDeltaKind::AddedRegularFile,
                 Some(hash1),
             )],
         );
@@ -1582,7 +1729,7 @@ mod tests {
             "update file",
             vec![make_delta(
                 "file.txt",
-                ArtifactDeltaKind::Modified,
+                ArtifactDeltaKind::ModifiedRegularFile,
                 Some(hash2),
             )],
         );
@@ -1594,7 +1741,7 @@ mod tests {
             "add another file",
             vec![make_delta(
                 "src/lib.rs",
-                ArtifactDeltaKind::Added,
+                ArtifactDeltaKind::AddedRegularFile,
                 Some(hash3),
             )],
         );
@@ -1659,7 +1806,7 @@ mod tests {
             "feature work",
             vec![make_delta(
                 "feature.rs",
-                ArtifactDeltaKind::Added,
+                ArtifactDeltaKind::AddedRegularFile,
                 Some(hash),
             )],
         );
@@ -1964,7 +2111,7 @@ mod tests {
             "first commit",
             vec![make_delta(
                 "file.txt",
-                ArtifactDeltaKind::Added,
+                ArtifactDeltaKind::AddedRegularFile,
                 Some(hash1),
             )],
         );
@@ -1987,7 +2134,7 @@ mod tests {
             "second commit",
             vec![make_delta(
                 "file.txt",
-                ArtifactDeltaKind::Modified,
+                ArtifactDeltaKind::ModifiedRegularFile,
                 Some(hash2),
             )],
         );
@@ -2031,7 +2178,11 @@ mod tests {
             1,
             vec![genesis.id],
             "add file",
-            vec![make_delta("temp.txt", ArtifactDeltaKind::Added, Some(hash))],
+            vec![make_delta(
+                "temp.txt",
+                ArtifactDeltaKind::AddedRegularFile,
+                Some(hash),
+            )],
         );
 
         let change2 = make_change(
@@ -2084,9 +2235,21 @@ mod tests {
             vec![genesis.id],
             "add nested files",
             vec![
-                make_delta("src/lib/mod.rs", ArtifactDeltaKind::Added, Some(hash1)),
-                make_delta("src/main.rs", ArtifactDeltaKind::Added, Some(hash2)),
-                make_delta("README.md", ArtifactDeltaKind::Added, Some(hash3)),
+                make_delta(
+                    "src/lib/mod.rs",
+                    ArtifactDeltaKind::AddedRegularFile,
+                    Some(hash1),
+                ),
+                make_delta(
+                    "src/main.rs",
+                    ArtifactDeltaKind::AddedRegularFile,
+                    Some(hash2),
+                ),
+                make_delta(
+                    "README.md",
+                    ArtifactDeltaKind::AddedRegularFile,
+                    Some(hash3),
+                ),
             ],
         );
 

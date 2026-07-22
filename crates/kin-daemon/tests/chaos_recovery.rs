@@ -168,6 +168,7 @@ async fn wait_for_path_removed(path: &Path, what: &str, timeout: Duration) {
 async fn create_branch(repo_root: &Path, port: u16, name: &str) {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{port}/graph/branches");
+    let genesis = kin_core::build_genesis_change().id.to_string();
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut backoff = Duration::from_millis(50);
 
@@ -183,7 +184,7 @@ async fn create_branch(repo_root: &Path, port: u16, name: &str) {
             .filter(|token| !token.is_empty());
         let mut request = client.post(&url).json(&serde_json::json!({
             "name": name,
-            "head": "0000000000000000000000000000000000000000000000000000000000000001"
+            "head": genesis
         }));
         if let Some(token) = token {
             request = request.bearer_auth(token);

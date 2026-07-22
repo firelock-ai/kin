@@ -8,10 +8,11 @@ use kin_model::ChangeStore;
 use kin_model::EntityStore;
 use kin_model::VerificationStore;
 use kin_model::{
-    ArtifactId, AuthorId, Entity, EntityDelta, EntityFilter, EntityId, FileLayout, FilePathId,
-    GraphNodeId, Hash256, OpaqueArtifact, ParseCompleteness, Relation, RelationDelta, RelationId,
-    RelationKind, RelationOrigin, SemanticChange, SemanticChangeId, ShallowTrackedFile,
-    SourceRegion, StructuredArtifact, TestCase, TestId, TestKind, TestRunner, Timestamp, WorkScope,
+    ArtifactDeltaKind, ArtifactId, AuthorId, Entity, EntityDelta, EntityFilter, EntityId,
+    FileLayout, FilePathId, GraphNodeId, Hash256, OpaqueArtifact, ParseCompleteness, Relation,
+    RelationDelta, RelationId, RelationKind, RelationOrigin, ResolvedSourceEntry, SemanticChange,
+    SemanticChangeId, ShallowTrackedFile, SourceEntryKind, SourceRegion, SourceTreeResolution,
+    StructuredArtifact, TestCase, TestId, TestKind, TestRunner, Timestamp, WorkScope,
 };
 use kin_projection::build_layout;
 use rayon::prelude::*;
@@ -248,6 +249,14 @@ struct IndexableFile {
     classification: FileClassification,
 }
 
+#[derive(Debug, Clone)]
+struct ExactInitSourceEntry {
+    abs_path: PathBuf,
+    rel_path: String,
+    hash: [u8; 32],
+    kind: kin_model::SourceEntryKind,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 struct InitIndexSummary {
     total_entity_count: usize,
@@ -287,10 +296,9 @@ struct WarmCacheDeltaResult {
     queued_artifacts: Vec<ArtifactId>,
 }
 
-/// Take an independent copy-based snapshot of the working tree before `kin init`
-/// mutates it.  We always use `fs::copy()` rather than hardlinks because
-/// hardlinks share inodes — modifying the original file after init would
-/// silently corrupt the snapshot.
+/// Take an independent snapshot of the working tree before `kin init` mutates
+/// it. Regular files are copied rather than hardlinked; symbolic links are
+/// recreated with their exact target bytes.
 /// Take snapshot BEFORE kin init creates .kin/.
 /// We snapshot to a temp dir, then move it into .kin/snapshot/ after init succeeds.
 ///
@@ -375,10 +383,8 @@ fn walk_and_snapshot(
     file_count: &mut u64,
     total_bytes: &mut u64,
 ) -> Result<()> {
-    let entries = match fs::read_dir(current) {
-        Ok(e) => e,
-        Err(_) => return Ok(()), // skip unreadable dirs
-    };
+    let entries = fs::read_dir(current)
+        .with_context(|| format!("read source directory {}", current.display()))?;
 
     for entry in entries {
         let entry = entry?;
@@ -406,8 +412,25 @@ fn walk_and_snapshot(
 
             *total_bytes += entry.metadata()?.len();
             *file_count += 1;
+        } else if ft.is_symlink() {
+            #[cfg(not(unix))]
+            anyhow::bail!(
+                "kin init cannot preserve symbolic link {} on this platform",
+                rel.display()
+            );
+            #[cfg(unix)]
+            {
+                let dest = snapshot_dir.join(rel);
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let target = fs::read_link(&path)?;
+                std::os::unix::fs::symlink(&target, &dest)?;
+                *total_bytes += target.as_os_str().len() as u64;
+                *file_count += 1;
+            }
         }
-        // Skip symlinks / other special types.
+        // Skip other special types.
     }
 
     Ok(())
@@ -566,6 +589,53 @@ fn stable_change_payload_without_parents_matches(
     }
 
     matches!((payload(left), payload(right)), (Some(left), Some(right)) if left == right)
+        || legacy_git_source_mode_upgrade_matches(left, right, true)
+}
+
+/// Prove that an existing Git-derived change differs from the freshly
+/// imported canonical record only because pre-0.3 history lacked exact source
+/// entry kinds. Git OID-derived change IDs intentionally remain stable, so
+/// this narrow matcher authorizes an in-place history migration instead of
+/// treating the exact-mode payload upgrade as an unrelated ID collision.
+fn legacy_git_source_mode_upgrade_matches(
+    existing: &SemanticChange,
+    canonical: &SemanticChange,
+    ignore_parents: bool,
+) -> bool {
+    if existing.id != canonical.id
+        || existing.artifact_deltas.len() != canonical.artifact_deltas.len()
+    {
+        return false;
+    }
+    let mut normalized = existing.clone();
+    if ignore_parents {
+        normalized.parents = canonical.parents.clone();
+    }
+    let mut upgraded_any = false;
+    for (old, exact) in normalized
+        .artifact_deltas
+        .iter_mut()
+        .zip(&canonical.artifact_deltas)
+    {
+        let compatible_legacy_kind = match old.kind {
+            ArtifactDeltaKind::Added => {
+                exact.kind.is_added() && exact.kind.source_entry_kind().is_some()
+            }
+            ArtifactDeltaKind::Modified => {
+                exact.kind.is_modified() && exact.kind.source_entry_kind().is_some()
+            }
+            _ => false,
+        };
+        if compatible_legacy_kind {
+            old.kind = exact.kind;
+            upgraded_any = true;
+        }
+    }
+    upgraded_any
+        && matches!(
+            (serde_json::to_value(&normalized), serde_json::to_value(canonical)),
+            (Ok(normalized), Ok(canonical)) if normalized == canonical
+        )
 }
 
 /// Publish a deterministic init/import change exactly once.
@@ -728,6 +798,88 @@ fn candidate_parent_path_reaches(
     false
 }
 
+fn legacy_window_parent_shape_matches(
+    existing: &[SemanticChangeId],
+    canonical: &[SemanticChangeId],
+    boundary_root: SemanticChangeId,
+    anchor_ids: &HashMap<SemanticChangeId, SemanticChangeId>,
+) -> bool {
+    fn push_unique(output: &mut Vec<SemanticChangeId>, parent: SemanticChangeId) {
+        if !output.contains(&parent) {
+            output.push(parent);
+        }
+    }
+
+    if existing == canonical || canonical.is_empty() {
+        return false;
+    }
+
+    // The oldest record from the earliest truncated importer collapsed every
+    // missing Git parent to the Kin boundary root, deduplicating merges.
+    let mut collapsed = Vec::with_capacity(canonical.len());
+    for parent in canonical {
+        let replacement = if existing.contains(parent) {
+            *parent
+        } else {
+            boundary_root
+        };
+        push_unique(&mut collapsed, replacement);
+    }
+    if existing == collapsed {
+        return true;
+    }
+
+    // The later exact-tree truncated importer replaced each omitted Git
+    // parent with its deterministic base-link change. Recompute only those
+    // IDs from canonical Git OIDs; arbitrary parent substitutions stay
+    // unrecognized and are never rewritten.
+    let mut anchored = Vec::with_capacity(canonical.len());
+    for parent in canonical {
+        let replacement = if existing.contains(parent) {
+            *parent
+        } else if let Some(anchor) = anchor_ids.get(parent) {
+            *anchor
+        } else {
+            return false;
+        };
+        push_unique(&mut anchored, replacement);
+    }
+    existing == anchored
+}
+
+/// Recognize the reverse transition: an existing commit already has its real
+/// Git parents (from a wider/older window), while the newly bounded import has
+/// replaced one or more now-omitted parents with deterministic base links.
+/// Keeping the already-materialized real-parent payload makes Git-OID-derived
+/// change IDs stable as a 50-commit window slides or after `full -> recent`.
+fn existing_parent_shape_matches_anchored_window(
+    existing: &[SemanticChangeId],
+    canonical: &[SemanticChangeId],
+    anchor_targets: &HashMap<SemanticChangeId, SemanticChangeId>,
+) -> bool {
+    fn push_unique(output: &mut Vec<SemanticChangeId>, parent: SemanticChangeId) {
+        if !output.contains(&parent) {
+            output.push(parent);
+        }
+    }
+
+    if existing == canonical || canonical.is_empty() {
+        return false;
+    }
+    let mut expanded = Vec::with_capacity(canonical.len());
+    let mut expanded_anchor = false;
+    for parent in canonical {
+        let resolved = if let Some(target) = anchor_targets.get(parent) {
+            expanded_anchor = true;
+            *target
+        } else {
+            *parent
+        };
+        push_unique(&mut expanded, resolved);
+    }
+    expanded_anchor && existing == expanded
+}
+
 fn candidate_reverse_index_needs_rebuild(
     snapshot: &kin_db::GraphSnapshot,
     candidate_ids: &HashSet<SemanticChangeId>,
@@ -802,7 +954,44 @@ struct LegacyImportRepairOutcome {
     rebuilt_derived_indexes: bool,
 }
 
-/// Repair only the two provable legacy Git-import defects.
+fn upgrade_legacy_git_import_source_modes(
+    manager: &kin_db::SnapshotManager,
+    layout: &kin_core::KinLayout,
+    boundary_root: SemanticChangeId,
+    canonical_imported: &[kin_git::ImportedChange],
+) -> Result<usize> {
+    if canonical_imported.is_empty() {
+        return Ok(0);
+    }
+    let mut snapshot = manager.graph().to_snapshot();
+    let mut upgraded = 0_usize;
+    for canonical in canonical_imported {
+        let Some(existing) = snapshot.changes.get(&canonical.change.id) else {
+            continue;
+        };
+        if legacy_git_source_mode_upgrade_matches(existing, &canonical.change, false) {
+            snapshot
+                .changes
+                .insert(canonical.change.id, canonical.change.clone());
+            upgraded += 1;
+        }
+    }
+    if upgraded == 0 {
+        return Ok(0);
+    }
+
+    validate_repaired_change_history(&snapshot.changes, &snapshot.branches, boundary_root)?;
+    rebuild_history_derived_indexes(&mut snapshot);
+    let upgraded_graph =
+        kin_db::InMemoryGraph::from_snapshot_with_text_index(snapshot, layout.text_index_dir());
+    manager.swap(upgraded_graph);
+    manager
+        .save()
+        .context("persist exact-source mode upgrade for Git-derived history")?;
+    Ok(upgraded)
+}
+
+/// Repair only provable legacy Git-import defects.
 ///
 /// Old warm init passed the current imported head as the import boundary. The
 /// resulting persisted cycle is recognizable only after a fresh canonical Git
@@ -810,14 +999,19 @@ struct LegacyImportRepairOutcome {
 /// canonical genesis to one imported descendant, and that descendant's stored
 /// parent path closes the cycle. Separately, boundary-correct releases still
 /// reinserted deterministic imported ids and could duplicate reverse edges and
-/// revision generations. Both cases rebuild the derived indexes from immutable
-/// change truth. Any unrelated self-edge/cycle remains after the narrowly
-/// proven substitution and is refused by full-DAG validation.
+/// revision generations. Pre-0.3 `recent` imports also substituted the Kin
+/// boundary or a deterministic base-link for omitted Git parents, changing the
+/// immutable payload of the same Git-OID-derived change when a later `full`
+/// import widened the window. That exact substitution is migrated back to the
+/// canonical Git parent and the newly reachable canonical ancestors are
+/// installed in the same snapshot transaction. All cases rebuild derived
+/// indexes from immutable change truth. Any unrelated parent mismatch or cycle
+/// remains after the narrowly proven substitutions and is refused.
 fn repair_legacy_git_import_history(
     manager: &kin_db::SnapshotManager,
     layout: &kin_core::KinLayout,
     boundary_root: SemanticChangeId,
-    canonical_imported: &[kin_git::ImportedChange],
+    canonical_imported: &mut [kin_git::ImportedChange],
 ) -> Result<LegacyImportRepairOutcome> {
     if canonical_imported.is_empty() {
         return Ok(LegacyImportRepairOutcome::default());
@@ -828,9 +1022,27 @@ fn repair_legacy_git_import_history(
         .iter()
         .map(|entry| entry.change.id)
         .collect();
+    let anchor_ids: HashMap<_, _> = canonical_imported
+        .iter()
+        .map(|entry| {
+            kin_git::base_link_change_id_from_git_oid_hex(&entry.git_oid)
+                .map(|anchor| (entry.change.id, anchor))
+        })
+        .collect::<std::result::Result<_, _>>()?;
+    let mut anchor_targets = HashMap::new();
+    for entry in canonical_imported.iter() {
+        let anchor = kin_git::base_link_change_id_from_git_oid_hex(&entry.git_oid)?;
+        if entry.change.id == anchor {
+            anchor_targets.insert(
+                anchor,
+                kin_git::semantic_change_id_from_git_oid_hex(&entry.git_oid)?,
+            );
+        }
+    }
     let mut mismatches = Vec::<(SemanticChangeId, SemanticChangeId)>::new();
+    let mut window_mismatches = HashSet::new();
     let mut unrecognized_payload_or_parent = false;
-    for canonical in canonical_imported {
+    for canonical in canonical_imported.iter_mut() {
         let Some(existing) = snapshot.changes.get(&canonical.change.id) else {
             continue;
         };
@@ -839,6 +1051,35 @@ fn repair_legacy_git_import_history(
             continue;
         }
         if existing.parents == canonical.change.parents {
+            continue;
+        }
+        if existing_parent_shape_matches_anchored_window(
+            &existing.parents,
+            &canonical.change.parents,
+            &anchor_targets,
+        ) {
+            if existing
+                .parents
+                .iter()
+                .all(|parent| *parent == boundary_root || snapshot.changes.contains_key(parent))
+            {
+                // The wider parent chain is already graph authority. Normalize
+                // this bounded import back to that immutable payload before
+                // exact-once insertion, instead of downgrading the same ID to
+                // a window-relative anchor parent.
+                canonical.change.parents = existing.parents.clone();
+                continue;
+            }
+            unrecognized_payload_or_parent = true;
+            continue;
+        }
+        if legacy_window_parent_shape_matches(
+            &existing.parents,
+            &canonical.change.parents,
+            boundary_root,
+            &anchor_ids,
+        ) {
+            window_mismatches.insert(canonical.change.id);
             continue;
         }
         let matching_targets: Vec<_> = candidate_ids
@@ -872,16 +1113,39 @@ fn repair_legacy_git_import_history(
             )
         });
 
+    let window_shape_proven = !window_mismatches.is_empty() && !unrecognized_payload_or_parent;
     let mut corrected_changes = 0usize;
+    if window_shape_proven {
+        for canonical in canonical_imported.iter() {
+            if window_mismatches.contains(&canonical.change.id) {
+                snapshot
+                    .changes
+                    .insert(canonical.change.id, canonical.change.clone());
+                corrected_changes += 1;
+            }
+        }
+    }
     if legacy_shape_proven {
         let mismatch_ids: HashSet<_> = mismatches.iter().map(|(id, _)| *id).collect();
-        for canonical in canonical_imported {
+        for canonical in canonical_imported.iter() {
             if mismatch_ids.contains(&canonical.change.id) {
                 snapshot
                     .changes
                     .insert(canonical.change.id, canonical.change.clone());
                 corrected_changes += 1;
             }
+        }
+    }
+
+    if window_shape_proven {
+        // A corrected boundary now points at ancestors the old bounded window
+        // never stored. Install the already-enriched canonical records before
+        // validating or publishing the migrated snapshot.
+        for canonical in canonical_imported.iter() {
+            snapshot
+                .changes
+                .entry(canonical.change.id)
+                .or_insert_with(|| canonical.change.clone());
         }
     }
 
@@ -1114,12 +1378,36 @@ pub async fn run(
     let all_files = collect_source_files(&tmp_snapshot)?;
     phase!("collect_source_files");
 
+    let exact_source_entries = collect_exact_init_source_entries(&tmp_snapshot, &all_files)?;
+    phase!("collect_exact_source_entries");
+
+    // Persist exact bytes while the frozen snapshot still lives at its
+    // temporary path. `move_snapshot_into_place` renames that directory, so
+    // deferring this backfill until after the move makes every retained
+    // `abs_path` stale (most visibly for symlinks, which parsing skips).
+    for entry in &exact_source_entries {
+        let blob_hash = kin_blobs::Hash256::from_bytes(entry.hash);
+        if !blob_store.exists(&blob_hash).unwrap_or(false) {
+            let (content, observed_kind) = read_exact_init_source(&entry.abs_path)?;
+            if observed_kind != entry.kind || kin_blobs::digest_bytes(&content) != entry.hash {
+                anyhow::bail!(
+                    "frozen init source changed while building graph authority: {}",
+                    entry.rel_path
+                );
+            }
+            blob_store
+                .write(&content)
+                .with_context(|| format!("store exact init source {}", entry.rel_path))?;
+        }
+    }
+    phase!("persist_exact_source_entries");
+
     let indexable_files = collect_indexable_files(&tmp_snapshot, &all_files)?;
     phase!("collect_indexable_files");
     let (entity_source_input_count, shallow_source_input_count) =
         count_supported_source_inputs(&indexable_files);
 
-    let init_summary = if !all_files.is_empty() {
+    let init_summary = if !all_files.is_empty() || is_warm {
         if is_warm {
             // NATIVE WARM CACHE: Run the diff directly against the existing graph!
             let graph = snap.graph();
@@ -1193,41 +1481,33 @@ pub async fn run(
 
     let mut graph = snap.graph();
     let branch_name = kin_core::read_current_branch(&layout)?;
-    if !all_files.is_empty() {
+    if !all_files.is_empty() || is_warm {
         // Build a semantic change for the initial parse.
         // Include artifact_deltas for every file so that the VFS tree
         // (built from the change DAG) knows which files exist.
         let change_id = compute_init_change_id(
             &auto_parse_parent_id,
             &compute_artifact_fingerprint(
-                indexable_files
+                exact_source_entries
                     .iter()
-                    .map(|f| (f.rel_path.as_str(), &f.hash)),
+                    .map(|entry| (entry.rel_path.as_str(), &entry.hash, entry.kind)),
             ),
         );
 
-        // Ensure every tracked file has its blob in the store.
-        // The warm-cache path may skip unchanged files, leaving blobs missing.
-        // Read from the working directory (not snapshot) as a fallback.
-        for f in &indexable_files {
-            let blob_hash = kin_blobs::Hash256::from_bytes(f.hash);
-            if !blob_store.exists(&blob_hash).unwrap_or(false) {
-                let work_path = dir.join(&f.rel_path);
-                if let Ok(content) = fs::read(&work_path) {
-                    let _ = blob_store.write(&content);
-                }
+        let artifact_deltas = match graph.resolve_source_tree_at(&auto_parse_parent_id)? {
+            SourceTreeResolution::Exact { entries } => {
+                build_exact_init_artifact_deltas(entries, &exact_source_entries)
             }
-        }
-
-        let artifact_deltas: Vec<_> = indexable_files
-            .iter()
-            .map(|f| kin_model::ArtifactDelta {
-                file_id: FilePathId::new(&f.rel_path),
-                kind: kin_model::ArtifactDeltaKind::Added,
-                old_hash: None,
-                new_hash: Some(kin_model::Hash256::from_bytes(f.hash)),
-            })
-            .collect();
+            SourceTreeResolution::Incomplete { gaps } => {
+                warn!(
+                    gap_count = gaps.len(),
+                    parent = %auto_parse_parent_id,
+                    "repairing incomplete legacy source history from the frozen init snapshot"
+                );
+                let parent_file_tree = graph.resolve_file_tree_at(&auto_parse_parent_id)?;
+                build_exact_init_repair_deltas(parent_file_tree, &exact_source_entries)
+            }
+        };
         let mut all_entities = graph.list_all_entities()?;
         // `list_all_entities` is backed by a hash map. Canonicalize its order
         // before it becomes a deterministic init change payload so a repeated
@@ -1312,6 +1592,7 @@ pub async fn run(
                 Some(&blob_store),
             ) {
                 Ok(mut imported) if !imported.is_empty() => {
+                    let imported_git_commit_count = imported.len();
                     // Anchor the (possibly truncated) history at a full base
                     // universe so ref-scoped blast at historical refs sees
                     // committed inbound edges across files untouched inside
@@ -1328,13 +1609,11 @@ pub async fn run(
                             debug!(base_link = %base_id, "anchored imported history at base-link change");
                         }
                         Ok(None) => {}
-                        Err(err) => {
-                            warn!(
-                                error = %err,
-                                mode = %git_history,
-                                "failed to anchor imported Git history at a base-link change; continuing without base-universe anchoring"
-                            );
-                        }
+                        Err(err) => return Err(err).with_context(|| {
+                            format!(
+                                "anchor imported Git history at its exact base universe ({git_history})"
+                            )
+                        }),
                     }
 
                     // Historical semantic truth is an authority path. A
@@ -1355,7 +1634,7 @@ pub async fn run(
                         &snap,
                         &layout,
                         history_boundary_root,
-                        &imported,
+                        &mut imported,
                     )?;
                     if repair.rebuilt_derived_indexes {
                         warn!(
@@ -1365,6 +1644,20 @@ pub async fn run(
                         // `SnapshotManager::swap` is RCU-style. Refresh the
                         // caller's Arc so exact-once collision checks target
                         // the repaired graph rather than the retired view.
+                        graph = snap.graph();
+                    }
+
+                    let upgraded_source_modes = upgrade_legacy_git_import_source_modes(
+                        &snap,
+                        &layout,
+                        history_boundary_root,
+                        &imported,
+                    )?;
+                    if upgraded_source_modes > 0 {
+                        warn!(
+                            upgraded_changes = upgraded_source_modes,
+                            "upgraded Git-derived history to exact source entry modes"
+                        );
                         graph = snap.graph();
                     }
 
@@ -1408,7 +1701,7 @@ pub async fn run(
                         };
                         println!(
                             "  Imported {} {mode_label} Git commit(s) as semantic history.",
-                            imported.len()
+                            imported_git_commit_count
                         );
                     }
                 }
@@ -1821,22 +2114,20 @@ impl Clone for ImportedCommitSemanticState {
     }
 }
 
-/// Deterministic topological order over the first-parent forest.
+/// Deterministic topological order over the complete imported parent DAG.
 ///
-/// `first_parent_index[c]` is the slice index of commit `c`'s first git parent
-/// when that parent is itself in the imported set (`None` for a root or a parent
-/// below the import horizon). Each commit has at most one in-set first parent,
-/// so "process a commit after its first parent" is a forest constraint; Kahn's
-/// algorithm seeded and drained in ascending index order yields a stable order
-/// in which every commit follows its first parent, staying as close as possible
-/// to the input order. An (impossible for Git) cycle is rejected instead of
-/// manufacturing an order that would replay a child before its baseline.
-fn first_parent_topological_order(first_parent_index: &[Option<usize>]) -> Result<Vec<usize>> {
-    let n = first_parent_index.len();
+/// Every in-set parent must be processed before its child. This is stricter
+/// than the first-parent ordering required to compute a Git commit's target
+/// tree: merge-delta rebasing also resolves the runtime all-parent baseline, so
+/// every secondary parent must already be present in the scratch change store.
+/// Kahn's algorithm is seeded and drained in ascending input-index order to keep
+/// the result byte-stable and as close as possible to the importer order.
+fn full_parent_topological_order(parent_indices: &[Vec<usize>]) -> Result<Vec<usize>> {
+    let n = parent_indices.len();
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut indegree = vec![0usize; n];
-    for (child, parent) in first_parent_index.iter().enumerate() {
-        if let Some(parent) = *parent {
+    for (child, parents) in parent_indices.iter().enumerate() {
+        for &parent in parents {
             children[parent].push(child);
             indegree[child] += 1;
         }
@@ -1856,7 +2147,7 @@ fn first_parent_topological_order(first_parent_index: &[Option<usize>]) -> Resul
     }
     if order.len() != n {
         return Err(anyhow!(
-            "historical hydration invariant violated: imported first-parent graph contains a cycle"
+            "historical hydration invariant violated: imported parent DAG contains a cycle"
         ));
     }
     Ok(order)
@@ -1882,6 +2173,7 @@ fn validate_imported_parent_closure(
         }
     }
     for imported_change in imported {
+        let mut unique_parents = HashSet::with_capacity(imported_change.change.parents.len());
         if imported_change.change.parents.is_empty() {
             return Err(anyhow!(
                 "historical hydration invariant violated: imported change {} has no parent; Git roots must reference canonical genesis {}",
@@ -1890,6 +2182,13 @@ fn validate_imported_parent_closure(
             ));
         }
         for parent in &imported_change.change.parents {
+            if !unique_parents.insert(*parent) {
+                return Err(anyhow!(
+                    "historical hydration invariant violated: imported change {} repeats parent {}",
+                    imported_change.change.id,
+                    parent
+                ));
+            }
             if *parent != boundary_root && !imported_ids.contains(parent) {
                 return Err(anyhow!(
                     "historical hydration invariant violated: imported change {} has dangling parent {} (expected imported history or canonical genesis {})",
@@ -2180,6 +2479,22 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
             })
         })
         .collect();
+    let all_parent_indices: Vec<Vec<usize>> = imported
+        .iter()
+        .map(|imported_change| {
+            imported_change
+                .change
+                .parents
+                .iter()
+                .filter(|parent| **parent != boundary_root)
+                .map(|parent| {
+                    *index_by_change_id
+                        .get(parent)
+                        .expect("validated imported parent must be present")
+                })
+                .collect()
+        })
+        .collect();
 
     // Count how many in-set commits fork from each commit as their first parent,
     // so a commit's snapshot is retained only while children still need it. This
@@ -2194,7 +2509,7 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
     // store lock or creates any store paths. Git cannot contain a commit
     // cycle, so accepting one here would only turn corrupt input into a later
     // missing-snapshot failure with partial hydration side effects.
-    let order = first_parent_topological_order(&first_parent_index)?;
+    let order = full_parent_topological_order(&all_parent_indices)?;
     let mut snapshots = HashMap::<SemanticChangeId, ImportedCommitSemanticState>::new();
     let mut resumed_from = 0usize;
     let mut checkpoint_session = if let Some(config) = checkpoint_config {
@@ -2262,6 +2577,14 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
             mut relations_by_dst,
             linker: mut incremental_linker,
         } = baseline;
+        let mut merge_runtime_baseline = if imported[i].change.parents.len() > 1 {
+            Some(ImportedRuntimeSemanticState {
+                entities: imported_target_entities(&current_files)?,
+                relations: current_relations.clone(),
+            })
+        } else {
+            None
+        };
 
         let mut entity_deltas = Vec::new();
         let mut relation_deltas = Vec::new();
@@ -2613,6 +2936,26 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
             RelationDelta::Added(relation) => relation.id.0,
             RelationDelta::Removed(relation_id) => relation_id.0,
         });
+
+        // Artifact deltas describe the merge target against its first parent,
+        // while runtime DAG replay reaches a merge by replaying every parent.
+        // Rebase the computed target onto that actual all-parent baseline so a
+        // secondary-parent-only entity or relation cannot leak through merely
+        // because the merge's first-parent target deleted it.
+        if let Some(all_parent_baseline) = merge_runtime_baseline.as_mut() {
+            replay_imported_secondary_parents(
+                all_parent_baseline,
+                imported,
+                &index_by_change_id,
+                boundary_root,
+                &imported[i].change.parents,
+            )?;
+            (entity_deltas, relation_deltas) = rebase_imported_merge_semantic_deltas(
+                all_parent_baseline,
+                &current_files,
+                &current_relations,
+            )?;
+        }
         imported[i].change.entity_deltas = entity_deltas;
         imported[i].change.relation_deltas = relation_deltas;
 
@@ -3034,6 +3377,234 @@ fn imported_relations_equivalent(old: &Relation, new: &Relation) -> bool {
         && old.import_source == new.import_source
         && old.evidence == new.evidence
         && (old.confidence - new.confidence).abs() < f32::EPSILON
+}
+
+fn imported_entities_exactly_equivalent(old: &Entity, new: &Entity) -> bool {
+    old.id == new.id
+        && old.kind == new.kind
+        && old.name == new.name
+        && old.language == new.language
+        && old.fingerprint.algorithm == new.fingerprint.algorithm
+        && old.fingerprint.ast_hash == new.fingerprint.ast_hash
+        && old.fingerprint.signature_hash == new.fingerprint.signature_hash
+        && old.fingerprint.behavior_hash == new.fingerprint.behavior_hash
+        && old.fingerprint.equivalence_hash == new.fingerprint.equivalence_hash
+        && old.fingerprint.stability_score.to_bits() == new.fingerprint.stability_score.to_bits()
+        && old.file_origin == new.file_origin
+        && old.span == new.span
+        && old.signature == new.signature
+        && old.visibility == new.visibility
+        && old.role == new.role
+        && old.doc_summary == new.doc_summary
+        && old.metadata.extra == new.metadata.extra
+        && old.lineage_parent == new.lineage_parent
+        && old.created_in == new.created_in
+        && old.superseded_by == new.superseded_by
+}
+
+fn imported_relations_exactly_equivalent(old: &Relation, new: &Relation) -> bool {
+    old.id == new.id
+        && old.kind == new.kind
+        && old.src == new.src
+        && old.dst == new.dst
+        && old.confidence.to_bits() == new.confidence.to_bits()
+        && old.origin == new.origin
+        && old.created_in == new.created_in
+        && old.import_source == new.import_source
+        && old.evidence == new.evidence
+}
+
+fn imported_target_entities(
+    files: &HashMap<String, ImportedSemanticFileState>,
+) -> Result<HashMap<EntityId, Entity>> {
+    let mut entities = HashMap::new();
+    for file in files.values() {
+        for entity in &file.entities {
+            if entities.insert(entity.id, entity.clone()).is_some() {
+                return Err(anyhow!(
+                    "historical hydration invariant violated: entity {} occurs in more than one imported file state",
+                    entity.id
+                ));
+            }
+        }
+    }
+    Ok(entities)
+}
+
+struct ImportedRuntimeSemanticState {
+    entities: HashMap<EntityId, Entity>,
+    relations: HashMap<RelationId, Relation>,
+}
+
+fn imported_relation_mentions_entity(relation: &Relation, entity_id: EntityId) -> bool {
+    relation.src.as_entity() == Some(entity_id) || relation.dst.as_entity() == Some(entity_id)
+}
+
+/// Apply only the live entity/relation portion of runtime graph replay. This is
+/// deliberately kept field-for-field aligned with `kin_model`'s authoritative
+/// `replay_graph_state`; revisions, tombstones, and artifacts do not affect the
+/// live semantic diff produced by history hydration.
+fn apply_imported_change_to_runtime_state(
+    state: &mut ImportedRuntimeSemanticState,
+    change: &SemanticChange,
+) {
+    for delta in &change.entity_deltas {
+        match delta {
+            EntityDelta::Added(entity) => {
+                state.entities.insert(entity.id, entity.clone());
+            }
+            EntityDelta::Modified { new, .. } => {
+                state.entities.insert(new.id, new.clone());
+            }
+            EntityDelta::Removed(entity_id) => {
+                state.entities.remove(entity_id);
+                state
+                    .relations
+                    .retain(|_, relation| !imported_relation_mentions_entity(relation, *entity_id));
+            }
+        }
+    }
+    for delta in &change.relation_deltas {
+        match delta {
+            RelationDelta::Added(relation) => {
+                state.relations.insert(relation.id, relation.clone());
+            }
+            RelationDelta::Removed(relation_id) => {
+                state.relations.remove(relation_id);
+            }
+        }
+    }
+}
+
+/// Starting from the already-resolved first-parent state, replay exactly the
+/// changes runtime DFS contributes from each later parent. Shared ancestry is
+/// marked visited but never replayed twice. Unlike `resolve_graph_at` per merge,
+/// this traverses only change IDs through shared history and applies semantic
+/// payloads only for secondary-parent-unique changes, avoiding repeated full
+/// graph/revision reconstruction and its high-RSS quadratic behavior.
+fn replay_imported_secondary_parents(
+    state: &mut ImportedRuntimeSemanticState,
+    imported: &[kin_git::ImportedChange],
+    index_by_change_id: &HashMap<SemanticChangeId, usize>,
+    boundary_root: SemanticChangeId,
+    parents: &[SemanticChangeId],
+) -> Result<()> {
+    let Some(first_parent) = parents.first().copied() else {
+        return Err(anyhow!(
+            "historical hydration invariant violated: merge has no first parent"
+        ));
+    };
+
+    let mut visited = HashSet::new();
+    visited.insert(boundary_root);
+
+    // The supplied state already includes the complete first-parent history;
+    // mark that ancestry visited without replaying its semantic payloads.
+    let mut mark_stack = vec![first_parent];
+    while let Some(change_id) = mark_stack.pop() {
+        if !visited.insert(change_id) {
+            continue;
+        }
+        let imported_index = *index_by_change_id.get(&change_id).ok_or_else(|| {
+            anyhow!(
+                "historical hydration invariant violated: runtime replay cannot find imported ancestor {}",
+                change_id
+            )
+        })?;
+        mark_stack.extend(imported[imported_index].change.parents.iter().copied());
+    }
+
+    enum ReplayFrame {
+        Visit(SemanticChangeId),
+        Emit(usize),
+    }
+
+    // Match `collect_changes_topologically`: visit parents left-to-right,
+    // emit each change after its parents, and skip every ID already reached by
+    // an earlier direct parent.
+    for secondary_parent in parents.iter().skip(1).copied() {
+        let mut stack = vec![ReplayFrame::Visit(secondary_parent)];
+        while let Some(frame) = stack.pop() {
+            match frame {
+                ReplayFrame::Visit(change_id) => {
+                    if !visited.insert(change_id) {
+                        continue;
+                    }
+                    let imported_index =
+                        *index_by_change_id.get(&change_id).ok_or_else(|| {
+                            anyhow!(
+                                "historical hydration invariant violated: runtime replay cannot find imported ancestor {}",
+                                change_id
+                            )
+                        })?;
+                    stack.push(ReplayFrame::Emit(imported_index));
+                    for parent in imported[imported_index].change.parents.iter().rev() {
+                        stack.push(ReplayFrame::Visit(*parent));
+                    }
+                }
+                ReplayFrame::Emit(imported_index) => {
+                    apply_imported_change_to_runtime_state(state, &imported[imported_index].change);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Build the semantic delta that transforms runtime's all-parent merge state
+/// into the target Git tree parsed against the commit's first parent.
+fn rebase_imported_merge_semantic_deltas(
+    all_parent_baseline: &ImportedRuntimeSemanticState,
+    target_files: &HashMap<String, ImportedSemanticFileState>,
+    target_relations: &HashMap<RelationId, Relation>,
+) -> Result<(Vec<EntityDelta>, Vec<RelationDelta>)> {
+    let target_entities = imported_target_entities(target_files)?;
+    let mut entity_ids = BTreeSet::new();
+    entity_ids.extend(all_parent_baseline.entities.keys().copied());
+    entity_ids.extend(target_entities.keys().copied());
+
+    let mut entity_deltas = Vec::new();
+    for entity_id in entity_ids {
+        match (
+            all_parent_baseline.entities.get(&entity_id),
+            target_entities.get(&entity_id),
+        ) {
+            (Some(old), Some(new)) if !imported_entities_exactly_equivalent(old, new) => {
+                entity_deltas.push(EntityDelta::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                });
+            }
+            (Some(_), None) => entity_deltas.push(EntityDelta::Removed(entity_id)),
+            (None, Some(new)) => entity_deltas.push(EntityDelta::Added(new.clone())),
+            _ => {}
+        }
+    }
+
+    let mut relation_ids = HashSet::new();
+    relation_ids.extend(all_parent_baseline.relations.keys().copied());
+    relation_ids.extend(target_relations.keys().copied());
+    let mut relation_ids: Vec<_> = relation_ids.into_iter().collect();
+    relation_ids.sort_by_key(|relation_id| relation_id.0);
+
+    let mut relation_deltas = Vec::new();
+    for relation_id in relation_ids {
+        match (
+            all_parent_baseline.relations.get(&relation_id),
+            target_relations.get(&relation_id),
+        ) {
+            (Some(old), Some(new)) if !imported_relations_exactly_equivalent(old, new) => {
+                relation_deltas.push(RelationDelta::Removed(relation_id));
+                relation_deltas.push(RelationDelta::Added(new.clone()));
+            }
+            (Some(_), None) => relation_deltas.push(RelationDelta::Removed(relation_id)),
+            (None, Some(new)) => relation_deltas.push(RelationDelta::Added(new.clone())),
+            _ => {}
+        }
+    }
+
+    Ok((entity_deltas, relation_deltas))
 }
 
 pub(crate) fn entity_fingerprint_changed(old: &Entity, new: &Entity) -> bool {
@@ -3743,6 +4314,13 @@ fn collect_indexable_files(
         Ok(all_files
             .par_iter()
             .filter_map(|file_path| {
+                if fs::symlink_metadata(file_path)
+                    .ok()?
+                    .file_type()
+                    .is_symlink()
+                {
+                    return None;
+                }
                 let source = fs::read(file_path).ok()?;
                 let classification = FileClassifier::classify(file_path);
                 Some(IndexableFile {
@@ -3760,6 +4338,182 @@ fn collect_indexable_files(
     })?;
 
     Ok(files)
+}
+
+fn read_exact_init_source(path: &Path) -> Result<(Vec<u8>, kin_model::SourceEntryKind)> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect exact init source {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(path)
+            .with_context(|| format!("read symbolic link {}", path.display()))?;
+        let target = target.to_str().ok_or_else(|| {
+            anyhow!(
+                "symbolic link target is not valid UTF-8: {}",
+                path.display()
+            )
+        })?;
+        return Ok((
+            target.as_bytes().to_vec(),
+            kin_model::SourceEntryKind::Symlink,
+        ));
+    }
+    if !metadata.is_file() {
+        anyhow::bail!("unsupported source entry type: {}", path.display());
+    }
+    #[cfg(unix)]
+    let executable = {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    };
+    #[cfg(not(unix))]
+    let executable = false;
+    Ok((
+        fs::read(path).with_context(|| format!("read exact init source {}", path.display()))?,
+        kin_model::SourceEntryKind::File { executable },
+    ))
+}
+
+fn collect_exact_init_source_entries(
+    source_root: &Path,
+    all_files: &[PathBuf],
+) -> Result<Vec<ExactInitSourceEntry>> {
+    all_files
+        .iter()
+        .map(|path| {
+            let rel_path = path
+                .strip_prefix(source_root)
+                .unwrap_or(path)
+                .to_str()
+                .ok_or_else(|| anyhow!("source path is not valid UTF-8: {}", path.display()))?
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            let (bytes, kind) = read_exact_init_source(path)?;
+            Ok(ExactInitSourceEntry {
+                abs_path: path.clone(),
+                rel_path,
+                hash: kin_blobs::digest_bytes(&bytes),
+                kind,
+            })
+        })
+        .collect()
+}
+
+fn added_exact_init_kind(kind: SourceEntryKind) -> kin_model::ArtifactDeltaKind {
+    match kind {
+        SourceEntryKind::File { executable: false } => {
+            kin_model::ArtifactDeltaKind::AddedRegularFile
+        }
+        SourceEntryKind::File { executable: true } => {
+            kin_model::ArtifactDeltaKind::AddedExecutableFile
+        }
+        SourceEntryKind::Symlink => kin_model::ArtifactDeltaKind::AddedSymlink,
+    }
+}
+
+fn modified_exact_init_kind(kind: SourceEntryKind) -> kin_model::ArtifactDeltaKind {
+    match kind {
+        SourceEntryKind::File { executable: false } => {
+            kin_model::ArtifactDeltaKind::ModifiedRegularFile
+        }
+        SourceEntryKind::File { executable: true } => {
+            kin_model::ArtifactDeltaKind::ModifiedExecutableFile
+        }
+        SourceEntryKind::Symlink => kin_model::ArtifactDeltaKind::ModifiedSymlink,
+    }
+}
+
+/// Diff the frozen source snapshot against the exact parent tree. Warm init
+/// must record removals as well as additions/mode changes, including deletion
+/// of the final source file, or graph-owned source history keeps ghost files.
+fn build_exact_init_artifact_deltas(
+    parent: HashMap<FilePathId, ResolvedSourceEntry>,
+    current: &[ExactInitSourceEntry],
+) -> Vec<kin_model::ArtifactDelta> {
+    let current: BTreeMap<&str, &ExactInitSourceEntry> = current
+        .iter()
+        .map(|entry| (entry.rel_path.as_str(), entry))
+        .collect();
+    let parent: BTreeMap<String, ResolvedSourceEntry> = parent
+        .into_iter()
+        .map(|(path, entry)| (path.0, entry))
+        .collect();
+    let mut deltas = Vec::new();
+
+    for (path, old) in &parent {
+        if !current.contains_key(path.as_str()) {
+            deltas.push(kin_model::ArtifactDelta {
+                file_id: FilePathId::new(path),
+                kind: kin_model::ArtifactDeltaKind::Removed,
+                old_hash: Some(old.hash),
+                new_hash: None,
+            });
+        }
+    }
+    for (path, entry) in current {
+        let new_hash = Hash256::from_bytes(entry.hash);
+        match parent.get(path) {
+            Some(old) if old.hash == new_hash && old.kind == entry.kind => {}
+            Some(old) => deltas.push(kin_model::ArtifactDelta {
+                file_id: FilePathId::new(path),
+                kind: modified_exact_init_kind(entry.kind),
+                old_hash: Some(old.hash),
+                new_hash: Some(new_hash),
+            }),
+            None => deltas.push(kin_model::ArtifactDelta {
+                file_id: FilePathId::new(path),
+                kind: added_exact_init_kind(entry.kind),
+                old_hash: None,
+                new_hash: Some(new_hash),
+            }),
+        }
+    }
+    deltas.sort_by(|left, right| left.file_id.0.cmp(&right.file_id.0));
+    deltas
+}
+
+/// Repair an incomplete legacy source parent by restating the entire current
+/// tree with exact entry kinds and explicitly removing every parent path that
+/// no longer exists. Replaying this correction clears both legacy-mode gaps on
+/// retained paths and gaps for deleted paths, without consulting the live
+/// filesystem as an authority source.
+fn build_exact_init_repair_deltas(
+    parent: HashMap<FilePathId, Hash256>,
+    current: &[ExactInitSourceEntry],
+) -> Vec<kin_model::ArtifactDelta> {
+    let current: BTreeMap<&str, &ExactInitSourceEntry> = current
+        .iter()
+        .map(|entry| (entry.rel_path.as_str(), entry))
+        .collect();
+    let parent: BTreeMap<String, Hash256> = parent
+        .into_iter()
+        .map(|(path, hash)| (path.0, hash))
+        .collect();
+    let mut deltas = Vec::new();
+
+    for (path, old_hash) in &parent {
+        if !current.contains_key(path.as_str()) {
+            deltas.push(kin_model::ArtifactDelta {
+                file_id: FilePathId::new(path),
+                kind: kin_model::ArtifactDeltaKind::Removed,
+                old_hash: Some(*old_hash),
+                new_hash: None,
+            });
+        }
+    }
+    for (path, entry) in current {
+        let old_hash = parent.get(path).copied();
+        deltas.push(kin_model::ArtifactDelta {
+            file_id: FilePathId::new(path),
+            kind: if old_hash.is_some() {
+                modified_exact_init_kind(entry.kind)
+            } else {
+                added_exact_init_kind(entry.kind)
+            },
+            old_hash,
+            new_hash: Some(Hash256::from_bytes(entry.hash)),
+        });
+    }
+    deltas.sort_by(|left, right| left.file_id.0.cmp(&right.file_id.0));
+    deltas
 }
 
 fn try_warm_init_from_cache(
@@ -4975,6 +5729,21 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
+        } else if file_type.is_symlink() {
+            if let Some(parent) = dst_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let target = fs::read_link(&src_path)?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &dst_path)?;
+            #[cfg(windows)]
+            {
+                if src_path.is_dir() {
+                    std::os::windows::fs::symlink_dir(&target, &dst_path)?;
+                } else {
+                    std::os::windows::fs::symlink_file(&target, &dst_path)?;
+                }
+            }
         } else if file_type.is_file() {
             if let Some(parent) = dst_path.parent() {
                 fs::create_dir_all(parent)?;
@@ -5003,23 +5772,22 @@ fn source_file_sort_key(root: &Path, path: &Path) -> String {
 }
 
 fn collect_source_files_recursive(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(()),
-    };
+    let entries = fs::read_dir(dir)
+        .with_context(|| format!("read frozen source directory {}", dir.display()))?;
 
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
+        let file_type = entry.file_type()?;
 
-        if path.is_dir() {
+        if file_type.is_dir() {
             if kin_index::should_skip_dir(name_str.as_ref()) {
                 continue;
             }
             collect_source_files_recursive(root, &path, files)?;
-        } else if path.is_file() {
+        } else if file_type.is_file() || file_type.is_symlink() {
             // A git *worktree* root carries `.git` as a FILE (a `gitdir:` pointer
             // holding a machine-absolute path), not a directory. Apply the same
             // VCS/internal skip to file entries so that pointer file — and any
@@ -5096,20 +5864,25 @@ fn ensure_graph_surface_materialized(
     Ok(())
 }
 
-/// Deterministic digest of the (path, content-hash) set, independent of
-/// wall-clock time, machine path, and walk order. The path length prefix keeps
-/// the digest unambiguous across path boundaries.
+/// Deterministic digest of the (path, content-hash, source-kind) set,
+/// independent of wall-clock time, machine path, and walk order. The path
+/// length prefix keeps the digest unambiguous across path boundaries.
 fn compute_artifact_fingerprint<'a>(
-    entries: impl IntoIterator<Item = (&'a str, &'a [u8; 32])>,
+    entries: impl IntoIterator<Item = (&'a str, &'a [u8; 32], kin_model::SourceEntryKind)>,
 ) -> [u8; 32] {
-    let mut entries: Vec<(&str, &[u8; 32])> = entries.into_iter().collect();
-    entries.sort_unstable();
+    let mut entries: Vec<_> = entries.into_iter().collect();
+    entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
     let mut hasher = Sha256::new();
-    hasher.update(b"kin-init-artifacts-v1:");
-    for (path, hash) in entries {
+    hasher.update(b"kin-init-artifacts-v2:");
+    for (path, hash, kind) in entries {
         hasher.update((path.len() as u64).to_le_bytes());
         hasher.update(path.as_bytes());
         hasher.update(hash);
+        hasher.update([match kind {
+            kin_model::SourceEntryKind::File { executable: false } => 0,
+            kin_model::SourceEntryKind::File { executable: true } => 1,
+            kin_model::SourceEntryKind::Symlink => 2,
+        }]);
     }
     let result = hasher.finalize();
     let mut bytes = [0u8; 32];
@@ -5222,6 +5995,35 @@ mod tests {
             &original,
             &retried,
             DeterministicChangeProvenance::Regenerated,
+        ));
+    }
+
+    #[test]
+    fn git_history_mode_upgrade_accepts_only_the_proven_exact_kind_change() {
+        let root = kin_core::build_genesis_change();
+        let mut exact = root.clone();
+        exact.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x91; 32]));
+        exact.parents = vec![root.id];
+        exact.message = "imported git commit".to_string();
+        exact.artifact_deltas = vec![kin_model::ArtifactDelta {
+            file_id: FilePathId::new("src/lib.rs"),
+            kind: ArtifactDeltaKind::AddedRegularFile,
+            old_hash: None,
+            new_hash: Some(Hash256::from_bytes([0x22; 32])),
+        }];
+        let mut legacy = exact.clone();
+        legacy.artifact_deltas[0].kind = ArtifactDeltaKind::Added;
+
+        assert!(legacy_git_source_mode_upgrade_matches(
+            &legacy, &exact, false
+        ));
+
+        let mut changed_bytes = exact.clone();
+        changed_bytes.artifact_deltas[0].new_hash = Some(Hash256::from_bytes([0x23; 32]));
+        assert!(!legacy_git_source_mode_upgrade_matches(
+            &legacy,
+            &changed_bytes,
+            false
         ));
     }
 
@@ -5354,6 +6156,250 @@ mod tests {
         let full = git_history_import_options("full").unwrap();
         assert_eq!(full.max_commits, 0);
         assert!(!full.shallow);
+
+        assert_eq!(
+            recent.max_commits, 50,
+            "recent must bound both co-change mining and semantic history import"
+        );
+    }
+
+    #[test]
+    fn legacy_window_parent_matcher_accepts_only_exact_boundary_substitutions() {
+        let boundary = SemanticChangeId::from_hash(Hash256::from_bytes([0x10; 32]));
+        let parent_a = SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32]));
+        let parent_b = SemanticChangeId::from_hash(Hash256::from_bytes([0x12; 32]));
+        let anchor_a = SemanticChangeId::from_hash(Hash256::from_bytes([0x13; 32]));
+        let anchor_b = SemanticChangeId::from_hash(Hash256::from_bytes([0x14; 32]));
+        let unrelated = SemanticChangeId::from_hash(Hash256::from_bytes([0x15; 32]));
+        let anchors = HashMap::from([(parent_a, anchor_a), (parent_b, anchor_b)]);
+
+        assert!(legacy_window_parent_shape_matches(
+            &[boundary],
+            &[parent_a, parent_b],
+            boundary,
+            &anchors,
+        ));
+        assert!(legacy_window_parent_shape_matches(
+            &[anchor_a, anchor_b],
+            &[parent_a, parent_b],
+            boundary,
+            &anchors,
+        ));
+        assert!(legacy_window_parent_shape_matches(
+            &[parent_a, anchor_b],
+            &[parent_a, parent_b],
+            boundary,
+            &anchors,
+        ));
+        assert!(!legacy_window_parent_shape_matches(
+            &[unrelated],
+            &[parent_a],
+            boundary,
+            &anchors,
+        ));
+    }
+
+    #[test]
+    fn legacy_recent_parent_is_migrated_with_missing_canonical_ancestor_atomically() {
+        let repo = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(repo.path()).unwrap().layout;
+        let manager = kin_db::SnapshotManager::new(layout.kindb_snapshot_path());
+        let graph = manager.graph();
+        let genesis = kin_core::build_genesis_change();
+        graph.create_change(&genesis).unwrap();
+
+        let parent_oid = "1111111111111111111111111111111111111111";
+        let child_oid = "2222222222222222222222222222222222222222";
+        let parent_id = kin_git::semantic_change_id_from_git_oid_hex(parent_oid).unwrap();
+        let child_id = kin_git::semantic_change_id_from_git_oid_hex(child_oid).unwrap();
+        let anchor_id = kin_git::base_link_change_id_from_git_oid_hex(parent_oid).unwrap();
+        let parent = SemanticChange {
+            id: parent_id,
+            parents: vec![genesis.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("git-parent"),
+            message: "parent".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(kin_model::BranchName::new("main")),
+        };
+        let child = SemanticChange {
+            id: child_id,
+            parents: vec![parent_id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("git-child"),
+            message: "child".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(kin_model::BranchName::new("main")),
+        };
+        let mut legacy_child = child.clone();
+        legacy_child.parents = vec![anchor_id];
+        let anchor = SemanticChange {
+            id: anchor_id,
+            parents: vec![genesis.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("git-anchor"),
+            message: history_checkpoint::BASE_LINK_MESSAGE.to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(kin_model::BranchName::new("main")),
+        };
+        graph.create_change(&anchor).unwrap();
+        graph.create_change(&legacy_child).unwrap();
+        graph
+            .create_branch(&kin_model::Branch {
+                name: kin_model::BranchName::new("main"),
+                head: child_id,
+            })
+            .unwrap();
+        manager.save().unwrap();
+        drop(graph);
+
+        let mut canonical = vec![
+            kin_git::ImportedChange {
+                change: parent.clone(),
+                git_oid: parent_oid.to_string(),
+            },
+            kin_git::ImportedChange {
+                change: child.clone(),
+                git_oid: child_oid.to_string(),
+            },
+        ];
+        let outcome =
+            repair_legacy_git_import_history(&manager, &layout, genesis.id, &mut canonical)
+                .unwrap();
+
+        assert_eq!(outcome.corrected_changes, 1);
+        assert!(outcome.rebuilt_derived_indexes);
+        let repaired = manager.graph().to_snapshot();
+        assert_eq!(repaired.changes[&child_id].parents, vec![parent_id]);
+        assert_eq!(repaired.changes[&parent_id].parents, vec![genesis.id]);
+        assert_eq!(
+            repaired
+                .change_children
+                .get(&parent_id)
+                .into_iter()
+                .flatten()
+                .filter(|id| **id == child_id)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn bounded_window_preserves_existing_real_parent_payload() {
+        let repo = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(repo.path()).unwrap().layout;
+        let manager = kin_db::SnapshotManager::new(layout.kindb_snapshot_path());
+        let graph = manager.graph();
+        let genesis = kin_core::build_genesis_change();
+        graph.create_change(&genesis).unwrap();
+
+        let parent_oid = "3333333333333333333333333333333333333333";
+        let child_oid = "4444444444444444444444444444444444444444";
+        let parent_id = kin_git::semantic_change_id_from_git_oid_hex(parent_oid).unwrap();
+        let child_id = kin_git::semantic_change_id_from_git_oid_hex(child_oid).unwrap();
+        let anchor_id = kin_git::base_link_change_id_from_git_oid_hex(parent_oid).unwrap();
+        let parent = SemanticChange {
+            id: parent_id,
+            parents: vec![genesis.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("git-parent"),
+            message: "parent".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(kin_model::BranchName::new("main")),
+        };
+        let child = SemanticChange {
+            id: child_id,
+            parents: vec![parent_id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("git-child"),
+            message: "child".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(kin_model::BranchName::new("main")),
+        };
+        graph.create_change(&parent).unwrap();
+        graph.create_change(&child).unwrap();
+        graph
+            .create_branch(&kin_model::Branch {
+                name: kin_model::BranchName::new("main"),
+                head: child_id,
+            })
+            .unwrap();
+        manager.save().unwrap();
+        drop(graph);
+
+        let anchor = SemanticChange {
+            id: anchor_id,
+            parents: vec![genesis.id],
+            timestamp: parent.timestamp,
+            author: parent.author.clone(),
+            message: history_checkpoint::BASE_LINK_MESSAGE.to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(kin_model::BranchName::new("main")),
+        };
+        let mut bounded_child = child.clone();
+        bounded_child.parents = vec![anchor_id];
+        let mut bounded = vec![
+            kin_git::ImportedChange {
+                change: anchor,
+                git_oid: parent_oid.to_string(),
+            },
+            kin_git::ImportedChange {
+                change: bounded_child,
+                git_oid: child_oid.to_string(),
+            },
+        ];
+
+        let outcome =
+            repair_legacy_git_import_history(&manager, &layout, genesis.id, &mut bounded).unwrap();
+
+        assert_eq!(outcome, LegacyImportRepairOutcome::default());
+        assert_eq!(
+            bounded[1].change.parents,
+            vec![parent_id],
+            "a sliding/full-to-recent window must retain the existing immutable Git payload"
+        );
+        create_deterministic_change_once(
+            manager.graph().as_ref(),
+            &bounded[1].change,
+            DeterministicChangeProvenance::Stable,
+        )
+        .expect("normalized bounded import must not collide with the existing Git-derived ID");
     }
 
     #[test]
@@ -5361,7 +6407,9 @@ mod tests {
         let parent = SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32]));
         let a: [u8; 32] = [0xaa; 32];
         let b: [u8; 32] = [0xbb; 32];
-        let fingerprint = compute_artifact_fingerprint([("src/a.rs", &a), ("src/b.rs", &b)]);
+        let regular = kin_model::SourceEntryKind::File { executable: false };
+        let fingerprint =
+            compute_artifact_fingerprint([("src/a.rs", &a, regular), ("src/b.rs", &b, regular)]);
 
         let id1 = compute_init_change_id(&parent, &fingerprint);
         let id2 = compute_init_change_id(&parent, &fingerprint);
@@ -5373,13 +6421,15 @@ mod tests {
 
         assert_eq!(
             fingerprint,
-            compute_artifact_fingerprint([("src/b.rs", &b), ("src/a.rs", &a)]),
+            compute_artifact_fingerprint([("src/b.rs", &b, regular), ("src/a.rs", &a, regular)]),
             "fingerprint must be independent of walk order"
         );
 
         let c: [u8; 32] = [0xcc; 32];
-        let id3 =
-            compute_init_change_id(&parent, &compute_artifact_fingerprint([("src/a.rs", &c)]));
+        let id3 = compute_init_change_id(
+            &parent,
+            &compute_artifact_fingerprint([("src/a.rs", &c, regular)]),
+        );
         assert_ne!(
             id1.to_string(),
             id3.to_string(),
@@ -6391,6 +7441,555 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 .any(|delta| matches!(delta, EntityDelta::Removed(id) if *id == f_id)),
             "branch B must not report a phantom Removed for `f`, got {b_deltas:?}"
         );
+    }
+
+    fn merge_rebase_fixture(blob_store: &kin_blobs::BlobStore) -> Vec<kin_git::ImportedChange> {
+        let tools = blob_store.write(b"def helper():\n    return 1\n").unwrap();
+        let app_root = blob_store.write(b"def run():\n    return 1\n").unwrap();
+        let app_first_parent = blob_store.write(b"def run():\n    return 2\n").unwrap();
+        let app_secondary_parent = blob_store
+            .write(b"from tools import helper\n\ndef run():\n    return helper()\n")
+            .unwrap();
+        let secondary_only = blob_store
+            .write(b"def secondary_only():\n    return 'secondary'\n")
+            .unwrap();
+
+        let root = imported_change(
+            [0x81; 32],
+            [0; 32],
+            "root",
+            vec![
+                artifact_delta(
+                    "tools.py",
+                    kin_model::ArtifactDeltaKind::AddedRegularFile,
+                    None,
+                    Some(Hash256::from_bytes(tools.0)),
+                ),
+                artifact_delta(
+                    "app.py",
+                    kin_model::ArtifactDeltaKind::AddedRegularFile,
+                    None,
+                    Some(Hash256::from_bytes(app_root.0)),
+                ),
+            ],
+        );
+        let first_parent = imported_change(
+            [0x82; 32],
+            [0x81; 32],
+            "first parent",
+            vec![artifact_delta(
+                "app.py",
+                kin_model::ArtifactDeltaKind::ModifiedRegularFile,
+                Some(Hash256::from_bytes(app_root.0)),
+                Some(Hash256::from_bytes(app_first_parent.0)),
+            )],
+        );
+        let secondary_parent = imported_change(
+            [0x83; 32],
+            [0x81; 32],
+            "secondary parent",
+            vec![
+                artifact_delta(
+                    "app.py",
+                    kin_model::ArtifactDeltaKind::ModifiedRegularFile,
+                    Some(Hash256::from_bytes(app_root.0)),
+                    Some(Hash256::from_bytes(app_secondary_parent.0)),
+                ),
+                artifact_delta(
+                    "secondary.py",
+                    kin_model::ArtifactDeltaKind::AddedRegularFile,
+                    None,
+                    Some(Hash256::from_bytes(secondary_only.0)),
+                ),
+            ],
+        );
+        let mut merge = imported_change(
+            [0x84; 32],
+            [0x82; 32],
+            "merge choosing first-parent tree",
+            vec![
+                artifact_delta(
+                    "app.py",
+                    kin_model::ArtifactDeltaKind::ModifiedRegularFile,
+                    Some(Hash256::from_bytes(app_secondary_parent.0)),
+                    Some(Hash256::from_bytes(app_first_parent.0)),
+                ),
+                artifact_delta(
+                    "secondary.py",
+                    kin_model::ArtifactDeltaKind::Removed,
+                    Some(Hash256::from_bytes(secondary_only.0)),
+                    None,
+                ),
+            ],
+        );
+        merge.change.parents = vec![first_parent.change.id, secondary_parent.change.id];
+
+        vec![root, first_parent, secondary_parent, merge]
+    }
+
+    fn resolve_imported_semantics(
+        imported: &[kin_git::ImportedChange],
+        head: SemanticChangeId,
+    ) -> kin_model::graph::ResolvedGraphState {
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .create_change(&kin_core::build_genesis_change())
+            .unwrap();
+        for imported_change in imported {
+            graph.create_change(&imported_change.change).unwrap();
+        }
+        graph.resolve_graph_at(&head).unwrap()
+    }
+
+    fn assert_imported_semantics_exact(
+        expected: &kin_model::graph::ResolvedGraphState,
+        actual: &kin_model::graph::ResolvedGraphState,
+    ) {
+        assert_eq!(expected.entities.len(), actual.entities.len());
+        for (entity_id, expected_entity) in &expected.entities {
+            let actual_entity = actual
+                .entities
+                .get(entity_id)
+                .unwrap_or_else(|| panic!("missing entity {entity_id}"));
+            assert!(
+                imported_entities_exactly_equivalent(expected_entity, actual_entity),
+                "entity {entity_id} differs: expected {expected_entity:#?}, actual {actual_entity:#?}"
+            );
+        }
+        assert_eq!(expected.relations.len(), actual.relations.len());
+        for (relation_id, expected_relation) in &expected.relations {
+            let actual_relation = actual
+                .relations
+                .get(relation_id)
+                .unwrap_or_else(|| panic!("missing relation {relation_id}"));
+            assert!(
+                imported_relations_exactly_equivalent(expected_relation, actual_relation),
+                "relation {relation_id} differs: expected {expected_relation:#?}, actual {actual_relation:#?}"
+            );
+        }
+        assert_eq!(expected.file_tree, actual.file_tree);
+    }
+
+    fn identity_neutral_semantic_shape(
+        state: &kin_model::graph::ResolvedGraphState,
+    ) -> (Vec<String>, Vec<String>) {
+        let normalized_ids: HashMap<_, _> = state
+            .entities
+            .values()
+            .map(|entity| {
+                let file = entity
+                    .file_origin
+                    .as_ref()
+                    .map(|file| file.0.as_str())
+                    .unwrap_or("");
+                let start_line = entity
+                    .span
+                    .as_ref()
+                    .map(|span| span.start_line)
+                    .unwrap_or(0);
+                (
+                    entity.id,
+                    EntityId::from_content(
+                        file,
+                        &entity.name,
+                        &format!("{:?}", entity.kind),
+                        start_line,
+                    ),
+                )
+            })
+            .collect();
+
+        let mut entities = state
+            .entities
+            .values()
+            .cloned()
+            .map(|mut entity| {
+                entity.id = normalized_ids[&entity.id];
+                entity.lineage_parent = entity
+                    .lineage_parent
+                    .and_then(|id| normalized_ids.get(&id).copied());
+                entity.superseded_by = entity
+                    .superseded_by
+                    .and_then(|id| normalized_ids.get(&id).copied());
+                canonical_json(&entity)
+            })
+            .collect::<Vec<_>>();
+        entities.sort();
+
+        let normalize_node = |node: GraphNodeId| match node {
+            GraphNodeId::Entity(id) => {
+                GraphNodeId::Entity(normalized_ids.get(&id).copied().unwrap_or(id))
+            }
+            other => other,
+        };
+        let mut relations = state
+            .relations
+            .values()
+            .cloned()
+            .map(|mut relation| {
+                relation.src = normalize_node(relation.src);
+                relation.dst = normalize_node(relation.dst);
+                relation.id = RelationId::from_content(
+                    &relation.src.to_string(),
+                    &relation.dst.to_string(),
+                    &format!("{:?}", relation.kind),
+                );
+                canonical_json(&relation)
+            })
+            .collect::<Vec<_>>();
+        relations.sort();
+        (entities, relations)
+    }
+
+    fn assert_secondary_parent_replay_matches_authoritative_model(
+        imported: &[kin_git::ImportedChange],
+        merge_id: SemanticChangeId,
+    ) {
+        let merge = imported
+            .iter()
+            .find(|entry| entry.change.id == merge_id)
+            .unwrap();
+        let first_parent = merge.change.parents[0];
+        let first_parent_state = resolve_imported_semantics(imported, first_parent);
+        let mut lightweight = ImportedRuntimeSemanticState {
+            entities: first_parent_state.entities,
+            relations: first_parent_state.relations,
+        };
+        let index_by_change_id: HashMap<_, _> = imported
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.change.id, index))
+            .collect();
+        replay_imported_secondary_parents(
+            &mut lightweight,
+            imported,
+            &index_by_change_id,
+            kin_core::build_genesis_change().id,
+            &merge.change.parents,
+        )
+        .unwrap();
+
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .create_change(&kin_core::build_genesis_change())
+            .unwrap();
+        for imported_change in imported {
+            graph.create_change(&imported_change.change).unwrap();
+        }
+        let mut probe = merge.change.clone();
+        probe.id = SemanticChangeId::from_hash(Hash256::from_bytes([0xf9; 32]));
+        probe.entity_deltas.clear();
+        probe.relation_deltas.clear();
+        probe.artifact_deltas.clear();
+        graph.create_change(&probe).unwrap();
+        let authoritative = graph.resolve_graph_at(&probe.id).unwrap();
+
+        assert_eq!(lightweight.entities.len(), authoritative.entities.len());
+        for (entity_id, expected) in &authoritative.entities {
+            let actual = lightweight
+                .entities
+                .get(entity_id)
+                .unwrap_or_else(|| panic!("lightweight replay missed entity {entity_id}"));
+            assert!(imported_entities_exactly_equivalent(expected, actual));
+        }
+        assert_eq!(lightweight.relations.len(), authoritative.relations.len());
+        for (relation_id, expected) in &authoritative.relations {
+            let actual = lightweight
+                .relations
+                .get(relation_id)
+                .unwrap_or_else(|| panic!("lightweight replay missed relation {relation_id}"));
+            assert!(imported_relations_exactly_equivalent(expected, actual));
+        }
+    }
+
+    #[test]
+    fn enrich_imported_merge_rebases_runtime_union_to_first_parent_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let fixture = merge_rebase_fixture(&blob_store);
+        let first_parent_id = fixture[1].change.id;
+        let merge_id = fixture[3].change.id;
+
+        // Put the merge before both of its parents in input order. A
+        // first-parent-only scheduler can process it after parent A but before
+        // secondary parent B; complete-DAG ordering must wait for both.
+        let mut imported = vec![
+            fixture[0].clone(),
+            fixture[3].clone(),
+            fixture[1].clone(),
+            fixture[2].clone(),
+        ];
+        enrich_imported_changes_with_semantics(&mut imported, &blob_store).unwrap();
+        assert_secondary_parent_replay_matches_authoritative_model(&imported, merge_id);
+
+        let expected = resolve_imported_semantics(&imported, first_parent_id);
+        let actual = resolve_imported_semantics(&imported, merge_id);
+        assert_imported_semantics_exact(&expected, &actual);
+
+        let merge = imported
+            .iter()
+            .find(|entry| entry.change.id == merge_id)
+            .unwrap();
+        assert!(
+            merge
+                .change
+                .entity_deltas
+                .iter()
+                .any(|delta| matches!(delta, EntityDelta::Removed(_))),
+            "merge must explicitly remove secondary-parent-only semantic state"
+        );
+        assert!(
+            merge
+                .change
+                .relation_deltas
+                .iter()
+                .any(|delta| matches!(delta, RelationDelta::Removed(_))),
+            "merge must explicitly remove secondary-parent-only relations"
+        );
+    }
+
+    #[test]
+    fn enrich_imported_octopus_merge_removes_every_unselected_parent_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let mut fixture = merge_rebase_fixture(&blob_store);
+        let first_parent_id = fixture[1].change.id;
+        let tertiary_blob = blob_store
+            .write(b"def tertiary_only():\n    return 'tertiary'\n")
+            .unwrap();
+        let tertiary = imported_change(
+            [0x85; 32],
+            [0x81; 32],
+            "tertiary parent",
+            vec![artifact_delta(
+                "tertiary.py",
+                kin_model::ArtifactDeltaKind::AddedRegularFile,
+                None,
+                Some(Hash256::from_bytes(tertiary_blob.0)),
+            )],
+        );
+        let mut merge = fixture.pop().unwrap();
+        merge.change.parents.push(tertiary.change.id);
+        merge.change.artifact_deltas.push(artifact_delta(
+            "tertiary.py",
+            kin_model::ArtifactDeltaKind::Removed,
+            Some(Hash256::from_bytes(tertiary_blob.0)),
+            None,
+        ));
+        let merge_id = merge.change.id;
+
+        // Keep the octopus merge ahead of all three parent records in the
+        // slice; complete-DAG scheduling still has to delay it until each arm
+        // has been enriched for the exact secondary-parent replay.
+        let mut imported = vec![
+            fixture[0].clone(),
+            merge,
+            fixture[1].clone(),
+            fixture[2].clone(),
+            tertiary,
+        ];
+        enrich_imported_changes_with_semantics(&mut imported, &blob_store).unwrap();
+        assert_secondary_parent_replay_matches_authoritative_model(&imported, merge_id);
+
+        let expected = resolve_imported_semantics(&imported, first_parent_id);
+        let actual = resolve_imported_semantics(&imported, merge_id);
+        assert_imported_semantics_exact(&expected, &actual);
+        assert!(actual
+            .entities
+            .values()
+            .all(|entity| !matches!(entity.name.as_str(), "secondary_only" | "tertiary_only")));
+    }
+
+    #[test]
+    fn secondary_parent_replay_prunes_relation_when_removed_entity_is_already_absent() {
+        let removed = test_entity("removed", "removed.py");
+        let peer = test_entity("peer", "peer.py");
+        let relation = test_relation(RelationKind::Calls, peer.id, removed.id);
+
+        // First-parent runtime state contains a dangling cross-branch relation
+        // but not the referenced entity. The secondary parent removes that
+        // absent entity. Authoritative replay still prunes every relation that
+        // mentions the ID; conditioning pruning on `entities.remove()` would
+        // leak this edge through the merge baseline.
+        let mut first_parent = imported_change(
+            [0xa1; 32],
+            [0; 32],
+            "first parent adds cross-branch relation",
+            Vec::new(),
+        );
+        first_parent.change.relation_deltas = vec![RelationDelta::Added(relation)];
+        let mut secondary_parent = imported_change(
+            [0xa2; 32],
+            [0; 32],
+            "secondary parent removes absent entity",
+            Vec::new(),
+        );
+        secondary_parent.change.entity_deltas = vec![EntityDelta::Removed(removed.id)];
+        let mut merge = imported_change([0xa3; 32], [0xa1; 32], "merge", Vec::new());
+        merge.change.parents = vec![first_parent.change.id, secondary_parent.change.id];
+        let merge_id = merge.change.id;
+        let imported = vec![first_parent, secondary_parent, merge];
+
+        assert_secondary_parent_replay_matches_authoritative_model(&imported, merge_id);
+    }
+
+    #[test]
+    fn imported_merge_target_can_select_secondary_state_and_add_novel_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let mut imported = merge_rebase_fixture(&blob_store);
+        let tools_hash = imported[0]
+            .change
+            .artifact_deltas
+            .iter()
+            .find(|delta| delta.file_id.0 == "tools.py")
+            .and_then(|delta| delta.new_hash)
+            .unwrap();
+        let app_first_parent_hash = imported[1].change.artifact_deltas[0].new_hash.unwrap();
+        let app_secondary_hash = imported[2]
+            .change
+            .artifact_deltas
+            .iter()
+            .find(|delta| delta.file_id.0 == "app.py")
+            .and_then(|delta| delta.new_hash)
+            .unwrap();
+        let secondary_hash = imported[2]
+            .change
+            .artifact_deltas
+            .iter()
+            .find(|delta| delta.file_id.0 == "secondary.py")
+            .and_then(|delta| delta.new_hash)
+            .unwrap();
+        let novel_hash = Hash256::from_bytes(
+            blob_store
+                .write(b"def novel_at_merge():\n    return 'novel'\n")
+                .unwrap()
+                .0,
+        );
+
+        let merge = imported.last_mut().unwrap();
+        let app_delta = merge
+            .change
+            .artifact_deltas
+            .iter_mut()
+            .find(|delta| delta.file_id.0 == "app.py")
+            .unwrap();
+        app_delta.old_hash = Some(app_first_parent_hash);
+        app_delta.new_hash = Some(app_secondary_hash);
+        let secondary_delta = merge
+            .change
+            .artifact_deltas
+            .iter_mut()
+            .find(|delta| delta.file_id.0 == "secondary.py")
+            .unwrap();
+        secondary_delta.kind = kin_model::ArtifactDeltaKind::ModifiedRegularFile;
+        secondary_delta.new_hash = Some(secondary_hash);
+        merge.change.artifact_deltas.push(artifact_delta(
+            "novel.py",
+            kin_model::ArtifactDeltaKind::AddedRegularFile,
+            None,
+            Some(novel_hash),
+        ));
+        let merge_id = merge.change.id;
+
+        enrich_imported_changes_with_semantics(&mut imported, &blob_store).unwrap();
+        assert_secondary_parent_replay_matches_authoritative_model(&imported, merge_id);
+
+        // Hydrate the exact selected merge tree independently as a single
+        // root. This oracle proves the merge is not hardwired to reset to its
+        // first parent: it keeps secondary-parent app/edge state and adds a
+        // path that exists in neither parent.
+        let mut oracle = vec![imported_change(
+            [0xb1; 32],
+            [0; 32],
+            "independent exact merge target",
+            vec![
+                artifact_delta(
+                    "tools.py",
+                    kin_model::ArtifactDeltaKind::AddedRegularFile,
+                    None,
+                    Some(tools_hash),
+                ),
+                artifact_delta(
+                    "app.py",
+                    kin_model::ArtifactDeltaKind::AddedRegularFile,
+                    None,
+                    Some(app_secondary_hash),
+                ),
+                artifact_delta(
+                    "secondary.py",
+                    kin_model::ArtifactDeltaKind::AddedRegularFile,
+                    None,
+                    Some(secondary_hash),
+                ),
+                artifact_delta(
+                    "novel.py",
+                    kin_model::ArtifactDeltaKind::AddedRegularFile,
+                    None,
+                    Some(novel_hash),
+                ),
+            ],
+        )];
+        enrich_imported_changes_with_semantics(&mut oracle, &blob_store).unwrap();
+
+        let expected = resolve_imported_semantics(&oracle, oracle[0].change.id);
+        let actual = resolve_imported_semantics(&imported, merge_id);
+        assert_eq!(
+            identity_neutral_semantic_shape(&expected),
+            identity_neutral_semantic_shape(&actual),
+            "selected merge tree must match an independently hydrated exact-tree oracle after neutralizing expected lineage-preserving IDs"
+        );
+        assert_eq!(expected.file_tree, actual.file_tree);
+        assert!(actual
+            .entities
+            .values()
+            .any(|entity| entity.name == "novel_at_merge"));
+        assert!(!actual.relations.is_empty());
+    }
+
+    #[test]
+    fn checkpoint_resume_seeds_all_parent_merge_rebase_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let fixture = merge_rebase_fixture(&blob_store);
+        let first_parent_id = fixture[1].change.id;
+        let merge_id = fixture[3].change.id;
+        let config = HydrationCheckpointConfig::clean_for_test(
+            &dir.path().join("kin"),
+            "merge-rebase-clean-sha",
+            1,
+            16 * 1024 * 1024,
+        );
+
+        let mut oracle = fixture.clone();
+        enrich_imported_changes_with_semantics_inner(&mut oracle, &blob_store, true).unwrap();
+
+        let mut prefix = fixture[..2].to_vec();
+        enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut prefix,
+            &blob_store,
+            true,
+            Some(config.clone()),
+        )
+        .unwrap();
+
+        let mut resumed = fixture;
+        let stats = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut resumed,
+            &blob_store,
+            true,
+            Some(config),
+        )
+        .unwrap();
+        assert_eq!(
+            stats.resumed_from, 1,
+            "resume must fall back to the newest frontier retaining root state for both branches"
+        );
+        assert_same_hydration_deltas(&oracle, &resumed);
+
+        let expected = resolve_imported_semantics(&resumed, first_parent_id);
+        let actual = resolve_imported_semantics(&resumed, merge_id);
+        assert_imported_semantics_exact(&expected, &actual);
     }
 
     /// Minimal git repo bootstrap for history-import tests. Returns false when
@@ -8548,6 +10147,104 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         assert!(snapshot.join("manifest.json").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_and_exact_init_entries_preserve_modes_and_symlink_targets() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("plain.txt"), b"plain\n").unwrap();
+        fs::write(root.join("bin/run"), b"#!/bin/sh\n").unwrap();
+        let mut permissions = fs::metadata(root.join("bin/run")).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(root.join("bin/run"), permissions).unwrap();
+        symlink("plain.txt", root.join("current")).unwrap();
+
+        let (snapshot, manifest) = snapshot_repo(root, false).unwrap();
+        assert_eq!(manifest["file_count"], 3);
+        assert_eq!(
+            fs::read_link(snapshot.join("current")).unwrap(),
+            Path::new("plain.txt")
+        );
+        assert_ne!(
+            fs::metadata(snapshot.join("bin/run"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+
+        let all_files = collect_source_files(&snapshot).unwrap();
+        let exact = collect_exact_init_source_entries(&snapshot, &all_files).unwrap();
+        let kinds: BTreeMap<_, _> = exact
+            .iter()
+            .map(|entry| (entry.rel_path.as_str(), entry.kind))
+            .collect();
+        assert_eq!(
+            kinds.get("plain.txt"),
+            Some(&kin_model::SourceEntryKind::File { executable: false })
+        );
+        assert_eq!(
+            kinds.get("bin/run"),
+            Some(&kin_model::SourceEntryKind::File { executable: true })
+        );
+        assert_eq!(
+            kinds.get("current"),
+            Some(&kin_model::SourceEntryKind::Symlink)
+        );
+        let link = exact
+            .iter()
+            .find(|entry| entry.rel_path == "current")
+            .unwrap();
+        let (target, _) = read_exact_init_source(&link.abs_path).unwrap();
+        assert_eq!(target, b"plain.txt");
+    }
+
+    #[test]
+    fn exact_init_repair_restates_retained_paths_and_removes_deleted_gaps() {
+        let retained_hash = Hash256::from_bytes([0x11; 32]);
+        let deleted_hash = Hash256::from_bytes([0x22; 32]);
+        let added_hash = [0x33; 32];
+        let parent = HashMap::from([
+            (FilePathId::new("legacy.sh"), retained_hash),
+            (FilePathId::new("deleted.txt"), deleted_hash),
+        ]);
+        let current = vec![
+            ExactInitSourceEntry {
+                abs_path: PathBuf::from("legacy.sh"),
+                rel_path: "legacy.sh".to_string(),
+                hash: *retained_hash.as_bytes(),
+                kind: SourceEntryKind::File { executable: true },
+            },
+            ExactInitSourceEntry {
+                abs_path: PathBuf::from("new-link"),
+                rel_path: "new-link".to_string(),
+                hash: added_hash,
+                kind: SourceEntryKind::Symlink,
+            },
+        ];
+
+        let deltas = build_exact_init_repair_deltas(parent, &current);
+        assert_eq!(deltas.len(), 3);
+        assert_eq!(deltas[0].file_id, FilePathId::new("deleted.txt"));
+        assert_eq!(deltas[0].kind, kin_model::ArtifactDeltaKind::Removed);
+        assert_eq!(deltas[0].old_hash, Some(deleted_hash));
+        assert_eq!(deltas[1].file_id, FilePathId::new("legacy.sh"));
+        assert_eq!(
+            deltas[1].kind,
+            kin_model::ArtifactDeltaKind::ModifiedExecutableFile
+        );
+        assert_eq!(deltas[1].old_hash, Some(retained_hash));
+        assert_eq!(deltas[1].new_hash, Some(retained_hash));
+        assert_eq!(deltas[2].file_id, FilePathId::new("new-link"));
+        assert_eq!(deltas[2].kind, kin_model::ArtifactDeltaKind::AddedSymlink);
+        assert_eq!(deltas[2].old_hash, None);
+        assert_eq!(deltas[2].new_hash, Some(Hash256::from_bytes(added_hash)));
+    }
+
     #[test]
     fn manifest_has_correct_file_count() {
         let dir = tempfile::tempdir().unwrap();
@@ -8908,18 +10605,46 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         // deterministic Git id. Reuse the already-persisted semantic deltas;
         // the old replay also treated that wrong boundary as external, so the
         // only authoritative record difference is the generated parent edge.
+        let ids: Vec<_> = legacy.iter().map(|entry| entry.change.id).collect();
+        let id_set: HashSet<_> = ids.iter().copied().collect();
+        let mut snapshot = graph.to_snapshot();
         for imported in &legacy {
-            let mut old_release_record = graph
-                .get_change(&imported.change.id)
-                .unwrap()
+            let old_release_record = snapshot
+                .changes
+                .get_mut(&imported.change.id)
                 .expect("fresh init must already contain every imported Git id");
             old_release_record.parents = imported.change.parents.clone();
-            graph.create_change(&old_release_record).unwrap();
+
+            // Reproduce the append-only derived-index side effects of the old
+            // duplicate-ID insertion implementation. The current kin-db
+            // correctly rejects that public operation, so a legacy fixture
+            // must install the already-persisted corrupt shape directly.
+            for parent in &old_release_record.parents {
+                snapshot
+                    .change_children
+                    .entry(*parent)
+                    .or_default()
+                    .push(old_release_record.id);
+            }
         }
-        let ids: Vec<_> = legacy.iter().map(|entry| entry.change.id).collect();
-        graph
-            .update_branch_head(&branch, ids.last().unwrap())
-            .unwrap();
+        for revisions in snapshot.entity_revisions.values_mut() {
+            let duplicates = revisions
+                .iter()
+                .filter(|revision| id_set.contains(&revision.introduced_by))
+                .cloned()
+                .collect::<Vec<_>>();
+            revisions.extend(duplicates);
+        }
+        snapshot
+            .branches
+            .get_mut(&branch)
+            .expect("fixture branch must exist")
+            .head = *ids.last().unwrap();
+        drop(graph);
+        snap.swap(kin_db::InMemoryGraph::from_snapshot_with_text_index(
+            snapshot,
+            layout.text_index_dir(),
+        ));
         snap.save().unwrap();
         ids
     }
@@ -9133,18 +10858,43 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         .await
         .unwrap();
 
-        // Reproduce the pre-fix warm-init corruption under kin-db 0.2.31:
-        // overwriting the deterministic Git change with a self-parent appends
-        // both a stale reverse edge and duplicate revision generations.
+        // Reproduce the pre-fix warm-init corruption under kin-db 0.2.31.
+        // Current kin-db rejects duplicate-ID insertion, so install the exact
+        // already-persisted legacy shape through the snapshot boundary.
         let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
         {
             let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
             let graph = snap.graph();
-            let mut malformed = graph.get_change(&git_change).unwrap().unwrap();
-            malformed.parents = vec![git_change];
-            graph.create_change(&malformed).unwrap();
+            let mut snapshot = graph.to_snapshot();
+            snapshot
+                .changes
+                .get_mut(&git_change)
+                .expect("imported change must exist")
+                .parents = vec![git_change];
+            snapshot
+                .change_children
+                .entry(git_change)
+                .or_default()
+                .push(git_change);
+            for revisions in snapshot.entity_revisions.values_mut() {
+                let duplicates = revisions
+                    .iter()
+                    .filter(|revision| revision.introduced_by == git_change)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                revisions.extend(duplicates);
+            }
             let branch = kin_core::read_current_branch(&layout).unwrap();
-            graph.update_branch_head(&branch, &git_change).unwrap();
+            snapshot
+                .branches
+                .get_mut(&branch)
+                .expect("fixture branch must exist")
+                .head = git_change;
+            drop(graph);
+            snap.swap(kin_db::InMemoryGraph::from_snapshot_with_text_index(
+                snapshot,
+                layout.text_index_dir(),
+            ));
             snap.save().unwrap();
         }
 
@@ -9450,13 +11200,30 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 .filter(|change| change.message != "kin init: auto-parse")
                 .map(|change| change.id)
                 .collect();
-            for _ in 0..2 {
-                for id in &ids {
-                    graph
-                        .create_change(&graph.get_change(id).unwrap().unwrap())
-                        .unwrap();
+            let id_set: HashSet<_> = ids.iter().copied().collect();
+            let mut snapshot = graph.to_snapshot();
+            for id in &ids {
+                for parent in snapshot.changes[id].parents.clone() {
+                    snapshot
+                        .change_children
+                        .entry(parent)
+                        .or_default()
+                        .push(*id);
                 }
             }
+            for revisions in snapshot.entity_revisions.values_mut() {
+                let duplicates = revisions
+                    .iter()
+                    .filter(|revision| id_set.contains(&revision.introduced_by))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                revisions.extend(duplicates);
+            }
+            drop(graph);
+            snap.swap(kin_db::InMemoryGraph::from_snapshot_with_text_index(
+                snapshot,
+                layout.text_index_dir(),
+            ));
             snap.save().unwrap();
             ids
         };

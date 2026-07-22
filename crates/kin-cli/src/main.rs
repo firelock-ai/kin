@@ -681,7 +681,7 @@ enum Command {
         /// Block release if entities lack linked passing tests
         #[arg(long)]
         require_proof: bool,
-        /// Block release if unapproved agent changes exist
+        /// Require known-human approval for every reachable non-root change
         #[arg(long)]
         require_approval: bool,
         /// Force release even with low coverage
@@ -1907,7 +1907,7 @@ enum ReleaseAction {
         /// Block release if entities lack linked passing tests
         #[arg(long)]
         require_proof: bool,
-        /// Block release if unapproved agent changes exist
+        /// Require known-human approval for every reachable non-root change
         #[arg(long)]
         require_approval: bool,
         /// Force release even with low coverage

@@ -94,8 +94,11 @@
 //!   scoped reconcile mutates a session-private graph isolated from HEAD.
 //! - `POST /graph/mutations` (`graph_mutations`): work-item / annotation / audit
 //!   metadata, not entity truth; ungated.
-//! - `PUT /graph/branches/{name}/head`, `DELETE /graph/branches/{name}`: branch
-//!   ref operations; ungated.
+//! - `PUT /v2/graph/branches/{name}/head`: compare-and-swap against the live
+//!   head plus ancestry validation; stale, sideways, and backward moves fail
+//!   before mutation. The v1 mutation route is retired with `410 Gone`.
+//!   `DELETE /graph/branches/{name}` remains a ref-management operation outside
+//!   the entity write-veto policy.
 //! - `POST /mcp/tools/call` (`kin_transaction_commit`): **write-veto** before
 //!   `apply_transaction_delta`, plus `can_write`/`can_commit` capability checks.
 //!   Enforce mode fails closed for an unknown/non-rich session. Exact entity,

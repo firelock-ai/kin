@@ -119,7 +119,7 @@ can run `kin mcp start` with the same `agent-default` profile), see
 - **`kin_verify_entity`**: Inspect the test coverage recorded for an entity — which tests are linked to it and whether it is covered (optionally filtered by runner).
 - **`kin_coverage_summary`**: Report repo-wide test coverage — total entities, how many are covered, the ratio, and what's still untested.
 - **`kin_security_scan`**: Run a graph-based security/quality scan that returns findings with severity (today it surfaces dead/unreachable code; `propagate=true` also computes each finding's downstream impact).
-- **`kin_release_check`**: Run a pre-release gate returning a pass/fail verdict with blockers (toggle `require_proof` / `require_approval`).
+- **`kin_release_check`**: Run a graph-only advisory against a named branch and immutable source change. It checks exact history/tree completeness and an optional source entity count; `require_approval` covers every reachable non-root change, while `require_proof` currently fails closed for every non-empty source because verification runs are not yet source-bound. Final object availability and mutation CAS remain daemon `kin release` authority.
 - **`kin_contract_check`**: Check whether a specific behavioral contract has backing tests (which tests cover it, and whether it is covered).
 - **`kin_provenance_query`**: Answer who-changed-and-whether-approved for an entity — its change count, latest change, recorded approvals, and recent audit events.
 

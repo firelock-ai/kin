@@ -40,6 +40,7 @@ kin-lsp = { workspace = true }
 kin-cli = { workspace = true }
 kin-buildinfo = { workspace = true }
 kin-mcp = { workspace = true }
+kin-review = { workspace = true }
 gix = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
@@ -74,6 +75,7 @@ kin-infer = { version = ">=0.2.1", registry = "kin", features = ["metal"] }
 [dev-dependencies]
 base64 = "0.22"
 kin-git = { workspace = true }
+http-body = "1"
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
 serial_test = { workspace = true }

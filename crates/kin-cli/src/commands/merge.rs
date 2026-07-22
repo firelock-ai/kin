@@ -55,6 +55,7 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
             &layout,
             &current_name.to_string(),
             &current.head.to_string(),
+            &current.head.to_string(),
         )
         .await?;
     }
@@ -106,7 +107,7 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
                 &source.head,
                 &[],
                 &format!("Merge unrelated '{}' into '{}'", branch, current.name),
-            );
+            )?;
             crate::backend::require_daemon_commit(&layout, &merge, &current.name.to_string())
                 .await?;
             println!("  Merge commit: {}", merge.id);
@@ -159,6 +160,7 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
                 &layout,
                 &current.name.to_string(),
                 &source.head.to_string(),
+                &current.head.to_string(),
             )
             .await?;
             println!("  Fast-forward: '{}' -> {}", current.name, source.head);
@@ -169,7 +171,7 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
                 &source.head,
                 &theirs,
                 &format!("Merge '{}' into '{}'", branch, current.name),
-            );
+            )?;
             crate::backend::require_daemon_commit(&layout, &merge, &current.name.to_string())
                 .await?;
             println!("  Merge commit: {}", merge.id);
@@ -199,6 +201,7 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
                     &layout,
                     &current.name.to_string(),
                     &source.head.to_string(),
+                    &current.head.to_string(),
                 )
                 .await?;
                 println!("  Fast-forward: '{}' -> {}", current.name, source.head);
@@ -208,7 +211,7 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
                     &source.head,
                     &theirs,
                     &format!("Merge '{}' into '{}' (auto-resolved)", branch, current.name),
-                );
+                )?;
                 crate::backend::require_daemon_commit(&layout, &merge, &current.name.to_string())
                     .await?;
                 println!("  Merge commit: {}", merge.id);
@@ -360,17 +363,7 @@ fn build_merge_change(
     theirs_head: &SemanticChangeId,
     their_changes: &[SemanticChange],
     message: &str,
-) -> SemanticChange {
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(b"kin-merge-v1:");
-    hasher.update(ours_head.0.as_bytes());
-    hasher.update(theirs_head.0.as_bytes());
-    let result = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&result);
-    let id = SemanticChangeId::from_hash(Hash256::from_bytes(bytes));
-
+) -> Result<SemanticChange> {
     // Collect all deltas from their side
     let entity_deltas: Vec<_> = their_changes
         .iter()
@@ -385,8 +378,8 @@ fn build_merge_change(
         .flat_map(|c| c.artifact_deltas.clone())
         .collect();
 
-    SemanticChange {
-        id,
+    let mut change = SemanticChange {
+        id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
         parents: vec![*ours_head, *theirs_head],
         timestamp: Timestamp::now(),
         author: AuthorId::new("kin-merge"),
@@ -399,5 +392,30 @@ fn build_merge_change(
         evidence: vec![],
         risk_summary: None,
         authored_on: None,
+    };
+    change.id = kin_core::compute_semantic_change_id(&change)?;
+    Ok(change)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_identity_binds_complete_constructed_payload() {
+        let ours = SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32]));
+        let theirs = SemanticChangeId::from_hash(Hash256::from_bytes([0x22; 32]));
+        let merge = build_merge_change(&ours, &theirs, &[], "merge feature").unwrap();
+        assert_eq!(
+            merge.id,
+            kin_core::compute_semantic_change_id(&merge).unwrap()
+        );
+
+        let mut changed = merge.clone();
+        changed.message = "different merge payload".to_string();
+        assert_ne!(
+            merge.id,
+            kin_core::compute_semantic_change_id(&changed).unwrap()
+        );
     }
 }

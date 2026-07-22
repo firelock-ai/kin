@@ -13,59 +13,171 @@ use kin_model::change::EntityDelta;
 use kin_model::entity::{EntityKind, Visibility};
 use kin_model::graph::GraphStore;
 use kin_model::ids::{EntityId, SemanticChangeId};
-use kin_model::provenance::ApprovalDecision;
+use kin_model::provenance::{ActorKind, ApprovalDecision};
 use kin_model::relation::{GraphNodeId, RelationKind};
+use kin_model::verification::{CoverageSummary, VerificationStatus};
 
 use crate::error::ReviewError;
 
-/// An unapproved change authored by an agent, found while walking history.
+/// A non-root change without a recorded human approval, found while walking history.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnapprovedAgentChange {
+pub struct UnapprovedChange {
     pub change_id: SemanticChangeId,
     pub author: String,
 }
 
-/// Walk change history from `head` and collect changes authored by an agent
-/// that lack a recorded `Approved` approval.
+/// Walk change history from `head` and collect non-root changes that lack a
+/// recorded approval by a known human actor.
 ///
-/// Matches the `kin release --require-approval` gate: a change blocks the
-/// release when its author identifier contains "agent" and no approval with
-/// decision `Approved` is recorded for it. The walk follows first parents
-/// (linear history) for up to `limit` changes.
-pub fn unapproved_agent_changes<G: GraphStore>(
+/// `SemanticChange.author` is an unauthenticated display string and supported
+/// daemon commits commonly populate it with the OS username even when an agent
+/// authored the change. It therefore cannot safely decide whether approval is
+/// required. The release gate fails closed for every non-root change and only
+/// accepts an `Approved` decision whose approver resolves to `ActorKind::Human`.
+pub fn unapproved_changes<G: GraphStore>(
     store: &G,
     head: &SemanticChangeId,
     limit: usize,
-) -> Result<Vec<UnapprovedAgentChange>, ReviewError> {
+) -> Result<Vec<UnapprovedChange>, ReviewError> {
     let mut unapproved = Vec::new();
-    let mut current = *head;
+    let mut pending = vec![*head];
+    let mut visited = std::collections::HashSet::new();
 
     for _ in 0..limit {
-        let change = match store.get_change(&current).map_err(ReviewError::graph)? {
-            Some(change) => change,
-            None => break,
+        let Some(current) = pending.pop() else {
+            break;
         };
+        if !visited.insert(current) {
+            continue;
+        }
+        let change = store
+            .get_change(&current)
+            .map_err(ReviewError::graph)?
+            .ok_or(ReviewError::RefStateUnavailable {
+                at: *head,
+                missing: current,
+            })?;
 
-        let approvals = store
+        let mut is_approved = false;
+        for approval in store
             .get_approvals_for_change(&change.id)
-            .map_err(ReviewError::graph)?;
-        let is_approved = approvals
-            .iter()
-            .any(|a| a.decision == ApprovalDecision::Approved);
-        if !is_approved && change.author.0.contains("agent") {
-            unapproved.push(UnapprovedAgentChange {
+            .map_err(ReviewError::graph)?
+        {
+            if approval.decision != ApprovalDecision::Approved {
+                continue;
+            }
+            if store
+                .get_actor(&approval.approver)
+                .map_err(ReviewError::graph)?
+                .is_some_and(|actor| actor.kind == ActorKind::Human)
+            {
+                is_approved = true;
+                break;
+            }
+        }
+        if !change.parents.is_empty() && !is_approved {
+            unapproved.push(UnapprovedChange {
                 change_id: change.id,
                 author: change.author.0.clone(),
             });
         }
 
-        match change.parents.first() {
-            Some(parent) => current = *parent,
-            None => break,
+        for parent in change.parents.iter().rev() {
+            if !visited.contains(parent) {
+                pending.push(*parent);
+            }
         }
     }
 
+    unapproved.sort_by_key(|change| change.change_id.to_string());
     Ok(unapproved)
+}
+
+// Compatibility aliases for downstream crates compiled against the pre-0.3
+// symbol names. The policy has always been conservative at this boundary: it
+// applies to every non-root change, regardless of the unauthenticated author
+// display string.
+pub use unapproved_changes as unapproved_agent_changes;
+pub use UnapprovedChange as UnapprovedAgentChange;
+
+/// Compute current, advisory proof coverage for a graph.
+///
+/// Structural `Test -> Covers -> Entity` links describe intended coverage,
+/// but do not prove that a test ran or passed. Release proof therefore counts
+/// an entity only when at least one persisted `VerificationRun` linked through
+/// `run_proves_entity` has status `Passing`.
+pub fn passing_proof_coverage<G: GraphStore>(store: &G) -> Result<CoverageSummary, ReviewError> {
+    let mut entities = store.list_all_entities().map_err(ReviewError::graph)?;
+    entities.sort_by_key(|entity| entity.id.to_string());
+
+    let mut covered_entities = 0_usize;
+    let mut missing_proof = Vec::new();
+    for entity in &entities {
+        let has_passing_run = store
+            .list_runs_proving_entity(&entity.id)
+            .map_err(ReviewError::graph)?
+            .iter()
+            .any(|run| run.status == VerificationStatus::Passing);
+        if has_passing_run {
+            covered_entities += 1;
+        } else {
+            missing_proof.push(entity.id);
+        }
+    }
+
+    let total_entities = entities.len();
+    let coverage_ratio = if total_entities == 0 {
+        0.0
+    } else {
+        covered_entities as f64 / total_entities as f64
+    };
+    Ok(CoverageSummary {
+        total_entities,
+        covered_entities,
+        coverage_ratio,
+        missing_proof,
+    })
+}
+
+/// Compute proof coverage admissible for an immutable release source.
+///
+/// `VerificationRun` currently has no source-change or source-manifest field,
+/// so a passing run in live graph state cannot prove an older immutable source
+/// and must not authorize publication. Until that binding exists, release
+/// admission fails closed by reporting every source entity as missing proof.
+/// The empty source is vacuously covered.
+pub fn source_bound_release_proof_coverage<G: GraphStore>(
+    store: &G,
+) -> Result<CoverageSummary, ReviewError> {
+    let mut entities = store.list_all_entities().map_err(ReviewError::graph)?;
+    entities.sort_by_key(|entity| entity.id.to_string());
+    Ok(source_bound_release_proof_coverage_for_entities(
+        entities.iter(),
+    ))
+}
+
+/// Compute fail-closed release coverage for an already-resolved immutable
+/// source state.
+///
+/// Callers use this after resolving a specific branch head or change, so
+/// ambient graph overlays cannot change the release count. Verification runs
+/// do not yet carry an immutable source binding; every entity in a non-empty
+/// source therefore remains missing and coverage is exactly 0%.
+pub fn source_bound_release_proof_coverage_for_entities<'a>(
+    entities: impl IntoIterator<Item = &'a kin_model::Entity>,
+) -> CoverageSummary {
+    let mut missing_proof = entities
+        .into_iter()
+        .map(|entity| entity.id)
+        .collect::<Vec<_>>();
+    missing_proof.sort_by_key(ToString::to_string);
+    let total_entities = missing_proof.len();
+    CoverageSummary {
+        total_entities,
+        covered_entities: 0,
+        coverage_ratio: if total_entities == 0 { 1.0 } else { 0.0 },
+        missing_proof,
+    }
 }
 
 /// Severity of a security finding, ordered low → high.
@@ -312,9 +424,9 @@ mod tests {
     use kin_model::entity::{
         Entity, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint,
     };
-    use kin_model::graph::{ChangeStore, EntityStore, ProvenanceStore};
+    use kin_model::graph::{ChangeStore, EntityStore, ProvenanceStore, VerificationStore};
     use kin_model::ids::{AuthorId, Hash256, LanguageId, RelationId};
-    use kin_model::provenance::{ActorId, Approval, ApprovalId};
+    use kin_model::provenance::{Actor, ActorId, Approval, ApprovalId};
     use kin_model::relation::{Relation, RelationOrigin};
     use kin_model::timestamp::Timestamp;
 
@@ -371,11 +483,26 @@ mod tests {
         Approval {
             approval_id: ApprovalId::new(),
             change_id: change.id,
-            approver: ActorId::new(),
+            approver: ActorId::from_hash(Hash256::from_bytes([0xa5; 32])),
             decision,
             reason: "test".into(),
             timestamp: Timestamp::now(),
         }
+    }
+
+    fn register_approver(store: &InMemoryGraph, kind: ActorKind) {
+        store
+            .create_actor(&Actor {
+                actor_id: ActorId::from_hash(Hash256::from_bytes([0xa5; 32])),
+                kind,
+                display_name: "reviewer".into(),
+                external_refs: vec![],
+            })
+            .unwrap();
+    }
+
+    fn add_root(store: &InMemoryGraph) {
+        store.create_change(&change(0, None, "kin")).unwrap();
     }
 
     fn calls(src: &Entity, dst: &Entity) -> Relation {
@@ -397,7 +524,8 @@ mod tests {
     #[test]
     fn agent_change_without_approval_is_flagged() {
         let store = InMemoryGraph::new();
-        let c = change(1, None, "claude-agent");
+        add_root(&store);
+        let c = change(1, Some(0), "claude-agent");
         store.create_change(&c).unwrap();
 
         let found = unapproved_agent_changes(&store, &c.id, 50).unwrap();
@@ -409,7 +537,9 @@ mod tests {
     #[test]
     fn agent_change_with_approval_is_not_flagged() {
         let store = InMemoryGraph::new();
-        let c = change(1, None, "claude-agent");
+        add_root(&store);
+        register_approver(&store, ActorKind::Human);
+        let c = change(1, Some(0), "claude-agent");
         store.create_change(&c).unwrap();
         store
             .create_approval(&approval(&c, ApprovalDecision::Approved))
@@ -420,20 +550,37 @@ mod tests {
     }
 
     #[test]
-    fn human_change_without_approval_is_not_flagged() {
+    fn display_name_cannot_bypass_required_approval() {
         let store = InMemoryGraph::new();
-        let c = change(1, None, "alice");
+        add_root(&store);
+        let c = change(1, Some(0), "alice");
         store.create_change(&c).unwrap();
 
         let found = unapproved_agent_changes(&store, &c.id, 50).unwrap();
-        assert!(found.is_empty(), "non-agent author is never gated");
+        assert_eq!(found.len(), 1, "display text must not bypass the gate");
+    }
+
+    #[test]
+    fn assistant_approval_does_not_satisfy_human_gate() {
+        let store = InMemoryGraph::new();
+        add_root(&store);
+        register_approver(&store, ActorKind::Assistant);
+        let c = change(1, Some(0), "alice");
+        store.create_change(&c).unwrap();
+        store
+            .create_approval(&approval(&c, ApprovalDecision::Approved))
+            .unwrap();
+
+        let found = unapproved_agent_changes(&store, &c.id, 50).unwrap();
+        assert_eq!(found.len(), 1);
     }
 
     #[test]
     fn rejected_and_conditional_do_not_satisfy_approval() {
         for decision in [ApprovalDecision::Rejected, ApprovalDecision::Conditional] {
             let store = InMemoryGraph::new();
-            let c = change(1, None, "agent-x");
+            add_root(&store);
+            let c = change(1, Some(0), "agent-x");
             store.create_change(&c).unwrap();
             store.create_approval(&approval(&c, decision)).unwrap();
 
@@ -452,6 +599,7 @@ mod tests {
         // The new unapproved mutation must block even though an earlier change
         // was approved — this is the audit-events-exist-but-latest-unapproved case.
         let store = InMemoryGraph::new();
+        register_approver(&store, ActorKind::Human);
         let c1 = change(1, None, "agent-a");
         let c2 = change(2, Some(1), "agent-a");
         store.create_change(&c1).unwrap();
@@ -488,10 +636,45 @@ mod tests {
     }
 
     #[test]
-    fn missing_head_change_yields_no_blockers() {
+    fn missing_head_change_fails_closed() {
         let store = InMemoryGraph::new();
-        let found = unapproved_agent_changes(&store, &change_id(9), 50).unwrap();
-        assert!(found.is_empty());
+        let head = change_id(9);
+        let error = unapproved_agent_changes(&store, &head, 50).unwrap_err();
+        assert!(matches!(
+            error,
+            ReviewError::RefStateUnavailable { at, missing }
+                if at == head && missing == head
+        ));
+    }
+
+    #[test]
+    fn unbound_passing_run_is_advisory_but_never_release_authority() {
+        let store = InMemoryGraph::new();
+        let source = entity("source", EntityKind::Function, Visibility::Public);
+        store.upsert_entity(&source).unwrap();
+        let run = kin_model::VerificationRun {
+            run_id: kin_model::VerificationRunId::new(),
+            test_ids: vec![],
+            status: VerificationStatus::Passing,
+            runner: kin_model::TestRunner::Cargo,
+            started_at: Timestamp::now(),
+            finished_at: Some(Timestamp::now()),
+            duration_ms: Some(1),
+            evidence_blob: None,
+            exit_code: Some(0),
+        };
+        store.create_verification_run(&run).unwrap();
+        store
+            .link_run_proves_entity(&run.run_id, &source.id)
+            .unwrap();
+
+        assert_eq!(passing_proof_coverage(&store).unwrap().covered_entities, 1);
+        let release = source_bound_release_proof_coverage(&store).unwrap();
+        assert_eq!(release.covered_entities, 0);
+        assert_eq!(release.missing_proof, vec![source.id]);
+
+        let empty = source_bound_release_proof_coverage(&InMemoryGraph::new()).unwrap();
+        assert_eq!(empty.coverage_ratio, 1.0);
     }
 
     // ── security_findings ───────────────────────────────────────────────────
