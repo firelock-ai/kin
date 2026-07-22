@@ -10,9 +10,10 @@
 //! - PUT /registry/npm/{package}
 
 use axum::{
-    body::Bytes,
-    extract::{Extension, OriginalUri, State},
-    http::{StatusCode, Uri},
+    body::{Body, Bytes},
+    extract::{DefaultBodyLimit, Extension, OriginalUri, Request, State},
+    http::{header, Method, StatusCode, Uri},
+    middleware::{self, Next},
     response::{IntoResponse, Json, Response},
     routing::get,
     Router,
@@ -24,17 +25,44 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha1::Sha1;
 use sha2::{Digest, Sha512};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, path::Path as FsPath, sync::Arc};
 
 use crate::{Ecosystem, ManifestStore, PackageId, PackageVersion, RegistryError};
 
 const INTERNAL_REGISTRY_KEY: &str = "_kin_registry";
+const MAX_NPM_PACKAGE_LEN: usize = 214;
+const MAX_NPM_VERSION_LEN: usize = 128;
+const MAX_NPM_TARBALL_SIZE: usize = 100 * 1024 * 1024;
+const MAX_NPM_PUBLISH_BODY_SIZE: usize = 140 * 1024 * 1024;
+const MAX_NPM_ARCHIVE_ENTRIES: u64 = 100_000;
+const MAX_NPM_UNPACKED_SIZE: u64 = 1024 * 1024 * 1024;
+const MAX_NPM_ARCHIVE_DECOMPRESSED_SIZE: u64 =
+    MAX_NPM_UNPACKED_SIZE + (MAX_NPM_ARCHIVE_ENTRIES * 1024) + 1024;
+const NPM_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 /// Shared state for the npm registry routes
 pub struct NpmRegistryState {
     pub manifest_store: ManifestStore,
     pub blobs_dir: std::path::PathBuf,
+    blobs_authority: crate::atomic_file::AuthorityRoot,
     pub base_url: String,
+}
+
+impl NpmRegistryState {
+    pub fn new(
+        manifest_store: ManifestStore,
+        blobs_dir: std::path::PathBuf,
+        base_url: String,
+    ) -> Self {
+        let blobs_authority = crate::atomic_file::AuthorityRoot::new(&blobs_dir);
+        let blobs_dir = blobs_authority.path().to_path_buf();
+        Self {
+            manifest_store,
+            blobs_dir,
+            blobs_authority,
+            base_url,
+        }
+    }
 }
 
 /// Authenticated caller metadata injected by the daemon-side registry auth
@@ -61,7 +89,46 @@ pub struct RegistryAccessIdentity {
 pub fn npm_routes(state: Arc<NpmRegistryState>) -> Router {
     Router::new()
         .route("/registry/npm/{*path}", get(handle_get).put(handle_put))
+        .layer(DefaultBodyLimit::max(MAX_NPM_PUBLISH_BODY_SIZE))
+        .route_layer(middleware::from_fn(authorize_npm_publish))
         .with_state(state)
+}
+
+/// Refuse writes without the daemon-injected identity before Axum polls the
+/// request body. This keeps a disabled or unauthenticated registry from
+/// buffering the 140 MiB publish envelope merely to return a 503.
+async fn authorize_npm_publish(request: Request<Body>, next: Next) -> Response {
+    if request.method() != Method::PUT {
+        return next.run(request).await;
+    }
+    if request
+        .extensions()
+        .get::<RegistryAccessIdentity>()
+        .is_none()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "npm publishing is disabled: no authenticated registry identity",
+            })),
+        )
+            .into_response();
+    }
+    let declared = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if declared.is_some_and(|length| length > MAX_NPM_PUBLISH_BODY_SIZE as u64) {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": "npm publish body exceeds the configured size limit",
+            })),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 async fn handle_get(
@@ -74,11 +141,24 @@ async fn handle_get(
     };
 
     match route {
-        ParsedRoute::PackageMetadata { package } => package_metadata(&state, &package),
-        ParsedRoute::VersionMetadata { package, version } => {
-            version_metadata(&state, &package, &version)
+        ParsedRoute::PackageMetadata { package } => {
+            if validate_npm_package(&package).is_err() {
+                return invalid_npm_coordinate();
+            }
+            package_metadata(&state, &package).await
         }
-        ParsedRoute::Tarball { package, tarball } => download_tarball(&state, &package, &tarball),
+        ParsedRoute::VersionMetadata { package, version } => {
+            if validate_npm_package(&package).is_err() || !valid_npm_version(&version) {
+                return invalid_npm_coordinate();
+            }
+            version_metadata(&state, &package, &version).await
+        }
+        ParsedRoute::Tarball { package, tarball } => {
+            if validate_npm_package(&package).is_err() || !valid_npm_tarball_name(&tarball) {
+                return invalid_npm_coordinate();
+            }
+            download_tarball(&state, &package, &tarball).await
+        }
     }
 }
 
@@ -98,12 +178,24 @@ async fn handle_put(
         _ => return StatusCode::METHOD_NOT_ALLOWED.into_response(),
     };
 
-    publish_package(
-        &state,
-        &package,
-        identity.map(|extension| extension.0),
-        body,
-    )
+    let identity = match identity {
+        Some(Extension(identity)) => identity,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "npm publishing is disabled: no authenticated registry identity",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    if validate_npm_package(&package).is_err() {
+        return invalid_npm_coordinate();
+    }
+
+    publish_package(state, &package, identity, body).await
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,8 +282,101 @@ fn decode_package_path(raw: &str) -> Option<String> {
     Some(decoded)
 }
 
-fn package_metadata(state: &NpmRegistryState, package: &str) -> Response {
-    let versions = match state.manifest_store.get_versions(Ecosystem::Npm, package) {
+fn valid_npm_name_segment(segment: &str) -> bool {
+    if segment.is_empty() || segment == "." || segment == ".." {
+        return false;
+    }
+    let bytes = segment.as_bytes();
+    bytes
+        .first()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && bytes
+            .last()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        })
+}
+
+fn validate_npm_package(package: &str) -> Result<PackageId, String> {
+    if package.is_empty() || package.len() > MAX_NPM_PACKAGE_LEN {
+        return Err("npm package name is empty or too long".to_string());
+    }
+    if let Some(scoped) = package.strip_prefix('@') {
+        let Some((scope, name)) = scoped.split_once('/') else {
+            return Err("scoped npm package must contain one scope and one name".to_string());
+        };
+        if name.contains('/') || !valid_npm_name_segment(scope) || !valid_npm_name_segment(name) {
+            return Err("scoped npm package contains an invalid segment".to_string());
+        }
+        return Ok(PackageId {
+            ecosystem: Ecosystem::Npm,
+            scope: Some(scope.to_string()),
+            name: name.to_string(),
+        });
+    }
+    if package.contains('/') || !valid_npm_name_segment(package) {
+        return Err("npm package contains an invalid segment".to_string());
+    }
+    Ok(PackageId {
+        ecosystem: Ecosystem::Npm,
+        scope: None,
+        name: package.to_string(),
+    })
+}
+
+fn valid_npm_version(version: &str) -> bool {
+    if version.is_empty() || version.len() > MAX_NPM_VERSION_LEN {
+        return false;
+    }
+    let Ok(version) = semver::Version::parse(version) else {
+        return false;
+    };
+    version.major <= NPM_MAX_SAFE_INTEGER
+        && version.minor <= NPM_MAX_SAFE_INTEGER
+        && version.patch <= NPM_MAX_SAFE_INTEGER
+}
+
+fn valid_npm_tarball_name(tarball: &str) -> bool {
+    !tarball.is_empty()
+        && tarball.len() <= MAX_NPM_PACKAGE_LEN + MAX_NPM_VERSION_LEN + 5
+        && tarball != "."
+        && tarball != ".."
+        && !tarball
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || matches!(byte, b'/' | b'\\' | 0))
+}
+
+fn invalid_npm_coordinate() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": "invalid npm package coordinate" })),
+    )
+        .into_response()
+}
+
+async fn read_npm_versions(
+    state: &Arc<NpmRegistryState>,
+    package: &str,
+) -> Result<Vec<PackageVersion>, RegistryError> {
+    let state = Arc::clone(state);
+    let package = package.to_string();
+    tokio::task::spawn_blocking(move || {
+        state
+            .manifest_store
+            .read_transaction(Ecosystem::Npm)?
+            .get_versions(&package)
+    })
+    .await
+    .map_err(|error| {
+        RegistryError::Storage(std::io::Error::other(format!(
+            "npm storage task failed: {error}"
+        )))
+    })?
+}
+
+async fn package_metadata(state: &Arc<NpmRegistryState>, package: &str) -> Response {
+    let versions = match read_npm_versions(state, package).await {
         Ok(v) if v.is_empty() => return StatusCode::NOT_FOUND.into_response(),
         Ok(v) => v,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -278,8 +463,8 @@ fn package_metadata(state: &NpmRegistryState, package: &str) -> Response {
     Json(response).into_response()
 }
 
-fn version_metadata(state: &NpmRegistryState, package: &str, version: &str) -> Response {
-    let versions = match state.manifest_store.get_versions(Ecosystem::Npm, package) {
+async fn version_metadata(state: &Arc<NpmRegistryState>, package: &str, version: &str) -> Response {
+    let versions = match read_npm_versions(state, package).await {
         Ok(v) => v,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
@@ -293,44 +478,64 @@ fn version_metadata(state: &NpmRegistryState, package: &str, version: &str) -> R
     }
 }
 
-fn download_tarball(state: &NpmRegistryState, package: &str, tarball: &str) -> Response {
-    let versions = match state.manifest_store.get_versions(Ecosystem::Npm, package) {
-        Ok(v) => v,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
-    };
-
-    let pkg_version = match versions.iter().find(|version| {
-        registry_metadata(version)
-            .map(|meta| meta.tarball_filename == tarball)
-            .unwrap_or(false)
-    }) {
-        Some(version) => version,
-        None => return StatusCode::NOT_FOUND.into_response(),
-    };
-
-    let metadata = match registry_metadata(pkg_version) {
-        Some(metadata) => metadata,
-        None => return StatusCode::NOT_FOUND.into_response(),
-    };
-
-    let tarball_path = state.blobs_dir.join(&metadata.blob_rel_path);
-    match std::fs::read(&tarball_path) {
-        Ok(bytes) => (
+async fn download_tarball(state: &Arc<NpmRegistryState>, package: &str, tarball: &str) -> Response {
+    let read_state = Arc::clone(state);
+    let package = package.to_string();
+    let tarball = tarball.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        let transaction = read_state.manifest_store.read_transaction(Ecosystem::Npm)?;
+        let versions = transaction.get_versions(&package)?;
+        let Some(pkg_version) = versions.iter().find(|candidate| {
+            registry_metadata(candidate)
+                .is_some_and(|metadata| metadata.tarball_filename == tarball)
+        }) else {
+            return Ok::<_, RegistryError>(None);
+        };
+        let Some(metadata) = registry_metadata(pkg_version) else {
+            return Ok(None);
+        };
+        let Some(path) = stored_npm_blob_path(
+            &read_state.blobs_dir,
+            &package,
+            &pkg_version.version,
+            &metadata,
+        ) else {
+            return Err(RegistryError::InvalidOperation(
+                "stored npm blob path failed validation".to_string(),
+            ));
+        };
+        let relative = path.strip_prefix(&read_state.blobs_dir).map_err(|_| {
+            RegistryError::InvalidOperation("stored npm blob escaped authority".to_string())
+        })?;
+        let bytes = match read_state.blobs_authority.read(relative) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Some((
+            bytes,
+            pkg_version.checksum.clone(),
+            metadata.content_type,
+        )))
+    })
+    .await;
+    match result {
+        Ok(Ok(Some((bytes, checksum, content_type)))) => (
             StatusCode::OK,
             [
                 (
                     "content-type",
-                    metadata
-                        .content_type
+                    content_type
                         .as_deref()
                         .unwrap_or("application/octet-stream"),
                 ),
-                ("etag", &format!("\"{}\"", pkg_version.checksum)),
+                ("etag", &format!("\"{checksum}\"")),
             ],
             bytes,
         )
             .into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(_)) | Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
@@ -358,10 +563,10 @@ struct NpmAttachment {
     length: Option<u64>,
 }
 
-fn publish_package(
-    state: &NpmRegistryState,
+async fn publish_package(
+    state: Arc<NpmRegistryState>,
     package: &str,
-    identity: Option<RegistryAccessIdentity>,
+    identity: RegistryAccessIdentity,
     body: Bytes,
 ) -> Response {
     let publish_request: NpmPublishRequest = match serde_json::from_slice(&body) {
@@ -387,6 +592,15 @@ fn publish_package(
             .into_response();
     }
 
+    if publish_request.versions.len() != 1 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "npm publish payload must contain exactly one version",
+            })),
+        )
+            .into_response();
+    }
     let (version, mut version_document) = match publish_request.versions.into_iter().next() {
         Some((version, Value::Object(document))) => (version, Value::Object(document)),
         Some(_) => {
@@ -409,27 +623,26 @@ fn publish_package(
         }
     };
 
-    let existing = match state.manifest_store.get_versions(Ecosystem::Npm, package) {
-        Ok(existing) => existing,
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("{error}") })),
-            )
-                .into_response();
-        }
-    };
-    if existing.iter().any(|entry| entry.version == version) {
+    if !valid_npm_version(&version) {
+        return invalid_npm_coordinate();
+    }
+    if version_document.get("name").and_then(Value::as_str) != Some(package)
+        || version_document.get("version").and_then(Value::as_str) != Some(version.as_str())
+    {
         return (
-            StatusCode::CONFLICT,
+            StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": format!("version already exists: {package}@{version}"),
+                "error": "npm version document does not match the published coordinate",
             })),
         )
             .into_response();
     }
 
-    let package_id = PackageId::from_registry_name(Ecosystem::Npm, package);
+    let package_id = match validate_npm_package(package) {
+        Ok(package_id) => package_id,
+        Err(_) => return invalid_npm_coordinate(),
+    };
+
     let tarball_filename = tarball_filename(&package_id, &version);
 
     let attachment = match select_attachment(&publish_request.attachments, &package_id, &version) {
@@ -457,6 +670,15 @@ fn publish_package(
                 .into_response();
         }
     };
+    if tarball_bytes.is_empty() || tarball_bytes.len() > MAX_NPM_TARBALL_SIZE {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": "npm tarball is empty or exceeds the configured size limit",
+            })),
+        )
+            .into_response();
+    }
 
     if let Some(expected_length) = attachment.length {
         if expected_length != tarball_bytes.len() as u64 {
@@ -470,48 +692,55 @@ fn publish_package(
         }
     }
 
-    let shasum = hex::encode(Sha1::digest(&tarball_bytes));
-    let blob_hash = hex::encode(sha2::Sha256::digest(&tarball_bytes));
-    let integrity = format!("sha512-{}", STANDARD.encode(Sha512::digest(&tarball_bytes)));
-    let (file_count, unpacked_size) = tarball_stats(&tarball_bytes);
+    let parsed_tarball = tokio::task::spawn_blocking(move || {
+        let shasum = hex::encode(Sha1::digest(&tarball_bytes));
+        let blob_hash = hex::encode(sha2::Sha256::digest(&tarball_bytes));
+        let integrity = format!("sha512-{}", STANDARD.encode(Sha512::digest(&tarball_bytes)));
+        let (file_count, unpacked_size) = tarball_stats(&tarball_bytes)?;
+        Ok::<_, String>((
+            tarball_bytes,
+            shasum,
+            blob_hash,
+            integrity,
+            file_count,
+            unpacked_size,
+        ))
+    })
+    .await;
+    let (tarball_bytes, shasum, blob_hash, integrity, file_count, unpacked_size) =
+        match parsed_tarball {
+            Ok(Ok(parsed)) => parsed,
+            Ok(Err(error)) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": error })),
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("npm attachment validation task failed: {error}"),
+                    })),
+                )
+                    .into_response();
+            }
+        };
 
-    let package_dir = match tarball_dir(&package_id) {
-        Some(dir) => dir,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "invalid npm package name",
-                })),
-            )
-                .into_response();
-        }
-    };
-    let tarball_rel_path = package_dir.join(&tarball_filename);
-    let tarball_path = state.blobs_dir.join(&tarball_rel_path);
-
-    if let Some(parent) = tarball_path.parent() {
-        if let Err(error) = std::fs::create_dir_all(parent) {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("failed to create npm blob directory: {error}"),
-                })),
-            )
-                .into_response();
-        }
-    }
-
-    if let Err(error) = std::fs::write(&tarball_path, &tarball_bytes) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("failed to store npm tarball: {error}"),
-            })),
-        )
-            .into_response();
-    }
-
+    let (tarball_rel_path, tarball_path) =
+        match npm_blob_path(&state.blobs_dir, &package_id, &version) {
+            Some(paths) => paths,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid npm package name",
+                    })),
+                )
+                    .into_response();
+            }
+        };
     let mut registry_metadata = Map::new();
     registry_metadata.insert(
         "tarball_filename".to_string(),
@@ -561,10 +790,7 @@ fn publish_package(
         );
     }
 
-    let published_by = identity
-        .as_ref()
-        .map(|caller| caller.email.clone())
-        .unwrap_or_else(|| "anonymous".to_string());
+    let published_by = identity.email;
 
     let package_version = PackageVersion {
         id: package_id,
@@ -578,8 +804,37 @@ fn publish_package(
         yanked: false,
     };
 
-    match state.manifest_store.add_version(&package_version) {
-        Ok(()) => (
+    let relative = match tarball_path.strip_prefix(&state.blobs_dir) {
+        Ok(relative) if relative == tarball_rel_path => relative.to_path_buf(),
+        _ => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "npm blob escaped storage authority" })),
+            )
+                .into_response();
+        }
+    };
+    let commit_state = Arc::clone(&state);
+    let commit_package = package.to_string();
+    let commit_version = version.clone();
+    let commit_bytes = tarball_bytes;
+    let result = tokio::task::spawn_blocking(move || {
+        let transaction = commit_state
+            .manifest_store
+            .write_transaction(Ecosystem::Npm)?;
+        let existing = transaction.get_versions(&commit_package)?;
+        if existing.iter().any(|entry| entry.version == commit_version) {
+            return Err(RegistryError::VersionExists(commit_package, commit_version));
+        }
+        commit_state
+            .blobs_authority
+            .write(&relative, &commit_bytes)
+            .map_err(RegistryError::Storage)?;
+        transaction.add_version(&package_version)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => (
             StatusCode::CREATED,
             Json(serde_json::json!({
                 "ok": "created",
@@ -589,16 +844,23 @@ fn publish_package(
             })),
         )
             .into_response(),
-        Err(RegistryError::VersionExists(name, version)) => (
+        Ok(Err(RegistryError::VersionExists(name, version))) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "error": format!("version already exists: {name}@{version}"),
             })),
         )
             .into_response(),
-        Err(error) => (
+        Ok(Err(error)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("{error}") })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("npm publication task failed: {error}")
+            })),
         )
             .into_response(),
     }
@@ -646,6 +908,48 @@ fn tarball_dir(package_id: &PackageId) -> Option<std::path::PathBuf> {
     }
     path.push(&package_id.name);
     Some(path)
+}
+
+fn npm_blob_path(
+    blobs_dir: &FsPath,
+    package_id: &PackageId,
+    version: &str,
+) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let validated = validate_npm_package(&package_id.canonical_name()).ok()?;
+    if package_id.ecosystem != Ecosystem::Npm
+        || !valid_npm_version(version)
+        || validated.scope != package_id.scope
+        || validated.name != package_id.name
+    {
+        return None;
+    }
+    let directory = tarball_dir(package_id)?;
+    let relative = directory.join(tarball_filename(package_id, version));
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let package_directory = blobs_dir.join(&directory);
+    let path = blobs_dir.join(&relative);
+    (path.parent() == Some(package_directory.as_path())).then_some((relative, path))
+}
+
+fn stored_npm_blob_path(
+    blobs_dir: &FsPath,
+    package: &str,
+    version: &str,
+    metadata: &ParsedRegistryMetadata,
+) -> Option<std::path::PathBuf> {
+    let package_id = validate_npm_package(package).ok()?;
+    let (expected_relative, expected_path) = npm_blob_path(blobs_dir, &package_id, version)?;
+    if metadata.tarball_filename != tarball_filename(&package_id, version)
+        || FsPath::new(&metadata.blob_rel_path) != expected_relative
+    {
+        return None;
+    }
+    Some(expected_path)
 }
 
 fn npm_version_document(
@@ -698,22 +1002,68 @@ fn format_npm_time(timestamp: chrono::DateTime<Utc>) -> String {
     timestamp.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-fn tarball_stats(tarball_bytes: &[u8]) -> (u64, u64) {
-    use flate2::read::GzDecoder;
+fn tarball_stats(tarball_bytes: &[u8]) -> Result<(u64, u64), String> {
+    tarball_stats_with_limit(tarball_bytes, MAX_NPM_ARCHIVE_DECOMPRESSED_SIZE)
+}
 
-    let gz = GzDecoder::new(tarball_bytes);
-    let mut archive = tar::Archive::new(gz);
+fn tarball_stats_with_limit(
+    tarball_bytes: &[u8],
+    decompressed_limit: u64,
+) -> Result<(u64, u64), String> {
+    use flate2::bufread::GzDecoder;
+    use std::io::Read;
+
+    let gz = GzDecoder::new(std::io::BufReader::new(tarball_bytes));
+    let limited = gz.take(decompressed_limit.saturating_add(1));
+    let mut archive = tar::Archive::new(limited);
     let mut file_count = 0u64;
     let mut unpacked_size = 0u64;
 
-    if let Ok(entries) = archive.entries() {
-        for entry in entries.flatten() {
-            file_count += 1;
-            unpacked_size += entry.header().size().unwrap_or(0);
+    let entries = archive
+        .entries()
+        .map_err(|error| format!("npm attachment is not a valid gzip-tar archive: {error}"))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| format!("npm attachment is not a valid gzip-tar archive: {error}"))?;
+        file_count = file_count
+            .checked_add(1)
+            .ok_or_else(|| "npm archive entry count overflowed".to_string())?;
+        if file_count > MAX_NPM_ARCHIVE_ENTRIES {
+            return Err(format!(
+                "npm archive exceeds the {MAX_NPM_ARCHIVE_ENTRIES} entry limit"
+            ));
+        }
+        let size = entry
+            .header()
+            .size()
+            .map_err(|error| format!("npm archive entry has an invalid size: {error}"))?;
+        unpacked_size = unpacked_size
+            .checked_add(size)
+            .ok_or_else(|| "npm archive unpacked size overflowed".to_string())?;
+        if unpacked_size > MAX_NPM_UNPACKED_SIZE {
+            return Err(format!(
+                "npm archive exceeds the {MAX_NPM_UNPACKED_SIZE} byte unpacked limit"
+            ));
         }
     }
 
-    (file_count, unpacked_size)
+    let mut limited = archive.into_inner();
+    std::io::copy(&mut limited, &mut std::io::sink())
+        .map_err(|error| format!("npm attachment gzip stream is truncated: {error}"))?;
+    if limited.limit() == 0 {
+        return Err(format!(
+            "npm archive exceeds the {decompressed_limit} byte decompressed limit"
+        ));
+    }
+    let decoder = limited.into_inner();
+    let compressed = decoder.into_inner();
+    if !compressed.buffer().is_empty() || !compressed.get_ref().is_empty() {
+        return Err(
+            "npm attachment contains trailing data or more than one gzip member".to_string(),
+        );
+    }
+
+    Ok((file_count, unpacked_size))
 }
 
 #[derive(Debug, Clone)]
@@ -774,13 +1124,64 @@ mod tests {
     use axum::http::{Method, Request, StatusCode};
     use tower::ServiceExt;
 
-    fn registry_state() -> Arc<NpmRegistryState> {
+    fn registry_state() -> (tempfile::TempDir, Arc<NpmRegistryState>) {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".kin")).unwrap();
-        Arc::new(NpmRegistryState {
-            manifest_store: ManifestStore::new(&root.path().join(".kin")),
-            blobs_dir: root.path().join("npm"),
-            base_url: "https://kinlab.ai".to_string(),
+        let state = Arc::new(NpmRegistryState::new(
+            ManifestStore::new(&root.path().join(".kin")),
+            root.path().join("npm"),
+            "https://kinlab.ai".to_string(),
+        ));
+        (root, state)
+    }
+
+    fn publish_identity() -> RegistryAccessIdentity {
+        RegistryAccessIdentity {
+            email: "builder@firelock.ai".to_string(),
+            display_name: "Builder".to_string(),
+            user_id: "user_123".to_string(),
+            actor_kind: "human".to_string(),
+            org_ids: vec![],
+            scopes: vec!["packages:write".to_string()],
+            credential_type: Some("pat".to_string()),
+        }
+    }
+
+    fn build_test_tarball(marker: &str) -> Vec<u8> {
+        use flate2::{write::GzEncoder, Compression};
+
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let contents = format!("module.exports = {marker:?};\n");
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "package/index.js", contents.as_bytes())
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn publish_payload(package: &str, version: &str, tarball: &[u8]) -> Value {
+        let attachment = format!("{package}-{version}.tgz");
+        serde_json::json!({
+            "_id": package,
+            "name": package,
+            "dist-tags": { "latest": version },
+            "versions": {
+                version: {
+                    "name": package,
+                    "version": version,
+                }
+            },
+            "_attachments": {
+                attachment: {
+                    "content_type": "application/octet-stream",
+                    "data": STANDARD.encode(tarball),
+                    "length": tarball.len(),
+                }
+            }
         })
     }
 
@@ -816,8 +1217,9 @@ mod tests {
 
     #[tokio::test]
     async fn publishes_and_reads_back_scoped_package_metadata() {
-        let state = registry_state();
+        let (_root, state) = registry_state();
         let app = npm_routes(state.clone());
+        let tarball_bytes = build_test_tarball("boundary-contracts");
         let payload = serde_json::json!({
             "_id": "@kin/boundary-contracts",
             "name": "@kin/boundary-contracts",
@@ -836,8 +1238,8 @@ mod tests {
             "_attachments": {
                 "@kin/boundary-contracts-0.1.0.tgz": {
                     "content_type": "application/octet-stream",
-                    "data": STANDARD.encode(b"fake-tarball"),
-                    "length": 12
+                    "data": STANDARD.encode(&tarball_bytes),
+                    "length": tarball_bytes.len()
                 }
             }
         });
@@ -848,15 +1250,7 @@ mod tests {
                 Request::builder()
                     .method(Method::PUT)
                     .uri("/registry/npm/@kin%2Fboundary-contracts")
-                    .extension(RegistryAccessIdentity {
-                        email: "builder@firelock.ai".to_string(),
-                        display_name: "Builder".to_string(),
-                        user_id: "user_123".to_string(),
-                        actor_kind: "human".to_string(),
-                        org_ids: vec![],
-                        scopes: vec!["packages:write".to_string()],
-                        credential_type: Some("pat".to_string()),
-                    })
+                    .extension(publish_identity())
                     .header("content-type", "application/json")
                     .body(Body::from(payload.to_string()))
                     .unwrap(),
@@ -923,8 +1317,9 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_immutable_version_republish() {
-        let state = registry_state();
+        let (_root, state) = registry_state();
         let app = npm_routes(state);
+        let tarball_bytes = build_test_tarball("immutable");
         let payload = serde_json::json!({
             "_id": "@kin/boundary-contracts",
             "name": "@kin/boundary-contracts",
@@ -938,8 +1333,8 @@ mod tests {
             "_attachments": {
                 "@kin/boundary-contracts-0.1.0.tgz": {
                     "content_type": "application/octet-stream",
-                    "data": STANDARD.encode(b"fake-tarball"),
-                    "length": 12
+                    "data": STANDARD.encode(&tarball_bytes),
+                    "length": tarball_bytes.len()
                 }
             }
         });
@@ -950,6 +1345,7 @@ mod tests {
                 Request::builder()
                     .method(Method::PUT)
                     .uri("/registry/npm/@kin%2Fboundary-contracts")
+                    .extension(publish_identity())
                     .header("content-type", "application/json")
                     .body(Body::from(payload.to_string()))
                     .unwrap(),
@@ -963,6 +1359,7 @@ mod tests {
                 Request::builder()
                     .method(Method::PUT)
                     .uri("/registry/npm/@kin%2Fboundary-contracts")
+                    .extension(publish_identity())
                     .header("content-type", "application/json")
                     .body(Body::from(payload.to_string()))
                     .unwrap(),
@@ -970,5 +1367,267 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn publishing_fails_closed_without_an_authenticated_identity() {
+        let (_root, state) = registry_state();
+        let response = npm_routes(state)
+            .oneshot(
+                Request::put("/registry/npm/demo")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_publish_is_rejected_without_polling_the_body() {
+        use std::task::Poll;
+
+        let (_root, state) = registry_state();
+        let body = Body::from_stream(futures_util::stream::poll_fn(
+            |_| -> Poll<Option<Result<Bytes, std::io::Error>>> {
+                panic!("unauthenticated npm request body was polled")
+            },
+        ));
+        let response = npm_routes(state)
+            .oneshot(
+                Request::put("/registry/npm/demo")
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn stored_tarball_metadata_cannot_redirect_reads_outside_the_blob_root() {
+        let root = tempfile::tempdir().unwrap();
+        let metadata = ParsedRegistryMetadata {
+            tarball_filename: "demo-1.0.0.tgz".to_string(),
+            blob_rel_path: "../outside".to_string(),
+            content_type: None,
+            shasum: "checksum".to_string(),
+            integrity: "integrity".to_string(),
+            file_count: 0,
+            unpacked_size: 0,
+            dist_tags: None,
+            readme: None,
+        };
+        assert!(stored_npm_blob_path(root.path(), "demo", "1.0.0", &metadata).is_none());
+        for invalid in [
+            "../demo",
+            "@scope/../demo",
+            "@../demo",
+            "demo/../../outside",
+        ] {
+            assert!(
+                validate_npm_package(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_stats_reject_invalid_and_declared_oversize_tarballs() {
+        assert!(tarball_stats(b"not-a-tarball").is_err());
+
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(MAX_NPM_UNPACKED_SIZE + 1);
+        header.set_mode(0o644);
+        header.set_cksum();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(header.as_bytes()).unwrap();
+        let declared_oversize = encoder.finish().unwrap();
+        let error = tarball_stats(&declared_oversize).unwrap_err();
+        assert!(error.contains("unpacked limit"), "{error}");
+    }
+
+    #[test]
+    fn archive_stats_rejects_a_second_gzip_member() {
+        let mut tarball = build_test_tarball("first");
+        tarball.extend_from_slice(&build_test_tarball("second"));
+        assert!(tarball_stats(&tarball)
+            .unwrap_err()
+            .contains("more than one gzip member"));
+    }
+
+    #[test]
+    fn archive_stats_bounds_bytes_after_the_tar_end_marker() {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let contents = b"package";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "package/index.js", contents.as_slice())
+            .unwrap();
+        builder.finish().unwrap();
+        let mut uncompressed = builder.into_inner().unwrap();
+        let decompressed_limit = uncompressed.len() as u64 + 64;
+        uncompressed.resize(uncompressed.len() + 4096, 0);
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&uncompressed).unwrap();
+        let tarball = encoder.finish().unwrap();
+        let error = tarball_stats_with_limit(&tarball, decompressed_limit).unwrap_err();
+        assert!(error.contains("decompressed limit"), "{error}");
+    }
+
+    #[test]
+    fn npm_versions_match_node_safe_integer_limits() {
+        assert!(valid_npm_version(
+            "9007199254740991.9007199254740991.9007199254740991"
+        ));
+        for version in [
+            "9007199254740992.0.0",
+            "0.9007199254740992.0",
+            "0.0.9007199254740992",
+        ] {
+            assert!(!valid_npm_version(version), "accepted {version}");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_accepted_semver_tarball_is_retrievable() {
+        let (_root, state) = registry_state();
+        let app = npm_routes(state);
+        for version in ["1.0.0+build.1", "1.0.1-RC.1"] {
+            let tarball = build_test_tarball(version);
+            let payload = publish_payload("demo", version, &tarball);
+            let published = app
+                .clone()
+                .oneshot(
+                    Request::put("/registry/npm/demo")
+                        .extension(publish_identity())
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(published.status(), StatusCode::CREATED, "{version}");
+
+            let downloaded = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/registry/npm/demo/-/demo-{version}.tgz"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(downloaded.status(), StatusCode::OK, "{version}");
+            assert_eq!(
+                axum::body::to_bytes(downloaded.into_body(), MAX_NPM_TARBALL_SIZE)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                tarball.as_slice()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_npm_state_cannot_be_redirected_by_root_replacement() {
+        let (root, state) = registry_state();
+        let original_blobs = root.path().join("npm-retained");
+        std::fs::rename(&state.blobs_dir, &original_blobs).unwrap();
+        std::fs::create_dir(&state.blobs_dir).unwrap();
+        let manifest_path = root.path().join(".kin/packages/manifests");
+        let original_manifests = root.path().join("manifests-retained");
+        std::fs::rename(&manifest_path, &original_manifests).unwrap();
+        std::fs::create_dir(&manifest_path).unwrap();
+
+        let tarball = build_test_tarball("retained");
+        let payload = publish_payload("demo", "1.0.0", &tarball);
+        let response = npm_routes(state)
+            .oneshot(
+                Request::put("/registry/npm/demo")
+                    .extension(publish_identity())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(original_blobs.join("demo/demo-1.0.0.tgz").is_file());
+        assert!(!root.path().join("npm/demo/demo-1.0.0.tgz").exists());
+        assert!(original_manifests.join("npm/demo").is_file());
+        assert!(!manifest_path.join("npm/demo").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn independent_states_preserve_concurrent_versions_and_matching_blobs() {
+        let root = tempfile::tempdir().unwrap();
+        let kin_dir = root.path().join(".kin");
+        let blobs_dir = root.path().join("npm");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        let make_state = || {
+            Arc::new(NpmRegistryState::new(
+                ManifestStore::new(&kin_dir),
+                blobs_dir.clone(),
+                "https://kinlab.ai".to_string(),
+            ))
+        };
+        let first_state = make_state();
+        let second_state = make_state();
+        let first_tarball = build_test_tarball("first");
+        let second_tarball = build_test_tarball("second");
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+
+        let publish = |state: Arc<NpmRegistryState>,
+                       version: &'static str,
+                       tarball: Vec<u8>,
+                       start: Arc<tokio::sync::Barrier>| {
+            tokio::spawn(async move {
+                let payload = publish_payload("demo", version, &tarball);
+                start.wait().await;
+                npm_routes(state)
+                    .oneshot(
+                        Request::put("/registry/npm/demo")
+                            .extension(publish_identity())
+                            .header("content-type", "application/json")
+                            .body(Body::from(payload.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .status()
+            })
+        };
+        let first = publish(first_state, "1.0.0", first_tarball.clone(), start.clone());
+        let second = publish(second_state, "2.0.0", second_tarball.clone(), start.clone());
+        start.wait().await;
+        assert_eq!(first.await.unwrap(), StatusCode::CREATED);
+        assert_eq!(second.await.unwrap(), StatusCode::CREATED);
+
+        let versions = ManifestStore::new(&kin_dir)
+            .get_versions(Ecosystem::Npm, "demo")
+            .unwrap();
+        assert_eq!(versions.len(), 2);
+        for (version, expected) in [("1.0.0", first_tarball), ("2.0.0", second_tarball)] {
+            let entry = versions
+                .iter()
+                .find(|candidate| candidate.version == version)
+                .unwrap();
+            let metadata = registry_metadata(entry).unwrap();
+            let path = stored_npm_blob_path(&blobs_dir, "demo", version, &metadata).unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), expected);
+        }
     }
 }
