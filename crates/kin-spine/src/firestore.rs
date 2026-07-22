@@ -28,7 +28,7 @@
 //! the authoritative copy used to rebuild the cache; the sibling fields stay
 //! human-readable for the Firestore console and back the by-repo delete queries.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -109,12 +109,10 @@ impl FirestoreSpineBackend {
             self.cache
                 .register_repo(&repo.repo_id, repo.entries, &repo.root_hash);
         }
-        let mut edge_count = 0;
-        for edge in edges {
-            if self.cache.index().add_cross_repo_edge(edge) {
-                edge_count += 1;
-            }
-        }
+        // Hydration is a bulk install, not a stream of authority publications.
+        // Rebuild the global incident projection/revision once after all rows
+        // are resident; doing it once per edge is O(E^2 log E).
+        let edge_count = self.cache.index().add_cross_repo_edges(edges);
 
         self.hydrated.store(true, Ordering::Release);
         info!(
@@ -179,9 +177,23 @@ impl SpineBackend for FirestoreSpineBackend {
     }
 
     fn cross_repo_edges_snapshot(&self) -> CrossRepoEdgesSnapshot {
-        // Hydration is cache warm-start only. Completeness comes exclusively
-        // from the cache's graph-authoritative dirty/epoch/endpoint checks.
-        self.cache.cross_repo_edges_snapshot()
+        // Durable rows and this pod's graph refreshes are useful advisory
+        // positives, but neither can prove that every other pod observed the
+        // same registered roots. Keep completeness fail-closed until the
+        // durable backend owns a shared pass/root CAS.
+        let mut snapshot = self.cache.cross_repo_edges_snapshot();
+        snapshot.complete = false;
+        snapshot
+    }
+
+    fn cross_repo_xref_response(
+        &self,
+        repo_id: &str,
+        entity_id: &EntityId,
+    ) -> crate::SpineXrefResponse {
+        let mut response = self.cache.cross_repo_xref_response(repo_id, entity_id);
+        response.authority_complete = false;
+        response
     }
 
     fn add_cross_repo_edge(&self, edge: CrossRepoEdge) {
@@ -238,6 +250,32 @@ impl SpineBackend for FirestoreSpineBackend {
                 error!(error = %e, "failed to write refreshed edge to store");
             }
         }
+    }
+
+    fn invalidate_cross_repo_edges(&self, repo_id: &str) {
+        self.cache.invalidate_cross_repo_edges(repo_id);
+    }
+
+    fn begin_cross_repo_refresh_pass(
+        &self,
+        authority_roots: &BTreeMap<String, String>,
+    ) -> Option<u64> {
+        self.cache.begin_cross_repo_refresh_pass(authority_roots)
+    }
+
+    fn finish_cross_repo_refresh_pass(
+        &self,
+        token: u64,
+        authority_roots: &BTreeMap<String, String>,
+        _success: bool,
+    ) -> bool {
+        // Clear this pod's lease while deliberately retaining its dirty set.
+        // A successful local pass cannot be published as globally complete
+        // without a shared durable epoch/root compare-and-swap.
+        let _ = self
+            .cache
+            .finish_cross_repo_refresh_pass(token, authority_roots, false);
+        false
     }
 
     fn federated_impact(
@@ -822,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn valid_hydration_stays_incomplete_until_graph_authoritative_full_refresh() {
+    fn valid_hydration_and_pod_local_refresh_remain_advisory() {
         let store = Arc::new(FakeSpineStore::default());
         let writer = FirestoreSpineBackend::with_store(store.clone());
         let provider = test_entry("provider", "provide", EntityKind::Function);
@@ -871,14 +909,20 @@ mod tests {
         );
 
         let snapshot = reader.cross_repo_edges_snapshot();
-        assert!(snapshot.complete);
+        assert!(
+            !snapshot.complete,
+            "a pod-local refresh cannot certify shared durable authority"
+        );
         assert_eq!(snapshot.repos, vec!["consumer", "provider"]);
         assert_eq!(snapshot.edges.len(), 1);
         assert!(snapshot.revision.starts_with("sha256:"));
+        let xref = reader.cross_repo_xref_response("provider", &provider.entity_id);
+        assert_eq!(xref.edges.len(), 1, "known positives remain advisory");
+        assert!(!xref.authority_complete);
     }
 
     #[test]
-    fn torn_hydration_stays_incomplete_until_authoritative_refresh_removes_orphan() {
+    fn torn_hydration_remains_incomplete_after_pod_local_rebuild() {
         let store = Arc::new(FakeSpineStore::default());
         let writer = FirestoreSpineBackend::with_store(store.clone());
         let provider = test_entry("provider", "provide", EntityKind::Function);
@@ -910,7 +954,10 @@ mod tests {
             reader.refresh_cross_repo_edges(repo, &[], &[], &registry);
         }
         let rebuilt = reader.cross_repo_edges_snapshot();
-        assert!(rebuilt.complete);
+        assert!(
+            !rebuilt.complete,
+            "a local rebuild cannot establish shared-store completeness"
+        );
         assert!(
             rebuilt.edges.is_empty(),
             "authoritative refresh removes torn edge"
@@ -918,7 +965,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_hydration_does_not_block_later_authoritative_rebuild() {
+    fn failed_hydration_and_local_rebuild_remain_incomplete() {
         let store = Arc::new(FakeSpineStore::default());
         let writer = FirestoreSpineBackend::with_store(store.clone());
         let alpha = test_entry("alpha", "alpha", EntityKind::Function);
@@ -936,9 +983,70 @@ mod tests {
             reader.refresh_cross_repo_edges(repo, &[], &[], &registry);
         }
         assert!(
-            reader.cross_repo_edges_snapshot().complete,
-            "hydration status must not veto a complete graph-authoritative rebuild"
+            !reader.cross_repo_edges_snapshot().complete,
+            "shared-store authority needs a durable pass/root CAS even after local recovery"
         );
+    }
+
+    #[test]
+    fn stale_pod_cannot_certify_shared_store_completeness() {
+        let store = Arc::new(FakeSpineStore::default());
+        let stale_pod = FirestoreSpineBackend::with_store(store.clone());
+        let provider = test_entry("provider", "provide", EntityKind::Function);
+        let consumer = test_entry("consumer", "consume", EntityKind::Function);
+        stale_pod.register_repo("provider", vec![provider.clone()], "provider-root-v1");
+        stale_pod.register_repo("consumer", vec![consumer.clone()], "consumer-root");
+        stale_pod.add_cross_repo_edge(CrossRepoEdge {
+            src_repo: "consumer".to_string(),
+            src_entity: consumer.entity_id,
+            dst_repo: "provider".to_string(),
+            dst_entity: provider.entity_id,
+            confidence: 0.95,
+        });
+
+        let fresh_pod = FirestoreSpineBackend::with_store(store.clone());
+        fresh_pod.hydrate().expect("hydrate shared durable rows");
+        fresh_pod.register_repo(
+            "provider",
+            vec![test_entry("provider", "provide_v2", EntityKind::Function)],
+            "provider-root-v2",
+        );
+
+        let stale_roots = BTreeMap::from([
+            ("consumer".to_string(), "consumer-root".to_string()),
+            ("provider".to_string(), "provider-root-v1".to_string()),
+        ]);
+        let token = stale_pod
+            .begin_cross_repo_refresh_pass(&stale_roots)
+            .expect("stale pod can only acquire its local lease");
+        assert!(
+            !stale_pod.finish_cross_repo_refresh_pass(token, &stale_roots, true),
+            "a local pass must never publish shared durable completeness"
+        );
+
+        let durable_provider = store
+            .load_repos()
+            .unwrap()
+            .into_iter()
+            .find(|repo| repo.repo_id == "provider")
+            .expect("provider remains in shared store");
+        assert_eq!(durable_provider.root_hash, "provider-root-v2");
+        assert_eq!(
+            stale_pod.root_hash("provider").as_deref(),
+            Some("provider-root-v1"),
+            "the first pod is demonstrably stale"
+        );
+
+        let snapshot = stale_pod.cross_repo_edges_snapshot();
+        assert!(!snapshot.complete);
+        let xref = stale_pod.cross_repo_xref_response("provider", &provider.entity_id);
+        assert_eq!(xref.edges.len(), 1, "stale known positives stay advisory");
+        assert!(!xref.authority_complete);
+
+        let retry_token = stale_pod
+            .begin_cross_repo_refresh_pass(&stale_roots)
+            .expect("failed publication still clears the pod-local lease");
+        assert!(!stale_pod.finish_cross_repo_refresh_pass(retry_token, &stale_roots, false));
     }
 
     #[test]

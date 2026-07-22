@@ -414,6 +414,21 @@ async fn run_idle_monitor(
     }
 }
 
+fn install_lsp_relations(state: &DaemonState, relations: &[kin_model::Relation]) -> usize {
+    if relations.is_empty() {
+        return 0;
+    }
+
+    use kin_model::EntityStore;
+    let graph_mutation = state.begin_graph_authority_mutation();
+    for relation in relations {
+        let _ = state.graph.upsert_relation(relation);
+    }
+    state.bump_version();
+    drop(graph_mutation);
+    relations.len()
+}
+
 /// Enrich a single entity with all available LSP relation types (calls, overrides,
 /// uses-type, references). Each query is capped at 5 seconds. Returns the total
 /// number of relations upserted into the graph.
@@ -422,9 +437,8 @@ async fn enrich_single_entity(
     entity_ref: &kin_lsp::EntityRef,
     index: &kin_lsp::EntityIndex,
     root: &std::path::Path,
-    graph: &kin_db::InMemoryGraph,
+    state: &DaemonState,
 ) -> usize {
-    use kin_model::EntityStore;
     let timeout = std::time::Duration::from_secs(5);
     let mut count = 0;
 
@@ -436,10 +450,7 @@ async fn enrich_single_entity(
     .await
     {
         Ok(Ok(relations)) => {
-            for r in &relations {
-                let _ = graph.upsert_relation(r);
-            }
-            count += relations.len();
+            count += install_lsp_relations(state, &relations);
         }
         Ok(Err(e)) => {
             debug!(entity = %entity_ref.name, error = %e, "LSP calls enrichment failed");
@@ -456,10 +467,7 @@ async fn enrich_single_entity(
     )
     .await
     {
-        for r in &relations {
-            let _ = graph.upsert_relation(r);
-        }
-        count += relations.len();
+        count += install_lsp_relations(state, &relations);
     }
 
     // UsesType
@@ -469,10 +477,7 @@ async fn enrich_single_entity(
     )
     .await
     {
-        for r in &relations {
-            let _ = graph.upsert_relation(r);
-        }
-        count += relations.len();
+        count += install_lsp_relations(state, &relations);
     }
 
     // References
@@ -482,10 +487,7 @@ async fn enrich_single_entity(
     )
     .await
     {
-        for r in &relations {
-            let _ = graph.upsert_relation(r);
-        }
-        count += relations.len();
+        count += install_lsp_relations(state, &relations);
     }
 
     count
@@ -1564,11 +1566,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                         for entity_ref in &file_entities {
                             info!(entity = %entity_ref.name, "querying LSP for entity");
                             total_relations += enrich_single_entity(
-                                server,
-                                entity_ref,
-                                &index,
-                                &lsp_root,
-                                &lsp_state.graph,
+                                server, entity_ref, &index, &lsp_root, &lsp_state,
                             )
                             .await;
                         }
@@ -1772,20 +1770,14 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                             .await
                             .unwrap_or_default();
 
-                            let mut file_relations = file_result.relations.len();
-                            for rel in &file_result.relations {
-                                let _ = lsp_state.graph.upsert_relation(rel);
-                            }
+                            let mut file_relations =
+                                install_lsp_relations(&lsp_state, &file_result.relations);
 
                             // Also run per-entity call hierarchy for Calls relations
                             // (definition approach gives References, call hierarchy gives Calls).
                             for entity_ref in &file_entity_refs {
                                 file_relations += enrich_single_entity(
-                                    server,
-                                    entity_ref,
-                                    &index,
-                                    &lsp_root,
-                                    &lsp_state.graph,
+                                    server, entity_ref, &index, &lsp_root, &lsp_state,
                                 )
                                 .await;
                             }
