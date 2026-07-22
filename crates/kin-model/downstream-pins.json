@@ -6,19 +6,19 @@
       "repo": "firelock-ai/kin",
       "consumer": "kin (workspace root)",
       "manifest": "Cargo.toml",
-      "req": "0.3.0"
+      "req": "0.4.0"
     },
     {
       "repo": "firelock-ai/kin-db",
       "consumer": "kin-db",
       "manifest": "crates/kin-db/Cargo.toml",
-      "req": "0.3.0"
+      "req": "0.4.0"
     },
     {
       "repo": "firelock-ai/kin-bench",
       "consumer": "kin-bench (workspace root)",
       "manifest": "Cargo.toml",
-      "req": "0.3.0"
+      "req": "0.4.0"
     }
   ]
 }
