@@ -3,10 +3,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::process::Command;
 
 use gix::objs::tree::{Entry, EntryKind, EntryMode};
 use gix::objs::{Commit, Tree};
-use gix::refs::{transaction::PreviousValue, Target};
 use kin_blobs::BlobStore;
 use kin_model::{ArtifactDeltaKind, BranchName, GraphStore, SemanticChange, SemanticChangeId};
 use tracing::{debug, info, warn};
@@ -450,29 +450,106 @@ fn update_branch_ref(
     expected_head: Option<gix::ObjectId>,
     commit_id: gix::ObjectId,
 ) -> Result<()> {
-    let ref_name = format!("refs/heads/{}", branch_name.0);
-    let expected = match expected_head {
-        Some(expected_head) => PreviousValue::MustExistAndMatch(Target::Object(expected_head)),
-        None => PreviousValue::MustNotExist,
-    };
-    repo.reference(
-        ref_name,
+    update_branch_ref_with_command_runner(
+        repo,
+        branch_name,
+        expected_head,
         commit_id,
-        expected,
-        format!("kin export: update {}", branch_name.0),
+        Command::output,
     )
-    .map_err(|e| GitError::Git(e.to_string()))?;
+}
+
+fn update_branch_ref_with_command_runner(
+    repo: &gix::Repository,
+    branch_name: &BranchName,
+    expected_head: Option<gix::ObjectId>,
+    commit_id: gix::ObjectId,
+    run_command: impl FnOnce(&mut Command) -> std::io::Result<std::process::Output>,
+) -> Result<()> {
+    let ref_name = format!("refs/heads/{}", branch_name.0);
+    let expected_head = expected_head.unwrap_or_else(|| gix::ObjectId::null(commit_id.kind()));
+    let log_message = format!("kin export: update {}", branch_name.0);
+    let mut command = Command::new("git");
+    for variable in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_NAMESPACE",
+        "GIT_QUARANTINE_PATH",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+    ] {
+        command.env_remove(variable);
+    }
+    command
+        .arg("--git-dir")
+        .arg(repo.path())
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .arg("update-ref")
+        .arg("--create-reflog")
+        .arg("--no-deref")
+        .arg("-m")
+        .arg(&log_message)
+        .arg(&ref_name)
+        .arg(commit_id.to_string())
+        .arg(expected_head.to_string())
+        .stdin(std::process::Stdio::null());
+    let output = run_command(&mut command).map_err(|error| {
+        GitError::Git(format!(
+            "failed to execute git update-ref for {ref_name}: {error}"
+        ))
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        let detail = if detail.is_empty() {
+            output.status.to_string()
+        } else {
+            detail.to_string()
+        };
+        return Err(GitError::Git(format!(
+            "git update-ref rejected {ref_name}: {detail}"
+        )));
+    }
 
     info!(branch = %branch_name.0, commit = %commit_id, "updated branch ref");
     Ok(())
 }
 
 #[cfg(test)]
+fn update_branch_ref_after_spawn(
+    repo: &gix::Repository,
+    branch_name: &BranchName,
+    expected_head: Option<gix::ObjectId>,
+    commit_id: gix::ObjectId,
+    after_spawn: impl FnOnce(&mut std::process::Child),
+) -> Result<()> {
+    update_branch_ref_with_command_runner(repo, branch_name, expected_head, commit_id, |command| {
+        let mut child = command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        after_spawn(&mut child);
+        child.wait_with_output()
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use gix::refs::{transaction::PreviousValue, Target};
     use kin_model::*;
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+    use std::sync::{mpsc, Mutex};
+    use std::thread;
+    use std::time::Duration;
 
     // -- Test helpers --
 
@@ -534,6 +611,17 @@ mod tests {
             old_hash: None,
             new_hash,
         }
+    }
+
+    fn write_test_commit(repo: &gix::Repository, id_byte: u8, message: &str) -> gix::ObjectId {
+        let change = make_change(id_byte, vec![], message, vec![]);
+        create_commit(
+            repo,
+            &change,
+            gix::ObjectId::empty_tree(gix::hash::Kind::Sha1),
+            &[],
+        )
+        .unwrap()
     }
 
     /// Test-only GraphStore mock for export tests. Stores branches and changes
@@ -1551,8 +1639,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = gix::init_bare(tmp.path()).unwrap();
         let branch_name = BranchName::new("main");
-        let first = repo.write_blob(b"first").unwrap().detach();
-        let second = repo.write_blob(b"second").unwrap().detach();
+        let first = write_test_commit(&repo, 1, "first");
+        let second = write_test_commit(&repo, 2, "second");
 
         update_branch_ref(&repo, &branch_name, None, first).unwrap();
         update_branch_ref(&repo, &branch_name, Some(first), second).unwrap();
@@ -1565,8 +1653,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = gix::init_bare(tmp.path()).unwrap();
         let branch_name = BranchName::new("main");
-        let concurrent = repo.write_blob(b"concurrent").unwrap().detach();
-        let exported = repo.write_blob(b"exported").unwrap().detach();
+        let concurrent = write_test_commit(&repo, 1, "concurrent");
+        let exported = write_test_commit(&repo, 2, "exported");
 
         repo.reference(
             "refs/heads/main",
@@ -1585,9 +1673,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = gix::init_bare(tmp.path()).unwrap();
         let branch_name = BranchName::new("main");
-        let observed = repo.write_blob(b"observed").unwrap().detach();
-        let concurrent = repo.write_blob(b"concurrent").unwrap().detach();
-        let exported = repo.write_blob(b"exported").unwrap().detach();
+        let observed = write_test_commit(&repo, 1, "observed");
+        let concurrent = write_test_commit(&repo, 2, "concurrent");
+        let exported = write_test_commit(&repo, 3, "exported");
 
         update_branch_ref(&repo, &branch_name, None, observed).unwrap();
         repo.reference(
@@ -1599,6 +1687,95 @@ mod tests {
         .unwrap();
 
         assert!(update_branch_ref(&repo, &branch_name, Some(observed), exported).is_err());
+        assert_eq!(find_branch_head(&repo, &branch_name), Some(concurrent));
+    }
+
+    #[test]
+    fn branch_ref_update_rejects_a_move_prepared_while_the_exporter_waits_for_the_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = gix::init_bare(tmp.path()).unwrap();
+        let branch_name = BranchName::new("main");
+        let observed = write_test_commit(&repo, 1, "observed");
+        let concurrent = write_test_commit(&repo, 2, "concurrent");
+        let exported = write_test_commit(&repo, 3, "exported");
+
+        update_branch_ref(&repo, &branch_name, None, observed).unwrap();
+
+        let config_status = Command::new("git")
+            .arg("--git-dir")
+            .arg(repo.path())
+            .args(["config", "core.filesRefLockTimeout", "5000"])
+            .status()
+            .unwrap();
+        assert!(config_status.success());
+
+        let mut competing = Command::new("git")
+            .arg("--git-dir")
+            .arg(repo.path())
+            .arg("update-ref")
+            .arg("--create-reflog")
+            .arg("--no-deref")
+            .arg("-m")
+            .arg("concurrent prepared update")
+            .arg("--stdin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let mut competing_stdin = competing.stdin.take().unwrap();
+        let mut competing_stdout = BufReader::new(competing.stdout.take().unwrap());
+
+        writeln!(competing_stdin, "start").unwrap();
+        writeln!(
+            competing_stdin,
+            "update refs/heads/main {concurrent} {observed}"
+        )
+        .unwrap();
+        writeln!(competing_stdin, "prepare").unwrap();
+        competing_stdin.flush().unwrap();
+
+        let mut response = String::new();
+        competing_stdout.read_line(&mut response).unwrap();
+        assert_eq!(response.trim_end(), "start: ok");
+        response.clear();
+        competing_stdout.read_line(&mut response).unwrap();
+        assert_eq!(response.trim_end(), "prepare: ok");
+
+        let repo_path = repo.path().to_path_buf();
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let exporter = thread::spawn(move || {
+            let repo = gix::open(repo_path).unwrap();
+            update_branch_ref_after_spawn(
+                &repo,
+                &BranchName::new("main"),
+                Some(observed),
+                exported,
+                |child| {
+                    thread::sleep(Duration::from_millis(250));
+                    assert!(
+                        child.try_wait().unwrap().is_none(),
+                        "exporter git child should be blocked by the prepared ref transaction"
+                    );
+                    blocked_tx.send(()).unwrap();
+                },
+            )
+        });
+        blocked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        writeln!(competing_stdin, "commit").unwrap();
+        competing_stdin.flush().unwrap();
+        drop(competing_stdin);
+        response.clear();
+        competing_stdout.read_line(&mut response).unwrap();
+        assert_eq!(response.trim_end(), "commit: ok");
+        assert!(competing.wait().unwrap().success());
+
+        let exporter_result = exporter.join().unwrap();
+        assert!(
+            exporter_result.is_err(),
+            "stale exporter must not replace the prepared concurrent update"
+        );
         assert_eq!(find_branch_head(&repo, &branch_name), Some(concurrent));
     }
 
