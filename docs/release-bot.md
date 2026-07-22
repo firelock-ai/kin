@@ -47,8 +47,12 @@ The single job refuses — before any tag is created — unless **all** hold:
    (`REQUIRED_CHECKS`) must be present and green — a SHA missing any of these is
    refused even if nothing failed (a SHA that never ran CI is refused, not passed
    vacuously). Second, **no** check on the SHA may be failing or still in
-   progress. `skipped`/`neutral` count as non-failing — on a merged HEAD
-   `DCO Sign-off` is `skipped` because the PR-time DCO already gated the merge.
+   progress. The workflow's own `Mint release tag` check-run is self-excluded
+   from this second guard — a refused dispatch is recorded as a failed
+   `Mint release tag` check-run on the target SHA, and a gate must not read its
+   own refusals as evidence. `skipped`/`neutral` count as non-failing — on a
+   merged HEAD `DCO Sign-off` is `skipped` because the PR-time DCO already gated
+   the merge.
    The presence-required set is:
    - `Check & Test (ubuntu-latest)`
    - `Check & Test (macos-latest)`
@@ -105,8 +109,10 @@ These steps require the founder / org owner and gate the bot going live.
      (org-only install).
    - Create the App. On its page, generate a **private key** (downloads a `.pem`).
      Note the **App ID**.
-2. **Install the App on `firelock-ai/kin` only.** App → Install App → install on
-   the `firelock-ai` org, **Only select repositories → `kin`**.
+2. **Install the App.** App → Install App → install on the `firelock-ai` org.
+   Scoping the install to **Only select repositories → `kin`** is the tightest
+   posture, but the App is currently installed **org-wide** (founder decision) —
+   see "Install scope and token narrowing" below for why that is still safe.
 3. **Add the Actions secrets** (org-level, scoped to `kin`, or repo-level on
    `firelock-ai/kin`):
    - `KIN_RELEASE_BOT_APP_ID` — the App ID (numeric).
@@ -120,6 +126,20 @@ These steps require the founder / org owner and gate the bot going live.
    `permissions: contents: read` + `checks: read`. Ensure repo/org Actions
    settings permit those read scopes on `GITHUB_TOKEN` (default). The App token,
    not `GITHUB_TOKEN`, carries the write.
+
+### Install scope and token narrowing
+
+The `kin-release-bot` App is installed **org-wide** across `firelock-ai` (founder
+decision), so the App itself can reach every repository in the org. The workflow
+does not depend on a repo-scoped install: the "Mint kin-release-bot installation
+token" step passes `owner: firelock-ai` + `repositories: kin` to
+`actions/create-github-app-token`, which narrows every minted installation token
+to the `kin` repository alone — so a compromised or misused run can only write to
+`kin`, never a sibling repo. Extending bot-mediated tagging to another repo is a
+deliberate act: replicate this workflow and its secrets in that repo and widen or
+duplicate the `repositories:` narrowing to name the new repo explicitly — never
+drop the `owner`/`repositories` inputs, since without them a single token would
+span every repository the org-wide install can reach.
 
 ### Validating the setup
 
