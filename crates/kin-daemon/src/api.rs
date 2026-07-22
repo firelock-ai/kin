@@ -930,11 +930,11 @@ fn npm_registry_routes(
     let npm_dir = packages_dir.join("npm");
     std::fs::create_dir_all(&npm_dir).ok();
 
-    let router = kin_registry::npm::npm_routes(Arc::new(kin_registry::npm::NpmRegistryState {
-        manifest_store: kin_registry::ManifestStore::new(state.layout.root()),
-        blobs_dir: npm_dir,
-        base_url: base_url.to_string(),
-    }));
+    let router = kin_registry::npm::npm_routes(Arc::new(kin_registry::npm::NpmRegistryState::new(
+        kin_registry::ManifestStore::new(state.layout.root()),
+        npm_dir,
+        base_url.to_string(),
+    )));
 
     match auth_state {
         Some(auth_state) => router.route_layer(middleware::from_fn_with_state(
@@ -1093,21 +1093,21 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
     let base_url = std::env::var("KIN_REGISTRY_BASE_URL")
         .unwrap_or_else(|_| "http://localhost:4219".to_string());
 
-    // Cargo registry. The publish (write) path is gated on a shared secret from
-    // KIN_REGISTRY_CARGO_TOKEN; reads stay open. A None token fails closed
-    // (publishing disabled), so an unset/empty env var never falls open.
+    // Cargo and OCI have independent write credentials. Reads stay open, while
+    // an unset/empty token fails its own write surface closed.
     let crates_dir = packages_dir.join("crates");
     std::fs::create_dir_all(&crates_dir).ok();
-    let cargo_publish_token = std::env::var("KIN_REGISTRY_CARGO_TOKEN")
+    let cargo_write_token = std::env::var("KIN_REGISTRY_CARGO_TOKEN")
         .ok()
-        .filter(|s| !s.is_empty());
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty());
     let cargo_routes =
-        kin_registry::cargo::cargo_routes(Arc::new(kin_registry::cargo::CargoRegistryState {
-            manifest_store: kin_registry::ManifestStore::new(state.layout.root()),
-            blobs_dir: crates_dir,
-            base_url: base_url.clone(),
-            publish_token: cargo_publish_token,
-        }));
+        kin_registry::cargo::cargo_routes(Arc::new(kin_registry::cargo::CargoRegistryState::new(
+            kin_registry::ManifestStore::new(state.layout.root()),
+            crates_dir,
+            base_url.clone(),
+            cargo_write_token,
+        )));
 
     let npm_routes = npm_registry_routes(
         &state,
@@ -1119,22 +1119,25 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
     // OCI container registry
     let oci_dir = packages_dir.join("oci");
     std::fs::create_dir_all(&oci_dir).ok();
-    let oci_routes = kin_registry::oci::oci_routes(Arc::new(kin_registry::oci::OciRegistryState {
-        blobs_dir: oci_dir,
-        manifests: Default::default(),
-        uploads: Default::default(),
-    }));
+    let oci_write_token = std::env::var("KIN_REGISTRY_OCI_WRITE_TOKEN")
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty());
+    let oci_routes = kin_registry::oci::oci_routes(Arc::new(
+        kin_registry::oci::OciRegistryState::new(oci_dir, oci_write_token),
+    ));
 
     // Go module proxy
     let go_dir = packages_dir.join("go");
     std::fs::create_dir_all(&go_dir).ok();
-    let go_routes = kin_registry::go::go_routes(Arc::new(kin_registry::go::GoProxyState {
-        manifest_store: kin_registry::ManifestStore::new(state.layout.root()),
-        blobs_dir: go_dir,
-    }));
+    let go_routes = kin_registry::go::go_routes(Arc::new(kin_registry::go::GoProxyState::new(
+        kin_registry::ManifestStore::new(state.layout.root()),
+        go_dir,
+    )));
 
     // The package registries (cargo/npm/oci/go) are PUBLIC services with their
-    // own per-write gates (cargo: `KIN_REGISTRY_CARGO_TOKEN`; npm:
+    // own per-write gates (Cargo: `KIN_REGISTRY_CARGO_TOKEN`; OCI:
+    // `KIN_REGISTRY_OCI_WRITE_TOKEN`; npm:
     // `KIN_REGISTRY_NPM_AUTH_URL` introspection); their reads stay open. The
     // daemon API is a PROTECTED control surface. So `daemon_auth` is scoped to
     // ONLY the daemon routes — applied as an inner `.layer()` on the daemon
@@ -15931,6 +15934,22 @@ mod tests {
         builder.into_inner().unwrap().finish().unwrap()
     }
 
+    fn build_valid_npm_tarball() -> Vec<u8> {
+        use flate2::{write::GzEncoder, Compression};
+
+        let contents = b"module.exports = 'kin';\n";
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "package/index.js", contents.as_slice())
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
     #[tokio::test]
     async fn registry_routes_public_even_with_daemon_auth_token() {
         // With a daemon auth token configured, the cargo registry's read routes
@@ -16062,6 +16081,70 @@ mod tests {
         assert_eq!(ok.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn oci_writes_require_their_own_token_while_pulls_stay_public() {
+        let _lock = REGISTRY_ENV_LOCK.lock().await;
+
+        std::env::remove_var("KIN_REGISTRY_OCI_WRITE_TOKEN");
+        let _cargo_env = RegistryEnvGuard("KIN_REGISTRY_CARGO_TOKEN");
+        std::env::set_var("KIN_REGISTRY_CARGO_TOKEN", "cargo-secret");
+        let disabled = router_with_auth(test_state(), Some("daemon-token".to_string()))
+            .oneshot(
+                Request::post("/v2/demo/blobs/uploads/")
+                    .header("authorization", "Bearer anything")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disabled.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let _oci_env = RegistryEnvGuard("KIN_REGISTRY_OCI_WRITE_TOKEN");
+        std::env::set_var("KIN_REGISTRY_OCI_WRITE_TOKEN", "registry-secret");
+        let app = router_with_auth(test_state(), Some("daemon-token".to_string()));
+
+        // The Cargo credential is deliberately not accepted on the OCI scope.
+        let cargo_token_rejected = app
+            .clone()
+            .oneshot(
+                Request::post("/v2/demo/blobs/uploads/")
+                    .header("authorization", "Bearer cargo-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cargo_token_rejected.status(), StatusCode::UNAUTHORIZED);
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::post("/v2/demo/blobs/uploads/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let accepted = app
+            .clone()
+            .oneshot(
+                Request::post("/v2/demo/blobs/uploads/")
+                    .header("authorization", "Bearer registry-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+
+        let public = app
+            .oneshot(Request::get("/v2/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(public.status(), StatusCode::OK);
+    }
+
     fn test_packages_dir(state: &Arc<DaemonState>) -> std::path::PathBuf {
         let packages_dir = state.layout.root().join("packages");
         std::fs::create_dir_all(&packages_dir).unwrap();
@@ -16127,7 +16210,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn npm_registry_writes_fail_closed_without_auth_configuration() {
+        let state = test_state();
+        let app = npm_registry_routes(
+            &state,
+            &test_packages_dir(&state),
+            "https://kinlab.ai",
+            None,
+        );
+
+        let read = app
+            .clone()
+            .oneshot(
+                Request::get("/registry/npm/@kin%2Fboundary-contracts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::NOT_FOUND);
+
+        let write = app
+            .oneshot(
+                Request::put("/registry/npm/@kin%2Fboundary-contracts")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(write.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
     async fn npm_publish_records_authenticated_publisher() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
         let state = test_state();
         let (auth_url, auth_server) = spawn_registry_auth_server(
             StatusCode::OK,
@@ -16155,6 +16273,7 @@ mod tests {
             })),
         );
 
+        let tarball = build_valid_npm_tarball();
         let publish_payload = serde_json::json!({
             "_id": "@kin/boundary-contracts",
             "name": "@kin/boundary-contracts",
@@ -16168,8 +16287,8 @@ mod tests {
             "_attachments": {
                 "@kin/boundary-contracts-0.1.0.tgz": {
                     "content_type": "application/octet-stream",
-                    "data": "ZmFrZS10YXJiYWxs",
-                    "length": 12
+                    "data": STANDARD.encode(&tarball),
+                    "length": tarball.len()
                 }
             }
         });

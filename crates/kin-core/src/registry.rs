@@ -16,6 +16,83 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+#[derive(Default)]
+struct RegistryProcessGates {
+    active: std::collections::HashSet<RegistryProcessKey>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RegistryProcessKey {
+    parent: FileIdentity,
+    lock_authority_name: Vec<u8>,
+}
+
+#[cfg(unix)]
+static REGISTRY_PROCESS_GATES: std::sync::OnceLock<(
+    std::sync::Mutex<RegistryProcessGates>,
+    std::sync::Condvar,
+)> = std::sync::OnceLock::new();
+
+#[cfg(unix)]
+struct RegistryProcessGuard {
+    key: RegistryProcessKey,
+}
+
+#[cfg(unix)]
+impl Drop for RegistryProcessGuard {
+    fn drop(&mut self) {
+        let (state, changed) = REGISTRY_PROCESS_GATES
+            .get()
+            .expect("registry process gate was initialized before guard creation");
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active.remove(&self.key);
+        changed.notify_all();
+    }
+}
+
+/// `flock` semantics for separately-opened descriptors differ across Unix
+/// kernels when contenders are threads in one process. Keep a path-keyed local
+/// gate around the preflight + OS-lock transaction so an atomic rename cannot
+/// unlink a sibling thread's just-opened registry descriptor (`st_nlink == 0`).
+/// Different registry authorities remain independent; the durable lock file
+/// remains the cross-process authority. Keying on the opened parent identity
+/// plus the collision-normalized lock name collapses both prefix aliases such
+/// as `/tmp` and `/private/tmp` and case aliases on default macOS filesystems.
+#[cfg(unix)]
+fn lock_registry_process(path: &Path) -> std::io::Result<RegistryProcessGuard> {
+    let anchor = prepare_anchor(path).map_err(|error| {
+        std::io::Error::other(format!("failed to anchor registry process lock: {error}"))
+    })?;
+    let parent_stat = stat_file(&anchor.parent)?;
+    let key = RegistryProcessKey {
+        parent: FileIdentity {
+            device: parent_stat.st_dev as u64,
+            inode: parent_stat.st_ino as u64,
+        },
+        lock_authority_name: collision_normalized_authority_name(&anchor.lock_name),
+    };
+    let (state, changed) = REGISTRY_PROCESS_GATES.get_or_init(|| {
+        (
+            std::sync::Mutex::new(RegistryProcessGates::default()),
+            std::sync::Condvar::new(),
+        )
+    });
+    let mut state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while state.active.contains(&key) {
+        state = changed
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    state.active.insert(key.clone());
+    Ok(RegistryProcessGuard { key })
+}
+
 /// Read-only classification of one local registry-authority path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -471,7 +548,7 @@ pub fn initialize_registry_authority_at(
 }
 
 #[cfg(unix)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct FileIdentity {
     device: u64,
     inode: u64,
@@ -546,6 +623,8 @@ impl RegistryAnchor {
             })?
             .to_os_string();
 
+        validate_authority_filename(&registry_name)?;
+
         if authority_names_collide(&registry_name, &lock_name)
             || authority_names_collide(&registry_name, &legacy_tmp_name)
             || authority_names_collide(&lock_name, &legacy_tmp_name)
@@ -573,6 +652,32 @@ fn authority_names_collide(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
     // Conservatively reject ASCII case variants on every Unix platform so a
     // case-insensitive filesystem cannot alias registry data with lock/temp.
     a.as_bytes().eq_ignore_ascii_case(b.as_bytes())
+}
+
+#[cfg(unix)]
+fn validate_authority_filename(name: &std::ffi::OsStr) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    // Filesystems such as default macOS APFS apply Unicode normalization and
+    // case folding that cannot be reproduced from raw OsStr bytes. In
+    // particular, `registry.locK` aliases `registry.lock`, despite the two
+    // names being neither byte-equal nor ASCII-case-equal. Restrict only the
+    // authority filename (parent paths remain fully Unicode-capable) so the
+    // data, lock, and reserved temp names can never alias unexpectedly.
+    if !name.as_bytes().is_ascii() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "registry authority filename must be ASCII to avoid filesystem case-fold aliases",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn collision_normalized_authority_name(name: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
+    name.as_bytes().iter().map(u8::to_ascii_lowercase).collect()
 }
 
 #[cfg(unix)]
@@ -878,6 +983,7 @@ fn inspect_named_authority(
 fn repair_registry_authority_permissions_at_unix(
     path: &Path,
 ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let _process_guard = lock_registry_process(path)?;
     let anchor = match RegistryAnchor::open(path) {
         Ok(anchor) => anchor,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -931,6 +1037,7 @@ fn repair_registry_authority_permissions_at_unix(
 fn initialize_registry_authority_at_unix(
     path: &Path,
 ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let _process_guard = lock_registry_process(path)?;
     // This preflight is deliberately before directory or lock creation: an
     // unsafe existing registry must not cause any companion-path mutation.
     require_registry_authority_secure_at(path)?;
@@ -959,6 +1066,7 @@ fn initialize_registry_authority_at_unix(
 
 #[cfg(unix)]
 fn load_from_unix(path: &Path) -> Result<KinRegistry, Box<dyn std::error::Error>> {
+    let _process_guard = lock_registry_process(path)?;
     // Reject the complete authority snapshot before a missing lock can be
     // created. Descriptor-anchored checks below then revalidate under lock.
     require_registry_authority_secure_at(path)?;
@@ -978,6 +1086,7 @@ fn load_from_unix(path: &Path) -> Result<KinRegistry, Box<dyn std::error::Error>
 
 #[cfg(unix)]
 fn save_to_unix(registry: &KinRegistry, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let _process_guard = lock_registry_process(path)?;
     require_registry_authority_secure_at(path)?;
     let contents = toml::to_string_pretty(registry)?;
     let anchor = prepare_anchor(path)?;
@@ -992,6 +1101,7 @@ fn update_at_unix<T>(
     path: &Path,
     mutate: impl FnOnce(&mut KinRegistry) -> T,
 ) -> Result<T, Box<dyn std::error::Error>> {
+    let _process_guard = lock_registry_process(path)?;
     require_registry_authority_secure_at(path)?;
     let anchor = prepare_anchor(path)?;
     let lock_file = open_private_lock_at(&anchor).map_err(|err| {
@@ -1224,7 +1334,7 @@ fn validate_regular_stat(stat: &libc::stat, label: &str) -> std::io::Result<File
     }
     Ok(FileIdentity {
         device: stat.st_dev as u64,
-        inode: stat.st_ino as u64,
+        inode: stat.st_ino,
     })
 }
 
@@ -1513,6 +1623,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn unicode_case_fold_cannot_alias_registry_and_lock_authorities() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg_path = dir.path().join("registry.locK");
+
+        let error = KinRegistry::default().save_to(&reg_path).unwrap_err();
+
+        assert!(error.to_string().contains("filename must be ASCII"));
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn unsafe_permissions_are_rejected_without_mutation_until_explicit_repair() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1644,6 +1766,172 @@ mod tests {
         assert_eq!(std::fs::read(&upgrade_path).unwrap(), existing);
         assert_eq!(mode(&upgrade_path), 0o600);
         assert_eq!(mode(&upgrade_path.with_extension("lock")), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_gate_keeps_same_registry_rename_outside_open_descriptor_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("registry.toml");
+        let replacement = dir.path().join("replacement.toml");
+        let unrelated = dir.path().join("other-registry.toml");
+        std::fs::write(&registry, b"repos = []\n").unwrap();
+        std::fs::write(&replacement, b"repos = []\n").unwrap();
+
+        let guard = lock_registry_process(&registry).unwrap();
+        let opened_before_rename = File::open(&registry).unwrap();
+        assert_eq!(stat_file(&opened_before_rename).unwrap().st_nlink, 1);
+
+        // The key is path-scoped: an unrelated authority remains available.
+        drop(lock_registry_process(&unrelated).unwrap());
+
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (renamed_tx, renamed_rx) = std::sync::mpsc::channel();
+        let registry_for_thread = registry.clone();
+        let replacement_for_thread = replacement.clone();
+        let writer = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let _guard = lock_registry_process(&registry_for_thread).unwrap();
+            std::fs::rename(replacement_for_thread, registry_for_thread).unwrap();
+            renamed_tx.send(()).unwrap();
+        });
+
+        attempted_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            renamed_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(stat_file(&opened_before_rename).unwrap().st_nlink, 1);
+
+        drop(guard);
+        renamed_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        writer.join().unwrap();
+        assert_eq!(stat_file(&opened_before_rename).unwrap().st_nlink, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_gate_collapses_symlinked_prefix_aliases_by_parent_identity() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let real_root = root.path().join("real");
+        let nested = real_root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let alias_root = root.path().join("alias");
+        symlink(&real_root, &alias_root).unwrap();
+        let real_registry = nested.join("registry.toml");
+        let aliased_registry = alias_root.join("nested").join("registry.toml");
+
+        let first = lock_registry_process(&real_registry).unwrap();
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let _guard = lock_registry_process(&aliased_registry).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        attempted_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            acquired_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(first);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        contender.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_gate_collapses_case_aliases_of_the_named_lock_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let lowercase = root.path().join("registry.toml");
+        let uppercase = root.path().join("REGISTRY.TOML");
+
+        let first = lock_registry_process(&lowercase).unwrap();
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let _guard = lock_registry_process(&uppercase).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        attempted_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            acquired_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(first);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        contender.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn case_alias_updates_preserve_both_writers_on_case_insensitive_filesystems() {
+        use std::sync::{Arc, Barrier};
+
+        let root = tempfile::tempdir().unwrap();
+        let lowercase = root.path().join("registry.toml");
+        let uppercase = root.path().join("REGISTRY.TOML");
+        KinRegistry::default().save_to(&lowercase).unwrap();
+        let Ok(lower_file) = File::open(&lowercase) else {
+            return;
+        };
+        let Ok(upper_file) = File::open(&uppercase) else {
+            return;
+        };
+        let lower_stat = stat_file(&lower_file).unwrap();
+        let upper_stat = stat_file(&upper_file).unwrap();
+        if lower_stat.st_dev != upper_stat.st_dev || lower_stat.st_ino != upper_stat.st_ino {
+            return;
+        }
+
+        let barrier = Arc::new(Barrier::new(2));
+        let writers = [(lowercase.clone(), "lower"), (uppercase, "upper")]
+            .into_iter()
+            .map(|(path, id)| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    KinRegistry::update_at(&path, |registry| {
+                        registry.repos.push(RegisteredRepo {
+                            id: id.to_string(),
+                            path: PathBuf::from(format!("/{id}")),
+                            entities: 1,
+                            last_commit: "now".to_string(),
+                            dependencies: Vec::new(),
+                        });
+                    })
+                    .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        let registry = KinRegistry::load_from(&lowercase).unwrap();
+        let ids = registry
+            .repos
+            .iter()
+            .map(|repo| repo.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids, std::collections::HashSet::from(["lower", "upper"]));
     }
 
     #[test]

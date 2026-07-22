@@ -138,6 +138,10 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --locked --target x86_64-pc-windows-msvc \
+            -p kin-registry --lib
+          cargo test --locked --target x86_64-pc-windows-msvc \
+            -p kin-core --lib registry::tests
+          cargo test --locked --target x86_64-pc-windows-msvc \
             -p kin-cli --no-default-features --no-run
           test_binary=$(find target/x86_64-pc-windows-msvc/debug/deps \
             -maxdepth 1 -type f -name 'kin_cli-*.exe' -print -quit)
