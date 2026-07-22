@@ -21,6 +21,11 @@ pub enum KinDbError {
     #[error("storage error: {0}")]
     StorageError(String),
 
+    #[error(
+        "immutable source blob is {actual_bytes} bytes, above the caller-supplied {max_bytes}-byte read limit"
+    )]
+    SourceBlobReadLimitExceeded { actual_bytes: u64, max_bytes: u64 },
+
     #[error("incompatible snapshot schema: on-disk snapshot format version {found} {direction} the range this binary supports (versions {min} through {max}); {remediation}")]
     IncompatibleSnapshotVersion {
         found: u32,
@@ -89,6 +94,26 @@ mod tests {
             error,
             KinDbError::Model(kin_model::ModelError::ChangeNotFound(id))
                 if id == "missing-parent"
+        ));
+    }
+
+    #[test]
+    fn source_blob_read_limit_error_has_stable_fields_and_display() {
+        let error = KinDbError::SourceBlobReadLimitExceeded {
+            actual_bytes: 300,
+            max_bytes: 256,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "immutable source blob is 300 bytes, above the caller-supplied 256-byte read limit"
+        );
+        assert!(matches!(
+            error,
+            KinDbError::SourceBlobReadLimitExceeded {
+                actual_bytes: 300,
+                max_bytes: 256
+            }
         ));
     }
 }

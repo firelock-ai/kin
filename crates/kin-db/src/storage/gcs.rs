@@ -27,9 +27,9 @@ use sha2::{Digest, Sha256};
 
 use crate::error::KinDbError;
 use crate::storage::backend::{
-    validate_source_blob_repo_id, validate_source_blob_size, verify_source_blob_digest, Generation,
-    SnapshotAuthority, SnapshotRecoveryState, StorageBackend, GENERATION_INIT,
-    MAX_SOURCE_BLOB_BYTES,
+    validate_source_blob_read_size, validate_source_blob_repo_id, validate_source_blob_size,
+    verify_source_blob_digest, Generation, SnapshotAuthority, SnapshotRecoveryState,
+    StorageBackend, GENERATION_INIT, MAX_SOURCE_BLOB_BYTES,
 };
 
 const GCS_FULL_AUTHORITY_MAGIC: [u8; 8] = *b"KNGCSF02";
@@ -396,6 +396,15 @@ impl StorageBackend for GcsBackend {
         repo_id: &str,
         digest: [u8; 32],
     ) -> Result<Option<Vec<u8>>, KinDbError> {
+        self.load_source_blob_bounded(repo_id, digest, MAX_SOURCE_BLOB_BYTES)
+    }
+
+    fn load_source_blob_bounded(
+        &self,
+        repo_id: &str,
+        digest: [u8; 32],
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>, KinDbError> {
         validate_source_blob_repo_id(repo_id)?;
         let path = self.source_blob_path(repo_id, digest)?;
         let metadata = match self.block_on(self.store.head(&path)) {
@@ -407,7 +416,7 @@ impl StorageBackend for GcsBackend {
                 )))
             }
         };
-        validate_source_blob_size(metadata.size, path.as_ref())?;
+        validate_source_blob_read_size(metadata.size, max_bytes, path.as_ref())?;
         // Object stores commonly reject a bounded 0..N range request for an
         // existing zero-byte object. Its HEAD metadata is authoritative enough
         // to avoid that invalid range; the digest still verifies the identity.
@@ -419,9 +428,10 @@ impl StorageBackend for GcsBackend {
         let get_result = match self.block_on(self.store.get_opts(
             &path,
             GetOptions {
-                range: Some(GetRange::Bounded(
-                    0..MAX_SOURCE_BLOB_BYTES.saturating_add(1),
-                )),
+                // HEAD already proved this exact range fits both limits. Never
+                // ask the store for max+1 bytes merely to detect oversize: the
+                // returned metadata is checked again before the body is read.
+                range: Some(GetRange::Bounded(0..metadata.size)),
                 ..GetOptions::default()
             },
         )) {
@@ -433,14 +443,25 @@ impl StorageBackend for GcsBackend {
                 )))
             }
         };
-        validate_source_blob_size(get_result.meta.size, path.as_ref())?;
+        validate_source_blob_read_size(get_result.meta.size, max_bytes, path.as_ref())?;
         let bytes = self.block_on(get_result.bytes()).map_err(|error| {
             KinDbError::StorageError(format!(
                 "GCS source blob read bytes failed for {path}: {error}"
             ))
         })?;
         let data = bytes.to_vec();
-        validate_source_blob_size(data.len() as u64, path.as_ref())?;
+        let data_len = u64::try_from(data.len()).map_err(|_| {
+            KinDbError::StorageError(format!(
+                "GCS source blob byte length does not fit the read boundary for {path}"
+            ))
+        })?;
+        validate_source_blob_read_size(data_len, max_bytes, path.as_ref())?;
+        if data_len != metadata.size {
+            return Err(KinDbError::StorageError(format!(
+                "GCS source blob changed size while reading {path}: HEAD reported {}, body returned {data_len}",
+                metadata.size
+            )));
+        }
         verify_source_blob_digest(digest, &data, path.as_ref())?;
         Ok(Some(data))
     }
@@ -708,7 +729,7 @@ mod tests {
     };
     use std::collections::HashMap;
     use std::fmt;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     #[derive(Debug)]
@@ -724,6 +745,7 @@ mod tests {
         state: Arc<tokio::sync::Mutex<VersionState>>,
         fail_next_delete: Arc<AtomicBool>,
         report_next_get_as_oversized: Arc<AtomicBool>,
+        body_get_count: Arc<AtomicUsize>,
     }
 
     impl VersionedMemoryStore {
@@ -736,6 +758,7 @@ mod tests {
                 })),
                 fail_next_delete: Arc::new(AtomicBool::new(false)),
                 report_next_get_as_oversized: Arc::new(AtomicBool::new(false)),
+                body_get_count: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -746,6 +769,10 @@ mod tests {
         fn report_next_get_as_oversized(&self) {
             self.report_next_get_as_oversized
                 .store(true, Ordering::SeqCst);
+        }
+
+        fn body_get_count(&self) -> usize {
+            self.body_get_count.load(Ordering::SeqCst)
         }
 
         fn precondition_error(path: &ObjectPath, message: String) -> object_store::Error {
@@ -820,7 +847,11 @@ mod tests {
             location: &ObjectPath,
             options: GetOptions,
         ) -> ObjectStoreResult<GetResult> {
+            let reads_body = !options.head;
             let mut result = self.inner.get_opts(location, options).await?;
+            if reads_body {
+                self.body_get_count.fetch_add(1, Ordering::SeqCst);
+            }
             let state = self.state.lock().await;
             Self::apply_version(&mut result.meta, &state);
             if self
@@ -958,6 +989,38 @@ mod tests {
         backend
             .save_source_blob("repo-a", digest, data)
             .expect("zero-byte immutable retry remains idempotent");
+    }
+
+    #[test]
+    fn gcs_source_blob_honors_caller_limit_before_body_get() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        let data = b"bounded cloud source bytes";
+        let digest = source_digest(data);
+        let path = backend.source_blob_path("repo-a", digest).unwrap();
+        backend
+            .block_on(backend.store.put(&path, PutPayload::from(data.to_vec())))
+            .unwrap();
+
+        let error = backend
+            .load_source_blob_bounded("repo-a", digest, data.len() as u64 - 1)
+            .expect_err("HEAD above the caller limit must reject before GET");
+        assert!(matches!(
+            error,
+            KinDbError::SourceBlobReadLimitExceeded {
+                actual_bytes,
+                max_bytes
+            } if actual_bytes == data.len() as u64 && max_bytes == data.len() as u64 - 1
+        ));
+        assert_eq!(store.body_get_count(), 0);
+
+        assert_eq!(
+            backend
+                .load_source_blob_bounded("repo-a", digest, data.len() as u64)
+                .unwrap(),
+            Some(data.to_vec())
+        );
+        assert_eq!(store.body_get_count(), 1);
     }
 
     #[test]

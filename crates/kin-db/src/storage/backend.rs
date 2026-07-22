@@ -132,6 +132,21 @@ pub(crate) fn validate_source_blob_size(byte_len: u64, authority: &str) -> Resul
     Ok(())
 }
 
+pub(crate) fn validate_source_blob_read_size(
+    byte_len: u64,
+    max_bytes: u64,
+    authority: &str,
+) -> Result<(), KinDbError> {
+    validate_source_blob_size(byte_len, authority)?;
+    if byte_len > max_bytes {
+        return Err(KinDbError::SourceBlobReadLimitExceeded {
+            actual_bytes: byte_len,
+            max_bytes,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 struct SourceBlobCapability {
     repo_dir: std::fs::File,
@@ -428,10 +443,15 @@ fn open_source_file_at(
 fn read_source_file_at(
     directory: &std::fs::File,
     name: &str,
+    max_bytes: u64,
 ) -> Result<Option<OpenedSourceBlob>, KinDbError> {
     let Some((mut file, byte_len)) = open_source_file_at(directory, name)? else {
         return Ok(None);
     };
+    // Reject objects larger than the caller's budget before allocating their
+    // bytes. The backend safety limit was already enforced at open time; this
+    // is the caller's stricter, possibly per-request, boundary.
+    validate_source_blob_read_size(byte_len, max_bytes, "pinned local source object")?;
     run_source_file_after_metadata_hook();
 
     let capacity = usize::try_from(byte_len).map_err(|_| {
@@ -802,6 +822,27 @@ pub trait StorageBackend: Send + Sync {
         let _ = (repo_id, digest);
         Err(KinDbError::StorageError(
             "immutable source blob storage is not supported by this backend".to_string(),
+        ))
+    }
+
+    /// Load immutable source bytes without permitting an allocation above
+    /// `max_bytes`.
+    ///
+    /// Implementations must inspect trusted object metadata before reading a
+    /// body, reject objects larger than `max_bytes`, and also retain the
+    /// backend-wide [`MAX_SOURCE_BLOB_BYTES`] safety boundary. This default is
+    /// deliberately fail-closed instead of delegating to [`load_source_blob`]
+    /// so a backend compiled before bounded reads existed cannot accidentally
+    /// allocate an unbounded legacy result on a security-sensitive path.
+    fn load_source_blob_bounded(
+        &self,
+        repo_id: &str,
+        digest: [u8; 32],
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>, KinDbError> {
+        let _ = (repo_id, digest, max_bytes);
+        Err(KinDbError::StorageError(
+            "bounded immutable source blob reads are not supported by this backend".to_string(),
         ))
     }
 
@@ -2347,7 +2388,9 @@ impl StorageBackend for LocalFileBackend {
             let _lock = acquire_source_blob_lock(&capability.repo_dir)?;
             let digest_hex = hex::encode(digest);
 
-            if let Some(existing) = read_source_file_at(&capability.leaf_dir, &digest_hex)? {
+            if let Some(existing) =
+                read_source_file_at(&capability.leaf_dir, &digest_hex, MAX_SOURCE_BLOB_BYTES)?
+            {
                 verify_source_blob_digest(
                     digest,
                     &existing.data,
@@ -2389,12 +2432,13 @@ impl StorageBackend for LocalFileBackend {
 
             let _published = publish_source_file_at(&capability.leaf_dir, &digest_hex, data)?;
             let installed =
-                read_source_file_at(&capability.leaf_dir, &digest_hex)?.ok_or_else(|| {
-                    KinDbError::StorageError(format!(
-                        "immutable source blob disappeared after publication below {}",
-                        capability.leaf_path.display()
-                    ))
-                })?;
+                read_source_file_at(&capability.leaf_dir, &digest_hex, MAX_SOURCE_BLOB_BYTES)?
+                    .ok_or_else(|| {
+                        KinDbError::StorageError(format!(
+                            "immutable source blob disappeared after publication below {}",
+                            capability.leaf_path.display()
+                        ))
+                    })?;
             verify_source_blob_digest(
                 digest,
                 &installed.data,
@@ -2420,10 +2464,19 @@ impl StorageBackend for LocalFileBackend {
         repo_id: &str,
         digest: [u8; 32],
     ) -> Result<Option<Vec<u8>>, KinDbError> {
+        self.load_source_blob_bounded(repo_id, digest, MAX_SOURCE_BLOB_BYTES)
+    }
+
+    fn load_source_blob_bounded(
+        &self,
+        repo_id: &str,
+        digest: [u8; 32],
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>, KinDbError> {
         validate_source_blob_repo_id(repo_id)?;
         #[cfg(not(unix))]
         {
-            let _ = (repo_id, digest);
+            let _ = (repo_id, digest, max_bytes);
             return Err(KinDbError::StorageError(
                 "secure local immutable source storage is unavailable on this platform; use the GCS backend"
                     .to_string(),
@@ -2443,7 +2496,8 @@ impl StorageBackend for LocalFileBackend {
             )?;
             let _lock = acquire_source_blob_lock(&capability.repo_dir)?;
             let digest_hex = hex::encode(digest);
-            let Some(data) = read_source_file_at(&capability.leaf_dir, &digest_hex)? else {
+            let Some(data) = read_source_file_at(&capability.leaf_dir, &digest_hex, max_bytes)?
+            else {
                 return Ok(None);
             };
             verify_source_blob_digest(
@@ -3058,8 +3112,92 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    struct LegacyUnboundedOnlyBackend;
+
+    impl StorageBackend for LegacyUnboundedOnlyBackend {
+        fn load_snapshot(
+            &self,
+            _repo_id: &str,
+        ) -> Result<Option<(Vec<u8>, Generation)>, KinDbError> {
+            unreachable!("snapshot methods are not used by this fixture")
+        }
+
+        fn load_source_blob(
+            &self,
+            _repo_id: &str,
+            _digest: [u8; 32],
+        ) -> Result<Option<Vec<u8>>, KinDbError> {
+            panic!("the bounded default must not call the legacy unbounded method")
+        }
+
+        fn save_snapshot(
+            &self,
+            _repo_id: &str,
+            _data: &[u8],
+            _expected_gen: Generation,
+        ) -> Result<Generation, KinDbError> {
+            unreachable!("snapshot methods are not used by this fixture")
+        }
+
+        fn save_delta(
+            &self,
+            _repo_id: &str,
+            _delta_data: &[u8],
+            _base_gen: Generation,
+        ) -> Result<Generation, KinDbError> {
+            unreachable!("delta methods are not used by this fixture")
+        }
+
+        fn load_deltas_since(
+            &self,
+            _repo_id: &str,
+            _since_gen: Generation,
+        ) -> Result<Vec<(Vec<u8>, Generation)>, KinDbError> {
+            unreachable!("delta methods are not used by this fixture")
+        }
+
+        fn clear_deltas(&self, _repo_id: &str) -> Result<(), KinDbError> {
+            unreachable!("delta methods are not used by this fixture")
+        }
+
+        fn save_overlay(
+            &self,
+            _repo_id: &str,
+            _session_id: &str,
+            _data: &[u8],
+        ) -> Result<(), KinDbError> {
+            unreachable!("overlay methods are not used by this fixture")
+        }
+
+        fn load_overlay(
+            &self,
+            _repo_id: &str,
+            _session_id: &str,
+        ) -> Result<Option<Vec<u8>>, KinDbError> {
+            unreachable!("overlay methods are not used by this fixture")
+        }
+
+        fn delete_overlay(&self, _repo_id: &str, _session_id: &str) -> Result<(), KinDbError> {
+            unreachable!("overlay methods are not used by this fixture")
+        }
+
+        fn list_repos(&self) -> Result<Vec<String>, KinDbError> {
+            unreachable!("repo listing is not used by this fixture")
+        }
+    }
+
     fn source_digest(data: &[u8]) -> [u8; 32] {
         Sha256::digest(data).into()
+    }
+
+    #[test]
+    fn bounded_source_blob_default_fails_closed_without_calling_legacy_load() {
+        let error = LegacyUnboundedOnlyBackend
+            .load_source_blob_bounded("repo-a", [0; 32], 4)
+            .expect_err("legacy backends must opt in to bounded reads");
+        assert!(error
+            .to_string()
+            .contains("bounded immutable source blob reads are not supported"));
     }
 
     #[test]
@@ -3107,6 +3245,32 @@ mod tests {
         backend
             .save_source_blob("repo-a", digest, data)
             .expect("the retry is acknowledged after file and directory confirmation");
+    }
+
+    #[test]
+    fn local_source_blob_honors_caller_limit_before_allocating_body() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let data = b"bounded source bytes";
+        let digest = source_digest(data);
+        backend.save_source_blob("repo-a", digest, data).unwrap();
+
+        let error = backend
+            .load_source_blob_bounded("repo-a", digest, data.len() as u64 - 1)
+            .expect_err("metadata above the caller's limit must fail before reading");
+        assert!(matches!(
+            error,
+            KinDbError::SourceBlobReadLimitExceeded {
+                actual_bytes,
+                max_bytes
+            } if actual_bytes == data.len() as u64 && max_bytes == data.len() as u64 - 1
+        ));
+        assert_eq!(
+            backend
+                .load_source_blob_bounded("repo-a", digest, data.len() as u64)
+                .unwrap(),
+            Some(data.to_vec())
+        );
     }
 
     #[test]
