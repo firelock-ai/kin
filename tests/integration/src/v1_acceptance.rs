@@ -366,7 +366,7 @@ fn git_export_creates_commits() {
     let mut change = make_change(genesis_id, vec![entity], "add exported function");
     change.artifact_deltas.push(kin_model::ArtifactDelta {
         file_id: kin_model::FilePathId::new("src/lib.rs"),
-        kind: kin_model::ArtifactDeltaKind::Added,
+        kind: kin_model::ArtifactDeltaKind::AddedRegularFile,
         old_hash: None,
         new_hash: Some(content_hash),
     });

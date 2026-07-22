@@ -141,7 +141,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -152,7 +152,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -433,7 +433,7 @@ dependencies = [
  "cap-primitives",
  "cap-std",
  "io-lifetimes 3.0.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -450,7 +450,7 @@ dependencies = [
  "maybe-owned",
  "rustix",
  "rustix-linux-procfs",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
  "winx",
 ]
 
@@ -1115,7 +1115,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1224,7 +1224,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1893,7 +1893,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19753d40da53d0ec41604750eeb969097a90fb2d7f7992730d904541c04e2c19"
 dependencies = [
  "bstr",
- "hashbrown 0.17.1",
+ "hashbrown 0.16.1",
 ]
 
 [[package]]
@@ -3044,14 +3044,14 @@ dependencies = [
 
 [[package]]
 name = "kin-buildinfo"
-version = "0.2.28"
+version = "0.3.0"
 dependencies = [
  "sha2 0.11.0",
 ]
 
 [[package]]
 name = "kin-cli"
-version = "0.2.28"
+version = "0.3.0"
 dependencies = [
  "age",
  "anyhow",
@@ -3125,7 +3125,7 @@ dependencies = [
 
 [[package]]
 name = "kin-context"
-version = "0.2.28"
+version = "0.3.0"
 dependencies = [
  "kin-blobs",
  "kin-db",
@@ -3141,8 +3141,10 @@ dependencies = [
 
 [[package]]
 name = "kin-core"
-version = "0.2.28"
+version = "0.3.0"
 dependencies = [
+ "cap-fs-ext",
+ "cap-std",
  "chrono",
  "directories 5.0.1",
  "fs2",
@@ -3154,6 +3156,7 @@ dependencies = [
  "kin-parser",
  "libc",
  "pretty_assertions",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3161,12 +3164,14 @@ dependencies = [
  "thiserror 2.0.18",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
+ "unicode-normalization",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "kin-daemon"
-version = "0.2.28"
+version = "0.3.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -3176,6 +3181,7 @@ dependencies = [
  "fs2",
  "gix",
  "hex",
+ "http-body",
  "kin-blobs",
  "kin-buildinfo",
  "kin-cli",
@@ -3191,6 +3197,7 @@ dependencies = [
  "kin-projection",
  "kin-reconcile",
  "kin-registry",
+ "kin-review",
  "kin-spine",
  "libc",
  "mimalloc",
@@ -3216,9 +3223,9 @@ dependencies = [
 
 [[package]]
 name = "kin-db"
-version = "0.2.39"
+version = "0.3.1"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "e70759792c8a050ac85ff72acfd0b0d563cddd8aba8a3e1876f9fd683ede25a1"
+checksum = "80bfc3d362b3e928051e80fca41293f239a38bb5a46c384ff5c39343fc6b6d8d"
 dependencies = [
  "bincode",
  "bytes",
@@ -3257,7 +3264,7 @@ dependencies = [
 
 [[package]]
 name = "kin-git"
-version = "0.2.28"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "gix",
@@ -3275,7 +3282,7 @@ dependencies = [
 
 [[package]]
 name = "kin-index"
-version = "0.2.28"
+version = "0.3.0"
 dependencies = [
  "hex",
  "kin-blobs",
@@ -3299,9 +3306,9 @@ dependencies = [
 
 [[package]]
 name = "kin-infer"
-version = "0.2.40"
+version = "0.2.41"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "97fd7176da2b74e8e261285856d812f917b35a7e13eab7c2589e1868652f94a1"
+checksum = "073c47139ed0850d8f3ae2d1f11c63ffc10f3bc24e6a09c9e2d77a134ab416b1"
 dependencies = [
  "block",
  "half",
@@ -3323,7 +3330,7 @@ dependencies = [
 
 [[package]]
 name = "kin-integration-tests"
-version = "0.2.28"
+version = "0.3.0"
 dependencies = [
  "kin-blobs",
  "kin-cli",
@@ -3350,9 +3357,9 @@ dependencies = [
 
 [[package]]
 name = "kin-lsp"
-version = "0.2.3"
+version = "0.4.0"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "18c12c2c4ceea690f0a587d58a7b6d1ad8a177f2fbe2a79fc990dd680b2b0d8c"
+checksum = "eac57c8501983212e1923efdf64c76ad5e61dce24dd62d714cb1b15f71b2ce54"
 dependencies = [
  "kin-model",
  "serde",
@@ -3365,7 +3372,7 @@ dependencies = [
 
 [[package]]
 name = "kin-mcp"
-version = "0.2.28"
+version = "0.3.0"
 dependencies = [
  "kin-blobs",
  "kin-context",
@@ -3392,7 +3399,7 @@ dependencies = [
 
 [[package]]
 name = "kin-migrate"
-version = "0.2.28"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "kin-blobs",
@@ -3416,9 +3423,9 @@ dependencies = [
 
 [[package]]
 name = "kin-model"
-version = "0.2.5"
+version = "0.4.0"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "f0fb9f21abc67a9f9c1374e6d8f304ca496fba96d98586fa3a8ff0ca2d5a91bd"
+checksum = "56123029e2cc463a2acc85d00bb4ae2146db7c5088097cadcc92a60d6d1a1b03"
 dependencies = [
  "chrono",
  "hex",
@@ -3434,7 +3441,7 @@ dependencies = [
 
 [[package]]
 name = "kin-parser"
-version = "0.2.28"
+version = "0.3.0"
 dependencies = [
  "kin-model",
  "pretty_assertions",
@@ -3464,7 +3471,7 @@ dependencies = [
 
 [[package]]
 name = "kin-projection"
-version = "0.2.28"
+version = "0.3.0"
 dependencies = [
  "kin-blobs",
  "kin-db",
@@ -3479,7 +3486,7 @@ dependencies = [
 
 [[package]]
 name = "kin-ranking"
-version = "0.2.28"
+version = "0.3.0"
 dependencies = [
  "kin-model",
  "serde",
@@ -3488,7 +3495,7 @@ dependencies = [
 
 [[package]]
 name = "kin-reconcile"
-version = "0.2.28"
+version = "0.3.0"
 dependencies = [
  "kin-blobs",
  "kin-db",
@@ -3508,7 +3515,7 @@ dependencies = [
 
 [[package]]
 name = "kin-registry"
-version = "0.2.28"
+version = "0.3.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -3541,7 +3548,7 @@ dependencies = [
 
 [[package]]
 name = "kin-remote"
-version = "0.2.28"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "kin-model",
@@ -3557,7 +3564,7 @@ dependencies = [
 
 [[package]]
 name = "kin-review"
-version = "0.2.28"
+version = "0.3.0"
 dependencies = [
  "kin-blobs",
  "kin-db",
@@ -3573,7 +3580,7 @@ dependencies = [
 
 [[package]]
 name = "kin-runtime"
-version = "0.2.28"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "hex",
@@ -3605,7 +3612,7 @@ dependencies = [
 
 [[package]]
 name = "kin-semantic-contracts"
-version = "0.2.28"
+version = "0.3.0"
 dependencies = [
  "kin-db",
  "kin-model",
@@ -3620,7 +3627,7 @@ dependencies = [
 
 [[package]]
 name = "kin-spine"
-version = "0.2.28"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "hashbrown 0.15.5",
@@ -3641,9 +3648,9 @@ dependencies = [
 
 [[package]]
 name = "kin-vector"
-version = "0.1.6"
+version = "0.1.7"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "4a0675c99c00faf3fd2a8cb71f73513677daef4fb35b2eb7d300da07f4990550"
+checksum = "59643af64209511b0721f919f4bd4e0defe08c4e8e48055eb291953b4519b582"
 dependencies = [
  "fs2",
  "hashbrown 0.15.5",
@@ -4026,7 +4033,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4925,7 +4932,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4994,7 +5001,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5438,7 +5445,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5571,7 +5578,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6504,7 +6511,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

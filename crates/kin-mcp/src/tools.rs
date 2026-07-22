@@ -759,8 +759,12 @@ pub fn tool_definitions() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "require_proof": { "type": "boolean", "description": "Require all entities to have test proof", "default": false },
-                        "require_approval": { "type": "boolean", "description": "Require approval on the latest change", "default": false }
+                        "branch": { "type": "string", "description": "Branch authority to evaluate; may be omitted only when main exists or graph truth has exactly one branch" },
+                        "source_change_id": { "type": "string", "description": "Optional observed branch head; a moved branch fails the advisory CAS check" },
+                        "expected_entity_count": { "type": "integer", "minimum": 0, "description": "Optional release-marker count to validate against the immutable source" },
+                        "force": { "type": "boolean", "description": "Override only the baseline 50% immutable source-bound proof coverage threshold", "default": false },
+                        "require_proof": { "type": "boolean", "description": "Require every entity to have immutable source-bound passing proof", "default": false },
+                        "require_approval": { "type": "boolean", "description": "Require a known human approval for every reachable non-root change", "default": false }
                     }
                 }),
             },

@@ -341,6 +341,7 @@ pub async fn require_daemon_update_head(
     layout: &kin_core::KinLayout,
     branch_name: &str,
     head_id: &str,
+    expected_head_id: &str,
 ) -> anyhow::Result<()> {
     let daemon_url = crate::daemon_client::resolve_daemon_url_if_running_async(layout)
         .await
@@ -351,11 +352,12 @@ pub async fn require_daemon_update_head(
 
     let payload = serde_json::json!({
         "head": head_id,
+        "expected_head": expected_head_id,
     });
 
     let resp = with_daemon_auth(
         client.put(format!(
-            "{}/v1/graph/branches/{}/head",
+            "{}/v2/graph/branches/{}/head",
             daemon_url.trim_end_matches('/'),
             branch_name
         )),
@@ -411,6 +413,215 @@ pub async fn require_daemon_commit(
         anyhow::bail!("daemon commit rejected for branch {branch_name}: HTTP {status}: {body}");
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonReleaseFailureKind {
+    /// The daemon returned a non-retryable client/policy response, so the
+    /// request did not become release authority.
+    Definitive,
+    /// A transport error, timeout, or exhausted 5xx response leaves the caller
+    /// unable to know whether the daemon committed before the response failed.
+    Uncertain,
+}
+
+#[derive(Debug)]
+pub struct DaemonReleaseCommitError {
+    pub kind: DaemonReleaseFailureKind,
+    /// The daemon serialized this exact change against graph authority and
+    /// explicitly proved it was not materialized before returning a stale-head
+    /// rejection. A durable recovery journal may be abandoned instead of
+    /// wedging every later release.
+    pub safe_to_abandon: bool,
+    message: String,
+}
+
+impl std::fmt::Display for DaemonReleaseCommitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DaemonReleaseCommitError {}
+
+fn release_finalization_timeout() -> Duration {
+    // A release request performs a full authority snapshot and durable
+    // generation-marker finalization before responding. Ten seconds was a
+    // normal mutation timeout, not a realistic finalization budget.
+    Duration::from_secs(120)
+}
+
+async fn send_serialized_release_request(
+    layout: &kin_core::KinLayout,
+    daemon_url: &str,
+    serialized_payload: &[u8],
+    branch_name: &str,
+    timeout: Duration,
+    max_attempts: usize,
+    initial_backoff: Duration,
+) -> Result<(), DaemonReleaseCommitError> {
+    let expected_change_id = serde_json::from_slice::<serde_json::Value>(serialized_payload)
+        .ok()
+        .and_then(|request| request.pointer("/change/id")?.as_str().map(str::to_owned));
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(Duration::from_secs(2))
+        .build()
+        .map_err(|error| DaemonReleaseCommitError {
+            kind: DaemonReleaseFailureKind::Uncertain,
+            safe_to_abandon: false,
+            message: format!("build daemon release client: {error}"),
+        })?;
+    let endpoint = format!("{}/v1/graph/commit", daemon_url.trim_end_matches('/'));
+    let attempts = max_attempts.max(1);
+    let mut backoff = initial_backoff;
+    let mut last_uncertain = String::new();
+    let mut saw_uncertain = false;
+
+    for attempt in 0..attempts {
+        let response = with_daemon_auth(
+            client
+                .post(&endpoint)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                // Clone the already-serialized bytes. Retries must never
+                // regenerate the change, timestamp, ID, or JSON request.
+                .body(serialized_payload.to_vec()),
+            layout,
+        )
+        .send()
+        .await;
+
+        match response {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(response)
+                if response.status().is_server_error()
+                    || response.status() == reqwest::StatusCode::REQUEST_TIMEOUT =>
+            {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                last_uncertain = format!("HTTP {status}: {body}");
+                saw_uncertain = true;
+            }
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                let kind = if saw_uncertain {
+                    // A later rejection can describe the exact retry (for
+                    // example, a stale-head 409) without proving that an
+                    // earlier timed-out/5xx attempt was not committed. Keep
+                    // the durable request journal until an exact retry
+                    // succeeds.
+                    DaemonReleaseFailureKind::Uncertain
+                } else {
+                    DaemonReleaseFailureKind::Definitive
+                };
+                return Err(DaemonReleaseCommitError {
+                    kind,
+                    safe_to_abandon: !saw_uncertain
+                        && expected_change_id.as_deref().is_some_and(|change_id| {
+                            stale_release_rejection_proves_change_absent(&body, change_id)
+                        }),
+                    message: if saw_uncertain {
+                        format!(
+                            "daemon release outcome remains uncertain for branch {branch_name}: an earlier exact-payload attempt had an uncertain outcome, then a retry was rejected with HTTP {status}: {body}"
+                        )
+                    } else {
+                        format!(
+                            "daemon release rejected for branch {branch_name}: HTTP {status}: {body}"
+                        )
+                    },
+                });
+            }
+            Err(error) => {
+                last_uncertain = format!("transport/finalization error: {error}");
+                saw_uncertain = true;
+            }
+        }
+
+        if attempt + 1 < attempts {
+            tokio::time::sleep(backoff).await;
+            backoff = backoff.saturating_mul(2).min(Duration::from_secs(2));
+        }
+    }
+
+    Err(DaemonReleaseCommitError {
+        kind: DaemonReleaseFailureKind::Uncertain,
+        safe_to_abandon: false,
+        message: format!(
+            "daemon release outcome is uncertain for branch {branch_name} after {attempts} exact-payload attempt(s): {last_uncertain}"
+        ),
+    })
+}
+
+/// POST an already-serialized release request and retry transport, timeout,
+/// and 5xx outcomes with those exact bytes. The caller persists the payload
+/// before calling so an exhausted uncertain result can be resumed by a later
+/// process without manufacturing another marker.
+pub async fn require_daemon_release_commit(
+    layout: &kin_core::KinLayout,
+    serialized_payload: &[u8],
+    branch_name: &str,
+) -> Result<(), DaemonReleaseCommitError> {
+    let daemon_url = crate::daemon_client::resolve_daemon_url(layout)
+        .await
+        .map_err(|error| DaemonReleaseCommitError {
+            kind: DaemonReleaseFailureKind::Uncertain,
+            safe_to_abandon: false,
+            message: format!("start or resolve Kin daemon for pending semantic release: {error:#}"),
+        })?
+        .ok_or_else(|| DaemonReleaseCommitError {
+            kind: DaemonReleaseFailureKind::Uncertain,
+            safe_to_abandon: false,
+            message: "Kin daemon is disabled; exact semantic release request remains pending"
+                .to_string(),
+        })?;
+    send_serialized_release_request(
+        layout,
+        &daemon_url,
+        serialized_payload,
+        branch_name,
+        release_finalization_timeout(),
+        3,
+        Duration::from_millis(100),
+    )
+    .await
+}
+
+fn stale_release_rejection_proves_change_absent(body: &str, expected_change_id: &str) -> bool {
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    body.get("error").and_then(serde_json::Value::as_str) == Some("stale_branch_head")
+        && body
+            .get("mutation_applied")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        && body
+            .get("change_materialized")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        && body.get("change_id").and_then(serde_json::Value::as_str) == Some(expected_change_id)
+}
+
+/// Build the canonical daemon request bytes once. These bytes are persisted
+/// and reused verbatim for every recovery attempt.
+pub fn serialize_daemon_release_request(
+    change: &kin_model::SemanticChange,
+    branch_name: &str,
+    force: bool,
+    require_proof: bool,
+    require_approval: bool,
+) -> anyhow::Result<Vec<u8>> {
+    serde_json::to_vec(&serde_json::json!({
+        "change": change,
+        "branch_name": branch_name,
+        "release_policy": {
+            "force": force,
+            "require_proof": require_proof,
+            "require_approval": require_approval,
+        },
+    }))
+    .map_err(Into::into)
 }
 
 #[derive(Default, serde::Serialize)]
@@ -569,12 +780,243 @@ pub async fn get_spine_xref(
 
 #[cfg(test)]
 mod tests {
+    use super::{send_serialized_release_request, stale_release_rejection_proves_change_absent};
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use axum::body::Bytes;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use axum::Router;
     use kin_model::EntityStore;
     use kin_model::WorkStore;
     use kin_model::{
         Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm,
         Hash256, LanguageId, RetrievalKey, SemanticFingerprint, Visibility,
     };
+
+    #[derive(Clone, Default)]
+    struct ReleaseRetryServerState {
+        attempts: Arc<AtomicUsize>,
+        received: Arc<Mutex<Vec<Vec<u8>>>>,
+        markers: Arc<Mutex<HashSet<String>>>,
+        head: Arc<Mutex<Option<String>>>,
+        first_response: Arc<Mutex<Option<StatusCode>>>,
+        first_delay: Arc<Mutex<Option<Duration>>>,
+        later_response: Arc<Mutex<Option<StatusCode>>>,
+    }
+
+    async fn release_retry_handler(
+        State(state): State<ReleaseRetryServerState>,
+        body: Bytes,
+    ) -> StatusCode {
+        state.received.lock().unwrap().push(body.to_vec());
+        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let change_id = request["change"]["id"].as_str().unwrap().to_string();
+        state.markers.lock().unwrap().insert(change_id.clone());
+        *state.head.lock().unwrap() = Some(change_id);
+
+        if state.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            let delay = *state.first_delay.lock().unwrap();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            return state
+                .first_response
+                .lock()
+                .unwrap()
+                .unwrap_or(StatusCode::OK);
+        }
+        state
+            .later_response
+            .lock()
+            .unwrap()
+            .unwrap_or(StatusCode::OK)
+    }
+
+    async fn release_retry_server(
+        state: ReleaseRetryServerState,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/graph/commit", post(release_retry_handler))
+            .with_state(state);
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), task)
+    }
+
+    fn serialized_release_fixture() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "change": {
+                "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "parents": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+                "author": "kin-release",
+                "message": "release: v0.3.0",
+            },
+            "branch_name": "main",
+            "release_policy": {
+                "force": true,
+                "require_proof": false,
+                "require_approval": false,
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn only_identity_bound_stale_rejection_proves_pending_change_absent() {
+        let expected = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let exact = serde_json::json!({
+            "error": "stale_branch_head",
+            "mutation_applied": false,
+            "change_materialized": false,
+            "change_id": expected,
+        })
+        .to_string();
+        assert!(stale_release_rejection_proves_change_absent(
+            &exact, expected
+        ));
+
+        for body in [
+            serde_json::json!({
+                "error": "stale_branch_head",
+                "mutation_applied": false,
+                "change_materialized": false,
+                "change_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            })
+            .to_string(),
+            serde_json::json!({
+                "error": "stale_branch_head",
+                "mutation_applied": false,
+                "change_materialized": true,
+                "change_id": expected,
+            })
+            .to_string(),
+            serde_json::json!({
+                "error": "stale_branch_head",
+                "mutation_applied": false,
+                "change_id": expected,
+            })
+            .to_string(),
+            serde_json::json!({
+                "error": "release_policy_failed",
+                "mutation_applied": false,
+                "change_materialized": false,
+                "change_id": expected,
+            })
+            .to_string(),
+            "not-json".to_string(),
+        ] {
+            assert!(!stale_release_rejection_proves_change_absent(
+                &body, expected
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn release_5xx_retry_reuses_identical_serialized_bytes() {
+        let repo = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(repo.path()).unwrap().layout;
+        let state = ReleaseRetryServerState::default();
+        *state.first_response.lock().unwrap() = Some(StatusCode::INTERNAL_SERVER_ERROR);
+        let (url, server) = release_retry_server(state.clone()).await;
+        let payload = serialized_release_fixture();
+
+        send_serialized_release_request(
+            &layout,
+            &url,
+            &payload,
+            "main",
+            Duration::from_secs(1),
+            3,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        let received = state.received.lock().unwrap();
+        assert_eq!(received.len(), 2);
+        assert!(received.iter().all(|request| request == &payload));
+    }
+
+    #[tokio::test]
+    async fn release_timeout_retry_keeps_exactly_one_marker_and_head() {
+        let repo = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(repo.path()).unwrap().layout;
+        let state = ReleaseRetryServerState::default();
+        *state.first_delay.lock().unwrap() = Some(Duration::from_millis(80));
+        let (url, server) = release_retry_server(state.clone()).await;
+        let payload = serialized_release_fixture();
+
+        send_serialized_release_request(
+            &layout,
+            &url,
+            &payload,
+            "main",
+            Duration::from_millis(20),
+            3,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        let received = state.received.lock().unwrap();
+        assert_eq!(received.len(), 2);
+        assert!(received.iter().all(|request| request == &payload));
+        let markers = state.markers.lock().unwrap();
+        assert_eq!(
+            markers.len(),
+            1,
+            "timeout retry manufactured a second marker"
+        );
+        assert_eq!(
+            state.head.lock().unwrap().as_deref(),
+            markers.iter().next().map(String::as_str)
+        );
+    }
+
+    #[tokio::test]
+    async fn release_retry_rejection_after_timeout_remains_uncertain() {
+        let repo = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(repo.path()).unwrap().layout;
+        let state = ReleaseRetryServerState::default();
+        *state.first_delay.lock().unwrap() = Some(Duration::from_millis(80));
+        *state.later_response.lock().unwrap() = Some(StatusCode::CONFLICT);
+        let (url, server) = release_retry_server(state.clone()).await;
+        let payload = serialized_release_fixture();
+
+        let error = send_serialized_release_request(
+            &layout,
+            &url,
+            &payload,
+            "main",
+            Duration::from_millis(20),
+            2,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        server.abort();
+
+        assert_eq!(error.kind, super::DaemonReleaseFailureKind::Uncertain);
+        let received = state.received.lock().unwrap();
+        assert_eq!(received.len(), 2);
+        assert!(received.iter().all(|request| request == &payload));
+        let markers = state.markers.lock().unwrap();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(
+            state.head.lock().unwrap().as_deref(),
+            markers.iter().next().map(String::as_str)
+        );
+    }
 
     fn test_entity(name: &str) -> Entity {
         Entity {

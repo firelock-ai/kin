@@ -160,6 +160,7 @@ mod tests {
         file_hashes: HashMap<FilePathId, Hash256>,
         branches: Vec<Branch>,
         changes_by_id: HashMap<SemanticChangeId, SemanticChange>,
+        actors_by_id: HashMap<kin_model::provenance::ActorId, kin_model::provenance::Actor>,
         approvals_by_change: HashMap<SemanticChangeId, Vec<kin_model::provenance::Approval>>,
     }
 
@@ -849,14 +850,14 @@ mod tests {
         }
         fn get_actor(
             &self,
-            _: &kin_model::provenance::ActorId,
+            id: &kin_model::provenance::ActorId,
         ) -> std::result::Result<Option<kin_model::provenance::Actor>, Self::Error> {
-            Ok(None)
+            Ok(self.actors_by_id.get(id).cloned())
         }
         fn list_actors(
             &self,
         ) -> std::result::Result<Vec<kin_model::provenance::Actor>, Self::Error> {
-            Ok(vec![])
+            Ok(self.actors_by_id.values().cloned().collect())
         }
         fn create_delegation(
             &self,
@@ -2760,6 +2761,25 @@ mod tests {
         }
     }
 
+    fn gov_approver_id() -> kin_model::provenance::ActorId {
+        kin_model::provenance::ActorId::from_hash(Hash256::from_bytes([0xa5; 32]))
+    }
+
+    fn register_gov_human_approver(store: &mut EmptyStore) {
+        let actor = kin_model::provenance::Actor {
+            actor_id: gov_approver_id(),
+            kind: kin_model::provenance::ActorKind::Human,
+            display_name: "reviewer".into(),
+            external_refs: vec![],
+        };
+        store.actors_by_id.insert(actor.actor_id, actor);
+    }
+
+    fn add_gov_root(store: &mut EmptyStore) {
+        let root = gov_change(0, None, "kin");
+        store.changes_by_id.insert(root.id, root);
+    }
+
     fn gov_approval(
         change: &SemanticChange,
         decision: kin_model::provenance::ApprovalDecision,
@@ -2767,7 +2787,7 @@ mod tests {
         kin_model::provenance::Approval {
             approval_id: kin_model::provenance::ApprovalId::new(),
             change_id: change.id,
-            approver: kin_model::provenance::ActorId::new(),
+            approver: gov_approver_id(),
             decision,
             reason: "test".into(),
             timestamp: kin_model::timestamp::Timestamp::now(),
@@ -2804,13 +2824,11 @@ mod tests {
         }
     }
 
-    async fn call_release_check(store: &EmptyStore, require_approval: bool) -> serde_json::Value {
+    async fn call_release_check_with_args(
+        store: &EmptyStore,
+        args: HashMap<String, serde_json::Value>,
+    ) -> serde_json::Value {
         let sessions = SessionRegistry::new();
-        let mut args = HashMap::new();
-        args.insert(
-            "require_approval".into(),
-            serde_json::json!(require_approval),
-        );
         let result = handle_tool_call(
             "kin_release_check",
             &args,
@@ -2826,12 +2844,109 @@ mod tests {
         serde_json::from_str(&text).unwrap()
     }
 
+    async fn call_release_check(store: &EmptyStore, require_approval: bool) -> serde_json::Value {
+        call_release_check_with_args(
+            store,
+            HashMap::from([(
+                "require_approval".into(),
+                serde_json::json!(require_approval),
+            )]),
+        )
+        .await
+    }
+
     #[tokio::test]
-    async fn release_check_require_approval_passes_with_no_branches() {
-        // No branches => nothing to walk => approval gate cannot find blockers.
+    async fn release_check_force_overrides_baseline_but_not_strict_source_proof() {
+        let mut store = EmptyStore::default();
+        let entity = gov_entity("unbound", EntityKind::Function, Visibility::Public);
+        store.entities_by_id.insert(entity.id, entity.clone());
+        let mut root = gov_change(0, None, "kin");
+        root.entity_deltas = vec![kin_model::EntityDelta::Added(entity)];
+        store.changes_by_id.insert(root.id, root.clone());
+        store.branches.push(Branch {
+            name: BranchName::new("main"),
+            head: root.id,
+        });
+
+        let baseline = call_release_check_with_args(&store, HashMap::new()).await;
+        assert_eq!(baseline["pass"], false);
+        assert_eq!(baseline["coverage"]["missing_proof_count"], 1);
+
+        let forced = call_release_check_with_args(
+            &store,
+            HashMap::from([("force".into(), serde_json::json!(true))]),
+        )
+        .await;
+        assert_eq!(forced["pass"], true);
+
+        let strict = call_release_check_with_args(
+            &store,
+            HashMap::from([
+                ("force".into(), serde_json::json!(true)),
+                ("require_proof".into(), serde_json::json!(true)),
+            ]),
+        )
+        .await;
+        assert_eq!(strict["pass"], false);
+        assert!(strict["blockers"][0]
+            .as_str()
+            .unwrap()
+            .contains("immutable source-bound"));
+    }
+
+    #[tokio::test]
+    async fn release_check_binds_source_count_and_branch_cas_not_ambient_entities() {
+        let mut store = EmptyStore::default();
+        let source_entity = gov_entity("source", EntityKind::Function, Visibility::Public);
+        let ambient_entity = gov_entity("ambient", EntityKind::Function, Visibility::Public);
+        store
+            .entities_by_id
+            .insert(source_entity.id, source_entity.clone());
+        store
+            .entities_by_id
+            .insert(ambient_entity.id, ambient_entity);
+
+        let mut source = gov_change(0, None, "kin");
+        source.entity_deltas = vec![kin_model::EntityDelta::Added(source_entity)];
+        let advanced = gov_change(1, Some(0), "human");
+        store.changes_by_id.insert(source.id, source.clone());
+        store.changes_by_id.insert(advanced.id, advanced.clone());
+        store.branches.push(Branch {
+            name: BranchName::new("main"),
+            head: advanced.id,
+        });
+
+        let response = call_release_check_with_args(
+            &store,
+            HashMap::from([
+                ("force".into(), serde_json::json!(true)),
+                (
+                    "source_change_id".into(),
+                    serde_json::json!(source.id.to_string()),
+                ),
+                ("expected_entity_count".into(), serde_json::json!(2)),
+            ]),
+        )
+        .await;
+
+        assert_eq!(response["pass"], false);
+        assert_eq!(response["source_entity_count"], 1);
+        let blockers = response["blockers"].as_array().unwrap();
+        assert!(blockers
+            .iter()
+            .any(|blocker| blocker.as_str().unwrap().contains("branch main moved")));
+        assert!(blockers.iter().any(|blocker| blocker
+            .as_str()
+            .unwrap()
+            .contains("expected entity count 2")));
+    }
+
+    #[tokio::test]
+    async fn release_check_requires_source_authority_when_no_branch_exists() {
         let store = EmptyStore::default();
-        let response = call_release_check(&store, true).await;
-        assert_eq!(response["pass"], true);
+        let error = verification::handle_release_check(&HashMap::new(), &store).unwrap_err();
+        assert!(matches!(error, crate::error::McpError::InvalidParams(_)));
+        assert!(error.to_string().contains("requires branch"));
     }
 
     #[tokio::test]
@@ -2839,7 +2954,8 @@ mod tests {
         // The false-green this fix targets: an agent change with NO approval must
         // fail the gate. (Previously it passed because any audit event sufficed.)
         let mut store = EmptyStore::default();
-        let head = gov_change(1, None, "claude-agent");
+        add_gov_root(&mut store);
+        let head = gov_change(1, Some(0), "claude-agent");
         store.changes_by_id.insert(head.id, head.clone());
         store.branches.push(Branch {
             name: BranchName::new("main"),
@@ -2852,15 +2968,17 @@ mod tests {
         assert!(
             blockers
                 .iter()
-                .any(|b| b.as_str().unwrap().contains("unapproved agent change")),
-            "blocker list must name the unapproved agent change: {blockers:?}"
+                .any(|b| b.as_str().unwrap().contains("lack human approval")),
+            "blocker list must name the unapproved non-root change: {blockers:?}"
         );
     }
 
     #[tokio::test]
     async fn release_check_passes_when_agent_change_approved() {
         let mut store = EmptyStore::default();
-        let head = gov_change(1, None, "claude-agent");
+        add_gov_root(&mut store);
+        register_gov_human_approver(&mut store);
+        let head = gov_change(1, Some(0), "claude-agent");
         store.changes_by_id.insert(head.id, head.clone());
         store.approvals_by_change.insert(
             head.id,
@@ -2883,7 +3001,9 @@ mod tests {
         // c1 (agent, approved) <- c2 (agent, unapproved, HEAD): the later
         // unapproved mutation must block even though an earlier change is approved.
         let mut store = EmptyStore::default();
-        let c1 = gov_change(1, None, "agent-a");
+        add_gov_root(&mut store);
+        register_gov_human_approver(&mut store);
+        let c1 = gov_change(1, Some(0), "agent-a");
         let c2 = gov_change(2, Some(1), "agent-a");
         store.changes_by_id.insert(c1.id, c1.clone());
         store.changes_by_id.insert(c2.id, c2.clone());
@@ -2915,9 +3035,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_check_human_change_does_not_block() {
+    async fn release_check_display_name_cannot_bypass_approval() {
         let mut store = EmptyStore::default();
-        let head = gov_change(1, None, "alice");
+        add_gov_root(&mut store);
+        let head = gov_change(1, Some(0), "alice");
         store.changes_by_id.insert(head.id, head.clone());
         store.branches.push(Branch {
             name: BranchName::new("main"),
@@ -2925,14 +3046,18 @@ mod tests {
         });
 
         let response = call_release_check(&store, true).await;
-        assert_eq!(response["pass"], true, "human-authored change is not gated");
+        assert_eq!(
+            response["pass"], false,
+            "an unauthenticated author display name must not bypass approval"
+        );
     }
 
     #[tokio::test]
     async fn release_check_approval_disabled_skips_gate() {
         // With require_approval=false, an unapproved agent change must NOT block.
         let mut store = EmptyStore::default();
-        let head = gov_change(1, None, "claude-agent");
+        add_gov_root(&mut store);
+        let head = gov_change(1, Some(0), "claude-agent");
         store.changes_by_id.insert(head.id, head.clone());
         store.branches.push(Branch {
             name: BranchName::new("main"),
@@ -3004,8 +3129,9 @@ mod tests {
         // so the sort is what makes the output stable. Two identical-state calls
         // must produce byte-identical blockers.
         let mut store = EmptyStore::default();
-        let c_a = gov_change(0xAA, None, "agent-a");
-        let c_b = gov_change(0xBB, None, "agent-b");
+        add_gov_root(&mut store);
+        let c_a = gov_change(0xAA, Some(0), "agent-a");
+        let c_b = gov_change(0xBB, Some(0), "agent-b");
         store.changes_by_id.insert(c_a.id, c_a.clone());
         store.changes_by_id.insert(c_b.id, c_b.clone());
         store.branches.push(Branch {

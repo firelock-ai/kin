@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-22
+
+This release makes exact source state part of Kin's graph authority and tightens
+the release boundary around that state.
+
+### Added
+
+- Exact source archives preserve regular files, executable files, symbolic-link
+  target bytes, and truncated Git-history parent boundaries. Git export and
+  supported-platform checkout can reconstruct that graph-owned tree without
+  consulting raw files; platforms without safe symbolic-link publication reject
+  those checkout entries during preflight rather than partially materializing.
+- Semantic change IDs bind the complete normalized entity, relation, and
+  artifact payload. An existing ID with a different payload is rejected instead
+  of being treated as the same immutable change.
+
+### Changed
+
+- Branch-head mutation is now an API v2 operation. Clients must send
+  `{ "head": "<change-id>", "expected_head": "<current-change-id>" }` to
+  `PUT /v2/graph/branches/{name}/head`; the former v1 mutation endpoint returns
+  `410 Gone` instead of accepting an update without compare-and-swap.
+- Native semantic changes now derive their ID from the complete immutable
+  record (all parents, timestamp, author, message, deltas, provenance, risk,
+  and authored branch). Independent deltas remain order-canonical, while
+  overlapping replay targets bind their order because replay is order-sensitive.
+- Checkout preflights the complete graph-resolved source tree and its blobs
+  before mutating the projection. Release commits are graph-only markers whose
+  proof and approval policy is evaluated against the marker's immutable source
+  parent on both the initial request and every exact identical retry. Because
+  verification runs do not yet bind an immutable source change, source-bound
+  coverage is 0% for every non-empty source and strict proof fails closed; the
+  approval option requires known-human approval for every reachable non-root
+  change.
+- The external graph boundary now resolves exactly `kin-model` 0.4.0,
+  `kin-lsp` 0.4.0, and `kin-db` 0.3.1; local workspace crates and all three npm
+  release manifests advance together to 0.3.0.
+
+### Fixed
+
+- Daemon graph commits and branch-head updates enforce compare-and-swap against
+  the live branch head, reject stale or malformed release requests before graph
+  mutation, and keep exact identical retries idempotent.
+- CLI release admission and the MCP graph-only advisory use the same immutable
+  source coverage semantics and full reachable-history approval policy. Missing
+  referenced changes fail closed. The MCP result is explicitly advisory because
+  only daemon admission verifies source-object availability and the final CAS.
+- Session workspace paths are contained: session workspace path traversal and
+  symlinked session workspaces are rejected so a session cannot resolve or
+  operate outside its workspace root.
+- Git export updates each ref under a lock-first compare-and-swap using Git's
+  atomic ref update, so a concurrent writer cannot lose or overwrite a ref
+  update during export.
+
 ## [0.2.28] - 2026-07-20
 
 ### Fixed
@@ -701,7 +755,8 @@ Historical note: this snapshot predates the public GitHub prerelease series and 
 - Daemon mode for background file watching (`kin-daemon`)
 - 19-crate workspace architecture
 
-[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.28...HEAD
+[unreleased]: https://github.com/firelock-ai/kin/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/firelock-ai/kin/compare/v0.2.28...v0.3.0
 [0.2.28]: https://github.com/firelock-ai/kin/compare/v0.2.27...v0.2.28
 [0.2.27]: https://github.com/firelock-ai/kin/compare/v0.2.26...v0.2.27
 [0.2.26]: https://github.com/firelock-ai/kin/compare/v0.2.25...v0.2.26

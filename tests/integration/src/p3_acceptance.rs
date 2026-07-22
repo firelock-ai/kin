@@ -153,7 +153,7 @@ fn branch_switch_reprojects_working_directory() {
     let mut change_main = make_change(genesis_id, vec![entity_main], "add main_fn");
     change_main.artifact_deltas.push(ArtifactDelta {
         file_id: FilePathId::new("src/lib.rs"),
-        kind: ArtifactDeltaKind::Added,
+        kind: ArtifactDeltaKind::AddedRegularFile,
         old_hash: None,
         new_hash: Some(main_hash),
     });
@@ -178,7 +178,7 @@ fn branch_switch_reprojects_working_directory() {
     let mut change_feature = make_change(change_main.id, vec![entity_feature], "add feature_fn");
     change_feature.artifact_deltas.push(ArtifactDelta {
         file_id: FilePathId::new("src/feature.rs"),
-        kind: ArtifactDeltaKind::Added,
+        kind: ArtifactDeltaKind::AddedRegularFile,
         old_hash: None,
         new_hash: Some(feature_hash),
     });
@@ -189,7 +189,7 @@ fn branch_switch_reprojects_working_directory() {
 
     // Checkout main: working dir should have src/lib.rs only.
     let main_branch = graph.get_branch(&BranchName::new("main")).unwrap().unwrap();
-    let files_written = kin_core::checkout_branch(
+    let files_written = kin_core::tree::checkout_branch_between_heads(
         graph.as_ref(),
         &blob_store,
         &layout,
@@ -207,11 +207,11 @@ fn branch_switch_reprojects_working_directory() {
         .get_branch(&BranchName::new("feature"))
         .unwrap()
         .unwrap();
-    let files_written = kin_core::checkout_branch(
+    let files_written = kin_core::tree::checkout_branch_between_heads(
         graph.as_ref(),
         &blob_store,
         &layout,
-        &genesis_id,
+        &main_branch.head,
         &feature.head,
     )
     .unwrap();
@@ -624,7 +624,7 @@ fn git_export_import_round_trip() {
     let mut change = make_change(genesis_id, vec![entity], "add round_trip function");
     change.artifact_deltas.push(ArtifactDelta {
         file_id: FilePathId::new("src/lib.rs"),
-        kind: ArtifactDeltaKind::Added,
+        kind: ArtifactDeltaKind::AddedRegularFile,
         old_hash: None,
         new_hash: Some(content_hash),
     });

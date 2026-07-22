@@ -2,10 +2,43 @@
 // Copyright 2026 Firelock, LLC
 
 use std::collections::HashMap;
+#[cfg(any(unix, windows))]
+use std::collections::HashSet;
+#[cfg(any(unix, windows))]
+use std::ffi::OsString;
+#[cfg(any(unix, windows))]
+use std::io::{Read, Write};
+use std::path::Path;
+#[cfg(any(unix, windows))]
+use std::path::PathBuf;
 
-use kin_model::{ArtifactDeltaKind, FilePathId, GraphStore, Hash256, SemanticChangeId};
+use kin_model::{
+    FilePathId, GraphStore, Hash256, SemanticChangeId, SourceEntryKind, SourceTreeResolution,
+};
 
 use crate::{KinError, KinLayout, Result};
+
+#[cfg(any(unix, windows))]
+use fs2::FileExt as _;
+
+#[cfg(any(unix, windows))]
+const RECONCILIATION_CONTROL_DIRECTORY: &str = "reconciliation";
+#[cfg(any(unix, windows))]
+const RECONCILIATION_AUTHORITY_FILE: &str = "authority.key";
+#[cfg(any(unix, windows))]
+const RECONCILIATION_MANIFEST_FILE: &str = "manifest.json";
+#[cfg(any(unix, windows))]
+const RECONCILIATION_PROJECTION_LOCK_FILE: &str = "projection.lock";
+#[cfg(any(unix, windows))]
+const RECONCILIATION_MANIFEST_SCHEMA: u32 = 2;
+#[cfg(any(unix, windows))]
+const RECONCILIATION_ACTION_FILE_PREFIX: &str = "action-";
+#[cfg(any(unix, windows))]
+const MAX_RECONCILIATION_ACTIONS: usize = 100_000;
+#[cfg(any(unix, windows))]
+const MAX_RECONCILIATION_ACTION_RECORD_BYTES: u64 = 256 * 1024;
+#[cfg(any(unix, windows))]
+const MAX_RECONCILIATION_ACTION_LOG_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Walk the SemanticChange DAG from genesis to branch_head and build
 /// the current file tree: Map<FilePathId, Hash256>.
@@ -17,19 +50,13 @@ pub fn build_file_tree<G: GraphStore>(
     let changes = graph
         .get_changes_since(genesis_id, branch_head)
         .map_err(|e| KinError::Graph(format!("{}", e)))?;
-
-    let mut tree: HashMap<FilePathId, Hash256> = HashMap::new();
+    let mut tree = HashMap::new();
     for change in &changes {
         for delta in &change.artifact_deltas {
-            match delta.kind {
-                ArtifactDeltaKind::Added | ArtifactDeltaKind::Modified => {
-                    if let Some(hash) = delta.new_hash {
-                        tree.insert(delta.file_id.clone(), hash);
-                    }
-                }
-                ArtifactDeltaKind::Removed => {
-                    tree.remove(&delta.file_id);
-                }
+            if delta.kind.is_removed() {
+                tree.remove(&delta.file_id);
+            } else if let Some(hash) = delta.new_hash {
+                tree.insert(delta.file_id.clone(), hash);
             }
         }
     }
@@ -43,34 +70,7390 @@ pub fn checkout_branch<G: GraphStore>(
     graph: &G,
     blob_store: &kin_blobs::BlobStore,
     layout: &KinLayout,
-    genesis_id: &SemanticChangeId,
+    _genesis_id: &SemanticChangeId,
     branch_head: &SemanticChangeId,
+) -> Result<usize> {
+    checkout_branch_with_pre_mutation_hook(
+        graph,
+        blob_store,
+        layout,
+        _genesis_id,
+        branch_head,
+        || {},
+    )
+}
+
+/// Test seam for deterministically exercising a working-copy edit that lands
+/// after reconciliation's first read-only preflight but before mutation.
+/// Production callers use [`checkout_branch`], which supplies a no-op hook.
+#[doc(hidden)]
+pub fn checkout_branch_with_pre_mutation_hook<G: GraphStore>(
+    graph: &G,
+    blob_store: &kin_blobs::BlobStore,
+    layout: &KinLayout,
+    _genesis_id: &SemanticChangeId,
+    branch_head: &SemanticChangeId,
+    after_read_only_preflight: impl FnOnce(),
 ) -> Result<usize> {
     // VFS projects files from the graph — no physical checkout needed.
     // Kept for backward compatibility with repos that don't have VFS yet.
     // Once VFS is universal, this entire function can be removed.
 
-    let tree = build_file_tree(graph, genesis_id, branch_head)?;
-    let work_dir = layout.working_dir();
-    let mut count = 0;
+    let current_branch_name = crate::read_current_branch(layout)?;
+    let current_branch = graph
+        .get_branch(&current_branch_name)
+        .map_err(|error| KinError::Graph(error.to_string()))?
+        .ok_or_else(|| {
+            KinError::Graph(format!(
+                "current branch {current_branch_name:?} is absent from graph authority"
+            ))
+        })?;
+    checkout_branch_between_heads_with_pre_mutation_hook(
+        graph,
+        blob_store,
+        layout,
+        &current_branch.head,
+        branch_head,
+        after_read_only_preflight,
+    )
+}
 
-    for (file_id, hash) in &tree {
-        // Convert kin_model::Hash256 to kin_blobs::Hash256
-        let blob_hash = kin_blobs::Hash256(*hash.as_bytes());
-        match blob_store.read(&blob_hash) {
-            Ok(content) => {
-                let path = work_dir.join(&file_id.0);
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| KinError::io(parent, e))?;
+/// Reconcile the projection between two explicit, exact graph heads.
+///
+/// Branch switching uses this to compensate a successfully published target
+/// tree when a later branch-head recheck or HEAD update fails. The current
+/// branch marker cannot supply the `previous_head` in that path because it
+/// intentionally still names the old branch.
+#[doc(hidden)]
+pub fn checkout_branch_between_heads<G: GraphStore>(
+    graph: &G,
+    blob_store: &kin_blobs::BlobStore,
+    layout: &KinLayout,
+    previous_head: &SemanticChangeId,
+    branch_head: &SemanticChangeId,
+) -> Result<usize> {
+    checkout_branch_between_heads_with_pre_mutation_hook(
+        graph,
+        blob_store,
+        layout,
+        previous_head,
+        branch_head,
+        || {},
+    )
+}
+
+fn checkout_branch_between_heads_with_pre_mutation_hook<G: GraphStore>(
+    graph: &G,
+    blob_store: &kin_blobs::BlobStore,
+    layout: &KinLayout,
+    previous_head: &SemanticChangeId,
+    branch_head: &SemanticChangeId,
+    after_read_only_preflight: impl FnOnce(),
+) -> Result<usize> {
+    let previous_tree = resolve_exact_source_tree(graph, previous_head)?;
+    let tree = resolve_exact_source_tree(graph, branch_head)?;
+    let work_dir = layout.working_dir();
+    let previous_prepared = load_source_tree_blobs(blob_store, previous_tree)?;
+    let prepared = load_source_tree_blobs(blob_store, tree)?;
+
+    // A checkout may require destructive file/directory transitions. Resolve
+    // and verify every content object and every path/link shape before any of
+    // those transitions begin, so a late corrupt or missing blob cannot leave
+    // a partially projected working tree.
+    reconcile_source_tree_with_pre_mutation_hook(
+        work_dir,
+        previous_prepared
+            .iter()
+            .map(|(file_id, kind, content)| (file_id, *kind, content.as_slice())),
+        prepared
+            .iter()
+            .map(|(file_id, kind, content)| (file_id, *kind, content.as_slice())),
+        should_preserve_checkout_path,
+        after_read_only_preflight,
+    )?;
+
+    Ok(prepared.len())
+}
+
+/// Publish a branch projection and its `.kin/HEAD` transition as one
+/// crash-recoverable transaction. `before_head_commit` runs after all target
+/// bytes are durable while the repository projection lock and rollback journal
+/// are still retained. It must recheck graph authority; the transaction then
+/// writes the target HEAD through its retained `.kin` capability.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn checkout_branch_between_heads_transactional_with_hooks<G: GraphStore>(
+    graph: &G,
+    blob_store: &kin_blobs::BlobStore,
+    layout: &KinLayout,
+    previous_branch: &str,
+    previous_head: &SemanticChangeId,
+    target_branch: &str,
+    target_head: &SemanticChangeId,
+    after_read_only_preflight: impl FnOnce(),
+    before_head_commit: impl FnOnce() -> Result<()>,
+) -> Result<usize> {
+    let previous_tree = resolve_exact_source_tree(graph, previous_head)?;
+    let target_tree = resolve_exact_source_tree(graph, target_head)?;
+    let previous_prepared = load_source_tree_blobs(blob_store, previous_tree)?;
+    let prepared = load_source_tree_blobs(blob_store, target_tree)?;
+    let previous_entries = validated_source_entries(
+        previous_prepared
+            .iter()
+            .map(|(file_id, kind, content)| (file_id, *kind, content.as_slice())),
+    )?;
+    let entries = validated_source_entries(
+        prepared
+            .iter()
+            .map(|(file_id, kind, content)| (file_id, *kind, content.as_slice())),
+    )?;
+    let transition = BranchProjectionTransition {
+        previous_branch: previous_branch.to_string(),
+        previous_head: *previous_head,
+        target_branch: target_branch.to_string(),
+        target_head: *target_head,
+    };
+    project_reconciled_source_tree(
+        layout.working_dir(),
+        &previous_entries,
+        &entries,
+        &should_preserve_checkout_path,
+        after_read_only_preflight,
+        || {},
+        Some(transition),
+        before_head_commit,
+    )?;
+    Ok(prepared.len())
+}
+
+fn load_source_tree_blobs(
+    blob_store: &kin_blobs::BlobStore,
+    tree: HashMap<FilePathId, kin_model::ResolvedSourceEntry>,
+) -> Result<Vec<(FilePathId, SourceEntryKind, Vec<u8>)>> {
+    let mut entries: Vec<_> = tree.into_iter().collect();
+    entries.sort_by(|left, right| left.0 .0.cmp(&right.0 .0));
+    entries
+        .into_iter()
+        .map(|(file_id, source)| {
+            // Convert kin_model::Hash256 to kin_blobs::Hash256.
+            let blob_hash = kin_blobs::Hash256(*source.hash.as_bytes());
+            let content = blob_store.read(&blob_hash)?;
+            Ok((file_id, source.kind, content))
+        })
+        .collect()
+}
+
+fn resolve_exact_source_tree<G: GraphStore>(
+    graph: &G,
+    head: &SemanticChangeId,
+) -> Result<HashMap<FilePathId, kin_model::ResolvedSourceEntry>> {
+    match graph
+        .resolve_source_tree_at(head)
+        .map_err(|error| KinError::Graph(error.to_string()))?
+    {
+        SourceTreeResolution::Exact { entries } => Ok(entries),
+        SourceTreeResolution::Incomplete { gaps } => {
+            let gaps = gaps
+                .iter()
+                .map(|gap| format!("{}@{}:{:?}", gap.file_id, gap.change_id, gap.reason))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(KinError::Graph(format!(
+                "checkout requires exact source history at {head}, but found unresolved gaps: {gaps}"
+            )))
+        }
+    }
+}
+
+/// Preserve control-plane and generated dependency/build directories during
+/// exact tree cleanup. This policy is shared by full checkout and branch
+/// switching so neither path treats generated state as graph-owned source.
+pub fn should_preserve_checkout_path(relative: &Path) -> bool {
+    const PRESERVED_COMPONENTS: &[&str] = &[
+        ".kin",
+        ".kin-session",
+        ".git",
+        "node_modules",
+        "target",
+        "__pycache__",
+        ".next",
+        "dist",
+        "build",
+        "vendor",
+    ];
+
+    relative.components().any(|component| {
+        if let std::path::Component::Normal(name) = component {
+            name.to_str().is_some_and(|name| {
+                PRESERVED_COMPONENTS
+                    .iter()
+                    .any(|preserved| name.eq_ignore_ascii_case(preserved))
+            })
+        } else {
+            false
+        }
+    })
+}
+
+/// Materialize one graph-owned exact source entry beneath `root`.
+///
+/// Paths and link targets are validated before mutation. Supported-platform
+/// writes are anchored to directory capabilities and use no-follow traversal
+/// plus atomic replacement, so neither a pre-existing link nor a concurrent
+/// rename can redirect bytes outside the projection root.
+pub fn materialize_source_entry(
+    root: &Path,
+    file_id: &FilePathId,
+    kind: SourceEntryKind,
+    content: &[u8],
+) -> Result<()> {
+    materialize_source_tree(root, [(file_id, kind, content)]).map(|_| ())
+}
+
+/// Materialize a complete graph-owned source tree under one retained root
+/// capability.
+///
+/// Validation finishes before the root is opened, and every preparation and
+/// replacement operation after that is relative to the same directory handle.
+/// A concurrent rename or symlink swap therefore cannot redirect a later
+/// entry to a different ambient path.
+pub fn materialize_source_tree<'a>(
+    root: &Path,
+    entries: impl IntoIterator<Item = (&'a FilePathId, SourceEntryKind, &'a [u8])>,
+) -> Result<usize> {
+    let entries = validated_source_entries(entries)?;
+    project_validated_source_tree(root, &entries, None, || {})
+}
+
+/// Replace a working tree from exact graph-owned source under one retained
+/// root capability, removing non-tree files except paths selected by
+/// `should_preserve`.
+///
+/// Cleanup discovery is part of the read-only preflight. Cleanup, transition
+/// preparation, materialization, and empty-directory removal then all use the
+/// same retained capability rather than ambient pathnames.
+pub fn replace_source_tree<'a>(
+    root: &Path,
+    entries: impl IntoIterator<Item = (&'a FilePathId, SourceEntryKind, &'a [u8])>,
+    should_preserve: impl Fn(&Path) -> bool,
+) -> Result<usize> {
+    let entries = validated_source_entries(entries)?;
+    project_validated_source_tree(root, &entries, Some(&should_preserve), || {})
+}
+
+/// Reconcile one exact graph-owned tree to another without deleting unrelated
+/// working-copy files.
+///
+/// Only paths tracked by `previous_entries` and absent from `entries` are
+/// eligible for deletion. A prior tracked path that would be replaced or
+/// removed must still match its exact current-branch kind and content; local
+/// edits fail the whole read-only preflight. New target paths fail closed when
+/// an unrelated working-copy object occupies the destination or blocks an
+/// ancestor.
+pub fn reconcile_source_tree<'a, 'b>(
+    root: &Path,
+    previous_entries: impl IntoIterator<Item = (&'b FilePathId, SourceEntryKind, &'b [u8])>,
+    entries: impl IntoIterator<Item = (&'a FilePathId, SourceEntryKind, &'a [u8])>,
+    should_preserve: impl Fn(&Path) -> bool,
+) -> Result<usize> {
+    reconcile_source_tree_with_pre_mutation_hook(
+        root,
+        previous_entries,
+        entries,
+        should_preserve,
+        || {},
+    )
+}
+
+#[doc(hidden)]
+pub fn reconcile_source_tree_with_pre_mutation_hook<'a, 'b>(
+    root: &Path,
+    previous_entries: impl IntoIterator<Item = (&'b FilePathId, SourceEntryKind, &'b [u8])>,
+    entries: impl IntoIterator<Item = (&'a FilePathId, SourceEntryKind, &'a [u8])>,
+    should_preserve: impl Fn(&Path) -> bool,
+    after_read_only_preflight: impl FnOnce(),
+) -> Result<usize> {
+    reconcile_source_tree_with_mutation_hooks(
+        root,
+        previous_entries,
+        entries,
+        should_preserve,
+        after_read_only_preflight,
+        || {},
+    )
+}
+
+/// Test seam for a namespace replacement that lands after the second
+/// byte/kind/identity validation but before any tracked object is displaced.
+#[doc(hidden)]
+pub fn reconcile_source_tree_with_mutation_hooks<'a, 'b>(
+    root: &Path,
+    previous_entries: impl IntoIterator<Item = (&'b FilePathId, SourceEntryKind, &'b [u8])>,
+    entries: impl IntoIterator<Item = (&'a FilePathId, SourceEntryKind, &'a [u8])>,
+    should_preserve: impl Fn(&Path) -> bool,
+    after_read_only_preflight: impl FnOnce(),
+    after_identity_revalidation: impl FnOnce(),
+) -> Result<usize> {
+    let entries = validated_source_entries(entries)?;
+    let previous_entries = validated_source_entries(previous_entries)?;
+    project_reconciled_source_tree(
+        root,
+        &previous_entries,
+        &entries,
+        &should_preserve,
+        after_read_only_preflight,
+        after_identity_revalidation,
+        None,
+        || Ok(()),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct ValidatedSourceEntry<'a> {
+    file_id: &'a FilePathId,
+    kind: SourceEntryKind,
+    content: &'a [u8],
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static INJECT_PUBLICATION_FAILURE_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn inject_next_publication_failure() {
+    inject_publication_failure_after(0);
+}
+
+#[cfg(test)]
+fn inject_publication_failure_after(successful_publications: usize) {
+    INJECT_PUBLICATION_FAILURE_AFTER.set(Some(successful_publications));
+}
+
+#[cfg(test)]
+fn fail_publication_if_injected() -> Result<()> {
+    INJECT_PUBLICATION_FAILURE_AFTER.with(|remaining| match remaining.get() {
+        None => Ok(()),
+        Some(0) => {
+            remaining.set(None);
+            Err(KinError::Other(
+                "injected exact-source publication failure".to_string(),
+            ))
+        }
+        Some(count) => {
+            remaining.set(Some(count - 1));
+            Ok(())
+        }
+    })
+}
+
+#[cfg(not(test))]
+fn fail_publication_if_injected() -> Result<()> {
+    Ok(())
+}
+
+fn validated_source_entries<'a>(
+    entries: impl IntoIterator<Item = (&'a FilePathId, SourceEntryKind, &'a [u8])>,
+) -> Result<Vec<ValidatedSourceEntry<'a>>> {
+    let mut entries: Vec<_> = entries
+        .into_iter()
+        .map(|(file_id, kind, content)| ValidatedSourceEntry {
+            file_id,
+            kind,
+            content,
+        })
+        .collect();
+    entries.sort_by(|left, right| left.file_id.0.cmp(&right.file_id.0));
+    validate_source_tree(
+        entries
+            .iter()
+            .map(|entry| (entry.file_id, entry.kind, entry.content)),
+    )?;
+    Ok(entries)
+}
+
+/// Validate an exact-source entry without touching the projection root.
+///
+/// Checkout callers use this during their global preflight so unsafe paths,
+/// unsupported entry encodings, and escaping symbolic-link targets all fail
+/// before any file/directory transition is applied.
+pub fn validate_source_entry(
+    file_id: &FilePathId,
+    kind: SourceEntryKind,
+    content: &[u8],
+) -> Result<()> {
+    validate_source_entry_components(file_id, kind, content).map(|_| ())
+}
+
+fn validate_source_entry_components<'a>(
+    file_id: &'a FilePathId,
+    kind: SourceEntryKind,
+    content: &[u8],
+) -> Result<Vec<&'a str>> {
+    let components = validate_source_path(&file_id.0)?;
+
+    if kind == SourceEntryKind::Symlink {
+        let target = std::str::from_utf8(content).map_err(|_| {
+            KinError::Other(format!(
+                "symbolic link target is not valid UTF-8 for {}",
+                file_id.0
+            ))
+        })?;
+        validate_source_symlink_target(&components, target)?;
+
+        #[cfg(not(unix))]
+        return Err(KinError::Other(
+            "safe exact symbolic-link checkout is unsupported on this platform".to_string(),
+        ));
+    }
+    Ok(components)
+}
+
+/// Validate a complete exact-source tree without mutating the filesystem.
+///
+/// In addition to validating every entry kind and symbolic-link target, this
+/// rejects path-prefix conflicts such as `a` and `a/b` before callers remove a
+/// blocking file or directory.
+pub fn validate_source_tree<'a>(
+    entries: impl IntoIterator<Item = (&'a FilePathId, SourceEntryKind, &'a [u8])>,
+) -> Result<()> {
+    let entries: Vec<_> = entries.into_iter().collect();
+    validate_source_paths(entries.iter().map(|(file_id, _, _)| *file_id))?;
+    for (file_id, kind, content) in entries {
+        validate_source_entry(file_id, kind, content)?;
+    }
+    Ok(())
+}
+
+/// Validate a complete exact-source path set without retaining source bytes.
+///
+/// Authority preflights that read blobs from a remote store use this before
+/// validating each entry one at a time. Keeping path-shape validation separate
+/// from byte validation prevents a repository-sized second copy of the source
+/// tree from accumulating in memory merely to detect path-prefix conflicts.
+pub fn validate_source_paths<'a>(file_ids: impl IntoIterator<Item = &'a FilePathId>) -> Result<()> {
+    validate_source_path_set(file_ids)
+}
+
+/// Validate paths for a portable exact-source artifact regardless of the host
+/// running the validator. This applies the conservative Windows component
+/// rules plus Unicode normalization/case alias detection used by default
+/// Windows and macOS filesystems, so an archive accepted on Linux cannot
+/// collapse or overwrite entries when extracted elsewhere.
+pub fn validate_portable_source_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    let mut paths: Vec<_> = paths
+        .into_iter()
+        .map(|path| (portable_source_path_comparison_key(path), path))
+        .collect();
+    paths.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    for (_, path) in &paths {
+        validate_portable_source_path(path)?;
+    }
+    for pair in paths.windows(2) {
+        if pair[1].0 == pair[0].0
+            || pair[1]
+                .0
+                .strip_prefix(&pair[0].0)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            return Err(KinError::Other(format!(
+                "conflicting graph-owned source paths {:?} and {:?}",
+                pair[0].1, pair[1].1
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate one portable relative symlink using the same cross-platform path
+/// rules as [`validate_portable_source_paths`].
+pub fn validate_portable_source_symlink(path: &str, target: &str) -> Result<()> {
+    let components = validate_portable_source_path(path)?;
+    validate_source_symlink_target_with_windows_rules(&components, target, true)
+}
+
+/// Validate a complete exact-source path set and remove only filesystem
+/// objects whose shape blocks materialization (file-as-parent or
+/// directory-as-file).
+pub fn prepare_source_tree<'a>(
+    root: &Path,
+    file_ids: impl IntoIterator<Item = &'a FilePathId>,
+) -> Result<()> {
+    let file_ids: Vec<_> = file_ids.into_iter().collect();
+    validate_source_paths(file_ids.iter().copied())?;
+
+    #[cfg(any(unix, windows))]
+    {
+        let projection = ProjectionRoot::open(root)?;
+        return projection.prepare(&file_ids);
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = root;
+        Err(unsupported_safe_projection_error())
+    }
+}
+
+fn validate_source_path_set<'a>(file_ids: impl IntoIterator<Item = &'a FilePathId>) -> Result<()> {
+    let mut paths: Vec<_> = file_ids
+        .into_iter()
+        .map(|file_id| {
+            let path = file_id.0.as_str();
+            (projection_path_comparison_key(path), path)
+        })
+        .collect();
+    paths.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    for (_, path) in &paths {
+        validate_source_path(path)?;
+    }
+    for pair in paths.windows(2) {
+        if pair[1].0 == pair[0].0
+            || pair[1]
+                .0
+                .strip_prefix(&pair[0].0)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            return Err(KinError::Other(format!(
+                "conflicting graph-owned source paths {:?} and {:?}",
+                pair[0].1, pair[1].1
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn projection_path_comparison_key(path: &str) -> String {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        // Windows and the default macOS filesystem are case-insensitive, and
+        // macOS also aliases canonically equivalent Unicode spellings. Build a
+        // conservative per-component key using canonical decomposition and
+        // Unicode case expansion so those trees fail before any transition is
+        // applied. Upper-then-lower also catches folds such as sharp-s and the
+        // Greek final sigma that lowercase alone does not collapse.
+        return path
+            .split('/')
+            .map(projection_component_comparison_key)
+            .collect::<Vec<_>>()
+            .join("/");
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    path.to_string()
+}
+
+fn portable_source_path_comparison_key(path: &str) -> String {
+    path.split('/')
+        .map(projection_component_comparison_key)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn projection_component_comparison_key(component: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+
+    component
+        .nfd()
+        .flat_map(char::to_uppercase)
+        .flat_map(char::to_lowercase)
+        .nfd()
+        .collect()
+}
+
+fn project_validated_source_tree(
+    root: &Path,
+    entries: &[ValidatedSourceEntry<'_>],
+    should_preserve: Option<&dyn Fn(&Path) -> bool>,
+    after_read_only_preflight: impl FnOnce(),
+) -> Result<usize> {
+    #[cfg(any(unix, windows))]
+    {
+        let projection = ProjectionRoot::open(root)?;
+        let tracked = TrackedPathClassifier::new(entries.iter().map(|entry| entry.file_id));
+        let plan = projection.plan_full_replacement(&tracked, should_preserve)?;
+
+        // Tests use this boundary to deterministically swap ambient pathnames
+        // after validation and cleanup discovery. All later work must remain
+        // anchored to `projection.root`.
+        after_read_only_preflight();
+
+        projection.apply_full_replacement(entries, plan)?;
+        return Ok(entries.len());
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (root, entries, should_preserve, after_read_only_preflight);
+        Err(unsupported_safe_projection_error())
+    }
+}
+
+fn project_reconciled_source_tree(
+    root: &Path,
+    previous_entries: &[ValidatedSourceEntry<'_>],
+    entries: &[ValidatedSourceEntry<'_>],
+    should_preserve: &dyn Fn(&Path) -> bool,
+    after_read_only_preflight: impl FnOnce(),
+    after_identity_revalidation: impl FnOnce(),
+    branch_transition: Option<BranchProjectionTransition>,
+    before_head_commit: impl FnOnce() -> Result<()>,
+) -> Result<usize> {
+    #[cfg(any(unix, windows))]
+    {
+        let projection = ProjectionRoot::open(root)?;
+        let previous =
+            TrackedPathClassifier::new(previous_entries.iter().map(|entry| entry.file_id));
+        let target = TrackedPathClassifier::new(entries.iter().map(|entry| entry.file_id));
+        let target_by_path: HashMap<_, _> = entries
+            .iter()
+            .map(|entry| (entry.file_id.0.as_str(), entry))
+            .collect();
+        let previous_by_path: HashMap<_, _> = previous_entries
+            .iter()
+            .map(|entry| (entry.file_id.0.as_str(), entry))
+            .collect();
+        let affected_previous: Vec<_> = previous_entries
+            .iter()
+            .filter(|previous_entry| {
+                target_by_path
+                    .get(previous_entry.file_id.0.as_str())
+                    .is_none_or(|target_entry| !source_entries_match(previous_entry, target_entry))
+            })
+            .collect();
+        let mut removed_file_ids: Vec<_> = previous_entries
+            .iter()
+            .map(|entry| entry.file_id)
+            .filter(|file_id| target.relation(Path::new(&file_id.0)) != TrackedPathRelation::Exact)
+            .collect();
+        removed_file_ids.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let removed = TrackedPathClassifier::new(removed_file_ids.iter().copied());
+        let entries_to_materialize: Vec<_> = entries
+            .iter()
+            .copied()
+            .filter(|target_entry| {
+                previous_by_path
+                    .get(target_entry.file_id.0.as_str())
+                    .is_none_or(|previous_entry| {
+                        !source_entries_match(previous_entry, target_entry)
+                    })
+            })
+            .collect();
+
+        // This is one read-only preflight boundary: first prove that every old
+        // path the switch would mutate is still byte/kind-exact, then validate
+        // every target collision. No deletion or replacement occurs until all
+        // local-edit and untracked-path conflicts have been rejected.
+        let previous_identities =
+            projection.validate_tracked_entries_unchanged(&affected_previous)?;
+        projection.validate_reconciliation_targets(&entries_to_materialize, &previous, &removed)?;
+
+        let files_to_delete: Vec<_> = removed_file_ids
+            .iter()
+            .map(|file_id| PathBuf::from(&file_id.0))
+            .collect();
+
+        // A generated-directory name is preservation policy only for
+        // unrelated occupants. When the previous graph owns every leaf under
+        // a directory and the target graph owns the directory path as a file,
+        // remove that now-empty graph-owned directory explicitly so names such
+        // as target/vendor/dist/build/node_modules can transition exactly.
+        let replacement_roots: Vec<_> = entries_to_materialize
+            .iter()
+            .filter_map(|entry| {
+                let relative = Path::new(&entry.file_id.0);
+                (previous.relation(relative) == TrackedPathRelation::Ancestor
+                    && removed.relation(relative) == TrackedPathRelation::Ancestor)
+                    .then(|| relative.to_path_buf())
+            })
+            .collect();
+        let mut directories_to_replace = HashSet::new();
+        for removed_path in &files_to_delete {
+            for replacement_root in &replacement_roots {
+                if !removed_path.starts_with(replacement_root) {
+                    continue;
                 }
-                std::fs::write(&path, &content).map_err(|e| KinError::io(&path, e))?;
-                count += 1;
+                let mut directory = removed_path.parent();
+                while let Some(relative) = directory {
+                    if !relative.starts_with(replacement_root) {
+                        break;
+                    }
+                    directories_to_replace.insert(relative.to_path_buf());
+                    if relative == replacement_root {
+                        break;
+                    }
+                    directory = relative.parent();
+                }
             }
-            Err(_) => {
-                tracing::warn!(file = %file_id, "blob not found in store, skipping");
+        }
+        let mut directories_to_replace: Vec<_> = directories_to_replace.into_iter().collect();
+        directories_to_replace.sort_by(|left, right| {
+            right
+                .components()
+                .count()
+                .cmp(&left.components().count())
+                .then_with(|| left.cmp(right))
+        });
+
+        let replacement_directory_set: HashSet<_> =
+            directories_to_replace.iter().cloned().collect();
+        let mut cleanup_directories = HashSet::new();
+        for removed_path in &files_to_delete {
+            let mut directory = removed_path.parent();
+            while let Some(relative) = directory {
+                if relative.as_os_str().is_empty() {
+                    break;
+                }
+                if !should_preserve(relative)
+                    && removed.relation(relative) == TrackedPathRelation::Ancestor
+                    && !replacement_directory_set.contains(relative)
+                {
+                    cleanup_directories.insert(relative.to_path_buf());
+                }
+                directory = relative.parent();
+            }
+        }
+        let mut cleanup_directories: Vec<_> = cleanup_directories.into_iter().collect();
+        cleanup_directories.sort_by(|left, right| {
+            right
+                .components()
+                .count()
+                .cmp(&left.components().count())
+                .then_with(|| left.cmp(right))
+        });
+
+        let mut directory_identities = HashMap::new();
+        for relative in directories_to_replace.iter().chain(&cleanup_directories) {
+            let identity = projection
+                .relative_directory_identity(relative)?
+                .ok_or_else(|| {
+                    KinError::Other(format!(
+                        "graph-owned directory {} disappeared during exact-source preflight",
+                        projection.display_root.join(relative).display()
+                    ))
+                })?;
+            directory_identities.insert(relative.clone(), identity);
+        }
+
+        after_read_only_preflight();
+        projection
+            .revalidate_tracked_entries_unchanged(&affected_previous, &previous_identities)?;
+        for (relative, expected_identity) in &directory_identities {
+            let actual = projection.relative_directory_identity(relative)?;
+            if actual != Some(*expected_identity) {
+                return Err(KinError::Other(format!(
+                    "graph-owned directory {} changed identity after exact-source preflight",
+                    projection.display_root.join(relative).display()
+                )));
+            }
+        }
+
+        let file_ids: Vec<_> = entries_to_materialize
+            .iter()
+            .map(|entry| entry.file_id)
+            .collect();
+
+        // Stage every target object before the first destructive namespace
+        // operation. The transaction directory is retained until either all
+        // publications succeed or every displaced old object is restored.
+        let mut transaction =
+            projection.create_reconciliation_transaction_with_transition(branch_transition)?;
+        let staged = match projection
+            .stage_reconciliation_entries(&transaction.directory, &entries_to_materialize)
+        {
+            Ok(staged) => staged,
+            Err(error) => {
+                return match projection.cleanup_reconciliation_transaction(transaction) {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(KinError::Other(format!(
+                        "{error}; staged exact-source cleanup also failed: {cleanup_error}"
+                    ))),
+                };
+            }
+        };
+
+        // Tests exercise the final namespace race here. Every later removal is
+        // a compare-and-swap: the named object is first moved into the retained
+        // transaction, then its exact preflight identity/kind/content is
+        // verified before any replacement can publish.
+        after_identity_revalidation();
+
+        let mut created_directories = Vec::new();
+        let mut removed_directories = Vec::new();
+
+        let mutation_result: Result<()> = (|| {
+            for (name_index, (entry, identity)) in affected_previous
+                .iter()
+                .zip(&previous_identities)
+                .enumerate()
+            {
+                projection.displace_previous_entry(
+                    &mut transaction,
+                    **entry,
+                    *identity,
+                    name_index,
+                )?;
+            }
+
+            for relative in &directories_to_replace {
+                removed_directories.push(projection.back_up_planned_empty_directory(
+                    &mut transaction,
+                    relative,
+                    directory_identities[relative],
+                    removed_directories.len(),
+                )?);
+            }
+
+            projection.prepare_without_replacement_transactional(
+                &mut transaction,
+                &file_ids,
+                &mut created_directories,
+            )?;
+            for staged_entry in &staged {
+                projection.publish_staged_entry(&mut transaction, staged_entry)?;
+            }
+
+            for relative in &cleanup_directories {
+                if projection.relative_directory_is_empty(relative)? {
+                    removed_directories.push(projection.back_up_planned_empty_directory(
+                        &mut transaction,
+                        relative,
+                        directory_identities[relative],
+                        removed_directories.len(),
+                    )?);
+                }
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = mutation_result {
+            let rollback = projection.rollback_reconciliation_manifest(&transaction);
+            return match rollback {
+                Ok(()) => match projection.cleanup_reconciliation_transaction(transaction) {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(KinError::Other(format!(
+                        "{error}; exact-source rollback succeeded but transaction cleanup failed: {cleanup_error}"
+                    ))),
+                },
+                Err(rollback_error) => Err(KinError::Other(format!(
+                    "{error}; {rollback_error}; retained recovery transaction at {}",
+                    projection
+                        .reconciliation_control_path()
+                        .join(&transaction.name)
+                        .display()
+                ))),
+            };
+        }
+
+        let head_commit = before_head_commit().and_then(|()| {
+            projection.revalidate_projection_lock()?;
+            if let Some(transition) = &transaction.manifest.branch_transition {
+                projection.write_branch_marker_capability(&transition.target_branch)?;
+            }
+            Ok(())
+        });
+        if let Err(error) = head_commit {
+            let rollback = projection.rollback_reconciliation_manifest(&transaction);
+            return match rollback {
+                Ok(()) => match projection.cleanup_reconciliation_transaction(transaction) {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(KinError::Other(format!(
+                        "{error}; finalized branch rollback succeeded but transaction cleanup failed: {cleanup_error}"
+                    ))),
+                },
+                Err(rollback_error) => Err(KinError::Other(format!(
+                    "{error}; {rollback_error}; retained recovery transaction at {}",
+                    projection
+                        .reconciliation_control_path()
+                        .join(&transaction.name)
+                        .display()
+                ))),
+            };
+        }
+
+        if transaction.manifest.branch_transition.is_some() {
+            transaction.manifest.state = ReconciliationTransactionState::Committed;
+            if let Err(error) = projection.persist_reconciliation_manifest(&transaction) {
+                // The durable descriptor is still pending. Restore the
+                // in-memory phase before using the same recovery path so HEAD
+                // and projected bytes return to the prior authority.
+                transaction.manifest.state = ReconciliationTransactionState::Pending;
+                let rollback = projection.rollback_reconciliation_manifest(&transaction);
+                return match rollback {
+                    Ok(()) => match projection.cleanup_reconciliation_transaction(transaction) {
+                        Ok(()) => Err(error),
+                        Err(cleanup_error) => Err(KinError::Other(format!(
+                            "{error}; branch commit-marker rollback succeeded but transaction cleanup failed: {cleanup_error}"
+                        ))),
+                    },
+                    Err(rollback_error) => Err(KinError::Other(format!(
+                        "{error}; {rollback_error}; retained recovery transaction at {}",
+                        projection
+                            .reconciliation_control_path()
+                            .join(&transaction.name)
+                            .display()
+                    ))),
+                };
+            }
+        }
+
+        projection.cleanup_reconciliation_transaction(transaction)?;
+        return Ok(entries_to_materialize.len());
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (
+            root,
+            previous_entries,
+            entries,
+            should_preserve,
+            after_read_only_preflight,
+            after_identity_revalidation,
+        );
+        Err(unsupported_safe_projection_error())
+    }
+}
+
+fn source_entries_match(left: &ValidatedSourceEntry<'_>, right: &ValidatedSourceEntry<'_>) -> bool {
+    left.kind == right.kind && left.content == right.content
+}
+
+#[cfg(not(any(unix, windows)))]
+fn unsupported_safe_projection_error() -> KinError {
+    KinError::Other(
+        "safe exact source checkout is unsupported on this platform because retained no-follow directory capabilities are unavailable"
+            .to_string(),
+    )
+}
+
+#[cfg(any(unix, windows))]
+struct ProjectionRoot {
+    root: cap_std::fs::Dir,
+    kin_control: cap_std::fs::Dir,
+    control: cap_std::fs::Dir,
+    projection_lock: std::fs::File,
+    projection_lock_identity: TrackedEntryIdentity,
+    display_root: PathBuf,
+    kin_control_identity: TrackedEntryIdentity,
+    control_identity: TrackedEntryIdentity,
+    authority_key: [u8; 32],
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct TrackedEntryIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    volume_serial: u64,
+    #[cfg(windows)]
+    file_id: [u8; 16],
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Clone, Copy)]
+struct StagedReconciliationEntry<'a> {
+    entry: ValidatedSourceEntry<'a>,
+    name_index: usize,
+    identity: TrackedEntryIdentity,
+    state: TrackedObjectState,
+}
+
+#[cfg(any(unix, windows))]
+struct ReconciliationTransaction {
+    name: OsString,
+    directory: cap_std::fs::Dir,
+    identity: TrackedEntryIdentity,
+    manifest: ReconciliationManifest,
+    action_log_bytes: u64,
+    action_tail_authentication: Vec<u8>,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+enum ExistingObjectKind {
+    File,
+    Symlink,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct TrackedObjectState {
+    content_sha256: [u8; 32],
+    /// Unix permission bits. Windows exact-source projection binds bytes and
+    /// FILE_ID_128, but sets this to zero because Win32 ACLs are not a stable
+    /// mode scalar and are outside the current projection transaction model.
+    mode: u32,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct ReconciliationManifest {
+    schema: u32,
+    transaction_id: String,
+    root_identity: TrackedEntryIdentity,
+    kin_control_identity: TrackedEntryIdentity,
+    control_identity: TrackedEntryIdentity,
+    transaction_identity: TrackedEntryIdentity,
+    state: ReconciliationTransactionState,
+    branch_transition: Option<BranchProjectionTransition>,
+    actions: Vec<ReconciliationRecoveryAction>,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReconciliationTransactionState {
+    Pending,
+    Committed,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct BranchProjectionTransition {
+    previous_branch: String,
+    previous_head: SemanticChangeId,
+    target_branch: String,
+    target_head: SemanticChangeId,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct AuthenticatedReconciliationManifest {
+    manifest: ReconciliationManifest,
+    authentication: Vec<u8>,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct AuthenticatedReconciliationAction {
+    sequence: u64,
+    previous_authentication: Vec<u8>,
+    action: ReconciliationRecoveryAction,
+    authentication: Vec<u8>,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+enum ReconciliationRecoveryAction {
+    BackupObject {
+        relative: PathBuf,
+        kind: ExistingObjectKind,
+        identity: TrackedEntryIdentity,
+        state: TrackedObjectState,
+        slot: String,
+    },
+    BackupDirectory {
+        relative: PathBuf,
+        identity: TrackedEntryIdentity,
+        slot: String,
+    },
+    PublishObject {
+        relative: PathBuf,
+        kind: ExistingObjectKind,
+        identity: TrackedEntryIdentity,
+        state: TrackedObjectState,
+        slot: String,
+    },
+    PublishDirectory {
+        relative: PathBuf,
+        identity: TrackedEntryIdentity,
+        slot: String,
+    },
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Clone, Debug)]
+struct PlannedExistingObject {
+    relative: PathBuf,
+    kind: ExistingObjectKind,
+    identity: TrackedEntryIdentity,
+    state: TrackedObjectState,
+}
+
+#[cfg(any(unix, windows))]
+struct BackedUpDirectory {
+    _directory: cap_std::fs::Dir,
+}
+
+#[cfg(any(unix, windows))]
+struct PublishedDirectory {
+    #[cfg(all(test, unix))]
+    relative: PathBuf,
+    #[cfg(all(test, unix))]
+    identity: TrackedEntryIdentity,
+    #[cfg(all(test, unix))]
+    name_index: usize,
+    directory: cap_std::fs::Dir,
+}
+
+#[cfg(any(unix, windows))]
+struct FullReplacementPlan {
+    objects: Vec<PlannedExistingObject>,
+    directories: Vec<(PathBuf, TrackedEntryIdentity)>,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Clone, Copy)]
+struct NamedEntryLocation<'a> {
+    parent: &'a cap_std::fs::Dir,
+    name: &'a std::ffi::OsStr,
+}
+
+#[cfg(unix)]
+fn tracked_entry_identity(metadata: &cap_std::fs::Metadata) -> TrackedEntryIdentity {
+    use cap_std::fs::MetadataExt;
+
+    TrackedEntryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(unix)]
+fn tracked_open_file_identity(metadata: &std::fs::Metadata) -> TrackedEntryIdentity {
+    use std::os::unix::fs::MetadataExt;
+
+    TrackedEntryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(windows)]
+fn tracked_open_file_identity(file: &cap_std::fs::File) -> std::io::Result<TrackedEntryIdentity> {
+    use std::os::windows::io::AsRawHandle;
+
+    tracked_windows_handle_identity(file.as_raw_handle().cast())
+}
+
+#[cfg(unix)]
+fn tracked_open_file_identity_for_std(
+    file: &std::fs::File,
+) -> std::io::Result<TrackedEntryIdentity> {
+    file.metadata()
+        .map(|metadata| tracked_open_file_identity(&metadata))
+}
+
+#[cfg(unix)]
+fn tracked_cap_file_identity(file: &cap_std::fs::File) -> std::io::Result<TrackedEntryIdentity> {
+    file.metadata()
+        .map(|metadata| tracked_entry_identity(&metadata))
+}
+
+#[cfg(windows)]
+fn tracked_cap_file_identity(file: &cap_std::fs::File) -> std::io::Result<TrackedEntryIdentity> {
+    tracked_open_file_identity(file)
+}
+
+#[cfg(windows)]
+fn tracked_open_file_identity_for_std(
+    file: &std::fs::File,
+) -> std::io::Result<TrackedEntryIdentity> {
+    use std::os::windows::io::AsRawHandle;
+
+    tracked_windows_handle_identity(file.as_raw_handle().cast())
+}
+
+#[cfg(unix)]
+fn tracked_open_directory_identity(
+    directory: &cap_std::fs::Dir,
+) -> std::io::Result<TrackedEntryIdentity> {
+    directory
+        .dir_metadata()
+        .map(|metadata| tracked_entry_identity(&metadata))
+}
+
+#[cfg(windows)]
+fn tracked_open_directory_identity(
+    directory: &cap_std::fs::Dir,
+) -> std::io::Result<TrackedEntryIdentity> {
+    use std::os::windows::io::AsRawHandle;
+
+    tracked_windows_handle_identity(directory.as_raw_handle().cast())
+}
+
+#[cfg(windows)]
+fn tracked_windows_handle_identity(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> std::io::Result<TrackedEntryIdentity> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
+    };
+
+    // FILE_ID_INFO is the Windows namespace authority for modern filesystems.
+    // The legacy 64-bit file index exposed by metadata can alias on ReFS, so it
+    // must never authorize a destructive exact-source transition.
+    let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    let inspected = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            (&raw mut info).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if inspected == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let identity = TrackedEntryIdentity {
+        volume_serial: info.VolumeSerialNumber,
+        file_id: info.FileId.Identifier,
+    };
+    if identity.volume_serial == 0 || identity.file_id.iter().all(|byte| *byte == 0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Windows exact-source object returned a zero volume or FILE_ID_128 identity",
+        ));
+    }
+    Ok(identity)
+}
+
+#[cfg(any(unix, windows))]
+fn reconciliation_hmac(key: &[u8; 32], message: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    const BLOCK_BYTES: usize = 64;
+    let mut inner_key = [0x36_u8; BLOCK_BYTES];
+    let mut outer_key = [0x5c_u8; BLOCK_BYTES];
+    for (index, byte) in key.iter().enumerate() {
+        inner_key[index] ^= byte;
+        outer_key[index] ^= byte;
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_key);
+    inner.update(message);
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_key);
+    outer.update(inner_digest);
+    outer.finalize().into()
+}
+
+#[cfg(any(unix, windows))]
+fn sync_directory_capability(directory: &cap_std::fs::Dir, display: &Path) -> Result<()> {
+    #[cfg(unix)]
+    rustix::fs::fsync(directory)
+        .map_err(|error| KinError::io(display, std::io::Error::from(error)))?;
+    #[cfg(windows)]
+    {
+        // Win32 has no supported equivalent of fsync for a directory handle;
+        // FlushFileBuffers requires GENERIC_WRITE and applies to file data, not
+        // directory namespace entries. The file contents and recovery manifest
+        // are flushed through their retained file handles before any rename.
+        let _ = (directory, display);
+    }
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+fn sync_namespace_parents(
+    source: &cap_std::fs::Dir,
+    source_display: &Path,
+    destination: &cap_std::fs::Dir,
+    destination_display: &Path,
+) -> Result<()> {
+    sync_directory_capability(source, source_display)?;
+    if tracked_open_directory_identity(source)
+        .map_err(|error| KinError::io(source_display, error))?
+        != tracked_open_directory_identity(destination)
+            .map_err(|error| KinError::io(destination_display, error))?
+    {
+        sync_directory_capability(destination, destination_display)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+fn open_or_create_private_directory(
+    parent: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+    display: &Path,
+) -> Result<cap_std::fs::Dir> {
+    for _ in 0..8 {
+        // Open the control-plane directory read-only. This handle is held for the
+        // projection's lifetime and never deletes its own directory (children are
+        // removed through their own per-child handles), so it must not request
+        // DELETE access. On Windows a peer that already holds this directory open
+        // without FILE_SHARE_DELETE — for example the graph store's snapshot/index
+        // under `.kin` — denies any DELETE-access open regardless of the sharing we
+        // offer; POSIX imposes no such bilateral constraint. Directory removal uses
+        // `open_directory_nofollow_for_removal` at the point of deletion instead.
+        match open_directory_nofollow(parent, name) {
+            Ok(directory) => {
+                #[cfg(unix)]
+                rustix::fs::fchmod(&directory, rustix::fs::Mode::from_raw_mode(0o700))
+                    .map_err(|error| KinError::io(display, error.into()))?;
+                return Ok(directory);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match parent.create_dir(name) {
+                    Ok(()) => {
+                        sync_directory_capability(parent, display.parent().unwrap_or(display))?
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(KinError::io(display, error)),
+                }
+            }
+            Err(error) => return Err(KinError::io(display, error)),
+        }
+    }
+    Err(KinError::Other(format!(
+        "control-plane directory {} changed repeatedly during exact-source initialization",
+        display.display()
+    )))
+}
+
+#[cfg(unix)]
+fn open_reconciliation_control_file(
+    parent: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<cap_std::fs::File> {
+    rustix::fs::openat(
+        parent,
+        name,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map(std::fs::File::from)
+    .map(cap_std::fs::File::from_std)
+    .map_err(Into::into)
+}
+
+#[cfg(windows)]
+fn open_reconciliation_control_file(
+    parent: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<cap_std::fs::File> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    parent.open_with(name, &options)
+}
+
+#[cfg(any(unix, windows))]
+fn load_or_create_reconciliation_authority_key(
+    control: &cap_std::fs::Dir,
+    display_control: &Path,
+) -> Result<[u8; 32]> {
+    for _ in 0..8 {
+        match open_reconciliation_control_file(
+            control,
+            std::ffi::OsStr::new(RECONCILIATION_AUTHORITY_FILE),
+        ) {
+            Ok(mut file) => {
+                let metadata = file.metadata().map_err(|error| {
+                    KinError::io(display_control.join(RECONCILIATION_AUTHORITY_FILE), error)
+                })?;
+                if !metadata.is_file() || metadata.len() != 32 {
+                    return Err(KinError::Other(format!(
+                        "reconciliation authority {} is not an exact 32-byte regular file",
+                        display_control
+                            .join(RECONCILIATION_AUTHORITY_FILE)
+                            .display()
+                    )));
+                }
+                let mut key = [0_u8; 32];
+                file.read_exact(&mut key).map_err(|error| {
+                    KinError::io(display_control.join(RECONCILIATION_AUTHORITY_FILE), error)
+                })?;
+                return Ok(key);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut key = [0_u8; 32];
+                key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+                key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+                let temporary = OsString::from(format!(".authority-{}.tmp", uuid::Uuid::new_v4()));
+                let mut options = cap_std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                match control.open_with(&temporary, &options) {
+                    Ok(mut file) => {
+                        #[cfg(unix)]
+                        rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(0o600)).map_err(
+                            |error| KinError::io(display_control.join(&temporary), error.into()),
+                        )?;
+                        file.write_all(&key)
+                            .and_then(|()| file.sync_all())
+                            .map_err(|error| {
+                                KinError::io(display_control.join(&temporary), error)
+                            })?;
+                        let publication =
+                            control.hard_link(&temporary, control, RECONCILIATION_AUTHORITY_FILE);
+                        match publication {
+                            Ok(()) => {
+                                file.sync_all().map_err(|error| {
+                                    KinError::io(
+                                        display_control.join(RECONCILIATION_AUTHORITY_FILE),
+                                        error,
+                                    )
+                                })?;
+                                drop(file);
+                                sync_directory_capability(control, display_control)?;
+                                control.remove_file(&temporary).map_err(|error| {
+                                    KinError::io(display_control.join(&temporary), error)
+                                })?;
+                                sync_directory_capability(control, display_control)?;
+                                return Ok(key);
+                            }
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::AlreadyExists
+                                        | std::io::ErrorKind::PermissionDenied
+                                ) =>
+                            {
+                                drop(file);
+                                let _ = control.remove_file(&temporary);
+                                continue;
+                            }
+                            Err(error) => {
+                                drop(file);
+                                let _ = control.remove_file(&temporary);
+                                return Err(KinError::io(
+                                    display_control.join(RECONCILIATION_AUTHORITY_FILE),
+                                    error,
+                                ));
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => {
+                        return Err(KinError::io(
+                            display_control.join(RECONCILIATION_AUTHORITY_FILE),
+                            error,
+                        ));
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(KinError::io(
+                    display_control.join(RECONCILIATION_AUTHORITY_FILE),
+                    error,
+                ));
+            }
+        }
+    }
+    Err(KinError::Other(format!(
+        "reconciliation authority {} changed repeatedly during initialization",
+        display_control
+            .join(RECONCILIATION_AUTHORITY_FILE)
+            .display()
+    )))
+}
+
+#[cfg(any(unix, windows))]
+fn acquire_reconciliation_projection_lock(
+    control: &cap_std::fs::Dir,
+    display_control: &Path,
+) -> Result<(std::fs::File, TrackedEntryIdentity)> {
+    let name = std::ffi::OsStr::new(RECONCILIATION_PROJECTION_LOCK_FILE);
+    #[cfg(unix)]
+    let file = rustix::fs::openat(
+        control,
+        name,
+        rustix::fs::OFlags::RDWR
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::from_raw_mode(0o600),
+    )
+    .map(std::fs::File::from)
+    .map_err(|error| {
+        KinError::io(
+            display_control.join(RECONCILIATION_PROJECTION_LOCK_FILE),
+            error.into(),
+        )
+    })?;
+    #[cfg(windows)]
+    let file = {
+        use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create(true)
+            .follow(FollowSymlinks::No);
+        control
+            .open_with(name, &options)
+            .map(cap_std::fs::File::into_std)
+            .map_err(|error| {
+                KinError::io(
+                    display_control.join(RECONCILIATION_PROJECTION_LOCK_FILE),
+                    error,
+                )
+            })?
+    };
+    let metadata = file.metadata().map_err(|error| {
+        KinError::io(
+            display_control.join(RECONCILIATION_PROJECTION_LOCK_FILE),
+            error,
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(KinError::Other(format!(
+            "projection lock {} is not a regular file",
+            display_control
+                .join(RECONCILIATION_PROJECTION_LOCK_FILE)
+                .display()
+        )));
+    }
+    let identity = tracked_open_file_identity_for_std(&file).map_err(|error| {
+        KinError::io(
+            display_control.join(RECONCILIATION_PROJECTION_LOCK_FILE),
+            error,
+        )
+    })?;
+    file.try_lock_exclusive().map_err(|error| {
+        KinError::io(
+            display_control.join(RECONCILIATION_PROJECTION_LOCK_FILE),
+            std::io::Error::new(
+                error.kind(),
+                format!("another exact-source projection is active: {error}"),
+            ),
+        )
+    })?;
+
+    let named = open_reconciliation_control_file(control, name).map_err(|error| {
+        KinError::io(
+            display_control.join(RECONCILIATION_PROJECTION_LOCK_FILE),
+            error,
+        )
+    })?;
+    let named_identity = tracked_cap_file_identity(&named).map_err(|error| {
+        KinError::io(
+            display_control.join(RECONCILIATION_PROJECTION_LOCK_FILE),
+            error,
+        )
+    })?;
+    if named_identity != identity {
+        return Err(KinError::Other(format!(
+            "projection lock {} changed identity while acquiring",
+            display_control
+                .join(RECONCILIATION_PROJECTION_LOCK_FILE)
+                .display()
+        )));
+    }
+    Ok((file, identity))
+}
+
+#[cfg(any(unix, windows))]
+impl ProjectionRoot {
+    fn open(root: &Path) -> Result<Self> {
+        #[cfg(unix)]
+        let capability = {
+            let root_fd = rustix::fs::open(
+                root,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(std::fs::File::from)
+            .map_err(|error| KinError::io(root, std::io::Error::from(error)))?;
+            cap_std::fs::Dir::from_std_file(root_fd)
+        };
+        #[cfg(windows)]
+        let capability =
+            open_windows_projection_root(root).map_err(|error| KinError::io(root, error))?;
+        let kin_control = open_or_create_private_directory(
+            &capability,
+            std::ffi::OsStr::new(".kin"),
+            &root.join(".kin"),
+        )?;
+        let kin_control_identity = tracked_open_directory_identity(&kin_control)
+            .map_err(|error| KinError::io(root.join(".kin"), error))?;
+        let control = open_or_create_private_directory(
+            &kin_control,
+            std::ffi::OsStr::new(RECONCILIATION_CONTROL_DIRECTORY),
+            &root.join(".kin").join(RECONCILIATION_CONTROL_DIRECTORY),
+        )?;
+        let control_identity = tracked_open_directory_identity(&control).map_err(|error| {
+            KinError::io(
+                root.join(".kin").join(RECONCILIATION_CONTROL_DIRECTORY),
+                error,
+            )
+        })?;
+        let display_control = root.join(".kin").join(RECONCILIATION_CONTROL_DIRECTORY);
+        let (projection_lock, projection_lock_identity) =
+            acquire_reconciliation_projection_lock(&control, &display_control)?;
+        let authority_key =
+            load_or_create_reconciliation_authority_key(&control, &display_control)?;
+        let projection = Self {
+            root: capability,
+            kin_control,
+            control,
+            projection_lock,
+            projection_lock_identity,
+            display_root: root.to_path_buf(),
+            kin_control_identity,
+            control_identity,
+            authority_key,
+        };
+        projection.recover_reconciliation_transactions()?;
+        Ok(projection)
+    }
+
+    fn create_reconciliation_transaction(&self) -> Result<ReconciliationTransaction> {
+        self.create_reconciliation_transaction_with_transition(None)
+    }
+
+    fn create_reconciliation_transaction_with_transition(
+        &self,
+        branch_transition: Option<BranchProjectionTransition>,
+    ) -> Result<ReconciliationTransaction> {
+        self.revalidate_projection_lock()?;
+        for _ in 0..8 {
+            let id = uuid::Uuid::new_v4().to_string();
+            let name = OsString::from(format!("tx-{id}"));
+            match self.control.create_dir(&name) {
+                Ok(()) => {
+                    let directory = open_directory_nofollow_for_removal(&self.control, &name)
+                        .map_err(|error| {
+                            KinError::io(self.reconciliation_control_path().join(&name), error)
+                        })?;
+                    #[cfg(unix)]
+                    rustix::fs::fchmod(&directory, rustix::fs::Mode::from_raw_mode(0o700))
+                        .map_err(|error| {
+                            KinError::io(
+                                self.reconciliation_control_path().join(&name),
+                                error.into(),
+                            )
+                        })?;
+                    let identity =
+                        tracked_open_directory_identity(&directory).map_err(|error| {
+                            KinError::io(self.reconciliation_control_path().join(&name), error)
+                        })?;
+                    sync_directory_capability(&self.control, &self.reconciliation_control_path())?;
+                    let root_identity = tracked_open_directory_identity(&self.root)
+                        .map_err(|error| KinError::io(&self.display_root, error))?;
+                    let mut transaction = ReconciliationTransaction {
+                        name,
+                        directory,
+                        identity,
+                        manifest: ReconciliationManifest {
+                            schema: RECONCILIATION_MANIFEST_SCHEMA,
+                            transaction_id: id,
+                            root_identity,
+                            kin_control_identity: self.kin_control_identity,
+                            control_identity: self.control_identity,
+                            transaction_identity: identity,
+                            state: ReconciliationTransactionState::Pending,
+                            branch_transition: branch_transition.clone(),
+                            actions: Vec::new(),
+                        },
+                        action_log_bytes: 0,
+                        action_tail_authentication: Vec::new(),
+                    };
+                    if let Err(error) = self.persist_reconciliation_manifest(&transaction) {
+                        let cleanup = self.cleanup_reconciliation_transaction(transaction);
+                        return match cleanup {
+                            Ok(()) => Err(error),
+                            Err(cleanup_error) => Err(KinError::Other(format!(
+                                "{error}; empty reconciliation transaction cleanup also failed: {cleanup_error}"
+                            ))),
+                        };
+                    }
+                    // Keep the value mutable at its construction boundary so
+                    // every later namespace intent can be journaled in-place.
+                    transaction.manifest.actions.reserve(16);
+                    return Ok(transaction);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(KinError::io(
+                        self.reconciliation_control_path().join(&name),
+                        error,
+                    ));
+                }
+            }
+        }
+        Err(KinError::Other(
+            "could not allocate a unique exact-source reconciliation transaction".to_string(),
+        ))
+    }
+
+    fn cleanup_reconciliation_transaction(
+        &self,
+        transaction: ReconciliationTransaction,
+    ) -> Result<()> {
+        let display = self.reconciliation_control_path().join(&transaction.name);
+        let actual = tracked_open_directory_identity(&transaction.directory)
+            .map_err(|error| KinError::io(&display, error))?;
+        if actual != transaction.identity {
+            return Err(KinError::Other(format!(
+                "exact-source transaction capability identity changed for {}",
+                display.display()
+            )));
+        }
+        #[cfg(unix)]
+        transaction
+            .directory
+            .remove_open_dir_all()
+            .map_err(|error| KinError::io(display, error))?;
+        #[cfg(windows)]
+        {
+            self.remove_windows_directory_contents(
+                &transaction.directory,
+                Path::new(&transaction.name),
+            )?;
+            mark_windows_directory_for_deletion(transaction.directory)
+                .map_err(|error| KinError::io(display, error))?;
+        }
+        sync_directory_capability(&self.control, &self.reconciliation_control_path())?;
+        Ok(())
+    }
+
+    fn reconciliation_control_path(&self) -> PathBuf {
+        self.display_root
+            .join(".kin")
+            .join(RECONCILIATION_CONTROL_DIRECTORY)
+    }
+
+    fn revalidate_projection_lock(&self) -> Result<()> {
+        // Read-only identity check, not a removal: requesting DELETE access on
+        // `.kin` here would be vetoed on Windows by the graph store's live handle
+        // opened without FILE_SHARE_DELETE (the same bilateral collision as the
+        // use-path open).
+        let named_kin = open_directory_nofollow(&self.root, std::ffi::OsStr::new(".kin"))
+            .map_err(|error| KinError::io(self.display_root.join(".kin"), error))?;
+        if tracked_open_directory_identity(&named_kin)
+            .map_err(|error| KinError::io(self.display_root.join(".kin"), error))?
+            != self.kin_control_identity
+        {
+            return Err(KinError::Other(format!(
+                "repository control directory {} was replaced while the projection lock was held",
+                self.display_root.join(".kin").display()
+            )));
+        }
+        // Read-only identity check, matching the `.kin` open above: `.kin/control`
+        // is projection-owned and does not collide today, but narrowing it now
+        // closes the gratuitous-DELETE-access class rather than only the instance.
+        let named_control = open_directory_nofollow(
+            &self.kin_control,
+            std::ffi::OsStr::new(RECONCILIATION_CONTROL_DIRECTORY),
+        )
+        .map_err(|error| KinError::io(self.reconciliation_control_path(), error))?;
+        if tracked_open_directory_identity(&named_control)
+            .map_err(|error| KinError::io(self.reconciliation_control_path(), error))?
+            != self.control_identity
+        {
+            return Err(KinError::Other(format!(
+                "reconciliation control directory {} was replaced while the projection lock was held",
+                self.reconciliation_control_path().display()
+            )));
+        }
+        let display = self
+            .reconciliation_control_path()
+            .join(RECONCILIATION_PROJECTION_LOCK_FILE);
+        let held_identity = tracked_open_file_identity_for_std(&self.projection_lock)
+            .map_err(|error| KinError::io(&display, error))?;
+        if held_identity != self.projection_lock_identity {
+            return Err(KinError::Other(format!(
+                "projection lock capability changed identity for {}",
+                display.display()
+            )));
+        }
+        let named = open_reconciliation_control_file(
+            &self.control,
+            std::ffi::OsStr::new(RECONCILIATION_PROJECTION_LOCK_FILE),
+        )
+        .map_err(|error| KinError::io(&display, error))?;
+        if tracked_cap_file_identity(&named).map_err(|error| KinError::io(&display, error))?
+            != self.projection_lock_identity
+        {
+            return Err(KinError::Other(format!(
+                "projection lock {} was replaced while held; refusing namespace mutation",
+                display.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn read_branch_marker_capability(&self) -> Result<String> {
+        let display = self.display_root.join(".kin/HEAD");
+        let file =
+            open_reconciliation_control_file(&self.kin_control, std::ffi::OsStr::new("HEAD"))
+                .map_err(|error| KinError::io(&display, error))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| KinError::io(&display, error))?;
+        if !metadata.is_file() || metadata.len() > 4096 {
+            return Err(KinError::Other(format!(
+                "branch marker {} is not a bounded regular file",
+                display.display()
+            )));
+        }
+        let mut bytes = Vec::new();
+        file.take(4097)
+            .read_to_end(&mut bytes)
+            .map_err(|error| KinError::io(&display, error))?;
+        if bytes.len() > 4096 {
+            return Err(KinError::Other(format!(
+                "branch marker {} exceeds 4096 bytes",
+                display.display()
+            )));
+        }
+        let marker = std::str::from_utf8(&bytes).map_err(|error| {
+            KinError::Other(format!(
+                "branch marker {} is not UTF-8: {error}",
+                display.display()
+            ))
+        })?;
+        let marker = marker.trim();
+        if marker.is_empty() {
+            return Err(KinError::Other(format!(
+                "branch marker {} is empty",
+                display.display()
+            )));
+        }
+        Ok(marker.to_string())
+    }
+
+    fn write_branch_marker_capability(&self, branch: &str) -> Result<()> {
+        if branch.trim().is_empty()
+            || branch != branch.trim()
+            || branch.len() > 4096
+            || branch.chars().any(char::is_control)
+        {
+            return Err(KinError::Other(
+                "refusing to write an invalid branch marker during recovery".to_string(),
+            ));
+        }
+        let temporary = OsString::from(format!(".HEAD-{}.tmp", uuid::Uuid::new_v4()));
+        let display = self.display_root.join(".kin/HEAD");
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(windows)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+            use windows_sys::Win32::Storage::FileSystem::{
+                DELETE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            };
+
+            options
+                .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+        }
+        let mut file = self
+            .kin_control
+            .open_with(&temporary, &options)
+            .map_err(|error| KinError::io(&display, error))?;
+        #[cfg(unix)]
+        rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(0o600))
+            .map_err(|error| KinError::io(&display, error.into()))?;
+        if let Err(error) = file
+            .write_all(branch.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|error| KinError::io(&display, error))
+        {
+            drop(file);
+            let _ = self.kin_control.remove_file(&temporary);
+            return Err(error);
+        }
+        #[cfg(unix)]
+        let rename_result =
+            self.kin_control
+                .rename(&temporary, &self.kin_control, std::ffi::OsStr::new("HEAD"));
+        #[cfg(windows)]
+        let rename_result = replace_windows_file_handle_exact(
+            &file,
+            &self.kin_control,
+            std::ffi::OsStr::new("HEAD"),
+            true,
+        );
+        if let Err(error) = rename_result {
+            drop(file);
+            let _ = self.kin_control.remove_file(&temporary);
+            return Err(KinError::io(&display, error));
+        }
+        file.sync_all()
+            .map_err(|error| KinError::io(&display, error))?;
+        drop(file);
+        sync_directory_capability(&self.kin_control, &self.display_root.join(".kin"))
+    }
+
+    fn recover_pending_branch_transition(
+        &self,
+        transition: &BranchProjectionTransition,
+    ) -> Result<()> {
+        let current = self.read_branch_marker_capability()?;
+        if current == transition.previous_branch {
+            return Ok(());
+        }
+        if current != transition.target_branch {
+            return Err(KinError::Other(format!(
+                "branch-switch recovery refused to overwrite HEAD '{}': expected '{}' or '{}'",
+                current, transition.previous_branch, transition.target_branch
+            )));
+        }
+        self.write_branch_marker_capability(&transition.previous_branch)
+    }
+
+    fn validate_committed_branch_transition(
+        &self,
+        transition: &BranchProjectionTransition,
+    ) -> Result<()> {
+        let current = self.read_branch_marker_capability()?;
+        if current == transition.target_branch {
+            Ok(())
+        } else {
+            Err(KinError::Other(format!(
+                "committed branch-switch transaction expected HEAD '{}', found '{}'; refusing cleanup",
+                transition.target_branch, current
+            )))
+        }
+    }
+
+    fn authenticate_reconciliation_manifest(
+        &self,
+        manifest: &ReconciliationManifest,
+    ) -> Result<Vec<u8>> {
+        let encoded = serde_json::to_vec(manifest)
+            .map_err(|error| KinError::Other(format!("encode reconciliation manifest: {error}")))?;
+        Ok(reconciliation_hmac(&self.authority_key, &encoded).to_vec())
+    }
+
+    fn persist_reconciliation_manifest(
+        &self,
+        transaction: &ReconciliationTransaction,
+    ) -> Result<()> {
+        let mut descriptor = transaction.manifest.clone();
+        // Recovery actions live in the append-only authenticated WAL. Keeping
+        // the fixed descriptor action-free makes every phase update bounded,
+        // independent of repository size.
+        descriptor.actions.clear();
+        let authenticated = AuthenticatedReconciliationManifest {
+            authentication: self.authenticate_reconciliation_manifest(&descriptor)?,
+            manifest: descriptor,
+        };
+        let bytes = serde_json::to_vec(&authenticated).map_err(|error| {
+            KinError::Other(format!(
+                "encode authenticated reconciliation manifest: {error}"
+            ))
+        })?;
+        let temporary = OsString::from(format!(".manifest-{}.tmp", uuid::Uuid::new_v4()));
+        let display = self
+            .reconciliation_control_path()
+            .join(&transaction.name)
+            .join(RECONCILIATION_MANIFEST_FILE);
+        // Every step below reports the same manifest path; on Windows the control
+        // renames all funnel through one handle helper, so tag each operation so CI
+        // failure output identifies which step failed rather than only the path. Unix
+        // keeps the bare path so existing error-path expectations are unchanged.
+        #[cfg(windows)]
+        let step = |name: &str| -> PathBuf {
+            let mut raw = display.as_os_str().to_os_string();
+            raw.push(" [");
+            raw.push(name);
+            raw.push("]");
+            PathBuf::from(raw)
+        };
+        #[cfg(not(windows))]
+        let step = |_name: &str| -> PathBuf { display.clone() };
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(windows)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+            use windows_sys::Win32::Storage::FileSystem::{
+                DELETE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            };
+
+            options
+                .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+        }
+        let mut file = transaction
+            .directory
+            .open_with(&temporary, &options)
+            .map_err(|error| KinError::io(step("create-temp"), error))?;
+        #[cfg(unix)]
+        rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(0o600))
+            .map_err(|error| KinError::io(&display, error.into()))?;
+        let write_result = file
+            .write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| KinError::io(step("write-temp"), error));
+        if let Err(error) = write_result {
+            drop(file);
+            let _ = transaction.directory.remove_file(&temporary);
+            return Err(error);
+        }
+        #[cfg(unix)]
+        let publish = transaction.directory.rename(
+            &temporary,
+            &transaction.directory,
+            std::ffi::OsStr::new(RECONCILIATION_MANIFEST_FILE),
+        );
+        #[cfg(windows)]
+        let publish = replace_windows_file_handle_exact(
+            &file,
+            &transaction.directory,
+            std::ffi::OsStr::new(RECONCILIATION_MANIFEST_FILE),
+            true,
+        );
+        if let Err(error) = publish {
+            drop(file);
+            let _ = transaction.directory.remove_file(&temporary);
+            return Err(KinError::io(step("publish-rename"), error));
+        }
+        file.sync_all()
+            .map_err(|error| KinError::io(step("sync-final"), error))?;
+        drop(file);
+        sync_directory_capability(&transaction.directory, &display)?;
+        Ok(())
+    }
+
+    fn record_reconciliation_action(
+        &self,
+        transaction: &mut ReconciliationTransaction,
+        action: ReconciliationRecoveryAction,
+    ) -> Result<()> {
+        if transaction.manifest.actions.len() >= MAX_RECONCILIATION_ACTIONS {
+            return Err(KinError::Other(format!(
+                "exact-source reconciliation exceeds the bounded {}-action recovery log",
+                MAX_RECONCILIATION_ACTIONS
+            )));
+        }
+        let sequence = u64::try_from(transaction.manifest.actions.len()).map_err(|_| {
+            KinError::Other("exact-source recovery action sequence overflow".to_string())
+        })?;
+        let previous_authentication = transaction.action_tail_authentication.clone();
+        let authentication =
+            self.authenticate_reconciliation_action(sequence, &previous_authentication, &action)?;
+        let record = AuthenticatedReconciliationAction {
+            sequence,
+            previous_authentication,
+            action: action.clone(),
+            authentication: authentication.clone(),
+        };
+        let bytes = serde_json::to_vec(&record).map_err(|error| {
+            KinError::Other(format!(
+                "encode authenticated reconciliation action: {error}"
+            ))
+        })?;
+        let record_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if record_bytes > MAX_RECONCILIATION_ACTION_RECORD_BYTES
+            || transaction.action_log_bytes.saturating_add(record_bytes)
+                > MAX_RECONCILIATION_ACTION_LOG_BYTES
+        {
+            return Err(KinError::Other(format!(
+                "exact-source reconciliation action log exceeds its bounded {} MiB recovery limit",
+                MAX_RECONCILIATION_ACTION_LOG_BYTES / (1024 * 1024)
+            )));
+        }
+
+        let name = format!("{RECONCILIATION_ACTION_FILE_PREFIX}{sequence:020}.json");
+        let temporary = OsString::from(format!(".action-{}.tmp", uuid::Uuid::new_v4()));
+        let display = self
+            .reconciliation_control_path()
+            .join(&transaction.name)
+            .join(&name);
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = transaction
+            .directory
+            .open_with(&temporary, &options)
+            .map_err(|error| KinError::io(&display, error))?;
+        #[cfg(unix)]
+        rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(0o600))
+            .map_err(|error| KinError::io(&display, error.into()))?;
+        if let Err(error) = file
+            .write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| KinError::io(&display, error))
+        {
+            drop(file);
+            let _ = transaction.directory.remove_file(&temporary);
+            return Err(error);
+        }
+        if let Err(error) = transaction
+            .directory
+            .hard_link(&temporary, &transaction.directory, &name)
+            .map_err(|error| KinError::io(&display, error))
+        {
+            drop(file);
+            let _ = transaction.directory.remove_file(&temporary);
+            return Err(error);
+        }
+        file.sync_all()
+            .map_err(|error| KinError::io(&display, error))?;
+        sync_directory_capability(&transaction.directory, &display)?;
+        transaction
+            .directory
+            .remove_file(&temporary)
+            .map_err(|error| KinError::io(&display, error))?;
+        sync_directory_capability(&transaction.directory, &display)?;
+
+        transaction.manifest.actions.push(action);
+        transaction.action_log_bytes += record_bytes;
+        transaction.action_tail_authentication = authentication;
+        Ok(())
+    }
+
+    fn authenticate_reconciliation_action(
+        &self,
+        sequence: u64,
+        previous_authentication: &[u8],
+        action: &ReconciliationRecoveryAction,
+    ) -> Result<Vec<u8>> {
+        let encoded =
+            serde_json::to_vec(&(sequence, previous_authentication, action)).map_err(|error| {
+                KinError::Other(format!("encode reconciliation action payload: {error}"))
+            })?;
+        Ok(reconciliation_hmac(&self.authority_key, &encoded).to_vec())
+    }
+
+    fn load_reconciliation_manifest(
+        &self,
+        transaction_name: &std::ffi::OsStr,
+        directory: &cap_std::fs::Dir,
+    ) -> Result<Option<ReconciliationManifest>> {
+        let display = self
+            .reconciliation_control_path()
+            .join(transaction_name)
+            .join(RECONCILIATION_MANIFEST_FILE);
+        let file = match open_reconciliation_control_file(
+            directory,
+            std::ffi::OsStr::new(RECONCILIATION_MANIFEST_FILE),
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(KinError::io(&display, error)),
+        };
+        let metadata = file
+            .metadata()
+            .map_err(|error| KinError::io(&display, error))?;
+        if !metadata.is_file() || metadata.len() > 4 * 1024 * 1024 {
+            return Err(KinError::Other(format!(
+                "reconciliation manifest {} is not a bounded regular file",
+                display.display()
+            )));
+        }
+        let mut bytes = Vec::new();
+        file.take(4 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| KinError::io(&display, error))?;
+        if bytes.len() > 4 * 1024 * 1024 {
+            return Err(KinError::Other(format!(
+                "reconciliation manifest {} exceeds 4 MiB",
+                display.display()
+            )));
+        }
+        let authenticated: AuthenticatedReconciliationManifest = serde_json::from_slice(&bytes)
+            .map_err(|error| {
+                KinError::Other(format!(
+                    "decode reconciliation manifest {}: {error}",
+                    display.display()
+                ))
+            })?;
+        let encoded = serde_json::to_vec(&authenticated.manifest)
+            .map_err(|error| KinError::Other(format!("encode reconciliation manifest: {error}")))?;
+        let expected = reconciliation_hmac(&self.authority_key, &encoded);
+        let authentication_valid = authenticated.authentication.len() == expected.len()
+            && authenticated
+                .authentication
+                .iter()
+                .zip(expected)
+                .fold(0_u8, |difference, (actual, expected)| {
+                    difference | (*actual ^ expected)
+                })
+                == 0;
+        if !authentication_valid {
+            return Err(KinError::Other(format!(
+                "reconciliation manifest {} failed authentication",
+                display.display()
+            )));
+        }
+        Ok(Some(authenticated.manifest))
+    }
+
+    fn load_reconciliation_actions(
+        &self,
+        transaction_name: &std::ffi::OsStr,
+        directory: &cap_std::fs::Dir,
+    ) -> Result<(Vec<ReconciliationRecoveryAction>, u64, Vec<u8>)> {
+        let mut names = Vec::new();
+        for entry in directory.entries().map_err(|error| {
+            KinError::io(
+                self.reconciliation_control_path().join(transaction_name),
+                error,
+            )
+        })? {
+            let entry = entry.map_err(|error| {
+                KinError::io(
+                    self.reconciliation_control_path().join(transaction_name),
+                    error,
+                )
+            })?;
+            let name = entry.file_name();
+            if name.to_str().is_some_and(|name| {
+                name.starts_with(RECONCILIATION_ACTION_FILE_PREFIX) && name.ends_with(".json")
+            }) {
+                names.push(name);
+            }
+        }
+        names.sort();
+        if names.len() > MAX_RECONCILIATION_ACTIONS {
+            return Err(KinError::Other(format!(
+                "reconciliation transaction {} exceeds the bounded action count",
+                self.reconciliation_control_path()
+                    .join(transaction_name)
+                    .display()
+            )));
+        }
+
+        let mut actions = Vec::with_capacity(names.len());
+        let mut total_bytes = 0_u64;
+        let mut tail = Vec::new();
+        for (index, name) in names.into_iter().enumerate() {
+            let expected_name = format!("{RECONCILIATION_ACTION_FILE_PREFIX}{index:020}.json");
+            if name != std::ffi::OsStr::new(&expected_name) {
+                return Err(KinError::Other(format!(
+                    "reconciliation action log {} is not contiguous at sequence {}",
+                    self.reconciliation_control_path()
+                        .join(transaction_name)
+                        .display(),
+                    index
+                )));
+            }
+            let display = self
+                .reconciliation_control_path()
+                .join(transaction_name)
+                .join(&name);
+            let file = open_reconciliation_control_file(directory, &name)
+                .map_err(|error| KinError::io(&display, error))?;
+            let metadata = file
+                .metadata()
+                .map_err(|error| KinError::io(&display, error))?;
+            if !metadata.is_file() || metadata.len() > MAX_RECONCILIATION_ACTION_RECORD_BYTES {
+                return Err(KinError::Other(format!(
+                    "reconciliation action {} is not a bounded regular file",
+                    display.display()
+                )));
+            }
+            total_bytes = total_bytes.saturating_add(metadata.len());
+            if total_bytes > MAX_RECONCILIATION_ACTION_LOG_BYTES {
+                return Err(KinError::Other(format!(
+                    "reconciliation action log {} exceeds {} MiB",
+                    self.reconciliation_control_path()
+                        .join(transaction_name)
+                        .display(),
+                    MAX_RECONCILIATION_ACTION_LOG_BYTES / (1024 * 1024)
+                )));
+            }
+            let mut bytes = Vec::new();
+            file.take(MAX_RECONCILIATION_ACTION_RECORD_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| KinError::io(&display, error))?;
+            if u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+                > MAX_RECONCILIATION_ACTION_RECORD_BYTES
+            {
+                return Err(KinError::Other(format!(
+                    "reconciliation action {} exceeds its record bound",
+                    display.display()
+                )));
+            }
+            let record: AuthenticatedReconciliationAction = serde_json::from_slice(&bytes)
+                .map_err(|error| {
+                    KinError::Other(format!(
+                        "decode reconciliation action {}: {error}",
+                        display.display()
+                    ))
+                })?;
+            if record.sequence != index as u64 || record.previous_authentication != tail {
+                return Err(KinError::Other(format!(
+                    "reconciliation action {} broke the authenticated sequence chain",
+                    display.display()
+                )));
+            }
+            let expected = self.authenticate_reconciliation_action(
+                record.sequence,
+                &record.previous_authentication,
+                &record.action,
+            )?;
+            let authentication_valid = record.authentication.len() == expected.len()
+                && record
+                    .authentication
+                    .iter()
+                    .zip(&expected)
+                    .fold(0_u8, |difference, (actual, expected)| {
+                        difference | (*actual ^ *expected)
+                    })
+                    == 0;
+            if !authentication_valid {
+                return Err(KinError::Other(format!(
+                    "reconciliation action {} failed authentication",
+                    display.display()
+                )));
+            }
+            tail = record.authentication;
+            actions.push(record.action);
+        }
+        Ok((actions, total_bytes, tail))
+    }
+
+    fn recover_reconciliation_transactions(&self) -> Result<()> {
+        self.revalidate_projection_lock()?;
+        let root_identity = tracked_open_directory_identity(&self.root)
+            .map_err(|error| KinError::io(&self.display_root, error))?;
+        let mut transactions = Vec::new();
+        let entries = self
+            .control
+            .entries()
+            .map_err(|error| KinError::io(self.reconciliation_control_path(), error))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| KinError::io(self.reconciliation_control_path(), error))?;
+            let name = entry.file_name();
+            let Some(name_text) = name.to_str() else {
+                continue;
+            };
+            if !name_text.starts_with("tx-") {
+                continue;
+            }
+            transactions.push(name);
+        }
+        transactions.sort();
+
+        for name in transactions {
+            let directory =
+                open_directory_nofollow_for_removal(&self.control, &name).map_err(|error| {
+                    KinError::io(self.reconciliation_control_path().join(&name), error)
+                })?;
+            let identity = tracked_open_directory_identity(&directory).map_err(|error| {
+                KinError::io(self.reconciliation_control_path().join(&name), error)
+            })?;
+            let manifest = match self.load_reconciliation_manifest(&name, &directory)? {
+                Some(manifest) => manifest,
+                None => {
+                    let transaction = ReconciliationTransaction {
+                        name,
+                        directory,
+                        identity,
+                        manifest: ReconciliationManifest {
+                            schema: RECONCILIATION_MANIFEST_SCHEMA,
+                            transaction_id: String::new(),
+                            root_identity,
+                            kin_control_identity: self.kin_control_identity,
+                            control_identity: self.control_identity,
+                            transaction_identity: identity,
+                            state: ReconciliationTransactionState::Pending,
+                            branch_transition: None,
+                            actions: Vec::new(),
+                        },
+                        action_log_bytes: 0,
+                        action_tail_authentication: Vec::new(),
+                    };
+                    self.cleanup_reconciliation_transaction(transaction)?;
+                    continue;
+                }
+            };
+            let expected_name = format!("tx-{}", manifest.transaction_id);
+            if manifest.schema != RECONCILIATION_MANIFEST_SCHEMA
+                || name != std::ffi::OsStr::new(&expected_name)
+                || manifest.root_identity != root_identity
+                || manifest.kin_control_identity != self.kin_control_identity
+                || manifest.control_identity != self.control_identity
+                || manifest.transaction_identity != identity
+            {
+                return Err(KinError::Other(format!(
+                    "reconciliation transaction {} has an invalid identity-bound descriptor",
+                    self.reconciliation_control_path().join(&name).display()
+                )));
+            }
+            if !manifest.actions.is_empty() {
+                return Err(KinError::Other(format!(
+                    "reconciliation transaction {} embedded actions in its fixed descriptor",
+                    self.reconciliation_control_path().join(&name).display()
+                )));
+            }
+            if manifest.state == ReconciliationTransactionState::Committed {
+                if let Some(transition) = &manifest.branch_transition {
+                    self.validate_committed_branch_transition(transition)?;
+                }
+                let transaction = ReconciliationTransaction {
+                    name,
+                    directory,
+                    identity,
+                    manifest,
+                    action_log_bytes: 0,
+                    action_tail_authentication: Vec::new(),
+                };
+                self.cleanup_reconciliation_transaction(transaction)?;
+                continue;
+            }
+            let (actions, action_log_bytes, action_tail_authentication) =
+                self.load_reconciliation_actions(&name, &directory)?;
+            let mut manifest = manifest;
+            manifest.actions = actions;
+            let transaction = ReconciliationTransaction {
+                name,
+                directory,
+                identity,
+                manifest,
+                action_log_bytes,
+                action_tail_authentication,
+            };
+            self.rollback_reconciliation_manifest(&transaction)?;
+            self.cleanup_reconciliation_transaction(transaction)?;
+        }
+        Ok(())
+    }
+
+    fn rollback_reconciliation_manifest(
+        &self,
+        transaction: &ReconciliationTransaction,
+    ) -> Result<()> {
+        let mut failures = Vec::new();
+
+        for (index, action) in transaction.manifest.actions.iter().enumerate().rev() {
+            if let ReconciliationRecoveryAction::PublishObject {
+                relative,
+                kind,
+                identity,
+                state,
+                slot,
+            } = action
+            {
+                if let Err(error) = self.recover_published_object(
+                    transaction,
+                    relative,
+                    *kind,
+                    *identity,
+                    *state,
+                    slot,
+                    index,
+                ) {
+                    failures.push(error.to_string());
+                }
+            }
+        }
+
+        let mut published_directories: Vec<_> = transaction
+            .manifest
+            .actions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, action)| match action {
+                ReconciliationRecoveryAction::PublishDirectory {
+                    relative,
+                    identity,
+                    slot,
+                } => Some((index, relative, identity, slot)),
+                _ => None,
+            })
+            .collect();
+        published_directories.sort_by(|left, right| {
+            right
+                .1
+                .components()
+                .count()
+                .cmp(&left.1.components().count())
+                .then_with(|| left.1.cmp(right.1))
+        });
+        for (index, relative, identity, slot) in published_directories {
+            if let Err(error) =
+                self.recover_published_directory(transaction, relative, *identity, slot, index)
+            {
+                failures.push(error.to_string());
+            }
+        }
+
+        let mut backed_directories: Vec<_> = transaction
+            .manifest
+            .actions
+            .iter()
+            .filter_map(|action| match action {
+                ReconciliationRecoveryAction::BackupDirectory {
+                    relative,
+                    identity,
+                    slot,
+                } => Some((relative, identity, slot)),
+                _ => None,
+            })
+            .collect();
+        backed_directories.sort_by(|left, right| {
+            left.0
+                .components()
+                .count()
+                .cmp(&right.0.components().count())
+                .then_with(|| left.0.cmp(right.0))
+        });
+        for (relative, identity, slot) in backed_directories {
+            if let Err(error) =
+                self.recover_backed_directory(transaction, relative, *identity, slot)
+            {
+                failures.push(error.to_string());
+            }
+        }
+
+        let mut backed_objects: Vec<_> = transaction
+            .manifest
+            .actions
+            .iter()
+            .filter_map(|action| match action {
+                ReconciliationRecoveryAction::BackupObject {
+                    relative,
+                    kind,
+                    identity,
+                    state,
+                    slot,
+                } => Some((relative, kind, identity, state, slot)),
+                _ => None,
+            })
+            .collect();
+        backed_objects.sort_by(|left, right| {
+            left.0
+                .components()
+                .count()
+                .cmp(&right.0.components().count())
+                .then_with(|| left.0.cmp(right.0))
+        });
+        for (relative, kind, identity, state, slot) in backed_objects {
+            if let Err(error) =
+                self.recover_backed_object(transaction, relative, *kind, *identity, *state, slot)
+            {
+                failures.push(error.to_string());
+            }
+        }
+
+        if let Some(transition) = &transaction.manifest.branch_transition {
+            if let Err(error) = self.recover_pending_branch_transition(transition) {
+                failures.push(error.to_string());
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(KinError::Other(format!(
+                "exact-source startup recovery failed for {}: {}",
+                self.reconciliation_control_path()
+                    .join(&transaction.name)
+                    .display(),
+                failures.join("; ")
+            )))
+        }
+    }
+
+    fn optional_existing_object_inspection(
+        &self,
+        parent: &cap_std::fs::Dir,
+        name: &std::ffi::OsStr,
+        kind: ExistingObjectKind,
+        display: &Path,
+    ) -> Result<Option<(TrackedEntryIdentity, TrackedObjectState)>> {
+        match parent.symlink_metadata(name) {
+            Ok(_) => self
+                .inspect_named_existing_object(parent, name, kind, display)
+                .map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(KinError::io(display, error)),
+        }
+    }
+
+    fn require_recovery_object_state(
+        &self,
+        actual: Option<(TrackedEntryIdentity, TrackedObjectState)>,
+        expected_identity: TrackedEntryIdentity,
+        expected_state: TrackedObjectState,
+        display: &Path,
+        location: &str,
+    ) -> Result<bool> {
+        match actual {
+            Some((identity, state)) if identity == expected_identity && state == expected_state => {
+                Ok(true)
+            }
+            Some((identity, state)) if identity == expected_identity => Err(KinError::Other(
+                format!(
+                    "exact-source recovery refused to overwrite {}: the identity-bound {} changed content or mode after the crash (expected {:?}, found {:?})",
+                    display.display(),
+                    location,
+                    expected_state,
+                    state
+                ),
+            )),
+            _ => Ok(false),
+        }
+    }
+
+    fn optional_directory_identity(
+        &self,
+        parent: &cap_std::fs::Dir,
+        name: &std::ffi::OsStr,
+        display: &Path,
+    ) -> Result<Option<TrackedEntryIdentity>> {
+        match parent.symlink_metadata(name) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(KinError::io(display, error)),
+            Ok(metadata) if metadata.is_dir() && !metadata_is_reparse(&metadata) => {
+                // Read-only identity probe: the handle only reads its directory
+                // identity and is dropped, so it must not request DELETE access.
+                let directory = open_directory_nofollow(parent, name)
+                    .map_err(|error| KinError::io(display, error))?;
+                tracked_open_directory_identity(&directory)
+                    .map(Some)
+                    .map_err(|error| KinError::io(display, error))
+            }
+            Ok(_) => Err(KinError::Other(format!(
+                "exact-source recovery path {} changed into a non-directory",
+                display.display()
+            ))),
+        }
+    }
+
+    fn recover_published_object(
+        &self,
+        transaction: &ReconciliationTransaction,
+        relative: &Path,
+        kind: ExistingObjectKind,
+        identity: TrackedEntryIdentity,
+        state: TrackedObjectState,
+        slot: &str,
+        action_index: usize,
+    ) -> Result<()> {
+        let path = relative
+            .to_str()
+            .ok_or_else(|| KinError::Other(format!("recovery path is not UTF-8: {relative:?}")))?;
+        let components = validate_source_path(path)?;
+        let parent = self.open_existing_parent(&components)?;
+        let source_name = std::ffi::OsStr::new(components[components.len() - 1]);
+        let display = self.display_root.join(relative);
+        let root =
+            self.optional_existing_object_inspection(&parent, source_name, kind, &display)?;
+        if self.require_recovery_object_state(
+            root,
+            identity,
+            state,
+            &display,
+            "published object",
+        )? {
+            let discard = format!("recovery-discard-object-{action_index}");
+            self.move_existing_object_exact(
+                NamedEntryLocation {
+                    parent: &parent,
+                    name: source_name,
+                },
+                NamedEntryLocation {
+                    parent: &transaction.directory,
+                    name: std::ffi::OsStr::new(&discard),
+                },
+                kind,
+                identity,
+                state,
+                &display,
+            )?;
+            return Ok(());
+        }
+        let staged = self.optional_existing_object_inspection(
+            &transaction.directory,
+            std::ffi::OsStr::new(slot),
+            kind,
+            &display,
+        )?;
+        let discard = format!("recovery-discard-object-{action_index}");
+        let discarded = self.optional_existing_object_inspection(
+            &transaction.directory,
+            std::ffi::OsStr::new(&discard),
+            kind,
+            &display,
+        )?;
+        if self.require_recovery_object_state(staged, identity, state, &display, "staged object")?
+            || self.require_recovery_object_state(
+                discarded,
+                identity,
+                state,
+                &display,
+                "discarded object",
+            )?
+        {
+            return Ok(());
+        }
+        Err(KinError::Other(format!(
+            "published exact-source object {} is not recoverably attached to its root or transaction",
+            display.display()
+        )))
+    }
+
+    fn recover_published_directory(
+        &self,
+        transaction: &ReconciliationTransaction,
+        relative: &Path,
+        identity: TrackedEntryIdentity,
+        slot: &str,
+        action_index: usize,
+    ) -> Result<()> {
+        let path = relative
+            .to_str()
+            .ok_or_else(|| KinError::Other(format!("recovery path is not UTF-8: {relative:?}")))?;
+        let components = validate_source_path(path)?;
+        let parent = self.open_existing_parent(&components)?;
+        let source_name = std::ffi::OsStr::new(components[components.len() - 1]);
+        let display = self.display_root.join(relative);
+        if self.optional_directory_identity(&parent, source_name, &display)? == Some(identity) {
+            let directory = open_directory_nofollow_for_removal(&parent, source_name)
+                .map_err(|error| KinError::io(&display, error))?;
+            let discard = OsString::from(format!("recovery-discard-directory-{action_index}"));
+            self.move_open_directory_exact(
+                NamedEntryLocation {
+                    parent: &parent,
+                    name: source_name,
+                },
+                NamedEntryLocation {
+                    parent: &transaction.directory,
+                    name: &discard,
+                },
+                &directory,
+                identity,
+                &display,
+            )?;
+            return Ok(());
+        }
+        let staged = self.optional_directory_identity(
+            &transaction.directory,
+            std::ffi::OsStr::new(slot),
+            &display,
+        )?;
+        let discard = OsString::from(format!("recovery-discard-directory-{action_index}"));
+        let discarded =
+            self.optional_directory_identity(&transaction.directory, &discard, &display)?;
+        if staged == Some(identity) || discarded == Some(identity) {
+            return Ok(());
+        }
+        Err(KinError::Other(format!(
+            "published exact-source directory {} is not recoverably attached to its root or transaction",
+            display.display()
+        )))
+    }
+
+    fn recover_backed_directory(
+        &self,
+        transaction: &ReconciliationTransaction,
+        relative: &Path,
+        identity: TrackedEntryIdentity,
+        slot: &str,
+    ) -> Result<()> {
+        let path = relative
+            .to_str()
+            .ok_or_else(|| KinError::Other(format!("recovery path is not UTF-8: {relative:?}")))?;
+        let components = validate_source_path(path)?;
+        let parent = self.open_existing_parent(&components)?;
+        let destination_name = std::ffi::OsStr::new(components[components.len() - 1]);
+        let display = self.display_root.join(relative);
+        if self.optional_directory_identity(&parent, destination_name, &display)? == Some(identity)
+        {
+            return Ok(());
+        }
+        if self.optional_directory_identity(
+            &transaction.directory,
+            std::ffi::OsStr::new(slot),
+            &display,
+        )? != Some(identity)
+        {
+            return Err(KinError::Other(format!(
+                "backed-up exact-source directory {} is missing from its authenticated transaction slot",
+                display.display()
+            )));
+        }
+        let directory =
+            open_directory_nofollow_for_removal(&transaction.directory, std::ffi::OsStr::new(slot))
+                .map_err(|error| KinError::io(&display, error))?;
+        self.move_open_directory_exact(
+            NamedEntryLocation {
+                parent: &transaction.directory,
+                name: std::ffi::OsStr::new(slot),
+            },
+            NamedEntryLocation {
+                parent: &parent,
+                name: destination_name,
+            },
+            &directory,
+            identity,
+            &display,
+        )
+    }
+
+    fn recover_backed_object(
+        &self,
+        transaction: &ReconciliationTransaction,
+        relative: &Path,
+        kind: ExistingObjectKind,
+        identity: TrackedEntryIdentity,
+        state: TrackedObjectState,
+        slot: &str,
+    ) -> Result<()> {
+        let path = relative
+            .to_str()
+            .ok_or_else(|| KinError::Other(format!("recovery path is not UTF-8: {relative:?}")))?;
+        let components = validate_source_path(path)?;
+        let parent = self.open_existing_parent(&components)?;
+        let destination_name = std::ffi::OsStr::new(components[components.len() - 1]);
+        let display = self.display_root.join(relative);
+        let root =
+            self.optional_existing_object_inspection(&parent, destination_name, kind, &display)?;
+        if self.require_recovery_object_state(root, identity, state, &display, "restored object")? {
+            return Ok(());
+        }
+        let staged = self.optional_existing_object_inspection(
+            &transaction.directory,
+            std::ffi::OsStr::new(slot),
+            kind,
+            &display,
+        )?;
+        if !self.require_recovery_object_state(
+            staged,
+            identity,
+            state,
+            &display,
+            "backed-up object",
+        )? {
+            return Err(KinError::Other(format!(
+                "backed-up exact-source object {} is missing from its authenticated transaction slot",
+                display.display()
+            )));
+        }
+        self.move_existing_object_exact(
+            NamedEntryLocation {
+                parent: &transaction.directory,
+                name: std::ffi::OsStr::new(slot),
+            },
+            NamedEntryLocation {
+                parent: &parent,
+                name: destination_name,
+            },
+            kind,
+            identity,
+            state,
+            &display,
+        )
+    }
+
+    fn plan_full_replacement(
+        &self,
+        tracked: &TrackedPathClassifier,
+        should_preserve: Option<&dyn Fn(&Path) -> bool>,
+    ) -> Result<FullReplacementPlan> {
+        let mut plan = FullReplacementPlan {
+            objects: Vec::new(),
+            directories: Vec::new(),
+        };
+        self.plan_full_replacement_from(
+            &self.root,
+            Path::new(""),
+            tracked,
+            should_preserve,
+            false,
+            &mut plan,
+        )?;
+        plan.objects.sort_by(|left, right| {
+            right
+                .relative
+                .components()
+                .count()
+                .cmp(&left.relative.components().count())
+                .then_with(|| left.relative.cmp(&right.relative))
+        });
+        plan.directories.sort_by(|left, right| {
+            right
+                .0
+                .components()
+                .count()
+                .cmp(&left.0.components().count())
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        Ok(plan)
+    }
+
+    fn plan_full_replacement_from(
+        &self,
+        current: &cap_std::fs::Dir,
+        relative_directory: &Path,
+        tracked: &TrackedPathClassifier,
+        should_preserve: Option<&dyn Fn(&Path) -> bool>,
+        force_remove: bool,
+        plan: &mut FullReplacementPlan,
+    ) -> Result<bool> {
+        let entries = current
+            .entries()
+            .map_err(|error| KinError::io(self.display_root.join(relative_directory), error))?;
+        let mut all_children_removed = true;
+        for entry in entries {
+            let entry = entry
+                .map_err(|error| KinError::io(self.display_root.join(relative_directory), error))?;
+            let name = entry.file_name();
+            let relative = relative_directory.join(&name);
+            if relative_directory.as_os_str().is_empty()
+                && name
+                    .to_str()
+                    .is_some_and(|component| component.eq_ignore_ascii_case(".kin"))
+            {
+                all_children_removed = false;
+                continue;
+            }
+            let relation = tracked.relation(&relative);
+            let preserved_unrelated = relation == TrackedPathRelation::Unrelated
+                && should_preserve.is_some_and(|preserve| preserve(&relative));
+            let cleanup_unrelated = relation == TrackedPathRelation::Unrelated
+                && should_preserve.is_some()
+                && !preserved_unrelated;
+            let metadata = current
+                .symlink_metadata(&name)
+                .map_err(|error| KinError::io(self.display_root.join(&relative), error))?;
+
+            if metadata.is_dir() && !metadata_is_reparse(&metadata) {
+                if preserved_unrelated && !force_remove {
+                    all_children_removed = false;
+                    continue;
+                }
+                if relation == TrackedPathRelation::Unrelated && !cleanup_unrelated && !force_remove
+                {
+                    all_children_removed = false;
+                    continue;
+                }
+                let directory =
+                    self.open_existing_directory_for_removal(current, &name, &relative)?;
+                let identity = tracked_open_directory_identity(&directory)
+                    .map_err(|error| KinError::io(self.display_root.join(&relative), error))?;
+                let remove_entire_directory = force_remove
+                    || matches!(
+                        relation,
+                        TrackedPathRelation::Exact | TrackedPathRelation::Descendant
+                    );
+                let children_removed = self.plan_full_replacement_from(
+                    &directory,
+                    &relative,
+                    tracked,
+                    should_preserve,
+                    remove_entire_directory,
+                    plan,
+                )?;
+                let remove_directory = remove_entire_directory
+                    || (cleanup_unrelated && children_removed)
+                    || (force_remove && children_removed);
+                if remove_directory {
+                    plan.directories.push((relative, identity));
+                } else {
+                    all_children_removed = false;
+                }
+                continue;
+            }
+
+            let remove_object =
+                force_remove || relation != TrackedPathRelation::Unrelated || cleanup_unrelated;
+            if !remove_object || (preserved_unrelated && !force_remove) {
+                all_children_removed = false;
+                continue;
+            }
+            let kind = if metadata_is_reparse(&metadata) {
+                ExistingObjectKind::Symlink
+            } else if metadata.is_file() {
+                ExistingObjectKind::File
+            } else {
+                return Err(KinError::Other(format!(
+                    "working-copy object {} has an unsupported kind for atomic exact-source replacement",
+                    self.display_root.join(&relative).display()
+                )));
+            };
+            let (identity, state) = self.inspect_named_existing_object(
+                current,
+                &name,
+                kind,
+                &self.display_root.join(&relative),
+            )?;
+            plan.objects.push(PlannedExistingObject {
+                relative,
+                kind,
+                identity,
+                state,
+            });
+        }
+        Ok(all_children_removed)
+    }
+
+    fn apply_full_replacement(
+        &self,
+        entries: &[ValidatedSourceEntry<'_>],
+        plan: FullReplacementPlan,
+    ) -> Result<()> {
+        let mut transaction = self.create_reconciliation_transaction()?;
+        let staged = match self.stage_reconciliation_entries(&transaction.directory, entries) {
+            Ok(staged) => staged,
+            Err(error) => {
+                return match self.cleanup_reconciliation_transaction(transaction) {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(KinError::Other(format!(
+                        "{error}; staged full-tree cleanup also failed: {cleanup_error}"
+                    ))),
+                };
+            }
+        };
+
+        let mut backed_directories = Vec::with_capacity(plan.directories.len());
+        let mut created_directories = Vec::new();
+        let mut next_object_backup = plan.objects.len();
+        let file_ids: Vec<_> = entries.iter().map(|entry| entry.file_id).collect();
+        let mutation_result: Result<()> = (|| {
+            for (name_index, object) in plan.objects.iter().enumerate() {
+                self.back_up_existing_object(&mut transaction, object, name_index)?;
+            }
+            for (relative, expected_identity) in &plan.directories {
+                let backup = self.back_up_planned_empty_directory(
+                    &mut transaction,
+                    relative,
+                    *expected_identity,
+                    backed_directories.len(),
+                )?;
+                backed_directories.push(backup);
+            }
+            self.prepare_full_replacement_transactional(
+                &mut transaction,
+                &file_ids,
+                &mut created_directories,
+                &mut next_object_backup,
+                &mut backed_directories,
+            )?;
+            for staged_entry in &staged {
+                self.publish_staged_entry(&mut transaction, staged_entry)?;
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = mutation_result {
+            let rollback = self.rollback_reconciliation_manifest(&transaction);
+            return match rollback {
+                Ok(()) => match self.cleanup_reconciliation_transaction(transaction) {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(KinError::Other(format!(
+                        "{error}; full-tree rollback succeeded but transaction cleanup failed: {cleanup_error}"
+                    ))),
+                },
+                Err(rollback_error) => Err(KinError::Other(format!(
+                    "{error}; {rollback_error}; retained recovery transaction at {}",
+                    self.reconciliation_control_path()
+                        .join(&transaction.name)
+                        .display()
+                ))),
+            };
+        }
+
+        self.cleanup_reconciliation_transaction(transaction)
+    }
+
+    fn stage_reconciliation_entries<'a>(
+        &self,
+        transaction: &cap_std::fs::Dir,
+        entries: &[ValidatedSourceEntry<'a>],
+    ) -> Result<Vec<StagedReconciliationEntry<'a>>> {
+        let mut staged = Vec::with_capacity(entries.len());
+        for (name_index, entry) in entries.iter().copied().enumerate() {
+            let name = format!("stage-{name_index}");
+            let identity = self.stage_reconciliation_entry(transaction, &name, &entry)?;
+            let kind = match entry.kind {
+                SourceEntryKind::File { .. } => ExistingObjectKind::File,
+                SourceEntryKind::Symlink => ExistingObjectKind::Symlink,
+            };
+            let (inspected_identity, state) = self.inspect_named_existing_object(
+                transaction,
+                std::ffi::OsStr::new(&name),
+                kind,
+                &self.display_root.join(&entry.file_id.0),
+            )?;
+            if inspected_identity != identity {
+                return Err(KinError::Other(format!(
+                    "staged exact-source object {} changed identity before journaling",
+                    self.display_root.join(&entry.file_id.0).display()
+                )));
+            }
+            staged.push(StagedReconciliationEntry {
+                entry,
+                name_index,
+                identity,
+                state,
+            });
+        }
+        #[cfg(unix)]
+        rustix::fs::fsync(transaction)
+            .map_err(|error| KinError::io(&self.display_root, error.into()))?;
+        Ok(staged)
+    }
+
+    #[cfg(unix)]
+    fn stage_reconciliation_entry(
+        &self,
+        transaction: &cap_std::fs::Dir,
+        name: &str,
+        entry: &ValidatedSourceEntry<'_>,
+    ) -> Result<TrackedEntryIdentity> {
+        let display = self.display_root.join(&entry.file_id.0);
+        match entry.kind {
+            SourceEntryKind::File { executable } => {
+                let fd = rustix::fs::openat(
+                    transaction,
+                    name,
+                    rustix::fs::OFlags::RDWR
+                        | rustix::fs::OFlags::CREATE
+                        | rustix::fs::OFlags::EXCL
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::from_raw_mode(0o600),
+                )
+                .map_err(|error| KinError::io(&display, error.into()))?;
+                let mut file = std::fs::File::from(fd);
+                file.write_all(entry.content)
+                    .map_err(|error| KinError::io(&display, error))?;
+                rustix::fs::fchmod(
+                    &file,
+                    rustix::fs::Mode::from_raw_mode(if executable { 0o755 } else { 0o644 }),
+                )
+                .map_err(|error| KinError::io(&display, error.into()))?;
+                file.sync_all()
+                    .map_err(|error| KinError::io(&display, error))?;
+                let metadata = file
+                    .metadata()
+                    .map_err(|error| KinError::io(&display, error))?;
+                Ok(tracked_open_file_identity(&metadata))
+            }
+            SourceEntryKind::Symlink => {
+                let target =
+                    std::str::from_utf8(entry.content).expect("validated UTF-8 symlink target");
+                rustix::fs::symlinkat(target, transaction, name)
+                    .map_err(|error| KinError::io(&display, error.into()))?;
+                let metadata = transaction
+                    .symlink_metadata(name)
+                    .map_err(|error| KinError::io(&display, error))?;
+                Ok(tracked_entry_identity(&metadata))
             }
         }
     }
 
-    Ok(count)
+    #[cfg(windows)]
+    fn stage_reconciliation_entry(
+        &self,
+        transaction: &cap_std::fs::Dir,
+        name: &str,
+        entry: &ValidatedSourceEntry<'_>,
+    ) -> Result<TrackedEntryIdentity> {
+        use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+        use cap_std::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+        use windows_sys::Win32::Storage::FileSystem::DELETE;
+
+        if entry.kind == SourceEntryKind::Symlink {
+            return Err(KinError::Other(
+                "safe exact symbolic-link checkout is unsupported on Windows".to_string(),
+            ));
+        }
+        let display = self.display_root.join(&entry.file_id.0);
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+            .follow(FollowSymlinks::No);
+        let mut file = transaction
+            .open_with(name, &options)
+            .map_err(|error| KinError::io(&display, error))?;
+        file.write_all(entry.content)
+            .map_err(|error| KinError::io(&display, error))?;
+        file.sync_all()
+            .map_err(|error| KinError::io(&display, error))?;
+        tracked_open_file_identity(&file).map_err(|error| KinError::io(&display, error))
+    }
+
+    fn prepare(&self, file_ids: &[&FilePathId]) -> Result<()> {
+        let mut paths: Vec<_> = file_ids
+            .iter()
+            .map(|file_id| validate_source_path(&file_id.0))
+            .collect::<Result<_>>()?;
+        paths.sort_unstable();
+
+        for components in &paths {
+            let mut parent = self.clone_root()?;
+            for component in &components[..components.len() - 1] {
+                parent = self.open_or_create_directory(&parent, component)?;
+            }
+        }
+
+        // A graph-owned file or link cannot be atomically renamed over a
+        // directory. Remove only those leaf directories, relative to held
+        // parent capabilities, before staging replacements.
+        for components in paths {
+            let parent = self.open_existing_parent(&components)?;
+            let name = components[components.len() - 1];
+            match parent.symlink_metadata(name) {
+                Ok(metadata) if metadata.is_dir() && !metadata_is_reparse(&metadata) => {
+                    self.remove_directory_tree(
+                        &parent,
+                        std::ffi::OsStr::new(name),
+                        Path::new(&components.join("/")),
+                    )?;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(KinError::io(self.display_path(&components), error));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_without_replacement_transactional(
+        &self,
+        transaction: &mut ReconciliationTransaction,
+        file_ids: &[&FilePathId],
+        created_directories: &mut Vec<PublishedDirectory>,
+    ) -> Result<()> {
+        let mut paths: Vec<_> = file_ids
+            .iter()
+            .map(|file_id| validate_source_path(&file_id.0))
+            .collect::<Result<_>>()?;
+        paths.sort_unstable();
+        for components in &paths {
+            let mut parent = self.clone_root()?;
+            let mut relative = PathBuf::new();
+            for component in &components[..components.len() - 1] {
+                relative.push(component);
+                parent = loop {
+                    match open_directory_nofollow(&parent, std::ffi::OsStr::new(component)) {
+                        Ok(directory) => break directory,
+                        Err(_) => match parent.symlink_metadata(component) {
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                let published = self.stage_and_publish_directory(
+                                    transaction,
+                                    &parent,
+                                    std::ffi::OsStr::new(component),
+                                    &relative,
+                                    created_directories.len(),
+                                )?;
+                                let directory =
+                                    published.directory.try_clone().map_err(|error| {
+                                        KinError::io(self.display_root.join(&relative), error)
+                                    })?;
+                                created_directories.push(published);
+                                break directory;
+                            }
+                            Ok(metadata)
+                                if metadata.is_dir() && !metadata_is_reparse(&metadata) =>
+                            {
+                                continue;
+                            }
+                            Ok(_) => {
+                                return Err(KinError::Other(format!(
+                                    "working-copy path {} changed into an untracked blocker during exact branch reconciliation",
+                                    self.display_root.join(&relative).display()
+                                )));
+                            }
+                            Err(error) => {
+                                return Err(KinError::io(self.display_root.join(&relative), error));
+                            }
+                        },
+                    }
+                };
+            }
+        }
+
+        for components in paths {
+            let parent = self.open_existing_parent(&components)?;
+            let name = components[components.len() - 1];
+            match parent.symlink_metadata(name) {
+                Ok(metadata) if metadata.is_dir() && !metadata_is_reparse(&metadata) => {
+                    return Err(KinError::Other(format!(
+                        "working-copy directory {} conflicts with an exact branch file",
+                        self.display_path(&components).display()
+                    )));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(KinError::io(self.display_path(&components), error)),
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_full_replacement_transactional(
+        &self,
+        transaction: &mut ReconciliationTransaction,
+        file_ids: &[&FilePathId],
+        created_directories: &mut Vec<PublishedDirectory>,
+        next_object_backup: &mut usize,
+        backed_directories: &mut Vec<BackedUpDirectory>,
+    ) -> Result<()> {
+        let mut paths: Vec<_> = file_ids
+            .iter()
+            .map(|file_id| validate_source_path(&file_id.0))
+            .collect::<Result<_>>()?;
+        paths.sort_unstable();
+        for components in &paths {
+            let mut parent = self.clone_root()?;
+            let mut relative = PathBuf::new();
+            for component in &components[..components.len() - 1] {
+                relative.push(component);
+                parent = loop {
+                    match open_directory_nofollow(&parent, std::ffi::OsStr::new(component)) {
+                        Ok(directory) => break directory,
+                        Err(_) => match parent.symlink_metadata(component) {
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                let published = self.stage_and_publish_directory(
+                                    transaction,
+                                    &parent,
+                                    std::ffi::OsStr::new(component),
+                                    &relative,
+                                    created_directories.len(),
+                                )?;
+                                let directory =
+                                    published.directory.try_clone().map_err(|error| {
+                                        KinError::io(self.display_root.join(&relative), error)
+                                    })?;
+                                created_directories.push(published);
+                                break directory;
+                            }
+                            Ok(metadata)
+                                if metadata.is_dir() && !metadata_is_reparse(&metadata) =>
+                            {
+                                continue;
+                            }
+                            Ok(metadata) => {
+                                let kind = if metadata_is_reparse(&metadata) {
+                                    ExistingObjectKind::Symlink
+                                } else if metadata.is_file() {
+                                    ExistingObjectKind::File
+                                } else {
+                                    return Err(KinError::Other(format!(
+                                        "working-copy object {} has an unsupported kind for atomic exact-source replacement",
+                                        self.display_root.join(&relative).display()
+                                    )));
+                                };
+                                let (identity, state) = self.inspect_named_existing_object(
+                                    &parent,
+                                    std::ffi::OsStr::new(component),
+                                    kind,
+                                    &self.display_root.join(&relative),
+                                )?;
+                                let object = PlannedExistingObject {
+                                    relative: relative.clone(),
+                                    kind,
+                                    identity,
+                                    state,
+                                };
+                                self.back_up_existing_object(
+                                    transaction,
+                                    &object,
+                                    *next_object_backup,
+                                )?;
+                                *next_object_backup += 1;
+                            }
+                            Err(error) => {
+                                return Err(KinError::io(self.display_root.join(&relative), error));
+                            }
+                        },
+                    }
+                };
+            }
+        }
+
+        for components in paths {
+            let parent = self.open_existing_parent(&components)?;
+            let name = components[components.len() - 1];
+            let relative = PathBuf::from(components.join("/"));
+            match parent.symlink_metadata(name) {
+                Ok(metadata) if metadata.is_dir() && !metadata_is_reparse(&metadata) => {
+                    backed_directories.push(self.back_up_directory(
+                        transaction,
+                        &relative,
+                        backed_directories.len(),
+                        false,
+                        None,
+                    )?);
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(KinError::io(self.display_path(&components), error)),
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_reconciliation_targets(
+        &self,
+        entries: &[ValidatedSourceEntry<'_>],
+        previous: &TrackedPathClassifier,
+        removed: &TrackedPathClassifier,
+    ) -> Result<()> {
+        for entry in entries {
+            let components = validate_source_path(&entry.file_id.0)?;
+            let mut parent = self.clone_root()?;
+            let mut relative = PathBuf::new();
+            let mut ancestor_missing_or_authorized = false;
+
+            for component in &components[..components.len() - 1] {
+                relative.push(component);
+                match parent.symlink_metadata(component) {
+                    Ok(metadata) if metadata.is_dir() && !metadata_is_reparse(&metadata) => {
+                        parent = self.open_existing_directory(
+                            &parent,
+                            std::ffi::OsStr::new(component),
+                            &relative,
+                        )?;
+                    }
+                    Ok(_) if removed.relation(&relative) == TrackedPathRelation::Exact => {
+                        ancestor_missing_or_authorized = true;
+                        break;
+                    }
+                    Ok(_) => {
+                        return Err(KinError::Other(format!(
+                            "untracked working-copy path {} blocks exact branch target {}",
+                            self.display_root.join(&relative).display(),
+                            entry.file_id.0
+                        )));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        ancestor_missing_or_authorized = true;
+                        break;
+                    }
+                    Err(error) => {
+                        return Err(KinError::io(self.display_root.join(&relative), error));
+                    }
+                }
+            }
+
+            if ancestor_missing_or_authorized {
+                continue;
+            }
+
+            relative.push(components[components.len() - 1]);
+            match parent.symlink_metadata(components[components.len() - 1]) {
+                Ok(metadata) if metadata.is_dir() && !metadata_is_reparse(&metadata) => {
+                    if previous.relation(&relative) != TrackedPathRelation::Ancestor
+                        || removed.relation(&relative) != TrackedPathRelation::Ancestor
+                    {
+                        return Err(KinError::Other(format!(
+                            "untracked working-copy directory {} conflicts with exact branch target {}",
+                            self.display_root.join(&relative).display(),
+                            entry.file_id.0
+                        )));
+                    }
+                    let directory = self.open_existing_directory(
+                        &parent,
+                        std::ffi::OsStr::new(components[components.len() - 1]),
+                        &relative,
+                    )?;
+                    self.validate_removable_directory_contents(&directory, &relative, removed)?;
+                }
+                Ok(_) if previous.relation(&relative) == TrackedPathRelation::Exact => {}
+                Ok(_) => {
+                    return Err(KinError::Other(format!(
+                        "untracked working-copy path {} conflicts with exact branch target {}",
+                        self.display_root.join(&relative).display(),
+                        entry.file_id.0
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(KinError::io(self.display_root.join(&relative), error));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_removable_directory_contents(
+        &self,
+        directory: &cap_std::fs::Dir,
+        relative_directory: &Path,
+        removed: &TrackedPathClassifier,
+    ) -> Result<()> {
+        let entries = directory
+            .entries()
+            .map_err(|error| KinError::io(self.display_root.join(relative_directory), error))?;
+        for entry in entries {
+            let entry = entry
+                .map_err(|error| KinError::io(self.display_root.join(relative_directory), error))?;
+            let name = entry.file_name();
+            let relative = relative_directory.join(&name);
+            let metadata = directory
+                .symlink_metadata(&name)
+                .map_err(|error| KinError::io(self.display_root.join(&relative), error))?;
+            if metadata.is_dir() && !metadata_is_reparse(&metadata) {
+                if removed.relation(&relative) != TrackedPathRelation::Ancestor {
+                    return Err(KinError::Other(format!(
+                        "untracked working-copy directory {} blocks exact branch reconciliation",
+                        self.display_root.join(&relative).display()
+                    )));
+                }
+                let child = self.open_existing_directory(directory, &name, &relative)?;
+                self.validate_removable_directory_contents(&child, &relative, removed)?;
+            } else if removed.relation(&relative) != TrackedPathRelation::Exact {
+                return Err(KinError::Other(format!(
+                    "untracked working-copy path {} blocks exact branch reconciliation",
+                    self.display_root.join(&relative).display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_tracked_entries_unchanged(
+        &self,
+        entries: &[&ValidatedSourceEntry<'_>],
+    ) -> Result<Vec<TrackedEntryIdentity>> {
+        entries
+            .iter()
+            .map(|entry| self.validate_tracked_entry_unchanged(entry))
+            .collect()
+    }
+
+    fn revalidate_tracked_entries_unchanged(
+        &self,
+        entries: &[&ValidatedSourceEntry<'_>],
+        expected_identities: &[TrackedEntryIdentity],
+    ) -> Result<()> {
+        if entries.len() != expected_identities.len() {
+            return Err(KinError::Other(
+                "exact branch reconciliation identity preflight is inconsistent".to_string(),
+            ));
+        }
+        for (entry, expected_identity) in entries.iter().zip(expected_identities) {
+            let actual_identity = self.validate_tracked_entry_unchanged(entry)?;
+            if actual_identity != *expected_identity {
+                return Err(KinError::Other(format!(
+                    "tracked working-copy path {} changed object identity after exact branch preflight; reconciliation refused",
+                    self.display_root.join(&entry.file_id.0).display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_named_source_entry(
+        &self,
+        parent: &cap_std::fs::Dir,
+        name: &std::ffi::OsStr,
+        entry: &ValidatedSourceEntry<'_>,
+        display: &Path,
+    ) -> Result<TrackedEntryIdentity> {
+        match entry.kind {
+            SourceEntryKind::File { executable } => {
+                #[cfg(unix)]
+                let mut file = rustix::fs::openat(
+                    parent,
+                    name,
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )
+                .map(std::fs::File::from)
+                .map_err(|error| KinError::io(display, error.into()))?;
+                #[cfg(windows)]
+                let mut file = {
+                    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+
+                    let mut options = cap_std::fs::OpenOptions::new();
+                    options.read(true).follow(FollowSymlinks::No);
+                    parent
+                        .open_with(name, &options)
+                        .map_err(|error| KinError::io(display, error))?
+                };
+                let metadata = file
+                    .metadata()
+                    .map_err(|error| KinError::io(display, error))?;
+                if !metadata.is_file() {
+                    return Err(KinError::Other(format!(
+                        "exact-source object {} changed kind",
+                        display.display()
+                    )));
+                }
+                #[cfg(windows)]
+                if metadata_is_reparse(&metadata) {
+                    return Err(KinError::Other(format!(
+                        "exact-source object {} became a reparse point",
+                        display.display()
+                    )));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+
+                    if (metadata.permissions().mode() & 0o111 != 0) != executable {
+                        return Err(KinError::Other(format!(
+                            "exact-source object {} changed executable mode",
+                            display.display()
+                        )));
+                    }
+                }
+                #[cfg(windows)]
+                let _ = executable;
+                if !reader_matches_bytes(&mut file, entry.content)
+                    .map_err(|error| KinError::io(display, error))?
+                {
+                    return Err(KinError::Other(format!(
+                        "exact-source object {} changed content",
+                        display.display()
+                    )));
+                }
+                #[cfg(unix)]
+                {
+                    Ok(tracked_open_file_identity(&metadata))
+                }
+                #[cfg(windows)]
+                {
+                    tracked_open_file_identity(&file).map_err(|error| KinError::io(display, error))
+                }
+            }
+            SourceEntryKind::Symlink => {
+                #[cfg(unix)]
+                {
+                    let metadata = parent
+                        .symlink_metadata(name)
+                        .map_err(|error| KinError::io(display, error))?;
+                    if !metadata_is_reparse(&metadata) {
+                        return Err(KinError::Other(format!(
+                            "exact-source object {} changed kind",
+                            display.display()
+                        )));
+                    }
+                    let target = rustix::fs::readlinkat(parent, name, Vec::new())
+                        .map_err(|error| KinError::io(display, error.into()))?;
+                    if target.as_bytes() != entry.content {
+                        return Err(KinError::Other(format!(
+                            "exact-source symbolic link {} changed target",
+                            display.display()
+                        )));
+                    }
+                    Ok(tracked_entry_identity(&metadata))
+                }
+                #[cfg(windows)]
+                {
+                    Err(KinError::Other(
+                        "safe exact symbolic-link checkout is unsupported on Windows".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn move_named_entry_noreplace(
+        &self,
+        source_parent: &cap_std::fs::Dir,
+        source_name: &std::ffi::OsStr,
+        destination_parent: &cap_std::fs::Dir,
+        destination_name: &std::ffi::OsStr,
+    ) -> std::io::Result<()> {
+        rustix::fs::renameat_with(
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(Into::into)
+    }
+
+    #[cfg(windows)]
+    fn move_named_entry_noreplace(
+        &self,
+        source_parent: &cap_std::fs::Dir,
+        source_name: &std::ffi::OsStr,
+        destination_parent: &cap_std::fs::Dir,
+        destination_name: &std::ffi::OsStr,
+    ) -> std::io::Result<()> {
+        use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+        use cap_std::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::GENERIC_READ;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
+            .access_mode(GENERIC_READ | DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .follow(FollowSymlinks::No);
+        let source = source_parent.open_with(source_name, &options)?;
+        let metadata = source.metadata()?;
+        if metadata_is_reparse(&metadata) || !metadata.is_file() {
+            return Err(std::io::Error::other(
+                "exact-source displacement target changed kind",
+            ));
+        }
+        replace_windows_file_handle_exact(&source, destination_parent, destination_name, false)
+    }
+
+    #[cfg(unix)]
+    fn locate_open_directory(
+        &self,
+        directory: &cap_std::fs::Dir,
+        expected_identity: TrackedEntryIdentity,
+        display: &Path,
+    ) -> Result<(cap_std::fs::Dir, OsString)> {
+        let parent_fd = rustix::fs::openat(
+            directory,
+            std::path::Component::ParentDir.as_os_str(),
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map(std::fs::File::from)
+        .map_err(|error| KinError::io(display, error.into()))?;
+        let parent = cap_std::fs::Dir::from_std_file(parent_fd);
+        let entries = parent
+            .entries()
+            .map_err(|error| KinError::io(display, error))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| KinError::io(display, error))?;
+            let name = entry.file_name();
+            let metadata = match parent.symlink_metadata(&name) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(KinError::io(display, error)),
+            };
+            if metadata.is_dir()
+                && !metadata_is_reparse(&metadata)
+                && tracked_entry_identity(&metadata) == expected_identity
+            {
+                return Ok((parent, name));
+            }
+        }
+        Err(KinError::Other(format!(
+            "retained exact-source directory {} is no longer linked from its actual parent",
+            display.display()
+        )))
+    }
+
+    fn move_open_directory_exact(
+        &self,
+        source: NamedEntryLocation<'_>,
+        destination: NamedEntryLocation<'_>,
+        directory: &cap_std::fs::Dir,
+        expected_identity: TrackedEntryIdentity,
+        display: &Path,
+    ) -> Result<()> {
+        #[cfg(unix)]
+        let _ = source;
+        let retained_identity = tracked_open_directory_identity(directory)
+            .map_err(|error| KinError::io(display, error))?;
+        if retained_identity != expected_identity {
+            return Err(KinError::Other(format!(
+                "retained exact-source directory identity changed for {}",
+                display.display()
+            )));
+        }
+
+        #[cfg(unix)]
+        let (restore_parent, restore_name) =
+            self.locate_open_directory(directory, expected_identity, display)?;
+        #[cfg(windows)]
+        let (restore_parent, restore_name) = (
+            source
+                .parent
+                .try_clone()
+                .map_err(|error| KinError::io(display, error))?,
+            source.name.to_os_string(),
+        );
+
+        #[cfg(unix)]
+        rustix::fs::renameat_with(
+            &restore_parent,
+            &restore_name,
+            destination.parent,
+            destination.name,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(|error| KinError::io(display, error.into()))?;
+        #[cfg(windows)]
+        replace_windows_directory_handle_exact(
+            directory,
+            destination.parent,
+            destination.name,
+            false,
+        )
+        .map_err(|error| KinError::io(display, error))?;
+        sync_namespace_parents(&restore_parent, display, destination.parent, display)?;
+
+        let destination_validation = (|| {
+            // Read-only identity check: `named` only reads its identity for the
+            // comparison below and is dropped, so DELETE access is unnecessary.
+            let named = open_directory_nofollow(destination.parent, destination.name)
+                .map_err(|error| KinError::io(display, error))?;
+            let actual = tracked_open_directory_identity(&named)
+                .map_err(|error| KinError::io(display, error))?;
+            if actual != expected_identity {
+                return Err(KinError::Other(format!(
+                    "exact-source directory destination {} changed identity during publication",
+                    display.display()
+                )));
+            }
+            Ok(())
+        })();
+        if let Err(error) = destination_validation {
+            #[cfg(unix)]
+            let restoration = self
+                .locate_open_directory(directory, expected_identity, display)
+                .and_then(|(actual_parent, actual_name)| {
+                    rustix::fs::renameat_with(
+                        &actual_parent,
+                        &actual_name,
+                        &restore_parent,
+                        &restore_name,
+                        rustix::fs::RenameFlags::NOREPLACE,
+                    )
+                    .map_err(|restore_error| KinError::io(display, restore_error.into()))?;
+                    sync_namespace_parents(&actual_parent, display, &restore_parent, display)
+                });
+            #[cfg(windows)]
+            let restoration = replace_windows_directory_handle_exact(
+                directory,
+                &restore_parent,
+                &restore_name,
+                false,
+            )
+            .map_err(|restore_error| KinError::io(display, restore_error))
+            .and_then(|()| {
+                sync_namespace_parents(destination.parent, display, &restore_parent, display)
+            });
+            return match restoration {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(KinError::Other(format!(
+                    "{error}; exact-source directory restoration also failed for {}: {restore_error}",
+                    display.display()
+                ))),
+            };
+        }
+        Ok(())
+    }
+
+    fn stage_and_publish_directory(
+        &self,
+        transaction: &mut ReconciliationTransaction,
+        destination_parent: &cap_std::fs::Dir,
+        destination_name: &std::ffi::OsStr,
+        relative: &Path,
+        name_index: usize,
+    ) -> Result<PublishedDirectory> {
+        let stage_name = OsString::from(format!("created-dir-{name_index}"));
+        transaction
+            .directory
+            .create_dir(&stage_name)
+            .map_err(|error| KinError::io(self.display_root.join(relative), error))?;
+        let directory = self.open_existing_directory_for_removal(
+            &transaction.directory,
+            &stage_name,
+            Path::new(&stage_name),
+        )?;
+        let identity = tracked_open_directory_identity(&directory)
+            .map_err(|error| KinError::io(self.display_root.join(relative), error))?;
+        self.record_reconciliation_action(
+            transaction,
+            ReconciliationRecoveryAction::PublishDirectory {
+                relative: relative.to_path_buf(),
+                identity,
+                slot: stage_name.to_string_lossy().into_owned(),
+            },
+        )?;
+        let publication = self.move_open_directory_exact(
+            NamedEntryLocation {
+                parent: &transaction.directory,
+                name: &stage_name,
+            },
+            NamedEntryLocation {
+                parent: destination_parent,
+                name: destination_name,
+            },
+            &directory,
+            identity,
+            &self.display_root.join(relative),
+        );
+        publication?;
+        Ok(PublishedDirectory {
+            #[cfg(all(test, unix))]
+            relative: relative.to_path_buf(),
+            #[cfg(all(test, unix))]
+            identity,
+            #[cfg(all(test, unix))]
+            name_index,
+            directory,
+        })
+    }
+
+    fn relative_directory_is_empty(&self, relative: &Path) -> Result<bool> {
+        let path = relative.to_str().ok_or_else(|| {
+            KinError::Other(format!("graph-owned path is not UTF-8: {relative:?}"))
+        })?;
+        let components = validate_source_path(path)?;
+        let parent = self.open_existing_parent(&components)?;
+        let name = std::ffi::OsStr::new(components[components.len() - 1]);
+        let metadata = match parent.symlink_metadata(name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(KinError::io(self.display_root.join(relative), error)),
+        };
+        if !metadata.is_dir() || metadata_is_reparse(&metadata) {
+            return Ok(false);
+        }
+        let directory = self.open_existing_directory_for_removal(&parent, name, relative)?;
+        self.open_directory_is_empty(&directory, relative)
+    }
+
+    fn relative_directory_identity(&self, relative: &Path) -> Result<Option<TrackedEntryIdentity>> {
+        let path = relative.to_str().ok_or_else(|| {
+            KinError::Other(format!("graph-owned path is not UTF-8: {relative:?}"))
+        })?;
+        let components = validate_source_path(path)?;
+        let parent = self.open_existing_parent(&components)?;
+        let name = std::ffi::OsStr::new(components[components.len() - 1]);
+        let metadata = match parent.symlink_metadata(name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(KinError::io(self.display_root.join(relative), error)),
+        };
+        if !metadata.is_dir() || metadata_is_reparse(&metadata) {
+            return Ok(None);
+        }
+        let directory = self.open_existing_directory_for_removal(&parent, name, relative)?;
+        tracked_open_directory_identity(&directory)
+            .map(Some)
+            .map_err(|error| KinError::io(self.display_root.join(relative), error))
+    }
+
+    fn open_directory_is_empty(
+        &self,
+        directory: &cap_std::fs::Dir,
+        relative: &Path,
+    ) -> Result<bool> {
+        let mut entries = directory
+            .entries()
+            .map_err(|error| KinError::io(self.display_root.join(relative), error))?;
+        match entries.next() {
+            None => Ok(true),
+            Some(Ok(_)) => Ok(false),
+            Some(Err(error)) => Err(KinError::io(self.display_root.join(relative), error)),
+        }
+    }
+
+    fn back_up_planned_empty_directory(
+        &self,
+        transaction: &mut ReconciliationTransaction,
+        relative: &Path,
+        expected_identity: TrackedEntryIdentity,
+        name_index: usize,
+    ) -> Result<BackedUpDirectory> {
+        self.back_up_directory(
+            transaction,
+            relative,
+            name_index,
+            true,
+            Some(expected_identity),
+        )
+    }
+
+    fn back_up_directory(
+        &self,
+        transaction: &mut ReconciliationTransaction,
+        relative: &Path,
+        name_index: usize,
+        require_empty: bool,
+        expected_identity: Option<TrackedEntryIdentity>,
+    ) -> Result<BackedUpDirectory> {
+        let path = relative.to_str().ok_or_else(|| {
+            KinError::Other(format!("graph-owned path is not UTF-8: {relative:?}"))
+        })?;
+        let components = validate_source_path(path)?;
+        let parent = self.open_existing_parent(&components)?;
+        let source_name = std::ffi::OsStr::new(components[components.len() - 1]);
+        let directory = self.open_existing_directory_for_removal(&parent, source_name, relative)?;
+        if require_empty && !self.open_directory_is_empty(&directory, relative)? {
+            return Err(KinError::Other(format!(
+                "graph-owned directory transition target {} was not empty at displacement",
+                self.display_root.join(relative).display()
+            )));
+        }
+        let identity = tracked_open_directory_identity(&directory)
+            .map_err(|error| KinError::io(self.display_root.join(relative), error))?;
+        if expected_identity.is_some_and(|expected| expected != identity) {
+            return Err(KinError::Other(format!(
+                "working-copy directory {} changed identity after exact-source preflight",
+                self.display_root.join(relative).display()
+            )));
+        }
+        let backup_name = OsString::from(format!("directory-backup-{name_index}"));
+        self.record_reconciliation_action(
+            transaction,
+            ReconciliationRecoveryAction::BackupDirectory {
+                relative: relative.to_path_buf(),
+                identity,
+                slot: backup_name.to_string_lossy().into_owned(),
+            },
+        )?;
+        self.move_open_directory_exact(
+            NamedEntryLocation {
+                parent: &parent,
+                name: source_name,
+            },
+            NamedEntryLocation {
+                parent: &transaction.directory,
+                name: &backup_name,
+            },
+            &directory,
+            identity,
+            &self.display_root.join(relative),
+        )?;
+        if require_empty && !self.open_directory_is_empty(&directory, relative)? {
+            let restoration = self.move_open_directory_exact(
+                NamedEntryLocation {
+                    parent: &transaction.directory,
+                    name: &backup_name,
+                },
+                NamedEntryLocation {
+                    parent: &parent,
+                    name: source_name,
+                },
+                &directory,
+                identity,
+                &self.display_root.join(relative),
+            );
+            return match restoration {
+                Ok(()) => Err(KinError::Other(format!(
+                    "graph-owned directory {} changed contents during exact displacement",
+                    self.display_root.join(relative).display()
+                ))),
+                Err(restore_error) => Err(KinError::Other(format!(
+                    "graph-owned directory {} changed contents during exact displacement; restoration failed: {restore_error}",
+                    self.display_root.join(relative).display()
+                ))),
+            };
+        }
+        Ok(BackedUpDirectory {
+            _directory: directory,
+        })
+    }
+
+    fn move_named_entry_exact(
+        &self,
+        source: NamedEntryLocation<'_>,
+        destination: NamedEntryLocation<'_>,
+        entry: &ValidatedSourceEntry<'_>,
+        expected_identity: TrackedEntryIdentity,
+        expected_state: TrackedObjectState,
+        display: &Path,
+    ) -> Result<()> {
+        let kind = match entry.kind {
+            SourceEntryKind::File { .. } => ExistingObjectKind::File,
+            SourceEntryKind::Symlink => ExistingObjectKind::Symlink,
+        };
+        let (inspected_identity, inspected_state) =
+            self.inspect_named_existing_object(source.parent, source.name, kind, display)?;
+        if inspected_identity != expected_identity || inspected_state != expected_state {
+            return Err(KinError::Other(format!(
+                "tracked working-copy path {} changed object identity, content, or mode before exact displacement; reconciliation refused",
+                display.display()
+            )));
+        }
+        self.move_named_entry_noreplace(
+            source.parent,
+            source.name,
+            destination.parent,
+            destination.name,
+        )
+        .map_err(|error| KinError::io(display, error))?;
+        sync_namespace_parents(source.parent, display, destination.parent, display)?;
+
+        let validation = self
+            .validate_named_source_entry(destination.parent, destination.name, entry, display)
+            .and_then(|actual_identity| {
+                let (_, actual_state) = self.inspect_named_existing_object(
+                    destination.parent,
+                    destination.name,
+                    kind,
+                    display,
+                )?;
+                if actual_identity != expected_identity || actual_state != expected_state {
+                    Err(KinError::Other(format!(
+                        "tracked working-copy path {} changed object identity, content, or mode during exact displacement; reconciliation refused",
+                        display.display()
+                    )))
+                } else {
+                    Ok(())
+                }
+            });
+        if let Err(error) = validation {
+            let restored = self.move_named_entry_noreplace(
+                destination.parent,
+                destination.name,
+                source.parent,
+                source.name,
+            );
+            return match restored.and_then(|()| {
+                sync_namespace_parents(destination.parent, display, source.parent, display)
+                    .map_err(|error| std::io::Error::other(error.to_string()))
+            }) {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(KinError::Other(format!(
+                    "{error}; exact-source namespace restoration also failed for {}: {restore_error}",
+                    display.display()
+                ))),
+            };
+        }
+        Ok(())
+    }
+
+    fn inspect_named_existing_object(
+        &self,
+        parent: &cap_std::fs::Dir,
+        name: &std::ffi::OsStr,
+        expected_kind: ExistingObjectKind,
+        display: &Path,
+    ) -> Result<(TrackedEntryIdentity, TrackedObjectState)> {
+        fn hash_reader(mut reader: impl Read) -> std::io::Result<[u8; 32]> {
+            use sha2::{Digest, Sha256};
+
+            let mut hasher = Sha256::new();
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = reader.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            Ok(hasher.finalize().into())
+        }
+
+        fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
+            use sha2::{Digest, Sha256};
+
+            Sha256::digest(bytes).into()
+        }
+
+        #[cfg(unix)]
+        {
+            let metadata = parent
+                .symlink_metadata(name)
+                .map_err(|error| KinError::io(display, error))?;
+            let actual_kind = if metadata_is_reparse(&metadata) {
+                ExistingObjectKind::Symlink
+            } else if metadata.is_file() {
+                ExistingObjectKind::File
+            } else {
+                return Err(KinError::Other(format!(
+                    "working-copy object {} changed into an unsupported kind",
+                    display.display()
+                )));
+            };
+            if actual_kind != expected_kind {
+                return Err(KinError::Other(format!(
+                    "working-copy object {} changed kind after exact-source preflight",
+                    display.display()
+                )));
+            }
+            match actual_kind {
+                ExistingObjectKind::File => {
+                    use std::os::unix::fs::MetadataExt;
+
+                    let file = rustix::fs::openat(
+                        parent,
+                        name,
+                        rustix::fs::OFlags::RDONLY
+                            | rustix::fs::OFlags::NOFOLLOW
+                            | rustix::fs::OFlags::CLOEXEC,
+                        rustix::fs::Mode::empty(),
+                    )
+                    .map(std::fs::File::from)
+                    .map_err(|error| KinError::io(display, error.into()))?;
+                    let opened = file
+                        .metadata()
+                        .map_err(|error| KinError::io(display, error))?;
+                    let identity = tracked_open_file_identity(&opened);
+                    let state = TrackedObjectState {
+                        content_sha256: hash_reader(file)
+                            .map_err(|error| KinError::io(display, error))?,
+                        mode: opened.mode() & 0o7777,
+                    };
+                    Ok((identity, state))
+                }
+                ExistingObjectKind::Symlink => {
+                    use cap_std::fs::MetadataExt;
+
+                    let target = rustix::fs::readlinkat(parent, name, Vec::new())
+                        .map_err(|error| KinError::io(display, error.into()))?;
+                    let after = parent
+                        .symlink_metadata(name)
+                        .map_err(|error| KinError::io(display, error))?;
+                    let before_identity = tracked_entry_identity(&metadata);
+                    let after_identity = tracked_entry_identity(&after);
+                    if before_identity != after_identity || !metadata_is_reparse(&after) {
+                        return Err(KinError::Other(format!(
+                            "working-copy symbolic link {} changed while inspecting recovery state",
+                            display.display()
+                        )));
+                    }
+                    Ok((
+                        after_identity,
+                        TrackedObjectState {
+                            content_sha256: hash_bytes(target.as_bytes()),
+                            mode: after.mode() & 0o7777,
+                        },
+                    ))
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            let mut file = self.open_windows_existing_object(parent, name, display)?;
+            let metadata = file
+                .metadata()
+                .map_err(|error| KinError::io(display, error))?;
+            let actual_kind = if metadata_is_reparse(&metadata) {
+                ExistingObjectKind::Symlink
+            } else if metadata.is_file() {
+                ExistingObjectKind::File
+            } else {
+                return Err(KinError::Other(format!(
+                    "working-copy object {} changed into an unsupported kind",
+                    display.display()
+                )));
+            };
+            if actual_kind != expected_kind {
+                return Err(KinError::Other(format!(
+                    "working-copy object {} changed kind after exact-source preflight",
+                    display.display()
+                )));
+            }
+            let identity =
+                tracked_open_file_identity(&file).map_err(|error| KinError::io(display, error))?;
+            let content_sha256 = match actual_kind {
+                ExistingObjectKind::File => {
+                    hash_reader(&mut file).map_err(|error| KinError::io(display, error))?
+                }
+                ExistingObjectKind::Symlink => {
+                    use std::os::windows::ffi::OsStrExt;
+
+                    let target = parent
+                        .read_link(name)
+                        .map_err(|error| KinError::io(display, error))?;
+                    let wide = target
+                        .as_os_str()
+                        .encode_wide()
+                        .flat_map(u16::to_le_bytes)
+                        .collect::<Vec<_>>();
+                    hash_bytes(&wide)
+                }
+            };
+            Ok((
+                identity,
+                TrackedObjectState {
+                    content_sha256,
+                    mode: 0,
+                },
+            ))
+        }
+    }
+
+    #[cfg(windows)]
+    fn open_windows_existing_object(
+        &self,
+        parent: &cap_std::fs::Dir,
+        name: &std::ffi::OsStr,
+        display: &Path,
+    ) -> Result<cap_std::fs::File> {
+        use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+        use cap_std::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::GENERIC_READ;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
+            .access_mode(GENERIC_READ | DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .follow(FollowSymlinks::No);
+        parent
+            .open_with(name, &options)
+            .map_err(|error| KinError::io(display, error))
+    }
+
+    fn move_existing_object_exact(
+        &self,
+        source: NamedEntryLocation<'_>,
+        destination: NamedEntryLocation<'_>,
+        kind: ExistingObjectKind,
+        expected_identity: TrackedEntryIdentity,
+        expected_state: TrackedObjectState,
+        display: &Path,
+    ) -> Result<()> {
+        let (actual_identity, actual_state) =
+            self.inspect_named_existing_object(source.parent, source.name, kind, display)?;
+        if actual_identity != expected_identity {
+            return Err(KinError::Other(format!(
+                "working-copy object {} changed identity after exact-source preflight",
+                display.display()
+            )));
+        }
+        if actual_state != expected_state {
+            return Err(KinError::Other(format!(
+                "working-copy object {} changed content or mode after exact-source preflight",
+                display.display()
+            )));
+        }
+
+        #[cfg(unix)]
+        rustix::fs::renameat_with(
+            source.parent,
+            source.name,
+            destination.parent,
+            destination.name,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(|error| KinError::io(display, error.into()))?;
+        #[cfg(windows)]
+        let retained = self.open_windows_existing_object(source.parent, source.name, display)?;
+        #[cfg(windows)]
+        {
+            let retained_identity = tracked_open_file_identity(&retained)
+                .map_err(|error| KinError::io(display, error))?;
+            if retained_identity != expected_identity {
+                return Err(KinError::Other(format!(
+                    "working-copy object {} changed identity while opening for exact displacement",
+                    display.display()
+                )));
+            }
+            replace_windows_file_handle_exact(
+                &retained,
+                destination.parent,
+                destination.name,
+                false,
+            )
+            .map_err(|error| KinError::io(display, error))?;
+        }
+        sync_namespace_parents(source.parent, display, destination.parent, display)?;
+
+        let validation = self
+            .inspect_named_existing_object(destination.parent, destination.name, kind, display)
+            .and_then(|(actual_identity, actual_state)| {
+                if actual_identity == expected_identity && actual_state == expected_state {
+                    Ok(())
+                } else {
+                    Err(KinError::Other(format!(
+                        "working-copy object {} changed identity, content, or mode during exact displacement",
+                        display.display()
+                    )))
+                }
+            });
+        if let Err(error) = validation {
+            #[cfg(unix)]
+            let restoration = rustix::fs::renameat_with(
+                destination.parent,
+                destination.name,
+                source.parent,
+                source.name,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .map_err(|restore_error| KinError::io(display, restore_error.into()))
+            .and_then(|()| {
+                sync_namespace_parents(destination.parent, display, source.parent, display)
+            });
+            #[cfg(windows)]
+            let restoration =
+                replace_windows_file_handle_exact(&retained, source.parent, source.name, false)
+                    .map_err(|restore_error| KinError::io(display, restore_error))
+                    .and_then(|()| {
+                        sync_namespace_parents(destination.parent, display, source.parent, display)
+                    });
+            return match restoration {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(KinError::Other(format!(
+                    "{error}; exact-source object restoration also failed for {}: {restore_error}",
+                    display.display()
+                ))),
+            };
+        }
+        Ok(())
+    }
+
+    fn back_up_existing_object(
+        &self,
+        transaction: &mut ReconciliationTransaction,
+        object: &PlannedExistingObject,
+        name_index: usize,
+    ) -> Result<()> {
+        let path = object.relative.to_str().ok_or_else(|| {
+            KinError::Other(format!(
+                "working-copy path is not UTF-8: {:?}",
+                object.relative
+            ))
+        })?;
+        let components = validate_source_path(path)?;
+        let parent = self.open_existing_parent(&components)?;
+        let source_name = std::ffi::OsStr::new(components[components.len() - 1]);
+        let backup_name = OsString::from(format!("existing-backup-{name_index}"));
+        self.record_reconciliation_action(
+            transaction,
+            ReconciliationRecoveryAction::BackupObject {
+                relative: object.relative.clone(),
+                kind: object.kind,
+                identity: object.identity,
+                state: object.state,
+                slot: backup_name.to_string_lossy().into_owned(),
+            },
+        )?;
+        self.move_existing_object_exact(
+            NamedEntryLocation {
+                parent: &parent,
+                name: source_name,
+            },
+            NamedEntryLocation {
+                parent: &transaction.directory,
+                name: &backup_name,
+            },
+            object.kind,
+            object.identity,
+            object.state,
+            &self.display_root.join(&object.relative),
+        )
+    }
+
+    fn displace_previous_entry<'a>(
+        &self,
+        transaction: &mut ReconciliationTransaction,
+        entry: ValidatedSourceEntry<'a>,
+        expected_identity: TrackedEntryIdentity,
+        name_index: usize,
+    ) -> Result<()> {
+        let components = validate_source_path(&entry.file_id.0)?;
+        let parent = self.open_existing_parent(&components)?;
+        let source_name = std::ffi::OsStr::new(components[components.len() - 1]);
+        let backup_name = format!("backup-{name_index}");
+        let display = self.display_path(&components);
+        let kind = match entry.kind {
+            SourceEntryKind::File { .. } => ExistingObjectKind::File,
+            SourceEntryKind::Symlink => ExistingObjectKind::Symlink,
+        };
+        let (actual_identity, state) =
+            self.inspect_named_existing_object(&parent, source_name, kind, &display)?;
+        if actual_identity != expected_identity {
+            return Err(KinError::Other(format!(
+                "tracked working-copy path {} changed object identity before exact displacement",
+                display.display()
+            )));
+        }
+        self.record_reconciliation_action(
+            transaction,
+            ReconciliationRecoveryAction::BackupObject {
+                relative: PathBuf::from(&entry.file_id.0),
+                kind,
+                identity: expected_identity,
+                state,
+                slot: backup_name.clone(),
+            },
+        )?;
+        self.move_named_entry_exact(
+            NamedEntryLocation {
+                parent: &parent,
+                name: source_name,
+            },
+            NamedEntryLocation {
+                parent: &transaction.directory,
+                name: std::ffi::OsStr::new(&backup_name),
+            },
+            &entry,
+            expected_identity,
+            state,
+            &display,
+        )
+    }
+
+    fn publish_staged_entry(
+        &self,
+        transaction: &mut ReconciliationTransaction,
+        staged: &StagedReconciliationEntry<'_>,
+    ) -> Result<()> {
+        let components = validate_source_path(&staged.entry.file_id.0)?;
+        let parent = self.open_existing_parent(&components)?;
+        let destination_name = std::ffi::OsStr::new(components[components.len() - 1]);
+        let stage_name = format!("stage-{}", staged.name_index);
+        let display = self.display_path(&components);
+        let kind = match staged.entry.kind {
+            SourceEntryKind::File { .. } => ExistingObjectKind::File,
+            SourceEntryKind::Symlink => ExistingObjectKind::Symlink,
+        };
+        self.record_reconciliation_action(
+            transaction,
+            ReconciliationRecoveryAction::PublishObject {
+                relative: PathBuf::from(&staged.entry.file_id.0),
+                kind,
+                identity: staged.identity,
+                state: staged.state,
+                slot: stage_name.clone(),
+            },
+        )?;
+        fail_publication_if_injected()?;
+        self.move_named_entry_exact(
+            NamedEntryLocation {
+                parent: &transaction.directory,
+                name: std::ffi::OsStr::new(&stage_name),
+            },
+            NamedEntryLocation {
+                parent: &parent,
+                name: destination_name,
+            },
+            &staged.entry,
+            staged.identity,
+            staged.state,
+            &display,
+        )
+    }
+
+    #[cfg(all(test, unix))]
+    fn move_published_directory_back(
+        &self,
+        transaction: &cap_std::fs::Dir,
+        published: &PublishedDirectory,
+    ) -> Result<()> {
+        let path = published.relative.to_str().ok_or_else(|| {
+            KinError::Other(format!(
+                "graph-owned path is not UTF-8: {:?}",
+                published.relative
+            ))
+        })?;
+        let components = validate_source_path(path)?;
+        let parent = self.open_existing_parent(&components)?;
+        let source_name = std::ffi::OsStr::new(components[components.len() - 1]);
+        let discard_name = OsString::from(format!("discard-created-dir-{}", published.name_index));
+        self.move_open_directory_exact(
+            NamedEntryLocation {
+                parent: &parent,
+                name: source_name,
+            },
+            NamedEntryLocation {
+                parent: transaction,
+                name: &discard_name,
+            },
+            &published.directory,
+            published.identity,
+            &self.display_root.join(&published.relative),
+        )
+    }
+
+    fn validate_tracked_entry_unchanged(
+        &self,
+        entry: &ValidatedSourceEntry<'_>,
+    ) -> Result<TrackedEntryIdentity> {
+        let components =
+            validate_source_entry_components(entry.file_id, entry.kind, entry.content)?;
+        let display = self.display_path(&components);
+        let conflict = |reason: &str| {
+            KinError::Other(format!(
+                "tracked working-copy path {} differs from current branch source ({reason}); exact branch reconciliation refused",
+                display.display()
+            ))
+        };
+        let mut parent = self.clone_root()?;
+        let mut relative = PathBuf::new();
+        for component in &components[..components.len() - 1] {
+            relative.push(component);
+            let metadata = match parent.symlink_metadata(component) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(conflict("a parent directory is missing"));
+                }
+                Err(error) => {
+                    return Err(KinError::io(self.display_root.join(&relative), error));
+                }
+            };
+            if !metadata.is_dir() || metadata_is_reparse(&metadata) {
+                return Err(conflict("a parent path is not the expected directory"));
+            }
+            parent =
+                self.open_existing_directory(&parent, std::ffi::OsStr::new(component), &relative)?;
+        }
+
+        let name = components[components.len() - 1];
+        let metadata = match parent.symlink_metadata(name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(conflict("the tracked path is missing"));
+            }
+            Err(error) => return Err(KinError::io(&display, error)),
+        };
+        let identity = match entry.kind {
+            SourceEntryKind::File { executable } => {
+                if !metadata.is_file() || metadata_is_reparse(&metadata) {
+                    return Err(conflict("the tracked path kind changed"));
+                }
+                #[cfg(windows)]
+                let _ = executable;
+                #[cfg(unix)]
+                {
+                    use cap_std::fs::PermissionsExt;
+
+                    let actual_executable = metadata.permissions().mode() & 0o111 != 0;
+                    if actual_executable != executable {
+                        return Err(conflict("the executable bit changed"));
+                    }
+                }
+
+                #[cfg(unix)]
+                let mut file = rustix::fs::openat(
+                    &parent,
+                    name,
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )
+                .map(std::fs::File::from)
+                .map_err(|error| KinError::io(&display, error.into()))?;
+                #[cfg(windows)]
+                let mut file = {
+                    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+
+                    let mut options = cap_std::fs::OpenOptions::new();
+                    options.read(true).follow(FollowSymlinks::No);
+                    parent
+                        .open_with(name, &options)
+                        .map_err(|error| KinError::io(&display, error))?
+                };
+                let opened_metadata = file
+                    .metadata()
+                    .map_err(|error| KinError::io(&display, error))?;
+                if !opened_metadata.is_file() {
+                    return Err(conflict("the tracked path kind changed while opening"));
+                }
+                #[cfg(windows)]
+                if metadata_is_reparse(&opened_metadata) {
+                    return Err(conflict("the tracked path kind changed while opening"));
+                }
+                if !reader_matches_bytes(&mut file, entry.content)
+                    .map_err(|error| KinError::io(&display, error))?
+                {
+                    return Err(conflict("the file content changed"));
+                }
+                #[cfg(unix)]
+                {
+                    tracked_open_file_identity(&opened_metadata)
+                }
+                #[cfg(windows)]
+                {
+                    tracked_open_file_identity(&file)
+                        .map_err(|error| KinError::io(&display, error))?
+                }
+            }
+            SourceEntryKind::Symlink => {
+                #[cfg(windows)]
+                return Err(KinError::Other(
+                    "safe exact symbolic-link checkout is unsupported on Windows".to_string(),
+                ));
+                #[cfg(unix)]
+                {
+                    if !metadata_is_reparse(&metadata) {
+                        return Err(conflict("the tracked path kind changed"));
+                    }
+                    let target = parent
+                        .read_link(name)
+                        .map_err(|error| KinError::io(&display, error))?;
+                    if target.to_str().map(str::as_bytes) != Some(entry.content) {
+                        return Err(conflict("the symbolic-link target changed"));
+                    }
+                    tracked_entry_identity(&metadata)
+                }
+            }
+        };
+        Ok(identity)
+    }
+
+    fn open_existing_parent(&self, components: &[&str]) -> Result<cap_std::fs::Dir> {
+        let mut parent = self.clone_root()?;
+        let mut relative = PathBuf::new();
+        for component in &components[..components.len() - 1] {
+            relative.push(component);
+            parent =
+                self.open_existing_directory(&parent, std::ffi::OsStr::new(*component), &relative)?;
+        }
+        Ok(parent)
+    }
+
+    fn open_or_create_directory(
+        &self,
+        parent: &cap_std::fs::Dir,
+        component: &str,
+    ) -> Result<cap_std::fs::Dir> {
+        for _ in 0..8 {
+            if let Ok(directory) = open_directory_nofollow(parent, std::ffi::OsStr::new(component))
+            {
+                return Ok(directory);
+            }
+            match parent.symlink_metadata(component) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match create_capability_directory(parent, std::ffi::OsStr::new(component)) {
+                        Ok(()) => continue,
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                        Err(error) => {
+                            return Err(KinError::io(self.display_root.join(component), error));
+                        }
+                    }
+                }
+                Ok(metadata) if metadata.is_dir() && !metadata_is_reparse(&metadata) => {
+                    return open_directory_nofollow(parent, std::ffi::OsStr::new(component))
+                        .map_err(|error| KinError::io(self.display_root.join(component), error));
+                }
+                Ok(_) => {
+                    match remove_capability_file_or_symlink(parent, std::ffi::OsStr::new(component))
+                    {
+                        Ok(()) => continue,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => {
+                            return Err(KinError::io(self.display_root.join(component), error));
+                        }
+                    }
+                }
+                Err(error) => {
+                    return Err(KinError::io(self.display_root.join(component), error));
+                }
+            }
+        }
+        Err(KinError::Other(format!(
+            "projection parent changed repeatedly during checkout: {}",
+            self.display_root.join(component).display()
+        )))
+    }
+
+    fn open_existing_directory(
+        &self,
+        parent: &cap_std::fs::Dir,
+        component: &std::ffi::OsStr,
+        relative: &Path,
+    ) -> Result<cap_std::fs::Dir> {
+        open_directory_nofollow(parent, component)
+            .map_err(|error| KinError::io(self.display_root.join(relative), error))
+    }
+
+    fn open_existing_directory_for_removal(
+        &self,
+        parent: &cap_std::fs::Dir,
+        component: &std::ffi::OsStr,
+        relative: &Path,
+    ) -> Result<cap_std::fs::Dir> {
+        open_directory_nofollow_for_removal(parent, component)
+            .map_err(|error| KinError::io(self.display_root.join(relative), error))
+    }
+
+    fn remove_directory_tree(
+        &self,
+        parent: &cap_std::fs::Dir,
+        name: &std::ffi::OsStr,
+        relative: &Path,
+    ) -> Result<()> {
+        #[cfg(unix)]
+        {
+            // cap-std 4.0.2's Unix implementation performs a no-follow stat,
+            // opens the directory no-follow, then recursively removes through
+            // held child directory descriptors.
+            parent
+                .remove_dir_all(name)
+                .map_err(|error| KinError::io(self.display_root.join(relative), error))?;
+        }
+        #[cfg(windows)]
+        {
+            let directory = self.open_existing_directory_for_removal(parent, name, relative)?;
+            self.remove_windows_directory_contents(&directory, relative)?;
+            mark_windows_directory_for_deletion(directory)
+                .map_err(|error| KinError::io(self.display_root.join(relative), error))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn remove_windows_directory_contents(
+        &self,
+        directory: &cap_std::fs::Dir,
+        relative: &Path,
+    ) -> Result<()> {
+        let entries = directory
+            .entries()
+            .map_err(|error| KinError::io(self.display_root.join(relative), error))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| KinError::io(self.display_root.join(relative), error))?;
+            let name = entry.file_name();
+            let child_relative = relative.join(&name);
+            let metadata = directory
+                .symlink_metadata(&name)
+                .map_err(|error| KinError::io(self.display_root.join(&child_relative), error))?;
+            if metadata.is_dir() && !metadata_is_reparse(&metadata) {
+                let child =
+                    self.open_existing_directory_for_removal(directory, &name, &child_relative)?;
+                self.remove_windows_directory_contents(&child, &child_relative)?;
+                mark_windows_directory_for_deletion(child).map_err(|error| {
+                    KinError::io(self.display_root.join(&child_relative), error)
+                })?;
+            } else {
+                remove_capability_file_or_symlink(directory, &name).map_err(|error| {
+                    KinError::io(self.display_root.join(&child_relative), error)
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn clone_root(&self) -> Result<cap_std::fs::Dir> {
+        self.root
+            .try_clone()
+            .map_err(|error| KinError::io(&self.display_root, error))
+    }
+
+    fn display_path(&self, components: &[&str]) -> PathBuf {
+        self.display_root.join(components.join("/"))
+    }
+}
+
+#[cfg(unix)]
+fn open_directory_nofollow(
+    parent: &cap_std::fs::Dir,
+    component: &std::ffi::OsStr,
+) -> std::io::Result<cap_std::fs::Dir> {
+    rustix::fs::openat(
+        parent,
+        component,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map(|fd| cap_std::fs::Dir::from_std_file(fd.into()))
+    .map_err(Into::into)
+}
+
+#[cfg(any(unix, windows))]
+fn reader_matches_bytes(reader: &mut impl Read, expected: &[u8]) -> std::io::Result<bool> {
+    let mut offset = 0;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(offset == expected.len());
+        }
+        let Some(end) = offset.checked_add(read) else {
+            return Ok(false);
+        };
+        if end > expected.len() || buffer[..read] != expected[offset..end] {
+            return Ok(false);
+        }
+        offset = end;
+    }
+}
+
+#[cfg(unix)]
+fn open_directory_nofollow_for_removal(
+    parent: &cap_std::fs::Dir,
+    component: &std::ffi::OsStr,
+) -> std::io::Result<cap_std::fs::Dir> {
+    open_directory_nofollow(parent, component)
+}
+
+#[cfg(unix)]
+fn create_capability_directory(
+    parent: &cap_std::fs::Dir,
+    component: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    rustix::fs::mkdirat(parent, component, rustix::fs::Mode::from_raw_mode(0o755))
+        .map_err(Into::into)
+}
+
+#[cfg(unix)]
+fn remove_capability_file_or_symlink(
+    parent: &cap_std::fs::Dir,
+    component: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    rustix::fs::unlinkat(parent, component, rustix::fs::AtFlags::empty()).map_err(Into::into)
+}
+
+#[cfg(unix)]
+fn metadata_is_reparse(metadata: &cap_std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn open_directory_nofollow(
+    parent: &cap_std::fs::Dir,
+    component: &std::ffi::OsStr,
+) -> std::io::Result<cap_std::fs::Dir> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
+    use cap_std::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    // cap-std opens directories without FILE_SHARE_DELETE, which collides on
+    // Windows with a peer that holds a concurrent handle under `.kin` (for
+    // example the graph store's own snapshot/index). Share read/write/delete so
+    // the projection can open a control-plane directory alongside those handles;
+    // POSIX permits this implicitly.
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true);
+    let file = parent.open_with(component, &options)?;
+    let metadata = file.metadata()?;
+    if metadata_is_reparse(&metadata) || !metadata.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "projection directory component is a reparse point or non-directory: {}",
+            component.to_string_lossy()
+        )));
+    }
+    Ok(cap_std::fs::Dir::from_std_file(file.into_std()))
+}
+
+#[cfg(windows)]
+fn open_directory_nofollow_for_removal(
+    parent: &cap_std::fs::Dir,
+    component: &std::ffi::OsStr,
+) -> std::io::Result<cap_std::fs::Dir> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
+    use cap_std::fs::OpenOptionsExt;
+    use windows_sys::Win32::Foundation::GENERIC_READ;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    // Request DELETE access to remove the directory, and share read/write/delete
+    // so the open does not collide on Windows with a peer holding a concurrent
+    // handle under `.kin`. cap-std's directory default omits FILE_SHARE_DELETE,
+    // which raises a sharing violation here even though POSIX allows the same
+    // unlink-while-open pattern.
+    options
+        .access_mode(GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true);
+    let file = parent.open_with(component, &options)?;
+    let metadata = file.metadata()?;
+    if metadata_is_reparse(&metadata) || !metadata.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "projection removal target is a reparse point or non-directory: {}",
+            component.to_string_lossy()
+        )));
+    }
+    Ok(cap_std::fs::Dir::from_std_file(file.into_std()))
+}
+
+#[cfg(windows)]
+fn create_capability_directory(
+    parent: &cap_std::fs::Dir,
+    component: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    parent.create_dir(component)
+}
+
+#[cfg(windows)]
+fn remove_capability_file_or_symlink(
+    parent: &cap_std::fs::Dir,
+    component: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    use cap_fs_ext::DirExt;
+
+    parent.remove_file_or_symlink(component)
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse(metadata: &cap_std::fs::Metadata) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    cap_fs_ext::OsMetadataExt::file_attributes(metadata) & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
+fn replace_windows_file_handle_exact(
+    source: &cap_std::fs::File,
+    destination_parent: &cap_std::fs::Dir,
+    destination_name: &std::ffi::OsStr,
+    replace_existing: bool,
+) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    replace_windows_handle_exact(
+        source.as_raw_handle().cast(),
+        destination_parent,
+        destination_name,
+        replace_existing,
+    )
+}
+
+#[cfg(windows)]
+fn replace_windows_directory_handle_exact(
+    source: &cap_std::fs::Dir,
+    destination_parent: &cap_std::fs::Dir,
+    destination_name: &std::ffi::OsStr,
+    replace_existing: bool,
+) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    replace_windows_handle_exact(
+        source.as_raw_handle().cast(),
+        destination_parent,
+        destination_name,
+        replace_existing,
+    )
+}
+
+/// Resolve an open directory/file handle to its fully-qualified verbatim `\\?\`
+/// final path. Grows the buffer until `GetFinalPathNameByHandleW` reports the
+/// full length, mirroring the proven managed-config resolution idiom.
+#[cfg(windows)]
+fn read_windows_final_path(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> std::io::Result<Vec<u16>> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS,
+    };
+
+    let flags = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS;
+    let mut capacity = 256_usize;
+    loop {
+        let mut buffer = vec![0_u16; capacity];
+        let length = u32::try_from(buffer.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "exact-source destination path buffer exceeds the Windows length limit",
+            )
+        })?;
+        let written =
+            unsafe { GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), length, flags) };
+        if written == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let written = written as usize;
+        if written >= buffer.len() {
+            // The buffer was too small; the return value is the required length
+            // including the terminating NUL. Grow past it and retry.
+            capacity = written.checked_add(1).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "exact-source destination path length overflow",
+                )
+            })?;
+            continue;
+        }
+        buffer.truncate(written);
+        return Ok(buffer);
+    }
+}
+
+#[cfg(windows)]
+fn replace_windows_handle_exact(
+    source: windows_sys::Win32::Foundation::HANDLE,
+    destination_parent: &cap_std::fs::Dir,
+    destination_name: &std::ffi::OsStr,
+    replace_existing: bool,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO,
+    };
+
+    let mut components = Path::new(destination_name).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(name)) if name == destination_name)
+        || components.next().is_some()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "exact-source destination must be one normal path component",
+        ));
+    }
+    let name_wide = destination_name.encode_wide().collect::<Vec<_>>();
+    if name_wide.is_empty() || name_wide.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "exact-source destination is empty or contains an interior NUL",
+        ));
+    }
+    // SetFileInformationByHandle's FileRenameInfo requires RootDirectory to be NULL
+    // and FileName to carry the fully-qualified destination; passing a directory
+    // handle in RootDirectory is rejected with ERROR_INVALID_PARAMETER (only the NT
+    // NtSetInformationFile path honors a relative name against a root handle).
+    // Resolve the parent's verbatim `\\?\` final path from its handle and append the
+    // validated single-component leaf.
+    //
+    // A full-path destination is re-resolved from the volume root, so unlike a
+    // parent-handle-relative rename it does not by itself pin the destination against
+    // an ancestor swap. Callers bound that window: control renames hold the projection
+    // lock, working-copy displacement re-validates post-rename identity/state and rolls
+    // back on mismatch, and new destinations pass replace_existing = false so a raced
+    // destination fails closed rather than being overwritten.
+    let mut destination_wide = read_windows_final_path(destination_parent.as_raw_handle().cast())?;
+    destination_wide.push(u16::from(b'\\'));
+    destination_wide.extend_from_slice(&name_wide);
+    let name_bytes = destination_wide
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "exact-source destination length overflow",
+            )
+        })?;
+    let buffer_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName)
+        .checked_add(name_bytes)
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u16>()))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "exact-source rename buffer length overflow",
+            )
+        })?;
+    let file_name_length = u32::try_from(name_bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "exact-source destination exceeds the Windows length limit",
+        )
+    })?;
+    let buffer_length = u32::try_from(buffer_bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "exact-source rename buffer exceeds the Windows length limit",
+        )
+    })?;
+    let mut storage = vec![0_usize; buffer_bytes.div_ceil(std::mem::size_of::<usize>())];
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    unsafe {
+        // FileRenameInfo reads this union field as ReplaceIfExists: a nonzero low
+        // byte replaces an existing destination. New branch-only paths pass 0 so a
+        // raced untracked destination fails closed rather than being overwritten;
+        // previously-tracked paths pass 1 to replace. FileRenameInfo (not the Ex
+        // class) is used because FileRenameInfoEx raises ERROR_INVALID_PARAMETER
+        // where its POSIX-semantics extension is unavailable, and no POSIX flag is
+        // needed here.
+        (*info).Anonymous.Flags = u32::from(replace_existing);
+        (*info).RootDirectory = std::ptr::null_mut();
+        (*info).FileNameLength = file_name_length;
+        std::ptr::copy_nonoverlapping(
+            destination_wide.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            destination_wide.len(),
+        );
+        *std::ptr::addr_of_mut!((*info).FileName)
+            .cast::<u16>()
+            .add(destination_wide.len()) = 0;
+    }
+    if unsafe { SetFileInformationByHandle(source, FileRenameInfo, info.cast(), buffer_length) }
+        == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn mark_windows_directory_for_deletion(directory: cap_std::fs::Dir) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    let directory = directory.into_std_file();
+    mark_windows_handle_for_deletion(directory.as_raw_handle().cast())?;
+    drop(directory);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn mark_windows_handle_for_deletion(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> std::io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+    };
+
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let removed = unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if removed == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_windows_projection_root(root: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    let absolute = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(root)
+    };
+    if absolute
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "projection root may not contain parent traversal",
+        ));
+    }
+    let ambient_root = absolute
+        .ancestors()
+        .last()
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "projection root has no filesystem root",
+            )
+        })?;
+    let relative = absolute.strip_prefix(ambient_root).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "projection root is not beneath its filesystem root",
+        )
+    })?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "projection root contains an unsupported component",
+        ));
+    }
+
+    let mut current =
+        cap_std::fs::Dir::open_ambient_dir(ambient_root, cap_std::ambient_authority())?;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            unreachable!("projection root was validated as normal components")
+        };
+        current = open_directory_nofollow(&current, name)?;
+    }
+    Ok(current)
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrackedPathRelation {
+    Exact,
+    Ancestor,
+    Descendant,
+    Unrelated,
+}
+
+#[cfg(any(unix, windows))]
+struct TrackedPathClassifier {
+    /// Complete graph-owned leaf keys.
+    exact: HashSet<Vec<OsString>>,
+    /// Strict prefixes of graph-owned leaves. A filesystem directory whose key
+    /// is in this set must be traversed because it contains a tracked leaf.
+    ancestors: HashSet<Vec<OsString>>,
+}
+
+#[cfg(any(unix, windows))]
+impl TrackedPathClassifier {
+    fn new<'a>(tracked: impl IntoIterator<Item = &'a FilePathId>) -> Self {
+        let mut exact = HashSet::new();
+        let mut ancestors = HashSet::new();
+        for file_id in tracked {
+            let key = projection_path_key(Path::new(&file_id.0));
+            for prefix_len in 1..key.len() {
+                ancestors.insert(key[..prefix_len].to_vec());
+            }
+            exact.insert(key);
+        }
+        Self { exact, ancestors }
+    }
+
+    fn relation(&self, relative: &Path) -> TrackedPathRelation {
+        self.relation_with_probe_count(relative).0
+    }
+
+    /// Classify one filesystem path with a number of hash probes bounded by
+    /// path depth, independent of the number of graph-owned files. Returning
+    /// the probe count keeps the complexity contract directly testable without
+    /// a timing-sensitive benchmark.
+    fn relation_with_probe_count(&self, relative: &Path) -> (TrackedPathRelation, usize) {
+        let key = projection_path_key(relative);
+        let mut probes = 1;
+        if self.exact.contains(key.as_slice()) {
+            return (TrackedPathRelation::Exact, probes);
+        }
+        probes += 1;
+        if self.ancestors.contains(key.as_slice()) {
+            return (TrackedPathRelation::Ancestor, probes);
+        }
+        for prefix_len in 1..key.len() {
+            probes += 1;
+            if self.exact.contains(&key[..prefix_len]) {
+                return (TrackedPathRelation::Descendant, probes);
+            }
+        }
+        (TrackedPathRelation::Unrelated, probes)
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn projection_path_key(path: &Path) -> Vec<OsString> {
+    path.components()
+        .map(|component| match component {
+            std::path::Component::Normal(component) => {
+                #[cfg(any(windows, target_os = "macos"))]
+                if let Some(component) = component.to_str() {
+                    return OsString::from(projection_component_comparison_key(component));
+                }
+                component.to_os_string()
+            }
+            other => other.as_os_str().to_os_string(),
+        })
+        .collect()
+}
+
+fn is_reserved_source_component(component: &str) -> bool {
+    if component.eq_ignore_ascii_case(".git")
+        || component.eq_ignore_ascii_case(".kin")
+        || component.eq_ignore_ascii_case(".kin-session")
+    {
+        return true;
+    }
+
+    let key = projection_component_comparison_key(component);
+    matches!(key.as_str(), ".git" | ".kin" | ".kin-session")
+}
+
+fn validate_portable_source_path(path: &str) -> Result<Vec<&str>> {
+    if path.is_empty()
+        || path.len() > 4096
+        || path.starts_with('/')
+        || path.ends_with('/')
+        || path.contains(['\0', '\\'])
+    {
+        return Err(KinError::Other(format!(
+            "unsafe graph-owned source path {path:?}"
+        )));
+    }
+    let components: Vec<_> = path.split('/').collect();
+    if components.iter().any(|component| {
+        component.is_empty()
+            || component.len() > 255
+            || matches!(*component, "." | "..")
+            || is_reserved_source_component(component)
+            || !is_safe_windows_source_component(component)
+    }) {
+        return Err(KinError::Other(format!(
+            "unsafe graph-owned source path {path:?}"
+        )));
+    }
+    Ok(components)
+}
+
+fn validate_source_path(path: &str) -> Result<Vec<&str>> {
+    if path.is_empty()
+        || path.len() > 4096
+        || path.starts_with('/')
+        || path.ends_with('/')
+        || path.contains(['\0', '\\'])
+    {
+        return Err(KinError::Other(format!(
+            "unsafe graph-owned source path {path:?}"
+        )));
+    }
+    let components: Vec<_> = path.split('/').collect();
+    if components.iter().any(|component| {
+        component.is_empty()
+            || component.len() > 255
+            || matches!(*component, "." | "..")
+            || is_reserved_source_component(component)
+            || cfg!(windows) && !is_safe_windows_source_component(component)
+    }) {
+        return Err(KinError::Other(format!(
+            "unsafe graph-owned source path {path:?}"
+        )));
+    }
+    Ok(components)
+}
+
+fn is_safe_windows_source_component(component: &str) -> bool {
+    if component.encode_utf16().count() > 255
+        || component.ends_with(['.', ' '])
+        || component.chars().any(|character| {
+            character <= '\u{1f}' || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+        })
+    {
+        return false;
+    }
+
+    // Mirror cap-primitives' Windows open guard: take the file prefix before
+    // the first non-leading dot, trim trailing whitespace from that prefix,
+    // then apply Unicode uppercase. A looser check can pass global preflight
+    // and fail only after destructive tree preparation has begun.
+    let bytes = component.as_bytes();
+    let stem_end = bytes
+        .get(1..)
+        .and_then(|tail| tail.iter().position(|byte| *byte == b'.'))
+        .map_or(bytes.len(), |index| index + 1);
+    let stem = component[..stem_end].trim_end().to_uppercase();
+    if matches!(
+        stem.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "CONIN$"
+            | "CONOUT$"
+            | "COM0"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "COM¹"
+            | "COM²"
+            | "COM³"
+            | "LPT0"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+            | "LPT¹"
+            | "LPT²"
+            | "LPT³"
+    ) {
+        return false;
+    }
+    true
+}
+
+fn validate_source_symlink_target(path: &[&str], target: &str) -> Result<()> {
+    validate_source_symlink_target_with_windows_rules(path, target, cfg!(windows))
+}
+
+fn validate_source_symlink_target_with_windows_rules(
+    path: &[&str],
+    target: &str,
+    enforce_windows_components: bool,
+) -> Result<()> {
+    if target.is_empty()
+        || target.len() > 4096
+        || target.starts_with('/')
+        || target.contains(['\0', '\\'])
+    {
+        return Err(KinError::Other(format!(
+            "source symlink has unsafe target {target:?}"
+        )));
+    }
+    let mut resolved: Vec<&str> = path[..path.len().saturating_sub(1)].to_vec();
+    for component in target.split('/') {
+        match component {
+            "" => {
+                return Err(KinError::Other(format!(
+                    "source symlink has unsafe target {target:?}"
+                )))
+            }
+            "." => {}
+            ".." => {
+                if resolved.pop().is_none() {
+                    return Err(KinError::Other(format!(
+                        "source symlink target escapes projection root: {target:?}"
+                    )));
+                }
+            }
+            component if is_reserved_source_component(component) => {
+                return Err(KinError::Other(format!(
+                    "source symlink targets reserved control-plane path {target:?}"
+                )))
+            }
+            component
+                if component.len() > 255
+                    || enforce_windows_components
+                        && !is_safe_windows_source_component(component) =>
+            {
+                return Err(KinError::Other(format!(
+                    "source symlink has unmaterializable target component {component:?}"
+                )))
+            }
+            component => resolved.push(component),
+        }
+    }
+    if resolved
+        .iter()
+        .any(|component| is_reserved_source_component(component))
+    {
+        return Err(KinError::Other(format!(
+            "source symlink targets reserved control-plane path {target:?}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn regular() -> SourceEntryKind {
+        SourceEntryKind::File { executable: false }
+    }
+
+    #[test]
+    fn materialization_rejects_unsafe_source_paths() {
+        let root = tempfile::tempdir().unwrap();
+        for path in [
+            "",
+            "/absolute",
+            "../escape",
+            "src/../escape",
+            ".kin/config",
+            ".KIN/config",
+            ".git/config",
+            ".GiT/config",
+            ".kin-session/base.json",
+            "src/.KIN-SESSION/base.json",
+            "src\\escape",
+        ] {
+            let result = materialize_source_entry(
+                root.path(),
+                &FilePathId(path.to_string()),
+                regular(),
+                b"blocked",
+            );
+            assert!(result.is_err(), "unsafe path was accepted: {path:?}");
+        }
+    }
+
+    #[test]
+    fn unicode_case_aliases_cannot_target_reserved_control_plane_paths() {
+        for component in [".g\u{131}t", ".\u{212a}in", ".\u{212a}in-session"] {
+            assert!(
+                is_reserved_source_component(component),
+                "Unicode alias of a reserved component was accepted: {component:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn portable_source_paths_reject_windows_names_and_cross_platform_aliases() {
+        for path in [
+            "NUL",
+            "src/COM1.rs",
+            "src/trailing.",
+            "src/alternate:stream",
+        ] {
+            assert!(
+                validate_portable_source_paths(std::iter::once(path)).is_err(),
+                "unportable path was accepted: {path:?}"
+            );
+        }
+        for paths in [
+            ["src/Foo.rs", "src/foo.rs"],
+            ["src/caf\u{e9}.rs", "src/cafe\u{301}.rs"],
+        ] {
+            assert!(
+                validate_portable_source_paths(paths).is_err(),
+                "cross-platform aliases were accepted: {paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_source_component_validation_rejects_aliasing_names() {
+        for component in [
+            "CON",
+            "con.txt",
+            "PRN",
+            "AUX.log",
+            "NUL",
+            "NUL .log",
+            "COM0",
+            "COM0.rs",
+            "COM1.rs",
+            "COM1 .txt",
+            "com9",
+            "COM¹",
+            "com².rs",
+            "COM³ .txt",
+            "LPT0",
+            "LPT1",
+            "lpt9.txt",
+            "LPT¹",
+            "lpt².rs",
+            "LPT³ .txt",
+            "CONIN$",
+            "CONOUT$",
+            "alternate:stream",
+            "trailing.",
+            "trailing ",
+            "wild*card",
+            "question?mark",
+        ] {
+            assert!(
+                !is_safe_windows_source_component(component),
+                "unsafe Windows component was accepted: {component:?}"
+            );
+        }
+        for component in [
+            "console.rs",
+            "com10",
+            "lpt10",
+            "normal.name",
+            "space inside",
+        ] {
+            assert!(
+                is_safe_windows_source_component(component),
+                "ordinary Windows component was rejected: {component:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_symlink_target_components_reject_unmaterializable_names() {
+        let link_path = ["dir", "link"];
+        let overlong = "x".repeat(256);
+        for target in [
+            "CON/file".to_string(),
+            "nested/aux.txt".to_string(),
+            "alternate:stream".to_string(),
+            "trailing.".to_string(),
+            "wild*card".to_string(),
+            overlong,
+        ] {
+            let error =
+                validate_source_symlink_target_with_windows_rules(&link_path, &target, true)
+                    .expect_err("Windows-invalid link target component must fail preflight");
+            assert!(
+                error
+                    .to_string()
+                    .contains("unmaterializable target component"),
+                "unexpected error for {target:?}: {error}"
+            );
+        }
+
+        validate_source_symlink_target_with_windows_rules(
+            &link_path,
+            "../ordinary/target.rs",
+            true,
+        )
+        .expect("ordinary relative target should remain valid");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_symlink_entry_validates_target_before_reporting_unsupported_publication() {
+        let error = validate_source_entry(
+            &FilePathId("dir/link".to_string()),
+            SourceEntryKind::Symlink,
+            b"CON/file",
+        )
+        .expect_err("Windows-invalid target must fail before publication");
+
+        assert!(error
+            .to_string()
+            .contains("unmaterializable target component"));
+    }
+
+    #[test]
+    fn materialization_rejects_escaping_or_reserved_symlink_targets() {
+        let root = tempfile::tempdir().unwrap();
+        for target in [
+            "../../escape",
+            "/absolute",
+            ".kin/config",
+            "../.git/config",
+            "../.kin-session/base.json",
+        ] {
+            let result = materialize_source_entry(
+                root.path(),
+                &FilePathId("dir/link".to_string()),
+                SourceEntryKind::Symlink,
+                target.as_bytes(),
+            );
+            assert!(
+                result.is_err(),
+                "unsafe link target was accepted: {target:?}"
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn reserved_control_plane_path_fails_before_destructive_transition() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a-parent"), b"old complete bytes").unwrap();
+        let transition = FilePathId("a-parent/child.txt".to_string());
+        let reserved = FilePathId("z/.KIN-SESSION/base.json".to_string());
+
+        let error = replace_source_tree(
+            root.path(),
+            [
+                (&transition, regular(), b"new child".as_slice()),
+                (&reserved, regular(), b"forbidden".as_slice()),
+            ],
+            |_| false,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unsafe graph-owned source path"));
+        assert_eq!(
+            std::fs::read(root.path().join("a-parent")).unwrap(),
+            b"old complete bytes"
+        );
+        assert!(!root.path().join("a-parent/child.txt").exists());
+        assert!(!root.path().join("z").exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn overlong_component_fails_before_destructive_transition() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a-parent"), b"old complete bytes").unwrap();
+        let transition = FilePathId("a-parent/child.txt".to_string());
+        let overlong = FilePathId(format!("z/{}", "x".repeat(256)));
+
+        let error = replace_source_tree(
+            root.path(),
+            [
+                (&transition, regular(), b"new child".as_slice()),
+                (&overlong, regular(), b"forbidden".as_slice()),
+            ],
+            |_| false,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unsafe graph-owned source path"));
+        assert_eq!(
+            std::fs::read(root.path().join("a-parent")).unwrap(),
+            b"old complete bytes"
+        );
+        assert!(!root.path().join("a-parent/child.txt").exists());
+        assert!(!root.path().join("z").exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn targeted_reconciliation_rejects_untracked_collision_before_removal() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("old-tracked.rs"), b"old tracked bytes").unwrap();
+        std::fs::write(root.path().join("new-target.rs"), b"untracked user bytes").unwrap();
+        let old = FilePathId("old-tracked.rs".to_string());
+        let target = FilePathId("new-target.rs".to_string());
+
+        let error = reconcile_source_tree(
+            root.path(),
+            [(&old, regular(), b"old tracked bytes".as_slice())],
+            [(&target, regular(), b"target bytes".as_slice())],
+            should_preserve_checkout_path,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("untracked working-copy path"));
+        assert_eq!(
+            std::fs::read(root.path().join("old-tracked.rs")).unwrap(),
+            b"old tracked bytes"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("new-target.rs")).unwrap(),
+            b"untracked user bytes"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn targeted_reconciliation_removes_clean_tracked_generated_path_only() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("target/debug")).unwrap();
+        std::fs::write(root.path().join("target/tracked.bin"), b"graph-owned bytes").unwrap();
+        std::fs::write(
+            root.path().join("target/debug/untracked-cache"),
+            b"generated bytes",
+        )
+        .unwrap();
+        let old = FilePathId("target/tracked.bin".to_string());
+
+        reconcile_source_tree(
+            root.path(),
+            [(&old, regular(), b"graph-owned bytes".as_slice())],
+            std::iter::empty::<(&FilePathId, SourceEntryKind, &[u8])>(),
+            should_preserve_checkout_path,
+        )
+        .unwrap();
+
+        assert!(!root.path().join("target/tracked.bin").exists());
+        assert_eq!(
+            std::fs::read(root.path().join("target/debug/untracked-cache")).unwrap(),
+            b"generated bytes"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn graph_owned_generated_directory_can_transition_to_file() {
+        for generated in ["target", "vendor", "dist", "build", "node_modules"] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(root.path().join(generated).join("nested/deeper")).unwrap();
+            std::fs::write(
+                root.path()
+                    .join(generated)
+                    .join("nested/deeper/tracked.old"),
+                b"old graph bytes",
+            )
+            .unwrap();
+            std::fs::create_dir_all(root.path().join(".next/cache")).unwrap();
+            std::fs::write(root.path().join(".next/cache/untracked"), b"cache bytes").unwrap();
+            let old = FilePathId(format!("{generated}/nested/deeper/tracked.old"));
+            let target = FilePathId(generated.to_string());
+
+            reconcile_source_tree(
+                root.path(),
+                [(&old, regular(), b"old graph bytes".as_slice())],
+                [(&target, regular(), b"new graph file".as_slice())],
+                should_preserve_checkout_path,
+            )
+            .unwrap();
+
+            assert_eq!(
+                std::fs::read(root.path().join(generated)).unwrap(),
+                b"new graph file",
+                "graph-owned {generated} directory must transition to a file"
+            );
+            assert_eq!(
+                std::fs::read(root.path().join(".next/cache/untracked")).unwrap(),
+                b"cache bytes",
+                "unrelated generated content must survive {generated} transition"
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn generated_directory_transition_rejects_unrelated_child_before_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("target")).unwrap();
+        std::fs::write(root.path().join("target/tracked.old"), b"old graph bytes").unwrap();
+        std::fs::write(root.path().join("target/editor-cache"), b"editor bytes").unwrap();
+        let old = FilePathId("target/tracked.old".to_string());
+        let target = FilePathId("target".to_string());
+
+        let error = reconcile_source_tree(
+            root.path(),
+            [(&old, regular(), b"old graph bytes".as_slice())],
+            [(&target, regular(), b"new graph file".as_slice())],
+            should_preserve_checkout_path,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("untracked working-copy path"));
+        assert_eq!(
+            std::fs::read(root.path().join("target/tracked.old")).unwrap(),
+            b"old graph bytes"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("target/editor-cache")).unwrap(),
+            b"editor bytes"
+        );
+        assert!(root.path().join("target").is_dir());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn post_preflight_editor_replacement_blocks_overwrite_and_preserves_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        let path = root.path().join("src/owned.rs");
+        std::fs::write(&path, b"old graph bytes").unwrap();
+        let owned = FilePathId("src/owned.rs".to_string());
+
+        let error = reconcile_source_tree_with_pre_mutation_hook(
+            root.path(),
+            [(&owned, regular(), b"old graph bytes".as_slice())],
+            [(&owned, regular(), b"new branch bytes".as_slice())],
+            should_preserve_checkout_path,
+            || {
+                let replacement = root.path().join("src/editor.tmp");
+                std::fs::write(&replacement, b"editor bytes").unwrap();
+                std::fs::remove_file(&path).unwrap();
+                std::fs::rename(replacement, &path).unwrap();
+            },
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("differs from current branch source"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"editor bytes");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn post_preflight_editor_replacement_blocks_removal_and_preserves_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        let path = root.path().join("src/removed.rs");
+        std::fs::write(&path, b"old graph bytes").unwrap();
+        let removed = FilePathId("src/removed.rs".to_string());
+
+        let error = reconcile_source_tree_with_pre_mutation_hook(
+            root.path(),
+            [(&removed, regular(), b"old graph bytes".as_slice())],
+            std::iter::empty::<(&FilePathId, SourceEntryKind, &[u8])>(),
+            should_preserve_checkout_path,
+            || {
+                let replacement = root.path().join("src/editor.tmp");
+                std::fs::write(&replacement, b"editor bytes").unwrap();
+                std::fs::remove_file(&path).unwrap();
+                std::fs::rename(replacement, &path).unwrap();
+            },
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("differs from current branch source"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"editor bytes");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn projection_root_kernel_lock_serializes_cross_process_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let first = ProjectionRoot::open(root.path()).unwrap();
+
+        let error = match ProjectionRoot::open(root.path()) {
+            Ok(_) => panic!("a second projection authority entered while the lock was held"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("another exact-source projection is active"),
+            "unexpected lock refusal: {error}"
+        );
+
+        drop(first);
+        ProjectionRoot::open(root.path())
+            .expect("dropping the retained capability must release the kernel lock");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_preflight_control_directory_replacement_blocks_tree_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("owned.rs");
+        std::fs::write(&path, b"old graph bytes").unwrap();
+        let owned = FilePathId("owned.rs".to_string());
+
+        let error = reconcile_source_tree_with_pre_mutation_hook(
+            root.path(),
+            [(&owned, regular(), b"old graph bytes".as_slice())],
+            [(&owned, regular(), b"new graph bytes".as_slice())],
+            should_preserve_checkout_path,
+            || {
+                std::fs::rename(root.path().join(".kin"), root.path().join(".kin-detached"))
+                    .unwrap();
+                std::fs::create_dir(root.path().join(".kin")).unwrap();
+                std::fs::write(root.path().join(".kin/HEAD"), b"replacement").unwrap();
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("repository control directory"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"old graph bytes");
+        assert_eq!(
+            std::fs::read(root.path().join(".kin/HEAD")).unwrap(),
+            b"replacement"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn post_preflight_same_bytes_replacement_blocks_mutation_by_identity() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        let path = root.path().join("src/owned.rs");
+        std::fs::write(&path, b"old graph bytes").unwrap();
+        let owned = FilePathId("src/owned.rs".to_string());
+
+        let error = reconcile_source_tree_with_pre_mutation_hook(
+            root.path(),
+            [(&owned, regular(), b"old graph bytes".as_slice())],
+            [(&owned, regular(), b"new branch bytes".as_slice())],
+            should_preserve_checkout_path,
+            || {
+                let replacement = root.path().join("src/editor.tmp");
+                std::fs::write(&replacement, b"old graph bytes").unwrap();
+                std::fs::remove_file(&path).unwrap();
+                std::fs::rename(replacement, &path).unwrap();
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("changed object identity"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"old graph bytes");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn post_identity_validation_replacement_is_restored_without_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        let path = root.path().join("src/owned.rs");
+        std::fs::write(&path, b"old graph bytes").unwrap();
+        let owned = FilePathId("src/owned.rs".to_string());
+
+        let error = reconcile_source_tree_with_mutation_hooks(
+            root.path(),
+            [(&owned, regular(), b"old graph bytes".as_slice())],
+            [(&owned, regular(), b"new branch bytes".as_slice())],
+            should_preserve_checkout_path,
+            || {},
+            || {
+                let replacement = root.path().join("src/editor.tmp");
+                std::fs::write(&replacement, b"old graph bytes").unwrap();
+                std::fs::remove_file(&path).unwrap();
+                std::fs::rename(replacement, &path).unwrap();
+            },
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("changed object identity before exact displacement"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"old graph bytes");
+        assert!(std::fs::read_dir(root.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".kin-reconcile-")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_identity_swap_is_rejected_even_when_leaf_identity_matches() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("pkg")).unwrap();
+        std::fs::write(root.path().join("pkg/lib.rs"), b"old graph bytes").unwrap();
+        let previous = FilePathId("pkg/lib.rs".to_string());
+        let target = FilePathId("pkg".to_string());
+
+        let error = reconcile_source_tree_with_pre_mutation_hook(
+            root.path(),
+            [(&previous, regular(), b"old graph bytes".as_slice())],
+            [(&target, regular(), b"new graph file".as_slice())],
+            should_preserve_checkout_path,
+            || {
+                std::fs::rename(root.path().join("pkg"), root.path().join("true-pkg")).unwrap();
+                std::fs::create_dir(root.path().join("pkg")).unwrap();
+                std::fs::hard_link(
+                    root.path().join("true-pkg/lib.rs"),
+                    root.path().join("pkg/lib.rs"),
+                )
+                .unwrap();
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("directory"));
+        assert!(error.to_string().contains("changed identity"));
+        assert_eq!(
+            std::fs::read(root.path().join("true-pkg/lib.rs")).unwrap(),
+            b"old graph bytes"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("pkg/lib.rs")).unwrap(),
+            b"old graph bytes"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn generated_directory_publication_failure_restores_previous_tree() {
+        for generated in ["target", "vendor", "dist", "build", "node_modules"] {
+            let root = tempfile::tempdir().unwrap();
+            let previous_path = root
+                .path()
+                .join(generated)
+                .join("nested/deeper/tracked.old");
+            std::fs::create_dir_all(previous_path.parent().unwrap()).unwrap();
+            std::fs::write(&previous_path, b"old graph bytes").unwrap();
+            let previous = FilePathId(format!("{generated}/nested/deeper/tracked.old"));
+            let target = FilePathId(generated.to_string());
+
+            inject_next_publication_failure();
+            let error = reconcile_source_tree(
+                root.path(),
+                [(&previous, regular(), b"old graph bytes".as_slice())],
+                [(&target, regular(), b"new graph file".as_slice())],
+                should_preserve_checkout_path,
+            )
+            .unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains("injected exact-source publication failure"));
+            assert_eq!(std::fs::read(&previous_path).unwrap(), b"old graph bytes");
+            assert!(root.path().join(generated).is_dir());
+            assert!(std::fs::read_dir(root.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".kin-reconcile-")));
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn partial_publication_failure_rolls_back_every_published_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let first_path = root.path().join("first.txt");
+        let second_path = root.path().join("second.txt");
+        std::fs::write(&first_path, b"old first bytes").unwrap();
+        std::fs::write(&second_path, b"old second bytes").unwrap();
+        let first = FilePathId("first.txt".to_string());
+        let second = FilePathId("second.txt".to_string());
+
+        inject_publication_failure_after(1);
+        let error = reconcile_source_tree(
+            root.path(),
+            [
+                (&first, regular(), b"old first bytes".as_slice()),
+                (&second, regular(), b"old second bytes".as_slice()),
+            ],
+            [
+                (&first, regular(), b"new first bytes".as_slice()),
+                (&second, regular(), b"new second bytes".as_slice()),
+            ],
+            should_preserve_checkout_path,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("injected exact-source publication failure"));
+        assert_eq!(std::fs::read(&first_path).unwrap(), b"old first bytes");
+        assert_eq!(std::fs::read(&second_path).unwrap(), b"old second bytes");
+        assert!(std::fs::read_dir(root.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".kin-reconcile-")));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn full_tree_partial_publication_failure_restores_exact_prior_tree() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("first.txt"), b"old first bytes").unwrap();
+        std::fs::write(root.path().join("second.txt"), b"old second bytes").unwrap();
+        std::fs::create_dir_all(root.path().join("untracked/nested")).unwrap();
+        std::fs::write(
+            root.path().join("untracked/nested/sentinel.txt"),
+            b"untracked prior bytes",
+        )
+        .unwrap();
+        let first = FilePathId("first.txt".to_string());
+        let second = FilePathId("second.txt".to_string());
+
+        inject_publication_failure_after(1);
+        let error = replace_source_tree(
+            root.path(),
+            [
+                (&first, regular(), b"new first bytes".as_slice()),
+                (&second, regular(), b"new second bytes".as_slice()),
+            ],
+            |_| false,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("injected exact-source publication failure"));
+        assert_eq!(
+            std::fs::read(root.path().join("first.txt")).unwrap(),
+            b"old first bytes"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("second.txt")).unwrap(),
+            b"old second bytes"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("untracked/nested/sentinel.txt")).unwrap(),
+            b"untracked prior bytes"
+        );
+        assert!(std::fs::read_dir(root.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".kin-reconcile-")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_transaction_cleanup_ignores_ambient_name_substitution() {
+        let root = tempfile::tempdir().unwrap();
+        let projection = ProjectionRoot::open(root.path()).unwrap();
+        let transaction = projection.create_reconciliation_transaction().unwrap();
+        let transaction_path = projection
+            .reconciliation_control_path()
+            .join(&transaction.name);
+        std::fs::write(
+            transaction_path.join("true-backup"),
+            b"true transaction bytes",
+        )
+        .unwrap();
+        let renamed_transaction = projection
+            .reconciliation_control_path()
+            .join("renamed-true-transaction");
+        std::fs::rename(&transaction_path, &renamed_transaction).unwrap();
+        let substitute = transaction_path;
+        std::fs::create_dir(&substitute).unwrap();
+        std::fs::write(substitute.join("attacker-sentinel"), b"must survive").unwrap();
+
+        projection
+            .cleanup_reconciliation_transaction(transaction)
+            .unwrap();
+
+        assert!(!renamed_transaction.exists());
+        assert_eq!(
+            std::fs::read(substitute.join("attacker-sentinel")).unwrap(),
+            b"must survive"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn startup_recovers_identity_bound_full_tree_backup_transaction() {
+        let root = tempfile::tempdir().unwrap();
+        let prior = root.path().join("prior.txt");
+        std::fs::write(&prior, b"exact prior bytes").unwrap();
+        let projection = ProjectionRoot::open(root.path()).unwrap();
+        let (identity, state) = projection
+            .inspect_named_existing_object(
+                &projection.root,
+                std::ffi::OsStr::new("prior.txt"),
+                ExistingObjectKind::File,
+                &prior,
+            )
+            .unwrap();
+        let mut transaction = projection.create_reconciliation_transaction().unwrap();
+        projection
+            .back_up_existing_object(
+                &mut transaction,
+                &PlannedExistingObject {
+                    relative: PathBuf::from("prior.txt"),
+                    kind: ExistingObjectKind::File,
+                    identity,
+                    state,
+                },
+                0,
+            )
+            .unwrap();
+        let transaction_path = projection
+            .reconciliation_control_path()
+            .join(&transaction.name);
+        assert!(!prior.exists());
+        assert!(transaction_path.exists());
+        drop(transaction);
+        drop(projection);
+
+        let reopened = ProjectionRoot::open(root.path()).unwrap();
+
+        assert_eq!(std::fs::read(&prior).unwrap(), b"exact prior bytes");
+        assert!(!transaction_path.exists());
+        drop(reopened);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn startup_rolls_back_crash_after_exact_target_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let prior = root.path().join("owned.txt");
+        std::fs::write(&prior, b"exact prior bytes").unwrap();
+        let file_id = FilePathId("owned.txt".to_string());
+        let entry = ValidatedSourceEntry {
+            file_id: &file_id,
+            kind: regular(),
+            content: b"published target bytes",
+        };
+        let projection = ProjectionRoot::open(root.path()).unwrap();
+        let (identity, state) = projection
+            .inspect_named_existing_object(
+                &projection.root,
+                std::ffi::OsStr::new("owned.txt"),
+                ExistingObjectKind::File,
+                &prior,
+            )
+            .unwrap();
+        let mut transaction = projection.create_reconciliation_transaction().unwrap();
+        let staged = projection
+            .stage_reconciliation_entries(&transaction.directory, &[entry])
+            .unwrap();
+        projection
+            .back_up_existing_object(
+                &mut transaction,
+                &PlannedExistingObject {
+                    relative: PathBuf::from("owned.txt"),
+                    kind: ExistingObjectKind::File,
+                    identity,
+                    state,
+                },
+                0,
+            )
+            .unwrap();
+        projection
+            .publish_staged_entry(&mut transaction, &staged[0])
+            .unwrap();
+        let transaction_path = projection
+            .reconciliation_control_path()
+            .join(&transaction.name);
+        assert_eq!(std::fs::read(&prior).unwrap(), b"published target bytes");
+        drop(transaction);
+        drop(projection);
+
+        ProjectionRoot::open(root.path()).unwrap();
+
+        assert_eq!(std::fs::read(&prior).unwrap(), b"exact prior bytes");
+        assert!(!transaction_path.exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn startup_recovery_preserves_same_identity_post_crash_content_edit() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("owned.txt");
+        std::fs::write(&path, b"prior bytes").unwrap();
+        let file_id = FilePathId("owned.txt".to_string());
+        let entry = ValidatedSourceEntry {
+            file_id: &file_id,
+            kind: regular(),
+            content: b"published bytes",
+        };
+        let projection = ProjectionRoot::open(root.path()).unwrap();
+        let (identity, state) = projection
+            .inspect_named_existing_object(
+                &projection.root,
+                std::ffi::OsStr::new("owned.txt"),
+                ExistingObjectKind::File,
+                &path,
+            )
+            .unwrap();
+        let mut transaction = projection.create_reconciliation_transaction().unwrap();
+        let staged = projection
+            .stage_reconciliation_entries(&transaction.directory, &[entry])
+            .unwrap();
+        projection
+            .back_up_existing_object(
+                &mut transaction,
+                &PlannedExistingObject {
+                    relative: PathBuf::from("owned.txt"),
+                    kind: ExistingObjectKind::File,
+                    identity,
+                    state,
+                },
+                0,
+            )
+            .unwrap();
+        projection
+            .publish_staged_entry(&mut transaction, &staged[0])
+            .unwrap();
+        let transaction_path = projection
+            .reconciliation_control_path()
+            .join(&transaction.name);
+        drop(transaction);
+        drop(projection);
+
+        // `write` truncates the existing published inode in place. Identity-
+        // only recovery would delete this editor write and restore the backup.
+        std::fs::write(&path, b"editor bytes after crash").unwrap();
+        let error = match ProjectionRoot::open(root.path()) {
+            Ok(_) => panic!("same-inode post-crash edit was overwritten by recovery"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("changed content or mode"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"editor bytes after crash");
+        assert!(
+            transaction_path.exists(),
+            "failed-closed recovery must retain the authenticated transaction"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_recovery_preserves_same_identity_post_crash_mode_edit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("owned.sh");
+        std::fs::write(&path, b"prior bytes").unwrap();
+        let file_id = FilePathId("owned.sh".to_string());
+        let entry = ValidatedSourceEntry {
+            file_id: &file_id,
+            kind: regular(),
+            content: b"published bytes",
+        };
+        let projection = ProjectionRoot::open(root.path()).unwrap();
+        let (identity, state) = projection
+            .inspect_named_existing_object(
+                &projection.root,
+                std::ffi::OsStr::new("owned.sh"),
+                ExistingObjectKind::File,
+                &path,
+            )
+            .unwrap();
+        let mut transaction = projection.create_reconciliation_transaction().unwrap();
+        let staged = projection
+            .stage_reconciliation_entries(&transaction.directory, &[entry])
+            .unwrap();
+        projection
+            .back_up_existing_object(
+                &mut transaction,
+                &PlannedExistingObject {
+                    relative: PathBuf::from("owned.sh"),
+                    kind: ExistingObjectKind::File,
+                    identity,
+                    state,
+                },
+                0,
+            )
+            .unwrap();
+        projection
+            .publish_staged_entry(&mut transaction, &staged[0])
+            .unwrap();
+        drop(transaction);
+        drop(projection);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let error = match ProjectionRoot::open(root.path()) {
+            Ok(_) => panic!("same-inode post-crash mode edit was overwritten by recovery"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("changed content or mode"));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn pending_branch_transaction_recovers_tree_and_head_together() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = crate::init(root.path()).unwrap().layout;
+        let path = root.path().join("owned.txt");
+        std::fs::write(&path, b"main bytes").unwrap();
+        let file_id = FilePathId("owned.txt".to_string());
+        let entry = ValidatedSourceEntry {
+            file_id: &file_id,
+            kind: regular(),
+            content: b"feature bytes",
+        };
+        let transition = BranchProjectionTransition {
+            previous_branch: "main".to_string(),
+            previous_head: SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32])),
+            target_branch: "feature".to_string(),
+            target_head: SemanticChangeId::from_hash(Hash256::from_bytes([0x12; 32])),
+        };
+        let projection = ProjectionRoot::open(root.path()).unwrap();
+        let (identity, state) = projection
+            .inspect_named_existing_object(
+                &projection.root,
+                std::ffi::OsStr::new("owned.txt"),
+                ExistingObjectKind::File,
+                &path,
+            )
+            .unwrap();
+        let mut transaction = projection
+            .create_reconciliation_transaction_with_transition(Some(transition))
+            .unwrap();
+        let staged = projection
+            .stage_reconciliation_entries(&transaction.directory, &[entry])
+            .unwrap();
+        projection
+            .back_up_existing_object(
+                &mut transaction,
+                &PlannedExistingObject {
+                    relative: PathBuf::from("owned.txt"),
+                    kind: ExistingObjectKind::File,
+                    identity,
+                    state,
+                },
+                0,
+            )
+            .unwrap();
+        projection
+            .publish_staged_entry(&mut transaction, &staged[0])
+            .unwrap();
+        projection
+            .write_branch_marker_capability("feature")
+            .unwrap();
+        let transaction_path = projection
+            .reconciliation_control_path()
+            .join(&transaction.name);
+        drop(transaction);
+        drop(projection);
+
+        ProjectionRoot::open(root.path()).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"main bytes");
+        assert_eq!(
+            crate::read_current_branch(&layout).unwrap().to_string(),
+            "main"
+        );
+        assert!(!transaction_path.exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn committed_branch_transaction_keeps_tree_and_head_during_cleanup_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = crate::init(root.path()).unwrap().layout;
+        let path = root.path().join("owned.txt");
+        std::fs::write(&path, b"main bytes").unwrap();
+        let file_id = FilePathId("owned.txt".to_string());
+        let entry = ValidatedSourceEntry {
+            file_id: &file_id,
+            kind: regular(),
+            content: b"feature bytes",
+        };
+        let transition = BranchProjectionTransition {
+            previous_branch: "main".to_string(),
+            previous_head: SemanticChangeId::from_hash(Hash256::from_bytes([0x21; 32])),
+            target_branch: "feature".to_string(),
+            target_head: SemanticChangeId::from_hash(Hash256::from_bytes([0x22; 32])),
+        };
+        let projection = ProjectionRoot::open(root.path()).unwrap();
+        let (identity, state) = projection
+            .inspect_named_existing_object(
+                &projection.root,
+                std::ffi::OsStr::new("owned.txt"),
+                ExistingObjectKind::File,
+                &path,
+            )
+            .unwrap();
+        let mut transaction = projection
+            .create_reconciliation_transaction_with_transition(Some(transition))
+            .unwrap();
+        let staged = projection
+            .stage_reconciliation_entries(&transaction.directory, &[entry])
+            .unwrap();
+        projection
+            .back_up_existing_object(
+                &mut transaction,
+                &PlannedExistingObject {
+                    relative: PathBuf::from("owned.txt"),
+                    kind: ExistingObjectKind::File,
+                    identity,
+                    state,
+                },
+                0,
+            )
+            .unwrap();
+        projection
+            .publish_staged_entry(&mut transaction, &staged[0])
+            .unwrap();
+        projection
+            .write_branch_marker_capability("feature")
+            .unwrap();
+        transaction.manifest.state = ReconciliationTransactionState::Committed;
+        projection
+            .persist_reconciliation_manifest(&transaction)
+            .unwrap();
+        let transaction_path = projection
+            .reconciliation_control_path()
+            .join(&transaction.name);
+        drop(transaction);
+        drop(projection);
+
+        ProjectionRoot::open(root.path()).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"feature bytes");
+        assert_eq!(
+            crate::read_current_branch(&layout).unwrap().to_string(),
+            "feature"
+        );
+        assert!(!transaction_path.exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn recovery_actions_are_bounded_authenticated_wal_records() {
+        let root = tempfile::tempdir().unwrap();
+        let projection = ProjectionRoot::open(root.path()).unwrap();
+        let mut transaction = projection.create_reconciliation_transaction().unwrap();
+        let transaction_path = projection
+            .reconciliation_control_path()
+            .join(&transaction.name);
+        let manifest_path = transaction_path.join(RECONCILIATION_MANIFEST_FILE);
+        let manifest_before = std::fs::read(&manifest_path).unwrap();
+        let identity = tracked_open_directory_identity(&projection.root).unwrap();
+
+        for index in 0..32 {
+            projection
+                .record_reconciliation_action(
+                    &mut transaction,
+                    ReconciliationRecoveryAction::PublishDirectory {
+                        relative: PathBuf::from(format!("unused-{index}")),
+                        identity,
+                        slot: format!("unused-slot-{index}"),
+                    },
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            std::fs::read(&manifest_path).unwrap(),
+            manifest_before,
+            "action growth must never rewrite the fixed transaction descriptor"
+        );
+        assert_eq!(transaction.manifest.actions.len(), 32);
+        assert!(transaction.action_log_bytes < MAX_RECONCILIATION_ACTION_LOG_BYTES);
+        assert_eq!(
+            std::fs::read_dir(&transaction_path)
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(RECONCILIATION_ACTION_FILE_PREFIX))
+                .count(),
+            32
+        );
+        projection
+            .cleanup_reconciliation_transaction(transaction)
+            .unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn startup_rejects_tampered_recovery_action_without_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("sentinel.txt"), b"must survive").unwrap();
+        let projection = ProjectionRoot::open(root.path()).unwrap();
+        let mut transaction = projection.create_reconciliation_transaction().unwrap();
+        let identity = tracked_open_directory_identity(&projection.root).unwrap();
+        projection
+            .record_reconciliation_action(
+                &mut transaction,
+                ReconciliationRecoveryAction::PublishDirectory {
+                    relative: PathBuf::from("unused"),
+                    identity,
+                    slot: "unused-slot".to_string(),
+                },
+            )
+            .unwrap();
+        let action_path = projection
+            .reconciliation_control_path()
+            .join(&transaction.name)
+            .join(format!("{RECONCILIATION_ACTION_FILE_PREFIX}{:020}.json", 0));
+        let mut action: AuthenticatedReconciliationAction =
+            serde_json::from_slice(&std::fs::read(&action_path).unwrap()).unwrap();
+        action.authentication[0] ^= 1;
+        std::fs::write(&action_path, serde_json::to_vec(&action).unwrap()).unwrap();
+        drop(transaction);
+        drop(projection);
+
+        let error = match ProjectionRoot::open(root.path()) {
+            Ok(_) => panic!("tampered recovery action unexpectedly recovered"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("failed authentication"));
+        assert_eq!(
+            std::fs::read(root.path().join("sentinel.txt")).unwrap(),
+            b"must survive"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn startup_rejects_tampered_recovery_manifest_without_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("sentinel.txt"), b"must survive").unwrap();
+        let projection = ProjectionRoot::open(root.path()).unwrap();
+        let transaction = projection.create_reconciliation_transaction().unwrap();
+        let manifest_path = projection
+            .reconciliation_control_path()
+            .join(&transaction.name)
+            .join(RECONCILIATION_MANIFEST_FILE);
+        let mut manifest: AuthenticatedReconciliationManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.authentication[0] ^= 1;
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        drop(transaction);
+        drop(projection);
+
+        let error = match ProjectionRoot::open(root.path()) {
+            Ok(_) => panic!("tampered manifest unexpectedly recovered"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("failed authentication"));
+        assert_eq!(
+            std::fs::read(root.path().join("sentinel.txt")).unwrap(),
+            b"must survive"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn startup_cleans_pre_manifest_transaction_residue() {
+        let root = tempfile::tempdir().unwrap();
+        let projection = ProjectionRoot::open(root.path()).unwrap();
+        let residue = projection
+            .reconciliation_control_path()
+            .join(format!("tx-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&residue).unwrap();
+        std::fs::write(residue.join("staged-only"), b"no root mutation").unwrap();
+        drop(projection);
+
+        ProjectionRoot::open(root.path()).unwrap();
+
+        assert!(!residue.exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn graph_path_that_looks_like_legacy_transaction_name_is_materialized() {
+        let root = tempfile::tempdir().unwrap();
+        let target = FilePathId(".kin-reconcile-user.tmp".to_string());
+
+        replace_source_tree(
+            root.path(),
+            [(&target, regular(), b"graph-owned bytes".as_slice())],
+            |_| false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(root.path().join(".kin-reconcile-user.tmp")).unwrap(),
+            b"graph-owned bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_rollback_moves_retained_object_not_substitute() {
+        let root = tempfile::tempdir().unwrap();
+        let projection = ProjectionRoot::open(root.path()).unwrap();
+        let mut transaction = projection.create_reconciliation_transaction().unwrap();
+        let published = projection
+            .stage_and_publish_directory(
+                &mut transaction,
+                &projection.root,
+                std::ffi::OsStr::new("created"),
+                Path::new("created"),
+                0,
+            )
+            .unwrap();
+        let renamed_true_directory = root.path().join("renamed-true-created");
+        std::fs::rename(root.path().join("created"), &renamed_true_directory).unwrap();
+        std::fs::create_dir(root.path().join("created")).unwrap();
+        std::fs::write(
+            root.path().join("created/attacker-sentinel"),
+            b"must survive",
+        )
+        .unwrap();
+
+        projection
+            .move_published_directory_back(&transaction.directory, &published)
+            .unwrap();
+
+        assert!(!renamed_true_directory.exists());
+        assert_eq!(
+            std::fs::read(root.path().join("created/attacker-sentinel")).unwrap(),
+            b"must survive"
+        );
+        projection
+            .cleanup_reconciliation_transaction(transaction)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("created/attacker-sentinel")).unwrap(),
+            b"must survive"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reserved_component_fails_before_destructive_transition() {
+        for unsafe_component in ["COM0.rs", "LPT¹.txt", "COM1 .txt", "NUL .log"] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("a-parent"), b"old complete bytes").unwrap();
+            let transition = FilePathId("a-parent/child.txt".to_string());
+            let reserved = FilePathId(format!("z/{unsafe_component}"));
+
+            let error = replace_source_tree(
+                root.path(),
+                [
+                    (&transition, regular(), b"new child".as_slice()),
+                    (&reserved, regular(), b"forbidden".as_slice()),
+                ],
+                |_| false,
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains("unsafe graph-owned source path"));
+            assert_eq!(
+                std::fs::read(root.path().join("a-parent")).unwrap(),
+                b"old complete bytes"
+            );
+            assert!(!root.path().join("a-parent/child.txt").exists());
+            assert!(!root.path().join("z").exists());
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn injected_publication_failure_preserves_existing_complete_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("owned.txt");
+        std::fs::write(&destination, b"old complete bytes").unwrap();
+        let file_id = FilePathId("owned.txt".to_string());
+
+        inject_next_publication_failure();
+        let error =
+            materialize_source_entry(root.path(), &file_id, regular(), b"new bytes").unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("injected exact-source publication failure"));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"old complete bytes");
+        assert!(
+            std::fs::read_dir(root.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".kin-checkout-")),
+            "a failed exact-source publication must clean only its staged object"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialization_preserves_regular_executable_and_symlink_kinds() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        materialize_source_entry(
+            root.path(),
+            &FilePathId("README.md".to_string()),
+            regular(),
+            b"read me\n",
+        )
+        .unwrap();
+        materialize_source_entry(
+            root.path(),
+            &FilePathId("bin/tool".to_string()),
+            SourceEntryKind::File { executable: true },
+            b"#!/bin/sh\n",
+        )
+        .unwrap();
+        materialize_source_entry(
+            root.path(),
+            &FilePathId("bin/readme".to_string()),
+            SourceEntryKind::Symlink,
+            b"../README.md",
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(root.path().join("README.md")).unwrap(),
+            b"read me\n"
+        );
+        assert_eq!(
+            std::fs::metadata(root.path().join("README.md"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        assert_eq!(
+            std::fs::metadata(root.path().join("bin/tool"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::read_link(root.path().join("bin/readme")).unwrap(),
+            Path::new("../README.md")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialization_replaces_a_parent_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), root.path().join("redirect")).unwrap();
+
+        materialize_source_entry(
+            root.path(),
+            &FilePathId("redirect/owned".to_string()),
+            regular(),
+            b"must remain inside",
+        )
+        .unwrap();
+
+        assert!(!outside.path().join("owned").exists());
+        assert_eq!(
+            std::fs::read(root.path().join("redirect/owned")).unwrap(),
+            b"must remain inside"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialization_replaces_a_destination_symlink_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("sentinel");
+        std::fs::write(&outside_file, b"outside").unwrap();
+        symlink(&outside_file, root.path().join("victim")).unwrap();
+
+        materialize_source_entry(
+            root.path(),
+            &FilePathId("victim".to_string()),
+            regular(),
+            b"inside",
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&outside_file).unwrap(), b"outside");
+        assert_eq!(
+            std::fs::read(root.path().join("victim")).unwrap(),
+            b"inside"
+        );
+        assert!(!std::fs::symlink_metadata(root.path().join("victim"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn source_tree_preparation_rejects_file_directory_prefix_conflicts() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = [
+            FilePathId("same".to_string()),
+            FilePathId("same/child".to_string()),
+        ];
+
+        let error = prepare_source_tree(root.path(), paths.iter()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("conflicting graph-owned source paths"));
+
+        let duplicate = [
+            FilePathId("duplicate".to_string()),
+            FilePathId("duplicate".to_string()),
+        ];
+        let error = prepare_source_tree(root.path(), duplicate.iter()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("conflicting graph-owned source paths"));
+
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            let aliases = [
+                FilePathId("src/Owned.rs".to_string()),
+                FilePathId("SRC/owned.rs".to_string()),
+            ];
+            let error = prepare_source_tree(root.path(), aliases.iter()).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("conflicting graph-owned source paths"));
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn source_tree_preparation_rejects_unicode_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        for aliases in [
+            ["src/caf\u{e9}.rs", "src/cafe\u{301}.rs"],
+            ["src/\u{dc}ber.rs", "src/\u{fc}ber.rs"],
+        ] {
+            let paths = aliases.map(|path| FilePathId(path.to_string()));
+            let error = prepare_source_tree(root.path(), paths.iter()).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("conflicting graph-owned source paths"),
+                "Unicode aliases were not rejected: {aliases:?}"
+            );
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn full_tree_cleanup_preserves_unicode_aliases_of_tracked_destinations() {
+        for (ambient, tracked_path) in [
+            ("src/caf\u{e9}.rs", "src/cafe\u{301}.rs"),
+            ("src/\u{dc}ber.rs", "src/\u{fc}ber.rs"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join("src")).unwrap();
+            std::fs::write(root.path().join(ambient), b"old bytes").unwrap();
+            std::fs::write(root.path().join("untracked.txt"), b"remove me").unwrap();
+            let tracked_id = FilePathId(tracked_path.to_string());
+
+            replace_source_tree(
+                root.path(),
+                [(&tracked_id, regular(), b"new complete bytes".as_slice())],
+                |_| false,
+            )
+            .unwrap();
+
+            // The Unicode alias of the tracked path is recognized as the tracked
+            // destination and materialized, not deleted as a stale untracked file.
+            assert_eq!(
+                std::fs::read(root.path().join(tracked_path)).unwrap(),
+                b"new complete bytes",
+                "cleanup did not preserve the Unicode alias of tracked path {tracked_path:?}"
+            );
+            // A genuinely untracked file is still swept.
+            assert!(
+                !root.path().join("untracked.txt").exists(),
+                "cleanup left an untracked file for tracked path {tracked_path:?}"
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn tracked_cleanup_classification_is_bounded_by_path_depth() {
+        let tracked: Vec<_> = (0..20_000)
+            .map(|index| FilePathId(format!("src/generated/{index}/owned.rs")))
+            .collect();
+        let classifier = TrackedPathClassifier::new(tracked.iter());
+
+        let (relation, probes) =
+            classifier.relation_with_probe_count(Path::new("src/unrelated/leaf.rs"));
+        assert_eq!(relation, TrackedPathRelation::Unrelated);
+        assert!(
+            probes <= 5,
+            "classification used {probes} probes for a four-component path"
+        );
+
+        let (relation, probes) =
+            classifier.relation_with_probe_count(Path::new("src/generated/19999/owned.rs/cache"));
+        assert_eq!(relation, TrackedPathRelation::Descendant);
+        assert!(
+            probes <= 6,
+            "descendant classification used {probes} probes for a five-component path"
+        );
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn full_tree_cleanup_never_deletes_a_case_aliased_tracked_destination() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("SRC")).unwrap();
+        std::fs::write(root.path().join("SRC/Owned.rs"), b"old bytes").unwrap();
+        std::fs::write(root.path().join("untracked.txt"), b"remove me").unwrap();
+        let file_id = FilePathId("src/owned.rs".to_string());
+
+        replace_source_tree(
+            root.path(),
+            [(&file_id, regular(), b"new complete bytes".as_slice())],
+            |_| false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(root.path().join("src/owned.rs")).unwrap(),
+            b"new complete bytes"
+        );
+        assert!(!root.path().join("untracked.txt").exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn source_tree_preparation_handles_both_file_directory_transitions() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file_to_dir"), b"old file").unwrap();
+        std::fs::create_dir(root.path().join("dir_to_file")).unwrap();
+        std::fs::write(root.path().join("dir_to_file/old"), b"old child").unwrap();
+        let paths = [
+            FilePathId("file_to_dir/new".to_string()),
+            FilePathId("dir_to_file".to_string()),
+        ];
+
+        prepare_source_tree(root.path(), paths.iter()).unwrap();
+        materialize_source_entry(root.path(), &paths[0], regular(), b"new child").unwrap();
+        materialize_source_entry(root.path(), &paths[1], regular(), b"new file").unwrap();
+
+        assert_eq!(
+            std::fs::read(root.path().join("file_to_dir/new")).unwrap(),
+            b"new child"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("dir_to_file")).unwrap(),
+            b"new file"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn full_tree_cleanup_does_not_retain_children_of_a_replaced_directory() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("dir_to_file")).unwrap();
+        std::fs::write(root.path().join("dir_to_file/old"), b"old child").unwrap();
+        let file_id = FilePathId("dir_to_file".to_string());
+
+        replace_source_tree(
+            root.path(),
+            [(&file_id, regular(), b"new file".as_slice())],
+            |_| false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(root.path().join("dir_to_file")).unwrap(),
+            b"new file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_root_capability_survives_ambient_root_swap_at_preflight_barrier() {
+        use std::os::unix::fs::symlink;
+        use std::sync::{Arc, Barrier};
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path().join("root");
+        let moved_root = sandbox.path().join("moved-root");
+        let outside = sandbox.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(root.join("old.txt"), b"remove me").unwrap();
+        std::fs::write(outside.join("sentinel"), b"outside").unwrap();
+
+        let ready = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        std::thread::scope(|scope| {
+            let ready_worker = Arc::clone(&ready);
+            let resume_worker = Arc::clone(&resume);
+            let root_worker = root.clone();
+            scope.spawn(move || {
+                let file_id = FilePathId("owned.txt".to_string());
+                let entries =
+                    validated_source_entries([(&file_id, regular(), b"inside".as_slice())])
+                        .unwrap();
+                project_validated_source_tree(&root_worker, &entries, Some(&|_| false), || {
+                    ready_worker.wait();
+                    resume_worker.wait();
+                })
+                .unwrap();
+            });
+
+            ready.wait();
+            std::fs::rename(&root, &moved_root).unwrap();
+            symlink(&outside, &root).unwrap();
+            resume.wait();
+        });
+
+        assert_eq!(std::fs::read(outside.join("sentinel")).unwrap(), b"outside");
+        assert!(!outside.join("owned.txt").exists());
+        assert_eq!(
+            std::fs::read(moved_root.join("owned.txt")).unwrap(),
+            b"inside"
+        );
+        assert!(!moved_root.join("old.txt").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_root_capability_blocks_ambient_root_swap_at_preflight_barrier() {
+        use std::sync::{Arc, Barrier};
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path().join("root");
+        let moved_root = sandbox.path().join("moved-root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("old.txt"), b"remove me").unwrap();
+
+        let ready = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        std::thread::scope(|scope| {
+            let ready_worker = Arc::clone(&ready);
+            let resume_worker = Arc::clone(&resume);
+            let root_worker = root.clone();
+            let worker = scope.spawn(move || {
+                let file_id = FilePathId("owned.txt".to_string());
+                let entries =
+                    validated_source_entries([(&file_id, regular(), b"inside".as_slice())])
+                        .unwrap();
+                project_validated_source_tree(&root_worker, &entries, Some(&|_| false), || {
+                    ready_worker.wait();
+                    resume_worker.wait();
+                })
+            });
+
+            ready.wait();
+            assert!(
+                std::fs::rename(&root, &moved_root).is_err(),
+                "a retained Windows directory capability must block root replacement"
+            );
+            resume.wait();
+            worker.join().unwrap().unwrap();
+        });
+
+        assert_eq!(std::fs::read(root.join("owned.txt")).unwrap(), b"inside");
+        assert!(!root.join("old.txt").exists());
+        assert!(!moved_root.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn materialization_replaces_descendant_junction_without_following_it() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path().join("root");
+        let outside = sandbox.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("artifact"), b"outside").unwrap();
+
+        let junction = root.join("junction");
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "failed to create test junction: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        materialize_source_entry(
+            &root,
+            &FilePathId("junction/artifact".to_string()),
+            regular(),
+            b"inside",
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(outside.join("artifact")).unwrap(), b"outside");
+        assert_eq!(std::fs::read(junction.join("artifact")).unwrap(), b"inside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_parent_symlink_swap_at_preflight_barrier_cannot_escape() {
+        use std::os::unix::fs::symlink;
+        use std::sync::{Arc, Barrier};
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path().join("root");
+        let outside = sandbox.path().join("outside");
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("sentinel"), b"outside").unwrap();
+
+        let ready = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        std::thread::scope(|scope| {
+            let ready_worker = Arc::clone(&ready);
+            let resume_worker = Arc::clone(&resume);
+            let root_worker = root.clone();
+            scope.spawn(move || {
+                let file_id = FilePathId("a/b/file".to_string());
+                let entries =
+                    validated_source_entries([(&file_id, regular(), b"inside".as_slice())])
+                        .unwrap();
+                project_validated_source_tree(&root_worker, &entries, None, || {
+                    ready_worker.wait();
+                    resume_worker.wait();
+                })
+                .unwrap();
+            });
+
+            ready.wait();
+            std::fs::remove_dir_all(root.join("a")).unwrap();
+            symlink(&outside, root.join("a")).unwrap();
+            resume.wait();
+        });
+
+        assert_eq!(std::fs::read(outside.join("sentinel")).unwrap(), b"outside");
+        assert!(!outside.join("b/file").exists());
+        assert_eq!(std::fs::read(root.join("a/b/file")).unwrap(), b"inside");
+        assert!(!std::fs::symlink_metadata(root.join("a"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_cleanup_parent_swap_fails_without_touching_symlink_target() {
+        use std::os::unix::fs::symlink;
+        use std::sync::{Arc, Barrier};
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path().join("root");
+        let outside = sandbox.path().join("outside");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(root.join("a/delete.txt"), b"inside old tree").unwrap();
+        std::fs::write(outside.join("delete.txt"), b"outside sentinel").unwrap();
+
+        let ready = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let result = std::thread::scope(|scope| {
+            let ready_worker = Arc::clone(&ready);
+            let resume_worker = Arc::clone(&resume);
+            let root_worker = root.clone();
+            let handle = scope.spawn(move || {
+                let file_id = FilePathId("tracked.txt".to_string());
+                let entries =
+                    validated_source_entries([(&file_id, regular(), b"tracked".as_slice())])
+                        .unwrap();
+                project_validated_source_tree(&root_worker, &entries, Some(&|_| false), || {
+                    ready_worker.wait();
+                    resume_worker.wait();
+                })
+            });
+
+            ready.wait();
+            std::fs::remove_dir_all(root.join("a")).unwrap();
+            symlink(&outside, root.join("a")).unwrap();
+            resume.wait();
+            handle.join().unwrap()
+        });
+
+        assert!(result.is_err(), "a swapped cleanup parent must fail closed");
+        assert_eq!(
+            std::fs::read(outside.join("delete.txt")).unwrap(),
+            b"outside sentinel"
+        );
+    }
 }

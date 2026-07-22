@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
-use kin_model::{ChangeStore, FilePathId, Hash256, SemanticChangeId};
+use kin_model::{
+    ChangeStore, FilePathId, Hash256, ResolvedSourceEntry, SemanticChangeId, SourceEntryKind,
+    SourceTreeResolution,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,8 +60,6 @@ pub fn execute_checkout_request(
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
         .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
 
-    let genesis = kin_core::build_genesis_change();
-
     let target_head = match &request.change_id {
         Some(id) => {
             let hash = Hash256::from_hex(id).map_err(|_| {
@@ -79,41 +82,24 @@ pub fn execute_checkout_request(
         }
     };
 
-    let tree = kin_core::build_file_tree(graph, &genesis.id, &target_head)
-        .map_err(|e| anyhow::anyhow!("failed to build file tree: {}", e))?;
+    let tree = resolve_exact_checkout_tree(graph, &target_head)?;
 
     let normalized = normalize_checkout_path(&request.path);
 
     if normalized == "." || normalized == "*" || normalized.is_empty() {
         // Checkout the entire tree!
         // 1. Write/restore all files in the tree
-        for (file_id, blob_hash) in &tree {
-            let blob_key = kin_blobs::Hash256(*blob_hash.as_bytes());
-            let content = blob_store
-                .read(&blob_key)
-                .map_err(|e| anyhow::anyhow!("failed to read blob for '{}': {}", file_id.0, e))?;
+        let entries = load_and_validate_checkout_entries(&blob_store, tree.iter())?;
 
-            let dest = layout.working_dir().join(&file_id.0);
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    anyhow::anyhow!("failed to create directory {}: {}", parent.display(), e)
-                })?;
-            }
-            std::fs::write(&dest, &content)
-                .map_err(|e| anyhow::anyhow!("failed to write {}: {}", dest.display(), e))?;
-        }
-
-        // 2. Clean up any files in the working directory that are NOT in the tree
         let source_root = layout.working_dir();
-        let mut files_to_delete = Vec::new();
-        collect_non_tree_files(source_root, source_root, &tree, &mut files_to_delete)?;
-
-        for file_path in files_to_delete {
-            let _ = std::fs::remove_file(file_path);
-        }
-
-        // Clean up empty directories
-        clean_empty_dirs(source_root, source_root)?;
+        kin_core::replace_source_tree(
+            source_root,
+            entries
+                .iter()
+                .map(|entry| (&entry.file_id, entry.kind, entry.content.as_slice())),
+            should_skip_checkout_clean,
+        )
+        .map_err(|error| anyhow::anyhow!("failed to materialize exact source tree: {error}"))?;
 
         return Ok(CheckoutResponse {
             lines: vec![format!("Checked out all files from change {}", target_head)],
@@ -122,28 +108,28 @@ pub fn execute_checkout_request(
 
     let file_id = FilePathId(normalized.to_string());
 
-    let blob_hash = tree.get(&file_id).ok_or_else(|| {
+    let source = tree.get(&file_id).ok_or_else(|| {
         anyhow::anyhow!(
             "file '{}' not found in the semantic tree at change {}",
             normalized,
             target_head
         )
     })?;
-
-    let blob_key = kin_blobs::Hash256(*blob_hash.as_bytes());
-    let content = blob_store
-        .read(&blob_key)
-        .map_err(|e| anyhow::anyhow!("failed to read blob for '{}': {}", normalized, e))?;
-
-    let dest = layout.working_dir().join(normalized);
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            anyhow::anyhow!("failed to create directory {}: {}", parent.display(), e)
-        })?;
-    }
-
-    std::fs::write(&dest, &content)
-        .map_err(|e| anyhow::anyhow!("failed to write {}: {}", dest.display(), e))?;
+    let prepared = load_and_validate_checkout_entries(&blob_store, [(&file_id, source)])?;
+    let entry = prepared
+        .first()
+        .expect("single-file checkout preflight returns one entry");
+    kin_core::materialize_source_tree(
+        layout.working_dir(),
+        [(&entry.file_id, entry.kind, entry.content.as_slice())],
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "failed to materialize exact source '{}': {}",
+            normalized,
+            error
+        )
+    })?;
 
     Ok(CheckoutResponse {
         lines: vec![format!(
@@ -153,92 +139,66 @@ pub fn execute_checkout_request(
     })
 }
 
-fn collect_non_tree_files(
-    root: &std::path::Path,
-    current: &std::path::Path,
-    tree: &std::collections::HashMap<FilePathId, Hash256>,
-    files_to_delete: &mut Vec<std::path::PathBuf>,
-) -> Result<()> {
-    let entries = match std::fs::read_dir(current) {
-        Ok(e) => e,
-        Err(_) => return Ok(()),
-    };
+struct PreparedCheckoutEntry {
+    file_id: FilePathId,
+    kind: SourceEntryKind,
+    content: Vec<u8>,
+}
 
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let rel = path.strip_prefix(root)?;
-        let rel_str = rel.to_string_lossy().to_string();
+/// Resolve and verify every graph-owned source object before checkout mutates
+/// the working tree. `BlobStore::read` performs the SHA-256 verification bound
+/// to the requested content address; the tree validator then checks the whole
+/// path set, entry kinds, UTF-8 link payloads, and link targets without IO.
+fn load_and_validate_checkout_entries<'a>(
+    blob_store: &kin_blobs::BlobStore,
+    entries: impl IntoIterator<Item = (&'a FilePathId, &'a ResolvedSourceEntry)>,
+) -> Result<Vec<PreparedCheckoutEntry>> {
+    let mut entries: Vec<_> = entries.into_iter().collect();
+    entries.sort_by(|left, right| left.0 .0.cmp(&right.0 .0));
 
-        if should_skip_checkout_clean(rel) {
-            continue;
-        }
+    let mut prepared = Vec::with_capacity(entries.len());
+    for (file_id, source) in entries {
+        let blob_key = kin_blobs::Hash256(*source.hash.as_bytes());
+        let content = blob_store.read(&blob_key).map_err(|error| {
+            anyhow::anyhow!("failed to read blob for '{}': {}", file_id.0, error)
+        })?;
+        prepared.push(PreparedCheckoutEntry {
+            file_id: file_id.clone(),
+            kind: source.kind,
+            content,
+        });
+    }
+    kin_core::validate_source_tree(
+        prepared
+            .iter()
+            .map(|entry| (&entry.file_id, entry.kind, entry.content.as_slice())),
+    )?;
+    Ok(prepared)
+}
 
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            collect_non_tree_files(root, &path, tree, files_to_delete)?;
-        } else if ft.is_file() {
-            let file_id = FilePathId(rel_str);
-            if !tree.contains_key(&file_id) {
-                files_to_delete.push(path);
-            }
+fn resolve_exact_checkout_tree(
+    graph: &kin_db::InMemoryGraph,
+    target_head: &SemanticChangeId,
+) -> Result<HashMap<FilePathId, ResolvedSourceEntry>> {
+    match graph.resolve_source_tree_at(target_head)? {
+        SourceTreeResolution::Exact { entries } => Ok(entries),
+        SourceTreeResolution::Incomplete { gaps } => {
+            let gaps = gaps
+                .iter()
+                .map(|gap| format!("{}@{}:{:?}", gap.file_id, gap.change_id, gap.reason))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(anyhow::anyhow!(
+                "checkout requires exact source history at {}, but found unresolved gaps: {}",
+                target_head,
+                gaps
+            ))
         }
     }
-    Ok(())
 }
 
 fn should_skip_checkout_clean(rel: &std::path::Path) -> bool {
-    const SKIP_DIRS: &[&str] = &[
-        ".kin",
-        ".git",
-        "node_modules",
-        "target",
-        "__pycache__",
-        ".next",
-        "dist",
-        "build",
-        "vendor",
-    ];
-
-    rel.components().any(|component| {
-        if let std::path::Component::Normal(name) = component {
-            SKIP_DIRS
-                .iter()
-                .any(|skip| name == std::ffi::OsStr::new(skip))
-        } else {
-            false
-        }
-    })
-}
-
-fn clean_empty_dirs(root: &std::path::Path, current: &std::path::Path) -> Result<bool> {
-    let entries = match std::fs::read_dir(current) {
-        Ok(e) => e,
-        Err(_) => return Ok(false),
-    };
-
-    let mut is_empty = true;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            let rel = path.strip_prefix(root)?;
-            if should_skip_checkout_clean(rel) {
-                is_empty = false;
-                continue;
-            }
-            let child_empty = clean_empty_dirs(root, &path)?;
-            if child_empty {
-                let _ = std::fs::remove_dir(&path);
-            } else {
-                is_empty = false;
-            }
-        } else {
-            is_empty = false;
-        }
-    }
-    Ok(is_empty)
+    kin_core::should_preserve_checkout_path(rel)
 }
 
 fn normalize_checkout_path(path: &str) -> &str {
@@ -248,6 +208,7 @@ fn normalize_checkout_path(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_model::{ArtifactDelta, ArtifactDeltaKind, AuthorId, SemanticChange, Timestamp};
 
     #[test]
     fn normalizes_relative_path_prefix() {
@@ -280,6 +241,9 @@ mod tests {
             ".git/config"
         )));
         assert!(should_skip_checkout_clean(std::path::Path::new(
+            "nested/.KIN-SESSION/base.json"
+        )));
+        assert!(should_skip_checkout_clean(std::path::Path::new(
             "target/debug/app"
         )));
         assert!(should_skip_checkout_clean(std::path::Path::new(
@@ -293,47 +257,208 @@ mod tests {
         )));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn collect_non_tree_files_ignores_tracked_and_skip_dirs() {
+    fn full_tree_projection_ignores_tracked_and_skip_dirs() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join(".kin")).unwrap();
+        std::fs::create_dir_all(root.join(".kin-session")).unwrap();
         std::fs::create_dir_all(root.join("target/debug")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "tracked").unwrap();
         std::fs::write(root.join("src/old.rs"), "delete").unwrap();
         std::fs::write(root.join(".kin/state"), "keep").unwrap();
+        std::fs::write(root.join(".kin-session/base.json"), "keep").unwrap();
         std::fs::write(root.join("target/debug/app"), "keep").unwrap();
 
-        let mut tree = std::collections::HashMap::new();
-        tree.insert(
-            FilePathId("src/lib.rs".to_string()),
-            Hash256::from_bytes([0; 32]),
-        );
+        let tracked = FilePathId("src/lib.rs".to_string());
+        kin_core::replace_source_tree(
+            root,
+            [(
+                &tracked,
+                SourceEntryKind::File { executable: false },
+                b"new".as_slice(),
+            )],
+            should_skip_checkout_clean,
+        )
+        .unwrap();
 
-        let mut files = Vec::new();
-        collect_non_tree_files(root, root, &tree, &mut files).unwrap();
-        let rels: Vec<_> = files
-            .iter()
-            .map(|path| path.strip_prefix(root).unwrap().to_path_buf())
-            .collect();
-
-        assert_eq!(rels, vec![std::path::PathBuf::from("src/old.rs")]);
+        assert_eq!(std::fs::read(root.join("src/lib.rs")).unwrap(), b"new");
+        assert!(!root.join("src/old.rs").exists());
+        assert!(root.join(".kin/state").exists());
+        assert!(root.join(".kin-session/base.json").exists());
+        assert!(root.join("target/debug/app").exists());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn clean_empty_dirs_removes_only_untracked_empty_dirs() {
+    fn full_tree_projection_leaves_blocking_ancestor_for_tree_preparation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("a-parent"), "blocking file").unwrap();
+        std::fs::write(root.join("untracked.txt"), "delete").unwrap();
+
+        let tracked = FilePathId("a-parent/child.txt".to_string());
+        kin_core::replace_source_tree(
+            root,
+            [(
+                &tracked,
+                SourceEntryKind::File { executable: false },
+                b"child".as_slice(),
+            )],
+            should_skip_checkout_clean,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(root.join("a-parent/child.txt")).unwrap(),
+            b"child"
+        );
+        assert!(!root.join("untracked.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_tree_projection_removes_only_untracked_empty_dirs() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         std::fs::create_dir_all(root.join("src/empty/nested")).unwrap();
         std::fs::create_dir_all(root.join(".kin/empty")).unwrap();
         std::fs::create_dir_all(root.join("crates/app/target")).unwrap();
 
-        let root_empty = clean_empty_dirs(root, root).unwrap();
+        let tracked = FilePathId("tracked.txt".to_string());
+        kin_core::replace_source_tree(
+            root,
+            [(
+                &tracked,
+                SourceEntryKind::File { executable: false },
+                b"tracked".as_slice(),
+            )],
+            should_skip_checkout_clean,
+        )
+        .unwrap();
 
-        assert!(!root_empty);
         assert!(!root.join("src/empty").exists());
         assert!(root.join(".kin/empty").exists());
         assert!(root.join("crates/app/target").exists());
+    }
+
+    #[test]
+    fn late_missing_blob_preserves_destructive_transition_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(temp.path().join(".kin"));
+        let blob_store = kin_blobs::BlobStore::new(layout.objects_dir()).unwrap();
+        let valid_hash = blob_store.write(b"new child\n").unwrap();
+        let missing_hash = Hash256::from_bytes([0xf1; 32]);
+        let change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0xa1; 32])),
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("checkout-test"),
+            message: "exact checkout fixture".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![
+                ArtifactDelta {
+                    file_id: FilePathId("a-parent/child.txt".to_string()),
+                    kind: ArtifactDeltaKind::AddedRegularFile,
+                    old_hash: None,
+                    new_hash: Some(valid_hash),
+                },
+                ArtifactDelta {
+                    file_id: FilePathId("z-missing.txt".to_string()),
+                    kind: ArtifactDeltaKind::AddedRegularFile,
+                    old_hash: None,
+                    new_hash: Some(missing_hash),
+                },
+            ],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+        let graph = kin_db::InMemoryGraph::new();
+        graph.create_change(&change).unwrap();
+
+        std::fs::write(temp.path().join("a-parent"), b"old file stays\n").unwrap();
+        std::fs::write(temp.path().join("sentinel"), b"untouched\n").unwrap();
+
+        let error = execute_checkout_request(
+            &layout,
+            &graph,
+            &CheckoutRequest {
+                path: ".".to_string(),
+                change_id: Some(change.id.to_string()),
+            },
+        )
+        .expect_err("all blobs must verify before a file-to-directory transition");
+
+        assert!(error.to_string().contains("z-missing.txt"));
+        let metadata = std::fs::symlink_metadata(temp.path().join("a-parent")).unwrap();
+        assert!(
+            metadata.is_file(),
+            "the blocking file shape must be preserved"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("a-parent")).unwrap(),
+            b"old file stays\n"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("sentinel")).unwrap(),
+            b"untouched\n"
+        );
+        assert!(!temp.path().join("a-parent/child.txt").exists());
+    }
+
+    #[test]
+    fn checkout_replaces_blocking_ancestor_without_redeleting_new_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(temp.path().join(".kin"));
+        let blob_store = kin_blobs::BlobStore::new(layout.objects_dir()).unwrap();
+        let child_hash = blob_store.write(b"new child\n").unwrap();
+        let change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0xa2; 32])),
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("checkout-test"),
+            message: "blocking ancestor fixture".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![ArtifactDelta {
+                file_id: FilePathId("a-parent/child.txt".to_string()),
+                kind: ArtifactDeltaKind::AddedRegularFile,
+                old_hash: None,
+                new_hash: Some(child_hash),
+            }],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+        let graph = kin_db::InMemoryGraph::new();
+        graph.create_change(&change).unwrap();
+
+        std::fs::write(temp.path().join("a-parent"), b"old blocking file\n").unwrap();
+        std::fs::write(temp.path().join("untracked.txt"), b"remove me\n").unwrap();
+
+        execute_checkout_request(
+            &layout,
+            &graph,
+            &CheckoutRequest {
+                path: ".".to_string(),
+                change_id: Some(change.id.to_string()),
+            },
+        )
+        .expect("blocking ancestor should be replaced by the tracked tree");
+
+        assert!(temp.path().join("a-parent").is_dir());
+        assert_eq!(
+            std::fs::read(temp.path().join("a-parent/child.txt")).unwrap(),
+            b"new child\n"
+        );
+        assert!(!temp.path().join("untracked.txt").exists());
     }
 }

@@ -148,7 +148,8 @@ agent/runtime surfaces beside it.
 
 *Flags:*
 - `--git-history <off|recent|full>`: how much Git history to import into the graph on init
-  (default: `recent`).
+  (default: `recent`, a deterministic HEAD-connected window of at most 50 commits;
+  `full` imports complete reachable ancestry).
 - `--force`: initialize even if a `.git/` directory is already present.
 - `--no-lsp`: skip LSP enrichment (faster, tree-sitter-only init).
 

@@ -14,7 +14,9 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{GitError, Result};
 use crate::genesis::is_genesis_change;
-use crate::import::{commit_file_deltas, select_history_oids_from_head};
+use crate::import::{
+    commit_file_deltas, select_bounded_history_oids_from_head, select_history_oids_from_head,
+};
 
 const MAX_ENTITIES_PER_FILE: usize = 8;
 
@@ -92,19 +94,20 @@ where
         }
         Err(err) => return Err(GitError::Git(err.to_string())),
     };
-    let walk = repo
-        .rev_walk([head_id])
-        .sorting(gix::revision::walk::Sorting::ByCommitTime(
-            Default::default(),
-        ))
-        .all()
-        .map_err(|e| GitError::Git(e.to_string()))?;
-
-    // Phase 1: collect the full walk, then select the same deterministic,
-    // HEAD-rooted ancestry window used by semantic-history import. This keeps
-    // co-change evidence aligned with the commits present in recent history.
-    let oids: Vec<gix::ObjectId> = {
+    // Phase 1: select the same deterministic, HEAD-rooted ancestry window used
+    // by semantic-history import. Bounded mode expands directly from HEAD so a
+    // 50-commit request never scans or retains the full repository history.
+    let oids: Vec<gix::ObjectId> = if max_commits > 0 {
+        select_bounded_history_oids_from_head(&repo, head_id, max_commits)?
+    } else {
         let _span = tracing::info_span!("kin.git.cochange.collect_oids").entered();
+        let walk = repo
+            .rev_walk([head_id])
+            .sorting(gix::revision::walk::Sorting::ByCommitTime(
+                Default::default(),
+            ))
+            .all()
+            .map_err(|e| GitError::Git(e.to_string()))?;
         let timed: Vec<(i64, gix::ObjectId)> = walk
             .map(|r| {
                 r.map(|info| (info.commit_time.unwrap_or(0), info.id().detach()))
@@ -453,6 +456,10 @@ mod tests {
                     .output();
                 let _ = Command::new("git")
                     .args(["config", "user.name", "Test"])
+                    .current_dir(dir)
+                    .output();
+                let _ = Command::new("git")
+                    .args(["config", "core.hooksPath", ".git/no-hooks"])
                     .current_dir(dir)
                     .output();
                 true

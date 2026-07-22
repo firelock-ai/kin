@@ -479,11 +479,8 @@ async fn run_local_commit_pipeline_for_tests(
     let write_start = Instant::now();
 
     // Build the semantic change
-    let content_id =
-        kin_core::content_identity_from_deltas(&entity_deltas, &relation_deltas, &artifact_deltas);
-    let change_id = kin_core::compute_change_id(&message, &parent_id, &content_id);
-    let change = SemanticChange {
-        id: change_id,
+    let mut change = SemanticChange {
+        id: kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0; 32])),
         parents: vec![parent_id],
         timestamp: Timestamp::now(),
         author: AuthorId::new(kin_core::whoami()),
@@ -497,6 +494,8 @@ async fn run_local_commit_pipeline_for_tests(
         risk_summary: None,
         authored_on: Some(branch_name.clone()),
     };
+    change.id = kin_core::compute_semantic_change_id(&change)?;
+    let change_id = change.id;
 
     let details = Some(format!(
         "branch={}; entities={}; relations={}; files={}",

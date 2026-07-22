@@ -11,7 +11,8 @@ use kin_blobs::BlobStore;
 use kin_core::KinLayout;
 use kin_db::StorageBackend;
 use kin_model::{
-    EntityId, EntityStore, FilePathId, GraphOverlay, Hash256, SemanticChangeId, WorkingCopy,
+    ChangeStore, EntityId, EntityStore, FilePathId, GraphOverlay, Hash256, SemanticChange,
+    SemanticChangeId, SourceEntryKind, SourceTreeResolution, WorkingCopy,
 };
 use kin_projection::ProjectionState;
 use kin_reconcile::Reconciler;
@@ -20,6 +21,92 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::{DaemonError, Result};
 use crate::session_registry::SessionCoordinator;
+
+/// Read-only overlay used to resolve the complete source tree an incoming
+/// change would create without first inserting that change into graph
+/// authority. The default `ChangeStore` replay then applies the same
+/// topological and merge-parent semantics as a committed change.
+struct ProspectiveChangeStore<'a> {
+    graph: &'a kin_db::InMemoryGraph,
+    incoming: &'a SemanticChange,
+}
+
+impl ChangeStore for ProspectiveChangeStore<'_> {
+    type Error = kin_db::KinDbError;
+
+    fn get_entity_history(
+        &self,
+        id: &EntityId,
+    ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
+        self.graph.get_entity_history(id)
+    }
+
+    fn find_merge_bases(
+        &self,
+        a: &SemanticChangeId,
+        b: &SemanticChangeId,
+    ) -> std::result::Result<Vec<SemanticChangeId>, Self::Error> {
+        self.graph.find_merge_bases(a, b)
+    }
+
+    fn create_change(&self, _change: &SemanticChange) -> std::result::Result<(), Self::Error> {
+        Err(kin_db::KinDbError::StorageError(
+            "prospective exact-source replay is read-only".to_string(),
+        ))
+    }
+
+    fn get_change(
+        &self,
+        id: &SemanticChangeId,
+    ) -> std::result::Result<Option<SemanticChange>, Self::Error> {
+        if *id == self.incoming.id {
+            Ok(Some(self.incoming.clone()))
+        } else {
+            self.graph.get_change(id)
+        }
+    }
+
+    fn get_changes_since(
+        &self,
+        base: &SemanticChangeId,
+        head: &SemanticChangeId,
+    ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
+        self.graph.get_changes_since(base, head)
+    }
+
+    fn get_branch(
+        &self,
+        name: &kin_model::BranchName,
+    ) -> std::result::Result<Option<kin_model::Branch>, Self::Error> {
+        self.graph.get_branch(name)
+    }
+
+    fn create_branch(&self, _branch: &kin_model::Branch) -> std::result::Result<(), Self::Error> {
+        Err(kin_db::KinDbError::StorageError(
+            "prospective exact-source replay is read-only".to_string(),
+        ))
+    }
+
+    fn update_branch_head(
+        &self,
+        _name: &kin_model::BranchName,
+        _new_head: &SemanticChangeId,
+    ) -> std::result::Result<(), Self::Error> {
+        Err(kin_db::KinDbError::StorageError(
+            "prospective exact-source replay is read-only".to_string(),
+        ))
+    }
+
+    fn delete_branch(&self, _name: &kin_model::BranchName) -> std::result::Result<(), Self::Error> {
+        Err(kin_db::KinDbError::StorageError(
+            "prospective exact-source replay is read-only".to_string(),
+        ))
+    }
+
+    fn list_branches(&self) -> std::result::Result<Vec<kin_model::Branch>, Self::Error> {
+        self.graph.list_branches()
+    }
+}
 
 /// Reconciliation loop status values.
 pub const RECON_IDLE: u8 = 0;
@@ -612,6 +699,74 @@ impl Drop for GraphPersistenceAttempt<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotSaveMode {
+    Incremental,
+    Full,
+    /// Recover an earlier request whose graph mutation is already visible in
+    /// memory. Persist a full snapshot only when authority is still pending;
+    /// otherwise finish an already-committed generation without advancing it.
+    Retry,
+}
+
+fn exact_source_storage_error(message: impl Into<String>) -> DaemonError {
+    DaemonError::Graph(kin_db::KinDbError::StorageError(message.into()))
+}
+
+fn exact_source_objects<'a>(
+    changes: impl IntoIterator<Item = &'a SemanticChange>,
+) -> Result<Vec<(Hash256, FilePathId, SemanticChangeId, SourceEntryKind)>> {
+    let mut objects = Vec::new();
+    for change in changes {
+        for delta in &change.artifact_deltas {
+            if delta.kind.is_removed() {
+                continue;
+            }
+            let Some(kind) = delta.kind.source_entry_kind() else {
+                // Legacy mode-unknown history stays an explicit exact-tree gap;
+                // this object preflight must not normalize it into a mode.
+                continue;
+            };
+            let hash = delta.new_hash.ok_or_else(|| {
+                exact_source_storage_error(format!(
+                    "exact source delta for {} in change {} has no content identity",
+                    delta.file_id, change.id
+                ))
+            })?;
+            objects.push((hash, delta.file_id.clone(), change.id, kind));
+        }
+    }
+    objects.sort_by(|left, right| {
+        left.0
+            .as_bytes()
+            .cmp(right.0.as_bytes())
+            .then_with(|| left.1 .0.cmp(&right.1 .0))
+            .then_with(|| left.2 .0.as_bytes().cmp(right.2 .0.as_bytes()))
+    });
+    Ok(objects)
+}
+
+fn validate_exact_source_bytes(
+    file_id: &FilePathId,
+    kind: SourceEntryKind,
+    expected: Hash256,
+    data: &[u8],
+    authority: &str,
+) -> Result<()> {
+    let actual = kin_blobs::digest_bytes(data);
+    if actual != *expected.as_bytes() {
+        return Err(exact_source_storage_error(format!(
+            "{authority} exact source bytes for {file_id} do not match {expected}: found {}",
+            hex::encode(actual)
+        )));
+    }
+    kin_core::validate_source_entry(file_id, kind, data).map_err(|error| {
+        exact_source_storage_error(format!(
+            "{authority} exact source entry {file_id} at {expected} is not materializable: {error}"
+        ))
+    })
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct VfsTreeBuildTestHook {
@@ -708,6 +863,8 @@ pub struct DaemonState {
     pending_persistence_event: Mutex<Option<DaemonEvent>>,
     #[cfg(test)]
     finalization_fail_once: AtomicBool,
+    #[cfg(test)]
+    snapshot_save_fail_once: AtomicBool,
     /// Monotonically increasing version counter for VFS cache invalidation.
     /// Incremented on every graph mutation (reconcile, commit, overlay update).
     /// Unlike entity_count, this never decreases on deletions.
@@ -1226,6 +1383,8 @@ impl DaemonState {
             pending_persistence_event: Mutex::new(None),
             #[cfg(test)]
             finalization_fail_once: AtomicBool::new(false),
+            #[cfg(test)]
+            snapshot_save_fail_once: AtomicBool::new(false),
             vfs_version: AtomicU64::new(persisted_vfs_version),
             vfs_tree_cache: std::sync::RwLock::new(None),
             vfs_tree_build_lock: tokio::sync::Mutex::new(()),
@@ -1394,6 +1553,8 @@ impl DaemonState {
             pending_persistence_event: Mutex::new(None),
             #[cfg(test)]
             finalization_fail_once: AtomicBool::new(false),
+            #[cfg(test)]
+            snapshot_save_fail_once: AtomicBool::new(false),
             vfs_version: AtomicU64::new(persisted_vfs_version),
             vfs_tree_cache: std::sync::RwLock::new(None),
             vfs_tree_build_lock: tokio::sync::Mutex::new(()),
@@ -2672,6 +2833,11 @@ impl DaemonState {
     }
 
     #[cfg(test)]
+    pub(crate) fn fail_next_snapshot_save_for_test(&self) {
+        self.snapshot_save_fail_once.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
     pub(crate) fn persistence_event_is_queued_for_test(&self) -> bool {
         self.pending_persistence_event
             .lock()
@@ -2693,7 +2859,7 @@ impl DaemonState {
     /// `.kin/kindb/head-generation` so CLI and MCP processes can detect
     /// when their loaded snapshot is stale (P2-2.7).
     pub fn save_snapshot(&self) -> Result<()> {
-        self.save_snapshot_impl(false, None)
+        self.save_snapshot_impl(SnapshotSaveMode::Incremental, None)
     }
 
     /// Save graph authority and publish `event` only after the generation that
@@ -2701,11 +2867,24 @@ impl DaemonState {
     /// holding `persist_lock`, so an older in-flight generation cannot consume
     /// this event before the caller's batch is detached and committed.
     pub(crate) fn save_snapshot_with_event(&self, event: DaemonEvent) -> Result<()> {
-        self.save_snapshot_impl(false, Some(event))
+        self.save_snapshot_impl(SnapshotSaveMode::Incremental, Some(event))
     }
 
     pub fn save_snapshot_full(&self) -> Result<()> {
-        self.save_snapshot_impl(true, None)
+        self.save_snapshot_impl(SnapshotSaveMode::Full, None)
+    }
+
+    pub(crate) fn save_snapshot_full_with_event(&self, event: DaemonEvent) -> Result<()> {
+        self.save_snapshot_impl(SnapshotSaveMode::Full, Some(event))
+    }
+
+    /// Complete persistence for a request whose identical graph change and
+    /// branch head are already visible in memory. A failure before the prior
+    /// authority commit leaves graph deltas pending and therefore requires a
+    /// full snapshot. A failure after the authority commit leaves only local
+    /// finalization pending and must not create a second generation.
+    pub(crate) fn retry_snapshot_authority_with_event(&self, event: DaemonEvent) -> Result<()> {
+        self.save_snapshot_impl(SnapshotSaveMode::Retry, Some(event))
     }
 
     /// Whether derived embedding progress can be committed through the local
@@ -2717,6 +2896,240 @@ impl DaemonState {
     /// unsafe and must fail loud rather than fabricate a durable checkpoint.
     pub(crate) fn can_persist_embed_progress_locally(&self) -> bool {
         self.storage_backend.is_none()
+    }
+
+    /// Persist every exact-mode source object referenced by `changes` before
+    /// the graph authority that names those objects is committed.
+    ///
+    /// Legacy mode-unknown deltas remain explicit graph gaps and are skipped;
+    /// exact deltas fail closed when neither the local content-addressed store
+    /// nor the backend already has the named bytes. Durable source objects may
+    /// safely precede a failed graph CAS because they are immutable and
+    /// content-addressed, while committing the graph first would create an
+    /// irreparable authority gap.
+    fn persist_exact_source_objects<'a>(
+        &self,
+        backend: &dyn StorageBackend,
+        repo_id: &str,
+        changes: impl IntoIterator<Item = &'a SemanticChange>,
+    ) -> Result<()> {
+        let objects = exact_source_objects(changes)?;
+        // Reject path aliases/prefix conflicts before reading or publishing
+        // any source object. This metadata-only pass borrows paths from the
+        // object list and therefore does not duplicate repository bytes.
+        {
+            let mut paths = objects
+                .iter()
+                .map(|(_, file_id, change_id, _)| (*change_id, file_id))
+                .collect::<Vec<_>>();
+            paths.sort_by(|left, right| {
+                left.0
+                     .0
+                    .as_bytes()
+                    .cmp(right.0 .0.as_bytes())
+                    .then_with(|| left.1 .0.cmp(&right.1 .0))
+            });
+            let mut start = 0;
+            while start < paths.len() {
+                let change_id = paths[start].0;
+                let mut end = start + 1;
+                while end < paths.len() && paths[end].0 == change_id {
+                    end += 1;
+                }
+                kin_core::validate_source_paths(
+                    paths[start..end].iter().map(|(_, file_id)| *file_id),
+                )
+                .map_err(|error| {
+                    exact_source_storage_error(format!(
+                        "exact source change {change_id} is not materializable: {error}"
+                    ))
+                })?;
+                start = end;
+            }
+        }
+
+        let mut start = 0;
+        while start < objects.len() {
+            let hash = objects[start].0;
+            let mut end = start + 1;
+            while end < objects.len() && objects[end].0 == hash {
+                end += 1;
+            }
+            let digest = *hash.as_bytes();
+            match self.blobs.read(&kin_blobs::Hash256(digest)) {
+                Ok(data) => {
+                    for (_, file_id, _, kind) in &objects[start..end] {
+                        validate_exact_source_bytes(file_id, *kind, hash, &data, "local")?;
+                    }
+                    backend
+                        .save_source_blob(repo_id, digest, &data)
+                        .map_err(DaemonError::from)?;
+                }
+                Err(local_error) => match backend
+                    .load_source_blob(repo_id, digest)
+                    .map_err(DaemonError::from)?
+                {
+                    Some(data) => {
+                        for (_, file_id, _, kind) in &objects[start..end] {
+                            validate_exact_source_bytes(file_id, *kind, hash, &data, "backend")?;
+                        }
+                        let (_, first_file_id, first_change_id, _) = &objects[start];
+                        warn!(
+                            repo_id,
+                            file = %first_file_id,
+                            change = %first_change_id,
+                            hash = %hash,
+                            references = end - start,
+                            error = %local_error,
+                            "local source object unavailable; retained verified backend authority"
+                        );
+                    }
+                    None => {
+                        let (_, file_id, change_id, _) = &objects[start];
+                        return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                            format!(
+                                "exact source bytes for {} in change {} at {} are absent from both local and backend authority: {local_error}",
+                                file_id, change_id, hash
+                            ),
+                        )));
+                    }
+                },
+            };
+            start = end;
+        }
+        Ok(())
+    }
+
+    /// Preflight one incoming semantic change before mutating the live graph.
+    /// Hosted graph commits do not share the caller's local object directory;
+    /// an exact change whose bytes are unavailable must therefore fail before
+    /// its entities, relations, change record, or branch head become visible.
+    pub(crate) fn preflight_exact_source_change(
+        &self,
+        graph: &kin_db::InMemoryGraph,
+        change: &SemanticChange,
+    ) -> Result<()> {
+        if let Some(backend) = &self.storage_backend {
+            self.persist_exact_source_objects(
+                backend.as_ref(),
+                self.cached_repo_id.as_str(),
+                std::iter::once(change),
+            )?;
+        }
+
+        let prospective = ProspectiveChangeStore {
+            graph,
+            incoming: change,
+        };
+        let entries = match prospective
+            .resolve_source_tree_at(&change.id)
+            .map_err(DaemonError::from)?
+        {
+            SourceTreeResolution::Exact { entries } => entries,
+            SourceTreeResolution::Incomplete { gaps } => {
+                let gaps = gaps
+                    .iter()
+                    .map(|gap| format!("{}@{}:{:?}", gap.file_id, gap.change_id, gap.reason))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(exact_source_storage_error(format!(
+                    "incoming source history at {} is not exact: {gaps}",
+                    change.id
+                )));
+            }
+        };
+        self.preflight_materializable_source_entries(entries, "incoming exact")
+    }
+
+    fn preflight_materializable_source_entries(
+        &self,
+        entries: HashMap<FilePathId, kin_model::ResolvedSourceEntry>,
+        purpose: &str,
+    ) -> Result<()> {
+        let mut entries: Vec<_> = entries.into_iter().collect();
+        entries.sort_by(|left, right| left.0 .0.cmp(&right.0 .0));
+        kin_core::validate_source_paths(entries.iter().map(|(file_id, _)| file_id)).map_err(
+            |error| {
+                exact_source_storage_error(format!(
+                    "{purpose} source tree is not materializable: {error}"
+                ))
+            },
+        )?;
+        entries.sort_by(|left, right| {
+            left.1
+                .hash
+                .as_bytes()
+                .cmp(right.1.hash.as_bytes())
+                .then_with(|| left.0 .0.cmp(&right.0 .0))
+        });
+        let mut start = 0;
+        while start < entries.len() {
+            let source_hash = entries[start].1.hash;
+            let mut end = start + 1;
+            while end < entries.len() && entries[end].1.hash == source_hash {
+                end += 1;
+            }
+            let digest = *source_hash.as_bytes();
+            let (data, authority) = if let Some(backend) = &self.storage_backend {
+                let data = backend
+                    .load_source_blob(self.cached_repo_id.as_str(), digest)
+                    .map_err(DaemonError::from)?
+                    .ok_or_else(|| {
+                        exact_source_storage_error(format!(
+                            "{purpose} source bytes for {} at {} are absent from backend authority",
+                            entries[start].0, source_hash
+                        ))
+                    })?;
+                (data, "backend")
+            } else {
+                let data = self
+                    .blobs
+                    .read(&kin_blobs::Hash256(digest))
+                    .map_err(|error| {
+                        exact_source_storage_error(format!(
+                            "{purpose} source bytes for {} at {} are absent or corrupt in local authority: {error}",
+                            entries[start].0, source_hash
+                        ))
+                    })?;
+                (data, "local")
+            };
+            for (file_id, source) in &entries[start..end] {
+                validate_exact_source_bytes(file_id, source.kind, source.hash, &data, authority)?;
+            }
+            start = end;
+        }
+        Ok(())
+    }
+
+    /// Prove that the exact source tree at `head` is both complete and fully
+    /// materializable from the daemon's immutable source authority.
+    ///
+    /// Release admission calls this while holding the same coordination gate
+    /// as marker/head mutation. Backend-backed daemons use backend objects only
+    /// (the hosted immutable authority); local daemons use their verified CAS.
+    pub(crate) fn preflight_exact_source_tree(
+        &self,
+        graph: &kin_db::InMemoryGraph,
+        head: &SemanticChangeId,
+    ) -> Result<()> {
+        let entries = match graph
+            .resolve_source_tree_at(head)
+            .map_err(DaemonError::from)?
+        {
+            SourceTreeResolution::Exact { entries } => entries,
+            SourceTreeResolution::Incomplete { gaps } => {
+                let gaps = gaps
+                    .iter()
+                    .map(|gap| format!("{}@{}:{:?}", gap.file_id, gap.change_id, gap.reason))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(exact_source_storage_error(format!(
+                    "release source history at {head} is not exact: {gaps}"
+                )));
+            }
+        };
+
+        self.preflight_materializable_source_entries(entries, &format!("release source at {head}"))
     }
 
     /// Whether filesystem-to-graph compatibility ingestion is disabled for
@@ -2739,7 +3152,7 @@ impl DaemonState {
         )))
     }
 
-    fn save_snapshot_impl(&self, force_full: bool, event: Option<DaemonEvent>) -> Result<()> {
+    fn save_snapshot_impl(&self, mode: SnapshotSaveMode, event: Option<DaemonEvent>) -> Result<()> {
         // Serialize the whole kndb + generation-marker + kidx write sequence
         // against any other save (persist loop, idle flush, embed worker).
         // Without this, two concurrent saves race on the shared tmp paths and
@@ -2750,9 +3163,25 @@ impl DaemonState {
             .lock()
             .map_err(|_| DaemonError::Io(std::io::Error::other("persist lock poisoned")))?;
 
+        let has_unpersisted_changes = self.graph.has_unpersisted_changes();
+        let finalization_pending = self.post_commit_finalization_pending.load(Ordering::SeqCst);
+        if mode == SnapshotSaveMode::Retry && !has_unpersisted_changes && !finalization_pending {
+            return Ok(());
+        }
+
         if let Some(event) = event {
             self.queue_persistence_event(event);
         }
+
+        #[cfg(test)]
+        if self.snapshot_save_fail_once.swap(false, Ordering::SeqCst) {
+            return Err(DaemonError::Io(std::io::Error::other(
+                "injected pre-authority snapshot save failure",
+            )));
+        }
+
+        let force_full = mode == SnapshotSaveMode::Full
+            || (mode == SnapshotSaveMode::Retry && has_unpersisted_changes);
 
         let repo_id = self.cached_repo_id.as_str();
         let expected_gen = self.snapshot_generation.load(Ordering::SeqCst);
@@ -2770,6 +3199,13 @@ impl DaemonState {
                     .map_err(DaemonError::from)?;
                 let persistence_attempt =
                     GraphPersistenceAttempt::new(self.graph.as_ref(), persistence_epoch);
+                let detached_snapshot =
+                    kin_db::GraphSnapshot::from_bytes(&bytes).map_err(DaemonError::from)?;
+                self.persist_exact_source_objects(
+                    backend.as_ref(),
+                    repo_id,
+                    detached_snapshot.changes.values(),
+                )?;
                 // Keep every fallible derived-index operation before the
                 // authority commit. If it fails, the RAII attempt forces a full
                 // retry and the backend generation remains unchanged.
@@ -2805,6 +3241,16 @@ impl DaemonState {
             {
                 let persistence_attempt =
                     GraphPersistenceAttempt::new(self.graph.as_ref(), persistence_epoch);
+                self.persist_exact_source_objects(
+                    backend.as_ref(),
+                    repo_id,
+                    delta
+                        .changes
+                        .added
+                        .iter()
+                        .chain(delta.changes.modified.iter())
+                        .map(|(_, change)| change),
+                )?;
                 let bytes = delta.to_bytes().map_err(DaemonError::from)?;
                 // A text-index failure must precede the durable delta commit.
                 // The index is derived and root-stamped; the authority write is
@@ -3590,6 +4036,9 @@ mod tests {
         fail_cleanup: AtomicBool,
         delta_block: Option<DeltaSaveBlock>,
         recovery_loads: Option<Arc<AtomicU64>>,
+        source_loads: Option<Arc<AtomicU64>>,
+        source_saves: Option<Arc<AtomicU64>>,
+        source_override: Option<Vec<u8>>,
     }
 
     struct DeltaSaveBlock {
@@ -3605,6 +4054,9 @@ mod tests {
                 fail_cleanup: AtomicBool::new(fail_cleanup),
                 delta_block: None,
                 recovery_loads: None,
+                source_loads: None,
+                source_saves: None,
+                source_override: None,
             }
         }
 
@@ -3622,6 +4074,9 @@ mod tests {
                     block_once: AtomicBool::new(true),
                 }),
                 recovery_loads: None,
+                source_loads: None,
+                source_saves: None,
+                source_override: None,
             }
         }
 
@@ -3631,6 +4086,37 @@ mod tests {
                 fail_cleanup: AtomicBool::new(false),
                 delta_block: None,
                 recovery_loads: Some(recovery_loads),
+                source_loads: None,
+                source_saves: None,
+                source_override: None,
+            }
+        }
+
+        fn counting_source(
+            path: &std::path::Path,
+            source_loads: Arc<AtomicU64>,
+            source_saves: Arc<AtomicU64>,
+        ) -> Self {
+            Self {
+                inner: kin_db::LocalFileBackend::new(path),
+                fail_cleanup: AtomicBool::new(false),
+                delta_block: None,
+                recovery_loads: None,
+                source_loads: Some(source_loads),
+                source_saves: Some(source_saves),
+                source_override: None,
+            }
+        }
+
+        fn corrupt_source(path: &std::path::Path, bytes: Vec<u8>) -> Self {
+            Self {
+                inner: kin_db::LocalFileBackend::new(path),
+                fail_cleanup: AtomicBool::new(false),
+                delta_block: None,
+                recovery_loads: None,
+                source_loads: None,
+                source_saves: None,
+                source_override: Some(bytes),
             }
         }
     }
@@ -3646,6 +4132,32 @@ mod tests {
         ) -> std::result::Result<Option<(Vec<u8>, kin_db::Generation)>, kin_db::KinDbError>
         {
             self.inner.load_snapshot(repo_id)
+        }
+
+        fn save_source_blob(
+            &self,
+            repo_id: &str,
+            digest: [u8; 32],
+            data: &[u8],
+        ) -> std::result::Result<(), kin_db::KinDbError> {
+            if let Some(saves) = &self.source_saves {
+                saves.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.save_source_blob(repo_id, digest, data)
+        }
+
+        fn load_source_blob(
+            &self,
+            repo_id: &str,
+            digest: [u8; 32],
+        ) -> std::result::Result<Option<Vec<u8>>, kin_db::KinDbError> {
+            if let Some(loads) = &self.source_loads {
+                loads.fetch_add(1, Ordering::SeqCst);
+            }
+            if let Some(bytes) = &self.source_override {
+                return Ok(Some(bytes.clone()));
+            }
+            self.inner.load_source_blob(repo_id, digest)
         }
 
         fn load_snapshot_authority(
@@ -3748,6 +4260,39 @@ mod tests {
         }
     }
 
+    fn exact_source_change(
+        id_byte: u8,
+        file_id: &str,
+        kind: kin_model::ArtifactDeltaKind,
+        hash: Hash256,
+    ) -> kin_model::SemanticChange {
+        kin_model::SemanticChange {
+            id: kin_model::SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
+            parents: vec![],
+            author: kin_model::AuthorId::new("exact-source-preflight-test"),
+            message: "exact source preflight fixture".to_string(),
+            timestamp: kin_model::Timestamp::now(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![kin_model::ArtifactDelta {
+                file_id: FilePathId::new(file_id),
+                kind,
+                old_hash: None,
+                new_hash: Some(hash),
+            }],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        }
+    }
+
+    fn local_object_path(layout: &KinLayout, hash: Hash256) -> std::path::PathBuf {
+        let encoded = hash.to_string();
+        layout.objects_dir().join(&encoded[..2]).join(&encoded[2..])
+    }
+
     fn test_state(layout: KinLayout, working_dir: &std::path::Path) -> DaemonState {
         let snapshot_generation =
             if kin_db::SnapshotManager::local_authority_exists(layout.kindb_snapshot_path()) {
@@ -3796,6 +4341,8 @@ mod tests {
             pending_persistence_event: Mutex::new(None),
             #[cfg(test)]
             finalization_fail_once: AtomicBool::new(false),
+            #[cfg(test)]
+            snapshot_save_fail_once: AtomicBool::new(false),
             vfs_version: AtomicU64::new(0),
             vfs_tree_cache: std::sync::RwLock::new(None),
             vfs_tree_build_lock: tokio::sync::Mutex::new(()),
@@ -4968,6 +5515,550 @@ mod tests {
         assert!(names.contains("base_entity"));
         assert!(names.contains("first_delta_entity"));
         assert!(names.contains("second_delta_entity"));
+    }
+
+    #[test]
+    fn storage_backend_persists_exact_source_objects_before_full_and_delta_authority() {
+        use kin_db::{LocalFileBackend, StorageBackend};
+        use kin_model::{
+            ArtifactDelta, ArtifactDeltaKind, AuthorId, Branch, BranchName, ChangeStore,
+            SemanticChange, SemanticChangeId, Timestamp,
+        };
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+        let storage = tempfile::tempdir().unwrap();
+        let repo_id = "exact-source-restart";
+        let branch_name = BranchName::new("main");
+
+        let state = DaemonState::open_with_backend(
+            layout.clone(),
+            Box::new(LocalFileBackend::new(storage.path())),
+            repo_id,
+            None,
+        )
+        .unwrap();
+        let executable = b"#!/bin/sh\necho kin\n";
+        let executable_hash = state.blobs.write(executable).unwrap();
+        let executable_hash = Hash256::from_bytes(executable_hash.0);
+        let first = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([31; 32])),
+            parents: vec![],
+            author: AuthorId::new("tester"),
+            message: "add executable".to_string(),
+            timestamp: Timestamp::now(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![ArtifactDelta {
+                file_id: FilePathId("bin/kin".to_string()),
+                kind: ArtifactDeltaKind::AddedExecutableFile,
+                old_hash: None,
+                new_hash: Some(executable_hash),
+            }],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+        state.graph.create_change(&first).unwrap();
+        state
+            .graph
+            .create_branch(&Branch {
+                name: branch_name.clone(),
+                head: first.id,
+            })
+            .unwrap();
+        state.save_snapshot_full().unwrap();
+        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            LocalFileBackend::new(storage.path())
+                .load_source_blob(repo_id, *executable_hash.as_bytes())
+                .unwrap()
+                .as_deref(),
+            Some(executable.as_slice())
+        );
+        drop(state);
+
+        let reopened = DaemonState::open_with_backend(
+            layout.clone(),
+            Box::new(LocalFileBackend::new(storage.path())),
+            repo_id,
+            None,
+        )
+        .unwrap();
+        let target = b"bin/kin";
+        let target_hash = reopened.blobs.write(target).unwrap();
+        let target_hash = Hash256::from_bytes(target_hash.0);
+        let second = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([32; 32])),
+            parents: vec![first.id],
+            author: AuthorId::new("tester"),
+            message: "add symlink".to_string(),
+            timestamp: Timestamp::now(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![ArtifactDelta {
+                file_id: FilePathId("current".to_string()),
+                kind: ArtifactDeltaKind::AddedSymlink,
+                old_hash: None,
+                new_hash: Some(target_hash),
+            }],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+        reopened.graph.create_change(&second).unwrap();
+        reopened
+            .graph
+            .update_branch_head(&branch_name, &second.id)
+            .unwrap();
+        reopened.save_snapshot().unwrap();
+        assert_eq!(reopened.snapshot_generation.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            LocalFileBackend::new(storage.path())
+                .load_source_blob(repo_id, *target_hash.as_bytes())
+                .unwrap()
+                .as_deref(),
+            Some(target.as_slice())
+        );
+        drop(reopened);
+
+        let reopened = DaemonState::open_with_backend(
+            layout,
+            Box::new(LocalFileBackend::new(storage.path())),
+            repo_id,
+            None,
+        )
+        .unwrap();
+        let exact = reopened.graph.resolve_source_tree_at(&second.id).unwrap();
+        let kin_model::SourceTreeResolution::Exact { entries } = exact else {
+            panic!("persisted exact source history reopened as incomplete")
+        };
+        assert_eq!(
+            entries[&FilePathId("bin/kin".to_string())].kind,
+            kin_model::SourceEntryKind::File { executable: true }
+        );
+        assert_eq!(
+            entries[&FilePathId("current".to_string())].kind,
+            kin_model::SourceEntryKind::Symlink
+        );
+    }
+
+    #[test]
+    fn exact_source_persistence_and_preflight_load_each_content_hash_once() {
+        use kin_db::StorageBackend;
+        use kin_model::{
+            ArtifactDelta, ArtifactDeltaKind, AuthorId, ChangeStore, SemanticChange,
+            SemanticChangeId, Timestamp,
+        };
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let repo_id = "deduplicated-exact-source";
+        let source_loads = Arc::new(AtomicU64::new(0));
+        let source_saves = Arc::new(AtomicU64::new(0));
+        let backend = CleanupFailOnceBackend::counting_source(
+            storage.path(),
+            Arc::clone(&source_loads),
+            Arc::clone(&source_saves),
+        );
+        let bytes = b"shared exact source bytes\n";
+        let digest = kin_blobs::digest_bytes(bytes);
+        backend
+            .inner
+            .save_source_blob(repo_id, digest, bytes)
+            .unwrap();
+        let hash = Hash256::from_bytes(digest);
+        let change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x93; 32])),
+            parents: vec![],
+            author: AuthorId::new("tester"),
+            message: "reuse one immutable source object".to_string(),
+            timestamp: Timestamp::now(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![
+                ArtifactDelta {
+                    file_id: FilePathId("src/first.rs".to_string()),
+                    kind: ArtifactDeltaKind::AddedRegularFile,
+                    old_hash: None,
+                    new_hash: Some(hash),
+                },
+                ArtifactDelta {
+                    file_id: FilePathId("src/second.rs".to_string()),
+                    kind: ArtifactDeltaKind::AddedRegularFile,
+                    old_hash: None,
+                    new_hash: Some(hash),
+                },
+            ],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+        let state =
+            DaemonState::open_with_backend(init.layout, Box::new(backend), repo_id, None).unwrap();
+        state.graph.create_change(&change).unwrap();
+
+        source_loads.store(0, Ordering::SeqCst);
+        source_saves.store(0, Ordering::SeqCst);
+        state
+            .persist_exact_source_objects(
+                state.storage_backend.as_deref().unwrap(),
+                repo_id,
+                std::iter::once(&change),
+            )
+            .unwrap();
+        assert_eq!(source_loads.load(Ordering::SeqCst), 1);
+        assert_eq!(source_saves.load(Ordering::SeqCst), 0);
+
+        source_loads.store(0, Ordering::SeqCst);
+        state
+            .preflight_exact_source_tree(&state.graph, &change.id)
+            .unwrap();
+        assert_eq!(source_loads.load(Ordering::SeqCst), 1);
+
+        state.blobs.write(bytes).unwrap();
+        source_loads.store(0, Ordering::SeqCst);
+        source_saves.store(0, Ordering::SeqCst);
+        state
+            .persist_exact_source_objects(
+                state.storage_backend.as_deref().unwrap(),
+                repo_id,
+                std::iter::once(&change),
+            )
+            .unwrap();
+        assert_eq!(source_loads.load(Ordering::SeqCst), 0);
+        assert_eq!(source_saves.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn storage_backend_rejects_exact_graph_authority_when_source_bytes_are_missing() {
+        use kin_db::{LocalFileBackend, StorageBackend};
+        use kin_model::{
+            ArtifactDelta, ArtifactDeltaKind, AuthorId, ChangeStore, SemanticChange,
+            SemanticChangeId, Timestamp,
+        };
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let repo_id = "missing-exact-source";
+        let state = DaemonState::open_with_backend(
+            init.layout,
+            Box::new(LocalFileBackend::new(storage.path())),
+            repo_id,
+            None,
+        )
+        .unwrap();
+        let missing_hash = Hash256::from_bytes([99; 32]);
+        state
+            .graph
+            .create_change(&SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([33; 32])),
+                parents: vec![],
+                author: AuthorId::new("tester"),
+                message: "missing source".to_string(),
+                timestamp: Timestamp::now(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas: vec![ArtifactDelta {
+                    file_id: FilePathId("src/lib.rs".to_string()),
+                    kind: ArtifactDeltaKind::AddedRegularFile,
+                    old_hash: None,
+                    new_hash: Some(missing_hash),
+                }],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let error = state
+            .save_snapshot_full()
+            .expect_err("graph authority must not name unavailable exact source bytes");
+        assert!(error
+            .to_string()
+            .contains("absent from both local and backend authority"));
+        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 0);
+        assert!(LocalFileBackend::new(storage.path())
+            .load_snapshot(repo_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn corrupt_backend_exact_source_preflight_preserves_graph_and_generation() {
+        use kin_db::{LocalFileBackend, StorageBackend};
+        use kin_model::{
+            ArtifactDelta, ArtifactDeltaKind, AuthorId, ChangeStore, SemanticChange,
+            SemanticChangeId, Timestamp,
+        };
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let repo_id = "corrupt-exact-source";
+        let state = DaemonState::open_with_backend(
+            init.layout,
+            Box::new(CleanupFailOnceBackend::corrupt_source(
+                storage.path(),
+                b"wrong backend bytes".to_vec(),
+            )),
+            repo_id,
+            None,
+        )
+        .unwrap();
+        let expected_hash =
+            Hash256::from_bytes(kin_blobs::digest_bytes(b"expected exact source bytes"));
+        let change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([34; 32])),
+            parents: vec![],
+            author: AuthorId::new("tester"),
+            message: "corrupt backend source".to_string(),
+            timestamp: Timestamp::now(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![ArtifactDelta {
+                file_id: FilePathId("src/lib.rs".to_string()),
+                kind: ArtifactDeltaKind::AddedRegularFile,
+                old_hash: None,
+                new_hash: Some(expected_hash),
+            }],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+
+        let error = state
+            .preflight_exact_source_change(&state.graph, &change)
+            .expect_err("backend bytes with the wrong digest must fail before graph mutation");
+        assert!(error.to_string().contains("do not match"));
+        assert!(state.graph.get_change(&change.id).unwrap().is_none());
+        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 0);
+        assert!(LocalFileBackend::new(storage.path())
+            .load_snapshot(repo_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn local_exact_source_preflight_accepts_verified_cas_bytes() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+        let bytes = b"verified local source\n";
+        let blob_hash = state.blobs.write(bytes).unwrap();
+        let hash = Hash256::from_bytes(blob_hash.0);
+        let change = exact_source_change(
+            35,
+            "src/lib.rs",
+            kin_model::ArtifactDeltaKind::AddedRegularFile,
+            hash,
+        );
+
+        state
+            .preflight_exact_source_change(&state.graph, &change)
+            .expect("verified local CAS bytes must satisfy exact-source preflight");
+    }
+
+    #[test]
+    fn local_exact_source_preflight_rejects_missing_and_corrupt_bytes_without_mutation() {
+        for corrupt in [false, true] {
+            let repo_dir = tempfile::tempdir().unwrap();
+            let init = kin_core::init(repo_dir.path()).unwrap();
+            let state = test_state(init.layout, repo_dir.path());
+            let expected = b"expected local source\n";
+            let hash = if corrupt {
+                let blob_hash = state.blobs.write(expected).unwrap();
+                let hash = Hash256::from_bytes(blob_hash.0);
+                std::fs::write(local_object_path(&state.layout, hash), b"corrupt bytes").unwrap();
+                hash
+            } else {
+                Hash256::from_bytes(kin_blobs::digest_bytes(expected))
+            };
+            let change = exact_source_change(
+                if corrupt { 36 } else { 37 },
+                "src/lib.rs",
+                kin_model::ArtifactDeltaKind::AddedRegularFile,
+                hash,
+            );
+            let root_before = state.graph.compute_root_hash();
+            let generation_before = state.snapshot_generation.load(Ordering::SeqCst);
+
+            let error = state
+                .preflight_exact_source_change(&state.graph, &change)
+                .expect_err("unavailable local CAS authority must fail closed");
+
+            assert!(error.to_string().contains("absent or corrupt"));
+            assert!(state.graph.get_change(&change.id).unwrap().is_none());
+            assert_eq!(state.graph.compute_root_hash(), root_before);
+            assert_eq!(
+                state.snapshot_generation.load(Ordering::SeqCst),
+                generation_before
+            );
+        }
+    }
+
+    #[test]
+    fn local_exact_source_preflight_rejects_unmaterializable_path_and_symlink() {
+        let cases = [
+            (
+                ".kin/authority",
+                kin_model::ArtifactDeltaKind::AddedRegularFile,
+                b"must not enter control state".as_slice(),
+            ),
+            (
+                "src/escape",
+                kin_model::ArtifactDeltaKind::AddedSymlink,
+                b"../../outside".as_slice(),
+            ),
+        ];
+
+        for (index, (file_id, kind, bytes)) in cases.into_iter().enumerate() {
+            let repo_dir = tempfile::tempdir().unwrap();
+            let init = kin_core::init(repo_dir.path()).unwrap();
+            let state = test_state(init.layout, repo_dir.path());
+            let blob_hash = state.blobs.write(bytes).unwrap();
+            let change = exact_source_change(
+                38 + index as u8,
+                file_id,
+                kind,
+                Hash256::from_bytes(blob_hash.0),
+            );
+            let root_before = state.graph.compute_root_hash();
+            let generation_before = state.snapshot_generation.load(Ordering::SeqCst);
+
+            let error = state
+                .preflight_exact_source_change(&state.graph, &change)
+                .expect_err("unsafe exact-source entries must fail before graph mutation");
+
+            assert!(error.to_string().contains("not materializable"));
+            assert!(state.graph.get_change(&change.id).unwrap().is_none());
+            assert_eq!(state.graph.compute_root_hash(), root_before);
+            assert_eq!(
+                state.snapshot_generation.load(Ordering::SeqCst),
+                generation_before
+            );
+        }
+    }
+
+    #[test]
+    fn local_exact_source_preflight_rejects_file_directory_collision() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+        let file_hash = Hash256::from_bytes(state.blobs.write(b"file bytes").unwrap().0);
+        let child_hash = Hash256::from_bytes(state.blobs.write(b"child bytes").unwrap().0);
+        let mut change = exact_source_change(
+            40,
+            "pkg",
+            kin_model::ArtifactDeltaKind::AddedRegularFile,
+            file_hash,
+        );
+        change.artifact_deltas.push(kin_model::ArtifactDelta {
+            file_id: FilePathId::new("pkg/lib.rs"),
+            kind: kin_model::ArtifactDeltaKind::AddedRegularFile,
+            old_hash: None,
+            new_hash: Some(child_hash),
+        });
+        let root_before = state.graph.compute_root_hash();
+        let generation_before = state.snapshot_generation.load(Ordering::SeqCst);
+
+        let error = state
+            .preflight_exact_source_change(&state.graph, &change)
+            .expect_err("a file and its descendant cannot form one materializable tree");
+
+        assert!(error.to_string().contains("not materializable"));
+        assert!(state.graph.get_change(&change.id).unwrap().is_none());
+        assert_eq!(state.graph.compute_root_hash(), root_before);
+        assert_eq!(
+            state.snapshot_generation.load(Ordering::SeqCst),
+            generation_before
+        );
+    }
+
+    #[test]
+    fn local_exact_source_preflight_rejects_parent_delta_tree_collision() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+        let child_hash = Hash256::from_bytes(state.blobs.write(b"parent child bytes").unwrap().0);
+        let parent = exact_source_change(
+            41,
+            "pkg/lib.rs",
+            kin_model::ArtifactDeltaKind::AddedRegularFile,
+            child_hash,
+        );
+        state.graph.create_change(&parent).unwrap();
+
+        let file_hash = Hash256::from_bytes(state.blobs.write(b"incoming file bytes").unwrap().0);
+        let mut incoming = exact_source_change(
+            42,
+            "pkg",
+            kin_model::ArtifactDeltaKind::AddedRegularFile,
+            file_hash,
+        );
+        incoming.parents = vec![parent.id];
+        let root_before = state.graph.compute_root_hash();
+
+        let error = state
+            .preflight_exact_source_change(&state.graph, &incoming)
+            .expect_err("the complete parent plus delta tree must be materializable");
+
+        assert!(error.to_string().contains("not materializable"));
+        assert!(state.graph.get_change(&incoming.id).unwrap().is_none());
+        assert_eq!(state.graph.compute_root_hash(), root_before);
+    }
+
+    #[test]
+    fn local_exact_source_preflight_rejects_merge_parent_tree_collision() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+        let child_hash = Hash256::from_bytes(state.blobs.write(b"left child bytes").unwrap().0);
+        let left = exact_source_change(
+            43,
+            "pkg/lib.rs",
+            kin_model::ArtifactDeltaKind::AddedRegularFile,
+            child_hash,
+        );
+        let file_hash = Hash256::from_bytes(state.blobs.write(b"right file bytes").unwrap().0);
+        let right = exact_source_change(
+            44,
+            "pkg",
+            kin_model::ArtifactDeltaKind::AddedRegularFile,
+            file_hash,
+        );
+        state.graph.create_change(&left).unwrap();
+        state.graph.create_change(&right).unwrap();
+
+        let mut merge = exact_source_change(
+            45,
+            "merge-marker.txt",
+            kin_model::ArtifactDeltaKind::AddedRegularFile,
+            Hash256::from_bytes(state.blobs.write(b"merge marker").unwrap().0),
+        );
+        merge.parents = vec![left.id, right.id];
+        let root_before = state.graph.compute_root_hash();
+
+        let error = state
+            .preflight_exact_source_change(&state.graph, &merge)
+            .expect_err("all merge parents must participate in prospective tree validation");
+
+        assert!(error.to_string().contains("not materializable"));
+        assert!(state.graph.get_change(&merge.id).unwrap().is_none());
+        assert_eq!(state.graph.compute_root_hash(), root_before);
     }
 
     #[test]

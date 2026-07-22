@@ -59,12 +59,14 @@ pub fn handle_verify_entity<G: GraphStore>(
 pub const COVERAGE_SUMMARY_DESC: &str = "\
 Get repo-wide test coverage at a glance: total entities, how many are covered, the \
 coverage ratio, and the list of entities still missing test proof. Reach for it to \
-assess overall test health, find what's untested, or feed a release/quality gate. It's \
+assess current test health or find what's untested. Verification runs are not yet \
+bound to immutable source changes, so this advisory live view does not authorize a release. It's \
 the whole-repo counterpart to kin_verify_entity (one entity) and underlies \
 kin_release_check's proof requirement.";
 
 pub fn handle_coverage_summary<G: GraphStore>(store: &G) -> Result<ToolCallResult> {
-    let coverage = store.get_coverage_summary().map_err(McpError::graph)?;
+    let coverage = kin_review::passing_proof_coverage(store)
+        .map_err(|error| McpError::Review(error.to_string()))?;
 
     let result = serde_json::json!({
         "total_entities": coverage.total_entities,
@@ -126,80 +128,195 @@ pub fn handle_security_scan<G: GraphStore>(
 }
 
 pub const RELEASE_CHECK_DESC: &str = "\
-Run a pre-release gate and get a pass/fail verdict with the specific blockers. Toggle \
-the policy you want enforced: require_proof fails when entities are missing test proof; \
-require_approval fails when any agent-authored change in recent history lacks a recorded \
-approval (the same gate as `kin release --require-approval`). Returns whether the release \
-would pass plus a list of what's blocking it and the current coverage figures. Reach for \
-it as the final go/no-go check before cutting a release, consolidating coverage and \
-approval gates into one answer.";
+Run a graph-only pre-release advisory against one named branch and immutable source change. \
+force overrides only the baseline coverage threshold; require_proof fails closed for every \
+non-empty source because verification runs do not yet carry immutable source authority; \
+require_approval requires human approval for every reachable non-root change. The result \
+binds its source, rechecks the branch-head/source match before returning, and checks exact \
+graph history, source-tree completeness, and the optional expected entity count. It is not \
+daemon admission: object availability and the final mutation CAS are enforced only by \
+`kin release`.";
+
+fn release_optional_bool(
+    args: &HashMap<String, serde_json::Value>,
+    key: &str,
+    default: bool,
+) -> Result<bool> {
+    match args.get(key) {
+        None => Ok(default),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| McpError::InvalidParams(format!("{key} must be a boolean"))),
+    }
+}
+
+fn release_optional_string(
+    args: &HashMap<String, serde_json::Value>,
+    key: &str,
+) -> Result<Option<String>> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(|value| Some(value.to_string()))
+            .ok_or_else(|| McpError::InvalidParams(format!("{key} must be a string"))),
+    }
+}
+
+fn release_optional_entity_count(
+    args: &HashMap<String, serde_json::Value>,
+) -> Result<Option<usize>> {
+    match args.get("expected_entity_count") {
+        None => Ok(None),
+        Some(value) => {
+            let count = value.as_u64().ok_or_else(|| {
+                McpError::InvalidParams(
+                    "expected_entity_count must be a non-negative integer".to_string(),
+                )
+            })?;
+            usize::try_from(count)
+                .map(Some)
+                .map_err(|_| McpError::InvalidParams("expected_entity_count exceeds usize".into()))
+        }
+    }
+}
 
 pub fn handle_release_check<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
-    let require_proof = get_optional_bool(args, "require_proof", false);
-    let require_approval = get_optional_bool(args, "require_approval", false);
+    let require_proof = release_optional_bool(args, "require_proof", false)?;
+    let require_approval = release_optional_bool(args, "require_approval", false)?;
+    let force = release_optional_bool(args, "force", false)?;
+    let requested_branch = release_optional_string(args, "branch")?;
+    let requested_source = release_optional_string(args, "source_change_id")?
+        .map(|value| parse_change_id(&value))
+        .transpose()?;
+    let expected_entity_count = release_optional_entity_count(args)?;
 
-    let coverage = store.get_coverage_summary().map_err(McpError::graph)?;
+    let mut branches = store.list_branches().map_err(McpError::graph)?;
+    branches.sort_by(|left, right| left.name.0.cmp(&right.name.0));
+    let branch = if let Some(name) = requested_branch {
+        store
+            .get_branch(&kin_model::BranchName::new(&name))
+            .map_err(McpError::graph)?
+            .ok_or_else(|| McpError::InvalidParams(format!("branch not found: {name}")))?
+    } else if let Some(main) = branches.iter().find(|branch| branch.name.0 == "main") {
+        main.clone()
+    } else if let [only] = branches.as_slice() {
+        only.clone()
+    } else {
+        return Err(McpError::InvalidParams(
+            "kin_release_check requires branch when graph truth has zero or multiple branches"
+                .to_string(),
+        ));
+    };
+    let source_head = requested_source.unwrap_or(branch.head);
+    store
+        .get_change(&source_head)
+        .map_err(McpError::graph)?
+        .ok_or_else(|| {
+            McpError::Review(format!(
+                "release source change {source_head} is not materialized"
+            ))
+        })?;
+    let source_state = store
+        .resolve_graph_at(&source_head)
+        .map_err(|error| McpError::Review(error.to_string()))?;
+    let coverage = kin_review::source_bound_release_proof_coverage_for_entities(
+        source_state.entities.values(),
+    );
 
-    let mut pass = true;
     let mut blockers: Vec<String> = Vec::new();
 
-    if require_proof && !coverage.missing_proof.is_empty() {
-        pass = false;
+    if let Some(expected) = expected_entity_count {
+        if expected != source_state.entities.len() {
+            blockers.push(format!(
+                "expected entity count {expected} does not match immutable source count {}",
+                source_state.entities.len()
+            ));
+        }
+    }
+
+    match store
+        .resolve_source_tree_at(&source_head)
+        .map_err(McpError::graph)?
+    {
+        kin_model::SourceTreeResolution::Exact { .. } => {}
+        kin_model::SourceTreeResolution::Incomplete { gaps } => blockers.push(format!(
+            "immutable source tree is incomplete at {source_head}: {} gap(s)",
+            gaps.len()
+        )),
+    }
+
+    if coverage.coverage_ratio < 0.5 && !force {
         blockers.push(format!(
-            "{} entities missing test proof",
+            "immutable source-bound proof coverage {:.1}% is below 50%",
+            coverage.coverage_ratio * 100.0
+        ));
+    }
+
+    if require_proof && !coverage.missing_proof.is_empty() {
+        blockers.push(format!(
+            "{} entities missing immutable source-bound test proof",
             coverage.missing_proof.len()
         ));
     }
 
     if require_approval {
-        // Match `kin release --require-approval`: walk change history from each
-        // branch head and block on any agent-authored change that lacks a
-        // recorded `Approved` approval. The store has no working-tree HEAD file,
-        // so heads are resolved from the branch graph (graph truth). A branch is
-        // walked over its first-parent linear history.
-        let branches = store.list_branches().map_err(McpError::graph)?;
-        let mut seen: std::collections::HashSet<kin_model::SemanticChangeId> =
-            std::collections::HashSet::new();
-        let mut unapproved: Vec<kin_review::UnapprovedAgentChange> = Vec::new();
-        for branch in &branches {
-            for change in kin_review::unapproved_agent_changes(store, &branch.head, 50)
-                .map_err(|e| McpError::Review(e.to_string()))?
-            {
-                if seen.insert(change.change_id) {
-                    unapproved.push(change);
-                }
-            }
-        }
-        // Total-order the blockers by change id so the emitted list is byte-stable
-        // across identical-state runs regardless of branch iteration order — agents
-        // diffing gate output must not see phantom reorderings.
+        let mut unapproved = kin_review::unapproved_changes(store, &source_head, usize::MAX)
+            .map_err(|error| McpError::Review(error.to_string()))?;
         unapproved.sort_by(|a, b| a.change_id.to_string().cmp(&b.change_id.to_string()));
         if !unapproved.is_empty() {
-            pass = false;
             let detail = unapproved
                 .iter()
                 .map(|c| format!("{} ({})", c.change_id, c.author))
                 .collect::<Vec<_>>()
                 .join(", ");
             blockers.push(format!(
-                "{} unapproved agent change(s): {}",
+                "{} non-root change(s) lack human approval: {}",
                 unapproved.len(),
                 detail
             ));
         }
     }
 
+    // This tool is advisory and cannot hold the daemon's mutation gate, but it
+    // must at least detect a branch move that happened while the source checks
+    // above were running. Publication still performs the authoritative CAS.
+    let final_branch = store.get_branch(&branch.name).map_err(McpError::graph)?;
+    let final_branch_head = final_branch.as_ref().map(|branch| branch.head);
+    match final_branch_head {
+        Some(head) if head == source_head => {}
+        Some(head) => blockers.push(format!(
+            "branch {} moved: expected source {}, current head {}",
+            branch.name, source_head, head
+        )),
+        None => blockers.push(format!(
+            "branch {} disappeared while checking source {}",
+            branch.name, source_head
+        )),
+    }
+
     let result = serde_json::json!({
-        "pass": pass,
+        "pass": blockers.is_empty(),
         "blockers": blockers,
+        "branch": branch.name.to_string(),
+        "branch_head": final_branch_head.map(|head| head.to_string()),
+        "source_change_id": source_head.to_string(),
+        "source_entity_count": source_state.entities.len(),
         "coverage": {
             "total_entities": coverage.total_entities,
             "covered_entities": coverage.covered_entities,
             "coverage_ratio": coverage.coverage_ratio,
             "missing_proof_count": coverage.missing_proof.len(),
+        },
+        "authority": "advisory_graph_only",
+        "daemon_admission_required": true,
+        "proof_authority": if source_state.entities.is_empty() {
+            "empty_source_vacuous"
+        } else {
+            "strict_source_bound_proof_unavailable"
         }
     });
 
@@ -235,4 +352,54 @@ pub fn handle_contract_check<G: GraphStore>(
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kin_model::{Branch, BranchName, ChangeStore, Hash256, SemanticChangeId};
+
+    #[test]
+    fn release_check_fails_closed_for_dangling_branch_head() {
+        let store = kin_db::InMemoryGraph::new();
+        let missing = SemanticChangeId::from_hash(Hash256::from_bytes([0xd9; 32]));
+        store
+            .create_branch(&Branch {
+                name: BranchName::new("main"),
+                head: missing,
+            })
+            .unwrap();
+        let args = HashMap::from([("require_approval".to_string(), serde_json::json!(true))]);
+
+        let error = handle_release_check(&args, &store)
+            .expect_err("MCP release gate must not pass a missing graph head");
+
+        assert!(matches!(error, McpError::Review(_)));
+        assert!(error.to_string().contains(&missing.to_string()));
+        assert!(error.to_string().contains("not materialized"));
+    }
+
+    #[test]
+    fn release_check_rejects_present_parameters_with_wrong_json_types() {
+        let store = kin_db::InMemoryGraph::new();
+        let cases = [
+            ("branch", serde_json::json!(false)),
+            ("source_change_id", serde_json::json!([])),
+            ("expected_entity_count", serde_json::json!("1")),
+            ("force", serde_json::json!("false")),
+            ("require_proof", serde_json::json!(1)),
+            ("require_approval", serde_json::Value::Null),
+        ];
+
+        for (key, value) in cases {
+            let args = HashMap::from([(key.to_string(), value)]);
+            let error = handle_release_check(&args, &store)
+                .expect_err("present release parameters must not silently default on bad types");
+            assert!(matches!(error, McpError::InvalidParams(_)));
+            assert!(
+                error.to_string().contains(key),
+                "wrong-type error must name {key}: {error}"
+            );
+        }
+    }
 }
