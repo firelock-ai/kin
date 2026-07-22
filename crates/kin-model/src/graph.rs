@@ -4,6 +4,7 @@
 use crate::branch::Branch;
 use crate::change::{ArtifactDeltaKind, SemanticChange, SourceEntryKind, TransactionDelta};
 use crate::entity::{Entity, EntityKind, EntityRole};
+use crate::error::ModelError;
 use crate::ids::*;
 use crate::relation::{GraphNodeId, Relation, RelationKind};
 use crate::review::{
@@ -246,7 +247,9 @@ pub trait EntityStore: Send + Sync {
 
 /// Semantic change DAG and branch operations.
 pub trait ChangeStore: Send + Sync {
-    type Error: std::error::Error + Send + Sync + 'static;
+    /// Store errors must be able to represent model-level history integrity
+    /// failures surfaced by the default replay helpers.
+    type Error: std::error::Error + Send + Sync + From<ModelError> + 'static;
 
     fn get_entity_history(
         &self,
@@ -840,9 +843,9 @@ fn collect_changes_topologically<G: ChangeStore + ?Sized>(
                 if !visited.insert(id) {
                     continue;
                 }
-                let Some(change) = store.get_change(&id)? else {
-                    continue;
-                };
+                let change = store
+                    .get_change(&id)?
+                    .ok_or_else(|| ModelError::ChangeNotFound(id.to_string()))?;
 
                 stack.push(Frame::Emit(Box::new(change.clone())));
                 for parent in change.parents.iter().rev() {
@@ -1946,6 +1949,115 @@ mod tests {
             risk_summary: None,
             authored_on: None,
         }
+    }
+
+    #[derive(Default)]
+    struct HistoryStore {
+        changes: HashMap<SemanticChangeId, SemanticChange>,
+    }
+
+    impl HistoryStore {
+        fn with_change(change: SemanticChange) -> Self {
+            Self {
+                changes: HashMap::from([(change.id, change)]),
+            }
+        }
+    }
+
+    impl ChangeStore for HistoryStore {
+        type Error = ModelError;
+
+        fn get_entity_history(
+            &self,
+            _id: &EntityId,
+        ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
+            Ok(Vec::new())
+        }
+
+        fn find_merge_bases(
+            &self,
+            _a: &SemanticChangeId,
+            _b: &SemanticChangeId,
+        ) -> std::result::Result<Vec<SemanticChangeId>, Self::Error> {
+            Ok(Vec::new())
+        }
+
+        fn create_change(&self, _change: &SemanticChange) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn get_change(
+            &self,
+            id: &SemanticChangeId,
+        ) -> std::result::Result<Option<SemanticChange>, Self::Error> {
+            Ok(self.changes.get(id).cloned())
+        }
+
+        fn get_changes_since(
+            &self,
+            _base: &SemanticChangeId,
+            _head: &SemanticChangeId,
+        ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
+            Ok(Vec::new())
+        }
+
+        fn get_branch(
+            &self,
+            _name: &BranchName,
+        ) -> std::result::Result<Option<Branch>, Self::Error> {
+            Ok(None)
+        }
+
+        fn create_branch(&self, _branch: &Branch) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn update_branch_head(
+            &self,
+            _name: &BranchName,
+            _new_head: &SemanticChangeId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn delete_branch(&self, _name: &BranchName) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn list_branches(&self) -> std::result::Result<Vec<Branch>, Self::Error> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn assert_missing_change(error: ModelError, expected: SemanticChangeId) {
+        match error {
+            ModelError::ChangeNotFound(id) => assert_eq!(id, expected.to_string()),
+            other => panic!("expected missing-change error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn resolve_graph_at_fails_closed_when_head_is_missing() {
+        let head = make_change_id(240);
+        let error = HistoryStore::default().resolve_graph_at(&head).unwrap_err();
+
+        assert_missing_change(error, head);
+    }
+
+    #[test]
+    fn resolve_source_tree_at_fails_closed_when_reachable_parent_is_missing() {
+        let missing_parent = make_change_id(241);
+        let head = make_change_id(242);
+        let store = HistoryStore::with_change(make_semantic_change(
+            head,
+            vec![missing_parent],
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        let error = store.resolve_source_tree_at(&head).unwrap_err();
+
+        assert_missing_change(error, missing_parent);
     }
 
     #[test]
