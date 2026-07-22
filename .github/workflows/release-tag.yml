@@ -1,0 +1,272 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Release Tag (bot-mediated)
+
+# Bot-mediated creation of a `vX.Y.Z` release tag. The repository ruleset
+# "Protect version release tags" restricts who may create `v*` tags. Instead of
+# the release captain holding the founder credential that the ruleset admits,
+# this workflow mints a short-lived installation token for the "kin-release-bot"
+# GitHub App (allowlisted in that ruleset) and creates the tag ref only after a
+# strict, fail-closed set of checks pass. Creating the ref with an App token —
+# never the default GITHUB_TOKEN — is what lets the existing tag-triggered
+# `release.yml` DAG fire.
+#
+# Every step below is fail-closed: any unmet precondition aborts before the tag
+# is created. See docs/release-bot.md for the operator runbook and the one-time
+# founder setup.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create (must match ^v[0-9]+.[0-9]+.[0-9]+$, e.g. v0.3.0)"
+        required: true
+        type: string
+      sha:
+        description: "40-hex commit SHA that MUST equal current origin/main HEAD"
+        required: true
+        type: string
+
+# The App installation token carries the only write capability (creating the
+# tag ref). The workflow's own GITHUB_TOKEN stays read-only: contents:read for
+# checkout and ref reads, checks:read to inspect the commit's check-runs.
+permissions:
+  contents: read
+  checks: read
+
+# Never run two tag mints at once, and never cancel one mid-flight.
+concurrency:
+  group: release-tag
+  cancel-in-progress: false
+
+jobs:
+  mint-release-tag:
+    name: Mint release tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Guard — authorized actor and ref
+        # Only the release captain or the bot may dispatch, and only against the
+        # trusted workflow file on main. A branch dispatch of this file is
+        # refused loudly rather than silently skipped.
+        env:
+          ACTOR: ${{ github.actor }}
+          REF: ${{ github.ref }}
+          ALLOWED_ACTORS: |
+            troyjr4103
+            kin-release-bot[bot]
+        run: |
+          set -euo pipefail
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::release-tag must be dispatched from main (got '$REF')"
+            exit 1
+          fi
+          authorized=0
+          while IFS= read -r allowed; do
+            [ -z "$allowed" ] && continue
+            [ "$allowed" = "$ACTOR" ] && authorized=1
+          done <<< "$ALLOWED_ACTORS"
+          if [ "$authorized" -ne 1 ]; then
+            echo "::error::actor '$ACTOR' is not authorized to mint release tags"
+            exit 1
+          fi
+          echo "authorized actor=$ACTOR ref=$REF"
+
+      - name: Validate inputs
+        # workflow_dispatch inputs cannot enforce a regex, so validate here and
+        # normalize the SHA to lowercase. Both are routed through the job
+        # environment (never interpolated into a shell) to stay injection-safe.
+        env:
+          RAW_TAG: ${{ inputs.tag }}
+          RAW_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          tag="$RAW_TAG"
+          sha="$(printf '%s' "$RAW_SHA" | tr '[:upper:]' '[:lower:]')"
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::tag '$tag' must match ^v[0-9]+\.[0-9]+\.[0-9]+\$"
+            exit 1
+          fi
+          if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::sha '$sha' must be a 40-character lowercase hex commit SHA"
+            exit 1
+          fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "SHA=$sha" >> "$GITHUB_ENV"
+          echo "validated tag=$tag sha=$sha"
+
+      - name: Checkout requested SHA
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify SHA is current origin/main HEAD
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          head_sha="$(git rev-parse HEAD)"
+          main_sha="$(git rev-parse FETCH_HEAD)"
+          echo "checked-out=$head_sha main=$main_sha requested=$SHA"
+          if [ "$head_sha" != "$SHA" ]; then
+            echo "::error::checked-out HEAD ($head_sha) != requested sha ($SHA)"
+            exit 1
+          fi
+          if [ "$head_sha" != "$main_sha" ]; then
+            echo "::error::sha $SHA is not current origin/main HEAD ($main_sha) — refusing"
+            exit 1
+          fi
+          echo "sha confirmed at origin/main HEAD"
+
+      - name: Verify tag version matches workspace version
+        # The version of record is [workspace.package].version in the root
+        # Cargo.toml at the requested SHA. The tag must be exactly that, v-prefixed.
+        run: |
+          set -euo pipefail
+          ws_version="$(python3 - <<'PY'
+          import tomllib
+          with open("Cargo.toml", "rb") as f:
+              data = tomllib.load(f)
+          print(data["workspace"]["package"]["version"])
+          PY
+          )"
+          expected="v${ws_version}"
+          echo "workspace.package.version=$ws_version expected_tag=$expected requested_tag=$TAG"
+          if [ "$TAG" != "$expected" ]; then
+            echo "::error::tag $TAG does not match workspace version tag $expected at $SHA"
+            exit 1
+          fi
+          echo "tag matches workspace version"
+
+      - name: Verify required checks are green
+        # Fail closed on the commit's check-runs. REQUIRED_CHECKS is the
+        # presence-required release-critical set — a sha missing any of these is
+        # refused even if nothing failed. Each must be present and green
+        # (skipped/neutral allowed — DCO is skipped on a merged HEAD). Separately,
+        # no check anywhere may be failing or still in progress; the second loop
+        # owns that present-check strictness, so this list need not mirror every
+        # CI context. It is the main branch-protection required contexts plus the
+        # Windows installer leg, which is release-critical and never optional.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REQUIRED_CHECKS: |
+            Check & Test (ubuntu-latest)
+            Check & Test (macos-latest)
+            DCO Sign-off
+            cargo-deny
+            gitleaks (full history)
+            Windows installer + vector-free release build
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" --paginate \
+            -q '.check_runs[] | {name: .name, status: .status, conclusion: .conclusion, id: .id}' \
+            > check_runs.ndjson || { echo "::error::failed to fetch check-runs for $SHA"; exit 1; }
+          python3 - <<'PY'
+          import json, os, sys
+
+          runs = {}
+          with open("check_runs.ndjson") as handle:
+              for line in handle:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  run = json.loads(line)
+                  name = run["name"]
+                  # Keep only the latest attempt per check name (highest id).
+                  if name not in runs or run["id"] > runs[name]["id"]:
+                      runs[name] = run
+
+          required = [c.strip() for c in os.environ["REQUIRED_CHECKS"].splitlines() if c.strip()]
+          acceptable = {"success", "skipped", "neutral"}
+          errors = []
+
+          if not runs:
+              errors.append("no check-runs found on sha")
+
+          for name in required:
+              run = runs.get(name)
+              if run is None:
+                  errors.append(f"missing required check: {name}")
+              elif run["status"] != "completed":
+                  errors.append(f"required check not completed: {name} (status={run['status']})")
+              elif run["conclusion"] not in acceptable:
+                  errors.append(f"required check not green: {name} (conclusion={run['conclusion']})")
+
+          for name, run in runs.items():
+              if run["status"] != "completed":
+                  errors.append(f"check still in progress: {name} (status={run['status']})")
+              elif run["conclusion"] not in acceptable:
+                  errors.append(f"check not green: {name} (conclusion={run['conclusion']})")
+
+          if errors:
+              print("::error::refusing — check verification failed:")
+              for err in errors:
+                  print(f"  - {err}")
+              sys.exit(1)
+
+          print(f"verified {len(required)} required checks green; "
+                f"{len(runs)} total checks, none failing or in progress")
+          PY
+
+      - name: Verify tag does not already exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/$REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::tag $TAG already exists — refusing"
+            exit 1
+          fi
+          echo "tag $TAG does not exist yet"
+
+      - name: Mint kin-release-bot installation token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
+
+      - name: Create release tag ref
+        # Created with the App token (not GITHUB_TOKEN) so the ruleset admits it
+        # AND so the tag push triggers release.yml.
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          echo "creating refs/tags/$TAG -> $SHA via kin-release-bot"
+          gh api "repos/$REPO/git/refs" \
+            -f ref="refs/tags/$TAG" \
+            -f sha="$SHA" >/dev/null
+          echo "created refs/tags/$TAG"
+
+      - name: Verify tag ref and summarize
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          got="$(gh api "repos/$REPO/git/ref/tags/$TAG" -q '.object.sha')"
+          echo "created ref points at: $got (expected $SHA)"
+          if [ "$got" != "$SHA" ]; then
+            echo "::error::post-verify failed: tag $TAG points at $got, not $SHA"
+            exit 1
+          fi
+          {
+            echo "## Release tag minted"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| tag | \`$TAG\` |"
+            echo "| sha | \`$SHA\` |"
+            echo "| actor | \`$ACTOR\` |"
+            echo "| repo | \`$REPO\` |"
+            echo ""
+            echo "Tag ref created with the kin-release-bot installation token, which triggers the fail-closed \`release.yml\` DAG."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "release tag $TAG minted and verified at $SHA"
