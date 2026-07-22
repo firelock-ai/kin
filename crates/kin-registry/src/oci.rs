@@ -435,7 +435,8 @@ fn read_metadata_file(path: &FsPath) -> Result<OciMetadata, String> {
 /// lock orders this snapshot against publishers in other daemon processes.
 async fn metadata_snapshot(state: &OciRegistryState) -> Result<OciMetadata, String> {
     let mut cache = state.metadata.write().await;
-    let _storage_lock = crate::storage_lock::StorageLock::shared(&state.metadata_lock_path)
+    let _storage_lock = crate::storage_lock::StorageLock::shared_async(&state.metadata_lock_path)
+        .await
         .map_err(|error| format!("failed to lock OCI metadata for reading: {error}"))?;
     let fresh = read_metadata_file(&state.metadata_path)?;
     *cache = fresh.clone();
@@ -455,7 +456,8 @@ async fn begin_metadata_write(
     String,
 > {
     let cache = state.metadata.write().await;
-    let storage_lock = crate::storage_lock::StorageLock::exclusive(&state.metadata_lock_path)
+    let storage_lock = crate::storage_lock::StorageLock::exclusive_async(&state.metadata_lock_path)
+        .await
         .map_err(|error| format!("failed to lock OCI metadata for writing: {error}"))?;
     let fresh = read_metadata_file(&state.metadata_path)?;
     Ok((cache, storage_lock, fresh))
@@ -567,7 +569,8 @@ async fn begin_upload_write(
     state: &OciRegistryState,
 ) -> Result<UploadWriteTransaction<'_>, String> {
     let local = state.upload_gate.lock().await;
-    let storage = crate::storage_lock::StorageLock::exclusive(&state.uploads_lock_path)
+    let storage = crate::storage_lock::StorageLock::exclusive_async(&state.uploads_lock_path)
+        .await
         .map_err(|error| format!("failed to lock OCI uploads: {error}"))?;
     crate::atomic_file::ensure_directory_durable(&state.uploads_dir)
         .map_err(|error| format!("failed to create OCI upload storage: {error}"))?;
