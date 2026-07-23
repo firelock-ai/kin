@@ -784,12 +784,30 @@ jobs:
           ]);
 
           for (const [path, report] of reports) {
-            if (report.healthy !== true) {
+            const checks = new Map(report.checks.map((check) => [check.id, check]));
+            // This capability capture runs before `kin embed`, so the daemon
+            // graph still has embeddings pending. Under graph-authoritative
+            // health that is semantic_query_readiness=stale, an intentional
+            // authority gate that flips the aggregate report.healthy to false.
+            // Accept that single transient pre-embed reason here — the
+            // post-embed embedded-health capture below still requires
+            // healthy=true with readiness=healthy — while keeping every other
+            // unhealthy reason fatal: any missing/misconfigured check, or any
+            // other check that is neither healthy nor unsupported, still fails.
+            const onlyPendingEmbeddingsBlocks =
+              runnerOs !== "Windows" &&
+              checks.get("semantic_query_readiness")?.status === "stale" &&
+              report.checks.every(
+                (check) =>
+                  check.id === "semantic_query_readiness" ||
+                  check.status === "healthy" ||
+                  check.status === "unsupported"
+              );
+            if (report.healthy !== true && !onlyPendingEmbeddingsBlocks) {
               throw new Error(
                 `${path}: overall healthy=${report.healthy}; non-healthy checks: ${nonHealthyChecks(report)}`
               );
             }
-            const checks = new Map(report.checks.map((check) => [check.id, check]));
             for (const [id, expected] of required) {
               const actual = checks.get(id)?.status;
               if (actual !== expected) {

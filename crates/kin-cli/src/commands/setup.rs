@@ -2159,7 +2159,19 @@ pub(crate) fn codex_entry_has_exact_repo_binding(
     {
         return Ok(false);
     }
-    Ok(codex_repo_from_entry_bytes(content)?.as_deref() == Some(expected_repo))
+    // `configure_codex` writes the *canonicalized* working directory, and the
+    // parsed `--repo` path is normalized through `canonical_initialized_repo`.
+    // The expected repository is supplied by the health surface via
+    // `current_health_repo`, which does not canonicalize, so normalize it the
+    // same way before comparing. Otherwise a correctly written binding is
+    // rejected wherever a raw path differs from its canonical form — notably
+    // Windows `\\?\` verbatim prefixes and symlinked home directories. Compare
+    // canonical repository identity, not raw path strings.
+    let actual = codex_repo_from_entry_bytes(content)?;
+    Ok(match canonical_initialized_repo(expected_repo) {
+        Some(expected) => actual == Some(expected),
+        None => false,
+    })
 }
 
 fn json_mcp_repo_from_entry_bytes(content: &[u8], client: &str) -> Result<Option<PathBuf>> {
@@ -12785,6 +12797,46 @@ mod tests {
             .expect("relative --repo must resolve from the entry cwd");
 
         assert_eq!(resolved, repo_a);
+    }
+
+    #[test]
+    fn codex_binding_matches_expected_repo_regardless_of_path_form() {
+        // Regression: `configure_codex` writes the canonicalized repository
+        // path, but the health surface supplies the expected repo via
+        // `current_health_repo`, which does not canonicalize. Comparing the two
+        // by raw path equality wrongly reports a correct binding as
+        // misconfigured wherever the raw path differs from its canonical form —
+        // this is what failed every Windows install-proof leg (the `\\?\`
+        // verbatim prefix that `canonicalize` adds) while Unix passed. The
+        // comparison must normalize both sides to canonical repository identity.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".kin")).unwrap();
+        let canonical = repo.canonicalize().unwrap();
+
+        // Exactly what `configure_codex` writes: an absolute, canonicalized
+        // `--repo` path.
+        let content = format!(
+            "[mcp_servers.kin]\ncommand = \"/managed/kin\"\nargs = [\"mcp\", \"start\", \"--repo\", {:?}]\n",
+            canonical.to_string_lossy()
+        );
+
+        // The same repository named through a non-canonical but equivalent
+        // path, standing in for the Windows `\\?\`/symlink divergence.
+        let non_canonical = canonical.join("..").join(canonical.file_name().unwrap());
+        assert_ne!(non_canonical, canonical);
+        assert!(
+            codex_entry_has_exact_repo_binding(content.as_bytes(), &non_canonical).unwrap(),
+            "a canonically written binding must match its repository named through a non-canonical path"
+        );
+
+        // A genuinely different repository must still be refused.
+        let other = dir.path().join("other");
+        fs::create_dir_all(other.join(".kin")).unwrap();
+        assert!(
+            !codex_entry_has_exact_repo_binding(content.as_bytes(), &other).unwrap(),
+            "a binding for one repository must not satisfy a different repository"
+        );
     }
 
     #[test]
