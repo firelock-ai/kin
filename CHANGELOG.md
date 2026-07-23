@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-22
+
+### Fixed
+
+- Install-proof gate fixed for graph-authoritative health semantics (pre-embed
+  readiness staleness is expected); Windows Codex MCP binding health check now
+  compares canonical repository identity, fixing a false "misconfigured" on
+  extended-length paths. No other changes.
+
 ## [0.3.0] - 2026-07-22
 
 This release makes exact source state part of Kin's graph authority and tightens
@@ -755,7 +764,8 @@ Historical note: this snapshot predates the public GitHub prerelease series and 
 - Daemon mode for background file watching (`kin-daemon`)
 - 19-crate workspace architecture
 
-[unreleased]: https://github.com/firelock-ai/kin/compare/v0.3.0...HEAD
+[unreleased]: https://github.com/firelock-ai/kin/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/firelock-ai/kin/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/firelock-ai/kin/compare/v0.2.28...v0.3.0
 [0.2.28]: https://github.com/firelock-ai/kin/compare/v0.2.27...v0.2.28
 [0.2.27]: https://github.com/firelock-ai/kin/compare/v0.2.26...v0.2.27
