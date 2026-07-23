@@ -62,9 +62,11 @@ fn shallow_boundary_ids(repo: &gix::Repository) -> Result<HashSet<gix::ObjectId>
 #[derive(Debug, Clone)]
 pub(crate) struct CommitFileDelta {
     pub path: String,
-    pub old_blob_id: Option<gix::ObjectId>,
-    pub new_blob_id: Option<gix::ObjectId>,
-    pub new_entry_kind: Option<SourceEntryKind>,
+    /// Prior side of the change, if present: its Git object id and class. A file
+    /// or symlink carries a blob id; a gitlink carries the pinned commit id.
+    pub old: Option<(gix::ObjectId, GitEntryClass)>,
+    /// Resulting side of the change, if present: its Git object id and class.
+    pub new: Option<(gix::ObjectId, GitEntryClass)>,
 }
 
 /// Options for importing Git history into Kin.
@@ -780,23 +782,66 @@ fn commit_to_change(
     })
 }
 
-/// Extract artifact deltas from a commit by diffing against its first parent.
+/// Importer-internal classification of a Git tree entry.
 ///
-/// For root commits (no parents), all files in the tree are "Added".
-/// For non-root commits, we diff against the first parent's tree.
-fn source_entry_kind(mode: gix::objs::tree::EntryMode) -> Result<Option<SourceEntryKind>> {
+/// Distinct from the canonical [`SourceEntryKind`] so a submodule pointer can be
+/// carried through import as a tracked, mode-unknown change without adding a
+/// Git-compatibility construct to the shared type vocabulary. A gitlink is not
+/// exact-source materializable (it names another repository's commit, not file
+/// content), so it resolves to a source-tree gap rather than a synthesized file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GitEntryClass {
+    /// A file or symbolic link — an exact source entry with a known mode.
+    Source(SourceEntryKind),
+    /// A gitlink (submodule pointer). Recorded as a mode-unknown artifact delta;
+    /// its pinned commit id is captured as the delta's content identity.
+    Gitlink,
+}
+
+/// Classify a Git tree entry mode. `None` for a tree (directory), which is not a
+/// source entry.
+///
+/// A gitlink is classified, not refused: it is recorded as a tracked,
+/// mode-unknown pointer change so a submodule move is visible to review and the
+/// presence of a submodule anywhere in history does not block ref hydration.
+fn classify_git_entry(mode: gix::objs::tree::EntryMode) -> Option<GitEntryClass> {
     use gix::objs::tree::EntryKind;
 
     match mode.kind() {
-        EntryKind::Blob => Ok(Some(SourceEntryKind::File { executable: false })),
-        EntryKind::BlobExecutable => Ok(Some(SourceEntryKind::File { executable: true })),
-        EntryKind::Link => Ok(Some(SourceEntryKind::Symlink)),
-        EntryKind::Tree => Ok(None),
-        EntryKind::Commit => Err(GitError::Other(
-            "exact Git import does not yet support gitlink/submodule entries; import refused rather than silently omitting source state"
-                .to_string(),
-        )),
+        EntryKind::Blob => Some(GitEntryClass::Source(SourceEntryKind::File {
+            executable: false,
+        })),
+        EntryKind::BlobExecutable => Some(GitEntryClass::Source(SourceEntryKind::File {
+            executable: true,
+        })),
+        EntryKind::Link => Some(GitEntryClass::Source(SourceEntryKind::Symlink)),
+        EntryKind::Tree => None,
+        EntryKind::Commit => Some(GitEntryClass::Gitlink),
     }
+}
+
+/// Content-identity hash for one side of an artifact delta. A file or symlink
+/// hashes its Git blob; a gitlink hashes the textual pointer form Git itself
+/// uses in diffs (`Subproject commit <hex>`), so a pointer move is a visible
+/// content change and the pinned commit stays recoverable from the blob store.
+fn entry_content_hash(
+    repo: &gix::Repository,
+    oid: gix::ObjectId,
+    class: GitEntryClass,
+    blob_store: Option<&BlobStore>,
+) -> Result<Hash256> {
+    match class {
+        GitEntryClass::Source(_) => blob_hash(repo, oid, blob_store),
+        GitEntryClass::Gitlink => gitlink_pointer_hash(oid, blob_store),
+    }
+}
+
+fn gitlink_pointer_hash(oid: gix::ObjectId, blob_store: Option<&BlobStore>) -> Result<Hash256> {
+    let content = format!("Subproject commit {oid}\n").into_bytes();
+    if let Some(store) = blob_store {
+        store.write(&content)?;
+    }
+    Ok(Hash256::from_bytes(kin_blobs::digest(&content).0))
 }
 
 fn utf8_git_path(path: &[u8]) -> Result<String> {
@@ -824,6 +869,24 @@ fn modified_artifact_kind(kind: SourceEntryKind) -> ArtifactDeltaKind {
     }
 }
 
+/// Resulting delta kind for an added entry. A gitlink has no exact file mode, so
+/// it is recorded as a mode-unknown addition rather than a fabricated file kind.
+fn added_delta_kind(class: GitEntryClass) -> ArtifactDeltaKind {
+    match class {
+        GitEntryClass::Source(kind) => added_artifact_kind(kind),
+        GitEntryClass::Gitlink => ArtifactDeltaKind::Added,
+    }
+}
+
+/// Resulting delta kind for a modified entry. A gitlink pointer move is recorded
+/// as a mode-unknown modification.
+fn modified_delta_kind(class: GitEntryClass) -> ArtifactDeltaKind {
+    match class {
+        GitEntryClass::Source(kind) => modified_artifact_kind(kind),
+        GitEntryClass::Gitlink => ArtifactDeltaKind::Modified,
+    }
+}
+
 fn extract_artifact_deltas(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
@@ -831,21 +894,21 @@ fn extract_artifact_deltas(
 ) -> Result<Vec<ArtifactDelta>> {
     let mut deltas = Vec::new();
     for delta in commit_file_deltas(repo, commit)? {
-        let kind = match (delta.old_blob_id, delta.new_blob_id, delta.new_entry_kind) {
-            (None, Some(_), Some(entry_kind)) => added_artifact_kind(entry_kind),
-            (Some(_), None, None) => ArtifactDeltaKind::Removed,
-            (Some(_), Some(_), Some(entry_kind)) => modified_artifact_kind(entry_kind),
-            _ => continue,
+        let kind = match (&delta.old, &delta.new) {
+            (None, Some((_, class))) => added_delta_kind(*class),
+            (Some(_), None) => ArtifactDeltaKind::Removed,
+            (Some(_), Some((_, class))) => modified_delta_kind(*class),
+            (None, None) => continue,
         };
 
-        let old_hash = match delta.old_blob_id {
-            Some(blob_id) => Some(blob_hash(repo, blob_id, blob_store)?),
-            None => None,
-        };
-        let new_hash = match delta.new_blob_id {
-            Some(blob_id) => Some(blob_hash(repo, blob_id, blob_store)?),
-            None => None,
-        };
+        let old_hash = delta
+            .old
+            .map(|(oid, class)| entry_content_hash(repo, oid, class, blob_store))
+            .transpose()?;
+        let new_hash = delta
+            .new
+            .map(|(oid, class)| entry_content_hash(repo, oid, class, blob_store))
+            .transpose()?;
 
         deltas.push(ArtifactDelta {
             file_id: FilePathId::new(delta.path),
@@ -868,12 +931,12 @@ fn extract_full_tree_artifact_deltas(
         .map_err(|error| GitError::Git(error.to_string()))?;
     full_tree_blob_entries(repo, &tree)?
         .into_iter()
-        .map(|(path, blob_id, kind)| {
+        .map(|(path, oid, class)| {
             Ok(ArtifactDelta {
                 file_id: FilePathId::new(path),
-                kind: added_artifact_kind(kind),
+                kind: added_delta_kind(class),
                 old_hash: None,
-                new_hash: Some(blob_hash(repo, blob_id, blob_store)?),
+                new_hash: Some(entry_content_hash(repo, oid, class, blob_store)?),
             })
         })
         .collect()
@@ -890,16 +953,16 @@ fn extract_merge_artifact_deltas(
     let current_tree = commit
         .tree()
         .map_err(|error| GitError::Git(error.to_string()))?;
-    let current: BTreeMap<String, (gix::ObjectId, SourceEntryKind)> =
+    let current: BTreeMap<String, (gix::ObjectId, GitEntryClass)> =
         full_tree_blob_entries(repo, &current_tree)?
             .into_iter()
-            .map(|(path, id, kind)| (path, (id, kind)))
+            .map(|(path, id, class)| (path, (id, class)))
             .collect();
 
     // Parent order is Git-authoritative. Keep the first occurrence of a path
     // only to provide deterministic old_hash metadata; replay correctness is
     // supplied by the complete remove/upsert correction below.
-    let mut parent_union: BTreeMap<String, (gix::ObjectId, SourceEntryKind)> = BTreeMap::new();
+    let mut parent_union: BTreeMap<String, (gix::ObjectId, GitEntryClass)> = BTreeMap::new();
     for parent_id in commit.parent_ids() {
         let parent = repo
             .find_commit(parent_id.detach())
@@ -907,36 +970,36 @@ fn extract_merge_artifact_deltas(
         let parent_tree = parent
             .tree()
             .map_err(|error| GitError::Git(error.to_string()))?;
-        for (path, id, kind) in full_tree_blob_entries(repo, &parent_tree)? {
-            parent_union.entry(path).or_insert((id, kind));
+        for (path, id, class) in full_tree_blob_entries(repo, &parent_tree)? {
+            parent_union.entry(path).or_insert((id, class));
         }
     }
 
     let mut deltas = Vec::with_capacity(current.len() + parent_union.len());
-    for (path, (old_id, _)) in &parent_union {
+    for (path, (old_id, old_class)) in &parent_union {
         if !current.contains_key(path) {
             deltas.push(ArtifactDelta {
                 file_id: FilePathId::new(path),
                 kind: ArtifactDeltaKind::Removed,
-                old_hash: Some(blob_hash(repo, *old_id, blob_store)?),
+                old_hash: Some(entry_content_hash(repo, *old_id, *old_class, blob_store)?),
                 new_hash: None,
             });
         }
     }
-    for (path, (new_id, new_kind)) in current {
+    for (path, (new_id, new_class)) in current {
         let old_hash = parent_union
             .get(&path)
-            .map(|(old_id, _)| blob_hash(repo, *old_id, blob_store))
+            .map(|(old_id, old_class)| entry_content_hash(repo, *old_id, *old_class, blob_store))
             .transpose()?;
         deltas.push(ArtifactDelta {
             file_id: FilePathId::new(path),
             kind: if old_hash.is_some() {
-                modified_artifact_kind(new_kind)
+                modified_delta_kind(new_class)
             } else {
-                added_artifact_kind(new_kind)
+                added_delta_kind(new_class)
             },
             old_hash,
-            new_hash: Some(blob_hash(repo, new_id, blob_store)?),
+            new_hash: Some(entry_content_hash(repo, new_id, new_class, blob_store)?),
         });
     }
     deltas.sort_by(|left, right| left.file_id.0.cmp(&right.file_id.0));
@@ -973,12 +1036,11 @@ pub(crate) fn commit_file_deltas(
                 ..
             } => {
                 let path = utf8_git_path(location.as_ref())?;
-                if let Some(new_entry_kind) = source_entry_kind(entry_mode)? {
+                if let Some(class) = classify_git_entry(entry_mode) {
                     deltas.push(CommitFileDelta {
                         path,
-                        old_blob_id: None,
-                        new_blob_id: Some(id),
-                        new_entry_kind: Some(new_entry_kind),
+                        old: None,
+                        new: Some((id, class)),
                     });
                 }
             }
@@ -989,12 +1051,11 @@ pub(crate) fn commit_file_deltas(
                 ..
             } => {
                 let path = utf8_git_path(location.as_ref())?;
-                if source_entry_kind(entry_mode)?.is_some() {
+                if let Some(class) = classify_git_entry(entry_mode) {
                     deltas.push(CommitFileDelta {
                         path,
-                        old_blob_id: Some(id),
-                        new_blob_id: None,
-                        new_entry_kind: None,
+                        old: Some((id, class)),
+                        new: None,
                     });
                 }
             }
@@ -1006,15 +1067,10 @@ pub(crate) fn commit_file_deltas(
                 id,
             } => {
                 let path = utf8_git_path(location.as_ref())?;
-                let old_entry_kind = source_entry_kind(previous_entry_mode)?;
-                let new_entry_kind = source_entry_kind(entry_mode)?;
-                if old_entry_kind.is_some() || new_entry_kind.is_some() {
-                    deltas.push(CommitFileDelta {
-                        path,
-                        old_blob_id: old_entry_kind.map(|_| previous_id),
-                        new_blob_id: new_entry_kind.map(|_| id),
-                        new_entry_kind,
-                    });
+                let old = classify_git_entry(previous_entry_mode).map(|class| (previous_id, class));
+                let new = classify_git_entry(entry_mode).map(|class| (id, class));
+                if old.is_some() || new.is_some() {
+                    deltas.push(CommitFileDelta { path, old, new });
                 }
             }
             _ => {}
@@ -1075,7 +1131,7 @@ pub fn base_link_change_id_from_git_oid_hex(oid: &str) -> Result<SemanticChangeI
 fn full_tree_blob_entries(
     repo: &gix::Repository,
     tree: &gix::Tree<'_>,
-) -> Result<Vec<(String, gix::ObjectId, SourceEntryKind)>> {
+) -> Result<Vec<(String, gix::ObjectId, GitEntryClass)>> {
     let options = gix::diff::Options::default().with_rewrites(None);
     let changes = repo
         .diff_tree_to_tree(None, Some(tree), Some(options))
@@ -1091,8 +1147,8 @@ fn full_tree_blob_entries(
         } = change
         {
             let path = utf8_git_path(location.as_ref())?;
-            if let Some(kind) = source_entry_kind(entry_mode)? {
-                entries.push((path, id, kind));
+            if let Some(class) = classify_git_entry(entry_mode) {
+                entries.push((path, id, class));
             }
         }
     }
@@ -1109,6 +1165,10 @@ fn bounded_full_tree_blob_entries(
     tree: &gix::Tree<'_>,
     max_entries: usize,
 ) -> Result<Vec<(String, gix::ObjectId, SourceEntryKind)>> {
+    // Returns only exact-source (file/symlink) entries. A gitlink in a
+    // truncated-history boundary tree is left as an exact-source gap here rather
+    // than routed through the byte-budget blob-load path below; its pointer
+    // moves are still recorded by the per-commit diff path.
     let empty_tree = repo.empty_tree();
     let mut changes = empty_tree
         .changes()
@@ -1135,12 +1195,12 @@ fn bounded_full_tree_blob_entries(
                     return Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Break(()));
                 }
             };
-            let kind = match source_entry_kind(entry_mode) {
-                Ok(Some(kind)) => kind,
-                Ok(None) => return Ok(std::ops::ControlFlow::Continue(())),
-                Err(error) => {
-                    callback_error = Some(error);
-                    return Ok(std::ops::ControlFlow::Break(()));
+            let kind = match classify_git_entry(entry_mode) {
+                Some(GitEntryClass::Source(kind)) => kind,
+                // Gitlink (see the fn-level note) and directories are not
+                // exact-source entries at this boundary; skip.
+                Some(GitEntryClass::Gitlink) | None => {
+                    return Ok(std::ops::ControlFlow::Continue(()))
                 }
             };
             if entries.len() == max_entries {
@@ -1758,10 +1818,10 @@ mod tests {
     }
 
     #[test]
-    fn exact_import_rejects_gitlinks_instead_of_omitting_them() {
+    fn exact_import_records_gitlinks_as_tracked_pointer_changes() {
         let dir = tempfile::tempdir().unwrap();
         if !init_git_repo(dir.path()) {
-            eprintln!("git not available, skipping gitlink rejection test");
+            eprintln!("git not available, skipping gitlink import test");
             return;
         }
 
@@ -1799,10 +1859,26 @@ mod tests {
             .unwrap()
             .success());
 
+        // A submodule in history must not block import (regression: it used to
+        // be refused). The pointer is recorded as a tracked, mode-unknown
+        // artifact delta carrying the pinned commit as content — not refused,
+        // not silently omitted, and not mislabeled as a file.
         let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x13; 32]));
-        let error = import_git_history(dir.path(), genesis_id, &ImportOptions::default())
-            .expect_err("an exact import must not silently omit gitlinks");
-        assert!(error.to_string().contains("gitlink/submodule"));
+        let imported = import_git_history(dir.path(), genesis_id, &ImportOptions::default())
+            .expect("a submodule pointer is recorded as a tracked change, not refused");
+
+        let gitlink = imported
+            .iter()
+            .flat_map(|change| &change.change.artifact_deltas)
+            .find(|delta| delta.file_id.0 == "vendor/sub")
+            .expect("the gitlink pointer is recorded as an artifact delta");
+        assert_eq!(gitlink.kind, ArtifactDeltaKind::Added);
+        // Mode-unknown on purpose: a submodule is not an exact-source file kind,
+        // so it resolves to a source-tree gap rather than a fabricated file.
+        assert_eq!(gitlink.kind.source_entry_kind(), None);
+        // The pinned commit is captured as the delta's content identity.
+        assert!(gitlink.new_hash.is_some());
+        assert!(gitlink.old_hash.is_none());
     }
 
     #[test]
@@ -2591,7 +2667,7 @@ mod tests {
             let expected_paths: Vec<_> = full_tree_blob_entries(&repo, &parent_tree)
                 .unwrap()
                 .into_iter()
-                .map(|(path, _, kind)| (path, added_artifact_kind(kind)))
+                .map(|(path, _, class)| (path, added_delta_kind(class)))
                 .collect();
             let anchor_paths: Vec<_> = anchor
                 .change
@@ -2620,7 +2696,10 @@ mod tests {
         let head_tree = git_merge.tree().unwrap();
         let expected_entries = full_tree_blob_entries(&repo, &head_tree).unwrap();
         let mut expected_archive = Vec::new();
-        for (path, blob_oid, kind) in expected_entries {
+        for (path, blob_oid, class) in expected_entries {
+            let GitEntryClass::Source(kind) = class else {
+                unreachable!("merge fixture contains no submodules");
+            };
             let bytes = repo.find_blob(blob_oid).unwrap().take_data();
             expected_archive.push((path, kind, bytes));
         }
@@ -2698,7 +2777,10 @@ mod tests {
         let git_merge = repo.find_commit(head_id).unwrap();
         let expected_entries = full_tree_blob_entries(&repo, &git_merge.tree().unwrap()).unwrap();
         let mut expected_archive = Vec::new();
-        for (path, blob_oid, kind) in expected_entries {
+        for (path, blob_oid, class) in expected_entries {
+            let GitEntryClass::Source(kind) = class else {
+                unreachable!("merge fixture contains no submodules");
+            };
             expected_archive.push((path, kind, repo.find_blob(blob_oid).unwrap().take_data()));
         }
         let mut replay_archive = Vec::new();

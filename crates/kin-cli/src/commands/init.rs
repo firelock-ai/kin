@@ -1625,6 +1625,10 @@ pub async fn run(
                         &blob_store,
                         layout.root(),
                         history_boundary_root,
+                        // Certification: `kin init` builds the authoritative
+                        // repo graph and must reject a hydration invariant
+                        // rather than silently degrade it.
+                        false,
                     )
                     .with_context(|| {
                         format!("enrich imported Git history with semantic deltas ({git_history})")
@@ -2319,7 +2323,7 @@ fn enrich_imported_changes_with_semantics_and_genesis(
     genesis_id: SemanticChangeId,
 ) -> Result<()> {
     enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
-        imported, blob_store, true, None, genesis_id,
+        imported, blob_store, true, None, genesis_id, false,
     )
     .map(|_| ())
 }
@@ -2344,6 +2348,7 @@ pub(crate) fn enrich_imported_changes_with_semantics_checkpointed(
     blob_store: &kin_blobs::BlobStore,
     kin_root: &Path,
     boundary_root: SemanticChangeId,
+    tolerant: bool,
 ) -> Result<HydrationReplayStats> {
     let config = HydrationCheckpointConfig::production(kin_root);
     let stats = enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
@@ -2352,6 +2357,7 @@ pub(crate) fn enrich_imported_changes_with_semantics_checkpointed(
         true,
         Some(config),
         boundary_root,
+        tolerant,
     )?;
     debug!(
         resumed_from = stats.resumed_from,
@@ -2389,6 +2395,7 @@ pub(crate) fn enrich_imported_changes_with_semantics_test_checkpoint(
             16 * 1024 * 1024,
         )),
         boundary_root,
+        false,
     )
 }
 
@@ -2423,6 +2430,7 @@ fn enrich_imported_changes_with_semantics_with_checkpoints(
         parse_memo_enabled,
         checkpoint_config,
         kin_core::build_genesis_change().id,
+        false,
     )
 }
 
@@ -2432,6 +2440,7 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
     parse_memo_enabled: bool,
     checkpoint_config: Option<HydrationCheckpointConfig>,
     boundary_root: SemanticChangeId,
+    tolerant: bool,
 ) -> Result<HydrationReplayStats> {
     // Profiling timers (accumulated across every commit in the pass).
     let mut total_blob_read_time = std::time::Duration::ZERO;
@@ -2579,7 +2588,7 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
         } = baseline;
         let mut merge_runtime_baseline = if imported[i].change.parents.len() > 1 {
             Some(ImportedRuntimeSemanticState {
-                entities: imported_target_entities(&current_files)?,
+                entities: imported_target_entities(&current_files, tolerant)?,
                 relations: current_relations.clone(),
             })
         } else {
@@ -2954,6 +2963,7 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
                 all_parent_baseline,
                 &current_files,
                 &current_relations,
+                tolerant,
             )?;
         }
         imported[i].change.entity_deltas = entity_deltas;
@@ -3416,15 +3426,43 @@ fn imported_relations_exactly_equivalent(old: &Relation, new: &Relation) -> bool
 
 fn imported_target_entities(
     files: &HashMap<String, ImportedSemanticFileState>,
+    tolerant: bool,
 ) -> Result<HashMap<EntityId, Entity>> {
-    let mut entities = HashMap::new();
-    for file in files.values() {
+    let mut entities: HashMap<EntityId, Entity> = HashMap::new();
+    // Deterministic file order so the tolerant conflict resolution below is
+    // stable across runs (the map iterates in an unspecified order); reproducible
+    // hydration is required for a citable review.
+    let mut ordered: Vec<(&String, &ImportedSemanticFileState)> = files.iter().collect();
+    ordered.sort_by(|left, right| left.0.cmp(right.0));
+    for (_path, file) in ordered {
         for entity in &file.entities {
-            if entities.insert(entity.id, entity.clone()).is_some() {
-                return Err(anyhow!(
-                    "historical hydration invariant violated: entity {} occurs in more than one imported file state",
-                    entity.id
-                ));
+            match entities.get(&entity.id) {
+                // A content-addressed entity is not owned by one file: an
+                // identical definition projected into more than one file (a
+                // header and an amalgamated single-include copy, a vendored
+                // duplicate) resolves to the same entity id. Identical
+                // projections are the same entity, not a collision.
+                Some(existing) if imported_entities_exactly_equivalent(existing, entity) => {}
+                // Same id, diverging content: an entity-id derivation collision.
+                // Certification (strict) rejects it. Lazy-ref reads (review /
+                // history / blame) over arbitrary repos keep the first by
+                // deterministic file order and continue rather than failing the
+                // read on ancestry the caller is not certifying.
+                Some(_) if tolerant => {
+                    tracing::debug!(
+                        entity = %entity.id,
+                        "tolerant hydration: keeping first of diverging entity projections"
+                    );
+                }
+                Some(_) => {
+                    return Err(anyhow!(
+                        "historical hydration invariant violated: entity {} occurs with diverging content in more than one imported file state",
+                        entity.id
+                    ));
+                }
+                None => {
+                    entities.insert(entity.id, entity.clone());
+                }
             }
         }
     }
@@ -3558,8 +3596,9 @@ fn rebase_imported_merge_semantic_deltas(
     all_parent_baseline: &ImportedRuntimeSemanticState,
     target_files: &HashMap<String, ImportedSemanticFileState>,
     target_relations: &HashMap<RelationId, Relation>,
+    tolerant: bool,
 ) -> Result<(Vec<EntityDelta>, Vec<RelationDelta>)> {
-    let target_entities = imported_target_entities(target_files)?;
+    let target_entities = imported_target_entities(target_files, tolerant)?;
     let mut entity_ids = BTreeSet::new();
     entity_ids.extend(all_parent_baseline.entities.keys().copied());
     entity_ids.extend(target_entities.keys().copied());
