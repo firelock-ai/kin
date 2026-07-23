@@ -196,6 +196,9 @@ jobs:
                   errors.append(f"required check not green: {name} (conclusion={run['conclusion']})")
 
           for name, run in runs.items():
+              # Self-exclude this workflow's own job ("Mint release tag") — a gate must not read its own refusals as evidence.
+              if name == "Mint release tag":
+                  continue
               if run["status"] != "completed":
                   errors.append(f"check still in progress: {name} (status={run['status']})")
               elif run["conclusion"] not in acceptable:
@@ -229,6 +232,12 @@ jobs:
         with:
           app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
+          # kin-release-bot is installed org-wide, so scope every minted token to
+          # the kin repository alone. owner + repositories narrows the installation
+          # token to just these repos; setting owner without repositories would
+          # instead widen it to every repo the org-wide install can reach.
+          owner: firelock-ai
+          repositories: kin
 
       - name: Create release tag ref
         # Created with the App token (not GITHUB_TOKEN) so the ruleset admits it
