@@ -8,7 +8,6 @@ use std::fs;
 use std::path::Path;
 use tempfile::tempdir;
 
-#[cfg(feature = "vector")]
 mod common;
 
 use common::Command;
