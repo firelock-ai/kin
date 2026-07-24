@@ -20,11 +20,12 @@
 use serial_test::serial;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 use tempfile::tempdir;
 
 mod common;
+
+use common::Command;
 
 const README: &str =
     "# git export round-trip demo\n\nA tiny repo used to prove the export contract.\n";

@@ -4,10 +4,11 @@
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use tempfile::tempdir;
 
 mod common;
+
+use common::Command;
 
 fn git(path: &Path, args: &[&str]) {
     let output = Command::new("git")

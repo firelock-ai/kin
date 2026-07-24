@@ -13,10 +13,11 @@
 use kin_cli::commands::blame::{execute_blame_request, BlameRequest};
 use kin_cli::commands::history::{execute_history_request, HistoryRequest};
 use std::path::Path;
-use std::process::Command;
 use tempfile::tempdir;
 
 mod common;
+
+use common::Command;
 
 fn kin_command() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_kin"));

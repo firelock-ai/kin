@@ -6,11 +6,12 @@ use kin_db::EntityStore;
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use tempfile::tempdir;
 
 #[cfg(feature = "vector")]
 mod common;
+
+use common::Command;
 
 #[cfg(feature = "vector")]
 fn find_cache_graph_path(cache_dir: &Path) -> std::path::PathBuf {

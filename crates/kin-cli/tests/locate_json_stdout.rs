@@ -4,13 +4,14 @@
 use serial_test::serial;
 use std::env;
 use std::fs;
-use std::process::Command;
 use std::time::Duration;
 #[cfg(unix)]
 use std::time::Instant;
 use tempfile::tempdir;
 
 mod common;
+
+use common::Command;
 
 #[cfg(unix)]
 fn wait_for_pid_exit(pid: u32) {

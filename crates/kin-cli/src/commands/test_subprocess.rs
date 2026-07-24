@@ -502,6 +502,34 @@ pub(crate) fn output_with_timeout(
     }
 }
 
+/// Run a blocking call that waits on an external process or resource under a
+/// hard wall-clock cap.
+///
+/// The call runs on a worker thread, so a wait that never completes cannot
+/// stall the test binary: the caller panics with a legible message, drops any
+/// `serial_test` guard it holds, and the run still reaches a verdict. A suite
+/// that blocks forever reports nothing and pins the machine; one that fails
+/// names the resource that never arrived.
+pub(crate) fn call_with_deadline<T, F>(label: &str, timeout: Duration, call: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(call());
+    });
+    match receiver.recv_timeout(timeout) {
+        Ok(value) => value,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("{label} did not complete within {timeout:?}")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("{label} panicked before it produced a result")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

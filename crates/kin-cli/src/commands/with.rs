@@ -707,17 +707,29 @@ mod tests {
             .unwrap();
         }
 
-        let original_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{original_path}", stub_dir.display()));
-
         let (program, args) =
             build_assistant_command(AssistantKind::ClaudeCode, "session smoke task", false)
                 .unwrap();
+        assert_eq!(program, "claude");
+        // Launch the stub by absolute path. Resolving the assistant through a
+        // process-global `PATH` prepend races every other thread in this binary
+        // and can fall through to a real `claude` on a developer machine. The
+        // launcher inherits this process's stdin by contract, so a real
+        // interactive assistant would block on the terminal and never return.
+        let stub = stub_dir.join(&program);
+
         let mut env = session_launch_env(session_id, &ws_root, "http://127.0.0.1:9/test", None);
         env.extend(session_shim_env(&layout, &ws_root, false, false).unwrap());
-        let code = spawn_assistant_in_session(&program, &args, &ws_root, &env).unwrap();
 
-        std::env::set_var("PATH", original_path);
+        let launch_root = ws_root.clone();
+        let code = crate::commands::test_subprocess::call_with_deadline(
+            "session assistant launch",
+            crate::commands::test_subprocess::DEFAULT_TEST_SUBPROCESS_TIMEOUT,
+            move || {
+                spawn_assistant_in_session(&stub.to_string_lossy(), &args, &launch_root, &env)
+            },
+        )
+        .unwrap();
 
         assert_eq!(code, 0);
         let recorded = std::fs::read_to_string(&record).unwrap();
