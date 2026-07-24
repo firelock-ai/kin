@@ -725,9 +725,7 @@ mod tests {
         let code = crate::commands::test_subprocess::call_with_deadline(
             "session assistant launch",
             crate::commands::test_subprocess::DEFAULT_TEST_SUBPROCESS_TIMEOUT,
-            move || {
-                spawn_assistant_in_session(&stub.to_string_lossy(), &args, &launch_root, &env)
-            },
+            move || spawn_assistant_in_session(&stub.to_string_lossy(), &args, &launch_root, &env),
         )
         .unwrap();
 
