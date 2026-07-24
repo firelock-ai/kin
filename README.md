@@ -37,6 +37,25 @@ Supporting repositories provide graph storage, retrieval, embeddings, blobs,
 language enrichment, and reproducible proof. They are implementation layers,
 not separate products a new user needs to assemble.
 
+## Open source and the Kin ecosystem
+
+The core of Kin is open source under Apache-2.0: [kin](https://github.com/firelock-ai/kin),
+[kin-db](https://github.com/firelock-ai/kin-db), [kin-vfs](https://github.com/firelock-ai/kin-vfs),
+and [kin-editor](https://github.com/firelock-ai/kin-editor), plus the supporting
+libraries kin-model, kin-blobs, kin-search, kin-vector, kin-infer, kin-lsp, and
+kin-actions.
+
+[KinLab](https://kinlab.ai) is a proprietary product built on this open core: the
+hosted collaboration and control-plane layer described above.
+
+The same boundary applies to how benchmark work is shared. The [benchmark
+specification and a standalone, dependency-free bundle verifier](https://github.com/firelock-ai/kin-bench-spec)
+are public, so a claim can be checked without access to the system that produced
+it. The runner and proof infrastructure that produce sealed evidence bundles (the
+orchestration, the pinned-release proof gate, and the hosted measurement
+environment) remain private for now. The spec and verifier open first; the runner
+can open later.
+
 ## Shortest graph-backed path
 
 ### 1. Install and configure Kin
