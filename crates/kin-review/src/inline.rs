@@ -950,11 +950,11 @@ fn collect_modified_comments(
     // all moved with it, the break is a coherent in-diff migration: visible
     // evidence, not a blocking break.
     let consumers_migrated = per_entity.map_or(0, |e| e.consumers_migrated_in_diff);
-    let fanout_gate_consumer_count = if entity_covering_tests > 0 {
-        strong_consumer_count
-    } else {
-        consumer_count
-    };
+    // Only consumers whose inbound edge clears STRONG_CONSUMER_CONFIDENCE gate
+    // the fanout verdict. Ambiguous same-name dispatch links stay visible in the
+    // blast radius but must not alone escalate, so the confidence-filtered count
+    // gates whether or not the entity has covering tests.
+    let fanout_gate_consumer_count = strong_consumer_count;
 
     // Signature change. A difference that only ADDS strengthening qualifiers
     // (constexpr/inline/[[nodiscard]]) cannot invalidate existing callers and
@@ -2230,11 +2230,11 @@ mod tests {
     }
 
     #[test]
-    fn consumer_fanout_uses_weak_consumers_only_when_uncovered() {
+    fn consumer_fanout_gates_only_on_strong_consumers() {
         // Ambiguous-dispatch fan-out links every possible implementor at low
-        // confidence. Covered body-only changes need strong consumers to gate;
-        // uncovered body-only changes still gate on weak fanout, because the
-        // graph has no test evidence to absorb that possible blast radius.
+        // confidence. Only strong (confidence-cleared) consumers gate the fanout
+        // verdict, covered or not: a weak same-name link is shown in the blast
+        // radius but must not alone escalate a verdict.
         let old = test_entity_with_span("hot_path", "src/hot.rs", 1, 20);
         let new = old.clone();
         let diff = SemanticDiff {
@@ -2284,18 +2284,12 @@ mod tests {
             ..Default::default()
         };
         let comments = collect_inline_comments(&diff, &uncovered_weak_only);
-        let fanout: Vec<&InlineComment> = comments
-            .iter()
-            .filter(|c| c.kind == InlineCommentKind::ConsumerFanout)
-            .collect();
-        assert_eq!(
-            fanout.len(),
-            1,
-            "uncovered weak fanout must still fire the review gate"
-        );
         assert!(
-            fanout[0].message.contains("4 distinct non-test consumer"),
-            "uncovered fanout reports the full graph-native consumer count"
+            !comments
+                .iter()
+                .any(|c| c.kind == InlineCommentKind::ConsumerFanout),
+            "weak-only consumers no longer fire the fanout gate even when uncovered: \
+             an ambiguous same-name link must not alone escalate a verdict"
         );
 
         let mixed = ImpactReport {

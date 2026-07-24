@@ -793,7 +793,7 @@ fn resolve_one_file(
                     Some(dst_id) => (dst_id, LOCALITY_DISAMBIGUATED_CONFIDENCE),
                     // No locality signal: keep the historical bucket-order
                     // pick so signal-less repos do not lose existing edges.
-                    None => (other_file_candidates[0].1, 0.7),
+                    None => (other_file_candidates[0].1, AMBIGUOUS_NAME_FANOUT_CONFIDENCE),
                 }
             };
             accumulate_relation(
@@ -1405,6 +1405,13 @@ fn split_member_access(name: &str) -> Option<(&str, &str)> {
 /// is a real definition the suffix genuinely names, so the resolution quality is
 /// the same whether one target or several survive.
 const QUALIFIED_SUFFIX_CONFIDENCE: f32 = 0.6;
+
+/// Confidence for an ambiguous same-name resolution: several cross-file entities
+/// share the callee's bare name and no locality, import, or arity signal picks
+/// one, so the link is a possibly-reaching guess (every twin, or the bucket's
+/// first). Kept below the review-side strong-consumer floor so these edges stay
+/// visible in the blast radius without alone escalating a verdict.
+const AMBIGUOUS_NAME_FANOUT_CONFIDENCE: f32 = 0.5;
 
 /// Confidence for a method call resolved through the receiver class's Extends
 /// chain (`self.m()` in `Sub(Base)` linking to `Base.m`). The parser pinned the
@@ -4067,7 +4074,7 @@ fn resolve_one_file_incremental(
                     Some(dst_id) => (dst_id, LOCALITY_DISAMBIGUATED_CONFIDENCE),
                     // No locality signal: keep the historical bucket-order
                     // pick so signal-less repos do not lose existing edges.
-                    None => (other_file_candidates[0].1, 0.7),
+                    None => (other_file_candidates[0].1, AMBIGUOUS_NAME_FANOUT_CONFIDENCE),
                 }
             };
             accumulate_relation(
@@ -7486,7 +7493,7 @@ void f();
         let result = link_cross_file(&files);
         let edge = find_calls_edge(&result, &caller, &first)
             .expect("signal-less ambiguity keeps the historical first-bucket pick");
-        assert_eq!(edge.confidence, 0.7);
+        assert_eq!(edge.confidence, AMBIGUOUS_NAME_FANOUT_CONFIDENCE);
     }
 
     #[test]
@@ -7733,7 +7740,7 @@ void f();
         let result = link_cross_file(&files);
         let edge = find_calls_edge(&result, &caller, &first)
             .expect("signal-less closure ambiguity keeps the historical first-bucket pick");
-        assert_eq!(edge.confidence, 0.7);
+        assert_eq!(edge.confidence, AMBIGUOUS_NAME_FANOUT_CONFIDENCE);
     }
 
     /// Incremental counterpart of the transitive-closure test: the umbrella's
@@ -7880,7 +7887,7 @@ void f();
         let after = link_cross_file_incremental(&caller_step, &linker);
         let edge = find_calls_edge(&after, &caller, &bundled)
             .expect("losing the closure signal falls back to the first-bucket pick");
-        assert_eq!(edge.confidence, 0.7);
+        assert_eq!(edge.confidence, AMBIGUOUS_NAME_FANOUT_CONFIDENCE);
         assert!(find_calls_edge(&after, &caller, &target).is_none());
     }
 
@@ -7933,7 +7940,7 @@ void f();
         let result = link_cross_file(&files);
         let edge = find_calls_edge(&result, &caller, &decoy)
             .expect("definition past the closure bound keeps the historical pick");
-        assert_eq!(edge.confidence, 0.7);
+        assert_eq!(edge.confidence, AMBIGUOUS_NAME_FANOUT_CONFIDENCE);
         assert!(find_calls_edge(&result, &caller, &deep).is_none());
     }
 }
