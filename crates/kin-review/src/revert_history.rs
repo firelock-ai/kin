@@ -220,33 +220,43 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
                 .or_insert(removal.distance);
         }
 
+        // An exact behavior-fingerprint restore is strong evidence: it gates as
+        // a warning on a public contract, informational otherwise. A bare
+        // name+kind match with modified content is weak temporal evidence — a
+        // same-named surface recurs naturally over a long history, and the
+        // namesake may be an unrelated entity in another file — so it is
+        // reported but never gates, like the other weak revert shapes.
         for ((kind, name), added) in &head_added {
-            let finding = if let Some((removed_name, distance)) =
+            let comment = if let Some((removed_name, distance)) =
                 by_hash.get(&added.fingerprint.behavior_hash)
             {
-                Some(format!(
+                let message = format!(
                     "Added `{}` restores the exact content of `{}`, removed {} — \
                      revert-shaped reintroduction",
                     name,
                     removed_name,
                     distance_phrase(*distance)
-                ))
-            } else {
-                by_name.get(&(kind.clone(), name.clone())).map(|distance| {
-                    format!(
-                        "Added `{}` reintroduces a same-named {} removed {}, with \
-                         modified content — revert-shaped surface",
-                        name,
-                        kind_label(added.kind),
-                        distance_phrase(*distance)
-                    )
-                })
-            };
-            if let Some(message) = finding {
+                );
                 let mut comment = inline_finding(added, message);
                 if !is_public_contract(added) {
                     comment.kind = InlineCommentKind::RevertHistoryIncidental;
                 }
+                Some(comment)
+            } else if let Some(distance) = by_name.get(&(kind.clone(), name.clone())) {
+                let message = format!(
+                    "Added `{}` reintroduces a same-named {} removed {}, with \
+                     modified content — revert-shaped surface",
+                    name,
+                    kind_label(added.kind),
+                    distance_phrase(*distance)
+                );
+                let mut comment = inline_finding(added, message);
+                comment.kind = InlineCommentKind::RevertHistoryIncidental;
+                Some(comment)
+            } else {
+                None
+            };
+            if let Some(comment) = comment {
                 findings.push(comment);
             }
         }
