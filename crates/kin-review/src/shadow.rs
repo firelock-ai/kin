@@ -4346,6 +4346,51 @@ mod tests {
     }
 
     #[test]
+    fn revert_history_modified_content_reintroduction_is_evidence_only() {
+        // c1 adds `retry_budget`, c2 removes it, padding to depth 30, then the
+        // head re-adds a same-named public function whose body DIFFERS (a new
+        // behavior fingerprint). A name+kind match with modified content is weak
+        // temporal evidence — a same-named surface recurs naturally and the
+        // namesake may live in another file — so it is reported but must not
+        // move the verdict off pass.
+        let graph = InMemoryGraph::new();
+        let mut original = entity_with_span("retry_budget", "src/net.rs", 40, EntityRole::Source);
+        original.fingerprint.behavior_hash = Hash256::from_bytes([7; 32]);
+        let base_id = padded_history_graph(
+            &graph,
+            vec![EntityDelta::Added(original.clone())],
+            vec![EntityDelta::Removed(original.id)],
+            30,
+        );
+        let mut readded = entity_with_span("retry_budget", "src/net.rs", 77, EntityRole::Source);
+        readded.fingerprint.behavior_hash = Hash256::from_bytes([8; 32]);
+        graph.upsert_entity(&readded).unwrap();
+        let head_id = change_id(204);
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![EntityDelta::Added(readded.clone())],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+        let finding = report
+            .policy
+            .findings
+            .iter()
+            .find(|f| f.message.contains("with modified content"))
+            .expect("modified-content reintroduction must still be reported");
+        assert_eq!(
+            finding.kind, "revert_history_incidental",
+            "a modified-content match is weak evidence and must not gate"
+        );
+        assert_eq!(finding.severity, "info");
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::Pass);
+    }
+
+    #[test]
     fn revert_history_recent_addition_removal_is_evidence_only() {
         // c2 adds `beta_flag`; the head removes that exact entity id. Deleting
         // something that only just landed is revert-shaped and must be called

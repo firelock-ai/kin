@@ -3044,14 +3044,14 @@ dependencies = [
 
 [[package]]
 name = "kin-buildinfo"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "sha2 0.11.0",
 ]
 
 [[package]]
 name = "kin-cli"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "age",
  "anyhow",
@@ -3125,7 +3125,7 @@ dependencies = [
 
 [[package]]
 name = "kin-context"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "kin-blobs",
  "kin-db",
@@ -3141,7 +3141,7 @@ dependencies = [
 
 [[package]]
 name = "kin-core"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -3171,7 +3171,7 @@ dependencies = [
 
 [[package]]
 name = "kin-daemon"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "async-stream",
  "axum",
@@ -3264,7 +3264,7 @@ dependencies = [
 
 [[package]]
 name = "kin-git"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "chrono",
  "gix",
@@ -3282,7 +3282,7 @@ dependencies = [
 
 [[package]]
 name = "kin-index"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "hex",
  "kin-blobs",
@@ -3330,7 +3330,7 @@ dependencies = [
 
 [[package]]
 name = "kin-integration-tests"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "kin-blobs",
  "kin-cli",
@@ -3372,7 +3372,7 @@ dependencies = [
 
 [[package]]
 name = "kin-mcp"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "kin-blobs",
  "kin-context",
@@ -3399,7 +3399,7 @@ dependencies = [
 
 [[package]]
 name = "kin-migrate"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "chrono",
  "kin-blobs",
@@ -3441,7 +3441,7 @@ dependencies = [
 
 [[package]]
 name = "kin-parser"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "kin-model",
  "pretty_assertions",
@@ -3471,7 +3471,7 @@ dependencies = [
 
 [[package]]
 name = "kin-projection"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "kin-blobs",
  "kin-db",
@@ -3486,7 +3486,7 @@ dependencies = [
 
 [[package]]
 name = "kin-ranking"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "kin-model",
  "serde",
@@ -3495,7 +3495,7 @@ dependencies = [
 
 [[package]]
 name = "kin-reconcile"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "kin-blobs",
  "kin-db",
@@ -3515,7 +3515,7 @@ dependencies = [
 
 [[package]]
 name = "kin-registry"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "async-stream",
  "axum",
@@ -3548,7 +3548,7 @@ dependencies = [
 
 [[package]]
 name = "kin-remote"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "chrono",
  "kin-model",
@@ -3564,7 +3564,7 @@ dependencies = [
 
 [[package]]
 name = "kin-review"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "kin-blobs",
  "kin-db",
@@ -3580,7 +3580,7 @@ dependencies = [
 
 [[package]]
 name = "kin-runtime"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "chrono",
  "hex",
@@ -3612,7 +3612,7 @@ dependencies = [
 
 [[package]]
 name = "kin-semantic-contracts"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "kin-db",
  "kin-model",
@@ -3627,7 +3627,7 @@ dependencies = [
 
 [[package]]
 name = "kin-spine"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "chrono",
  "hashbrown 0.15.5",
