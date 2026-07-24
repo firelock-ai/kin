@@ -208,13 +208,15 @@ fn java_and_csharp_narrowed_method_calls_resolve_cross_file() {
     );
 }
 
-// ---- (B) same-name free functions: linker picks one, no fan-out ----
+// ---- (B) same-name free functions: no signal, no edge ----
 
 #[test]
-fn same_name_free_functions_resolve_to_single_target() {
+fn same_name_free_functions_without_signal_resolve_to_nothing() {
     // A bare `shared()` call with two same-named free-function targets and no
-    // disambiguating locality signal resolves to exactly one target (bucket
-    // order), NOT a fan-out. This is distinct from the receiver-method path.
+    // disambiguating locality signal names no reachable definition: neither a
+    // bucket-order pick nor a fan-out, because the callee's name is the only
+    // evidence and it proves nothing. This is distinct from the
+    // receiver-method path, where every implementor is a plausible dispatch.
     let caller = func("run", "c.rs");
     let files = vec![
         FileParseData {
@@ -240,8 +242,8 @@ fn same_name_free_functions_resolve_to_single_target() {
     let rels = link_cross_file(&files);
     assert_eq!(
         count_calls(&rels),
-        1,
-        "two same-named free functions must resolve to a single target, not fan out"
+        0,
+        "two same-named free functions with no scope signal must leave the call unlinked"
     );
 }
 

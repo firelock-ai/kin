@@ -762,6 +762,13 @@ fn resolve_one_file(
         };
 
         let mut linked = false;
+        // Set when the exact-name bucket named several cross-file entities and
+        // no import, directory, or include signal separated them. The callee's
+        // name alone cannot say which definition this call site reaches, so no
+        // edge is emitted and the blind name tiers below are suppressed: they
+        // key on the same unresolvable name and would re-guess the ambiguity
+        // (c) already failed to settle.
+        let mut unresolvable_name_ambiguity = false;
 
         // Arity gate for the exact-name fallbacks below: an overloaded C/C++
         // callee recorded its call-site argument count, so drop the same-name
@@ -774,8 +781,8 @@ fn resolve_one_file(
         if name_fallback_allowed && !other_file_candidates.is_empty() {
             let distinct_ids: HashSet<EntityId> =
                 other_file_candidates.iter().map(|&(_, id)| id).collect();
-            let (dst_id, confidence) = if distinct_ids.len() == 1 {
-                (other_file_candidates[0].1, 0.7)
+            let settled = if distinct_ids.len() == 1 {
+                Some((other_file_candidates[0].1, 0.7))
             } else {
                 let targets = caller_import_targets.get_or_insert_with(|| {
                     resolve_caller_import_targets(&file.file_path, &file.imports, &ctx.known_files)
@@ -783,25 +790,35 @@ fn resolve_one_file(
                 let closure = caller_include_closure.get_or_insert_with(|| {
                     include_closure_depths(&file.file_path, &ctx.include_graph)
                 });
-                match disambiguate_same_name_candidates(
+                disambiguate_same_name_candidates(
                     &file.file_path,
                     targets,
                     closure,
                     &other_file_candidates,
                     |path| ctx.entity_count_by_file.get(path).copied().unwrap_or(0),
-                ) {
-                    Some(dst_id) => (dst_id, LOCALITY_DISAMBIGUATED_CONFIDENCE),
-                    // No locality signal: keep the historical bucket-order
-                    // pick so signal-less repos do not lose existing edges.
-                    None => (other_file_candidates[0].1, 0.7),
-                }
+                )
+                .map(|dst_id| (dst_id, LOCALITY_DISAMBIGUATED_CONFIDENCE))
             };
-            accumulate_relation(
-                &mut resolved,
-                &mut relation_indices,
-                make_relation(rel, src_id, dst_id, confidence),
-            );
-            linked = true;
+            match settled {
+                Some((dst_id, confidence)) => {
+                    accumulate_relation(
+                        &mut resolved,
+                        &mut relation_indices,
+                        make_relation(rel, src_id, dst_id, confidence),
+                    );
+                    linked = true;
+                }
+                None => {
+                    unresolvable_name_ambiguity = true;
+                    debug!(
+                        src = %rel.src_name,
+                        dst = %rel.dst_name,
+                        file = %file.file_path,
+                        candidates = distinct_ids.len(),
+                        "linker: same-name bucket unresolvable without scope signal, leaving unlinked"
+                    );
+                }
+            }
         }
 
         // (c2) Receiver-method calls (`x.method()`) arrive as the bare method
@@ -812,7 +829,11 @@ fn resolve_one_file(
         // to the cap so every plausible dispatch target is counted rather than
         // dropped. Beyond the cap the name is too ubiquitous to guess, so it
         // stays unlinked for the inconclusive-absence gate.
-        if name_fallback_allowed && !linked && !bare_candidates.is_empty() {
+        if name_fallback_allowed
+            && !linked
+            && !unresolvable_name_ambiguity
+            && !bare_candidates.is_empty()
+        {
             let mut distinct_targets: HashSet<EntityId> = HashSet::new();
             for &(fp, dst_id) in bare_candidates {
                 if fp != file.file_path.as_str() {
@@ -869,6 +890,7 @@ fn resolve_one_file(
         // Rust would otherwise leave callers uncounted in refs/impact.
         if name_fallback_allowed
             && !linked
+            && !unresolvable_name_ambiguity
             && matches!(rel.kind, RelationKind::Calls | RelationKind::References)
         {
             // Fan out: an ambiguous qualified leaf resolves to every distinct
@@ -4035,12 +4057,15 @@ fn resolve_one_file_incremental(
             &linker.entity_arity_by_id,
         );
 
-        // (c) Global name-match fallback
+        // (c) Global name-match fallback. Mirrors the batch linker: a bucket
+        // several cross-file entities share, with no signal to separate them,
+        // leaves the call unlinked and suppresses the blind name tiers below.
+        let mut unresolvable_name_ambiguity = false;
         if name_fallback_allowed && !other_file_candidates.is_empty() {
             let distinct_ids: HashSet<EntityId> =
                 other_file_candidates.iter().map(|&(_, id)| id).collect();
-            let (dst_id, confidence) = if distinct_ids.len() == 1 {
-                (other_file_candidates[0].1, 0.7)
+            let settled = if distinct_ids.len() == 1 {
+                Some((other_file_candidates[0].1, 0.7))
             } else {
                 let targets = caller_import_targets.get_or_insert_with(|| {
                     resolve_caller_import_targets(
@@ -4051,7 +4076,7 @@ fn resolve_one_file_incremental(
                 });
                 let closure = caller_include_closure
                     .get_or_insert_with(|| include_closure_depths(&file.file_path, &include_graph));
-                match disambiguate_same_name_candidates(
+                disambiguate_same_name_candidates(
                     &file.file_path,
                     targets,
                     closure,
@@ -4063,19 +4088,29 @@ fn resolve_one_file_incremental(
                             .map(|entities| entities.len())
                             .unwrap_or(0)
                     },
-                ) {
-                    Some(dst_id) => (dst_id, LOCALITY_DISAMBIGUATED_CONFIDENCE),
-                    // No locality signal: keep the historical bucket-order
-                    // pick so signal-less repos do not lose existing edges.
-                    None => (other_file_candidates[0].1, 0.7),
-                }
+                )
+                .map(|dst_id| (dst_id, LOCALITY_DISAMBIGUATED_CONFIDENCE))
             };
-            accumulate_relation(
-                &mut resolved,
-                &mut relation_indices,
-                make_relation(rel, src_id, dst_id, confidence),
-            );
-            continue;
+            match settled {
+                Some((dst_id, confidence)) => {
+                    accumulate_relation(
+                        &mut resolved,
+                        &mut relation_indices,
+                        make_relation(rel, src_id, dst_id, confidence),
+                    );
+                    continue;
+                }
+                None => {
+                    unresolvable_name_ambiguity = true;
+                    debug!(
+                        src = %rel.src_name,
+                        dst = %rel.dst_name,
+                        file = %file.file_path,
+                        candidates = distinct_ids.len(),
+                        "linker(incremental): same-name bucket unresolvable without scope signal, leaving unlinked"
+                    );
+                }
+            }
         }
 
         // (c2) Receiver-method calls (`x.method()`) arrive as the bare method
@@ -4088,7 +4123,8 @@ fn resolve_one_file_incremental(
         // Without this step a receiver method resolved into a full-tree
         // snapshot is dropped the moment an incremental relink of the caller
         // re-derives its edges.
-        if name_fallback_allowed && rel.kind == RelationKind::Calls {
+        if name_fallback_allowed && !unresolvable_name_ambiguity && rel.kind == RelationKind::Calls
+        {
             if let Some(bare_candidates) = linker.entity_by_bare_name.get(dst_lookup) {
                 let distinct_targets: HashSet<EntityId> = bare_candidates
                     .iter()
@@ -4143,6 +4179,7 @@ fn resolve_one_file_incremental(
         // of the batch linker's (c3). Live edits reach this daemon path, so
         // qualified calls must resolve here too, not only on a full re-index.
         if name_fallback_allowed
+            && !unresolvable_name_ambiguity
             && matches!(rel.kind, RelationKind::Calls | RelationKind::References)
         {
             // Fan out: an ambiguous qualified leaf resolves to every distinct
@@ -5143,12 +5180,13 @@ mod tests {
             forward_result.iter().map(relation_key).collect::<Vec<_>>(),
             reverse_result.iter().map(relation_key).collect::<Vec<_>>()
         );
-        let calls = forward_result
-            .iter()
-            .find(|rel| rel.kind == RelationKind::Calls)
-            .expect("ambiguous global fallback should still pick one stable target");
-        assert_eq!(calls.src, GraphNodeId::Entity(caller.id));
-        assert_eq!(calls.dst, GraphNodeId::Entity(earlier_target.id));
+        assert!(
+            !forward_result
+                .iter()
+                .any(|rel| rel.kind == RelationKind::Calls),
+            "two same-named targets the caller neither imports nor sits beside \
+             leave the call unlinked rather than binding a bucket-order guess"
+        );
     }
 
     #[test]
@@ -7454,10 +7492,12 @@ void f();
         );
     }
 
-    /// An ambiguous bucket with no import pin and no locality signal keeps the
-    /// historical first-candidate link, so signal-less repos lose no edges.
+    /// An ambiguous bucket with no import pin and no locality signal names no
+    /// reachable definition. Binding the first bucket entry would attribute
+    /// every signal-less caller of a common name to one arbitrary target, so
+    /// the call is left unlinked and the gap is logged.
     #[test]
-    fn ambiguous_bucket_without_signal_keeps_first_candidate() {
+    fn ambiguous_bucket_without_signal_stays_unlinked() {
         let first = go_fn("parse", "src/x/parse.go");
         let second = go_fn("parse", "src/y/parse.go");
         let caller = go_fn("drive", "src/z/drive.go");
@@ -7484,9 +7524,8 @@ void f();
         ];
 
         let result = link_cross_file(&files);
-        let edge = find_calls_edge(&result, &caller, &first)
-            .expect("signal-less ambiguity keeps the historical first-bucket pick");
-        assert_eq!(edge.confidence, 0.7);
+        assert!(find_calls_edge(&result, &caller, &first).is_none());
+        assert!(find_calls_edge(&result, &caller, &second).is_none());
     }
 
     #[test]
@@ -7696,9 +7735,10 @@ void f();
     }
 
     /// Same-named candidates in headers the caller never includes carry no
-    /// closure signal; the historical first-bucket pick must survive.
+    /// closure signal. Neither header is reachable from the call site, so the
+    /// call stays unlinked instead of binding the first bucket entry.
     #[test]
-    fn cpp_closure_ambiguity_without_signal_keeps_first_candidate() {
+    fn cpp_closure_ambiguity_without_signal_stays_unlinked() {
         let first = cpp_entity("format", "alpha/format.hpp");
         let second = cpp_entity("format", "beta/format.hpp");
         let caller = cpp_entity("render", "src/render.cpp");
@@ -7731,9 +7771,8 @@ void f();
         ];
 
         let result = link_cross_file(&files);
-        let edge = find_calls_edge(&result, &caller, &first)
-            .expect("signal-less closure ambiguity keeps the historical first-bucket pick");
-        assert_eq!(edge.confidence, 0.7);
+        assert!(find_calls_edge(&result, &caller, &first).is_none());
+        assert!(find_calls_edge(&result, &caller, &second).is_none());
     }
 
     /// Incremental counterpart of the transitive-closure test: the umbrella's
@@ -7878,14 +7917,15 @@ void f();
         }]);
 
         let after = link_cross_file_incremental(&caller_step, &linker);
-        let edge = find_calls_edge(&after, &caller, &bundled)
-            .expect("losing the closure signal falls back to the first-bucket pick");
-        assert_eq!(edge.confidence, 0.7);
+        assert!(
+            find_calls_edge(&after, &caller, &bundled).is_none(),
+            "losing the closure signal drops the edge rather than guessing a target"
+        );
         assert!(find_calls_edge(&after, &caller, &target).is_none());
     }
 
     /// The closure walk is depth-bounded: a definition past the bound carries
-    /// no signal, so the legacy pick survives instead of an unbounded scan.
+    /// no signal, so the call stays unlinked instead of an unbounded scan.
     #[test]
     fn include_closure_depth_is_bounded() {
         let decoy = cpp_entity("probe", "aux/probe.hpp");
@@ -7931,9 +7971,108 @@ void f();
         }
 
         let result = link_cross_file(&files);
-        let edge = find_calls_edge(&result, &caller, &decoy)
-            .expect("definition past the closure bound keeps the historical pick");
-        assert_eq!(edge.confidence, 0.7);
+        assert!(
+            find_calls_edge(&result, &caller, &decoy).is_none(),
+            "a definition past the closure bound carries no signal, so no target is guessed"
+        );
         assert!(find_calls_edge(&result, &caller, &deep).is_none());
+    }
+
+    /// Regression for same-name consumer concentration. Five Go packages each
+    /// define `NewCmdCreate` and each package's own command constructor calls
+    /// it without a resolvable import pin. Binding the first bucket entry
+    /// attributed all five callers to one arbitrary package, minting four
+    /// consumers that package never had; the name alone proves nothing, so
+    /// none of the five is linked.
+    #[test]
+    fn signal_less_same_name_callers_do_not_concentrate_on_one_target() {
+        let pkgs = ["pr", "gist", "issue", "label", "release"];
+        let targets: Vec<Entity> = pkgs
+            .iter()
+            .map(|pkg| go_fn("NewCmdCreate", &format!("pkg/cmd/{pkg}/create/create.go")))
+            .collect();
+        let callers: Vec<Entity> = pkgs
+            .iter()
+            .map(|pkg| go_fn(&format!("NewCmd{pkg}"), &format!("pkg/cmd/{pkg}/{pkg}.go")))
+            .collect();
+
+        let mut files = Vec::new();
+        for (idx, pkg) in pkgs.iter().enumerate() {
+            files.push(FileParseData {
+                file_path: format!("pkg/cmd/{pkg}/create/create.go"),
+                entities: vec![targets[idx].clone()],
+                relations: vec![],
+                imports: vec![],
+            });
+            files.push(FileParseData {
+                file_path: format!("pkg/cmd/{pkg}/{pkg}.go"),
+                entities: vec![callers[idx].clone()],
+                relations: vec![calls_relation(&format!("NewCmd{pkg}"), "NewCmdCreate")],
+                imports: vec![],
+            });
+        }
+
+        let result = link_cross_file(&files);
+        for target in &targets {
+            let inbound = result
+                .iter()
+                .filter(|rel| {
+                    rel.kind == RelationKind::Calls && rel.dst == GraphNodeId::Entity(target.id)
+                })
+                .count();
+            assert_eq!(
+                inbound, 0,
+                "no target may absorb the signal-less callers of a shared name"
+            );
+        }
+    }
+
+    /// The same shape resolved: each caller imports its own package, so every
+    /// call binds to its own definition and no package gains a foreign caller.
+    #[test]
+    fn import_pinned_same_name_callers_bind_to_their_own_package() {
+        let pkgs = ["pr", "gist", "issue"];
+        let targets: Vec<Entity> = pkgs
+            .iter()
+            .map(|pkg| go_fn("NewCmdCreate", &format!("pkg/cmd/{pkg}/create/create.go")))
+            .collect();
+        let callers: Vec<Entity> = pkgs
+            .iter()
+            .map(|pkg| go_fn(&format!("NewCmd{pkg}"), &format!("pkg/cmd/{pkg}/{pkg}.go")))
+            .collect();
+
+        let mut files = Vec::new();
+        for (idx, pkg) in pkgs.iter().enumerate() {
+            files.push(FileParseData {
+                file_path: format!("pkg/cmd/{pkg}/create/create.go"),
+                entities: vec![targets[idx].clone()],
+                relations: vec![],
+                imports: vec![],
+            });
+            files.push(FileParseData {
+                file_path: format!("pkg/cmd/{pkg}/{pkg}.go"),
+                entities: vec![callers[idx].clone()],
+                relations: vec![pinned_calls_relation(
+                    &format!("NewCmd{pkg}"),
+                    "NewCmdCreate",
+                    &format!("github.com/cli/cli/v2/pkg/cmd/{pkg}/create"),
+                )],
+                imports: vec![],
+            });
+        }
+
+        let result = link_cross_file(&files);
+        for (idx, target) in targets.iter().enumerate() {
+            let edge = find_calls_edge(&result, &callers[idx], target)
+                .expect("a pinned call binds to its own package's definition");
+            assert_eq!(edge.confidence, IMPORT_PINNED_CONFIDENCE);
+            let inbound = result
+                .iter()
+                .filter(|rel| {
+                    rel.kind == RelationKind::Calls && rel.dst == GraphNodeId::Entity(target.id)
+                })
+                .count();
+            assert_eq!(inbound, 1, "a pinned target gains no foreign caller");
+        }
     }
 }
