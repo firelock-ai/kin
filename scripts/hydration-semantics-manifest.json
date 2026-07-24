@@ -1,0 +1,41 @@
+{
+  "comment": "Replay-semantics surface pinned by scripts/verify-hydration-semantics.py. These functions re-author the entity/relation deltas persisted for multi-parent (merge) changes during history hydration, so editing one changes what Kin reports about the past on already-ingested repositories. A digest mismatch is not a failure to fix by regenerating: decide first whether replay semantics changed, and if so bump HYDRATION_SEMANTICS_VERSION and hydration_semantics_version together.",
+  "hydration_semantics_version": 3,
+  "guarded": [
+    {
+      "file": "crates/kin-cli/src/commands/init.rs",
+      "function": "replay_imported_secondary_parents",
+      "digest": "sha256:a35363a3609e9f63c7a1289f8d437ccb662152caa1a80f1e905926a2938e7866",
+      "reason": "Walks each secondary parent's unique ancestry to build the all-parent runtime baseline a merge is rebased onto. Its DFS order and visited-marking rule decide which changes contribute, and so decide the merge's persisted deltas.",
+      "owner": "kin-cli"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/init.rs",
+      "function": "rebase_imported_merge_semantic_deltas",
+      "digest": "sha256:09ea99ef84c3bd580773e4ece8f819ddb71b963fdc33c7b46d21eadd1852a601",
+      "reason": "Diffs the all-parent baseline against the merge target and REPLACES the merge change's entity_deltas and relation_deltas outright. This function is the direct author of every merge change's persisted payload.",
+      "owner": "kin-cli"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/init.rs",
+      "function": "apply_imported_change_to_runtime_state",
+      "digest": "sha256:a2789e4d2aa3de44f5dcd1ffeaf05cb77f16df4154969cf7cbb53ac087c21f0f",
+      "reason": "The live entity/relation fold the baseline replay is built from, kept field-for-field aligned with kin-model's authoritative replay_graph_state. A divergence here silently shifts the baseline every merge is diffed against.",
+      "owner": "kin-cli"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/init.rs",
+      "function": "imported_entities_exactly_equivalent",
+      "digest": "sha256:6b6a9824a6c69f477da250e81a88c9380002398f336e04bb94d5d86b3dce2977",
+      "reason": "Decides whether a baseline entity and its target counterpart are the same, and therefore whether the merge emits a Modified delta or nothing at all.",
+      "owner": "kin-cli"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/init.rs",
+      "function": "imported_relations_exactly_equivalent",
+      "digest": "sha256:cfad3ea32fd6f44d7a57badb4470c8dad5adb444a4f179cf7ef6b706dd28433f",
+      "reason": "The relation-side equivalence predicate: decides whether a relation is rewritten as a Removed+Added pair in the merge's persisted deltas.",
+      "owner": "kin-cli"
+    }
+  ]
+}
