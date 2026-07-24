@@ -4750,15 +4750,21 @@ async fn review(
             drop(graph_mutation);
             drop(hydration_gate);
 
-            let response =
-                kin_cli::commands::review::render_prepared_shadow_request(graph.as_ref(), prepared)
-                    .map_err(|error| {
-                        if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
-                            (StatusCode::BAD_REQUEST, format!("{error:#}"))
-                        } else {
-                            internal_error(error)
-                        }
-                    })?;
+            let response = kin_cli::commands::review::render_prepared_shadow_request(
+                graph.as_ref(),
+                prepared,
+            )
+            .map_err(|error| {
+                // The client response carries only the top-level context;
+                // record the full cause chain here so a shadow failure is
+                // diagnosable from the daemon log.
+                tracing::warn!(target: "kin_daemon::api", "shadow review render failed: {error:#}");
+                if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
+                    (StatusCode::BAD_REQUEST, format!("{error:#}"))
+                } else {
+                    internal_error(error)
+                }
+            })?;
             return Ok(Json(response));
         }
         request => request,

@@ -703,6 +703,11 @@ fn replay_imported_semantics(
         blob_store,
         kin_root,
         kin_core::build_genesis_change().id,
+        // Lazy-ref hydration for review / history / blame reads arbitrary,
+        // uncertified repositories. It hydrates best-effort: a compatibility
+        // hydration facet degrades rather than failing the read. Certification
+        // (`kin init`) is the strict path.
+        true,
     )
     .map(|_| ())
 }
