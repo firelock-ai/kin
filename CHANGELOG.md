@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-07-24
+
+### Fixed
+
+- Review no longer raises a gating warning when an added entity merely shares a
+  name and kind with an entity removed earlier in history and the body differs.
+  A bare name match is weak temporal evidence: a common surface name recurs
+  across a long history, and the earlier removal may be an unrelated namesake in
+  another file. Only an exact behavior-fingerprint restore gates; a
+  modified-content match is reported as informational evidence.
+
+## [0.3.3] - 2026-07-24
+
+### Fixed
+
+- `kin review shadow` no longer fails on repositories that contain submodules.
+  Exact-source import strictness is now split by caller, so submodule pointers
+  are recorded as tracked pointer changes instead of refusing hydration during
+  review.
+
 ## [0.3.1] - 2026-07-22
 
 ### Fixed
@@ -765,6 +785,8 @@ Historical note: this snapshot predates the public GitHub prerelease series and 
 - 19-crate workspace architecture
 
 [unreleased]: https://github.com/firelock-ai/kin/compare/v0.3.1...HEAD
+[0.3.4]: https://github.com/firelock-ai/kin/compare/v0.3.3...v0.3.4
+[0.3.3]: https://github.com/firelock-ai/kin/compare/v0.3.1...v0.3.3
 [0.3.1]: https://github.com/firelock-ai/kin/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/firelock-ai/kin/compare/v0.2.28...v0.3.0
 [0.2.28]: https://github.com/firelock-ai/kin/compare/v0.2.27...v0.2.28
