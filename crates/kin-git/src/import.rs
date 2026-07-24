@@ -1512,6 +1512,18 @@ mod tests {
                     .args(["config", "core.hooksPath", ".git/no-hooks"])
                     .current_dir(dir)
                     .output();
+                // Commit signing is a common global default and it hands the
+                // terminal to a pinentry prompt. Nothing answers that prompt
+                // during a test run, so an inherited value makes the commits
+                // below wait forever instead of failing.
+                let _ = Command::new("git")
+                    .args(["config", "commit.gpgsign", "false"])
+                    .current_dir(dir)
+                    .output();
+                let _ = Command::new("git")
+                    .args(["config", "tag.gpgsign", "false"])
+                    .current_dir(dir)
+                    .output();
                 true
             }
             _ => false,

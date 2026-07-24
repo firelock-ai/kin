@@ -8043,7 +8043,19 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         if !ok {
             return false;
         }
-        for (k, v) in [("user.email", "test@test.com"), ("user.name", "Test")] {
+        // Pin every setting a developer's global config could otherwise supply
+        // to a `git commit` below. Commit signing hands the terminal to a
+        // pinentry prompt and hooks can wait on input of their own, neither of
+        // which anything in a test run will ever answer, so an inherited value
+        // turns a commit into an unbounded wait rather than a failure.
+        for (k, v) in [
+            ("user.email", "test@test.com"),
+            ("user.name", "Test"),
+            ("commit.gpgsign", "false"),
+            ("tag.gpgsign", "false"),
+            ("core.hooksPath", ".git/no-hooks"),
+            ("gc.auto", "0"),
+        ] {
             let _ = Command::new("git")
                 .args(["config", k, v])
                 .current_dir(dir)
