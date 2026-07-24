@@ -161,7 +161,15 @@ fn run_command_in_session(
     let status = cmd
         .current_dir(ws_root)
         .envs(extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .stdin(std::process::Stdio::inherit())
+        // A real `kin exec` hands the terminal to the command, which is the
+        // point of the surface. A unit test has no terminal to hand over: a
+        // command that reads stdin there would wait on a descriptor nobody
+        // writes to, so the test blocks forever instead of failing.
+        .stdin(if cfg!(test) {
+            std::process::Stdio::null()
+        } else {
+            std::process::Stdio::inherit()
+        })
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .status()

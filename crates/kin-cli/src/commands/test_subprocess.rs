@@ -17,7 +17,16 @@ use std::io::{Read as _, Seek as _, SeekFrom};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
-pub(crate) const DEFAULT_TEST_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(60);
+/// Wall-clock cap for a test-driven worker process.
+///
+/// This is a backstop against a wait that would otherwise never end, not an
+/// assertion about how fast the machine is. The workers it bounds re-execute
+/// this test binary and normally finish in under a second, but the suite runs
+/// them many-at-once and a developer machine may be saturated by other work at
+/// the same time, so the cap is set far above any legitimate completion time.
+/// Tightening it back toward the observed runtime trades a class of hangs for a
+/// class of load-dependent false failures.
+pub(crate) const DEFAULT_TEST_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(300);
 const TEST_SUBPROCESS_REAP_GRACE: Duration = Duration::from_secs(5);
 const TEST_SUBPROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 

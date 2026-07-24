@@ -224,7 +224,21 @@ mod tests {
     #[test]
     fn update_registry_does_not_panic_on_missing_home() {
         let tmp = tempfile::tempdir().unwrap();
-        // Should not panic even if ~/.kin doesn't exist.
+        // Point the registry authority at a path whose parent directory does
+        // not exist yet. That is the condition under test, and it keeps the
+        // test off the real `~/.kin/registry.toml`: writing there mutates the
+        // developer's own repo list, and the exclusive lock it takes has no
+        // timeout, so a `kin` process holding that lock would block this test
+        // forever.
+        let registry_path = tmp.path().join("registry-home/registry.toml");
+        std::env::set_var("KIN_REGISTRY_PATH", &registry_path);
+
         update_registry(tmp.path(), 42).unwrap();
+
+        assert!(
+            registry_path.exists(),
+            "the registry authority must be created under the missing home"
+        );
+        std::env::remove_var("KIN_REGISTRY_PATH");
     }
 }
