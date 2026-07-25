@@ -29,6 +29,11 @@ const RECONCILIATION_AUTHORITY_FILE: &str = "authority.key";
 const RECONCILIATION_MANIFEST_FILE: &str = "manifest.json";
 #[cfg(any(unix, windows))]
 const RECONCILIATION_PROJECTION_LOCK_FILE: &str = "projection.lock";
+
+/// How long a caller waits for a live exact-source projection to finish before
+/// failing loud. Bounded so an undiscovered lock-order cycle degrades to a
+/// slow, named failure instead of a hang.
+const PROJECTION_LOCK_WAIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 #[cfg(any(unix, windows))]
 const RECONCILIATION_MANIFEST_SCHEMA: u32 = 2;
 #[cfg(any(unix, windows))]
@@ -1545,10 +1550,25 @@ fn load_or_create_reconciliation_authority_key(
 }
 
 #[cfg(any(unix, windows))]
-fn acquire_reconciliation_projection_lock(
+enum ProjectionLockAttemptError {
+    /// The kernel lock is held by a live projection; the caller may wait.
+    Contended(std::io::Error),
+    /// Any other failure; surfaced immediately.
+    Failed(KinError),
+}
+
+#[cfg(any(unix, windows))]
+impl From<KinError> for ProjectionLockAttemptError {
+    fn from(error: KinError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn try_acquire_reconciliation_projection_lock(
     control: &cap_std::fs::Dir,
     display_control: &Path,
-) -> Result<(std::fs::File, TrackedEntryIdentity)> {
+) -> std::result::Result<(std::fs::File, TrackedEntryIdentity), ProjectionLockAttemptError> {
     let name = std::ffi::OsStr::new(RECONCILIATION_PROJECTION_LOCK_FILE);
     #[cfg(unix)]
     let file = rustix::fs::openat(
@@ -1598,7 +1618,8 @@ fn acquire_reconciliation_projection_lock(
             display_control
                 .join(RECONCILIATION_PROJECTION_LOCK_FILE)
                 .display()
-        )));
+        ))
+        .into());
     }
     let identity = tracked_open_file_identity_for_std(&file).map_err(|error| {
         KinError::io(
@@ -1607,13 +1628,18 @@ fn acquire_reconciliation_projection_lock(
         )
     })?;
     file.try_lock_exclusive().map_err(|error| {
-        KinError::io(
+        if error.kind() == std::io::ErrorKind::WouldBlock
+            || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+        {
+            return ProjectionLockAttemptError::Contended(error);
+        }
+        ProjectionLockAttemptError::Failed(KinError::io(
             display_control.join(RECONCILIATION_PROJECTION_LOCK_FILE),
             std::io::Error::new(
                 error.kind(),
                 format!("another exact-source projection is active: {error}"),
             ),
-        )
+        ))
     })?;
 
     let named = open_reconciliation_control_file(control, name).map_err(|error| {
@@ -1634,14 +1660,106 @@ fn acquire_reconciliation_projection_lock(
             display_control
                 .join(RECONCILIATION_PROJECTION_LOCK_FILE)
                 .display()
-        )));
+        ))
+        .into());
     }
     Ok((file, identity))
+}
+
+/// Acquire the exact-source projection lock, waiting out a live holder up to
+/// `wait_deadline` before failing loud.
+///
+/// A held lock means another projection is finishing legitimate work, so the
+/// caller retries the full attempt (open, lock, identity check) with backoff
+/// rather than surfacing WouldBlock to a user who merely ran two kin commands
+/// close together. Every retry revalidates the lock file's identity from
+/// scratch, so a holder that deletes or swaps the file mid-wait is caught by
+/// the same checks a first attempt performs. On timeout the error names the
+/// recorded holder when one is legible.
+#[cfg(any(unix, windows))]
+fn acquire_reconciliation_projection_lock(
+    control: &cap_std::fs::Dir,
+    display_control: &Path,
+    wait_deadline: std::time::Duration,
+) -> Result<(std::fs::File, TrackedEntryIdentity)> {
+    let started = std::time::Instant::now();
+    let mut backoff = std::time::Duration::from_millis(25);
+    loop {
+        match try_acquire_reconciliation_projection_lock(control, display_control) {
+            Ok((file, identity)) => {
+                record_projection_lock_holder(&file);
+                return Ok((file, identity));
+            }
+            Err(ProjectionLockAttemptError::Failed(error)) => return Err(error),
+            Err(ProjectionLockAttemptError::Contended(source)) => {
+                if started.elapsed() >= wait_deadline {
+                    let holder = read_projection_lock_holder(control)
+                        .map(|holder| format!(" (lock file records {holder})"))
+                        .unwrap_or_default();
+                    return Err(KinError::io(
+                        display_control.join(RECONCILIATION_PROJECTION_LOCK_FILE),
+                        std::io::Error::new(
+                            source.kind(),
+                            format!(
+                                "another exact-source projection is active after waiting \
+                                 {:.1}s{holder}: {source}",
+                                wait_deadline.as_secs_f64(),
+                            ),
+                        ),
+                    ));
+                }
+                let remaining = wait_deadline.saturating_sub(started.elapsed());
+                std::thread::sleep(backoff.min(remaining));
+                backoff = (backoff * 2).min(std::time::Duration::from_millis(250));
+            }
+        }
+    }
+}
+
+/// Best-effort holder record written through the held lock handle so a later
+/// contender's timeout error can name who was projecting.
+#[cfg(any(unix, windows))]
+fn record_projection_lock_holder(file: &std::fs::File) {
+    use std::io::Seek as _;
+    let mut file = file;
+    let start_unix_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    let _ = file.set_len(0);
+    let _ = file.seek(std::io::SeekFrom::Start(0));
+    let _ = write!(
+        file,
+        "pid={} start_unix_s={start_unix_s}",
+        std::process::id()
+    );
+    let _ = file.flush();
+}
+
+/// Best-effort read of the holder record; advisory locks do not block reads.
+#[cfg(any(unix, windows))]
+fn read_projection_lock_holder(control: &cap_std::fs::Dir) -> Option<String> {
+    let mut file = open_reconciliation_control_file(
+        control,
+        std::ffi::OsStr::new(RECONCILIATION_PROJECTION_LOCK_FILE),
+    )
+    .ok()?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).ok()?;
+    let trimmed = contents.trim();
+    (!trimmed.is_empty() && trimmed.len() <= 128).then(|| trimmed.to_string())
 }
 
 #[cfg(any(unix, windows))]
 impl ProjectionRoot {
     fn open(root: &Path) -> Result<Self> {
+        Self::open_with_projection_lock_deadline(root, PROJECTION_LOCK_WAIT_DEADLINE)
+    }
+
+    fn open_with_projection_lock_deadline(
+        root: &Path,
+        lock_deadline: std::time::Duration,
+    ) -> Result<Self> {
         #[cfg(unix)]
         let capability = {
             let root_fd = rustix::fs::open(
@@ -1679,7 +1797,7 @@ impl ProjectionRoot {
         })?;
         let display_control = root.join(".kin").join(RECONCILIATION_CONTROL_DIRECTORY);
         let (projection_lock, projection_lock_identity) =
-            acquire_reconciliation_projection_lock(&control, &display_control)?;
+            acquire_reconciliation_projection_lock(&control, &display_control, lock_deadline)?;
         let authority_key =
             load_or_create_reconciliation_authority_key(&control, &display_control)?;
         let projection = Self {
@@ -6038,20 +6156,63 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let first = ProjectionRoot::open(root.path()).unwrap();
 
-        let error = match ProjectionRoot::open(root.path()) {
+        let started = std::time::Instant::now();
+        let error = match ProjectionRoot::open_with_projection_lock_deadline(
+            root.path(),
+            std::time::Duration::from_millis(200),
+        ) {
             Ok(_) => panic!("a second projection authority entered while the lock was held"),
             Err(error) => error,
         };
         assert!(
+            started.elapsed() >= std::time::Duration::from_millis(200),
+            "the contender must wait out the deadline before failing"
+        );
+        assert!(
             error
                 .to_string()
-                .contains("another exact-source projection is active"),
+                .contains("another exact-source projection is active after waiting"),
             "unexpected lock refusal: {error}"
+        );
+        assert!(
+            error.to_string().contains("pid="),
+            "timeout error should name the recorded holder: {error}"
         );
 
         drop(first);
         ProjectionRoot::open(root.path())
             .expect("dropping the retained capability must release the kernel lock");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn projection_lock_waits_out_a_short_lived_holder() {
+        let root = tempfile::tempdir().unwrap();
+        let first = ProjectionRoot::open(root.path()).unwrap();
+
+        let contender_root = root.path().to_path_buf();
+        let contender = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let opened = ProjectionRoot::open_with_projection_lock_deadline(
+                &contender_root,
+                std::time::Duration::from_secs(10),
+            );
+            (opened.map(|_| ()), started.elapsed())
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(first);
+
+        let (opened, waited) = contender.join().unwrap();
+        opened.expect("the contender must acquire once the holder releases");
+        assert!(
+            waited >= std::time::Duration::from_millis(250),
+            "the contender should have genuinely waited, waited {waited:?}"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(10),
+            "the contender must not burn the full deadline once the lock frees"
+        );
     }
 
     #[cfg(unix)]
