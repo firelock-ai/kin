@@ -1,0 +1,123 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Registry Index Migrate
+
+# Repairs Cargo sparse-index version records that predate the
+# cargo_index_format marker and therefore fail index reads with
+# "legacy or incomplete". The repair is an identical-bytes republish
+# through the authenticated publish endpoint: the registry re-derives
+# index metadata from the manifest inside the stored archive and
+# rewrites the record in place. Different bytes are rejected with 409
+# before any mutation, so a failed run cannot corrupt registry state.
+
+on:
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: "Space-separated crate names whose sparse index reports legacy metadata"
+        required: true
+        default: "kin-db kin-model kin-blobs kin-search kin-vector kin-infer kin-lsp kin-vfs-core"
+      base_url:
+        description: "Registry base URL"
+        required: true
+        default: "https://kinlab.ai"
+      execute:
+        description: "true republishes stored bytes to repair records; anything else reports without mutating"
+        required: true
+        default: "false"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: registry-index-migrate
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Repair legacy index records
+        env:
+          KINLAB_CARGO_TOKEN: ${{ secrets.KINLAB_CARGO_TOKEN }}
+          BASE_URL: ${{ inputs.base_url }}
+          PACKAGES: ${{ inputs.packages }}
+          EXECUTE: ${{ inputs.execute }}
+        run: |
+          set -euo pipefail
+          if [ "$EXECUTE" = "true" ] && [ -z "$KINLAB_CARGO_TOKEN" ]; then
+            echo "KINLAB_CARGO_TOKEN is required to execute repairs" >&2
+            exit 1
+          fi
+          index_path() {
+            local name="$1"
+            case "${#name}" in
+              1) printf '1/%s' "$name" ;;
+              2) printf '2/%s' "$name" ;;
+              3) printf '3/%s/%s' "${name:0:1}" "$name" ;;
+              *) printf '%s/%s/%s' "${name:0:2}" "${name:2:2}" "$name" ;;
+            esac
+          }
+          overall=0
+          for pkg in $PACKAGES; do
+            path="$(index_path "$pkg")"
+            status=""
+            for attempt in $(seq 1 50); do
+              code=$(curl -sS -m 30 -o idx.body -w '%{http_code}' "$BASE_URL/registry/cargo/$path")
+              if [ "$code" = "200" ]; then
+                status="serving"
+                break
+              fi
+              if [ "$code" != "500" ] || ! grep -q "legacy or incomplete" idx.body; then
+                status="unexpected HTTP $code on index read: $(head -c 200 idx.body)"
+                break
+              fi
+              coord=$(sed -n 's/.*Cargo index metadata for \([^ ]*\) is legacy.*/\1/p' idx.body | head -n 1)
+              name="${coord%@*}"
+              ver="${coord##*@}"
+              if [ "$name" != "$pkg" ] || [ -z "$ver" ]; then
+                status="index error names ${coord:-nothing}, expected package $pkg"
+                break
+              fi
+              dl=$(curl -sS -m 300 -D crate.hdrs -o crate.bin -w '%{http_code}' "$BASE_URL/registry/cargo/dl/$name/$ver")
+              if [ "$dl" != "200" ]; then
+                status="download of $coord failed with HTTP $dl"
+                break
+              fi
+              etag=$(tr -d '\r' < crate.hdrs | awk -F'"' 'tolower($0) ~ /^etag: / { print $2; exit }')
+              sum=$(sha256sum crate.bin | cut -d' ' -f1)
+              if [ "$etag" != "$sum" ]; then
+                status="checksum drift on $coord: record $etag, stored blob $sum"
+                break
+              fi
+              if [ "$EXECUTE" != "true" ]; then
+                status="dry run: would republish $coord ($(wc -c < crate.bin | tr -d ' ') bytes, sha256 $sum)"
+                break
+              fi
+              pub=$(curl -sS -m 300 -o pub.body -w '%{http_code}' -X POST \
+                -H "Authorization: Bearer $KINLAB_CARGO_TOKEN" \
+                -H "Content-Type: application/octet-stream" \
+                --data-binary @crate.bin \
+                "$BASE_URL/registry/cargo/api/v1/crates/publish?name=$name&version=$ver")
+              if [ "$pub" != "200" ]; then
+                status="republish of $coord rejected with HTTP $pub: $(head -c 200 pub.body)"
+                break
+              fi
+              if ! grep -q '"already_published":true' pub.body; then
+                status="republish of $coord did not take the idempotent repair path: $(head -c 200 pub.body)"
+                break
+              fi
+              echo "repaired $coord"
+            done
+            case "$status" in
+              serving) echo "OK   $pkg index serves" ;;
+              "dry run"*) echo "PLAN $pkg $status" ;;
+              *)
+                echo "FAIL $pkg: ${status:-not serving after 50 repair attempts}"
+                overall=1
+                ;;
+            esac
+          done
+          exit "$overall"
