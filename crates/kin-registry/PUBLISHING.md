@@ -156,3 +156,5 @@ dispatch. It dry-runs by default and mutates only when dispatched with
 each unserveable record otherwise. Deployment promotions should gate on it
 immediately after deploy so a data precondition the serving code enforces
 can never sit undetected in front of clients.
+
+<!-- fast-path falsification probe -->
