@@ -519,6 +519,7 @@ pub(crate) fn output_with_timeout(
 /// `serial_test` guard it holds, and the run still reaches a verdict. A suite
 /// that blocks forever reports nothing and pins the machine; one that fails
 /// names the resource that never arrived.
+#[cfg(unix)]
 pub(crate) fn call_with_deadline<T, F>(label: &str, timeout: Duration, call: F) -> T
 where
     T: Send + 'static,
