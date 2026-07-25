@@ -517,11 +517,6 @@ enum Command {
         #[arg(long = "ref", value_name = "REF")]
         reference: Option<String>,
     },
-    /// Manage workspaces
-    Workspace {
-        #[command(subcommand)]
-        action: WorkspaceAction,
-    },
     /// MCP server commands
     Mcp {
         #[command(subcommand)]
@@ -1484,34 +1479,6 @@ enum StashAction {
     Pop,
     /// List stash entries
     List,
-}
-
-#[derive(Subcommand)]
-enum WorkspaceAction {
-    /// List workspaces
-    List,
-    /// Create a new workspace
-    Create {
-        /// Workspace name
-        name: String,
-    },
-    /// Switch to a workspace
-    Switch {
-        /// Workspace name
-        name: String,
-    },
-    /// Delete a workspace
-    Delete {
-        /// Workspace name
-        name: String,
-    },
-    /// Rename a workspace
-    Rename {
-        /// Current workspace name
-        old_name: String,
-        /// New workspace name
-        new_name: String,
-    },
 }
 
 #[derive(Subcommand)]
@@ -2514,15 +2481,6 @@ fn main() -> Result<()> {
                 Command::Blame { entity, reference } => {
                     commands::blame::run(entity, reference).await
                 }
-                Command::Workspace { action } => match action {
-                    WorkspaceAction::List => commands::workspace::list().await,
-                    WorkspaceAction::Create { name } => commands::workspace::create(name).await,
-                    WorkspaceAction::Switch { name } => commands::workspace::switch(name).await,
-                    WorkspaceAction::Delete { name } => commands::workspace::delete(name).await,
-                    WorkspaceAction::Rename { old_name, new_name } => {
-                        commands::workspace::rename(old_name, new_name).await
-                    }
-                },
                 Command::Mcp { action } => match action {
                     McpAction::Start { global, repo } => commands::mcp::start(global, repo).await,
                 },
@@ -3087,6 +3045,38 @@ mod tests {
             .expect("spawn cli validation thread")
             .join()
             .expect("cli definition validation must succeed");
+    }
+
+    #[test]
+    fn workspace_is_not_a_cli_surface() {
+        on_cli_test_stack(|| {
+            for args in [
+                vec!["kin", "workspace"],
+                vec!["kin", "workspace", "list"],
+                vec!["kin", "workspace", "create", "demo"],
+                vec!["kin", "workspace", "switch", "demo"],
+                vec!["kin", "workspace", "delete", "demo"],
+                vec!["kin", "workspace", "rename", "demo", "renamed"],
+            ] {
+                assert!(
+                    Cli::try_parse_from(args).is_err(),
+                    "the descriptor-only workspace command must not be parseable"
+                );
+            }
+
+            let mut command = Cli::command();
+            let help = command.render_long_help().to_string();
+            for supported in [
+                "Run a command in a graph-backed session workspace",
+                "Launch an editor in a materialized session workspace",
+                "Open an interactive shell in a materialized session workspace",
+            ] {
+                assert!(
+                    help.contains(supported),
+                    "supported graph-backed session surface missing from help: {supported}"
+                );
+            }
+        });
     }
 
     #[test]
