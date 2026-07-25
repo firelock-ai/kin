@@ -9021,9 +9021,12 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             checkpoint_worker_command(&root, &dir.path().join("crash-blobs"), "crash-orphan")
                 .output()
                 .unwrap();
-        assert!(
-            !crashed.status.success(),
-            "crash worker unexpectedly published a complete checkpoint"
+        assert_eq!(
+            crashed.status.code(),
+            Some(history_checkpoint::CRASH_SIMULATION_EXIT_CODE),
+            "crash worker did not die at the armed crash boundary\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&crashed.stdout),
+            String::from_utf8_lossy(&crashed.stderr)
         );
 
         let orphan_objects: Vec<_> = recursive_checkpoint_files(&root)
