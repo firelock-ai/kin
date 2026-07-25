@@ -110,3 +110,41 @@ the now-fail-closed registry (surfaced as a non-2xx HTTP error).
 | `publish-kinlab-crates.sh` | `KINLAB_CARGO_TOKEN` (or `KINLAB_TOKEN`) | No header; publish rejected by registry |
 
 The sender's token must match the credential for the ecosystem it is mutating.
+
+## Migrating legacy Cargo index metadata
+
+The sparse index serves only version records whose metadata carries
+`cargo_index_format: 1`. Records written before that marker existed make every
+`GET` of the package's index path fail with HTTP 500 and:
+
+```
+Cargo index metadata for <name>@<version> is legacy or incomplete; re-publish or migrate the manifest before serving it
+```
+
+One legacy record fails the whole package file, because a sparse index file is
+one newline-delimited entry per version and has no per-version error channel.
+Resolution of every version of that package fails until the record is repaired.
+
+The supported migration is an identical-bytes republish through the
+authenticated publish endpoint. Re-publishing the exact stored bytes takes the
+idempotent path: the registry re-derives index metadata from the manifest
+inside the archive and rewrites the record in place, preserving `published_at`
+and `published_by`. A republish with different bytes is rejected with `409`
+before touching the blob or the record, so a failed migration attempt changes
+nothing.
+
+Per affected package:
+
+1. `GET <base>/registry/cargo/<prefix>/<name>` and read the failing
+   `<name>@<version>` from the error body. The index reports one legacy record
+   at a time, so the remaining steps repeat until the read returns 200.
+2. `GET <base>/registry/cargo/dl/<name>/<version>` and check that the SHA-256
+   of the body equals the `ETag` value before sending anything.
+3. `POST <base>/registry/cargo/api/v1/crates/publish?name=<name>&version=<version>`
+   with the downloaded bytes and the Cargo bearer token. Expect `200` with
+   `"already_published": true`; a plain publish response means the version did
+   not previously exist and the coordinates should be re-checked.
+
+`.github/workflows/registry-index-migrate.yml` automates this loop as a manual
+dispatch. It dry-runs by default and mutates only when dispatched with
+`execute: true`, using the repository's `KINLAB_CARGO_TOKEN` secret.
