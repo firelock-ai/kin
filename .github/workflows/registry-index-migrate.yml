@@ -70,7 +70,7 @@ jobs:
                 status="serving"
                 break
               fi
-              if [ "$code" != "500" ] || ! grep -q "legacy or incomplete" idx.body; then
+              if { [ "$code" != "500" ] && [ "$code" != "503" ]; } || ! grep -qE "legacy or incomplete|unserveable_index_metadata" idx.body; then
                 status="unexpected HTTP $code on index read: $(head -c 200 idx.body)"
                 break
               fi

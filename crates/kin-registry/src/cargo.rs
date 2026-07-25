@@ -165,9 +165,28 @@ fn bad_coordinate(message: String) -> Response {
 }
 
 /// Create axum router for Cargo registry endpoints
+/// A stored record the index reader refuses to serve is a data condition
+/// with a standing remedy, not an internal fault. Report it distinguishably
+/// so operators and promotion gates can tell "needs migration" from
+/// "registry broken", while the whole-package read stays fail-loud.
+fn unserveable_record_response(name: &str, version: &str, detail: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": detail,
+            "error_code": "unserveable_index_metadata",
+            "crate": name,
+            "version": version,
+            "remedy": "republish identical bytes or dispatch the registry index migration; see crates/kin-registry/PUBLISHING.md",
+        })),
+    )
+        .into_response()
+}
+
 pub fn cargo_routes(state: Arc<CargoRegistryState>) -> Router {
     let public = Router::new()
         .route("/registry/cargo/config.json", get(config_json))
+        .route("/registry/cargo/health", get(registry_health))
         .route("/registry/cargo/dl/{name}/{version}", get(download_crate))
         // Cargo sparse index: 1-char names under /1/, 2-char under /2/,
         // 3-char under /3/{first-char}/, 4+ under /{first-two}/{second-two}/
@@ -263,13 +282,7 @@ async fn index_lookup(
     for v in &versions {
         let entry = match CargoIndexEntry::try_from_version(v) {
             Ok(entry) => entry,
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": error })),
-                )
-                    .into_response();
-            }
+            Err(error) => return unserveable_record_response(&v.id.name, &v.version, &error),
         };
         let line = match serde_json::to_string(&entry) {
             Ok(line) => line,
@@ -338,6 +351,85 @@ async fn download_crate(
             .into_response(),
         Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
         Ok(Err(_)) | Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// GET /registry/cargo/health -- serving readiness of every stored record
+///
+/// Enumerates the manifest store under the shared read lock and runs each
+/// record through the same conversion the sparse index uses. Returns 200
+/// with counts when everything serves, 503 listing each unserveable record
+/// otherwise, so deployment promotions can gate on data preconditions the
+/// serving code enforces.
+async fn registry_health(State(state): State<Arc<CargoRegistryState>>) -> Response {
+    let _read_guard = state.publish_gate.read().await;
+    let read_state = Arc::clone(&state);
+    let outcome = tokio::task::spawn_blocking(move || {
+        let transaction = read_state
+            .manifest_store
+            .read_transaction(Ecosystem::Cargo)?;
+        let packages = transaction.list_packages()?;
+        let mut versions_total = 0usize;
+        let mut unserveable = Vec::new();
+        for package in &packages {
+            let versions = match transaction.get_versions(package) {
+                Ok(versions) => versions,
+                Err(error) => {
+                    unserveable.push(serde_json::json!({
+                        "crate": package,
+                        "version": "*",
+                        "reason": format!("package manifest unreadable: {error}"),
+                    }));
+                    continue;
+                }
+            };
+            versions_total += versions.len();
+            for version in &versions {
+                if let Err(reason) = CargoIndexEntry::try_from_version(version) {
+                    unserveable.push(serde_json::json!({
+                        "crate": version.id.name,
+                        "version": version.version,
+                        "reason": reason,
+                    }));
+                }
+            }
+        }
+        Ok::<_, crate::RegistryError>((packages.len(), versions_total, unserveable))
+    })
+    .await;
+    match outcome {
+        Ok(Ok((packages, versions, unserveable))) => {
+            let healthy = unserveable.is_empty();
+            let status = if healthy {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            (
+                status,
+                Json(serde_json::json!({
+                    "status": if healthy { "ok" } else { "unserveable_records" },
+                    "packages": packages,
+                    "versions": versions,
+                    "unserveable": unserveable,
+                })),
+            )
+                .into_response()
+        }
+        Ok(Err(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("registry health scan failed: {error}")
+            })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("registry health task failed: {error}")
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -1254,7 +1346,7 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -1264,6 +1356,9 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
             .as_str()
             .unwrap()
             .contains("legacy or incomplete"));
+        assert_eq!(error["error_code"], "unserveable_index_metadata");
+        assert_eq!(error["crate"], "kin-infer");
+        assert_eq!(error["version"], "0.1.2");
 
         let manifest_after = state
             .manifest_store
@@ -1272,6 +1367,75 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
         assert_eq!(manifest_after.len(), manifest_before.len());
         assert_eq!(manifest_after[0].version, manifest_before[0].version);
         assert_eq!(manifest_after[0].metadata, manifest_before[0].metadata);
+    }
+
+    async fn health_report(state: Arc<CargoRegistryState>) -> (StatusCode, serde_json::Value) {
+        let response = cargo_routes(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/registry/cargo/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn health_reports_unserveable_records_and_recovers_after_identical_republish() {
+        let (_root, state) = registry_state_with_token(Some("s3cret"));
+
+        let (status, report) = health_report(state.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(report["status"], "ok");
+        assert_eq!(report["packages"], 0);
+
+        let body = build_test_crate(
+            "demo",
+            "1.0.0",
+            "[package]\nname = \"demo\"\nversion = \"1.0.0\"\n\n[dependencies]\nserde = \"1\"\n",
+        );
+        assert_eq!(
+            publish(state.clone(), "demo", "1.0.0", Some("s3cret"), body.clone()).await,
+            StatusCode::OK
+        );
+
+        let (status, report) = health_report(state.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(report["status"], "ok");
+        assert_eq!(report["packages"], 1);
+        assert_eq!(report["versions"], 1);
+        assert_eq!(report["unserveable"].as_array().unwrap().len(), 0);
+
+        let mut legacy = state
+            .manifest_store
+            .get_versions(Ecosystem::Cargo, "demo")
+            .unwrap();
+        legacy[0].metadata = serde_json::json!({});
+        state
+            .manifest_store
+            .replace_versions(&legacy[0].id, &legacy)
+            .unwrap();
+
+        let (status, report) = health_report(state.clone()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(report["status"], "unserveable_records");
+        assert_eq!(report["unserveable"][0]["crate"], "demo");
+        assert_eq!(report["unserveable"][0]["version"], "1.0.0");
+
+        assert_eq!(
+            publish(state.clone(), "demo", "1.0.0", Some("s3cret"), body).await,
+            StatusCode::OK
+        );
+        let (status, report) = health_report(state.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(report["status"], "ok");
+        assert_eq!(report["versions"], 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
