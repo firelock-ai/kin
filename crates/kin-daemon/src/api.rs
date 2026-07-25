@@ -4287,6 +4287,7 @@ async fn locate(
                 &head,
                 reference,
                 &variants,
+                auto_fanout,
                 req.explain,
                 req.max_files,
                 req.max_files_explicit,
@@ -4525,14 +4526,14 @@ async fn run_multiquery_fused_locate(
             )
             .await?,
         );
-        // The automatic sharp variant fuses only when the primary is unsure:
-        // a confidently separated single-query ranking returns untouched and
-        // the second retrieval never runs. Caller-supplied variants keep
+        // The automatic sharp variant fuses only when the primary is unsure.
+        // Direct-entity-ordered rankings always fuse (their top1/top2 gap
+        // measures lexical concentration, not confidence); RRF-composed
+        // rankings skip fusion when confidently separated, and the second
+        // retrieval never runs on a skip. Caller-supplied variants keep
         // unconditional fusion semantics.
         if index == 0 && auto_fanout {
-            let separation =
-                kin_cli::commands::locate::locate_confidence_separation(&per_variant[0]);
-            if !kin_cli::commands::locate::auto_fanout_should_fuse(separation) {
+            if !kin_cli::commands::locate::auto_fanout_should_fuse_for(&per_variant[0]) {
                 return Ok(per_variant.pop().expect("primary result present"));
             }
         }
@@ -4554,13 +4555,14 @@ fn run_multiquery_locate_at_ref(
     head: &kin_model::SemanticChangeId,
     reference: &str,
     variants: &[String],
+    auto_fanout: bool,
     explain: bool,
     max_files: usize,
     max_files_explicit: bool,
     snippet_opts: kin_cli::commands::locate::SnippetOptions,
 ) -> Result<kin_cli::commands::locate::LocateResult, String> {
     let mut per_variant = Vec::with_capacity(variants.len());
-    for variant in variants {
+    for (index, variant) in variants.iter().enumerate() {
         per_variant.push(
             kin_cli::commands::locate::run_with_graph_capture_at_ref(
                 &state.layout,
@@ -4576,6 +4578,15 @@ fn run_multiquery_locate_at_ref(
             )
             .map_err(|error| error.to_string())?,
         );
+        // Same confidence gate as the daemon-state path: the automatic sharp
+        // variant only fuses an unsure primary; caller-supplied variants keep
+        // unconditional fusion semantics.
+        if index == 0
+            && auto_fanout
+            && !kin_cli::commands::locate::auto_fanout_should_fuse_for(&per_variant[0])
+        {
+            return Ok(per_variant.pop().expect("primary result present"));
+        }
     }
     Ok(kin_cli::commands::locate::fuse_locate_results(
         variants.to_vec(),
