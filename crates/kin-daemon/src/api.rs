@@ -15976,8 +15976,24 @@ mod tests {
         );
 
         drop(guard);
-        assert_eq!(first.await.unwrap().status(), StatusCode::OK);
-        assert_eq!(second.await.unwrap().status(), StatusCode::OK);
+        // On failure, surface the error body: this test flaked once on CI with a
+        // bare 500 and the discarded body was the only thing that could have
+        // named the cause. 300 solo repetitions under load pass, so whatever
+        // fails here is cross-test interference the next occurrence must
+        // identify itself.
+        for (label, handle) in [("first", &mut first), ("second", &mut second)] {
+            let response = handle.await.unwrap();
+            let status = response.status();
+            if status != StatusCode::OK {
+                let body = axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap();
+                panic!(
+                    "{label} checkout returned {status} after the gate released: {}",
+                    String::from_utf8_lossy(&body)
+                );
+            }
+        }
         assert_eq!(
             std::fs::read(state.layout.working_dir().join("src/shared.rs")).unwrap(),
             b"main checkout bytes\n",
