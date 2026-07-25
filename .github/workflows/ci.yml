@@ -88,6 +88,61 @@ jobs:
           bash -n ./scripts/publish-npm-release.sh
           bash -n ./scripts/verify-npm-release.sh
 
+  windows-authority-tests:
+    name: Windows authority tests
+    # Split out of the installer job: the debug test compile and the release
+    # build share no artifacts (separate target profiles), so serialising them
+    # only added wall clock. They run concurrently now.
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Preserve tracked bytes on Windows
+        shell: bash
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # A key distinct from the installer job: this builds the debug profile,
+          # and one shared key would have the two jobs overwrite each other.
+          key: windows-authority-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            windows-authority-cargo-
+
+      - name: Compile and run native Windows authority tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RUST_BACKTRACE=1
+          cargo test --locked --target x86_64-pc-windows-msvc \
+            -p kin-registry --lib
+          cargo test --locked --target x86_64-pc-windows-msvc \
+            -p kin-core --lib registry::tests
+          cargo test --locked --target x86_64-pc-windows-msvc \
+            -p kin-git --lib
+          cargo test --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --no-run
+          test_binary=$(find target/x86_64-pc-windows-msvc/debug/deps \
+            -maxdepth 1 -type f -name 'kin_cli-*.exe' -print -quit)
+          test -n "$test_binary"
+          "$test_binary" windows --test-threads=1
+          cargo test --locked --target x86_64-pc-windows-msvc \
+            -p kin-core --lib current_branch_write_replaces_existing_head -- \
+            --test-threads=1
+          cargo test --locked --target x86_64-pc-windows-msvc \
+            -p kin-core --lib branch_transaction -- --test-threads=1
+
   windows-installer:
     name: Windows installer + vector-free release build
     runs-on: windows-latest
@@ -135,29 +190,6 @@ jobs:
             echo "::error::Windows vector-free build still enables a heavy kin-db feature"
             exit 1
           fi
-
-      - name: Compile and run native Windows authority tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          export RUST_BACKTRACE=1
-          cargo test --locked --target x86_64-pc-windows-msvc \
-            -p kin-registry --lib
-          cargo test --locked --target x86_64-pc-windows-msvc \
-            -p kin-core --lib registry::tests
-          cargo test --locked --target x86_64-pc-windows-msvc \
-            -p kin-git --lib
-          cargo test --locked --target x86_64-pc-windows-msvc \
-            -p kin-cli --no-default-features --no-run
-          test_binary=$(find target/x86_64-pc-windows-msvc/debug/deps \
-            -maxdepth 1 -type f -name 'kin_cli-*.exe' -print -quit)
-          test -n "$test_binary"
-          "$test_binary" windows --test-threads=1
-          cargo test --locked --target x86_64-pc-windows-msvc \
-            -p kin-core --lib current_branch_write_replaces_existing_head -- \
-            --test-threads=1
-          cargo test --locked --target x86_64-pc-windows-msvc \
-            -p kin-core --lib branch_transaction -- --test-threads=1
 
       - name: Build Windows release binaries without vector features
         shell: bash
@@ -429,6 +461,10 @@ jobs:
 
   coverage:
     name: Code Coverage
+    # Not the critical path (the Windows jobs are longer), so gating this off
+    # PRs costs no wall clock and reclaims ~23 min of billed compute per PR.
+    # Coverage still runs on every push to main, so it still gates what lands.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
