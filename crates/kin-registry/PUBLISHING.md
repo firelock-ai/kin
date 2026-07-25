@@ -156,3 +156,25 @@ dispatch. It dry-runs by default and mutates only when dispatched with
 each unserveable record otherwise. Deployment promotions should gate on it
 immediately after deploy so a data precondition the serving code enforces
 can never sit undetected in front of clients.
+
+### Automatic startup repair
+
+The daemon runs this migration itself at startup (`KIN_REGISTRY_STARTUP_REPAIR`,
+default enabled): records the index reader would refuse are re-derived from
+their stored archives, after a whole-ecosystem manifest snapshot is written
+under `packages/manifest-snapshots/`. Any write failure or post-repair
+verification failure restores the snapshot wholesale, so an interrupted repair
+never leaves the store worse than it started. Records whose archive is missing
+or fails checksum verification are reported and stay fail-loud; the manual
+republish path above remains the remedy for those. The five most recent
+snapshots are retained.
+
+### Format-change policy
+
+A release that tightens what the index reader requires must ship, in the same
+release, the automatic startup repair for the records it would refuse, and the
+manual identical-bytes republish must keep working. Enforcement points: the
+`startup_repair_migrates_a_pre_marker_store_fixture` test pins the frozen
+pre-marker record shape in CI, `GET /registry/cargo/health` exposes any gap at
+runtime, and the deployment promotions refuse an environment whose data the
+new reader would refuse.

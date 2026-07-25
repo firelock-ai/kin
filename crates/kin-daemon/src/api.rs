@@ -1311,13 +1311,37 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
         .ok()
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty());
-    let cargo_routes =
-        kin_registry::cargo::cargo_routes(Arc::new(kin_registry::cargo::CargoRegistryState::new(
-            kin_registry::ManifestStore::new(state.layout.root()),
-            crates_dir,
-            base_url.clone(),
-            cargo_write_token,
-        )));
+    let cargo_state = Arc::new(kin_registry::cargo::CargoRegistryState::new(
+        kin_registry::ManifestStore::new(state.layout.root()),
+        crates_dir,
+        base_url.clone(),
+        cargo_write_token,
+    ));
+    // Migrate-on-boot keeps a store written by an older daemon serveable
+    // without operator surgery. The pass snapshots the manifests before its
+    // first write and restores them on any failure, so disabling it is an
+    // operator preference, not a safety requirement.
+    let startup_repair_enabled = std::env::var("KIN_REGISTRY_STARTUP_REPAIR")
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !(value == "0" || value == "false" || value == "off")
+        })
+        .unwrap_or(true);
+    if startup_repair_enabled {
+        match kin_registry::cargo::repair_unserveable_records_at_startup(&cargo_state) {
+            Ok(report) if report.repaired.is_empty() && report.unrepairable.is_empty() => {}
+            Ok(report) => info!(
+                "cargo registry startup repair: repaired {:?}; left unserveable {:?}; snapshot {:?}",
+                report.repaired, report.unrepairable, report.snapshot
+            ),
+            Err(error) => tracing::error!(
+                "cargo registry startup repair failed and rolled back: {error}"
+            ),
+        }
+    } else {
+        info!("cargo registry startup repair disabled by KIN_REGISTRY_STARTUP_REPAIR");
+    }
+    let cargo_routes = kin_registry::cargo::cargo_routes(Arc::clone(&cargo_state));
 
     let npm_routes = npm_registry_routes(
         &state,

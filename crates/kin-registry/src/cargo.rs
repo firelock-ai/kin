@@ -55,6 +55,8 @@ pub struct CargoRegistryState {
     fail_next_blob_commit: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     delay_next_blob_commit_ms: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    fail_next_manifest_repair: std::sync::atomic::AtomicBool,
 }
 
 impl CargoRegistryState {
@@ -79,6 +81,8 @@ impl CargoRegistryState {
             fail_next_blob_commit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             delay_next_blob_commit_ms: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            fail_next_manifest_repair: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -809,6 +813,202 @@ fn write_crate_blob(
 
 /// Parse and verify the one authoritative Cargo.toml under bounded archive
 /// traversal. The returned value is reused for sparse-index extraction.
+/// Outcome of a startup repair pass over the stored Cargo records.
+#[derive(Debug, Serialize)]
+pub struct StartupRepairReport {
+    pub packages: usize,
+    pub versions: usize,
+    pub repaired: Vec<String>,
+    pub unrepairable: Vec<String>,
+    pub snapshot: Option<PathBuf>,
+}
+
+/// Repair every stored record the sparse index would refuse to serve.
+///
+/// Metadata is re-derived from each version's stored archive exactly as the
+/// idempotent republish path derives it, so identity fields are untouched and
+/// the dependency authority always comes from the manifest that was actually
+/// published. The pass snapshots the ecosystem's manifests before the first
+/// write and restores the snapshot if any write or the post-repair
+/// verification fails, so an interrupted or buggy repair can never leave the
+/// store worse than it started. Records whose archive is missing or no longer
+/// matches the recorded checksum are reported and left alone; they keep
+/// failing loud at serve time.
+pub fn repair_unserveable_records_at_startup(
+    state: &CargoRegistryState,
+) -> Result<StartupRepairReport, String> {
+    let configured_index = configured_sparse_index_url(&state.base_url)?;
+    let transaction = state
+        .manifest_store
+        .write_transaction(Ecosystem::Cargo)
+        .map_err(|error| format!("failed to lock Cargo registry storage: {error}"))?;
+    let packages = transaction
+        .list_packages()
+        .map_err(|error| format!("failed to list Cargo packages: {error}"))?;
+
+    let mut report = StartupRepairReport {
+        packages: packages.len(),
+        versions: 0,
+        repaired: Vec::new(),
+        unrepairable: Vec::new(),
+        snapshot: None,
+    };
+
+    // Scan first so a fully serveable store never pays for a snapshot.
+    let mut pending: Vec<(String, Vec<PackageVersion>, Vec<usize>)> = Vec::new();
+    for package in &packages {
+        let versions = transaction
+            .get_versions(package)
+            .map_err(|error| format!("failed to read package {package}: {error}"))?;
+        report.versions += versions.len();
+        let failing: Vec<usize> = versions
+            .iter()
+            .enumerate()
+            .filter(|(_, version)| CargoIndexEntry::try_from_version(version).is_err())
+            .map(|(index, _)| index)
+            .collect();
+        if !failing.is_empty() {
+            pending.push((package.clone(), versions, failing));
+        }
+    }
+    if pending.is_empty() {
+        return Ok(report);
+    }
+
+    let snapshot = transaction
+        .snapshot()
+        .map_err(|error| format!("failed to snapshot Cargo manifests before repair: {error}"))?;
+    report.snapshot = Some(snapshot.clone());
+
+    let mut write_error: Option<String> = None;
+    'packages: for (package, versions, failing) in &pending {
+        let mut updated = versions.clone();
+        let mut touched = false;
+        for index in failing.iter().copied() {
+            let record = &versions[index];
+            let coordinate = format!("{}@{}", record.id.name, record.version);
+            let blob_path =
+                match cargo_blob_path(&state.blobs_dir, &record.id.name, &record.version) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        report.unrepairable.push(format!("{coordinate}: {error}"));
+                        continue;
+                    }
+                };
+            let relative = match blob_path.strip_prefix(&state.blobs_dir) {
+                Ok(relative) => relative.to_path_buf(),
+                Err(_) => {
+                    report
+                        .unrepairable
+                        .push(format!("{coordinate}: archive path escaped the blob root"));
+                    continue;
+                }
+            };
+            let bytes = match state.blobs_authority.read(&relative) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    report
+                        .unrepairable
+                        .push(format!("{coordinate}: stored archive unreadable: {error}"));
+                    continue;
+                }
+            };
+            let digest = hex::encode(Sha256::digest(&bytes));
+            if digest != record.checksum {
+                report.unrepairable.push(format!(
+                    "{coordinate}: stored archive checksum {digest} does not match the recorded {}",
+                    record.checksum
+                ));
+                continue;
+            }
+            let manifest = match parse_crate_manifest(&bytes, &record.id.name, &record.version) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    report.unrepairable.push(format!("{coordinate}: {error}"));
+                    continue;
+                }
+            };
+            let metadata = match extract_crate_metadata(&manifest, &configured_index) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    report.unrepairable.push(format!("{coordinate}: {error}"));
+                    continue;
+                }
+            };
+            if updated[index].metadata != metadata {
+                updated[index].metadata = metadata;
+                touched = true;
+                report.repaired.push(coordinate);
+            } else {
+                report.unrepairable.push(format!(
+                    "{coordinate}: derived metadata is unchanged yet unserveable"
+                ));
+            }
+        }
+        if !touched {
+            continue;
+        }
+        let id = PackageId {
+            ecosystem: Ecosystem::Cargo,
+            scope: None,
+            name: package.clone(),
+        };
+        if let Err(error) = transaction.replace_versions(&id, &updated) {
+            write_error = Some(format!("failed to rewrite package {package}: {error}"));
+            break 'packages;
+        }
+    }
+
+    // Verify every claimed repair from disk before declaring success.
+    #[cfg(test)]
+    if write_error.is_none()
+        && state
+            .fail_next_manifest_repair
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        write_error = Some("injected repair verification failure".to_string());
+    }
+    if write_error.is_none() {
+        'verify: for (package, _, _) in &pending {
+            let versions = match transaction.get_versions(package) {
+                Ok(versions) => versions,
+                Err(error) => {
+                    write_error = Some(format!("post-repair read of {package} failed: {error}"));
+                    break 'verify;
+                }
+            };
+            for version in &versions {
+                let coordinate = format!("{}@{}", version.id.name, version.version);
+                if report.repaired.contains(&coordinate) {
+                    if let Err(error) = CargoIndexEntry::try_from_version(version) {
+                        write_error = Some(format!(
+                            "post-repair verification failed for {coordinate}: {error}"
+                        ));
+                        break 'verify;
+                    }
+                }
+            }
+        }
+    }
+
+    match write_error {
+        Some(error) => match transaction.restore(&snapshot) {
+            Ok(restored) => Err(format!(
+                "{error}; restored {restored} package manifest(s) from {}",
+                snapshot.display()
+            )),
+            Err(restore_error) => Err(format!(
+                "{error}; snapshot restore also failed ({restore_error}); manual restore required from {}",
+                snapshot.display()
+            )),
+        },
+        None => {
+            transaction.prune_snapshots(5);
+            Ok(report)
+        }
+    }
+}
+
 fn parse_crate_manifest(
     crate_bytes: &[u8],
     name: &str,
@@ -2146,6 +2346,227 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
         assert_eq!(repaired[0].published_by, published_by);
         assert_eq!(repaired[0].metadata["cargo_index_format"], 1);
         assert_eq!(repaired[0].metadata["deps"][0]["name"], "serde");
+    }
+
+    fn degrade_metadata(state: &Arc<CargoRegistryState>, name: &str) {
+        let mut versions = state
+            .manifest_store
+            .get_versions(Ecosystem::Cargo, name)
+            .unwrap();
+        let id = versions[0].id.clone();
+        for version in &mut versions {
+            version.metadata = serde_json::json!({});
+        }
+        state
+            .manifest_store
+            .replace_versions(&id, &versions)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_repair_migrates_legacy_records_and_snapshots_first() {
+        let (_root, state) = registry_state_with_token(Some("s3cret"));
+        let with_deps = build_test_crate(
+            "demo",
+            "1.0.0",
+            "[package]\nname = \"demo\"\nversion = \"1.0.0\"\n\n[dependencies]\nserde = \"1\"\n",
+        );
+        assert_eq!(
+            publish(state.clone(), "demo", "1.0.0", Some("s3cret"), with_deps).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            publish(
+                state.clone(),
+                "plain",
+                "0.2.0",
+                Some("s3cret"),
+                valid_crate("plain", "0.2.0")
+            )
+            .await,
+            StatusCode::OK
+        );
+        let before = state
+            .manifest_store
+            .get_versions(Ecosystem::Cargo, "demo")
+            .unwrap();
+        degrade_metadata(&state, "demo");
+        degrade_metadata(&state, "plain");
+
+        let report = repair_unserveable_records_at_startup(&state).unwrap();
+        assert_eq!(report.packages, 2);
+        assert_eq!(report.versions, 2);
+        assert_eq!(report.unrepairable, Vec::<String>::new());
+        assert!(report.repaired.contains(&"demo@1.0.0".to_string()));
+        assert!(report.repaired.contains(&"plain@0.2.0".to_string()));
+
+        let snapshot = report.snapshot.expect("snapshot taken before first write");
+        assert_eq!(
+            snapshot.parent().and_then(|p| p.file_name()),
+            Some(std::ffi::OsStr::new("manifest-snapshots"))
+        );
+        let snapshot_demo = std::fs::read_to_string(snapshot.join("demo")).unwrap();
+        assert!(snapshot_demo.contains("\"metadata\":{}"));
+
+        let after = state
+            .manifest_store
+            .get_versions(Ecosystem::Cargo, "demo")
+            .unwrap();
+        assert_eq!(after[0].published_at, before[0].published_at);
+        assert_eq!(after[0].published_by, before[0].published_by);
+        assert_eq!(after[0].metadata["cargo_index_format"], 1);
+        assert_eq!(after[0].metadata["deps"][0]["name"], "serde");
+
+        let response = cargo_routes(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/registry/cargo/de/mo/demo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn startup_repair_skips_unrepairable_records_and_keeps_them_failing_loud() {
+        let (_root, state) = registry_state_with_token(Some("s3cret"));
+        assert_eq!(
+            publish(
+                state.clone(),
+                "demo",
+                "1.0.0",
+                Some("s3cret"),
+                valid_crate("demo", "1.0.0")
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            publish(
+                state.clone(),
+                "plain",
+                "0.2.0",
+                Some("s3cret"),
+                valid_crate("plain", "0.2.0")
+            )
+            .await,
+            StatusCode::OK
+        );
+        degrade_metadata(&state, "demo");
+        degrade_metadata(&state, "plain");
+        std::fs::remove_file(state.blobs_dir.join("demo-1.0.0.crate")).unwrap();
+
+        let report = repair_unserveable_records_at_startup(&state).unwrap();
+        assert_eq!(report.repaired, vec!["plain@0.2.0".to_string()]);
+        assert_eq!(report.unrepairable.len(), 1);
+        assert!(report.unrepairable[0].starts_with("demo@1.0.0"));
+        assert!(report.unrepairable[0].contains("archive"));
+
+        let demo = cargo_routes(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/registry/cargo/de/mo/demo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(demo.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let plain = cargo_routes(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/registry/cargo/pl/ai/plain")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(plain.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn startup_repair_restores_the_snapshot_when_verification_fails() {
+        let (_root, state) = registry_state_with_token(Some("s3cret"));
+        assert_eq!(
+            publish(
+                state.clone(),
+                "demo",
+                "1.0.0",
+                Some("s3cret"),
+                valid_crate("demo", "1.0.0")
+            )
+            .await,
+            StatusCode::OK
+        );
+        degrade_metadata(&state, "demo");
+        let before = state
+            .manifest_store
+            .get_versions(Ecosystem::Cargo, "demo")
+            .unwrap();
+        state
+            .fail_next_manifest_repair
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let error = repair_unserveable_records_at_startup(&state).unwrap_err();
+        assert!(error.contains("injected repair verification failure"));
+        assert!(error.contains("restored 1 package manifest(s)"));
+
+        // The repair had already committed modern metadata; the restore must
+        // have put the degraded record back byte-for-byte.
+        let after = state
+            .manifest_store
+            .get_versions(Ecosystem::Cargo, "demo")
+            .unwrap();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after[0].metadata, serde_json::json!({}));
+        assert_eq!(after[0].checksum, before[0].checksum);
+    }
+
+    #[tokio::test]
+    async fn startup_repair_migrates_a_pre_marker_store_fixture() {
+        let (root, state) = registry_state_with_token(None);
+        let body = valid_crate("fixture-demo", "0.1.0");
+        std::fs::create_dir_all(&state.blobs_dir).unwrap();
+        std::fs::write(state.blobs_dir.join("fixture-demo-0.1.0.crate"), &body).unwrap();
+        let cksum = hex::encode(Sha256::digest(&body));
+        let manifest_dir = root
+            .path()
+            .join(".kin")
+            .join("packages")
+            .join("manifests")
+            .join("cargo");
+        std::fs::create_dir_all(&manifest_dir).unwrap();
+        // Frozen shape of a record written before the cargo_index_format
+        // marker existed. If PackageVersion stops deserializing this line,
+        // stores from that era stop being migratable, and a format change
+        // must ship a migration for it in the same release.
+        let line = format!(
+            "{{\"id\":{{\"ecosystem\":\"cargo\",\"scope\":null,\"name\":\"fixture-demo\"}},\"version\":\"0.1.0\",\"blob_hash\":\"{cksum}\",\"blob_size\":{},\"checksum\":\"{cksum}\",\"metadata\":{{}},\"published_at\":\"2026-06-01T00:00:00Z\",\"published_by\":\"legacy\",\"yanked\":false}}\n",
+            body.len()
+        );
+        std::fs::write(manifest_dir.join("fixture-demo"), line).unwrap();
+
+        let report = repair_unserveable_records_at_startup(&state).unwrap();
+        assert_eq!(report.repaired, vec!["fixture-demo@0.1.0".to_string()]);
+        assert_eq!(report.unrepairable, Vec::<String>::new());
+
+        let response = cargo_routes(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/registry/cargo/fi/xt/fixture-demo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let entry: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(entry["cksum"], cksum);
     }
 
     #[test]
