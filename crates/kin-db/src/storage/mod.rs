@@ -31,8 +31,8 @@ pub use index::ReadIndex;
 pub use merkle::{
     build_entity_hash_map, compute_entity_hash, compute_graph_root_hash, compute_relation_hash,
     compute_repo_truth_hash, compute_subgraph_hash, remove_entity_hash, update_entity_hash,
-    verify_entity, verify_subgraph, EntityVerification, MerkleHash, TamperedNode,
-    VerificationReport, ZERO_HASH,
+    verify_entity, verify_subgraph, EntityVerification, MerkleHash, RepoTruthHash, TamperedNode,
+    VerificationReport, REPO_TRUTH_HASH_VERSION, ZERO_HASH,
 };
 #[cfg(feature = "vector")]
 pub use snapshot::VECTOR_INDEX_METADATA_VERSION;

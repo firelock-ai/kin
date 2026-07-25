@@ -694,75 +694,205 @@ pub fn compute_root_hash_generic(
     compute_root_from_sorted_hashes(all_hashes)
 }
 
-/// Compute a full repo-truth hash covering ALL first-class truth domains.
+/// Encoding version of [`compute_repo_truth_hash`].
 ///
-/// Unlike [`compute_graph_root_hash`] which only covers entities and relations
-/// (and remains the entity-integrity primitive), this hash includes every
-/// domain in the snapshot: work items, work links, audit events, sessions,
-/// intents, artifacts, branches, reviews, tests, contracts, and verification.
+/// Version 1 covered most domains by cardinality only, so histories that
+/// disagreed about every delta but agreed on change count hashed identically.
+/// Version 2 hashes the full canonical content of every covered domain.
 ///
-/// Use this for bootstrap acceptance, optimistic concurrency, and cache
-/// validation — anywhere "has repo truth changed?" is the question.
-pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
-    let mut hasher = Sha256::new();
-    hasher.update(b"kin-repo-truth-v1:");
+/// Bump this whenever the covered domain set or the encoding changes. Callers
+/// that persist a truth hash should persist [`RepoTruthHash`] instead of a bare
+/// digest so a format upgrade is distinguishable from an actual change in repo
+/// truth.
+pub const REPO_TRUTH_HASH_VERSION: u32 = 2;
 
-    let entity_root = compute_graph_root_hash(snapshot);
-    hasher.update(entity_root);
+/// Domain separator for the repo-truth digest. Carries the encoding version so
+/// a v1 digest can never be mistaken for a v2 digest of the same snapshot.
+const REPO_TRUTH_DOMAIN: &[u8] = b"kin-repo-truth-v2:";
 
-    hash_domain_count(&mut hasher, "work_items", snapshot.work_items.len());
-    let mut work_ids: Vec<_> = snapshot.work_items.keys().collect();
-    work_ids.sort_by_key(|id| id.0.as_bytes());
-    for id in &work_ids {
-        hasher.update(id.0.as_bytes());
-        if let Some(item) = snapshot.work_items.get(id) {
-            hasher.update(format!("{}", item.status).as_bytes());
-            hasher.update(item.title.as_bytes());
+/// A repo-truth digest tagged with the encoding version that produced it.
+///
+/// Persist this rather than a bare [`MerkleHash`]: on upgrade, a stored value
+/// whose `version` differs from [`REPO_TRUTH_HASH_VERSION`] is *stale format*,
+/// not evidence that repo truth changed, and the correct response is to
+/// recompute rather than to raise a truth-drift alarm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RepoTruthHash {
+    /// Encoding version that produced `hash`.
+    pub version: u32,
+    /// The digest itself.
+    pub hash: MerkleHash,
+}
+
+impl RepoTruthHash {
+    /// Compute the current-version repo-truth hash for `snapshot`.
+    pub fn compute(snapshot: &GraphSnapshot) -> Self {
+        Self {
+            version: REPO_TRUTH_HASH_VERSION,
+            hash: compute_repo_truth_hash(snapshot),
         }
     }
 
-    hash_domain_count(&mut hasher, "work_links", snapshot.work_links.len());
-    hash_domain_count(&mut hasher, "audit_events", snapshot.audit_events.len());
-    for ev in &snapshot.audit_events {
-        hasher.update(ev.action.as_bytes());
-        hasher.update(ev.timestamp.0.to_rfc3339().as_bytes());
+    /// Whether this digest was produced by the current encoding.
+    ///
+    /// A `false` here means the stored value cannot be compared against a
+    /// freshly computed one; recompute instead of reporting drift.
+    pub fn is_current_version(&self) -> bool {
+        self.version == REPO_TRUTH_HASH_VERSION
     }
 
-    hash_domain_count(&mut hasher, "sessions", snapshot.sessions.len());
-    let mut sess_ids: Vec<_> = snapshot.sessions.keys().collect();
-    sess_ids.sort_by_key(|id| id.0.as_bytes());
-    for id in &sess_ids {
-        hasher.update(id.0.as_bytes());
+    /// Whether two digests are comparable *and* equal.
+    ///
+    /// Digests from different encoding versions are never equal, even if the
+    /// raw bytes were to collide.
+    pub fn matches(&self, other: &Self) -> bool {
+        self.version == other.version && self.hash == other.hash
     }
+}
 
-    hash_domain_count(&mut hasher, "intents", snapshot.intents.len());
-    let mut intent_ids: Vec<_> = snapshot.intents.keys().collect();
-    intent_ids.sort_by_key(|id| id.0.as_bytes());
-    for id in &intent_ids {
-        hasher.update(id.0.as_bytes());
-    }
+/// Compute a full repo-truth hash covering ALL first-class truth domains.
+///
+/// Unlike [`compute_graph_root_hash`] — which covers entity content and
+/// outgoing-relation topology only, and remains the entity-integrity primitive
+/// with unchanged semantics — this hash folds that root in and then adds the
+/// canonical *content* of every other snapshot domain: the change DAG (ids,
+/// parents, message, author, timestamp, and all entity/relation/artifact
+/// deltas), branches, work, reviews, tests, contracts, verification,
+/// provenance, sessions, intents, files, and artifacts.
+///
+/// Use this for bootstrap acceptance, optimistic concurrency, and cache
+/// validation — anywhere "has repo truth changed?" is the question. It is a
+/// full-snapshot digest, O(total truth), so it belongs at acceptance and
+/// validation checkpoints rather than in a per-operation polling loop.
+///
+/// Determinism guarantees:
+/// - every domain is reduced to a sorted multiset of per-element digests, so
+///   the result never depends on `HashMap` iteration order, on `Vec` order for
+///   collections that are materialised from maps, or on insertion order;
+/// - each element is hashed through a canonical JSON encoding with sorted
+///   object keys, type tags, and length prefixes, so distinct field layouts
+///   cannot collide by concatenation.
+///
+/// Deliberately *not* covered, because each is a derived index over data that
+/// is already hashed in full and none of them has a canonical element order —
+/// including them would produce spurious mismatches on an unchanged repo:
+/// - `outgoing` / `incoming`: adjacency indexes over `relations`;
+/// - `change_children`: inverse index over `changes[].parents`;
+/// - `change_order`: topological ordinals derived from the change DAG;
+/// - `entity_revisions`: re-derived from `changes` whenever it is absent.
+pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
+    // Exhaustive destructuring is the coverage guard: adding a domain to
+    // `GraphSnapshot` breaks this build until the new field is either hashed or
+    // explicitly bound to `_` with a reason. A silently uncovered domain is the
+    // exact failure this digest exists to prevent.
+    let GraphSnapshot {
+        version,
+        entities,
+        relations,
+        // Adjacency indexes rebuilt from `relations` on load, with no canonical
+        // element order of their own.
+        outgoing: _,
+        incoming: _,
+        changes,
+        // Inverse index over `changes[].parents`.
+        change_children: _,
+        branches,
+        work_items,
+        annotations,
+        work_links,
+        reviews,
+        review_decisions,
+        review_notes,
+        review_discussions,
+        review_assignments,
+        test_cases,
+        assertions,
+        verification_runs,
+        test_covers_entity,
+        test_covers_contract,
+        test_verifies_work,
+        run_proves_entity,
+        run_proves_work,
+        mock_hints,
+        contracts,
+        actors,
+        delegations,
+        approvals,
+        audit_events,
+        shallow_files,
+        file_layouts,
+        structured_artifacts,
+        opaque_artifacts,
+        file_hashes,
+        sessions,
+        intents,
+        downstream_warnings,
+        // Re-derived from `changes` whenever it is absent, so a load can
+        // legitimately populate it on an otherwise unchanged repo.
+        entity_revisions: _,
+        entity_tombstones,
+        relation_tombstones,
+        // Topological ordinals derived from the change DAG.
+        change_order: _,
+        artifact_index,
+    } = snapshot;
 
-    hash_domain_count(&mut hasher, "branches", snapshot.branches.len());
-    hash_domain_count(&mut hasher, "changes", snapshot.changes.len());
-    hash_domain_count(&mut hasher, "contracts", snapshot.contracts.len());
-    hash_domain_count(&mut hasher, "test_cases", snapshot.test_cases.len());
-    hash_domain_count(
-        &mut hasher,
-        "verification_runs",
-        snapshot.verification_runs.len(),
-    );
-    hash_domain_count(&mut hasher, "reviews", snapshot.reviews.len());
-    hash_domain_count(&mut hasher, "annotations", snapshot.annotations.len());
-    hash_domain_count(
-        &mut hasher,
-        "artifacts_structured",
-        snapshot.structured_artifacts.len(),
-    );
-    hash_domain_count(
-        &mut hasher,
-        "artifacts_opaque",
-        snapshot.opaque_artifacts.len(),
-    );
+    let mut hasher = Sha256::new();
+    hasher.update(REPO_TRUTH_DOMAIN);
+
+    hash_domain_count(&mut hasher, "snapshot_version", *version as usize);
+
+    // Fold in the dedicated entity/relation primitive so repo truth strictly
+    // dominates the graph root, then cover entity and relation records in full:
+    // the graph root intentionally omits fields such as span, role, lineage and
+    // `created_in` that are still part of repo truth.
+    hasher.update(compute_graph_root_hash(snapshot));
+
+    hash_map_domain(&mut hasher, "entities", entities);
+    hash_map_domain(&mut hasher, "relations", relations);
+
+    hash_map_domain(&mut hasher, "changes", changes);
+    hash_map_domain(&mut hasher, "branches", branches);
+
+    hash_map_domain(&mut hasher, "work_items", work_items);
+    hash_map_domain(&mut hasher, "annotations", annotations);
+    hash_vec_domain(&mut hasher, "work_links", work_links);
+
+    hash_map_domain(&mut hasher, "reviews", reviews);
+    hash_map_domain(&mut hasher, "review_decisions", review_decisions);
+    hash_vec_domain(&mut hasher, "review_notes", review_notes);
+    hash_vec_domain(&mut hasher, "review_discussions", review_discussions);
+    hash_map_domain(&mut hasher, "review_assignments", review_assignments);
+
+    hash_map_domain(&mut hasher, "test_cases", test_cases);
+    hash_map_domain(&mut hasher, "assertions", assertions);
+    hash_map_domain(&mut hasher, "verification_runs", verification_runs);
+    hash_vec_domain(&mut hasher, "test_covers_entity", test_covers_entity);
+    hash_vec_domain(&mut hasher, "test_covers_contract", test_covers_contract);
+    hash_vec_domain(&mut hasher, "test_verifies_work", test_verifies_work);
+    hash_vec_domain(&mut hasher, "run_proves_entity", run_proves_entity);
+    hash_vec_domain(&mut hasher, "run_proves_work", run_proves_work);
+    hash_vec_domain(&mut hasher, "mock_hints", mock_hints);
+    hash_map_domain(&mut hasher, "contracts", contracts);
+
+    hash_map_domain(&mut hasher, "actors", actors);
+    hash_vec_domain(&mut hasher, "delegations", delegations);
+    hash_vec_domain(&mut hasher, "approvals", approvals);
+    hash_vec_domain(&mut hasher, "audit_events", audit_events);
+
+    hash_vec_domain(&mut hasher, "shallow_files", shallow_files);
+    hash_vec_domain(&mut hasher, "file_layouts", file_layouts);
+    hash_vec_domain(&mut hasher, "artifacts_structured", structured_artifacts);
+    hash_vec_domain(&mut hasher, "artifacts_opaque", opaque_artifacts);
+    hash_map_domain(&mut hasher, "file_hashes", file_hashes);
+    hash_map_domain(&mut hasher, "artifact_index", artifact_index);
+
+    hash_map_domain(&mut hasher, "sessions", sessions);
+    hash_map_domain(&mut hasher, "intents", intents);
+    hash_vec_domain(&mut hasher, "downstream_warnings", downstream_warnings);
+
+    hash_map_domain(&mut hasher, "entity_tombstones", entity_tombstones);
+    hash_map_domain(&mut hasher, "relation_tombstones", relation_tombstones);
 
     let result = hasher.finalize();
     let mut hash = [0u8; 32];
@@ -770,9 +900,155 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
     hash
 }
 
+/// Write a domain tag and a cardinality. The tag is length-prefixed so no two
+/// domain-name/count pairs can produce the same byte run by concatenation.
 fn hash_domain_count(hasher: &mut Sha256, domain: &str, count: usize) {
+    hasher.update((domain.len() as u64).to_le_bytes());
     hasher.update(domain.as_bytes());
-    hasher.update(&(count as u64).to_le_bytes());
+    hasher.update((count as u64).to_le_bytes());
+}
+
+/// Fold a keyed domain in. Each `(key, value)` pair is hashed as a unit, so the
+/// key-to-value binding is covered, and the pair digests are sorted so the
+/// result is independent of map iteration order.
+fn hash_map_domain<K, V>(hasher: &mut Sha256, domain: &str, map: &HashMap<K, V>)
+where
+    K: serde::Serialize + Sync,
+    V: serde::Serialize + Sync,
+{
+    let entries: Vec<(&K, &V)> = map.iter().collect();
+    hash_domain_elements(hasher, domain, &entries);
+}
+
+/// Fold an unkeyed domain in.
+///
+/// Element digests are sorted rather than hashed in slice order: several of
+/// these vectors are materialised from maps (`shallow_files`, `file_layouts`,
+/// `structured_artifacts`, `opaque_artifacts`, `review_notes`,
+/// `review_discussions` are all built with `into_values()`), so their slice
+/// order is not stable across processes. Sorting trades detection of a pure
+/// reordering — which is not repo truth for these domains — for a digest that
+/// is stable everywhere.
+fn hash_vec_domain<T>(hasher: &mut Sha256, domain: &str, items: &[T])
+where
+    T: serde::Serialize + Sync,
+{
+    hash_domain_elements(hasher, domain, items);
+}
+
+fn hash_domain_elements<T>(hasher: &mut Sha256, domain: &str, elements: &[T])
+where
+    T: serde::Serialize + Sync,
+{
+    let mut element_hashes: Vec<MerkleHash> = elements
+        .par_iter()
+        .map(|element| canonical_element_hash(domain, element))
+        .collect();
+    element_hashes.sort_unstable();
+
+    hash_domain_count(hasher, domain, element_hashes.len());
+    for element_hash in &element_hashes {
+        hasher.update(element_hash);
+    }
+}
+
+/// Canonical content digest for one element of a truth domain.
+///
+/// The element is projected to a `serde_json::Value` and hashed through
+/// [`hash_canonical_json`], which sorts object keys and length-prefixes every
+/// scalar. That covers every serialised field without a hand-maintained field
+/// list, so a domain type gaining a field cannot silently fall out of coverage.
+fn canonical_element_hash<T>(domain: &str, element: &T) -> MerkleHash
+where
+    T: serde::Serialize + ?Sized,
+{
+    let mut hasher = Sha256::new();
+    hasher.update(b"kin-truth-element-v1:");
+    hasher.update((domain.len() as u64).to_le_bytes());
+    hasher.update(domain.as_bytes());
+
+    match serde_json::to_value(element) {
+        Ok(value) => {
+            hasher.update([JSON_TAG_OK]);
+            hash_canonical_json(&mut hasher, &value);
+        }
+        Err(err) => {
+            // An element that cannot be projected must still perturb the digest
+            // deterministically rather than be silently skipped. No domain type
+            // currently reaches this branch; the
+            // `repo_truth_elements_project_to_canonical_json` test guards that.
+            hasher.update([JSON_TAG_UNENCODABLE]);
+            let message = err.to_string();
+            hasher.update((message.len() as u64).to_le_bytes());
+            hasher.update(message.as_bytes());
+        }
+    }
+
+    let result = hasher.finalize();
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&result);
+    hash
+}
+
+const JSON_TAG_NULL: u8 = 0;
+const JSON_TAG_BOOL: u8 = 1;
+const JSON_TAG_NUMBER: u8 = 2;
+const JSON_TAG_STRING: u8 = 3;
+const JSON_TAG_ARRAY: u8 = 4;
+const JSON_TAG_OBJECT: u8 = 5;
+const JSON_TAG_OK: u8 = 0xC0;
+const JSON_TAG_UNENCODABLE: u8 = 0xEE;
+
+/// Hash a JSON value canonically.
+///
+/// Every node is prefixed with a type tag and every variable-length payload
+/// with its byte length, so no two structurally different values can produce
+/// the same byte stream by concatenation. Object keys are sorted, which is what
+/// makes a `HashMap`-backed field (entity metadata, for one) hash identically
+/// across processes.
+fn hash_canonical_json(hasher: &mut Sha256, value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Null => hasher.update([JSON_TAG_NULL]),
+        serde_json::Value::Bool(b) => {
+            hasher.update([JSON_TAG_BOOL]);
+            hasher.update([u8::from(*b)]);
+        }
+        serde_json::Value::Number(n) => {
+            // `Number`'s textual form is the only representation shared by all
+            // three internal variants (u64/i64/f64); ryu/itoa make it stable
+            // across platforms.
+            hasher.update([JSON_TAG_NUMBER]);
+            let text = n.to_string();
+            hasher.update((text.len() as u64).to_le_bytes());
+            hasher.update(text.as_bytes());
+        }
+        serde_json::Value::String(s) => {
+            hasher.update([JSON_TAG_STRING]);
+            hasher.update((s.len() as u64).to_le_bytes());
+            hasher.update(s.as_bytes());
+        }
+        serde_json::Value::Array(items) => {
+            hasher.update([JSON_TAG_ARRAY]);
+            hasher.update((items.len() as u64).to_le_bytes());
+            for item in items {
+                hash_canonical_json(hasher, item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            hasher.update([JSON_TAG_OBJECT]);
+            hasher.update((map.len() as u64).to_le_bytes());
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable();
+            for key in keys {
+                hasher.update((key.len() as u64).to_le_bytes());
+                hasher.update(key.as_bytes());
+                match map.get(key) {
+                    Some(child) => hash_canonical_json(hasher, child),
+                    None => hasher.update([JSON_TAG_NULL]),
+                }
+            }
+        }
+    }
 }
 
 /// Result of verifying a single entity.
@@ -1611,5 +1887,409 @@ mod tests {
             compute_graph_root_hash(&snapshot),
             "incremental refresh after bulk diverged from cold recompute"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Repo truth hash tests
+    // ---------------------------------------------------------------
+
+    fn fixed_timestamp(seconds: i64) -> Timestamp {
+        Timestamp(
+            chrono::DateTime::from_timestamp(seconds, 0).expect("timestamp within supported range"),
+        )
+    }
+
+    fn test_change(id_byte: u8, message: &str, entity_deltas: Vec<EntityDelta>) -> SemanticChange {
+        SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
+            parents: Vec::new(),
+            timestamp: fixed_timestamp(1_700_000_000),
+            author: AuthorId("tester".to_string()),
+            message: message.to_string(),
+            entity_deltas,
+            relation_deltas: Vec::new(),
+            artifact_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            authored_on: None,
+        }
+    }
+
+    fn snapshot_with_changes(changes: Vec<SemanticChange>) -> GraphSnapshot {
+        let mut snapshot = GraphSnapshot::empty();
+        for change in changes {
+            snapshot.changes.insert(change.id, change);
+        }
+        snapshot
+    }
+
+    /// The regression this primitive was blind to: identical head snapshot,
+    /// identical change ids, identical change count — but the history disagrees
+    /// about what the change actually did. A cardinality-only digest cannot see
+    /// it; a content digest must.
+    #[test]
+    fn repo_truth_hash_detects_rewritten_entity_delta() {
+        let original = test_entity("resolver_target");
+        let mut rewritten = original.clone();
+        rewritten.signature = "fn resolver_target(shadowed: bool)".to_string();
+
+        let before = snapshot_with_changes(vec![test_change(
+            0x11,
+            "add resolver target",
+            vec![EntityDelta::Added(original)],
+        )]);
+        let after = snapshot_with_changes(vec![test_change(
+            0x11,
+            "add resolver target",
+            vec![EntityDelta::Added(rewritten)],
+        )]);
+
+        assert_eq!(
+            before.changes.len(),
+            after.changes.len(),
+            "the two histories must have equal cardinality for this test to mean anything"
+        );
+        assert_eq!(
+            compute_graph_root_hash(&before),
+            compute_graph_root_hash(&after),
+            "the head snapshot is identical; only history disagrees"
+        );
+        assert_ne!(
+            compute_repo_truth_hash(&before),
+            compute_repo_truth_hash(&after),
+            "a rewritten entity delta must change the repo truth hash"
+        );
+    }
+
+    #[test]
+    fn repo_truth_hash_detects_rewritten_change_parents() {
+        let mut before_change = test_change(0x21, "commit", Vec::new());
+        let mut after_change = before_change.clone();
+        before_change.parents = vec![SemanticChangeId::from_hash(Hash256::from_bytes([0xA0; 32]))];
+        after_change.parents = vec![SemanticChangeId::from_hash(Hash256::from_bytes([0xB0; 32]))];
+
+        assert_ne!(
+            compute_repo_truth_hash(&snapshot_with_changes(vec![before_change])),
+            compute_repo_truth_hash(&snapshot_with_changes(vec![after_change])),
+            "a rewritten parent edge must change the repo truth hash"
+        );
+    }
+
+    #[test]
+    fn repo_truth_hash_detects_rewritten_change_message() {
+        assert_ne!(
+            compute_repo_truth_hash(&snapshot_with_changes(vec![test_change(
+                0x31,
+                "original message",
+                Vec::new()
+            )])),
+            compute_repo_truth_hash(&snapshot_with_changes(vec![test_change(
+                0x31,
+                "rewritten message",
+                Vec::new()
+            )])),
+            "a rewritten commit message must change the repo truth hash"
+        );
+    }
+
+    #[test]
+    fn repo_truth_hash_is_independent_of_change_insertion_order() {
+        let changes = vec![
+            test_change(0x41, "first", vec![EntityDelta::Added(test_entity("a"))]),
+            test_change(0x42, "second", vec![EntityDelta::Added(test_entity("b"))]),
+            test_change(0x43, "third", vec![EntityDelta::Added(test_entity("c"))]),
+        ];
+        let mut reversed = changes.clone();
+        reversed.reverse();
+
+        assert_eq!(
+            compute_repo_truth_hash(&snapshot_with_changes(changes)),
+            compute_repo_truth_hash(&snapshot_with_changes(reversed)),
+            "insertion order must not affect the repo truth hash"
+        );
+    }
+
+    #[test]
+    fn repo_truth_hash_changes_when_a_change_is_added_or_removed() {
+        let base = vec![test_change(0x51, "first", Vec::new())];
+        let mut extended = base.clone();
+        extended.push(test_change(0x52, "second", Vec::new()));
+
+        let base_hash = compute_repo_truth_hash(&snapshot_with_changes(base.clone()));
+        let extended_hash = compute_repo_truth_hash(&snapshot_with_changes(extended.clone()));
+        assert_ne!(
+            base_hash, extended_hash,
+            "adding a change must change the repo truth hash"
+        );
+
+        let mut shortened = extended;
+        shortened.pop();
+        assert_eq!(
+            compute_repo_truth_hash(&snapshot_with_changes(shortened)),
+            base_hash,
+            "removing the added change must restore the original hash"
+        );
+    }
+
+    #[test]
+    fn repo_truth_hash_is_stable_across_repeated_computation() {
+        let entity_a = test_entity("stable_a");
+        let entity_b = test_entity("stable_b");
+        let relation = test_relation(entity_a.id, entity_b.id, RelationKind::Calls);
+        let mut snapshot = build_snapshot(
+            vec![entity_a.clone(), entity_b.clone()],
+            vec![relation.clone()],
+        );
+        for change in [
+            test_change(0x61, "one", vec![EntityDelta::Added(entity_a)]),
+            test_change(0x62, "two", vec![EntityDelta::Added(entity_b)]),
+        ] {
+            snapshot.changes.insert(change.id, change);
+        }
+
+        let first = compute_repo_truth_hash(&snapshot);
+        for _ in 0..8 {
+            assert_eq!(
+                first,
+                compute_repo_truth_hash(&snapshot),
+                "repeated computation over one snapshot must be bit-identical"
+            );
+        }
+        assert_ne!(first, ZERO_HASH);
+    }
+
+    /// Entity metadata is a `HashMap`, so a digest that walked it in native
+    /// order would drift between processes. The canonical encoding sorts keys.
+    #[test]
+    fn repo_truth_hash_is_independent_of_metadata_insertion_order() {
+        let mut forward = test_entity("meta_order");
+        for key in ["alpha", "beta", "gamma", "delta"] {
+            forward
+                .metadata
+                .extra
+                .insert(key.to_string(), serde_json::json!(key));
+        }
+        let mut reverse = test_entity("meta_order");
+        reverse.id = forward.id;
+        for key in ["delta", "gamma", "beta", "alpha"] {
+            reverse
+                .metadata
+                .extra
+                .insert(key.to_string(), serde_json::json!(key));
+        }
+
+        assert_eq!(
+            compute_repo_truth_hash(&snapshot_with_changes(vec![test_change(
+                0x71,
+                "meta",
+                vec![EntityDelta::Added(forward)]
+            )])),
+            compute_repo_truth_hash(&snapshot_with_changes(vec![test_change(
+                0x71,
+                "meta",
+                vec![EntityDelta::Added(reverse)]
+            )])),
+            "metadata key insertion order must not affect the repo truth hash"
+        );
+    }
+
+    /// Fields the graph root deliberately omits are still repo truth.
+    #[test]
+    fn repo_truth_hash_covers_entity_fields_outside_the_graph_root() {
+        let entity = test_entity("provenance_carrier");
+        let mut with_origin = entity.clone();
+        with_origin.created_in = Some(SemanticChangeId::from_hash(Hash256::from_bytes([0xC1; 32])));
+
+        let before = build_snapshot(vec![entity], Vec::new());
+        let after = build_snapshot(vec![with_origin], Vec::new());
+
+        assert_eq!(
+            compute_graph_root_hash(&before),
+            compute_graph_root_hash(&after),
+            "graph root semantics are unchanged: it does not cover created_in"
+        );
+        assert_ne!(
+            compute_repo_truth_hash(&before),
+            compute_repo_truth_hash(&after),
+            "repo truth must cover entity provenance the graph root omits"
+        );
+    }
+
+    #[test]
+    fn repo_truth_hash_is_version_tagged() {
+        let snapshot = snapshot_with_changes(vec![test_change(0x81, "tagged", Vec::new())]);
+        let tagged = RepoTruthHash::compute(&snapshot);
+
+        assert_eq!(tagged.version, REPO_TRUTH_HASH_VERSION);
+        assert_eq!(tagged.hash, compute_repo_truth_hash(&snapshot));
+        assert!(tagged.is_current_version());
+        assert!(tagged.matches(&RepoTruthHash::compute(&snapshot)));
+
+        let stale = RepoTruthHash {
+            version: REPO_TRUTH_HASH_VERSION - 1,
+            hash: tagged.hash,
+        };
+        assert!(!stale.is_current_version());
+        assert!(
+            !tagged.matches(&stale),
+            "same bytes from a different encoding version must not compare equal"
+        );
+
+        let round_tripped: RepoTruthHash =
+            serde_json::from_str(&serde_json::to_string(&tagged).unwrap()).unwrap();
+        assert_eq!(round_tripped, tagged);
+    }
+
+    fn map_elements_encode<K, V>(map: &HashMap<K, V>) -> bool
+    where
+        K: serde::Serialize,
+        V: serde::Serialize,
+    {
+        // Mirrors `hash_map_domain`: the entry is projected as a `(key, value)`
+        // tuple, never as a JSON map. Keyed domains such as `changes` are keyed
+        // by `Hash256`-backed newtypes, which serialise as byte arrays and are
+        // therefore rejected in JSON key position — projecting the map directly
+        // would push every one of those domains onto the unencodable branch.
+        map.iter()
+            .all(|(key, value)| serde_json::to_value((key, value)).is_ok())
+    }
+
+    fn vec_elements_encode<T: serde::Serialize>(items: &[T]) -> bool {
+        items.iter().all(|item| serde_json::to_value(item).is_ok())
+    }
+
+    /// Guards the `JSON_TAG_UNENCODABLE` branch in [`canonical_element_hash`]:
+    /// if a domain element ever stops projecting to JSON, its content silently
+    /// degrades to an error-string digest instead of being covered. Fail here
+    /// instead. Domains left empty by this fixture are checked vacuously; the
+    /// populated ones are the ones with non-trivial key and value types.
+    #[test]
+    fn repo_truth_elements_project_to_canonical_json() {
+        let entity = test_entity("encodable");
+        let other = test_entity("encodable_other");
+        let relation = test_relation(entity.id, other.id, RelationKind::Calls);
+        let mut snapshot =
+            build_snapshot(vec![entity.clone(), other.clone()], vec![relation.clone()]);
+        let change = test_change(
+            0x91,
+            "encodable change",
+            vec![
+                EntityDelta::Added(entity.clone()),
+                EntityDelta::Modified {
+                    old: entity.clone(),
+                    new: other.clone(),
+                },
+                EntityDelta::Removed(other.id),
+            ],
+        );
+        snapshot.changes.insert(change.id, change);
+        snapshot.branches.insert(
+            BranchName("main".to_string()),
+            Branch {
+                name: BranchName("main".to_string()),
+                head: SemanticChangeId::from_hash(Hash256::from_bytes([0x91; 32])),
+            },
+        );
+        snapshot
+            .file_hashes
+            .insert("src/main.rs".to_string(), [7u8; 32]);
+
+        for (domain, encodes) in [
+            ("entities", map_elements_encode(&snapshot.entities)),
+            ("relations", map_elements_encode(&snapshot.relations)),
+            ("changes", map_elements_encode(&snapshot.changes)),
+            ("branches", map_elements_encode(&snapshot.branches)),
+            ("work_items", map_elements_encode(&snapshot.work_items)),
+            ("annotations", map_elements_encode(&snapshot.annotations)),
+            ("work_links", vec_elements_encode(&snapshot.work_links)),
+            ("reviews", map_elements_encode(&snapshot.reviews)),
+            (
+                "review_decisions",
+                map_elements_encode(&snapshot.review_decisions),
+            ),
+            ("review_notes", vec_elements_encode(&snapshot.review_notes)),
+            (
+                "review_discussions",
+                vec_elements_encode(&snapshot.review_discussions),
+            ),
+            (
+                "review_assignments",
+                map_elements_encode(&snapshot.review_assignments),
+            ),
+            ("test_cases", map_elements_encode(&snapshot.test_cases)),
+            ("assertions", map_elements_encode(&snapshot.assertions)),
+            (
+                "verification_runs",
+                map_elements_encode(&snapshot.verification_runs),
+            ),
+            (
+                "test_covers_entity",
+                vec_elements_encode(&snapshot.test_covers_entity),
+            ),
+            (
+                "test_covers_contract",
+                vec_elements_encode(&snapshot.test_covers_contract),
+            ),
+            (
+                "test_verifies_work",
+                vec_elements_encode(&snapshot.test_verifies_work),
+            ),
+            (
+                "run_proves_entity",
+                vec_elements_encode(&snapshot.run_proves_entity),
+            ),
+            (
+                "run_proves_work",
+                vec_elements_encode(&snapshot.run_proves_work),
+            ),
+            ("mock_hints", vec_elements_encode(&snapshot.mock_hints)),
+            ("contracts", map_elements_encode(&snapshot.contracts)),
+            ("actors", map_elements_encode(&snapshot.actors)),
+            ("delegations", vec_elements_encode(&snapshot.delegations)),
+            ("approvals", vec_elements_encode(&snapshot.approvals)),
+            ("audit_events", vec_elements_encode(&snapshot.audit_events)),
+            (
+                "shallow_files",
+                vec_elements_encode(&snapshot.shallow_files),
+            ),
+            ("file_layouts", vec_elements_encode(&snapshot.file_layouts)),
+            (
+                "artifacts_structured",
+                vec_elements_encode(&snapshot.structured_artifacts),
+            ),
+            (
+                "artifacts_opaque",
+                vec_elements_encode(&snapshot.opaque_artifacts),
+            ),
+            ("file_hashes", map_elements_encode(&snapshot.file_hashes)),
+            (
+                "artifact_index",
+                map_elements_encode(&snapshot.artifact_index),
+            ),
+            ("sessions", map_elements_encode(&snapshot.sessions)),
+            ("intents", map_elements_encode(&snapshot.intents)),
+            (
+                "downstream_warnings",
+                vec_elements_encode(&snapshot.downstream_warnings),
+            ),
+            (
+                "entity_tombstones",
+                map_elements_encode(&snapshot.entity_tombstones),
+            ),
+            (
+                "relation_tombstones",
+                map_elements_encode(&snapshot.relation_tombstones),
+            ),
+        ] {
+            assert!(
+                encodes,
+                "domain '{domain}' must project to canonical JSON, otherwise its content \
+                 silently drops out of the repo truth hash"
+            );
+        }
+
+        assert_ne!(compute_repo_truth_hash(&snapshot), ZERO_HASH);
     }
 }
