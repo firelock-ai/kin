@@ -4249,7 +4249,8 @@ async fn locate(
     // Multi-query fan-out: primary text plus any additional variants, deduped.
     // Two-or-more distinct variants trigger RRF fusion; otherwise the single
     // path runs exactly as before (byte-identical).
-    let variants = build_locate_variants(&req.text, &req.queries);
+    let (variants, auto_fanout) =
+        with_auto_sharp_variant(build_locate_variants(&req.text, &req.queries));
     let multi_query = variants.len() >= 2;
 
     let mut result = if let Some(reference) = req.reference.as_deref() {
@@ -4315,6 +4316,7 @@ async fn locate(
                 session_id.as_ref(),
                 graph.as_ref(),
                 &variants,
+                auto_fanout,
                 req.explain,
                 req.max_files,
                 req.max_files_explicit,
@@ -4426,6 +4428,29 @@ async fn run_fused_locate_for_state(
 /// primary query first (when non-empty), then each extra variant, trimmed and
 /// de-duplicated exactly so the same phrasing is never retrieved twice. A result
 /// with fewer than two entries means a single-query locate (no fan-out).
+/// Append the automatic identifier-distilled sharp variant when the caller
+/// supplied a single query and the text carries identifier-shaped tokens.
+/// The broad raw text and the concentrated identifier query then fuse through
+/// the existing multi-query union instead of one regime displacing the other.
+/// `KIN_LOCATE_AUTO_QUERY_FANOUT=0` restores single-query behavior.
+fn with_auto_sharp_variant(mut variants: Vec<String>) -> (Vec<String>, bool) {
+    if variants.len() != 1 {
+        return (variants, false);
+    }
+    let enabled = std::env::var("KIN_LOCATE_AUTO_QUERY_FANOUT")
+        .map(|value| value.trim() != "0")
+        .unwrap_or(true);
+    if !enabled {
+        return (variants, false);
+    }
+    let sharp = kin_cli::commands::locate::identifier_distilled_query(&variants[0]);
+    if !sharp.is_empty() && sharp != variants[0] {
+        variants.push(sharp);
+        return (variants, true);
+    }
+    (variants, false)
+}
+
 fn build_locate_variants(primary: &str, extra: &[String]) -> Vec<String> {
     let mut variants: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -4474,13 +4499,14 @@ async fn run_multiquery_fused_locate(
     session_id: Option<&SessionId>,
     graph: &kin_db::InMemoryGraph,
     variants: &[String],
+    auto_fanout: bool,
     explain: bool,
     max_files: usize,
     max_files_explicit: bool,
     snippet_opts: kin_cli::commands::locate::SnippetOptions,
 ) -> Result<kin_cli::commands::locate::LocateResult, String> {
     let mut per_variant = Vec::with_capacity(variants.len());
-    for variant in variants {
+    for (index, variant) in variants.iter().enumerate() {
         per_variant.push(
             run_fused_locate_for_state(
                 state,
@@ -4494,6 +4520,17 @@ async fn run_multiquery_fused_locate(
             )
             .await?,
         );
+        // The automatic sharp variant fuses only when the primary is unsure:
+        // a confidently separated single-query ranking returns untouched and
+        // the second retrieval never runs. Caller-supplied variants keep
+        // unconditional fusion semantics.
+        if index == 0 && auto_fanout {
+            let separation =
+                kin_cli::commands::locate::locate_confidence_separation(&per_variant[0]);
+            if !kin_cli::commands::locate::auto_fanout_should_fuse(separation) {
+                return Ok(per_variant.pop().expect("primary result present"));
+            }
+        }
     }
     Ok(kin_cli::commands::locate::fuse_locate_results(
         variants.to_vec(),
@@ -6405,7 +6442,10 @@ async fn build_fused_semantic_locate_result(
     // Multi-query fan-out: `query` plus any additional `queries` variants,
     // deduped. Two-or-more distinct variants trigger RRF fusion; otherwise the
     // single fused path runs exactly as before.
-    let variants = build_locate_variants(&query, &arg_string_array(arguments, "queries"));
+    let (variants, auto_fanout) = with_auto_sharp_variant(build_locate_variants(
+        &query,
+        &arg_string_array(arguments, "queries"),
+    ));
     let multi_query = variants.len() >= 2;
 
     // The agent asked for `limit` ranked hits; give the fused pipeline the
@@ -6418,6 +6458,7 @@ async fn build_fused_semantic_locate_result(
             session_id,
             graph,
             &variants,
+            auto_fanout,
             explain,
             limit,
             true,
@@ -12143,6 +12184,35 @@ mod tests {
         assert!(ev2.get("resolution_origin").is_none());
         assert!(ev2.get("seed_cosine").is_none());
         assert_eq!(ev2["definition"], json!(true));
+    }
+
+    #[test]
+    fn with_auto_sharp_variant_appends_identifier_query_for_single_variant() {
+        let (out, auto) = with_auto_sharp_variant(vec![
+            "The ScanResult keeps RemoveRaspbianPackFromResult stale entries".to_string(),
+        ]);
+        assert_eq!(out.len(), 2, "sharp variant must append: {out:?}");
+        assert!(auto, "auto flag must mark the appended variant");
+        assert!(out[1].contains("RemoveRaspbianPackFromResult"));
+        assert!(out[1].contains("ScanResult"));
+    }
+
+    #[test]
+    fn with_auto_sharp_variant_is_a_no_op_without_identifiers_or_with_explicit_queries() {
+        let (prose, prose_auto) =
+            with_auto_sharp_variant(vec!["please fix the broken behavior".to_string()]);
+        assert_eq!(prose.len(), 1, "no identifiers means no fan-out: {prose:?}");
+        assert!(!prose_auto);
+        let (explicit, explicit_auto) = with_auto_sharp_variant(vec![
+            "primary RemoveRaspbianPackFromResult".to_string(),
+            "user variant".to_string(),
+        ]);
+        assert!(!explicit_auto, "explicit variants never gate on confidence");
+        assert_eq!(
+            explicit.len(),
+            2,
+            "caller-supplied variants are never modified"
+        );
     }
 
     #[test]

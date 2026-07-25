@@ -361,6 +361,11 @@ pub struct LocateDebugInfo {
     pub skipped_signals: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub query_terms: Vec<String>,
+    /// Per-identifier verdicts from the query-identifier preservation gate:
+    /// `identifier=admitted|rejected`, recorded from the same invocation that
+    /// produced `query_terms`. Observability only; never feeds ranking.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_identifier_gate: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub priority_files: Vec<LocateDebugFileScore>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2234,6 +2239,45 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             fallback
         });
         let debug_limit = locate_env_usize("KIN_LOCATE_DEBUG_LIST_LIMIT", 12);
+        let query_identifier_gate = {
+            let mut verdicts = Vec::new();
+            for identifier in preserved_query_identifiers(text) {
+                let admitted = term_has_graph_support(graph, &identifier, false).unwrap_or(false);
+                let name_probe = {
+                    let filter = EntityFilter {
+                        name_pattern: Some(identifier.clone()),
+                        ..Default::default()
+                    };
+                    let hits = graph.query_entities(&filter).map(|v| v.len()).unwrap_or(0);
+                    let roles: Vec<String> = graph
+                        .query_entities(&filter)
+                        .map(|v| {
+                            v.into_iter()
+                                .take(4)
+                                .map(|e| {
+                                    format!(
+                                        "{}:{:?}:{}",
+                                        e.name,
+                                        e.role,
+                                        e.file_origin.map(|f| f.0).unwrap_or_default()
+                                    )
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let text_hits = graph
+                        .text_search(&identifier, 12)
+                        .map(|v| v.len())
+                        .unwrap_or(0);
+                    format!("name_hits={hits} text_hits={text_hits} sample={roles:?}")
+                };
+                verdicts.push(format!(
+                    "{identifier}={} [{name_probe}]",
+                    if admitted { "admitted" } else { "rejected" }
+                ));
+            }
+            (!verdicts.is_empty()).then_some(verdicts)
+        };
         // Re-attach entity identity (dropped at the FileHit/entity→file seam) to
         // resolved files for observability. Read-only; never feeds ranking.
         let resolve_identity = entity_resolve_identity(&all_entity_seeds, graph)?;
@@ -2256,6 +2300,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 skipped
             },
             query_terms,
+            query_identifier_gate,
             priority_files: priority_trace_to_debug(&priority_traces, debug_limit),
             resolved_files: resolved_files
                 .iter()
@@ -7006,6 +7051,36 @@ fn curate_search_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<
 /// CLI-flag forms — while stopwords, generic code modifiers, numerics, and issue
 /// boilerplate are dropped. Pure lexical: no graph lookups, no network, no
 /// model — fully deterministic for a given query.
+/// Identifier-distilled variant of a locate query: the identifier-shaped
+/// tokens preserved from the raw text, space-joined. Empty when the text
+/// carries no identifiers. Drives the automatic sharp variant of multi-query
+/// fan-out; the raw text stays the broad variant, so concentrated identifier
+/// ranking and diffuse contextual ranking union instead of competing.
+pub fn identifier_distilled_query(text: &str) -> String {
+    preserved_query_identifiers(text).join(" ")
+}
+
+/// Top-1 to top-2 file score separation of a locate result: the confidence
+/// signal the automatic fan-out gate reads. None when fewer than two files
+/// are ranked or the second score is non-positive.
+pub fn locate_confidence_separation(result: &LocateResult) -> Option<f32> {
+    let first = result.files.first()?.score;
+    let second = result.files.get(1)?.score;
+    (second > 0.0 && first.is_finite() && second.is_finite()).then(|| first / second)
+}
+
+/// Whether the automatic sharp-variant fan-out should fuse, given the primary
+/// query's separation. Weak separation means the single query is unsure and
+/// the union earns its churn; strong separation keeps a confident ranking
+/// untouched (and skips the second retrieval entirely).
+pub fn auto_fanout_should_fuse(separation: Option<f32>) -> bool {
+    let ratio = locate_env_f32("KIN_LOCATE_AUTO_FANOUT_CONFIDENCE_RATIO", 1.5);
+    match separation {
+        Some(s) => s < ratio,
+        None => true,
+    }
+}
+
 fn preserved_query_identifiers(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -7113,31 +7188,52 @@ fn term_has_graph_support(
     let mut other_hits = 0usize;
     let mut seen_files = HashSet::new();
 
-    let filter = EntityFilter {
-        name_pattern: Some(term.to_string()),
-        ..Default::default()
-    };
-    for entity in graph
-        .query_entities(&filter)?
-        .into_iter()
-        .take(locate_env_usize("KIN_LOCATE_GRAPH_NAME_MATCH_LIMIT", 16))
-    {
-        let Some(file_origin) = entity.file_origin.as_ref() else {
-            continue;
+    // Methods store qualified names (`Type.method`, `Type::method`), so an
+    // exact pass alone rejects the bare method identifiers issue text uses.
+    // Fall back to qualified-suffix passes before declaring the name unknown.
+    let name_patterns = [term.to_string(), format!("*.{term}"), format!("*::{term}")];
+    let match_limit = locate_env_usize("KIN_LOCATE_GRAPH_NAME_MATCH_LIMIT", 16);
+    'patterns: for (pass, pattern) in name_patterns.into_iter().enumerate() {
+        let filter = EntityFilter {
+            name_pattern: Some(pattern),
+            ..Default::default()
         };
-        let path = &file_origin.0;
-        if !seen_files.insert(path.clone()) {
-            continue;
+        for entity in graph.query_entities(&filter)?.into_iter().take(match_limit) {
+            let Some(file_origin) = entity.file_origin.as_ref() else {
+                continue;
+            };
+            let path = &file_origin.0;
+            if !seen_files.insert(path.clone()) {
+                continue;
+            }
+            // The entity carries its own layout-independent classification:
+            // a Source-role entity counts unless its path is positively
+            // excluded. Judging source-ness by directory name here rejected
+            // every repository whose source lives outside src/lib/pkg/
+            // internal/packages (models/, scanner/, oval/, ...), starving
+            // curation of real identifiers on layout grounds alone.
+            let excluded = is_test_path(path.as_str())
+                || is_docs_or_locale_path(path.as_str())
+                || is_vendor_path(path.as_str())
+                || is_embedded_framework_noise_path(path.as_str())
+                || is_license_or_notice_path(path.as_str());
+            match entity.role {
+                EntityRole::Docs => docs_hits += 1,
+                EntityRole::Source if !excluded => source_hits += 1,
+                EntityRole::Test
+                | EntityRole::External
+                | EntityRole::Vendored
+                | EntityRole::Generated
+                | EntityRole::Source => other_hits += 1,
+            }
         }
-        let signal_bearing = tracked_file_support_is_signal_bearing(path.as_str());
-        match entity.role {
-            EntityRole::Docs => docs_hits += 1,
-            EntityRole::Source if signal_bearing => source_hits += 1,
-            EntityRole::Test
-            | EntityRole::External
-            | EntityRole::Vendored
-            | EntityRole::Generated
-            | EntityRole::Source => other_hits += 1,
+        // The exact pass keeps its original short-circuit weight; suffix
+        // passes only run while nothing name-shaped has been found at all.
+        if pass == 0 && (source_hits > 0 || docs_hits > 0 || other_hits > 0) {
+            break 'patterns;
+        }
+        if source_hits > 0 {
+            break 'patterns;
         }
     }
 
@@ -13835,12 +13931,22 @@ fn is_docs_or_locale_path(path: &str) -> bool {
 
 fn is_vendor_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    lower.contains("/vendor/")
+    // Each family must match at the repo root as well as interior segments:
+    // a top-level vendor/ tree (the standard pre-modules Go layout) is just
+    // as vendored as an interior one.
+    lower.starts_with("vendor/")
+        || lower.contains("/vendor/")
+        || lower.starts_with("cextern/")
         || lower.contains("/cextern/")
+        || lower.starts_with("third_party/")
         || lower.contains("/third_party/")
+        || lower.starts_with("thirdparty/")
         || lower.contains("/thirdparty/")
+        || lower.starts_with("extern/")
         || lower.contains("/extern/")
+        || lower.starts_with("external/")
         || lower.contains("/external/")
+        || lower.starts_with("_vendor/")
         || lower.contains("/_vendor/")
         || lower.starts_with("dependencies/")
         || lower.contains("/dependencies/")
@@ -19714,6 +19820,77 @@ mod tests {
                 "curated term {term} must never be evicted: {out:?}"
             );
         }
+    }
+
+    #[test]
+    fn confidence_separation_and_fanout_gate_behave() {
+        let mut result = LocateResult::default();
+        assert_eq!(locate_confidence_separation(&result), None);
+        assert!(
+            auto_fanout_should_fuse(None),
+            "unknown separation must fuse"
+        );
+        let entry = |path: &str, score: f32| -> LocateFileEntry {
+            serde_json::from_value(serde_json::json!({ "path": path, "score": score }))
+                .expect("minimal file entry deserializes")
+        };
+        result.files = vec![entry("a.go", 3.0), entry("b.go", 1.0)];
+        let sep = locate_confidence_separation(&result);
+        assert_eq!(sep, Some(3.0));
+        assert!(
+            !auto_fanout_should_fuse(sep),
+            "a confidently separated primary must skip fusion"
+        );
+        result.files[0].score = 1.2;
+        let weak = locate_confidence_separation(&result);
+        assert!(
+            auto_fanout_should_fuse(weak),
+            "weak separation must fuse: {weak:?}"
+        );
+    }
+
+    #[test]
+    fn term_gate_admits_source_entities_outside_blessed_directories() {
+        // Source-role truth beats directory naming: a repo keeping source in
+        // models/ (vuls shape) must still support its identifiers.
+        let graph = kin_db::InMemoryGraph::new();
+        let mut method = test_entity(
+            "ScanResult.RemoveRaspbianPackFromResult",
+            "models/scanresults.go",
+            1,
+            30,
+        );
+        method.metadata.extra.insert(
+            "file_surface_context".into(),
+            serde_json::Value::String("surface scanresults models".into()),
+        );
+        graph.upsert_entity(&method).unwrap();
+        assert!(
+            term_has_graph_support(&graph, "RemoveRaspbianPackFromResult", false).unwrap(),
+            "bare method identifier with a qualified Source entity must be supported"
+        );
+        assert!(
+            !term_has_graph_support(&graph, "NoSuchIdentifierAnywhere", false).unwrap(),
+            "an unknown identifier must stay unsupported"
+        );
+    }
+
+    #[test]
+    fn term_gate_still_rejects_docs_and_vendored_paths() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut docs = test_entity("CodeSandbox", "docs/sandbox/CodeSandbox.ts", 1, 20);
+        docs.role = EntityRole::Docs;
+        let vendored = test_entity("VendorHelper", "vendor/lib/helper.go", 1, 20);
+        graph.upsert_entity(&docs).unwrap();
+        graph.upsert_entity(&vendored).unwrap();
+        assert!(
+            !term_has_graph_support(&graph, "CodeSandbox", false).unwrap(),
+            "docs-only stays rejected"
+        );
+        assert!(
+            !term_has_graph_support(&graph, "VendorHelper", false).unwrap(),
+            "vendored path stays rejected even with Source role"
+        );
     }
 
     #[test]
