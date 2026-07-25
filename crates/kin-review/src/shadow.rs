@@ -236,6 +236,7 @@ pub struct ShadowEvidenceGap {
     /// | "actor_attribution_unavailable" | "impact_signal_absent"
     /// | "deep_history_impact_ceiling" | "cross_repo_not_evaluated"
     /// | "ref_state_unavailable" | "base_not_on_head_ancestry"
+    /// | "revert_history_shallow" | "revert_history_incomplete_ancestry"
     pub kind: String,
     pub subject: String,
     pub detail: String,
@@ -567,19 +568,18 @@ fn assemble_report_with_changes<G: GraphStore>(
     // Toolchain-surface findings feed the gate as ordinary warning findings via
     // the inline-comment channel, never through the evidence-gap demotion path.
     review.inline_comments.extend(toolchain_findings);
-    // Revert-history findings use the same inline-comment channel, with an
-    // honest gap when the base has too little history to scan. Strong matches
-    // may gate as warnings; weak temporal hints stay informational. Evidence is
-    // available at review time only: the window looks strictly BEFORE the base.
-    let (revert_findings, revert_gap) = crate::revert_history::collect_revert_history_findings(
+    // Revert-history findings use the same inline-comment channel, with honest
+    // gaps when the base has too little history to scan or when the graph could
+    // not resolve part of the ancestry the DAG declares. Strong matches may gate
+    // as warnings; weak temporal hints stay informational. Evidence is available
+    // at review time only: the window looks strictly BEFORE the base.
+    let (revert_findings, revert_gaps) = crate::revert_history::collect_revert_history_findings(
         store,
         &request.resolved_base,
         changes,
     )?;
     review.inline_comments.extend(revert_findings);
-    if let Some(gap) = revert_gap {
-        evidence_gaps.push(gap);
-    }
+    evidence_gaps.extend(revert_gaps);
     let policy = derive_policy(&review, &evidence_gaps, &changed_entities);
     let repair_context = collect_repair_context(&policy.findings, &review);
     let audit = collect_audit_evidence(store, request, &review, changes.len())?;
@@ -4293,6 +4293,62 @@ mod tests {
             prev = Some(change_id(i));
         }
         prev.expect("chain is non-empty")
+    }
+
+    // An ancestry reference the graph cannot produce costs the window twice:
+    // the unresolved change's deltas never land, and its own ancestry is never
+    // enqueued. A clean scan of whatever remains reachable is therefore not
+    // evidence that no revert exists, so the channel must report the deficit
+    // rather than absorb it and certify silence.
+    #[test]
+    fn revert_history_unresolvable_ancestry_reports_incomplete_gap() {
+        let graph = InMemoryGraph::new();
+        let reachable_tail = padded_history_graph(&graph, vec![], vec![], 30);
+        let dangling = change_id(199);
+        let base_id = change_id(150);
+        let base = change_with_deltas(
+            base_id,
+            vec![reachable_tail, dangling],
+            vec![],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&base).unwrap();
+
+        let (_, gaps) =
+            crate::revert_history::collect_revert_history_findings(&graph, &base_id, &[]).unwrap();
+
+        let gap = gaps
+            .iter()
+            .find(|g| g.kind == "revert_history_incomplete_ancestry")
+            .expect("an unresolvable ancestry reference must be reported as an evidence gap");
+        assert!(
+            gap.detail.contains(&dangling.to_string()),
+            "the gap must name the unresolved change, got: {}",
+            gap.detail
+        );
+        assert!(
+            !gaps.iter().any(|g| g.kind == "revert_history_shallow"),
+            "ample reachable depth must not also report the shallow gap: the two \
+             deficits are independent"
+        );
+    }
+
+    // Negative control for the guard above: a fully resolvable ancestry must
+    // stay silent, or the gap becomes noise on every healthy review.
+    #[test]
+    fn revert_history_complete_ancestry_reports_no_gap() {
+        let graph = InMemoryGraph::new();
+        let base_id = padded_history_graph(&graph, vec![], vec![], 30);
+
+        let (_, gaps) =
+            crate::revert_history::collect_revert_history_findings(&graph, &base_id, &[]).unwrap();
+
+        assert!(
+            gaps.is_empty(),
+            "a complete 30-change ancestry must report no revert-history gap, got: {:?}",
+            gaps.iter().map(|g| g.kind.as_str()).collect::<Vec<_>>()
+        );
     }
 
     #[test]

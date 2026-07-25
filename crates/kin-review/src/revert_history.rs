@@ -31,8 +31,10 @@
 //! temporal evidence is still reported but stays informational: the benign-60
 //! sweep showed that deleting a recent addition is common cleanup unless an
 //! independent review signal also says the change is risky. When the base has
-//! less history than the window can meaningfully scan, the channel reports an
-//! honest evidence gap instead of silently passing.
+//! less history than the window can meaningfully scan, or when the graph cannot
+//! resolve an ancestry reference the DAG declares, the channel reports an
+//! honest evidence gap instead of silently passing: a window built from an
+//! incomplete DAG must never be presented as a complete one.
 //!
 //! Matching is computed at review time exclusively from the base's ancestry
 //! window — the graph may hold changes outside the reviewed lineage (other
@@ -69,16 +71,51 @@ struct WindowRemoval {
     distance: usize,
 }
 
-/// Revert-history findings plus an optional honesty gap for the scanned base.
+/// Revert-history findings plus the honesty gaps for the scanned base.
 pub(crate) fn collect_revert_history_findings<G: GraphStore>(
     store: &G,
     resolved_base: &SemanticChangeId,
     range_changes: &[SemanticChange],
-) -> Result<(Vec<InlineComment>, Option<ShadowEvidenceGap>), ReviewError> {
+) -> Result<(Vec<InlineComment>, Vec<ShadowEvidenceGap>), ReviewError> {
     let window = walk_base_window(store, resolved_base)?;
 
-    let gap = if window.changes_scanned < REVERT_HISTORY_MIN_DEPTH {
-        Some(ShadowEvidenceGap {
+    let mut gaps = Vec::new();
+
+    // An ancestry reference the graph cannot resolve truncates the walk twice
+    // over: the unresolved change contributes no deltas, and its own parents
+    // are never enqueued, so an arbitrarily large subtree of the base's causal
+    // past is absent from the window. Scanning fewer changes than the DAG
+    // declares makes the channel's silence unfalsifiable — indistinguishable
+    // from "no revert evidence exists" — so the deficit is reported rather than
+    // absorbed. This is a graph gap, not a shallow history: the count below can
+    // clear REVERT_HISTORY_MIN_DEPTH while the window is still incomplete.
+    if !window.unresolved_ancestry.is_empty() {
+        let (first_id, first_distance) = window.unresolved_ancestry[0];
+        let where_phrase = if first_distance == 0 {
+            "the resolved base itself".to_string()
+        } else {
+            format!("{} change(s) before the base", first_distance)
+        };
+        gaps.push(ShadowEvidenceGap {
+            kind: "revert_history_incomplete_ancestry".to_string(),
+            subject: "blast_radius.revert_history".to_string(),
+            detail: format!(
+                "{} ancestry reference(s) of the base do not resolve to a change in the \
+                 graph (first: {} at {}); the walk terminated at each, so their deltas \
+                 and their own ancestry are absent from the {} change(s) actually \
+                 scanned. Revert/reintroduction evidence was assessed against an \
+                 INCOMPLETE ancestry DAG, and the absence of a finding is NOT proof \
+                 that no revert exists",
+                window.unresolved_ancestry.len(),
+                first_id,
+                where_phrase,
+                window.changes_scanned
+            ),
+        });
+    }
+
+    if window.changes_scanned < REVERT_HISTORY_MIN_DEPTH {
+        gaps.push(ShadowEvidenceGap {
             kind: "revert_history_shallow".to_string(),
             subject: "blast_radius.revert_history".to_string(),
             detail: format!(
@@ -87,10 +124,8 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
                  of this verdict",
                 window.changes_scanned, REVERT_HISTORY_WINDOW
             ),
-        })
-    } else {
-        None
-    };
+        });
+    }
 
     // Head-side deltas for the reviewed range, deduplicated and order-stable.
     let mut head_added: BTreeMap<(String, String), Entity> = BTreeMap::new();
@@ -286,7 +321,7 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
         }
     }
 
-    Ok((findings, gap))
+    Ok((findings, gaps))
 }
 
 /// Everything the channel learned from scanning the base's ancestry window.
@@ -294,6 +329,11 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
 /// causal past may influence a finding.
 struct BaseWindow {
     changes_scanned: usize,
+    /// Ancestry references the graph could not resolve, in the walk's
+    /// deterministic discovery order, each with the distance it was reached at.
+    /// Non-empty means the window is a strict subset of the declared ancestry
+    /// and the channel's silence cannot be trusted.
+    unresolved_ancestry: Vec<(SemanticChangeId, usize)>,
     removals: Vec<WindowRemoval>,
     /// Entity ids ADDED inside the window, with their distance from the base.
     added_ids: HashMap<EntityId, usize>,
@@ -320,6 +360,7 @@ fn walk_base_window<G: GraphStore>(
         HashMap::new();
     let mut values: HashMap<EntityId, Entity> = HashMap::new();
     let mut visited: HashSet<SemanticChangeId> = HashSet::new();
+    let mut unresolved_ancestry: Vec<(SemanticChangeId, usize)> = Vec::new();
     let mut queue: VecDeque<(SemanticChangeId, usize)> = VecDeque::new();
 
     // The base change itself is scanned at distance 0: its deltas are part of
@@ -335,7 +376,13 @@ fn walk_base_window<G: GraphStore>(
         if !visited.insert(id) {
             continue;
         }
+        // A declared ancestor the graph cannot produce is a graph gap, not an
+        // end of history: its deltas and its own ancestry silently leave the
+        // window. Record it so the caller can report the deficit; continuing
+        // the walk still surfaces whatever evidence the reachable ancestry
+        // does hold, which is strictly more useful than abandoning the scan.
         let Some(change) = store.get_change(&id).map_err(ReviewError::graph)? else {
+            unresolved_ancestry.push((id, distance));
             continue;
         };
         scanned += 1;
@@ -368,6 +415,7 @@ fn walk_base_window<G: GraphStore>(
 
     Ok(BaseWindow {
         changes_scanned: scanned,
+        unresolved_ancestry,
         removals,
         added_ids,
         prior_bodies,

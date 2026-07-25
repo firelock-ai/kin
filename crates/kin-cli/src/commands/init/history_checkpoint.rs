@@ -31,6 +31,24 @@ const PARSER_FRONTIER_SCHEMA: &str = "kin.history-hydration.parser-frontier.v3";
 const LINKER_FRONTIER_SCHEMA: &str = "kin.history-hydration.linker-frontier.v3";
 const FORMAT_VERSION: u32 = 3;
 /// Bump for a replay semantic change even when the artifact shapes are stable.
+///
+/// Scope, precisely: this participates in [`CheckpointVersionKeyV2`] and so
+/// gates reuse of the hydration checkpoint store under
+/// `.kin/checkpoints/history-hydration/` — nothing else. It is NOT recorded in
+/// the graph, so it cannot describe which replay algorithm authored the changes
+/// already persisted there, and it cannot invalidate them.
+///
+/// It is also, on its own, inert: the same key carries `clean_git_sha`, and
+/// checkpoints are refused outright for a dirty or unknown build, so any source
+/// edit already produces a different key. Bumping this constant therefore
+/// invalidates nothing that the build SHA has not invalidated already, and a
+/// bump must not be mistaken for having addressed a replay-semantics change to
+/// existing repositories.
+///
+/// The mechanical coupling to the replay surface lives in
+/// `scripts/verify-hydration-semantics.py`, which pins those functions by
+/// digest and fails CI when one is edited without an explicit manifest update.
+/// Keep `scripts/hydration-semantics-manifest.json` in step with this value.
 const HYDRATION_SEMANTICS_VERSION: u32 = 3;
 const DEFAULT_INTERVAL: usize = 2_000;
 const DEFAULT_MANIFESTS_PER_HISTORY: usize = 6;

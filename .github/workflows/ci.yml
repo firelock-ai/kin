@@ -349,6 +349,27 @@ jobs:
 
           echo "Zero File-Search guards are falsifiable: every probe was caught."
 
+      # Deep history is a PROJECTION re-authored at ingest, not a stored fact:
+      # a merge change's entity/relation deltas are discarded and recomputed by
+      # the replay algorithm. Editing that algorithm changes what Kin reports
+      # about the past, and HYDRATION_SEMANTICS_VERSION is the declared dial for
+      # it — but nothing coupled the two, so the dial sat unchanged across the
+      # releases that rewrote replay. This pins the replay surface by digest, so
+      # an edit cannot ship without an explicit, reviewed manifest update.
+      - name: Check Hydration Replay Semantics
+        run: python3 scripts/verify-hydration-semantics.py
+
+      - name: Falsify Hydration Replay Semantics guard
+        run: |
+          set -euo pipefail
+          poisoned="$(mktemp -d)"
+          trap 'rm -rf "$poisoned"' EXIT
+          cp -a crates scripts "$poisoned/"
+          # The REAL guard and manifest run against the poisoned copy: the
+          # manifest is policy, so letting the copy supply it would falsify
+          # nothing.
+          python3 scripts/falsify-hydration-semantics.py "$poisoned"
+
       # TEMPORARY debt allow-list — burn down per crates/kin-cli/docs/kin-cli-clippy-triage.md
       # + release-ops task; no additions without lead sign-off.
       # Enumerated from `cargo clippy --all-targets --all-features` on main against
