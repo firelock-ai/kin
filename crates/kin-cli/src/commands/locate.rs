@@ -77,6 +77,22 @@ pub struct LocateResult {
     /// Empty for a single-query locate, so single-query output is byte-identical.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queries: Vec<String>,
+    /// How the ranked `files` scores were composed: direct entity-resolve
+    /// ordering keeps (normalized, boosted) raw match scores, while every
+    /// other track RRF-composes rank reciprocals. Top1/top2 separation is a
+    /// sound confidence signal only for RRF-composed rankings, so the
+    /// automatic fan-out gate always fuses direct-ordered primaries. Runtime
+    /// only; never serialized.
+    #[serde(skip)]
+    pub score_composition: Option<ScoreComposition>,
+}
+
+/// Score-composition regime of a locate ranking (see
+/// [`LocateResult::score_composition`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ScoreComposition {
+    DirectEntityOrdered,
+    RrfComposed,
 }
 
 /// One retrieval capability that did not fully run for a query, with the
@@ -2074,6 +2090,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // floors/adaptive_cap) below runs unchanged. When unset, the original
     // track-regime path fusion runs verbatim — see the flip-plan in
     // crates/kin-cli/docs/locate-entity-fusion-flip-plan.md for scope and A/B.
+    let mut direct_entity_ordered = false;
     let mut fused = if locate_env_bool("KIN_LOCATE_ENTITY_FUSION", quality.entity_fusion_default())
     {
         entity_granular_fused_files(
@@ -2143,6 +2160,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                     // Rich entity results — trust entity_resolve ordering directly.
                     // Normalize scores to a bounded range and supplement with other
                     // signals for files entity_resolve didn't find.
+                    direct_entity_ordered = true;
                     let resolve_list = &ranked_lists[7];
                     let mut result: Vec<(String, f32)> = Vec::new();
                     let resolve_set: HashSet<String> =
@@ -3506,6 +3524,11 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         explain,
     )
     .with_semantic_coverage(semantic_coverage);
+    result.score_composition = Some(if direct_entity_ordered {
+        ScoreComposition::DirectEntityOrdered
+    } else {
+        ScoreComposition::RrfComposed
+    });
     // No-silent-degradation contract: every capability that could not fully
     // run for this query rides on the result AND hits the daemon log at WARN.
     for degradation in &degradations {
@@ -7079,6 +7102,20 @@ pub fn auto_fanout_should_fuse(separation: Option<f32>) -> bool {
         Some(s) => s < ratio,
         None => true,
     }
+}
+
+/// Fan-out decision for the automatic sharp variant given the primary
+/// result. Direct-entity-ordered rankings always fuse: their top1/top2
+/// separation measures lexical concentration on the dominant name match,
+/// not answer confidence, so a wrong-file concentration reads as confident
+/// (raw resolve scale ~100 boosted, vs RRF's ~1.0). RRF-composed rankings
+/// keep the separation gate. Unknown composition (the budget-exhausted
+/// fallback path) also falls back to the separation gate.
+pub fn auto_fanout_should_fuse_for(result: &LocateResult) -> bool {
+    if result.score_composition == Some(ScoreComposition::DirectEntityOrdered) {
+        return true;
+    }
+    auto_fanout_should_fuse(locate_confidence_separation(result))
 }
 
 fn preserved_query_identifiers(text: &str) -> Vec<String> {
@@ -15364,6 +15401,7 @@ pub fn fuse_locate_results(
         semantic_coverage: primary.semantic_coverage,
         degradations,
         queries: variants,
+        score_composition: None,
     }
 }
 
@@ -19846,6 +19884,35 @@ mod tests {
         assert!(
             auto_fanout_should_fuse(weak),
             "weak separation must fuse: {weak:?}"
+        );
+    }
+
+    #[test]
+    fn fanout_gate_always_fuses_direct_entity_ordered_rankings() {
+        let entry = |path: &str, score: f32| -> LocateFileEntry {
+            serde_json::from_value(serde_json::json!({ "path": path, "score": score }))
+                .expect("minimal file entry deserializes")
+        };
+        let mut result = LocateResult::default();
+        result.files = vec![entry("a.go", 190.0), entry("b.go", 25.8)];
+        assert!(
+            !auto_fanout_should_fuse(locate_confidence_separation(&result)),
+            "the ratio alone reads this ranking as confident"
+        );
+        result.score_composition = Some(ScoreComposition::DirectEntityOrdered);
+        assert!(
+            auto_fanout_should_fuse_for(&result),
+            "direct-ordered rankings must fuse regardless of separation"
+        );
+        result.score_composition = Some(ScoreComposition::RrfComposed);
+        assert!(
+            !auto_fanout_should_fuse_for(&result),
+            "RRF-composed rankings keep the separation gate"
+        );
+        result.score_composition = None;
+        assert!(
+            !auto_fanout_should_fuse_for(&result),
+            "unknown composition falls back to the separation gate"
         );
     }
 
