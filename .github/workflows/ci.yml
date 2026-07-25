@@ -333,6 +333,23 @@ jobs:
           fi
           echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
 
+  # A skipped matrix job never expands, so the required per-platform contexts
+  # would go missing instead of reporting skipped. This stub carries the same
+  # display name and matrix as the real job and succeeds instantly on
+  # documentation-only diffs, producing the exact required context names. The
+  # two jobs' conditions are mutually exclusive.
+  check-docs-only:
+    name: Check & Test
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only == 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Report the documentation-only fast path
+        run: echo "documentation-only diff; build and test validation not applicable"
+
   check:
     name: Check & Test
     needs: changes
