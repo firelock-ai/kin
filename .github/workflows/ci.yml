@@ -179,7 +179,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-            .sccache
+            ${{ runner.temp }}/sccache
           key: windows-vectorless-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             windows-vectorless-cargo-
@@ -202,9 +202,11 @@ jobs:
         env:
           # Compile cache keyed per crate, so a Cargo.lock change warm-starts
           # from compiled dependencies instead of a cold tree. The cache lives
-          # in .sccache and persists through the actions/cache block above.
+          # OUTSIDE the workspace: an untracked directory inside it reads as a
+          # dirty checkout, and the provenance step then correctly refuses to
+          # certify the build (which is exactly how the first attempt failed).
           RUSTC_WRAPPER: sccache
-          SCCACHE_DIR: ${{ github.workspace }}/.sccache
+          SCCACHE_DIR: ${{ runner.temp }}/sccache
           CARGO_INCREMENTAL: "0"
         run: |
           cargo build --locked --release --target x86_64-pc-windows-msvc \
