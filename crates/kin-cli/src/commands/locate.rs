@@ -6989,12 +6989,12 @@ fn curate_search_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<
             });
         }
         fallback.truncate(locate_env_usize("KIN_LOCATE_FALLBACK_TERM_LIMIT", 6));
-        return Ok(augment_terms_with_query_identifiers(text, fallback));
+        return augment_terms_with_query_identifiers(text, fallback, graph);
     }
 
     // Skip graph expansion — it adds noise terms that dilute specificity.
     // The entity-first pipeline handles graph exploration in Phase 2.
-    Ok(augment_terms_with_query_identifiers(text, curated))
+    augment_terms_with_query_identifiers(text, curated, graph)
 }
 
 /// Identifier tokens pulled straight out of the raw query. This keeps a long,
@@ -7031,18 +7031,35 @@ fn preserved_query_identifiers(text: &str) -> Vec<String> {
     out
 }
 
-/// Union identifier tokens from the raw query into the curated term set,
-/// front-loading them so they survive the downstream `take(N)` that the vector
-/// track applies before embedding. Curated terms (which passed the graph-support
-/// gate) are always retained by reserving slots for them. Deterministic and
-/// order-stable. `KIN_LOCATE_PRESERVE_QUERY_IDENTIFIERS` is OFF by default, so
-/// the returned set is byte-identical to `curated` unless the lever is set.
-fn augment_terms_with_query_identifiers(text: &str, curated: Vec<String>) -> Vec<String> {
-    if !locate_env_bool("KIN_LOCATE_PRESERVE_QUERY_IDENTIFIERS", false) {
-        return curated;
+/// Union graph-supported identifier tokens from the raw query into the curated
+/// term set, front-loading them so they survive the downstream `take(N)` that
+/// the vector track applies before embedding. Curated terms (which passed the
+/// graph-support gate) are always retained by reserving slots for them.
+/// Deterministic and order-stable.
+///
+/// ON by default: self-distillation can collapse a query to generic terms
+/// while the raw text still carries the discriminating identifiers. Every
+/// rescued identifier must pass the same `term_has_graph_support` gate the
+/// curation itself applies, so an identifier curation rejected for cause
+/// (docs-only, no source backing) stays rejected even when it appears in the
+/// raw query. Set `KIN_LOCATE_PRESERVE_QUERY_IDENTIFIERS=0` to restore the
+/// distillation-only term set.
+fn augment_terms_with_query_identifiers(
+    text: &str,
+    curated: Vec<String>,
+    graph: &kin_db::InMemoryGraph,
+) -> Result<Vec<String>> {
+    if !locate_env_bool("KIN_LOCATE_PRESERVE_QUERY_IDENTIFIERS", true) {
+        return Ok(curated);
     }
     let limit = locate_env_usize("KIN_LOCATE_QUERY_IDENTIFIER_LIMIT", 10);
-    merge_query_identifier_terms(preserved_query_identifiers(text), curated, limit)
+    let mut supported = Vec::new();
+    for identifier in preserved_query_identifiers(text) {
+        if term_has_graph_support(graph, &identifier, false)? {
+            supported.push(identifier);
+        }
+    }
+    Ok(merge_query_identifier_terms(supported, curated, limit))
 }
 
 /// Pure merge used by [`augment_terms_with_query_identifiers`]: prepend as many
@@ -19660,14 +19677,43 @@ mod tests {
     }
 
     #[test]
-    fn augment_terms_with_query_identifiers_off_is_byte_identical() {
-        // Default (lever unset) must return the curated set untouched.
+    fn augment_terms_with_query_identifiers_defaults_on_with_graph_gate() {
+        // Default (lever unset): a raw-query identifier with source backing
+        // joins the terms; one curation would reject (docs-only) stays
+        // rejected even though it appears verbatim in the query; curated
+        // terms are never evicted.
+        let graph = kin_db::InMemoryGraph::new();
+        let mut source = test_entity("RemoveStalePackFromReport", "pkg/scan/report.go", 1, 20);
+        source.metadata.extra.insert(
+            "file_surface_context".into(),
+            serde_json::Value::String("surface RemoveStalePackFromReport report".into()),
+        );
+        let mut docs = test_entity("CodeSandbox", "docs/sandbox/CodeSandbox.ts", 1, 20);
+        docs.role = EntityRole::Docs;
+        graph.upsert_entity(&source).unwrap();
+        graph.upsert_entity(&docs).unwrap();
+
         let curated = vec!["behavior".to_string(), "ScanReport".to_string()];
         let out = augment_terms_with_query_identifiers(
-            "The ScanReport keeps RemoveStalePackFromReport stale entries around.",
+            "The ScanReport keeps RemoveStalePackFromReport stale; repro in CodeSandbox linked.",
             curated.clone(),
+            &graph,
+        )
+        .unwrap();
+        assert!(
+            out.iter().any(|t| t == "RemoveStalePackFromReport"),
+            "source-backed raw-query identifier must join the terms: {out:?}"
         );
-        assert_eq!(out, curated);
+        assert!(
+            !out.iter().any(|t| t == "CodeSandbox"),
+            "docs-only identifier must stay rejected: {out:?}"
+        );
+        for term in &curated {
+            assert!(
+                out.iter().any(|t| t.eq_ignore_ascii_case(term)),
+                "curated term {term} must never be evicted: {out:?}"
+            );
+        }
     }
 
     #[test]
