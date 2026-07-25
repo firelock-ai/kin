@@ -501,13 +501,17 @@ jobs:
           grep -q '^\[registries\.kin\]' .cargo/config.toml
           if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed — kin-* resolve from the Kin registry"; exit 1; fi
 
-      - name: Cache cargo registry and build
+      - name: Cache cargo registry
+        # Registry only, deliberately: tarpaulin's instrumented builds use their
+        # own flags, so a cached target never fingerprint-matches. Measured on
+        # main: a 4.62 GB target cache HIT left coverage at 24.2 min vs 23.5
+        # cold — zero benefit, while its size (47% of the repo's 10 GB budget)
+        # evicted the Windows release-build cache that does pay for itself.
         uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: ${{ runner.os }}-cargo-tarpaulin-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-tarpaulin-
