@@ -145,6 +145,8 @@ jobs:
 
   windows-installer:
     name: Windows installer + vector-free release build
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -291,8 +293,50 @@ jobs:
           test -s .kin/kindb/head-generation
           test -s .kin/kindb/graph.kidx
 
+  # Classify the PR diff so documentation-only and workflow-only changes can
+  # satisfy the heavy required checks without a toolchain or registry
+  # dependency. Fail closed: any classifier failure or non-pull_request event
+  # reports docs_only=false and every gated job runs. ci.yml itself never
+  # qualifies for its own fast path.
+  changes:
+    name: Classify diff scope
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Classify changed paths
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          docs_only=false
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA")"
+            if [ -n "$changed" ]; then
+              docs_only=true
+              while IFS= read -r path; do
+                case "$path" in
+                  .github/workflows/ci.yml) docs_only=false; break ;;
+                  *.md | docs/*) ;;
+                  .github/workflows/*) ;;
+                  *) docs_only=false; break ;;
+                esac
+              done <<< "$changed"
+            fi
+            printf '%s\n' "$changed"
+          fi
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+
   check:
     name: Check & Test
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     # The all-features clippy/build/test sequence can otherwise retain more
