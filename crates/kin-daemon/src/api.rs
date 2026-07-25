@@ -4438,7 +4438,12 @@ fn with_auto_sharp_variant(mut variants: Vec<String>) -> (Vec<String>, bool) {
         return (variants, false);
     }
     let enabled = std::env::var("KIN_LOCATE_AUTO_QUERY_FANOUT")
-        .map(|value| value.trim() != "0")
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
         .unwrap_or(true);
     if !enabled {
         return (variants, false);

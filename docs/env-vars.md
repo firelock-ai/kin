@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (405 total, 302 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (407 total, 304 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -211,6 +211,8 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_AMALGAM_PENALTY` | float>=0 | 0.05 | correctness | locate tuning knob: amalgam penalty |
 | `KIN_LOCATE_ARTIFACT_HUB_FANOUT_PENALTY` | float>=0 | 0.45 | correctness | locate tuning knob: artifact hub fanout penalty |
 | `KIN_LOCATE_ARTIFACT_PATH_OVERLAP_BOOST` | float>=0 | 1.85 | correctness | locate tuning knob: artifact path overlap boost |
+| `KIN_LOCATE_AUTO_FANOUT_CONFIDENCE_RATIO` | float>=0 | 1.5 | correctness | locate tuning knob: auto fanout confidence ratio |
+| `KIN_LOCATE_AUTO_QUERY_FANOUT` | bool | true | correctness | automatic identifier-distilled sharp variant for single-query locate, fused only when the primary ranking is unsure; falsy disables |
 | `KIN_LOCATE_BLOCK_SOURCE_FLOOR` | float>=0 | 0.74 | correctness | locate tuning knob: block source floor |
 | `KIN_LOCATE_BM25F_BODY_WEIGHT` | float>=0 | 1.0 | correctness | locate tuning knob: bm25f body weight |
 | `KIN_LOCATE_BM25F_NAME_WEIGHT` | float>=0 | 5.0 | correctness | locate tuning knob: bm25f name weight |
@@ -364,7 +366,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_POST_TEST_PENALTY` | float>=0 | 0.35 | correctness | locate tuning knob: post test penalty |
 | `KIN_LOCATE_POST_TEST_QUERY_PENALTY` | float>=0 | 1.0 | correctness | locate tuning knob: post test query penalty |
 | `KIN_LOCATE_PRECOMP_READMIT_PCT` | float>=0 | 0.3 | correctness | locate tuning knob: precomp readmit pct |
-| `KIN_LOCATE_PRESERVE_QUERY_IDENTIFIERS` | bool | false | correctness | locate tuning knob: preserve query identifiers |
+| `KIN_LOCATE_PRESERVE_QUERY_IDENTIFIERS` | bool | true | correctness | locate tuning knob: preserve query identifiers |
 | `KIN_LOCATE_PRIORITY_COMMON_FRAC` | float>=0 | 0.02 | correctness | locate tuning knob: priority common frac |
 | `KIN_LOCATE_PRIORITY_CONTRIB_PATH_PENALTY` | float>=0 | 0.65 | correctness | locate tuning knob: priority contrib path penalty |
 | `KIN_LOCATE_PRIORITY_FRAMEWORK_NOISE_PENALTY` | float>=0 | 0.6 | correctness | locate tuning knob: priority framework noise penalty |
