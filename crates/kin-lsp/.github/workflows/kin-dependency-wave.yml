@@ -5,11 +5,11 @@ on:
     types: [kin-registry-release]
   workflow_dispatch:
   schedule:
-    - cron: "31 * * * *"
+    - cron: "31 */6 * * *"
 
 jobs:
   dependency-wave:
-    uses: firelock-ai/kin-actions/.github/workflows/cargo-dependency-wave.yml@v0.1.7
+    uses: firelock-ai/kin-actions/.github/workflows/cargo-dependency-wave.yml@v0.1.14
     with:
       manifests: Cargo.toml
       test-command: cargo test

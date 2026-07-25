@@ -9,13 +9,16 @@ on:
 
 jobs:
   release:
-    uses: firelock-ai/kin-actions/.github/workflows/cargo-registry-release.yml@v0.1.8
+    uses: firelock-ai/kin-actions/.github/workflows/cargo-registry-release.yml@v0.1.14
     with:
       package: kin-lsp
       manifest: Cargo.toml
       source-paths: src Cargo.toml
       test-command: cargo test
+      mint-release-tag: true
     secrets:
+      KIN_RELEASE_BOT_APP_ID: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
+      KIN_RELEASE_BOT_PRIVATE_KEY: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
       KINLAB_CARGO_TOKEN: ${{ secrets.KINLAB_CARGO_TOKEN }}
       KIN_CI_BOT_TOKEN: ${{ secrets.KIN_CI_BOT_TOKEN }}
       KIN_DOWNSTREAM_DISPATCH_TOKEN: ${{ secrets.KIN_DOWNSTREAM_DISPATCH_TOKEN }}
