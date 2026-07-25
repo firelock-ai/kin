@@ -1,0 +1,19 @@
+name: Approve To Merge
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+# Read-only by default; the merge capability is granted only to the gate job,
+# which the release-workflow authority test requires: top-level tokens default
+# to contents: read, and write elevation is per-job.
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    if: github.event.review.state == 'approved'
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: firelock-ai/kin-actions/.github/workflows/approve-to-merge.yml@v0.1.17
