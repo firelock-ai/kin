@@ -154,6 +154,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_LOCATE_SYMBOL_CAP", kind: Kind::Usize, default: "25", sensitivity: Sensitivity::Correctness, summary: "cap on symbols surfaced per locate result" },
     EnvVarSpec { name: "KIN_LOCATE_CROSS_ENCODER_MODEL", kind: Kind::Str, default: "", sensitivity: Sensitivity::Correctness, summary: "override the cross-encoder rerank model id" },
     EnvVarSpec { name: "KIN_LOCATE_CROSS_ENCODER_REVISION", kind: Kind::Str, default: "", sensitivity: Sensitivity::Correctness, summary: "override the cross-encoder rerank model revision" },
+    EnvVarSpec { name: "KIN_LOCATE_AUTO_QUERY_FANOUT", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Correctness, summary: "automatic identifier-distilled sharp variant for single-query locate, fused only when the primary ranking is unsure; falsy disables" },
     EnvVarSpec { name: "KIN_REQUIRE_COMPLETE_EMBEDDINGS", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "require full embedding coverage before answering locate/search" },
     EnvVarSpec { name: "KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "bypass the embedding-coverage correctness gate" },
     EnvVarSpec { name: "KIN_STRICT_BUILD_MATCH", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "require a strict historical build match when resolving a ref view" },
