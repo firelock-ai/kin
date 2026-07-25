@@ -199,6 +199,79 @@ impl ManifestStore {
         Ok(versions)
     }
 
+    fn snapshots_root(&self) -> std::path::PathBuf {
+        self.manifests_dir
+            .parent()
+            .map(|parent| parent.join("manifest-snapshots"))
+            .unwrap_or_else(|| self.manifests_dir.join("manifest-snapshots"))
+    }
+
+    /// Copy every manifest file of one ecosystem into a fresh timestamped
+    /// snapshot directory outside the served tree, returning its path.
+    fn snapshot_ecosystem_unlocked(
+        &self,
+        ecosystem: Ecosystem,
+    ) -> Result<std::path::PathBuf, RegistryError> {
+        let names = self.list_packages_unlocked(ecosystem)?;
+        let stamp = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
+        let dest = self
+            .snapshots_root()
+            .join(format!("{}-{stamp}", ecosystem_dir_name(ecosystem)));
+        std::fs::create_dir_all(&dest)?;
+        for name in &names {
+            let relative = std::path::Path::new(ecosystem_dir_name(ecosystem)).join(name);
+            let bytes = self.authority.read(&relative)?;
+            std::fs::write(dest.join(name), bytes)?;
+        }
+        Ok(dest)
+    }
+
+    /// Rewrite every manifest file recorded in a snapshot back into the served
+    /// tree through the atomic authority writer. Only files present in the
+    /// snapshot are touched; repair never creates packages, so restoring the
+    /// snapshotted files reverses it completely.
+    fn restore_ecosystem_unlocked(
+        &self,
+        ecosystem: Ecosystem,
+        snapshot: &std::path::Path,
+    ) -> Result<usize, RegistryError> {
+        let mut restored = 0usize;
+        for entry in std::fs::read_dir(snapshot)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let bytes = std::fs::read(entry.path())?;
+            let relative = std::path::Path::new(ecosystem_dir_name(ecosystem)).join(&name);
+            self.authority.write(&relative, &bytes)?;
+            restored += 1;
+        }
+        Ok(restored)
+    }
+
+    /// Best-effort removal of the oldest snapshots beyond `keep`. The stamp
+    /// format sorts lexicographically in time order.
+    fn prune_ecosystem_snapshots_unlocked(&self, ecosystem: Ecosystem, keep: usize) {
+        let prefix = format!("{}-", ecosystem_dir_name(ecosystem));
+        let Ok(entries) = std::fs::read_dir(self.snapshots_root()) else {
+            return;
+        };
+        let mut dirs: Vec<std::path::PathBuf> = entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .map(|entry| entry.path())
+            .collect();
+        dirs.sort();
+        while dirs.len() > keep {
+            let oldest = dirs.remove(0);
+            let _ = std::fs::remove_dir_all(&oldest);
+        }
+    }
+
     fn list_packages_unlocked(&self, ecosystem: Ecosystem) -> Result<Vec<String>, RegistryError> {
         let relative = std::path::PathBuf::from(ecosystem_dir_name(ecosystem));
         let names = match self.authority.read_dir_names(&relative) {
@@ -387,6 +460,24 @@ impl ManifestReadTransaction<'_> {
 impl ManifestWriteTransaction<'_> {
     pub(crate) fn get_versions(&self, package: &str) -> Result<Vec<PackageVersion>, RegistryError> {
         self.store.get_versions_unlocked(self.ecosystem, package)
+    }
+
+    pub(crate) fn list_packages(&self) -> Result<Vec<String>, RegistryError> {
+        self.store.list_packages_unlocked(self.ecosystem)
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<std::path::PathBuf, RegistryError> {
+        self.store.snapshot_ecosystem_unlocked(self.ecosystem)
+    }
+
+    pub(crate) fn restore(&self, snapshot: &std::path::Path) -> Result<usize, RegistryError> {
+        self.store
+            .restore_ecosystem_unlocked(self.ecosystem, snapshot)
+    }
+
+    pub(crate) fn prune_snapshots(&self, keep: usize) {
+        self.store
+            .prune_ecosystem_snapshots_unlocked(self.ecosystem, keep);
     }
 
     pub(crate) fn add_version(&self, version: &PackageVersion) -> Result<(), RegistryError> {

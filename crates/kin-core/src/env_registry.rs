@@ -189,6 +189,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_SUPERVISOR_AUTH_TOKEN", kind: Kind::Secret, default: "", sensitivity: Sensitivity::Secret, summary: "bearer token for authenticated supervisor requests" },
     EnvVarSpec { name: "KIN_REGISTRY_CARGO_TOKEN", kind: Kind::Secret, default: "", sensitivity: Sensitivity::Secret, summary: "cargo registry auth token for publish" },
     EnvVarSpec { name: "KIN_REGISTRY_OCI_WRITE_TOKEN", kind: Kind::Secret, default: "", sensitivity: Sensitivity::Secret, summary: "OCI registry auth token for mutations" },
+    EnvVarSpec { name: "KIN_REGISTRY_STARTUP_REPAIR", kind: Kind::Str, default: "1", sensitivity: Sensitivity::Operational, summary: "set 0/false to disable the cargo registry migrate-on-boot repair" },
 
     // ---- daemon lifecycle / networking ---------------------------------------
     EnvVarSpec { name: "KIN_DAEMON_URL", kind: Kind::Url, default: "", sensitivity: Sensitivity::Operational, summary: "explicit daemon endpoint URL (skip local discovery)" },

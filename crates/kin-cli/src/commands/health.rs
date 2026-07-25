@@ -156,8 +156,77 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_kinlab_connect());
     checks.push(check_semantic_query_readiness().await);
     checks.push(check_retrieval_profile());
+    checks.push(check_binary_assessment_load());
 
     assemble_health_report(env::consts::OS.to_string(), checks)
+}
+
+/// macOS assesses each never-before-seen binary on first launch. Cold cargo
+/// builds mint thousands of fresh binaries, and concurrent cold builds can
+/// saturate the assessment daemon; while it is wedged, every new process
+/// launch on the machine stalls. Surface that state and the sanctioned
+/// exemption instead of leaving the operator to debug random tool hangs.
+#[cfg(target_os = "macos")]
+fn check_binary_assessment_load() -> HealthCheck {
+    match syspolicyd_cpu_percent() {
+        None => HealthCheck::new(
+            "binary_assessment_load",
+            "Host binary assessment",
+            HealthStatus::Healthy,
+            "assessment daemon not observable; no saturation signal",
+        ),
+        Some(load) if load < 50.0 => HealthCheck::new(
+            "binary_assessment_load",
+            "Host binary assessment",
+            HealthStatus::Healthy,
+            format!("syspolicyd at {load:.0}% CPU"),
+        ),
+        Some(load) => HealthCheck::new(
+            "binary_assessment_load",
+            "Host binary assessment",
+            HealthStatus::Stale,
+            format!(
+                "syspolicyd is at {load:.0}% CPU; launches of freshly built binaries will stall machine-wide until it drains"
+            ),
+        )
+        .with_manual_fix(
+            "pause concurrent cold builds, then enable your terminal and editor under System Settings, Privacy and Security, Developer Tools (sudo spctl developer-mode enable-terminal opens the pane) so locally built binaries skip assessment",
+        ),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn check_binary_assessment_load() -> HealthCheck {
+    HealthCheck::new(
+        "binary_assessment_load",
+        "Host binary assessment",
+        HealthStatus::Unsupported,
+        "binary assessment saturation is a macOS behavior",
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn syspolicyd_cpu_percent() -> Option<f32> {
+    let pgrep = std::process::Command::new("/usr/bin/pgrep")
+        .args(["-x", "syspolicyd"])
+        .output()
+        .ok()?;
+    let pid = String::from_utf8_lossy(&pgrep.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .to_string();
+    if pid.is_empty() {
+        return None;
+    }
+    let ps = std::process::Command::new("/bin/ps")
+        .args(["-o", "pcpu=", "-p", &pid])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&ps.stdout)
+        .trim()
+        .parse::<f32>()
+        .ok()
 }
 
 fn check_registry_authority() -> HealthCheck {
@@ -1455,6 +1524,19 @@ mod tests {
 
     fn check_with(id: &str, status: HealthStatus) -> HealthCheck {
         HealthCheck::new(id, id, status, "")
+    }
+
+    #[test]
+    fn binary_assessment_check_always_reports() {
+        let check = check_binary_assessment_load();
+        assert_eq!(check.id, "binary_assessment_load");
+        assert!(!check.detail.is_empty());
+        // Advisory by design: a wedged assessment daemon must warn without
+        // failing overall readiness.
+        assert!(!matches!(
+            check.status,
+            HealthStatus::Missing | HealthStatus::Misconfigured
+        ));
     }
 
     #[test]
