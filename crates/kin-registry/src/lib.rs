@@ -199,6 +199,22 @@ impl ManifestStore {
         Ok(versions)
     }
 
+    fn list_packages_unlocked(&self, ecosystem: Ecosystem) -> Result<Vec<String>, RegistryError> {
+        let relative = std::path::PathBuf::from(ecosystem_dir_name(ecosystem));
+        let names = match self.authority.read_dir_names(&relative) {
+            Ok(names) => names,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(error) => return Err(error.into()),
+        };
+        let mut packages: Vec<String> = names
+            .into_iter()
+            .filter_map(|name| name.into_string().ok())
+            .filter(|name| !name.starts_with('.'))
+            .collect();
+        packages.sort();
+        Ok(packages)
+    }
+
     /// Add a new version with a crash-durable whole-file replacement.
     ///
     /// Callers that can publish concurrently must serialize the read/modify/
@@ -217,6 +233,14 @@ impl ManifestStore {
     ) -> Result<(), RegistryError> {
         self.write_transaction(id.ecosystem)?
             .replace_versions(id, versions)
+    }
+
+    /// List package manifest names that are direct children of one
+    /// ecosystem's manifest directory. Scoped ecosystems (npm) surface their
+    /// scope directories as entries, so callers needing scoped coverage must
+    /// descend; the Cargo ecosystem is always unscoped and therefore complete.
+    pub fn list_packages(&self, ecosystem: Ecosystem) -> Result<Vec<String>, RegistryError> {
+        self.read_transaction(ecosystem)?.list_packages()
     }
 
     fn replace_versions_unlocked(
@@ -292,13 +316,7 @@ impl ManifestStore {
     }
 
     fn ecosystem_manifests_dir(&self, ecosystem: Ecosystem) -> std::path::PathBuf {
-        self.manifests_dir.join(match ecosystem {
-            Ecosystem::Cargo => "cargo",
-            Ecosystem::Npm => "npm",
-            Ecosystem::Oci => "oci",
-            Ecosystem::Go => "go",
-            Ecosystem::Raw => "raw",
-        })
+        self.manifests_dir.join(ecosystem_dir_name(ecosystem))
     }
 
     fn transaction_lock_relative(&self, ecosystem: Ecosystem) -> std::path::PathBuf {
@@ -313,13 +331,7 @@ impl ManifestStore {
     }
 
     fn manifest_relative_path(&self, id: &PackageId) -> std::path::PathBuf {
-        let ecosystem = match id.ecosystem {
-            Ecosystem::Cargo => "cargo",
-            Ecosystem::Npm => "npm",
-            Ecosystem::Oci => "oci",
-            Ecosystem::Go => "go",
-            Ecosystem::Raw => "raw",
-        };
+        let ecosystem = ecosystem_dir_name(id.ecosystem);
         match &id.scope {
             Some(scope) if !scope.is_empty() => std::path::PathBuf::from(ecosystem)
                 .join(format!("@{scope}"))
@@ -352,9 +364,23 @@ fn is_safe_relative_path(value: &str) -> bool {
             .all(|segment| !segment.is_empty() && is_one_normal_path_segment(segment))
 }
 
+fn ecosystem_dir_name(ecosystem: Ecosystem) -> &'static str {
+    match ecosystem {
+        Ecosystem::Cargo => "cargo",
+        Ecosystem::Npm => "npm",
+        Ecosystem::Oci => "oci",
+        Ecosystem::Go => "go",
+        Ecosystem::Raw => "raw",
+    }
+}
+
 impl ManifestReadTransaction<'_> {
     pub(crate) fn get_versions(&self, package: &str) -> Result<Vec<PackageVersion>, RegistryError> {
         self.store.get_versions_unlocked(self.ecosystem, package)
+    }
+
+    pub(crate) fn list_packages(&self) -> Result<Vec<String>, RegistryError> {
+        self.store.list_packages_unlocked(self.ecosystem)
     }
 }
 

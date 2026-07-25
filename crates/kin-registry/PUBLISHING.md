@@ -115,7 +115,9 @@ The sender's token must match the credential for the ecosystem it is mutating.
 
 The sparse index serves only version records whose metadata carries
 `cargo_index_format: 1`. Records written before that marker existed make every
-`GET` of the package's index path fail with HTTP 500 and:
+`GET` of the package's index path fail with HTTP 503 and `error_code`
+`unserveable_index_metadata` (older deployments return a bare 500), for
+example:
 
 ```
 Cargo index metadata for <name>@<version> is legacy or incomplete; re-publish or migrate the manifest before serving it
@@ -148,3 +150,9 @@ Per affected package:
 `.github/workflows/registry-index-migrate.yml` automates this loop as a manual
 dispatch. It dry-runs by default and mutates only when dispatched with
 `execute: true`, using the repository's `KINLAB_CARGO_TOKEN` secret.
+
+`GET /registry/cargo/health` reports serving readiness for the whole store:
+200 with package and version counts when every record serves, 503 listing
+each unserveable record otherwise. Deployment promotions should gate on it
+immediately after deploy so a data precondition the serving code enforces
+can never sit undetected in front of clients.
