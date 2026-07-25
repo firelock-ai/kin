@@ -17,8 +17,49 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  # Mirror of ci.yml's diff classifier: cargo-deny resolves the full
+  # dependency graph, which documentation-only and workflow-only changes
+  # cannot alter. Fail closed: any classifier failure or non-pull_request
+  # event reports docs_only=false and the gated job runs.
+  changes:
+    name: Classify diff scope
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Classify changed paths
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          docs_only=false
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA")"
+            if [ -n "$changed" ]; then
+              docs_only=true
+              while IFS= read -r path; do
+                case "$path" in
+                  .github/workflows/ci.yml) docs_only=false; break ;;
+                  *.md | docs/*) ;;
+                  .github/workflows/*) ;;
+                  *) docs_only=false; break ;;
+                esac
+              done <<< "$changed"
+            fi
+            printf '%s\n' "$changed"
+          fi
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+
   cargo-deny:
     name: cargo-deny
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
