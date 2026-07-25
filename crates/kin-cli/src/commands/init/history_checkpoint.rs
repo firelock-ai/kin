@@ -218,6 +218,12 @@ impl HydrationCheckpointConfig {
     }
 }
 
+/// Exit code for the injected mid-checkpoint process death. Distinct from a
+/// worker panic (libtest exits 101) so the parent can assert the process died
+/// at the armed boundary and not for an incidental reason.
+#[cfg(test)]
+pub(super) const CRASH_SIMULATION_EXIT_CODE: i32 = 86;
+
 fn checkpoint_build_policy(
     embedded_sha: &str,
     embedded_dirty: bool,
@@ -1872,9 +1878,13 @@ impl HydrationCheckpointSession {
         // Test-only process-crash injection after all immutable objects are
         // durably installed but before the reachability manifest exists.
         // Recovery must happen in the next process's prepare maintenance.
+        // Dies by exit rather than abort: both stop here without running
+        // destructors or writing the manifest, but SIGABRT additionally puts
+        // every suite run through the host's crash-report and binary
+        // assessment tooling.
         #[cfg(test)]
         if self.config.crash_after_objects_before_manifest {
-            std::process::abort();
+            std::process::exit(CRASH_SIMULATION_EXIT_CODE);
         }
 
         let manifest = ManifestPayloadV2 {
