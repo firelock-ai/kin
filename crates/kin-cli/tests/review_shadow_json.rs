@@ -12,10 +12,11 @@ use kin_cli::commands::ref_lookup::{
 };
 use serde_json::Value;
 use std::path::Path;
-use std::process::Command;
 use tempfile::tempdir;
 
 mod common;
+
+use common::Command;
 
 fn kin_command() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_kin"));

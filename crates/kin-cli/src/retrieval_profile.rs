@@ -308,10 +308,27 @@ mod tests {
         }
     }
 
+    /// Clears the process-global serving mark on the way out, including when
+    /// the test unwinds.
+    ///
+    /// The mark gates the cross-encoder default, and a cross-encoder default
+    /// left switched on makes unrelated `locate` tests fetch reranker weights
+    /// over the network. Restoring it only on the success path means one failed
+    /// assertion here turns into a download — and an unbounded one — somewhere
+    /// else in the binary.
+    struct DaemonServingMark;
+
+    impl Drop for DaemonServingMark {
+        fn drop(&mut self) {
+            reset_daemon_serving_for_tests();
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn accuracy_profile_gates_cross_encoder_on_cached_model_and_daemon_context() {
         let accuracy = RetrievalProfile::AccuracyV1;
+        let _mark = DaemonServingMark;
 
         // Outside a serving daemon the default never turns the reranker on,
         // cached model or not — a test binary or one-shot library caller must
@@ -326,6 +343,5 @@ mod tests {
             !accuracy.cross_encoder_default(false),
             "an unset default must never trigger a mid-query model download"
         );
-        reset_daemon_serving_for_tests();
     }
 }

@@ -25,8 +25,12 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 use tempfile::tempdir;
+
+mod common;
+
+use common::Command;
 
 /// Run a git command in `dir` and assert it succeeds.
 fn git(dir: &Path, args: &[&str]) -> Output {

@@ -2,8 +2,11 @@
 // Copyright 2026 Firelock, LLC
 
 use serde_json::Value;
-use std::process::Command;
 use tempfile::tempdir;
+
+mod common;
+
+use common::Command;
 
 #[test]
 fn bench_meta_json_reports_cache_key_dimensions() {

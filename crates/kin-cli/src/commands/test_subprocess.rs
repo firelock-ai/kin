@@ -17,7 +17,16 @@ use std::io::{Read as _, Seek as _, SeekFrom};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
-pub(crate) const DEFAULT_TEST_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(60);
+/// Wall-clock cap for a test-driven worker process.
+///
+/// This is a backstop against a wait that would otherwise never end, not an
+/// assertion about how fast the machine is. The workers it bounds re-execute
+/// this test binary and normally finish in under a second, but the suite runs
+/// them many-at-once and a developer machine may be saturated by other work at
+/// the same time, so the cap is set far above any legitimate completion time.
+/// Tightening it back toward the observed runtime trades a class of hangs for a
+/// class of load-dependent false failures.
+pub(crate) const DEFAULT_TEST_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(300);
 const TEST_SUBPROCESS_REAP_GRACE: Duration = Duration::from_secs(5);
 const TEST_SUBPROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -498,6 +507,35 @@ pub(crate) fn output_with_timeout(
                     reaped.is_some()
                 );
             }
+        }
+    }
+}
+
+/// Run a blocking call that waits on an external process or resource under a
+/// hard wall-clock cap.
+///
+/// The call runs on a worker thread, so a wait that never completes cannot
+/// stall the test binary: the caller panics with a legible message, drops any
+/// `serial_test` guard it holds, and the run still reaches a verdict. A suite
+/// that blocks forever reports nothing and pins the machine; one that fails
+/// names the resource that never arrived.
+#[cfg(unix)]
+pub(crate) fn call_with_deadline<T, F>(label: &str, timeout: Duration, call: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(call());
+    });
+    match receiver.recv_timeout(timeout) {
+        Ok(value) => value,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("{label} did not complete within {timeout:?}")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("{label} panicked before it produced a result")
         }
     }
 }

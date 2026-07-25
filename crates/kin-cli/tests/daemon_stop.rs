@@ -17,10 +17,12 @@
 use kin_cli::daemon_client::is_process_alive;
 use serde_json::Value;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::{Duration, Instant};
 
 mod common;
+
+use common::Command;
 
 /// Run `kin <args>` in `repo` with a fully isolated daemon/supervisor
 /// environment. The long idle timeouts keep the daemon from self-stopping mid
