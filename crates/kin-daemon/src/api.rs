@@ -4562,11 +4562,22 @@ async fn run_multiquery_fused_locate(
             }
         }
     }
-    Ok(kin_cli::commands::locate::fuse_locate_results(
+    let primary_declared = per_variant
+        .first()
+        .map(|result| result.files.len())
+        .unwrap_or(0);
+    let mut fused = kin_cli::commands::locate::fuse_locate_results(
         variants.to_vec(),
         per_variant,
         kin_cli::commands::locate::locate_rrf_k(),
-    ))
+    );
+    // The automatic sharp variant reorders within the declaration budget the
+    // primary earned; it must not widen it. Caller-supplied fusion keeps its
+    // union width.
+    if auto_fanout {
+        kin_cli::commands::locate::bound_fused_declaration_to_primary(&mut fused, primary_declared);
+    }
+    Ok(fused)
 }
 
 /// Fan out a multi-query locate at an explicit ref: retrieve each variant against
@@ -4612,11 +4623,22 @@ fn run_multiquery_locate_at_ref(
             return Ok(per_variant.pop().expect("primary result present"));
         }
     }
-    Ok(kin_cli::commands::locate::fuse_locate_results(
+    let primary_declared = per_variant
+        .first()
+        .map(|result| result.files.len())
+        .unwrap_or(0);
+    let mut fused = kin_cli::commands::locate::fuse_locate_results(
         variants.to_vec(),
         per_variant,
         kin_cli::commands::locate::locate_rrf_k(),
-    ))
+    );
+    // The automatic sharp variant reorders within the declaration budget the
+    // primary earned; it must not widen it. Caller-supplied fusion keeps its
+    // union width.
+    if auto_fanout {
+        kin_cli::commands::locate::bound_fused_declaration_to_primary(&mut fused, primary_declared);
+    }
+    Ok(fused)
 }
 
 /// Insert a full locate ranking into the paging cache, evicting the oldest entry
