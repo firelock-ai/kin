@@ -13,10 +13,10 @@ use kin_index::{
     FileParseCompletenessMap, FileParseData, IndexPipeline,
 };
 use kin_model::{
-    ArtifactId, ChangeStore, EntityId, EntityKind, EntityStore, FileLayout, FilePathId, GraphStore,
-    Hash256, ImportSection, OpaqueArtifact, ParseCompleteness, RelationKind, SemanticChange,
-    SemanticChangeId, ShallowTrackedFile, SourceRegion, StructuredArtifact, TreeDelta, TreeEntry,
-    TreeEntryKind,
+    ArtifactId, ChangeStore, EntityId, EntityKind, FileLayout, FilePathId, GraphStore, Hash256,
+    ImportSection, OpaqueArtifact, ParseCompleteness, RelationKind, RepoPath, ResolvedTree,
+    SemanticChange, SemanticChangeId, ShallowTrackedFile, SourceRegion, StructuredArtifact,
+    TreeEntry,
 };
 use kin_parser::extract::{EMBEDDING_BODY_PREVIEW_KEY, FILE_SURFACE_CONTEXT_KEY};
 
@@ -45,6 +45,7 @@ pub fn build_graph_at_ref(
         .unwrap_or(60.0);
 
     let changes = collect_changes_at_ref(graph, head)?;
+    let material_history = collect_first_parent_changes_at_ref(graph, head)?;
     let resolved = graph
         .resolve_graph_at(head)
         .map_err(|err| KinError::Graph(err.to_string()))?;
@@ -73,18 +74,7 @@ pub fn build_graph_at_ref(
         .map(|change| (change.id, change.clone()))
         .collect();
     snapshot.change_children = build_change_children(&changes);
-    snapshot.working_tree = ref_file_tree
-        .iter()
-        .map(|(file_id, entry)| (file_id.0.clone(), *entry))
-        .collect();
-    snapshot.artifact_index = ref_file_tree
-        .keys()
-        .map(|file_id| {
-            EntityStore::ensure_artifact_id(graph, file_id)
-                .map(|artifact_id| (file_id.clone(), artifact_id))
-                .map_err(|error| KinError::Graph(error.to_string()))
-        })
-        .collect::<Result<HashMap<_, _>>>()?;
+    snapshot.resolved_tree = ref_file_tree.clone();
     let mut branches = HashMap::new();
     if let Ok(parent_branches) = graph.list_branches() {
         let reachable_ids: HashSet<SemanticChangeId> = changes.iter().map(|c| c.id).collect();
@@ -115,10 +105,7 @@ pub fn build_graph_at_ref(
     }
     snapshot.branches = branches;
 
-    let lifecycle = RefLifecycle::from_changes(&changes);
-    let path_resolver = HistoricalPathResolver::from_changes(&changes, &ref_file_tree);
-
-    normalize_entity_file_origins_to_historical_tree(&mut snapshot, &ref_file_tree, &path_resolver);
+    let lifecycle = RefLifecycle::from_changes(&material_history);
     rebuild_entity_source_file_layouts(
         &mut snapshot,
         &ref_file_tree,
@@ -189,10 +176,10 @@ impl<'a> BlobReader<'a> {
         Self { blob_store }
     }
 
-    fn read(&self, hash: &kin_blobs::Hash256, file_path: &str) -> Result<Vec<u8>> {
+    fn read(&self, hash: &kin_blobs::Hash256, path: &RepoPath) -> Result<Vec<u8>> {
         self.blob_store.read(hash).map_err(|error| {
             KinError::Graph(format!(
-                "graph tree references missing or corrupt blob {hash} for {file_path}: {error}"
+                "graph tree references missing or corrupt blob {hash} for {path}: {error}"
             ))
         })
     }
@@ -251,184 +238,6 @@ impl RefLifecycle {
     }
 }
 
-/// Resolves historical FilePathIds to the canonical path that appears in the
-/// reconstructed file tree at the ref.
-///
-/// Replays artifact deltas in topological order to track move/rename history:
-/// when a path is removed and another path is added with the same blob hash
-/// inside the same change, the new path is treated as a rename target for the
-/// old path. This is more stable than the previous basename-only fallback,
-/// which silently misrouted entity spans when two files shared a basename.
-struct HistoricalPathResolver {
-    /// Maps a path that may appear in legacy entity records (origin or span)
-    /// to its current canonical path in the reconstructed file tree.
-    canonical_for_legacy: HashMap<String, FilePathId>,
-    /// Map from basename to all paths in the reconstructed file tree sharing that basename.
-    basename_to_paths: HashMap<String, Vec<FilePathId>>,
-}
-
-impl HistoricalPathResolver {
-    fn from_changes(
-        changes: &[SemanticChange],
-        file_tree: &HashMap<FilePathId, TreeEntry>,
-    ) -> Self {
-        let mut canonical_for_legacy: HashMap<String, FilePathId> = HashMap::new();
-
-        // Replay exact tree deltas to learn rename chains. A rename is detected
-        // when one change contains both a removal and an addition/modification
-        // sharing a blob identity. The removed path becomes a
-        // legacy alias of the new canonical path.
-        for change in changes {
-            let mut removed_by_hash: HashMap<Hash256, FilePathId> = HashMap::new();
-            for delta in &change.tree_deltas {
-                if let TreeDelta::Removed { file_id, old_entry } = delta {
-                    removed_by_hash.insert(old_entry.blob_hash, file_id.clone());
-                }
-            }
-            for delta in &change.tree_deltas {
-                let Some(new_entry) = delta.new_entry() else {
-                    continue;
-                };
-                if let Some(legacy_path) = removed_by_hash.get(&new_entry.blob_hash) {
-                    if legacy_path != delta.file_id() {
-                        canonical_for_legacy.insert(legacy_path.0.clone(), delta.file_id().clone());
-                    }
-                }
-            }
-        }
-
-        // Collapse chains: if A -> B and B -> C, A should also resolve to C.
-        // Iterate until stable.
-        let mut changed = true;
-        while changed {
-            changed = false;
-            let snapshot: Vec<(String, FilePathId)> = canonical_for_legacy
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            for (legacy, target) in snapshot {
-                if let Some(next) = canonical_for_legacy.get(&target.0).cloned() {
-                    if next != target {
-                        canonical_for_legacy.insert(legacy, next);
-                        changed = true;
-                    }
-                }
-            }
-        }
-
-        let mut basename_to_paths: HashMap<String, Vec<FilePathId>> = HashMap::new();
-        for file_id in file_tree.keys() {
-            if let Some(basename) = Path::new(&file_id.0)
-                .file_name()
-                .and_then(|name| name.to_str())
-            {
-                basename_to_paths
-                    .entry(basename.to_string())
-                    .or_default()
-                    .push(file_id.clone());
-            }
-        }
-
-        Self {
-            canonical_for_legacy,
-            basename_to_paths,
-        }
-    }
-
-    /// Resolve a legacy `FilePathId` to its canonical path in the ref tree.
-    /// Returns `None` when no canonical mapping can be established.
-    fn resolve(
-        &self,
-        file_id: &FilePathId,
-        file_tree: &HashMap<FilePathId, TreeEntry>,
-    ) -> Option<FilePathId> {
-        if file_tree.contains_key(file_id) {
-            return Some(file_id.clone());
-        }
-        if let Some(canonical) = self.canonical_for_legacy.get(&file_id.0) {
-            if file_tree.contains_key(canonical) {
-                return Some(canonical.clone());
-            }
-        }
-
-        let basename = Path::new(&file_id.0).file_name()?.to_str()?;
-        let candidates = self.basename_to_paths.get(basename)?;
-
-        // 1. Strict suffix match (longest-path suffix match)
-        let mut suffix_matches: Vec<&FilePathId> = candidates
-            .iter()
-            .filter(|path| {
-                if path.0 == file_id.0 {
-                    return true;
-                }
-                // path.0 ends with / + file_id.0
-                if path.0.len() > file_id.0.len() && path.0.ends_with(&file_id.0) {
-                    let prefix_len = path.0.len() - file_id.0.len();
-                    if path.0.as_bytes()[prefix_len - 1] == b'/' {
-                        return true;
-                    }
-                }
-                // file_id.0 ends with / + path.0
-                if file_id.0.len() > path.0.len() && file_id.0.ends_with(&path.0) {
-                    let prefix_len = file_id.0.len() - path.0.len();
-                    if file_id.0.as_bytes()[prefix_len - 1] == b'/' {
-                        return true;
-                    }
-                }
-                false
-            })
-            .collect();
-
-        if !suffix_matches.is_empty() {
-            suffix_matches.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
-            if suffix_matches.len() == 1 || suffix_matches[0].0.len() > suffix_matches[1].0.len() {
-                return Some(suffix_matches[0].clone());
-            }
-        }
-
-        // 2. Component-wise suffix match: try matching candidates that share a common suffix of
-        // at least 2 components, picking the one with the longest matching suffix if it is unique.
-        let mut best_candidate: Option<(&FilePathId, usize)> = None;
-        let mut second_best_len = 0;
-        for path in candidates {
-            let len = common_component_suffix_len(&file_id.0, &path.0);
-            if len >= 2 {
-                if let Some((_, best_len)) = best_candidate {
-                    if len > best_len {
-                        second_best_len = best_len;
-                        best_candidate = Some((path, len));
-                    } else if len == best_len {
-                        second_best_len = len;
-                    } else if len > second_best_len {
-                        second_best_len = len;
-                    }
-                } else {
-                    best_candidate = Some((path, len));
-                }
-            }
-        }
-        if let Some((path, best_len)) = best_candidate {
-            if best_len > second_best_len {
-                return Some(path.clone());
-            }
-        }
-
-        // 3. Last-resort basename match (if unique)
-        if candidates.len() == 1 {
-            return Some(candidates[0].clone());
-        }
-
-        None
-    }
-}
-
-fn common_component_suffix_len(a: &str, b: &str) -> usize {
-    a.rsplit('/')
-        .zip(b.rsplit('/'))
-        .take_while(|(ap, bp)| ap == bp)
-        .count()
-}
-
 pub fn collect_changes_at_ref<G>(graph: &G, head: &SemanticChangeId) -> Result<Vec<SemanticChange>>
 where
     G: GraphStore,
@@ -459,24 +268,9 @@ where
                         }
                     }
                     None => {
-                        // An absent ancestor is the import horizon, not
-                        // corruption: `kin init --git-history recent` imports a
-                        // bounded window (default 50 commits), so the oldest
-                        // imported change can reference a Git parent that was
-                        // never imported. Stop the walk at that edge — treating
-                        // it as the root of the visible history — instead of
-                        // failing the whole ref-scoped read with a bare "change
-                        // not found", which otherwise 500s `locate --ref
-                        // git:<oid>` even for HEAD (HEAD's own ancestry crosses
-                        // the horizon). Newer imports close this gap by
-                        // re-pointing boundary parents at genesis (see
-                        // kin_git::import::close_truncated_history_dag), so this
-                        // only fires for histories imported before that fix or
-                        // pruned below the requested ref.
-                        tracing::warn!(
-                            change = %id,
-                            "ref history walk stopped at an unresolved ancestor (import horizon); returning the changes reachable above it"
-                        );
+                        return Err(KinError::Graph(format!(
+                            "ref history is incomplete: change {id} is missing"
+                        )));
                     }
                 }
             }
@@ -484,6 +278,45 @@ where
         }
     }
     Ok(ordered)
+}
+
+/// Fetch the exact material lineage for `head`.
+///
+/// A merge result is always relative to its first declared parent. Additional
+/// parents contribute ancestry and revision lineage, but never have their
+/// repository or entity state implicitly folded into the historical view.
+fn collect_first_parent_changes_at_ref<G>(
+    graph: &G,
+    head: &SemanticChangeId,
+) -> Result<Vec<SemanticChange>>
+where
+    G: GraphStore,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    let mut seen = HashSet::new();
+    let mut reverse_history = Vec::new();
+    let mut current = Some(*head);
+
+    while let Some(change_id) = current {
+        if !seen.insert(change_id) {
+            return Err(KinError::Graph(format!(
+                "cycle in first-parent history at change {change_id}"
+            )));
+        }
+        let change = graph
+            .get_change(&change_id)
+            .map_err(|error| KinError::Graph(error.to_string()))?
+            .ok_or_else(|| {
+                KinError::Graph(format!(
+                    "first-parent history is incomplete: change {change_id} is missing"
+                ))
+            })?;
+        current = change.parents.first().copied();
+        reverse_history.push(change);
+    }
+
+    reverse_history.reverse();
+    Ok(reverse_history)
 }
 
 fn build_change_children(
@@ -520,48 +353,9 @@ fn filter_temporal_cochange_relations(snapshot: &mut GraphSnapshot) {
     }
 }
 
-fn normalize_entity_file_origins_to_historical_tree(
-    snapshot: &mut GraphSnapshot,
-    file_tree: &HashMap<FilePathId, TreeEntry>,
-    path_resolver: &HistoricalPathResolver,
-) {
-    for entity in snapshot.entities.values_mut() {
-        if let Some(file_origin) = entity.file_origin.as_mut() {
-            if let Some(canonical) = path_resolver.resolve(file_origin, file_tree) {
-                *file_origin = canonical;
-            }
-        }
-        if let Some(span) = entity.span.as_mut() {
-            if let Some(canonical) = path_resolver.resolve(&span.file, file_tree) {
-                span.file = canonical;
-            }
-        }
-        // Re-derive the entity role from its canonical historical path.
-        //
-        // `resolve_graph_at` replays persisted entities verbatim, and this
-        // reconstruction is the only stage that re-canonicalizes their paths --
-        // yet it never re-derived `role`. An entity persisted before the
-        // amalgamated-bundle / vendored path rules landed (e.g. `single_include/`
-        // single-header copies persisted with `role=Source`) therefore replays
-        // with a stale role. `impact.rs` excludes `Generated`/`Vendored`
-        // consumers from `consumer_count`, so a stale-`Source` derived copy leaks
-        // into the count and inflates a benign refactor's blast radius into a
-        // false breaking finding.
-        //
-        // `classify_file_role` is the same pure path function ingest applies
-        // (`pipeline.rs`), so re-applying it here is idempotent for correctly
-        // classified entities and only upgrades stale ones. `role` is not part of
-        // entity identity (`EntityId::from_content` keys on path/kind/name/line),
-        // so re-deriving it cannot desync persisted-vs-reconstructed identity.
-        if let Some(file_origin) = entity.file_origin.as_ref() {
-            entity.role = kin_index::classify_file_role(&file_origin.0);
-        }
-    }
-}
-
 fn rebuild_non_entity_tracked_files(
     snapshot: &mut GraphSnapshot,
-    file_tree: &HashMap<FilePathId, TreeEntry>,
+    file_tree: &ResolvedTree,
     reader: &BlobReader<'_>,
     build_start: std::time::Instant,
     build_timeout_secs: f64,
@@ -573,23 +367,35 @@ fn rebuild_non_entity_tracked_files(
         .map(|file_id| file_id.0.clone())
         .collect();
 
-    for (file_id, entry) in file_tree {
+    for artifact in file_tree.artifacts_by_path() {
         if build_start.elapsed().as_secs_f64() > build_timeout_secs {
             return Err(KinError::Other(format!(
                 "historical graph reconstruction exceeded its {build_timeout_secs:.1}s deadline while rebuilding non-entity entries"
             )));
         }
-        if entity_paths.contains(&file_id.0) {
+        let Some(path) = artifact.path.as_utf8() else {
+            // The exact artifact remains present in `snapshot.resolved_tree`.
+            // Semantic enrichers are UTF-8 surfaces and must not invent a
+            // lossy alias for byte-exact repository paths.
+            continue;
+        };
+        let file_id = FilePathId::new(path);
+        if entity_paths.contains(path) {
             continue;
         }
+        let Some(content_hash) = artifact.entry.blob_identity() else {
+            // Gitlinks have repository identity and history but no blob bytes
+            // owned by this repository to classify or index.
+            continue;
+        };
 
-        let content = reader.read(&entry.blob_hash, &file_id.0)?;
+        let content = reader.read(&content_hash, &artifact.path)?;
 
-        match FileClassifier::classify_with_content(Path::new(&file_id.0), &content) {
+        match FileClassifier::classify_with_content(Path::new(path), &content) {
             FileClassification::EntitySource => {}
             FileClassification::ShallowSyntax { language_hint } => {
                 if let Some(shallow) =
-                    kin_parser::parse_shallow_file(&content, file_id, &language_hint)
+                    kin_parser::parse_shallow_file(&content, &file_id, &language_hint)
                 {
                     snapshot.shallow_files.push(ShallowTrackedFile {
                         file_id: file_id.clone(),
@@ -607,8 +413,8 @@ fn rebuild_non_entity_tracked_files(
                     });
                 } else {
                     snapshot.opaque_artifacts.push(build_opaque_artifact(
-                        file_id,
-                        entry.blob_hash,
+                        &file_id,
+                        content_hash,
                         None,
                         &content,
                     ));
@@ -616,18 +422,18 @@ fn rebuild_non_entity_tracked_files(
             }
             FileClassification::StructuredArtifact(kind) => {
                 let artifact =
-                    extract_artifact(kind, &content, file_id).unwrap_or(StructuredArtifact {
+                    extract_artifact(kind, &content, &file_id).unwrap_or(StructuredArtifact {
                         file_id: file_id.clone(),
                         kind,
-                        content_hash: entry.blob_hash,
+                        content_hash,
                         text_preview: preview_text(&content),
                     });
                 snapshot.structured_artifacts.push(artifact);
             }
             FileClassification::OpaqueArtifact { mime_hint } => {
                 snapshot.opaque_artifacts.push(build_opaque_artifact(
-                    file_id,
-                    entry.blob_hash,
+                    &file_id,
+                    content_hash,
                     mime_hint,
                     &content,
                 ));
@@ -640,7 +446,7 @@ fn rebuild_non_entity_tracked_files(
 
 fn rebuild_entity_source_file_layouts(
     snapshot: &mut GraphSnapshot,
-    file_tree: &HashMap<FilePathId, TreeEntry>,
+    file_tree: &ResolvedTree,
     reader: &BlobReader<'_>,
     lifecycle: &RefLifecycle,
     build_start: std::time::Instant,
@@ -652,21 +458,31 @@ fn rebuild_entity_source_file_layouts(
     let mut parsed_files = Vec::new();
     let mut parsed_layouts = Vec::new();
     let mut projection_relations = Vec::new();
-    let known_files: HashSet<String> = file_tree.keys().map(|file_id| file_id.0.clone()).collect();
+    let known_files: HashSet<String> = file_tree
+        .artifacts_by_path()
+        .filter_map(|artifact| artifact.path.as_utf8().map(ToOwned::to_owned))
+        .collect();
 
-    for (file_id, entry) in file_tree {
+    for artifact in file_tree.artifacts_by_path() {
         if build_start.elapsed().as_secs_f64() > build_timeout_secs {
             return Err(KinError::Other(format!(
                 "historical graph reconstruction exceeded its {build_timeout_secs:.1}s deadline while rebuilding entity-source entries"
             )));
         }
-        let content = reader.read(&entry.blob_hash, &file_id.0)?;
-        if entry.kind == TreeEntryKind::Symlink
-            || !matches!(
-                FileClassifier::classify_with_content(Path::new(&file_id.0), &content),
-                FileClassification::EntitySource
-            )
-        {
+        let Some(path) = artifact.path.as_utf8() else {
+            continue;
+        };
+        let TreeEntry::Blob { hash, .. } = artifact.entry else {
+            // Symlinks and gitlinks retain exact repository history but are
+            // never parsed as source owned by the link path.
+            continue;
+        };
+        let file_id = FilePathId::new(path);
+        let content = reader.read(&hash, &artifact.path)?;
+        if !matches!(
+            FileClassifier::classify_with_content(Path::new(path), &content),
+            FileClassification::EntitySource
+        ) {
             continue;
         }
 
@@ -674,22 +490,18 @@ fn rebuild_entity_source_file_layouts(
         // even when semantic entity replay succeeds for the file.
         snapshot
             .opaque_artifacts
-            .push(build_historical_source_artifact(
-                file_id,
-                entry.blob_hash,
-                &content,
-            ));
+            .push(build_historical_source_artifact(&file_id, hash, &content));
         projection_relations.extend(build_projection_derived_relations_for_file(
-            &file_id.0,
+            path,
             &content,
             &known_files,
-            |path| snapshot_artifact_id_for_path(snapshot, path),
+            |path| snapshot_artifact_id_for_utf8_path(snapshot, path),
         ));
 
         let mut file_entities = snapshot
             .entities
             .values()
-            .filter(|entity| entity.file_origin.as_ref() == Some(file_id))
+            .filter(|entity| entity.file_origin.as_ref() == Some(&file_id))
             .cloned()
             .collect::<Vec<_>>();
         // Sort for deterministic reparse-to-persisted entity binding.
@@ -698,15 +510,15 @@ fn rebuild_entity_source_file_layouts(
             || should_probe_sparse_historical_source(&file_entities, content.len())
         {
             match pipeline.index_file_content_with_tests(
-                file_id,
+                &file_id,
                 &content,
-                kin_blobs::Hash256::from_bytes(*entry.blob_hash.as_bytes()),
+                kin_blobs::Hash256::from_bytes(*hash.as_bytes()),
             ) {
                 Ok(indexed) => Some(indexed),
                 Err(err) => {
                     tracing::warn!(
                         file = %file_id,
-                        hash = %entry.blob_hash,
+                        hash = %hash,
                         error = %err,
                         "skipping historical source fallback parse that could not be indexed"
                     );
@@ -726,7 +538,7 @@ fn rebuild_entity_source_file_layouts(
                         snapshot.entities.insert(entity.id, entity.clone());
                     }
                     snapshot.file_layouts.push(build_entity_file_layout(
-                        file_id,
+                        &file_id,
                         &contextual_entities,
                         content.len(),
                         ParseCompleteness::Partial(
@@ -775,7 +587,7 @@ fn rebuild_entity_source_file_layouts(
         }
 
         snapshot.file_layouts.push(build_entity_file_layout(
-            file_id,
+            &file_id,
             &file_entities,
             content.len(),
             ParseCompleteness::Partial(
@@ -798,7 +610,9 @@ fn rebuild_entity_source_file_layouts(
         .collect::<HashSet<_>>();
     for layout in &snapshot.file_layouts {
         parse_completeness.insert(layout.file_id.0.clone(), layout.parse_completeness.clone());
-        if linked_file_paths.insert(layout.file_id.0.clone()) {
+        if known_files.contains(&layout.file_id.0)
+            && linked_file_paths.insert(layout.file_id.0.clone())
+        {
             parsed_files.push(FileParseData {
                 file_path: layout.file_id.0.clone(),
                 entities: Vec::new(),
@@ -809,12 +623,31 @@ fn rebuild_entity_source_file_layouts(
     }
 
     if !parsed_files.is_empty() {
-        let universe_entities = snapshot.entities.values().cloned().collect::<Vec<_>>();
         let artifact_ids = snapshot
-            .artifact_index
-            .iter()
-            .map(|(file_id, artifact_id)| (file_id.0.clone(), *artifact_id))
+            .resolved_tree
+            .artifacts_by_path()
+            .filter_map(|artifact| {
+                artifact
+                    .path
+                    .as_utf8()
+                    .map(|path| (path.to_string(), artifact.artifact_id))
+            })
             .collect::<HashMap<_, _>>();
+        // Persisted entity origins that do not name an exact active artifact
+        // remain visible as recorded, but cannot participate in artifact
+        // linking. Never guess a suffix/basename match or allocate identity
+        // merely to make a dangling historical origin linkable.
+        let universe_entities = snapshot
+            .entities
+            .values()
+            .filter(|entity| {
+                entity
+                    .file_origin
+                    .as_ref()
+                    .is_none_or(|file| artifact_ids.contains_key(&file.0))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         parsed_relations.extend(
             link_cross_file_against_entities_with_completeness(
                 &parsed_files,
@@ -834,9 +667,9 @@ fn rebuild_entity_source_file_layouts(
     Ok(())
 }
 
-fn snapshot_artifact_id_for_path(snapshot: &GraphSnapshot, path: &str) -> Option<ArtifactId> {
-    let file_id = FilePathId::new(path);
-    snapshot.artifact_index.get(&file_id).copied()
+fn snapshot_artifact_id_for_utf8_path(snapshot: &GraphSnapshot, path: &str) -> Option<ArtifactId> {
+    let path = RepoPath::from_utf8(path).ok()?;
+    snapshot.resolved_tree.artifact_id_at_path(&path)
 }
 
 fn should_probe_sparse_historical_source(
@@ -1219,8 +1052,9 @@ mod tests {
 
     use kin_blobs::BlobStore;
     use kin_model::{
-        AuthorId, Entity, EntityDelta, EntityKind, EntityRole, EntityStore, FingerprintAlgorithm,
-        LanguageId, SemanticChange, SemanticFingerprint, SourceSpan, Timestamp, Visibility,
+        ArtifactId, AuthorId, Entity, EntityDelta, EntityKind, EntityRole, EntityStore,
+        FingerprintAlgorithm, GitObjectId, LanguageId, LocatedEntry, SemanticChange,
+        SemanticFingerprint, SourceSpan, Timestamp, TreeDelta, Visibility,
     };
 
     fn change(
@@ -1245,25 +1079,29 @@ mod tests {
         }
     }
 
-    fn added(path: &str, hash: Hash256) -> TreeDelta {
+    fn artifact_id(value: u128) -> ArtifactId {
+        ArtifactId(uuid::Uuid::from_u128(value))
+    }
+
+    fn located(path: &str, hash: Hash256) -> LocatedEntry {
+        LocatedEntry::new(
+            RepoPath::from_utf8(path).unwrap(),
+            TreeEntry::blob(hash, false),
+        )
+    }
+
+    fn added(artifact: u128, path: &str, hash: Hash256) -> TreeDelta {
         TreeDelta::Added {
-            file_id: FilePathId::new(path),
-            new_entry: TreeEntry::regular(hash, false),
+            artifact_id: artifact_id(artifact),
+            new: located(path, hash),
         }
     }
 
-    fn modified(path: &str, old_hash: Hash256, new_hash: Hash256) -> TreeDelta {
-        TreeDelta::Modified {
-            file_id: FilePathId::new(path),
-            old_entry: TreeEntry::regular(old_hash, false),
-            new_entry: TreeEntry::regular(new_hash, false),
-        }
-    }
-
-    fn removed(path: &str, hash: Hash256) -> TreeDelta {
-        TreeDelta::Removed {
-            file_id: FilePathId::new(path),
-            old_entry: TreeEntry::regular(hash, false),
+    fn modified(artifact: u128, path: &str, old_hash: Hash256, new_hash: Hash256) -> TreeDelta {
+        TreeDelta::Updated {
+            artifact_id: artifact_id(artifact),
+            old: located(path, old_hash),
+            new: located(path, new_hash),
         }
     }
 
@@ -1285,7 +1123,10 @@ mod tests {
             .create_change(&change(
                 add_id,
                 vec![genesis_id],
-                vec![added("README.md", readme_v1), added("Cargo.toml", cargo_v1)],
+                vec![
+                    added(0x101, "README.md", readme_v1),
+                    added(0x102, "Cargo.toml", cargo_v1),
+                ],
             ))
             .unwrap();
 
@@ -1295,7 +1136,7 @@ mod tests {
             .create_change(&change(
                 head_id,
                 vec![add_id],
-                vec![modified("README.md", readme_v1, readme_v2)],
+                vec![modified(0x101, "README.md", readme_v1, readme_v2)],
             ))
             .unwrap();
 
@@ -1348,7 +1189,7 @@ mod tests {
                 message: "add main".to_string(),
                 entity_deltas: vec![EntityDelta::Added(main_entity)],
                 relation_deltas: vec![],
-                tree_deltas: vec![added("src/main.c", source_hash)],
+                tree_deltas: vec![added(0x103, "src/main.c", source_hash)],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -1400,7 +1241,7 @@ mod tests {
                 message: "auto-parse".to_string(),
                 entity_deltas: vec![EntityDelta::Added(processor.clone())],
                 relation_deltas: vec![],
-                tree_deltas: vec![added("src/lib.py", current_hash)],
+                tree_deltas: vec![added(0x104, "src/lib.py", current_hash)],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -1417,7 +1258,7 @@ mod tests {
             .create_change(&change(
                 historical_id,
                 vec![auto_parse_id],
-                vec![modified("src/lib.py", current_hash, historical_hash)],
+                vec![modified(0x104, "src/lib.py", current_hash, historical_hash)],
             ))
             .unwrap();
 
@@ -1467,7 +1308,7 @@ mod tests {
             .create_change(&change(
                 historical_id,
                 vec![genesis_id],
-                vec![added("src/lib.py", historical_hash)],
+                vec![added(0x105, "src/lib.py", historical_hash)],
             ))
             .unwrap();
 
@@ -1492,7 +1333,7 @@ mod tests {
     }
 
     #[test]
-    fn build_graph_at_ref_normalizes_dangling_file_origin_aliases() {
+    fn build_graph_at_ref_never_rewrites_dangling_file_origin_aliases() {
         let graph = InMemoryGraph::new();
         let temp = tempfile::tempdir().unwrap();
         let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
@@ -1526,7 +1367,7 @@ mod tests {
                 message: "aliased historical file".to_string(),
                 entity_deltas: vec![EntityDelta::Added(aliased.clone())],
                 relation_deltas: vec![],
-                tree_deltas: vec![added("src/lib.py", source_hash)],
+                tree_deltas: vec![added(0x106, "src/lib.py", source_hash)],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -1544,18 +1385,18 @@ mod tests {
             .expect("historical entity should still exist");
         assert_eq!(
             processor.file_origin,
-            Some(FilePathId::new("src/lib.py")),
-            "dangling basename aliases should normalize to the tracked historical file"
+            Some(FilePathId::new("lib.py")),
+            "historical reads must not seed identity by guessing a tracked path"
         );
         assert_eq!(
             processor.span.as_ref().map(|span| span.file.clone()),
-            Some(FilePathId::new("src/lib.py")),
-            "span file aliases should normalize alongside file origins"
+            Some(FilePathId::new("lib.py")),
+            "historical reads must preserve persisted span authority"
         );
     }
 
     #[test]
-    fn build_graph_at_ref_normalizes_suffix_path_aliases() {
+    fn build_graph_at_ref_never_rewrites_suffix_path_aliases() {
         let graph = InMemoryGraph::new();
         let temp = tempfile::tempdir().unwrap();
         let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
@@ -1589,7 +1430,7 @@ mod tests {
                 message: "suffix-aliased historical file".to_string(),
                 entity_deltas: vec![EntityDelta::Added(aliased.clone())],
                 relation_deltas: vec![],
-                tree_deltas: vec![added("project/src/lib.py", source_hash)],
+                tree_deltas: vec![added(0x107, "project/src/lib.py", source_hash)],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -1607,8 +1448,8 @@ mod tests {
             .expect("historical entity should still exist");
         assert_eq!(
             processor.file_origin,
-            Some(FilePathId::new("project/src/lib.py")),
-            "suffix-based path aliases should normalize when basename is ambiguous or missing"
+            Some(FilePathId::new("src/lib.py")),
+            "suffix similarity is not artifact identity"
         );
     }
 
@@ -1642,7 +1483,7 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
                 message: "sparse imported history".to_string(),
                 entity_deltas: vec![EntityDelta::Added(processor.clone())],
                 relation_deltas: vec![],
-                tree_deltas: vec![added("src/lib.py", historical_hash)],
+                tree_deltas: vec![added(0x108, "src/lib.py", historical_hash)],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -1694,7 +1535,7 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
             ParseCompleteness::Partial(_)
         ));
         let artifact_id = historical
-            .artifact_id_for_path(&FilePathId::new("src/lib.py"))
+            .artifact_id_at_path(&RepoPath::from_utf8("src/lib.py").unwrap())
             .expect("historical source artifact id");
         let coverage = historical
             .traverse(
@@ -1739,13 +1580,8 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
         assert_eq!(ordered.last().map(|change| change.id), Some(head));
     }
 
-    /// A truncated import can leave the oldest imported change pointing at a
-    /// parent that was never inserted (the import horizon). The ref-scoped
-    /// history walk must treat that dangling edge as the root of the visible
-    /// history and return the reachable changes, NOT fail "change not found" —
-    /// the bare error that 500s `locate --ref git:<oid>` even for HEAD.
     #[test]
-    fn collect_changes_at_ref_stops_at_import_horizon_instead_of_erroring() {
+    fn collect_changes_at_ref_rejects_an_incomplete_history() {
         let graph = InMemoryGraph::new();
         let missing_ancestor = SemanticChangeId::from_hash(Hash256::from_bytes([0x77; 32]));
         let boundary = SemanticChangeId::from_hash(Hash256::from_bytes([0x78; 32]));
@@ -1760,18 +1596,12 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
             .create_change(&change(head, vec![boundary], vec![]))
             .unwrap();
 
-        let ordered = collect_changes_at_ref(&graph, &head)
-            .expect("history walk must not fail at the import horizon");
-        let ids: Vec<_> = ordered.iter().map(|change| change.id).collect();
-        assert_eq!(
-            ids,
-            vec![boundary, head],
-            "walk returns the changes reachable above the horizon, oldest first"
-        );
+        let error = collect_changes_at_ref(&graph, &head).unwrap_err();
         assert!(
-            !ids.contains(&missing_ancestor),
-            "the unresolved ancestor must not appear in the collected history"
+            error.to_string().contains(&missing_ancestor.to_string()),
+            "the exact missing change must be reported: {error}"
         );
+        assert!(collect_first_parent_changes_at_ref(&graph, &head).is_err());
     }
 
     fn test_entity(name: &str, path: &str) -> Entity {
@@ -1809,57 +1639,41 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
         }
     }
 
-    /// The historical-ref reconstruction
-    /// replays persisted entities verbatim and is the only stage that
-    /// re-canonicalizes their paths, so it must also re-derive `role`. A
-    /// single-header amalgamated copy persisted before the `single_include/`
-    /// rule landed replays with a stale `role=Source`; `impact.rs` only excludes
-    /// `Generated`/`Vendored` consumers, so the stale copy leaks into
-    /// `consumer_count` and inflates a benign refactor's blast radius into a
-    /// false breaking finding. Reconstruction must reclassify it to `Generated`
-    /// while leaving a genuine source consumer at a real path as `Source`.
     #[test]
-    fn generated_consumer_excluded_at_historical_ref() {
+    fn historical_reads_do_not_reclassify_persisted_entity_roles() {
+        let graph = InMemoryGraph::new();
+        let temp = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
+        let source_hash = blob_store.write(b"int addReporter(void);").unwrap();
+        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x81; 32]));
         let mut amalgamated = test_entity("addReporter", "single_include/catch.hpp");
-        amalgamated.role = EntityRole::Source; // stale persisted role (pre-rule ingest)
+        amalgamated.role = EntityRole::Source;
         let amalgamated_id = amalgamated.id;
 
-        let mut real_source =
-            test_entity("addReporter", "include/reporters/catch_reporter_multi.hpp");
-        real_source.role = EntityRole::Source;
-        let real_source_id = real_source.id;
+        graph
+            .create_change(&SemanticChange {
+                id: change_id,
+                parents: vec![],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "persist exact role".to_string(),
+                entity_deltas: vec![EntityDelta::Added(amalgamated)],
+                relation_deltas: vec![],
+                tree_deltas: vec![added(0x109, "single_include/catch.hpp", source_hash)],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
 
-        let mut snapshot = GraphSnapshot::empty();
-        snapshot.entities.insert(amalgamated_id, amalgamated);
-        snapshot.entities.insert(real_source_id, real_source);
-
-        let file_tree: HashMap<FilePathId, TreeEntry> = [
-            (
-                FilePathId::new("single_include/catch.hpp"),
-                TreeEntry::regular(Hash256::from_bytes([0x11; 32]), false),
-            ),
-            (
-                FilePathId::new("include/reporters/catch_reporter_multi.hpp"),
-                TreeEntry::regular(Hash256::from_bytes([0x22; 32]), false),
-            ),
-        ]
-        .into_iter()
-        .collect();
-
-        let path_resolver = HistoricalPathResolver::from_changes(&[], &file_tree);
-        normalize_entity_file_origins_to_historical_tree(&mut snapshot, &file_tree, &path_resolver);
-
+        let historical = build_graph_at_ref(&graph, &blob_store, &change_id).unwrap();
+        let entity = historical.get_entity(&amalgamated_id).unwrap().unwrap();
         assert_eq!(
-            snapshot.entities[&amalgamated_id].role,
-            EntityRole::Generated,
-            "a single_include/ amalgamated copy persisted as Source must be re-derived to \
-             Generated during historical-ref reconstruction so impact.rs excludes it from \
-             consumer_count"
-        );
-        assert_eq!(
-            snapshot.entities[&real_source_id].role,
             EntityRole::Source,
-            "a genuine source consumer at a real path must remain a counted consumer"
+            entity.role,
+            "classification changes belong in explicit enrichment writes, not ref reads"
         );
     }
 
@@ -1868,8 +1682,7 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
         let e1 = EntityId::new();
         let e2 = EntityId::new();
         let e3 = EntityId::new();
-        let artifact_key =
-            kin_model::RetrievalKey::Artifact(kin_model::ArtifactId::seed_from_path("README.md"));
+        let artifact_key = kin_model::RetrievalKey::Artifact(kin_model::ArtifactId::new());
 
         let mut scoped = HashSet::new();
         scoped.insert(e1);
@@ -2031,7 +1844,7 @@ def uri_encoder(value):\n    return value\n",
                 message: "create victim".to_string(),
                 entity_deltas: vec![EntityDelta::Added(victim.clone())],
                 relation_deltas: vec![],
-                tree_deltas: vec![added("src/lib.py", stale_hash)],
+                tree_deltas: vec![added(0x10a, "src/lib.py", stale_hash)],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -2061,7 +1874,7 @@ def uri_encoder(value):\n    return value\n",
                 message: "remove victim, update source".to_string(),
                 entity_deltas: vec![EntityDelta::Removed(victim.id)],
                 relation_deltas: vec![],
-                tree_deltas: vec![modified("src/lib.py", stale_hash, new_hash)],
+                tree_deltas: vec![modified(0x10a, "src/lib.py", stale_hash, new_hash)],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -2084,13 +1897,10 @@ def uri_encoder(value):\n    return value\n",
         );
     }
 
-    /// Gap 5: when two files in the historical tree share a basename, a
-    /// dangling entity origin that points to that basename must NOT be
-    /// silently routed to whichever file was first inserted. Suffix-based
-    /// disambiguation should keep the entity on the file whose full path
-    /// matches the entity record.
+    /// A basename collision must never trigger suffix/basename routing. An
+    /// already-exact persisted entity origin remains unchanged.
     #[test]
-    fn build_graph_at_ref_disambiguates_basename_collisions_via_suffix() {
+    fn build_graph_at_ref_never_routes_basename_collisions_by_path_similarity() {
         let graph = InMemoryGraph::new();
         let temp = tempfile::tempdir().unwrap();
         let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
@@ -2126,8 +1936,8 @@ def uri_encoder(value):\n    return value\n",
                 entity_deltas: vec![EntityDelta::Added(entity_a.clone())],
                 relation_deltas: vec![],
                 tree_deltas: vec![
-                    added("crates/a/src/mod.rs", mod_a),
-                    added("crates/b/src/mod.rs", mod_b),
+                    added(0x10b, "crates/a/src/mod.rs", mod_a),
+                    added(0x10c, "crates/b/src/mod.rs", mod_b),
                 ],
                 projected_files: vec![],
                 spec_link: None,
@@ -2151,61 +1961,52 @@ def uri_encoder(value):\n    return value\n",
         );
     }
 
-    /// Gap 5: a rename between commits is tracked via blob-hash continuity.
-    /// An entity whose record still references the pre-rename path should
-    /// normalize to the post-rename canonical path at the ref.
     #[test]
-    fn historical_path_resolver_follows_blob_hash_renames() {
-        let resolver_blob = Hash256::from_bytes([0xe1; 32]);
+    fn historical_rename_keeps_artifact_identity_without_path_guessing() {
+        let graph = InMemoryGraph::new();
+        let temp = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
+        let resolver_blob = blob_store.write(b"exact bytes").unwrap();
         let create_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xe2; 32]));
         let rename_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xe3; 32]));
+        let stable_id = ArtifactId(uuid::Uuid::from_u128(0xe1));
+        let old = located("old/path/file.rs", resolver_blob);
+        let new = located("new/path/file.rs", resolver_blob);
 
-        let create_change = SemanticChange {
-            id: create_id,
-            parents: vec![],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("test"),
-            message: "create".into(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            tree_deltas: vec![added("old/path/file.rs", resolver_blob)],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
-        };
-        let rename_change = SemanticChange {
-            id: rename_id,
-            parents: vec![create_id],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("test"),
-            message: "rename".into(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            tree_deltas: vec![
-                removed("old/path/file.rs", resolver_blob),
-                added("new/path/file.rs", resolver_blob),
-            ],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
-        };
+        graph
+            .create_change(&change(
+                create_id,
+                vec![],
+                vec![TreeDelta::Added {
+                    artifact_id: stable_id,
+                    new: old.clone(),
+                }],
+            ))
+            .unwrap();
+        graph
+            .create_change(&change(
+                rename_id,
+                vec![create_id],
+                vec![TreeDelta::Updated {
+                    artifact_id: stable_id,
+                    old,
+                    new: new.clone(),
+                }],
+            ))
+            .unwrap();
 
-        let mut file_tree = HashMap::new();
-        file_tree.insert(
-            FilePathId::new("new/path/file.rs"),
-            TreeEntry::regular(resolver_blob, false),
+        let historical = build_graph_at_ref(&graph, &blob_store, &rename_id).unwrap();
+        assert_eq!(historical.artifact_id_at_path(&new.path), Some(stable_id));
+        assert_eq!(
+            historical.artifact_id_at_path(&RepoPath::from_utf8("old/path/file.rs").unwrap()),
+            None
         );
-
-        let resolver =
-            HistoricalPathResolver::from_changes(&[create_change, rename_change], &file_tree);
-        let resolved = resolver
-            .resolve(&FilePathId::new("old/path/file.rs"), &file_tree)
-            .expect("rename should be tracked");
-        assert_eq!(resolved, FilePathId::new("new/path/file.rs"));
+        let revision = graph
+            .resolve_artifact_revision_at(&stable_id, &rename_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(revision.artifact_id, stable_id);
+        assert_eq!(revision.path, new.path);
     }
 
     #[test]
@@ -2214,7 +2015,8 @@ def uri_encoder(value):\n    return value\n",
         let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
         let reader = BlobReader::new(&blob_store);
         let missing = kin_blobs::Hash256::from_bytes([0xfe; 32]);
-        let error = reader.read(&missing, "any/path").unwrap_err().to_string();
+        let path = RepoPath::from_utf8("any/path").unwrap();
+        let error = reader.read(&missing, &path).unwrap_err().to_string();
         assert!(
             error.contains("graph tree references missing or corrupt blob")
                 && error.contains("any/path"),
@@ -2222,164 +2024,201 @@ def uri_encoder(value):\n    return value\n",
         );
     }
 
-    /// Gap 5 (audit follow-up): rename chains spanning more than one hop
-    /// must resolve transitively. A → B → C means resolve("path-a")
-    /// returns "path-c", and resolving the intermediate "path-b" also
-    /// reaches "path-c".
     #[test]
-    fn historical_path_resolver_follows_multi_hop_renames() {
-        let blob_ab = Hash256::from_bytes([0xf1; 32]);
-        let blob_bc = Hash256::from_bytes([0xf2; 32]);
+    fn historical_view_preserves_non_utf8_paths_and_gitlinks_exactly() {
+        let graph = InMemoryGraph::new();
+        let temp = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
+        let blob_hash = blob_store.write(b"opaque bytes").unwrap();
+        let byte_path = RepoPath::from_bytes(b"assets/icon-\xff.bin".to_vec()).unwrap();
+        let gitlink_path = RepoPath::from_utf8("vendor/runtime").unwrap();
+        let blob_id = ArtifactId(uuid::Uuid::from_u128(0x91));
+        let gitlink_id = ArtifactId(uuid::Uuid::from_u128(0x92));
+        let git_target = GitObjectId::sha1([0x93; 20]);
+        let head = SemanticChangeId::from_hash(Hash256::from_bytes([0x94; 32]));
 
-        let create_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xf3; 32]));
-        let rename1_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xf4; 32]));
-        let rename2_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xf5; 32]));
+        graph
+            .create_change(&change(
+                head,
+                vec![],
+                vec![
+                    TreeDelta::Added {
+                        artifact_id: blob_id,
+                        new: LocatedEntry::new(
+                            byte_path.clone(),
+                            TreeEntry::blob(blob_hash, false),
+                        ),
+                    },
+                    TreeDelta::Added {
+                        artifact_id: gitlink_id,
+                        new: LocatedEntry::new(
+                            gitlink_path.clone(),
+                            TreeEntry::gitlink(git_target),
+                        ),
+                    },
+                ],
+            ))
+            .unwrap();
 
-        let create_change = SemanticChange {
-            id: create_id,
-            parents: vec![],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("test"),
-            message: "create".into(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            tree_deltas: vec![added("path-a", blob_ab)],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
-        };
-        // First hop: path-a -> path-b, content unchanged so blob_ab carries.
-        let rename1 = SemanticChange {
-            id: rename1_id,
-            parents: vec![create_id],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("test"),
-            message: "a->b".into(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            tree_deltas: vec![removed("path-a", blob_ab), added("path-b", blob_ab)],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
-        };
-        // Second hop: path-b -> path-c with a new content hash (blob_bc).
-        // The resolver still chains b->c via the Removed/Added pair on
-        // blob_bc; collapse then promotes a -> c.
-        let rename2 = SemanticChange {
-            id: rename2_id,
-            parents: vec![rename1_id],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("test"),
-            message: "b->c".into(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            tree_deltas: vec![removed("path-b", blob_bc), added("path-c", blob_bc)],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
-        };
-
-        let mut file_tree = HashMap::new();
-        file_tree.insert(
-            FilePathId::new("path-c"),
-            TreeEntry::regular(blob_bc, false),
-        );
-
-        let resolver =
-            HistoricalPathResolver::from_changes(&[create_change, rename1, rename2], &file_tree);
-
-        let resolved_a = resolver
-            .resolve(&FilePathId::new("path-a"), &file_tree)
-            .expect("multi-hop chain a->b->c should resolve");
-        assert_eq!(
-            resolved_a,
-            FilePathId::new("path-c"),
-            "transitive rename chain should collapse a -> c"
-        );
-
-        let resolved_b = resolver
-            .resolve(&FilePathId::new("path-b"), &file_tree)
-            .expect("mid-chain reference should still resolve to canonical");
-        assert_eq!(
-            resolved_b,
-            FilePathId::new("path-c"),
-            "intermediate path b should also resolve to canonical c"
+        let historical = build_graph_at_ref(&graph, &blob_store, &head).unwrap();
+        let byte_artifact = historical.resolved_artifact(&blob_id).unwrap();
+        assert_eq!(byte_artifact.path, byte_path);
+        assert_eq!(byte_artifact.entry, TreeEntry::blob(blob_hash, false));
+        let gitlink = historical.resolved_artifact(&gitlink_id).unwrap();
+        assert_eq!(gitlink.path, gitlink_path);
+        assert_eq!(gitlink.entry, TreeEntry::gitlink(git_target));
+        assert!(
+            historical.list_opaque_artifacts().unwrap().is_empty(),
+            "UTF-8-only enrichment must not invent a lossy path or gitlink blob"
         );
     }
 
     #[test]
-    fn historical_path_resolver_resolves_nested_monorepo_paths() {
-        let resolver_blob = Hash256::from_bytes([0xaa; 32]);
-        let mut file_tree = HashMap::new();
-        // The tree has the inner path (like in old commit)
-        file_tree.insert(
-            FilePathId::new("src/compiler/phases/css.js"),
-            TreeEntry::regular(resolver_blob, false),
-        );
+    fn historical_path_reuse_keeps_replacement_identity_distinct() {
+        let graph = InMemoryGraph::new();
+        let temp = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
+        let old_hash = blob_store.write(b"old").unwrap();
+        let new_hash = blob_store.write(b"new").unwrap();
+        let old_id = ArtifactId(uuid::Uuid::from_u128(0xa1));
+        let new_id = ArtifactId(uuid::Uuid::from_u128(0xa2));
+        let path = RepoPath::from_utf8("config/runtime.bin").unwrap();
+        let old = LocatedEntry::new(path.clone(), TreeEntry::blob(old_hash, false));
+        let new = LocatedEntry::new(path.clone(), TreeEntry::blob(new_hash, false));
+        let create = SemanticChangeId::from_hash(Hash256::from_bytes([0xa3; 32]));
+        let replace = SemanticChangeId::from_hash(Hash256::from_bytes([0xa4; 32]));
 
-        let resolver = HistoricalPathResolver::from_changes(&[], &file_tree);
+        graph
+            .create_change(&change(
+                create,
+                vec![],
+                vec![TreeDelta::Added {
+                    artifact_id: old_id,
+                    new: old.clone(),
+                }],
+            ))
+            .unwrap();
+        graph
+            .create_change(&change(
+                replace,
+                vec![create],
+                vec![
+                    TreeDelta::Removed {
+                        artifact_id: old_id,
+                        old,
+                    },
+                    TreeDelta::Added {
+                        artifact_id: new_id,
+                        new,
+                    },
+                ],
+            ))
+            .unwrap();
 
-        // Resolving a query/HEAD path that is nested (monorepo layout)
-        let resolved = resolver
-            .resolve(
-                &FilePathId::new("packages/svelte/src/compiler/phases/css.js"),
-                &file_tree,
-            )
-            .expect("should resolve nested query path to inner tree path");
-        assert_eq!(resolved, FilePathId::new("src/compiler/phases/css.js"));
-
-        // Resolving an inner path when tree has a nested path (the other way around)
-        let mut file_tree_nested = HashMap::new();
-        file_tree_nested.insert(
-            FilePathId::new("packages/svelte/src/compiler/phases/css.js"),
-            TreeEntry::regular(resolver_blob, false),
-        );
-
-        let resolver_nested = HistoricalPathResolver::from_changes(&[], &file_tree_nested);
-        let resolved_nested = resolver_nested
-            .resolve(
-                &FilePathId::new("src/compiler/phases/css.js"),
-                &file_tree_nested,
-            )
-            .expect("should resolve inner query path to nested tree path");
+        let historical = build_graph_at_ref(&graph, &blob_store, &replace).unwrap();
+        assert_eq!(historical.artifact_id_at_path(&path), Some(new_id));
+        assert!(historical.resolved_artifact(&old_id).is_none());
+        assert!(graph
+            .resolve_artifact_revision_at(&old_id, &replace)
+            .unwrap()
+            .is_none());
         assert_eq!(
-            resolved_nested,
-            FilePathId::new("packages/svelte/src/compiler/phases/css.js")
+            graph
+                .resolve_artifact_revision_at(&new_id, &replace)
+                .unwrap()
+                .unwrap()
+                .artifact_id,
+            new_id
         );
     }
 
     #[test]
-    fn historical_path_resolver_resolves_renamed_packages() {
-        let resolver_blob = Hash256::from_bytes([0xaa; 32]);
-        let mut file_tree = HashMap::new();
-        // The tree has the historical path: packages/material-ui/src/useAutocomplete/index.js
-        file_tree.insert(
-            FilePathId::new("packages/material-ui/src/useAutocomplete/index.js"),
-            TreeEntry::regular(resolver_blob, false),
-        );
-        file_tree.insert(
-            FilePathId::new("packages/material-ui/src/index.js"),
-            TreeEntry::regular(resolver_blob, false),
-        );
+    fn merge_state_is_first_parent_relative_with_both_revision_predecessors() {
+        let graph = InMemoryGraph::new();
+        let temp = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
+        let base_hash = blob_store.write(b"base").unwrap();
+        let first_hash = blob_store.write(b"first").unwrap();
+        let second_hash = blob_store.write(b"second").unwrap();
+        let merged_hash = blob_store.write(b"merged").unwrap();
+        let artifact_id = ArtifactId(uuid::Uuid::from_u128(0xb1));
+        let path = RepoPath::from_utf8("compose.yaml").unwrap();
+        let state = |hash| LocatedEntry::new(path.clone(), TreeEntry::blob(hash, false));
+        let base = SemanticChangeId::from_hash(Hash256::from_bytes([0xb2; 32]));
+        let first = SemanticChangeId::from_hash(Hash256::from_bytes([0xb3; 32]));
+        let second = SemanticChangeId::from_hash(Hash256::from_bytes([0xb4; 32]));
+        let merge = SemanticChangeId::from_hash(Hash256::from_bytes([0xb5; 32]));
 
-        let resolver = HistoricalPathResolver::from_changes(&[], &file_tree);
+        graph
+            .create_change(&change(
+                base,
+                vec![],
+                vec![TreeDelta::Added {
+                    artifact_id,
+                    new: state(base_hash),
+                }],
+            ))
+            .unwrap();
+        graph
+            .create_change(&change(
+                first,
+                vec![base],
+                vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: state(base_hash),
+                    new: state(first_hash),
+                }],
+            ))
+            .unwrap();
+        graph
+            .create_change(&change(
+                second,
+                vec![base],
+                vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: state(base_hash),
+                    new: state(second_hash),
+                }],
+            ))
+            .unwrap();
+        graph
+            .create_change(&change(
+                merge,
+                vec![first, second],
+                vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: state(first_hash),
+                    new: state(merged_hash),
+                }],
+            ))
+            .unwrap();
 
-        // Resolving a legacy path that had its package renamed: packages/mui-material/src/useAutocomplete/index.js
-        let resolved = resolver
-            .resolve(
-                &FilePathId::new("packages/mui-material/src/useAutocomplete/index.js"),
-                &file_tree,
-            )
-            .expect("should resolve renamed package path via common suffix");
+        let historical = build_graph_at_ref(&graph, &blob_store, &merge).unwrap();
         assert_eq!(
-            resolved,
-            FilePathId::new("packages/material-ui/src/useAutocomplete/index.js")
+            historical.resolved_artifact(&artifact_id).unwrap().entry,
+            TreeEntry::blob(merged_hash, false)
+        );
+
+        let revisions = graph
+            .get_artifact_revisions_at(&artifact_id, &merge)
+            .unwrap();
+        let first_revision = revisions
+            .iter()
+            .find(|revision| revision.introduced_by == first)
+            .unwrap()
+            .revision_id;
+        let second_revision = revisions
+            .iter()
+            .find(|revision| revision.introduced_by == second)
+            .unwrap()
+            .revision_id;
+        let merge_revision = revisions
+            .iter()
+            .find(|revision| revision.introduced_by == merge)
+            .unwrap();
+        assert_eq!(
+            merge_revision.predecessor_revisions,
+            vec![first_revision, second_revision]
         );
     }
 
