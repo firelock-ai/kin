@@ -7,13 +7,11 @@
 //! refs, workspace state, aliases, or source bytes from legacy sidecars, Git,
 //! or the working directory.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager, RepositoryAuthorityState};
 use kin_model::{
-    decode_git_external_object, ExternalObjectId, ExternalObjectKind, GitObjectDependencyKind,
     GitObjectId, RefName, RefTarget, RepositoryId, SemanticChangeId, WorkspaceId, WorkspaceState,
 };
 
@@ -69,87 +67,20 @@ impl ActiveRepositoryAuthority {
             })
     }
 
-    /// Resolve one exact ref target against a caller-owned authority lease.
-    ///
-    /// Keeping resolution inside the supplied immutable state prevents a
-    /// request from mixing ref, alias, and external-object generations. Tags
-    /// are peeled only through authority-recorded bodies in Kin's source CAS;
-    /// Git and checkout files are never consulted.
-    pub(crate) fn resolve_target_in_state(
-        &self,
-        state: &RepositoryAuthorityState,
-        target: &RefTarget,
-    ) -> Result<SemanticChangeId> {
-        let mut target = target.clone();
-        let mut visited_refs = BTreeSet::new();
-        let mut visited_objects = BTreeSet::new();
-        loop {
-            match target {
-                RefTarget::Change { change_id } => return Ok(change_id),
-                RefTarget::ExternalObject { object } => match object.kind {
-                    ExternalObjectKind::Commit => {
-                        return state
-                            .metadata()
-                            .aliases
-                            .iter()
-                            .find(|alias| alias.oid == object.oid)
-                            .map(|alias| alias.change_id)
-                            .ok_or_else(|| {
-                                anyhow!(
-                                    "external commit {} has no repository-v6 semantic alias",
-                                    object.oid
-                                )
-                            });
-                    }
-                    ExternalObjectKind::Tag => {
-                        if !visited_objects.insert(object) {
-                            anyhow::bail!(
-                                "external tag cycle reaches repository object {}",
-                                object.oid
-                            );
-                        }
-                        target = RefTarget::external_object(self.peel_tag_in_state(state, object)?);
-                    }
-                    ExternalObjectKind::Tree | ExternalObjectKind::Blob => {
-                        anyhow::bail!(
-                            "repository ref target {} is a {:?}, not a materializable change",
-                            object.oid,
-                            object.kind
-                        );
-                    }
-                },
-                RefTarget::Symbolic { target: name } => {
-                    if !visited_refs.insert(name.clone()) {
-                        anyhow::bail!("symbolic repository ref cycle reaches {name}");
-                    }
-                    target = state
-                        .metadata()
-                        .ref_state
-                        .refs
-                        .iter()
-                        .find(|repository_ref| repository_ref.name == name)
-                        .map(|repository_ref| repository_ref.target.clone())
-                        .ok_or_else(|| anyhow!("symbolic repository ref {name} is absent"))?;
-                }
-            }
-        }
-    }
-
     pub(crate) fn resolve_named_ref(&self, name: &RefName) -> Result<SemanticChangeId> {
         let lease = self.manager.read_authority();
-        let repository_ref = lease
-            .metadata()
-            .ref_state
-            .refs
-            .iter()
-            .find(|repository_ref| &repository_ref.name == name)
+        let target = lease
+            .resolve_ref_target(name)
+            .with_context(|| format!("resolve repository ref '{name}'"))?
             .ok_or_else(|| anyhow!("repository ref '{name}' was not found"))?;
-        self.resolve_target_in_state(&lease, &repository_ref.target)
+        lease
+            .resolve_target_change_id(&target)
+            .with_context(|| format!("resolve repository ref '{name}' semantic target"))
     }
 
     pub(crate) fn current_change_id(&self) -> Result<Option<SemanticChangeId>> {
         let lease = self.manager.read_authority();
-        lease
+        let workspace = lease
             .metadata()
             .workspaces
             .iter()
@@ -160,10 +91,11 @@ impl ActiveRepositoryAuthority {
                     self.repository_id,
                     self.workspace_id
                 )
-            })?
+            })?;
+        workspace
             .base_target
             .as_ref()
-            .map(|target| self.resolve_target_in_state(&lease, target))
+            .map(|target| resolve_target_in_authority(&lease, target))
             .transpose()
     }
 
@@ -191,46 +123,22 @@ impl ActiveRepositoryAuthority {
             .with_context(|| format!("save immutable repository source blob {digest}"))
     }
 
-    fn peel_tag_in_state(
-        &self,
-        state: &RepositoryAuthorityState,
-        object: ExternalObjectId,
-    ) -> Result<ExternalObjectId> {
-        let record = state
-            .metadata()
-            .external_objects
-            .iter()
-            .find(|record| record.object == object)
-            .ok_or_else(|| {
-                anyhow!(
-                    "external tag {} has no repository-v6 object record",
-                    object.oid
-                )
-            })?;
-        let body = self.load_source_blob(record.body_hash)?;
-        let git_authority = state
-            .metadata()
-            .git_external_authority
-            .as_ref()
-            .ok_or_else(|| {
-                anyhow!(
-                    "external tag {} has no repository-v6 Git authority",
-                    object.oid
-                )
-            })?;
-        let decoded = decode_git_external_object(git_authority.object_format, record, &body)
-            .with_context(|| format!("decode repository-v6 external tag {}", object.oid))?;
-        let mut targets = decoded.dependencies.iter().filter_map(|dependency| {
-            (dependency.kind == GitObjectDependencyKind::TagTarget).then_some(dependency.target)
-        });
-        let target = targets
-            .next()
-            .ok_or_else(|| anyhow!("external tag {} has no exact target", object.oid))?;
-        if targets.next().is_some() {
-            anyhow::bail!("external tag {} has multiple exact targets", object.oid);
-        }
-        Ok(target)
-    }
+}
+
+fn resolve_target_in_authority(
+    authority: &RepositoryAuthorityState,
+    target: &RefTarget,
+) -> Result<SemanticChangeId> {
+    let resolved = match target {
+        RefTarget::Symbolic { target: name } => authority
+            .resolve_ref_target(name)
+            .with_context(|| format!("resolve symbolic repository ref '{name}'"))?
+            .ok_or_else(|| anyhow!("symbolic repository ref '{name}' is absent"))?,
+        target => target.clone(),
+    };
+    authority
+        .resolve_target_change_id(&resolved)
+        .context("resolve repository target to an exact semantic change")
 }
 
 pub(crate) fn parse_ref_name(value: &str) -> Result<RefName> {
