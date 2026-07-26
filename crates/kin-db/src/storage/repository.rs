@@ -1561,18 +1561,7 @@ fn validate_new_change_bodies<B: StorageBackend + ?Sized>(
     changes: &[kin_model::SemanticChange],
     policies: &[ChangeAdmissionPolicy],
 ) -> Result<(), KinDbError> {
-    for change in changes {
-        for delta in &change.tree_deltas {
-            if let Some(new) = delta.new_state() {
-                validate_tree_entry_body(
-                    backend,
-                    repository_id,
-                    new.entry,
-                    &format!("change {} artifact {}", change.id, new.path),
-                )?;
-            }
-        }
-    }
+    validate_change_tree_bodies(backend, repository_id, changes)?;
     let changed_ids: BTreeSet<_> = changes.iter().map(|change| change.id).collect();
     for resolved in policies
         .iter()
@@ -1604,18 +1593,7 @@ fn validate_all_authority_bodies<B: StorageBackend + ?Sized>(
         )?;
         record.validate_raw(&body)?;
     }
-    for change in snapshot.changes.values() {
-        for delta in &change.tree_deltas {
-            if let Some(new) = delta.new_state() {
-                validate_tree_entry_body(
-                    backend,
-                    repository_id,
-                    new.entry,
-                    &format!("change {} artifact {}", change.id, new.path),
-                )?;
-            }
-        }
-    }
+    validate_change_tree_bodies(backend, repository_id, snapshot.changes.values())?;
     for workspace in &metadata.workspaces {
         validate_tree_bodies(
             backend,
@@ -1639,6 +1617,39 @@ fn validate_all_authority_bodies<B: StorageBackend + ?Sized>(
                 source.body_len,
                 "local admission rule source",
             )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_change_tree_bodies<'a, B, I>(
+    backend: &B,
+    repository_id: &RepositoryId,
+    changes: I,
+) -> Result<(), KinDbError>
+where
+    B: StorageBackend + ?Sized,
+    I: IntoIterator<Item = &'a kin_model::SemanticChange>,
+{
+    let mut validated = BTreeSet::new();
+    for change in changes {
+        for delta in &change.tree_deltas {
+            for (state, side) in [(delta.old_state(), "old"), (delta.new_state(), "new")] {
+                let Some(state) = state else {
+                    continue;
+                };
+                let Some(digest) = state.entry.blob_identity() else {
+                    continue;
+                };
+                if validated.insert(digest) {
+                    validate_tree_entry_body(
+                        backend,
+                        repository_id,
+                        state.entry,
+                        &format!("change {} {side} artifact {}", change.id, state.path),
+                    )?;
+                }
+            }
         }
     }
     Ok(())
@@ -1731,7 +1742,7 @@ fn load_unbounded_body<B: StorageBackend + ?Sized>(
     digest: Hash256,
     label: &str,
 ) -> Result<Vec<u8>, KinDbError> {
-    backend
+    let body = backend
         .load_source_blob_bounded(
             repository_id.as_str(),
             *digest.as_bytes(),
@@ -1742,7 +1753,12 @@ fn load_unbounded_body<B: StorageBackend + ?Sized>(
                 "{label} body {} is absent from immutable source CAS",
                 digest
             ))
-        })
+        })?;
+    let body_len = u64::try_from(body.len())
+        .map_err(|_| storage(format!("{label} body length does not fit u64")))?;
+    validate_source_blob_size(body_len, label)?;
+    verify_source_blob_digest(*digest.as_bytes(), &body, label)?;
+    Ok(body)
 }
 
 fn placeholder_roots(generation: u64) -> RootBundle {
@@ -2437,6 +2453,56 @@ mod tests {
         (transaction, change_id, target)
     }
 
+    fn remove_compose_transaction(
+        manager: &RepositoryAuthorityManager<MemoryBackend>,
+        operation: u128,
+    ) -> (RepositoryTransaction, Hash256) {
+        let lease = manager.read_authority();
+        let old_target = lease.metadata().ref_state.refs[0].target.clone();
+        let old_change = target_change_id(lease.metadata(), &old_target).unwrap();
+        let compose = lease.metadata().workspaces[0]
+            .tree
+            .artifact_at_path(&RepoPath::from_utf8("compose.yaml").unwrap())
+            .unwrap();
+        let old_body = compose
+            .entry
+            .blob_identity()
+            .expect("compose fixture has a source body");
+        let removal = TreeDelta::Removed {
+            artifact_id: compose.artifact_id,
+            old: compose.located_entry(),
+        };
+        drop(lease);
+
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: vec![old_change],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("authority-test"),
+            message: "remove compose while retaining exact history".to_string(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: vec![removal],
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        change.id = compute_semantic_change_id(&change).unwrap();
+
+        let mut transaction = transaction_shell(manager, operation);
+        transaction.changes.push(change.clone());
+        transaction.ref_mutations.push(RefMutation {
+            name: RefName::branch(b"main").unwrap(),
+            expected: RefExpectation::MustEqual { target: old_target },
+            new_target: Some(RefTarget::change(change.id)),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        });
+        (transaction, old_body)
+    }
+
     #[test]
     fn reopen_replays_unreferenced_history_leaves_fail_closed() {
         let artifact_id = ArtifactId(Uuid::from_u128(0xdead));
@@ -2504,6 +2570,53 @@ mod tests {
         assert!(
             error.to_string().contains("tree"),
             "unexpected replay error: {error}"
+        );
+    }
+
+    #[test]
+    fn removal_rejects_a_missing_old_body_before_publication() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .unwrap();
+        let (transaction, old_body) = remove_compose_transaction(&manager, 0x0d1);
+        backend.blobs.lock().remove(old_body.as_bytes());
+
+        let error = manager
+            .commit_repository_transaction(transaction)
+            .expect_err("removed historical bytes must remain reconstructable");
+        assert!(
+            error.to_string().contains("old artifact")
+                && error
+                    .to_string()
+                    .contains("absent from immutable source CAS"),
+            "unexpected missing-old-body error: {error}"
+        );
+        assert_eq!(manager.read_authority().generation(), 1);
+    }
+
+    #[test]
+    fn reopen_rejects_tampered_bytes_retained_by_a_removal_delta() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .unwrap();
+        let (transaction, old_body) = remove_compose_transaction(&manager, 0x0d2);
+        manager.commit_repository_transaction(transaction).unwrap();
+        backend
+            .blobs
+            .lock()
+            .insert(*old_body.as_bytes(), b"tampered historical bytes".to_vec());
+
+        let error = match RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)) {
+            Ok(_) => panic!("tampered historical bytes must fail authority reopen"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("digest mismatch"),
+            "unexpected tampered-old-body error: {error}"
         );
     }
 
