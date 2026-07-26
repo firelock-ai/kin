@@ -135,13 +135,15 @@
       "required_for_bounded_dogfood": true,
       "acceptance_spec": [
         "transition exact workspace head and tree atomically against expected generation and roots",
-        "materialize the committed graph tree with rollback and verify all source bodies from repository CAS"
+        "verify every blob and symlink body from repository CAS while materializing only entries this host can represent",
+        "retain complete graph authority across Gitlink add, remove, and retarget operations and host-unrepresentable byte paths without inventing source blobs",
+        "preserve independently owned Gitlink directories without traversing their contents and fail closed on namespace races or projection tampering"
       ],
       "evidence_tests": [
         "crates/kin-core/src/tree.rs",
         "crates/kin-cli/tests/repository_branches.rs"
       ],
-      "note": "Branch switch resolves byte-exact repository refs from one authority lease, loads complete blob and symlink bodies from repository CAS, and commits the exact workspace mutation through a crash-recoverable projection WAL. Dirty graph workspaces and gitlink projection fail closed."
+      "note": "Branch switch resolves byte-exact repository refs from one authority lease, verifies the complete blob and symlink closure from repository CAS, and commits the exact workspace mutation through a crash-recoverable projection WAL. Gitlinks and host-unrepresentable paths remain exact graph members; only host-materializable source bodies are projected."
     },
     {
       "command": "git export",

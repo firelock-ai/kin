@@ -16,8 +16,8 @@ use std::sync::Arc;
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
 use kin_model::{
     compute_resolved_tree_hash, GraphStore, Hash256, OperationId, RepoPath,
-    RepositoryCommitReceipt, RepositoryId, RepositoryTransaction, ResolvedTree, SemanticChangeId,
-    TreeEntry,
+    RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId, RepositoryTransaction,
+    ResolvedTree, SemanticChangeId, TreeEntry, WorkspaceExpectation,
 };
 
 use crate::{KinError, Result};
@@ -258,6 +258,7 @@ pub fn reconcile_source_tree_and_commit_repository_transaction<'a, 'b>(
         &previous_entries,
         &entries,
         &transaction,
+        GraphOnlyTransitionPolicy::RequireUnchanged,
     )?;
     let materialized_count = entries.len();
     let marker = ReconciliationAuthorityCommit {
@@ -272,12 +273,171 @@ pub fn reconcile_source_tree_and_commit_repository_transaction<'a, 'b>(
         &previous_entries,
         &entries,
         &should_preserve_checkout_path,
+        ReconciledProjectionOptions::default(),
+        || {},
         || {},
         || {},
         Some(marker),
         || commit_repository_transaction_exact(authority, transaction),
     )
     .map(|(_, receipt)| (materialized_count, receipt))
+}
+
+/// Transition one complete repository-v6 workspace tree, including exact
+/// graph-only metadata, and publish its authority transaction at the
+/// projection WAL's commit boundary.
+///
+/// Only host-materializable blobs and symbolic links receive source bodies or
+/// filesystem writes. Gitlinks remain typed repository entries: an absent
+/// Gitlink stays absent, while an existing no-follow real directory is
+/// identity-bound and retained without inspecting independently owned
+/// descendants. Host-unrepresentable paths likewise remain in
+/// [`ResolvedTree`] without acquiring lossy local aliases.
+///
+/// Unlike ordinary source reconciliation, this is the dedicated graph-native
+/// workspace transition allowed to add, remove, or retarget graph-only
+/// entries. It requires an already initialized projection control plane and
+/// retains the root, projection lock, repository roots, and recovery journal
+/// through authority publication.
+///
+/// This API is deliberately ref-agnostic. Branch switch, detached checkout,
+/// ref checkout, and future restore operations should all construct their
+/// exact repository-v6 [`RepositoryTransaction`] and delegate the shared
+/// filesystem/authority transition here.
+pub fn transition_repository_workspace_tree_and_commit_repository_transaction(
+    root: &Path,
+    previous_tree: &ResolvedTree,
+    target_tree: &ResolvedTree,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    transaction: RepositoryTransaction,
+) -> Result<(usize, RepositoryCommitReceipt)> {
+    transition_repository_workspace_tree_and_commit_with_hooks(
+        root,
+        previous_tree,
+        target_tree,
+        authority,
+        transaction,
+        || {},
+        || {},
+        || {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transition_repository_workspace_tree_and_commit_with_hooks(
+    root: &Path,
+    previous_tree: &ResolvedTree,
+    target_tree: &ResolvedTree,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    transaction: RepositoryTransaction,
+    after_read_only_preflight: impl FnOnce(),
+    after_identity_revalidation: impl FnOnce(),
+    after_projection_mutation: impl FnOnce(),
+) -> Result<(usize, RepositoryCommitReceipt)> {
+    let previous_owned =
+        load_repository_projection_entries(authority, previous_tree, "previous workspace")?;
+    let target_owned =
+        load_repository_projection_entries(authority, target_tree, "target workspace")?;
+    let previous_entries = validated_source_entries(
+        previous_owned
+            .iter()
+            .map(|entry| (&entry.path, entry.kind, entry.content.as_slice())),
+    )?;
+    let entries = validated_source_entries(
+        target_owned
+            .iter()
+            .map(|entry| (&entry.path, entry.kind, entry.content.as_slice())),
+    )?;
+    validate_repository_projection_transaction(
+        previous_tree,
+        target_tree,
+        &previous_entries,
+        &entries,
+        &transaction,
+        GraphOnlyTransitionPolicy::AllowExactMetadataTransition,
+    )?;
+    let materialized_count = entries.len();
+    let marker = ReconciliationAuthorityCommit {
+        repository_id: transaction.repository_id.clone(),
+        operation_id: transaction.operation_id,
+        transaction_hash: transaction
+            .transaction_hash()
+            .map_err(|error| KinError::Other(error.to_string()))?,
+    };
+    project_reconciled_source_tree_and_commit(
+        root,
+        &previous_entries,
+        &entries,
+        &should_preserve_checkout_path,
+        ReconciledProjectionOptions {
+            open_mode: ProjectionOpenMode::ExistingFrozen,
+            graph_only_transition: Some(GraphOnlyWorkspaceTransition {
+                previous_tree,
+                target_tree,
+            }),
+        },
+        after_read_only_preflight,
+        after_identity_revalidation,
+        after_projection_mutation,
+        Some(marker),
+        || commit_repository_transaction_exact(authority, transaction),
+    )
+    .map(|(_, receipt)| (materialized_count, receipt))
+}
+
+struct OwnedProjectionSourceEntry {
+    path: RepoPath,
+    kind: TreeEntry,
+    content: Vec<u8>,
+}
+
+fn load_repository_projection_entries(
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    tree: &ResolvedTree,
+    label: &str,
+) -> Result<Vec<OwnedProjectionSourceEntry>> {
+    let mut entries = Vec::new();
+    for artifact in tree.artifacts_by_path() {
+        let disposition = source_projection_disposition(&artifact.path, artifact.entry)?;
+        let Some(expected) = artifact.entry.blob_identity() else {
+            if disposition != SourceProjectionDisposition::GraphOnlyGitlink {
+                return Err(KinError::Other(format!(
+                    "{label} path {} has no source-CAS identity but is not a Gitlink",
+                    artifact.path
+                )));
+            }
+            continue;
+        };
+        let content = authority
+            .load_source_blob(expected)
+            .map_err(|error| {
+                KinError::Other(format!(
+                    "load {label} source-CAS object {expected} for {}: {error}",
+                    artifact.path
+                ))
+            })?
+            .ok_or_else(|| {
+                KinError::Other(format!(
+                    "{label} source-CAS object {expected} for {} is absent",
+                    artifact.path
+                ))
+            })?;
+        let actual = Hash256::from_bytes(kin_blobs::digest_bytes(&content));
+        if actual != expected {
+            return Err(KinError::Other(format!(
+                "{label} source-CAS object for {} hashes to {actual}, expected {expected}",
+                artifact.path
+            )));
+        }
+        if disposition == SourceProjectionDisposition::Materialized {
+            entries.push(OwnedProjectionSourceEntry {
+                path: artifact.path.clone(),
+                kind: artifact.entry,
+                content,
+            });
+        }
+    }
+    Ok(entries)
 }
 
 /// Verify an already-current source projection and publish one repository
@@ -299,7 +459,14 @@ pub fn verify_unchanged_source_tree_and_commit_repository_transaction<'a>(
     transaction: RepositoryTransaction,
 ) -> Result<(usize, RepositoryCommitReceipt)> {
     let entries = validated_projection_proof_entries(entries)?;
-    validate_repository_projection_transaction(tree, tree, &entries, &entries, &transaction)?;
+    validate_repository_projection_transaction(
+        tree,
+        tree,
+        &entries,
+        &entries,
+        &transaction,
+        GraphOnlyTransitionPolicy::RequireUnchanged,
+    )?;
 
     #[cfg(any(unix, windows))]
     {
@@ -312,7 +479,7 @@ pub fn verify_unchanged_source_tree_and_commit_repository_transaction<'a>(
             .projection
             .revalidate_frozen_entries_unchanged(&entry_refs, &identities)?;
         freeze.revalidate_namespace()?;
-        let receipt = commit_repository_transaction_exact(authority, transaction)?;
+        let receipt = commit_repository_transaction_exact(authority, transaction).into_result()?;
         Ok((entries.len(), receipt))
     }
 
@@ -329,6 +496,7 @@ fn validate_repository_projection_transaction(
     previous_entries: &[ValidatedSourceEntry<'_>],
     entries: &[ValidatedSourceEntry<'_>],
     transaction: &RepositoryTransaction,
+    graph_only_policy: GraphOnlyTransitionPolicy,
 ) -> Result<()> {
     let mutation = transaction.workspace_mutation.as_ref().ok_or_else(|| {
         KinError::Other(
@@ -345,26 +513,51 @@ fn validate_repository_projection_transaction(
     }
     let target_tree_hash = compute_resolved_tree_hash(target_tree)
         .map_err(|error| KinError::Other(error.to_string()))?;
+    let previous_tree_hash = compute_resolved_tree_hash(previous_tree)
+        .map_err(|error| KinError::Other(error.to_string()))?;
+    match &mutation.expected {
+        WorkspaceExpectation::MustEqual { tree_hash, .. } if *tree_hash == previous_tree_hash => {}
+        WorkspaceExpectation::MustEqual { tree_hash, .. } => {
+            return Err(KinError::Other(format!(
+                "workspace mutation expects prior tree {tree_hash}, but caller supplied {previous_tree_hash}"
+            )));
+        }
+        WorkspaceExpectation::MustNotExist => {
+            return Err(KinError::Other(
+                "exact repository workspace transition requires a MustEqual prior workspace"
+                    .to_string(),
+            ));
+        }
+    }
     if mutation.new_tree_hash != target_tree_hash {
         return Err(KinError::Other(format!(
             "workspace mutation tree hash {} does not match requested projection tree {}",
             mutation.new_tree_hash, target_tree_hash
         )));
     }
-    validate_unchanged_graph_only_entries(previous_tree, target_tree)?;
+    if graph_only_policy == GraphOnlyTransitionPolicy::RequireUnchanged {
+        validate_unchanged_graph_only_entries(previous_tree, target_tree)?;
+    }
     validate_repository_projection_entries_match_tree("previous", previous_tree, previous_entries)?;
     validate_repository_projection_entries_match_tree("target", target_tree, entries)?;
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GraphOnlyTransitionPolicy {
+    RequireUnchanged,
+    AllowExactMetadataTransition,
+}
+
 /// Require graph-only repository members to remain byte-for-byte repository
 /// identity across a source-projection transaction.
 ///
-/// Gitlinks are exact repository tree entries, but they are not source blobs
-/// owned by this repository and may have an independently managed derived
-/// checkout at their path. Moving, adding, removing, or retargeting one needs a
-/// dedicated subrepository transaction; an ordinary source projection must
-/// never infer that transition from ambient directory contents.
+/// Gitlinks and host-unrepresentable members are exact repository tree
+/// entries, but they are not ordinary host projection objects. A Gitlink may
+/// have an independently managed derived checkout at its path. Moving, adding,
+/// removing, or retargeting graph-only state needs the dedicated workspace
+/// transition above; ordinary source reconciliation must never infer such a
+/// transition from ambient filesystem contents.
 fn validate_unchanged_graph_only_entries(
     previous_tree: &ResolvedTree,
     target_tree: &ResolvedTree,
@@ -397,11 +590,10 @@ fn validate_unchanged_graph_only_entries(
 /// Bind the materializable source bodies to the complete repository tree
 /// without pretending graph-only entries have local blob bodies.
 ///
-/// The caller separately proves that the complete previous tree transitions
-/// to the complete target tree and that every graph-only member is unchanged.
-/// This comparison therefore must cover exactly every blob and symlink, while
-/// excluding exactly the typed Gitlink set—never an arbitrary unsupported
-/// path.
+/// The caller separately proves how the complete previous tree transitions to
+/// the complete target tree. This comparison therefore covers exactly the
+/// materializable subset while excluding only entries classified by explicit
+/// host policy as graph-only—never arbitrary unknown or unsupported content.
 fn validate_repository_projection_entries_match_tree(
     label: &str,
     tree: &ResolvedTree,
@@ -1120,6 +1312,36 @@ impl ExactProjectionFreeze {
         }
     }
 
+    /// Acquire an existing projection for an authority-publishing workspace
+    /// transition, recovering an earlier authenticated reconciliation WAL
+    /// before admitting a new one.
+    ///
+    /// Unlike ordinary projection open, this never creates or repairs `.kin`
+    /// control state. Unlike eject freeze, it may recover a prior repository
+    /// transition because branch retry is itself the recovery boundary.
+    fn acquire_existing_for_transition(root: &Path) -> Result<Self> {
+        #[cfg(any(unix, windows))]
+        {
+            let projection = ProjectionRoot::open_existing_for_reconciliation(
+                root,
+                PROJECTION_LOCK_WAIT_DEADLINE,
+            )?;
+            let root_identity = tracked_open_directory_identity(&projection.root)
+                .map_err(|error| KinError::io(root, error))?;
+            let freeze = Self {
+                projection,
+                root_identity,
+            };
+            freeze.revalidate_namespace()?;
+            Ok(freeze)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = root;
+            Err(unsupported_safe_projection_error())
+        }
+    }
+
     /// Materialize and atomically publish one exact session projection beneath
     /// the retained repository's `.kin/runs` directory, creating that
     /// directory through the retained `.kin` capability when absent.
@@ -1363,13 +1585,15 @@ impl ExactProjectionFreeze {
             )?;
             let mut verified = Vec::with_capacity(tree.len());
             for artifact in tree.artifacts_by_path() {
-                let materializable_path = materializable_projection_proof_path(&artifact.path)?;
-                let proof = match (materializable_path, artifact.entry) {
-                    (None, _) => ExactProjectionEntryProof::HostUnrepresentableAbsent,
-                    (Some(_), TreeEntry::Gitlink { .. }) => {
-                        self.projection.verify_frozen_gitlink(&artifact.path)?
-                    }
-                    (Some(_), TreeEntry::Blob { .. } | TreeEntry::Symlink { .. }) => {
+                let disposition = source_projection_disposition(&artifact.path, artifact.entry)?;
+                let proof = match disposition {
+                    SourceProjectionDisposition::GraphOnlyGitlink => self
+                        .projection
+                        .verify_frozen_graph_only(&artifact.path, disposition)?,
+                    SourceProjectionDisposition::GraphOnlyHostUnrepresentable => self
+                        .projection
+                        .verify_frozen_graph_only(&artifact.path, disposition)?,
+                    SourceProjectionDisposition::Materialized => {
                         let content =
                             load_projection_proof_blob(blobs, &artifact.path, artifact.entry)?;
                         let entry = ValidatedSourceEntry {
@@ -1492,28 +1716,26 @@ impl ExactProjectionFreeze {
                             .to_string(),
                     ));
                 }
-                let materializable_path = materializable_projection_proof_path(&artifact.path)?;
-                match (
-                    materializable_path.as_ref(),
-                    &artifact.entry,
-                    &verified.proof,
-                ) {
-                    (None, _, ExactProjectionEntryProof::HostUnrepresentableAbsent) => {}
-                    (
-                        Some(_),
-                        TreeEntry::Gitlink { .. },
-                        ExactProjectionEntryProof::GitlinkAbsent
-                        | ExactProjectionEntryProof::GitlinkDirectory { .. },
-                    ) => self
-                        .projection
-                        .revalidate_frozen_gitlink(&artifact.path, &verified.proof)?,
-                    (
-                        Some(path),
-                        TreeEntry::Blob { .. } | TreeEntry::Symlink { .. },
-                        ExactProjectionEntryProof::Materialized {
+                let disposition = source_projection_disposition(&artifact.path, artifact.entry)?;
+                match disposition {
+                    SourceProjectionDisposition::GraphOnlyGitlink
+                    | SourceProjectionDisposition::GraphOnlyHostUnrepresentable => {
+                        self.projection.revalidate_frozen_graph_only(
+                            &artifact.path,
+                            disposition,
+                            &verified.proof,
+                        )?
+                    }
+                    SourceProjectionDisposition::Materialized => {
+                        let ExactProjectionEntryProof::Materialized {
                             identity: expected_identity,
-                        },
-                    ) => {
+                        } = &verified.proof
+                        else {
+                            return Err(KinError::Other(
+                                "exact projection verification mixed materialized and graph-only entry proofs"
+                                    .to_string(),
+                            ));
+                        };
                         let content =
                             load_projection_proof_blob(blobs, &artifact.path, artifact.entry)?;
                         let entry = ValidatedSourceEntry {
@@ -1523,17 +1745,12 @@ impl ExactProjectionFreeze {
                         };
                         let identity = self.projection.validate_frozen_entry_unchanged(&entry)?;
                         if identity != *expected_identity {
+                            let path = validate_projection_proof_path(&artifact.path)?;
                             return Err(KinError::Other(format!(
                                 "tracked working-copy path {} changed object identity after exact projection verification",
                                 self.projection.display_root.join(&path.relative).display()
                             )));
                         }
-                    }
-                    _ => {
-                        return Err(KinError::Other(
-                            "exact projection verification mixed materialized and graph-only entry proofs"
-                                .to_string(),
-                        ));
                     }
                 }
             }
@@ -2166,28 +2383,22 @@ impl ExactProjectionFreeze {
                         .to_string(),
                 ));
             }
-            let materializable_path = materializable_projection_proof_path(&artifact.path)?;
-            match (
-                materializable_path.as_ref(),
-                &artifact.entry,
-                &verified.proof,
-            ) {
-                (None, _, ExactProjectionEntryProof::HostUnrepresentableAbsent) => {}
-                (
-                    Some(_),
-                    TreeEntry::Gitlink { .. },
-                    ExactProjectionEntryProof::GitlinkAbsent
-                    | ExactProjectionEntryProof::GitlinkDirectory { .. },
-                ) => self
+            let disposition = source_projection_disposition(&artifact.path, artifact.entry)?;
+            match disposition {
+                SourceProjectionDisposition::GraphOnlyGitlink
+                | SourceProjectionDisposition::GraphOnlyHostUnrepresentable => self
                     .projection
-                    .revalidate_frozen_gitlink(&artifact.path, &verified.proof)?,
-                (
-                    Some(path),
-                    TreeEntry::Blob { .. } | TreeEntry::Symlink { .. },
-                    ExactProjectionEntryProof::Materialized {
+                    .revalidate_frozen_graph_only(&artifact.path, disposition, &verified.proof)?,
+                SourceProjectionDisposition::Materialized => {
+                    let ExactProjectionEntryProof::Materialized {
                         identity: expected_identity,
-                    },
-                ) => {
+                    } = &verified.proof
+                    else {
+                        return Err(KinError::Other(
+                            "exact projection verification mixed materialized and graph-only entry proofs"
+                                .to_string(),
+                        ));
+                    };
                     let content =
                         load_projection_proof_blob(blobs, &artifact.path, artifact.entry)?;
                     let entry = ValidatedSourceEntry {
@@ -2197,17 +2408,12 @@ impl ExactProjectionFreeze {
                     };
                     let identity = self.projection.validate_frozen_entry_unchanged(&entry)?;
                     if identity != *expected_identity {
+                        let path = validate_projection_proof_path(&artifact.path)?;
                         return Err(KinError::Other(format!(
                             "tracked working-copy path {} changed object identity after exact projection verification",
                             self.projection.display_root.join(&path.relative).display()
                         )));
                     }
-                }
-                _ => {
-                    return Err(KinError::Other(
-                        "exact projection verification mixed materialized and graph-only entry proofs"
-                            .to_string(),
-                    ));
                 }
             }
         }
@@ -2317,37 +2523,97 @@ impl ExactProjectionFreeze {
     }
 }
 
+enum ProjectionAuthorityCommit<T> {
+    Committed(T),
+    DefinitelyNotCommitted(KinError),
+    Indeterminate(KinError),
+}
+
+impl<T> ProjectionAuthorityCommit<T> {
+    fn into_result(self) -> Result<T> {
+        match self {
+            Self::Committed(value) => Ok(value),
+            Self::DefinitelyNotCommitted(error) | Self::Indeterminate(error) => Err(error),
+        }
+    }
+}
+
 fn commit_repository_transaction_exact(
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
     transaction: RepositoryTransaction,
-) -> Result<RepositoryCommitReceipt> {
+) -> ProjectionAuthorityCommit<RepositoryCommitReceipt> {
     let expected_hash = transaction
         .transaction_hash()
-        .map_err(|error| KinError::Other(error.to_string()))?;
+        .expect("projection transaction hash was validated before namespace mutation");
     match authority.commit_repository_transaction(transaction.clone()) {
-        Ok(receipt) => Ok(receipt),
+        Ok(receipt) => ProjectionAuthorityCommit::Committed(receipt),
         Err(first_error) => {
-            let exact_operation_is_visible = authority
-                .read_authority()
-                .metadata()
-                .operation_log
-                .iter()
-                .find(|operation| operation.operation_id == transaction.operation_id)
-                .is_some_and(|operation| operation.transaction_hash == expected_hash);
-            if !exact_operation_is_visible {
-                return Err(KinError::Other(format!(
-                    "commit repository projection authority: {first_error}"
-                )));
+            if let Some(receipt) =
+                installed_repository_receipt(authority, transaction.operation_id, expected_hash)
+            {
+                return ProjectionAuthorityCommit::Committed(receipt);
             }
-            authority
-                .commit_repository_transaction(transaction)
-                .map_err(|error| {
-                    KinError::Other(format!(
-                        "recover exact repository projection receipt after durable commit: {error}"
-                    ))
-                })
+
+            match authority.commit_repository_transaction(transaction.clone()) {
+                Ok(receipt) => ProjectionAuthorityCommit::Committed(receipt),
+                Err(second_error) => {
+                    if let Some(receipt) = installed_repository_receipt(
+                        authority,
+                        transaction.operation_id,
+                        expected_hash,
+                    ) {
+                        return ProjectionAuthorityCommit::Committed(receipt);
+                    }
+                    let error = KinError::Other(format!(
+                        "commit repository projection authority: {first_error}; exact retry: {second_error}"
+                    ));
+                    if repository_commit_error_is_definitely_prepublication(&second_error) {
+                        ProjectionAuthorityCommit::DefinitelyNotCommitted(error)
+                    } else {
+                        ProjectionAuthorityCommit::Indeterminate(KinError::Other(format!(
+                            "{error}; exact projection and authenticated recovery WAL were retained because authority commit outcome is uncertain"
+                        )))
+                    }
+                }
+            }
         }
     }
+}
+
+fn installed_repository_receipt(
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    operation_id: OperationId,
+    transaction_hash: Hash256,
+) -> Option<RepositoryCommitReceipt> {
+    authority
+        .read_authority()
+        .metadata()
+        .receipts
+        .iter()
+        .find(|receipt| {
+            receipt.operation_id == operation_id && receipt.transaction_hash == transaction_hash
+        })
+        .cloned()
+        .map(|mut receipt| {
+            receipt.outcome = RepositoryCommitOutcome::IdempotentReplay;
+            receipt
+        })
+}
+
+fn repository_commit_error_is_definitely_prepublication(error: &kin_db::KinDbError) -> bool {
+    matches!(
+        error,
+        kin_db::KinDbError::Model(_)
+            | kin_db::KinDbError::NotFound(_)
+            | kin_db::KinDbError::DuplicateEntity(_)
+            | kin_db::KinDbError::DuplicateChange(_)
+            | kin_db::KinDbError::SourceBlobReadLimitExceeded { .. }
+            | kin_db::KinDbError::IncompatibleSnapshotVersion { .. }
+            | kin_db::KinDbError::SerializationError(_)
+            | kin_db::KinDbError::IndexError(_)
+            | kin_db::KinDbError::ConcurrentAccessError(_)
+            | kin_db::KinDbError::SliceConversionError(_)
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -2843,12 +3109,256 @@ fn project_reconciled_source_tree(
         previous_entries,
         entries,
         should_preserve,
+        ReconciledProjectionOptions::default(),
         after_read_only_preflight,
         after_identity_revalidation,
+        || {},
         None,
-        || Ok(()),
+        || ProjectionAuthorityCommit::Committed(()),
     )
     .map(|(count, ())| count)
+}
+
+#[derive(Clone, Copy)]
+enum ProjectionOpenMode {
+    CreateOrOpen,
+    ExistingFrozen,
+}
+
+#[derive(Clone, Copy)]
+struct GraphOnlyWorkspaceTransition<'a> {
+    previous_tree: &'a ResolvedTree,
+    target_tree: &'a ResolvedTree,
+}
+
+#[derive(Clone, Copy)]
+struct ReconciledProjectionOptions<'a> {
+    open_mode: ProjectionOpenMode,
+    graph_only_transition: Option<GraphOnlyWorkspaceTransition<'a>>,
+}
+
+impl Default for ReconciledProjectionOptions<'_> {
+    fn default() -> Self {
+        Self {
+            open_mode: ProjectionOpenMode::CreateOrOpen,
+            graph_only_transition: None,
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+struct GraphOnlyWorkspaceTransitionVerification {
+    before_mutation: Vec<VerifiedGraphOnlyState>,
+    retained_after_mutation: Vec<VerifiedGraphOnlyState>,
+    absent_after_mutation: Vec<(RepoPath, SourceProjectionDisposition)>,
+    must_create_directories: HashSet<PathBuf>,
+}
+
+#[cfg(any(unix, windows))]
+struct VerifiedGraphOnlyState {
+    path: RepoPath,
+    disposition: SourceProjectionDisposition,
+    proof: ExactProjectionEntryProof,
+}
+
+#[cfg(any(unix, windows))]
+impl GraphOnlyWorkspaceTransitionVerification {
+    fn verify(
+        projection: &ProjectionRoot,
+        previous_tree: &ResolvedTree,
+        target_tree: &ResolvedTree,
+    ) -> Result<Self> {
+        validate_projection_proof_paths(
+            previous_tree
+                .artifacts_by_path()
+                .map(|artifact| &artifact.path),
+        )?;
+        validate_projection_proof_paths(
+            target_tree
+                .artifacts_by_path()
+                .map(|artifact| &artifact.path),
+        )?;
+
+        let mut before_mutation = Vec::new();
+        let mut retained_after_mutation = Vec::new();
+        let mut absent_after_mutation = Vec::new();
+        let mut must_create_directories = HashSet::new();
+
+        for artifact in previous_tree.artifacts_by_path() {
+            let disposition = source_projection_disposition(&artifact.path, artifact.entry)?;
+            if disposition == SourceProjectionDisposition::Materialized {
+                continue;
+            }
+            let proof = projection.verify_frozen_graph_only(&artifact.path, disposition)?;
+            let exact_target_disposition = tree_entry_at_path(target_tree, &artifact.path)
+                .map(|entry| source_projection_disposition(&artifact.path, entry))
+                .transpose()?;
+            let stable_graph_only_path = exact_target_disposition == Some(disposition);
+            let target_reuses_path = !stable_graph_only_path
+                && tree_has_related_repository_path(target_tree, &artifact.path);
+            if target_reuses_path && !graph_only_proof_is_absent(&proof) {
+                return Err(KinError::Other(format!(
+                    "graph-only path {} has retained host state that cannot be traversed or relabeled by a related repository tree transition",
+                    artifact.path
+                )));
+            }
+            if target_reuses_path && tree_has_materialized_descendant(target_tree, &artifact.path)?
+            {
+                if let Some(path) = materializable_projection_proof_path(&artifact.path)? {
+                    must_create_directories.insert(path.relative);
+                }
+            }
+
+            let verified = VerifiedGraphOnlyState {
+                path: artifact.path.clone(),
+                disposition,
+                proof,
+            };
+            if stable_graph_only_path || !target_reuses_path {
+                retained_after_mutation.push(VerifiedGraphOnlyState {
+                    path: verified.path.clone(),
+                    disposition,
+                    proof: clone_graph_only_proof(&verified.proof)?,
+                });
+            }
+            before_mutation.push(verified);
+        }
+
+        for artifact in target_tree.artifacts_by_path() {
+            let disposition = source_projection_disposition(&artifact.path, artifact.entry)?;
+            if disposition == SourceProjectionDisposition::Materialized {
+                continue;
+            }
+            let exact_previous_disposition = tree_entry_at_path(previous_tree, &artifact.path)
+                .map(|entry| source_projection_disposition(&artifact.path, entry))
+                .transpose()?;
+            if exact_previous_disposition == Some(disposition) {
+                continue;
+            }
+            if tree_has_related_repository_path(previous_tree, &artifact.path) {
+                absent_after_mutation.push((artifact.path.clone(), disposition));
+                continue;
+            }
+
+            let proof = projection.verify_frozen_graph_only(&artifact.path, disposition)?;
+            retained_after_mutation.push(VerifiedGraphOnlyState {
+                path: artifact.path.clone(),
+                disposition,
+                proof: clone_graph_only_proof(&proof)?,
+            });
+            before_mutation.push(VerifiedGraphOnlyState {
+                path: artifact.path.clone(),
+                disposition,
+                proof,
+            });
+        }
+
+        Ok(Self {
+            before_mutation,
+            retained_after_mutation,
+            absent_after_mutation,
+            must_create_directories,
+        })
+    }
+
+    fn revalidate_before_mutation(&self, projection: &ProjectionRoot) -> Result<()> {
+        for verified in &self.before_mutation {
+            projection.revalidate_frozen_graph_only(
+                &verified.path,
+                verified.disposition,
+                &verified.proof,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn revalidate_after_mutation(&self, projection: &ProjectionRoot) -> Result<()> {
+        for verified in &self.retained_after_mutation {
+            projection.revalidate_frozen_graph_only(
+                &verified.path,
+                verified.disposition,
+                &verified.proof,
+            )?;
+        }
+        for (path, disposition) in &self.absent_after_mutation {
+            let actual = projection.verify_frozen_graph_only(path, *disposition)?;
+            if !graph_only_proof_is_absent(&actual) {
+                return Err(KinError::Other(format!(
+                    "graph-only target {path} was not absent after exact workspace transition",
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn tree_has_materialized_descendant(tree: &ResolvedTree, ancestor: &RepoPath) -> Result<bool> {
+    for artifact in tree.artifacts_by_path() {
+        if artifact
+            .path
+            .as_bytes()
+            .strip_prefix(ancestor.as_bytes())
+            .is_some_and(|suffix| suffix.starts_with(b"/"))
+            && source_projection_disposition(&artifact.path, artifact.entry)?
+                == SourceProjectionDisposition::Materialized
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(any(unix, windows))]
+fn graph_only_proof_is_absent(proof: &ExactProjectionEntryProof) -> bool {
+    matches!(
+        proof,
+        ExactProjectionEntryProof::GitlinkAbsent
+            | ExactProjectionEntryProof::HostUnrepresentableAbsent
+    )
+}
+
+#[cfg(any(unix, windows))]
+fn clone_graph_only_proof(proof: &ExactProjectionEntryProof) -> Result<ExactProjectionEntryProof> {
+    match proof {
+        ExactProjectionEntryProof::GitlinkAbsent => Ok(ExactProjectionEntryProof::GitlinkAbsent),
+        ExactProjectionEntryProof::HostUnrepresentableAbsent => {
+            Ok(ExactProjectionEntryProof::HostUnrepresentableAbsent)
+        }
+        ExactProjectionEntryProof::GitlinkDirectory {
+            directory,
+            identity,
+        } => Ok(ExactProjectionEntryProof::GitlinkDirectory {
+            directory: directory
+                .try_clone()
+                .map_err(|error| KinError::Other(format!("retain graph-only Gitlink: {error}")))?,
+            identity: *identity,
+        }),
+        ExactProjectionEntryProof::Materialized { .. } => Err(KinError::Other(
+            "graph-only workspace transition received a materialized proof".to_string(),
+        )),
+    }
+}
+
+fn tree_entry_at_path(tree: &ResolvedTree, path: &RepoPath) -> Option<TreeEntry> {
+    tree.artifacts_by_path()
+        .find(|artifact| &artifact.path == path)
+        .map(|artifact| artifact.entry)
+}
+
+fn tree_has_related_repository_path(tree: &ResolvedTree, path: &RepoPath) -> bool {
+    tree.artifacts_by_path()
+        .any(|artifact| repository_paths_are_related(&artifact.path, path))
+}
+
+fn repository_paths_are_related(left: &RepoPath, right: &RepoPath) -> bool {
+    fn is_same_or_descendant(path: &[u8], ancestor: &[u8]) -> bool {
+        path == ancestor
+            || path
+                .strip_prefix(ancestor)
+                .is_some_and(|suffix| suffix.starts_with(b"/"))
+    }
+    is_same_or_descendant(left.as_bytes(), right.as_bytes())
+        || is_same_or_descendant(right.as_bytes(), left.as_bytes())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2857,14 +3367,41 @@ fn project_reconciled_source_tree_and_commit<T>(
     previous_entries: &[ValidatedSourceEntry<'_>],
     entries: &[ValidatedSourceEntry<'_>],
     should_preserve: &dyn Fn(&Path) -> bool,
+    options: ReconciledProjectionOptions<'_>,
     after_read_only_preflight: impl FnOnce(),
     after_identity_revalidation: impl FnOnce(),
+    after_projection_mutation: impl FnOnce(),
     authority_commit: Option<ReconciliationAuthorityCommit>,
-    commit: impl FnOnce() -> Result<T>,
+    commit: impl FnOnce() -> ProjectionAuthorityCommit<T>,
 ) -> Result<(usize, T)> {
     #[cfg(any(unix, windows))]
     {
-        let projection = ProjectionRoot::open(root)?;
+        let frozen = match options.open_mode {
+            ProjectionOpenMode::CreateOrOpen => None,
+            ProjectionOpenMode::ExistingFrozen => Some(
+                ExactProjectionFreeze::acquire_existing_for_transition(root)?,
+            ),
+        };
+        let opened = match options.open_mode {
+            ProjectionOpenMode::CreateOrOpen => Some(ProjectionRoot::open(root)?),
+            ProjectionOpenMode::ExistingFrozen => None,
+        };
+        let projection = frozen
+            .as_ref()
+            .map(|freeze| &freeze.projection)
+            .or(opened.as_ref())
+            .expect("one projection authority is open");
+        let graph_only_verification = options
+            .graph_only_transition
+            .map(|transition| {
+                GraphOnlyWorkspaceTransitionVerification::verify(
+                    projection,
+                    transition.previous_tree,
+                    transition.target_tree,
+                )
+            })
+            .transpose()?;
+        let requires_complete_target_revalidation = authority_commit.is_some();
         let previous =
             TrackedPathClassifier::new(previous_entries.iter().map(|entry| entry.file_id))?;
         let target = TrackedPathClassifier::new(entries.iter().map(|entry| entry.file_id))?;
@@ -3023,6 +3560,12 @@ fn project_reconciled_source_tree_and_commit<T>(
         }
 
         after_read_only_preflight();
+        if let Some(freeze) = &frozen {
+            freeze.revalidate_namespace()?;
+        }
+        if let Some(verification) = &graph_only_verification {
+            verification.revalidate_before_mutation(projection)?;
+        }
         projection
             .revalidate_tracked_entries_unchanged(&preflight_previous, &preflight_identities)?;
         for (relative, expected_identity) in &directory_identities {
@@ -3058,15 +3601,56 @@ fn project_reconciled_source_tree_and_commit<T>(
                 };
             }
         };
+        let staged_identity_by_path = staged
+            .iter()
+            .map(|staged| (staged.entry.file_id, staged.identity))
+            .collect::<HashMap<_, _>>();
+        let target_entry_refs = if requires_complete_target_revalidation {
+            entries.iter().collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let target_identities = if requires_complete_target_revalidation {
+            entries
+                .iter()
+                .map(|entry| {
+                    previous_by_path
+                        .get(entry.file_id)
+                        .filter(|previous| source_entries_match(previous, entry))
+                        .and_then(|_| identity_by_path.get(entry.file_id))
+                        .or_else(|| staged_identity_by_path.get(entry.file_id))
+                        .copied()
+                        .ok_or_else(|| {
+                            KinError::Other(format!(
+                                "exact workspace target {} has no retained publication identity",
+                                entry.file_id
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
 
         // Tests exercise the final namespace race here. Every later removal is
         // a compare-and-swap: the named object is first moved into the retained
         // transaction, then its exact preflight identity/kind/content is
         // verified before any replacement can publish.
         after_identity_revalidation();
+        if let Some(freeze) = &frozen {
+            freeze.revalidate_namespace()?;
+        }
+        if let Some(verification) = &graph_only_verification {
+            verification.revalidate_before_mutation(projection)?;
+        }
 
         let mut created_directories = Vec::new();
         let mut removed_directories = Vec::new();
+        let empty_must_create_directories = HashSet::new();
+        let must_create_directories = graph_only_verification
+            .as_ref()
+            .map(|verification| &verification.must_create_directories)
+            .unwrap_or(&empty_must_create_directories);
 
         let mutation_result: Result<()> = (|| {
             for (name_index, (entry, identity)) in affected_previous
@@ -3095,6 +3679,7 @@ fn project_reconciled_source_tree_and_commit<T>(
                 &mut transaction,
                 &file_ids,
                 &mut created_directories,
+                must_create_directories,
             )?;
             for staged_entry in &staged {
                 projection.publish_staged_entry(&mut transaction, staged_entry)?;
@@ -3109,6 +3694,19 @@ fn project_reconciled_source_tree_and_commit<T>(
                         removed_directories.len(),
                     )?);
                 }
+            }
+            after_projection_mutation();
+            if requires_complete_target_revalidation {
+                projection
+                    .revalidate_tracked_entries_unchanged(&target_entry_refs, &target_identities)?;
+            }
+            if let Some(verification) = &graph_only_verification {
+                verification.revalidate_after_mutation(projection)?;
+            }
+            if let Some(freeze) = &frozen {
+                freeze.revalidate_namespace()?;
+            } else {
+                projection.revalidate_projection_lock()?;
             }
             Ok(())
         })();
@@ -3133,8 +3731,8 @@ fn project_reconciled_source_tree_and_commit<T>(
         }
 
         let committed = match commit() {
-            Ok(committed) => committed,
-            Err(error) => {
+            ProjectionAuthorityCommit::Committed(committed) => committed,
+            ProjectionAuthorityCommit::DefinitelyNotCommitted(error) => {
                 let rollback = projection.rollback_reconciliation_manifest(&transaction);
                 return match rollback {
                     Ok(()) => match projection.cleanup_reconciliation_transaction(transaction) {
@@ -3151,6 +3749,9 @@ fn project_reconciled_source_tree_and_commit<T>(
                             .display()
                     ))),
                 };
+            }
+            ProjectionAuthorityCommit::Indeterminate(error) => {
+                return Err(error);
             }
         };
 
@@ -3172,8 +3773,10 @@ fn project_reconciled_source_tree_and_commit<T>(
             previous_entries,
             entries,
             should_preserve,
+            options,
             after_read_only_preflight,
             after_identity_revalidation,
+            after_projection_mutation,
             authority_commit,
             commit,
         );
@@ -3418,9 +4021,7 @@ struct BackedUpDirectory {
 
 #[cfg(any(unix, windows))]
 struct PublishedDirectory {
-    #[cfg(all(test, unix))]
     relative: PathBuf,
-    #[cfg(all(test, unix))]
     identity: TrackedEntryIdentity,
     #[cfg(all(test, unix))]
     name_index: usize,
@@ -4727,6 +5328,52 @@ impl ProjectionRoot {
         #[cfg(unix)]
         projection.recover_exact_eject()?;
         projection.refuse_reconciliation_transactions()?;
+        Ok(projection)
+    }
+
+    fn open_existing_for_reconciliation(
+        root: &Path,
+        lock_deadline: std::time::Duration,
+    ) -> Result<Self> {
+        let capability = open_projection_root_nofollow(root)?;
+        let display_projection_control = root.join(".kin");
+        let kin_control = open_directory_nofollow(&capability, std::ffi::OsStr::new(".kin"))
+            .map_err(|error| KinError::io(&display_projection_control, error))?;
+        let kin_control_identity = tracked_open_directory_identity(&kin_control)
+            .map_err(|error| KinError::io(&display_projection_control, error))?;
+        let display_control = display_projection_control.join(RECONCILIATION_CONTROL_DIRECTORY);
+        let control = open_directory_nofollow(
+            &kin_control,
+            std::ffi::OsStr::new(RECONCILIATION_CONTROL_DIRECTORY),
+        )
+        .map_err(|error| KinError::io(&display_control, error))?;
+        let control_identity = tracked_open_directory_identity(&control)
+            .map_err(|error| KinError::io(&display_control, error))?;
+        let (projection_lock, projection_lock_identity) =
+            acquire_existing_reconciliation_projection_lock(
+                &control,
+                &display_control,
+                lock_deadline,
+            )?;
+        let authority_key = load_existing_reconciliation_authority_key(&control, &display_control)?;
+        let projection = Self {
+            root: capability,
+            kin_control,
+            control,
+            projection_lock,
+            projection_lock_identity,
+            display_root: root.to_path_buf(),
+            projection_control_name: std::ffi::OsString::from(".kin"),
+            display_projection_control,
+            repository_authority_kindb: Some(root.join(".kin").join("kindb")),
+            kin_control_identity,
+            control_identity,
+            authority_key,
+        };
+        projection.revalidate_projection_lock()?;
+        #[cfg(unix)]
+        projection.recover_exact_eject()?;
+        projection.recover_reconciliation_transactions()?;
         Ok(projection)
     }
 
@@ -6367,6 +7014,19 @@ impl ProjectionRoot {
         if self.optional_directory_identity(&parent, source_name, &display)? == Some(identity) {
             let directory = open_directory_nofollow_for_removal(&parent, source_name)
                 .map_err(|error| KinError::io(&display, error))?;
+            if directory
+                .entries()
+                .map_err(|error| KinError::io(&display, error))?
+                .next()
+                .transpose()
+                .map_err(|error| KinError::io(&display, error))?
+                .is_some()
+            {
+                return Err(KinError::Other(format!(
+                    "exact-source rollback refused to remove Kin-created directory {} because it contains an unexpected object; the authenticated recovery transaction was retained",
+                    display.display()
+                )));
+            }
             let discard = OsString::from(format!("recovery-discard-directory-{action_index}"));
             self.move_open_directory_exact(
                 NamedEntryLocation {
@@ -6893,6 +7553,7 @@ impl ProjectionRoot {
         transaction: &mut ReconciliationTransaction,
         file_ids: &[&RepoPath],
         created_directories: &mut Vec<PublishedDirectory>,
+        must_create_directories: &HashSet<PathBuf>,
     ) -> Result<()> {
         let mut paths: Vec<_> = file_ids
             .iter()
@@ -6906,7 +7567,29 @@ impl ProjectionRoot {
                 relative.push(component);
                 parent = loop {
                     match open_directory_nofollow(&parent, std::ffi::OsStr::new(component)) {
-                        Ok(directory) => break directory,
+                        Ok(directory) => {
+                            if must_create_directories.contains(&relative) {
+                                let Some(published) = created_directories
+                                    .iter()
+                                    .find(|published| published.relative == relative)
+                                else {
+                                    return Err(KinError::Other(format!(
+                                        "working-copy directory {} appeared at an expected-absent graph-only boundary during exact workspace reconciliation",
+                                        self.display_root.join(&relative).display()
+                                    )));
+                                };
+                                let actual = tracked_open_directory_identity(&directory).map_err(
+                                    |error| KinError::io(self.display_root.join(&relative), error),
+                                )?;
+                                if actual != published.identity {
+                                    return Err(KinError::Other(format!(
+                                        "Kin-created directory {} changed identity during exact workspace reconciliation",
+                                        self.display_root.join(&relative).display()
+                                    )));
+                                }
+                            }
+                            break directory;
+                        }
                         Err(_) => match parent.symlink_metadata(component) {
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                                 let published = self.stage_and_publish_directory(
@@ -7902,9 +8585,7 @@ impl ProjectionRoot {
         );
         publication?;
         Ok(PublishedDirectory {
-            #[cfg(all(test, unix))]
             relative: relative.to_path_buf(),
-            #[cfg(all(test, unix))]
             identity,
             #[cfg(all(test, unix))]
             name_index,
@@ -8620,6 +9301,121 @@ impl ProjectionRoot {
     ) -> Result<TrackedEntryIdentity> {
         let path = validate_projection_proof_entry_path(entry.file_id, entry.kind)?;
         self.validate_tracked_entry_unchanged_at_path(entry, &path)
+    }
+
+    fn verify_frozen_graph_only(
+        &self,
+        file_id: &RepoPath,
+        disposition: SourceProjectionDisposition,
+    ) -> Result<ExactProjectionEntryProof> {
+        // A Gitlink can itself have a byte path this host cannot name. Keep
+        // the repository kind in `disposition`, but bind the host proof to
+        // non-materialization instead of trying to manufacture a lossy path
+        // merely to apply Gitlink directory policy.
+        let materializable_path = materializable_projection_proof_path(file_id)?;
+        if materializable_path.is_none() {
+            return Ok(ExactProjectionEntryProof::HostUnrepresentableAbsent);
+        }
+        match disposition {
+            SourceProjectionDisposition::GraphOnlyGitlink => self.verify_frozen_gitlink(file_id),
+            SourceProjectionDisposition::GraphOnlyHostUnrepresentable => {
+                self.verify_frozen_path_absent(
+                    file_id,
+                    materializable_path
+                        .as_ref()
+                        .expect("host-materializable graph-only path"),
+                )?;
+                Ok(ExactProjectionEntryProof::HostUnrepresentableAbsent)
+            }
+            SourceProjectionDisposition::Materialized => Err(KinError::Other(format!(
+                "materialized repository member {file_id} was supplied to graph-only verification"
+            ))),
+        }
+    }
+
+    fn revalidate_frozen_graph_only(
+        &self,
+        file_id: &RepoPath,
+        disposition: SourceProjectionDisposition,
+        expected: &ExactProjectionEntryProof,
+    ) -> Result<()> {
+        let materializable_path = materializable_projection_proof_path(file_id)?;
+        if materializable_path.is_none() {
+            return match expected {
+                ExactProjectionEntryProof::HostUnrepresentableAbsent => Ok(()),
+                _ => Err(KinError::Other(
+                    "host-unrepresentable repository path was paired with a materialized host proof"
+                        .to_string(),
+                )),
+            };
+        }
+        match (disposition, expected) {
+            (
+                SourceProjectionDisposition::GraphOnlyGitlink,
+                ExactProjectionEntryProof::GitlinkAbsent
+                | ExactProjectionEntryProof::GitlinkDirectory { .. },
+            ) => self.revalidate_frozen_gitlink(file_id, expected),
+            (
+                SourceProjectionDisposition::GraphOnlyHostUnrepresentable,
+                ExactProjectionEntryProof::HostUnrepresentableAbsent,
+            ) => {
+                self.verify_frozen_path_absent(
+                    file_id,
+                    materializable_path
+                        .as_ref()
+                        .expect("host-materializable graph-only path"),
+                )?;
+                Ok(())
+            }
+            _ => Err(KinError::Other(
+                "graph-only projection proof does not match its host disposition".to_string(),
+            )),
+        }
+    }
+
+    fn verify_frozen_path_absent(
+        &self,
+        file_id: &RepoPath,
+        path: &ValidatedProjectionPath,
+    ) -> Result<()> {
+        let display = self.display_root.join(&path.relative);
+        let mut parent = self.clone_root()?;
+        let mut relative = PathBuf::new();
+        for component in &path.components[..path.components.len() - 1] {
+            relative.push(component);
+            let metadata = match parent.symlink_metadata(component) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(KinError::io(self.display_root.join(&relative), error)),
+            };
+            if !metadata.is_dir() || metadata_is_reparse(&metadata) {
+                return Err(KinError::Other(format!(
+                    "host-unrepresentable graph-only path {file_id} is blocked by a non-directory or followed-link ancestor {}",
+                    self.display_root.join(&relative).display()
+                )));
+            }
+            let expected_identity = tracked_entry_identity(&metadata);
+            let child = open_directory_nofollow(&parent, component)
+                .map_err(|error| KinError::io(self.display_root.join(&relative), error))?;
+            if tracked_open_directory_identity(&child)
+                .map_err(|error| KinError::io(self.display_root.join(&relative), error))?
+                != expected_identity
+            {
+                return Err(KinError::Other(format!(
+                    "host-unrepresentable graph-only path {file_id} changed ancestor identity during verification"
+                )));
+            }
+            parent = child;
+        }
+        let name = path.components[path.components.len() - 1].as_os_str();
+        match parent.symlink_metadata(name) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(KinError::io(&display, error)),
+            Ok(_) => Err(KinError::Other(format!(
+                "host-unrepresentable graph-only path {file_id} has a conflicting working-copy object at {}",
+                display.display()
+            ))),
+        }
     }
 
     fn verify_frozen_gitlink(&self, file_id: &RepoPath) -> Result<ExactProjectionEntryProof> {
@@ -9753,7 +10549,8 @@ mod tests {
     use super::*;
     use kin_model::{
         ArtifactId, AuthorId, DefaultRefExpectation, DefaultRefMutation, GitObjectId, Hash256,
-        RefName, ResolvedArtifact, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        RefName, ResolvedArtifact, SharedAdmissionPolicy, WorkspaceExpectation, WorkspaceMutation,
+        REPOSITORY_TRANSACTION_SCHEMA_VERSION,
     };
 
     fn repo_path(path: impl Into<String>) -> RepoPath {
@@ -10034,6 +10831,309 @@ mod tests {
         );
     }
 
+    #[test]
+    fn repository_workspace_transition_binds_the_supplied_prior_tree_hash() {
+        let root = tempfile::tempdir().unwrap();
+        let initialized = crate::init(root.path()).unwrap();
+        let manager = RepositoryAuthorityManager::open(
+            initialized.repository_id.clone(),
+            Arc::new(LocalFileBackend::new(initialized.layout.kindb_dir())),
+        )
+        .unwrap();
+        let lease = manager.read_authority();
+        let roots = lease.roots().clone();
+        let workspace = lease.metadata().workspaces.first().unwrap().clone();
+        drop(lease);
+        assert!(workspace.tree.is_empty());
+
+        let path = repo_path("compose.yaml");
+        let body = b"services: {}\n";
+        let target_entry = exact_blob(body, false);
+        let target_tree = exact_tree(&path, target_entry);
+        let target_hash = compute_resolved_tree_hash(&target_tree).unwrap();
+        let target_entries =
+            validated_source_entries([(&path, target_entry, body.as_slice())]).unwrap();
+        let previous_entries: Vec<ValidatedSourceEntry<'_>> = Vec::new();
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::new(),
+            repository_id: initialized.repository_id,
+            expected_generation: roots.generation,
+            expected_roots: roots,
+            actor: AuthorId::new("prior-tree-binding-test"),
+            reason: "reject mismatched prior workspace tree".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: Some(WorkspaceMutation {
+                workspace_id: workspace.workspace_id,
+                expected: WorkspaceExpectation::MustEqual {
+                    generation: workspace.generation,
+                    head: workspace.head.clone(),
+                    base_target: workspace.base_target.clone(),
+                    base_tree_hash: workspace.base_tree_hash,
+                    tree_hash: target_hash,
+                    admission_policy: workspace.admission_policy,
+                },
+                new_generation: workspace.generation + 1,
+                new_head: workspace.head,
+                new_base_target: workspace.base_target,
+                new_base_tree_hash: Some(target_hash),
+                tree_deltas: crate::exact_tree_correction(&workspace.tree, &target_tree).unwrap(),
+                new_tree_hash: target_hash,
+                new_shared_admission_policy: SharedAdmissionPolicy::empty(0),
+                new_admission_policy: workspace.admission_policy,
+            }),
+            local_overlay_delta: None,
+        };
+
+        let error = validate_repository_projection_transaction(
+            &workspace.tree,
+            &target_tree,
+            &previous_entries,
+            &target_entries,
+            &transaction,
+            GraphOnlyTransitionPolicy::AllowExactMetadataTransition,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("expects prior tree"),
+            "unexpected prior-tree binding error: {error}"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn repository_workspace_transition_allows_exact_gitlink_add_retarget_and_remove() {
+        let root = tempfile::tempdir().unwrap();
+        drop(ProjectionRoot::open(root.path()).unwrap());
+        let path = repo_path("vendor/runtime");
+        let first = exact_tree(&path, TreeEntry::gitlink(GitObjectId::sha1([0x44; 20])));
+        let second = exact_tree(&path, TreeEntry::gitlink(GitObjectId::sha1([0x55; 20])));
+        let empty = ResolvedTree::default();
+        let no_entries: Vec<ValidatedSourceEntry<'_>> = Vec::new();
+
+        for (previous, target) in [(&empty, &first), (&first, &second), (&second, &empty)] {
+            let result = project_reconciled_source_tree_and_commit(
+                root.path(),
+                &no_entries,
+                &no_entries,
+                &should_preserve_checkout_path,
+                ReconciledProjectionOptions {
+                    open_mode: ProjectionOpenMode::ExistingFrozen,
+                    graph_only_transition: Some(GraphOnlyWorkspaceTransition {
+                        previous_tree: previous,
+                        target_tree: target,
+                    }),
+                },
+                || {},
+                || {},
+                || {},
+                None,
+                || ProjectionAuthorityCommit::Committed(()),
+            )
+            .unwrap();
+            assert_eq!(result, (0, ()));
+            assert!(
+                !root.path().join("vendor/runtime").exists(),
+                "graph-only transitions must not invent a Gitlink body or directory"
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn repository_workspace_transition_retains_gitlink_directory_without_traversing_it() {
+        let root = tempfile::tempdir().unwrap();
+        let dependency = root.path().join("vendor/runtime");
+        std::fs::create_dir_all(dependency.join("nested")).unwrap();
+        std::fs::write(dependency.join("nested/owned.bin"), [0_u8, 0xff, 0x44]).unwrap();
+        drop(ProjectionRoot::open(root.path()).unwrap());
+        let path = repo_path("vendor/runtime");
+        let first = exact_tree(&path, TreeEntry::gitlink(GitObjectId::sha1([0x44; 20])));
+        let second = exact_tree(&path, TreeEntry::gitlink(GitObjectId::sha1([0x55; 20])));
+        let empty = ResolvedTree::default();
+        let no_entries: Vec<ValidatedSourceEntry<'_>> = Vec::new();
+
+        for (previous, target) in [(&first, &second), (&second, &empty)] {
+            project_reconciled_source_tree_and_commit(
+                root.path(),
+                &no_entries,
+                &no_entries,
+                &should_preserve_checkout_path,
+                ReconciledProjectionOptions {
+                    open_mode: ProjectionOpenMode::ExistingFrozen,
+                    graph_only_transition: Some(GraphOnlyWorkspaceTransition {
+                        previous_tree: previous,
+                        target_tree: target,
+                    }),
+                },
+                || {},
+                || {},
+                || {},
+                None,
+                || ProjectionAuthorityCommit::Committed(()),
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read(dependency.join("nested/owned.bin")).unwrap(),
+                [0_u8, 0xff, 0x44]
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn repository_workspace_transition_rejects_gitlink_race_before_mutation() {
+        use std::cell::Cell;
+
+        let root = tempfile::tempdir().unwrap();
+        drop(ProjectionRoot::open(root.path()).unwrap());
+        let path = repo_path("vendor/runtime");
+        let target = exact_tree(&path, TreeEntry::gitlink(GitObjectId::sha1([0x44; 20])));
+        let empty = ResolvedTree::default();
+        let no_entries: Vec<ValidatedSourceEntry<'_>> = Vec::new();
+        let committed = Cell::new(false);
+
+        let error = project_reconciled_source_tree_and_commit(
+            root.path(),
+            &no_entries,
+            &no_entries,
+            &should_preserve_checkout_path,
+            ReconciledProjectionOptions {
+                open_mode: ProjectionOpenMode::ExistingFrozen,
+                graph_only_transition: Some(GraphOnlyWorkspaceTransition {
+                    previous_tree: &empty,
+                    target_tree: &target,
+                }),
+            },
+            || {
+                std::fs::create_dir(root.path().join("vendor")).unwrap();
+                std::fs::write(root.path().join("vendor/runtime"), b"raced object").unwrap();
+            },
+            || {},
+            || {},
+            None,
+            || {
+                committed.set(true);
+                ProjectionAuthorityCommit::Committed(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("neither absent nor a no-follow real directory"),
+            "unexpected Gitlink race error: {error}"
+        );
+        assert!(!committed.get(), "authority commit ran after Gitlink race");
+        assert_eq!(
+            std::fs::read(root.path().join("vendor/runtime")).unwrap(),
+            b"raced object"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn graph_only_boundary_directory_must_be_created_without_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let projection = ProjectionRoot::open(root.path()).unwrap();
+        let gitlink_path = repo_path("vendor/runtime");
+        let previous = exact_tree(
+            &gitlink_path,
+            TreeEntry::gitlink(GitObjectId::sha1([0x44; 20])),
+        );
+        let target_path = repo_path("vendor/runtime/src/lib.rs");
+        let target = exact_tree(&target_path, exact_blob(b"target\n", false));
+        let verification =
+            GraphOnlyWorkspaceTransitionVerification::verify(&projection, &previous, &target)
+                .unwrap();
+        assert!(verification
+            .must_create_directories
+            .contains(Path::new("vendor/runtime")));
+        verification
+            .revalidate_before_mutation(&projection)
+            .unwrap();
+
+        std::fs::create_dir_all(root.path().join("vendor/runtime")).unwrap();
+        std::fs::write(root.path().join("vendor/runtime/foreign.bin"), b"foreign").unwrap();
+        let mut transaction = projection.create_reconciliation_transaction().unwrap();
+        let mut created = Vec::new();
+        let error = projection
+            .prepare_without_replacement_transactional(
+                &mut transaction,
+                &[&target_path],
+                &mut created,
+                &verification.must_create_directories,
+            )
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("expected-absent graph-only boundary"),
+            "unexpected no-replace error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("vendor/runtime/foreign.bin")).unwrap(),
+            b"foreign"
+        );
+        projection
+            .cleanup_reconciliation_transaction(transaction)
+            .unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn graph_only_boundary_rollback_never_deletes_injected_foreign_content() {
+        let root = tempfile::tempdir().unwrap();
+        let projection = ProjectionRoot::open(root.path()).unwrap();
+        let gitlink_path = repo_path("vendor/runtime");
+        let previous = exact_tree(
+            &gitlink_path,
+            TreeEntry::gitlink(GitObjectId::sha1([0x44; 20])),
+        );
+        let target_path = repo_path("vendor/runtime/src/lib.rs");
+        let target = exact_tree(&target_path, exact_blob(b"target\n", false));
+        let verification =
+            GraphOnlyWorkspaceTransitionVerification::verify(&projection, &previous, &target)
+                .unwrap();
+        let mut transaction = projection.create_reconciliation_transaction().unwrap();
+        let transaction_path = projection
+            .reconciliation_control_path()
+            .join(&transaction.name);
+        let mut created = Vec::new();
+        projection
+            .prepare_without_replacement_transactional(
+                &mut transaction,
+                &[&target_path],
+                &mut created,
+                &verification.must_create_directories,
+            )
+            .unwrap();
+        std::fs::write(root.path().join("vendor/runtime/foreign.bin"), b"foreign").unwrap();
+
+        let error = projection
+            .rollback_reconciliation_manifest(&transaction)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("unexpected object"),
+            "unexpected rollback error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("vendor/runtime/foreign.bin")).unwrap(),
+            b"foreign"
+        );
+        assert!(
+            transaction_path.is_dir(),
+            "failed safe rollback must retain its authenticated WAL"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn non_utf8_repository_path_is_graph_only_when_macos_cannot_materialize_it() {
@@ -10042,6 +11142,29 @@ mod tests {
             source_projection_disposition(&path, regular()).unwrap(),
             SourceProjectionDisposition::GraphOnlyHostUnrepresentable
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn non_utf8_gitlink_uses_host_unrepresentable_absence_proof() {
+        let root = tempfile::tempdir().unwrap();
+        let projection = ProjectionRoot::open(root.path()).unwrap();
+        let path = RepoPath::from_bytes(b"vendor/runtime-\xff".to_vec()).unwrap();
+        let disposition =
+            source_projection_disposition(&path, TreeEntry::gitlink(GitObjectId::sha1([0x44; 20])))
+                .unwrap();
+        assert_eq!(disposition, SourceProjectionDisposition::GraphOnlyGitlink);
+
+        let proof = projection
+            .verify_frozen_graph_only(&path, disposition)
+            .unwrap();
+        assert!(matches!(
+            proof,
+            ExactProjectionEntryProof::HostUnrepresentableAbsent
+        ));
+        projection
+            .revalidate_frozen_graph_only(&path, disposition, &proof)
+            .unwrap();
     }
 
     #[cfg(any(unix, windows))]
@@ -10617,11 +11740,13 @@ mod tests {
             &previous,
             &target,
             &should_preserve_checkout_path,
+            ReconciledProjectionOptions::default(),
+            || {},
             || {},
             || {},
             None,
-            || -> Result<()> {
-                Err(KinError::Other(
+            || {
+                ProjectionAuthorityCommit::<()>::DefinitelyNotCommitted(KinError::Other(
                     "injected repository authority conflict".to_string(),
                 ))
             },
@@ -10642,6 +11767,136 @@ mod tests {
                 .file_name()
                 .to_string_lossy()
                 .starts_with("tx-")));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn repository_projection_tamper_after_publication_fails_before_authority_commit() {
+        use std::cell::Cell;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = repo_path("compose.yaml");
+        let previous_body = b"services:\n  old: {}\n";
+        let target_body = b"services:\n  target: {}\n";
+        let previous_entry = exact_blob(previous_body, false);
+        let target_entry = exact_blob(target_body, false);
+        std::fs::write(root.path().join("compose.yaml"), previous_body).unwrap();
+        drop(ProjectionRoot::open(root.path()).unwrap());
+        let previous_tree = exact_tree(&path, previous_entry);
+        let target_tree = exact_tree(&path, target_entry);
+        let previous =
+            validated_source_entries([(&path, previous_entry, previous_body.as_slice())]).unwrap();
+        let target =
+            validated_source_entries([(&path, target_entry, target_body.as_slice())]).unwrap();
+        let marker = ReconciliationAuthorityCommit {
+            repository_id: RepositoryId::new("repository-projection-tamper").unwrap(),
+            operation_id: OperationId::new(),
+            transaction_hash: Hash256::from_bytes([0x77; 32]),
+        };
+        let committed = Cell::new(false);
+
+        let error = project_reconciled_source_tree_and_commit(
+            root.path(),
+            &previous,
+            &target,
+            &should_preserve_checkout_path,
+            ReconciledProjectionOptions {
+                open_mode: ProjectionOpenMode::ExistingFrozen,
+                graph_only_transition: Some(GraphOnlyWorkspaceTransition {
+                    previous_tree: &previous_tree,
+                    target_tree: &target_tree,
+                }),
+            },
+            || {},
+            || {},
+            || {
+                std::fs::write(root.path().join("compose.yaml"), b"raced target bytes\n").unwrap();
+            },
+            Some(marker),
+            || {
+                committed.set(true);
+                ProjectionAuthorityCommit::Committed(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("differs from prior workspace source")
+                || error.to_string().contains("retained recovery transaction"),
+            "unexpected post-publication tamper error: {error}"
+        );
+        assert!(
+            !committed.get(),
+            "authority commit ran after target projection tamper"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn indeterminate_repository_commit_retains_projection_and_authenticated_wal() {
+        let root = tempfile::tempdir().unwrap();
+        let path = repo_path("compose.yaml");
+        let previous_body = b"services:\n  old: {}\n";
+        let target_body = b"services:\n  target: {}\n";
+        let previous_entry = exact_blob(previous_body, false);
+        let target_entry = exact_blob(target_body, false);
+        std::fs::write(root.path().join("compose.yaml"), previous_body).unwrap();
+        drop(ProjectionRoot::open(root.path()).unwrap());
+        let previous_tree = exact_tree(&path, previous_entry);
+        let target_tree = exact_tree(&path, target_entry);
+        let previous =
+            validated_source_entries([(&path, previous_entry, previous_body.as_slice())]).unwrap();
+        let target =
+            validated_source_entries([(&path, target_entry, target_body.as_slice())]).unwrap();
+        let marker = ReconciliationAuthorityCommit {
+            repository_id: RepositoryId::new("repository-projection-uncertain").unwrap(),
+            operation_id: OperationId::new(),
+            transaction_hash: Hash256::from_bytes([0x88; 32]),
+        };
+
+        let error = project_reconciled_source_tree_and_commit(
+            root.path(),
+            &previous,
+            &target,
+            &should_preserve_checkout_path,
+            ReconciledProjectionOptions {
+                open_mode: ProjectionOpenMode::ExistingFrozen,
+                graph_only_transition: Some(GraphOnlyWorkspaceTransition {
+                    previous_tree: &previous_tree,
+                    target_tree: &target_tree,
+                }),
+            },
+            || {},
+            || {},
+            || {},
+            Some(marker),
+            || {
+                ProjectionAuthorityCommit::<()>::Indeterminate(KinError::Other(
+                    "injected indeterminate authority outcome".to_string(),
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("injected indeterminate authority outcome"));
+        assert_eq!(
+            std::fs::read(root.path().join("compose.yaml")).unwrap(),
+            target_body
+        );
+        assert!(
+            std::fs::read_dir(root.path().join(".kin/reconciliation"))
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("tx-")),
+            "uncertain authority outcome must retain its authenticated recovery WAL"
+        );
     }
 
     #[cfg(any(unix, windows))]
@@ -10701,6 +11956,8 @@ mod tests {
                 &previous,
                 &target,
                 &should_preserve_checkout_path,
+                ReconciledProjectionOptions::default(),
+                || {},
                 || {},
                 || {},
                 Some(marker),

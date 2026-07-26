@@ -6,10 +6,9 @@
 use anyhow::{Context, Result};
 use kin_model::{
     compute_resolved_tree_hash, AuthorId, EffectiveAdmissionPolicyStamp, OperationId,
-    RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy, RepoPath,
-    RepositoryCommitReceipt, RepositoryId, RepositoryTransaction, ResolvedTree, RootBundle,
-    TreeEntry, WorkspaceExpectation, WorkspaceHead, WorkspaceId, WorkspaceMutation,
-    REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy, RepositoryCommitReceipt,
+    RepositoryId, RepositoryTransaction, RootBundle, WorkspaceExpectation, WorkspaceHead,
+    WorkspaceId, WorkspaceMutation, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -444,19 +443,11 @@ fn switch_at(layout: &kin_core::KinLayout, name: &RefName) -> Result<BranchRespo
         }),
         local_overlay_delta: None,
     };
-    let previous_bodies = load_tree_bodies(&authority, &workspace.tree, "current workspace")?;
-    let target_bodies = load_tree_bodies(&authority, &target_tree, "branch target")?;
     let (materialized, receipt) =
-        kin_core::tree::reconcile_source_tree_and_commit_repository_transaction(
+        kin_core::tree::transition_repository_workspace_tree_and_commit_repository_transaction(
             layout.working_dir(),
             &workspace.tree,
             &target_tree,
-            previous_bodies
-                .iter()
-                .map(|body| (&body.path, body.entry, body.bytes.as_slice())),
-            target_bodies
-                .iter()
-                .map(|body| (&body.path, body.entry, body.bytes.as_slice())),
             authority.manager(),
             transaction,
         )
@@ -470,40 +461,6 @@ fn switch_at(layout: &kin_core::KinLayout, name: &RefName) -> Result<BranchRespo
         mutated: true,
         report: None,
     })
-}
-
-struct SourceBody {
-    path: RepoPath,
-    entry: TreeEntry,
-    bytes: Vec<u8>,
-}
-
-fn load_tree_bodies(
-    authority: &ActiveRepositoryAuthority,
-    tree: &ResolvedTree,
-    label: &str,
-) -> Result<Vec<SourceBody>> {
-    let mut bodies = Vec::with_capacity(tree.len());
-    for artifact in tree.artifacts() {
-        let digest = artifact.entry.blob_identity().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{label} contains gitlink {}; exact submodule projection is not implemented",
-                artifact.path
-            )
-        })?;
-        bodies.push(SourceBody {
-            path: artifact.path.clone(),
-            entry: artifact.entry,
-            bytes: authority.load_source_blob(digest).with_context(|| {
-                format!(
-                    "load {label} body {} for graph-owned path {}",
-                    digest, artifact.path
-                )
-            })?,
-        });
-    }
-    bodies.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(bodies)
 }
 
 fn ref_transaction(
