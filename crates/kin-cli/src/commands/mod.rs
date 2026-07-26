@@ -51,6 +51,7 @@ pub mod merge;
 pub mod migrate;
 pub mod native_sync;
 pub mod note;
+pub mod notify;
 pub mod open;
 pub mod overview;
 pub mod pipeline;

@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+[package]
+name = "kin-notifier-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kin's macOS notification identity; the executable inside KinNotifier.app"
+repository.workspace = true
+
+# The binary is named for the bundle it lives in. macOS shows CFBundleName to
+# users, but the executable name is what appears in process listings.
+[[bin]]
+name = "KinNotifier"
+path = "src/main.rs"
+
+# Apple framework bindings are macOS-only so that `cargo build --all-targets`
+# stays green on the Linux and Windows release legs, where this binary compiles
+# to a stub that reports it is unsupported.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+  "std",
+  "NSApplication",
+  "NSResponder",
+  "NSRunningApplication",
+] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+  "std",
+  "CFRunLoop",
+  "CFDate",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+  "std",
+  "NSBundle",
+  "NSError",
+  "NSString",
+] }
+objc2-user-notifications = { version = "0.3", default-features = false, features = [
+  "std",
+  "block2",
+  "UNError",
+  "UNNotificationContent",
+  "UNNotificationRequest",
+  "UNNotificationSettings",
+  "UNNotificationSound",
+  "UNNotificationTrigger",
+  "UNUserNotificationCenter",
+] }
