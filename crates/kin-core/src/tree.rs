@@ -41,6 +41,12 @@ const SESSION_PROJECTION_BASE_FILE: &str = "base.json";
 const SESSION_RUNS_DIRECTORY: &str = "runs";
 #[cfg(any(unix, windows))]
 const SESSION_STAGING_DIRECTORY_PREFIX: &str = ".session-stage-";
+#[cfg(unix)]
+const EXACT_EJECT_JOURNAL_FILE: &str = "exact-eject-journal.json";
+#[cfg(unix)]
+const EXACT_EJECT_JOURNAL_SCHEMA: u32 = 1;
+#[cfg(unix)]
+const MAX_EXACT_EJECT_JOURNAL_BYTES: u64 = 256 * 1024;
 
 /// How long a caller waits for a live exact-source projection to finish before
 /// failing loud. Bounded so an undiscovered lock-order cycle degrades to a
@@ -475,16 +481,22 @@ pub struct ExactProjectionDetachTarget {
 /// this capability. The consuming eject transaction moves this exact directory
 /// into the frozen projection and restores it to its retained parent on error.
 pub struct ExactProjectionGitStage {
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     parent: cap_std::fs::Dir,
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     parent_identity: TrackedEntryIdentity,
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     directory: cap_std::fs::Dir,
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     name: OsString,
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     identity: TrackedEntryIdentity,
+    #[cfg(unix)]
+    seal: ExactGitDirectorySeal,
+    #[cfg(unix)]
+    proof: Option<kin_git::RepositoryGitExportProof>,
+    #[cfg(unix)]
+    expected_tree: Option<ResolvedTree>,
     parent_display_path: std::path::PathBuf,
     display_path: std::path::PathBuf,
 }
@@ -730,58 +742,107 @@ impl ExactProjectionDetachTarget {
 }
 
 impl ExactProjectionGitStage {
-    /// Retain an already-created staged `.git` directory without following its
-    /// leaf or any ambient path after this call.
-    pub fn open_existing(path: &Path) -> Result<Self> {
-        #[cfg(any(unix, windows))]
+    /// Prove and retain an already-created staged `.git` directory.
+    ///
+    /// The repository must still match the opaque proof returned by
+    /// `kin_git::export_repository_to_git`, its checked-out HEAD tree must
+    /// equal `expected_tree`, and every descendant byte, mode, kind, and object
+    /// identity is sealed through no-follow capabilities before this returns.
+    pub fn open_existing(
+        path: &Path,
+        proof: &kin_git::RepositoryGitExportProof,
+        expected_tree: &ResolvedTree,
+    ) -> Result<Self> {
+        #[cfg(unix)]
         {
-            if !path.is_absolute() {
-                return Err(KinError::Other(format!(
-                    "staged Git directory must be absolute: {}",
-                    path.display()
-                )));
-            }
-            let parent_path = path.parent().ok_or_else(|| {
+            let mut stage = Self::open_and_seal(path)?;
+            kin_git::verify_repository_git_export(path, proof, expected_tree).map_err(|error| {
                 KinError::Other(format!(
-                    "staged Git directory has no parent: {}",
-                    path.display()
+                    "verify staged Git repository against repository-v6 export proof: {error}"
                 ))
             })?;
-            let name = path.file_name().ok_or_else(|| {
-                KinError::Other(format!(
-                    "staged Git directory has no file name: {}",
-                    path.display()
-                ))
-            })?;
-            let parent = open_projection_root_nofollow(parent_path)?;
-            let parent_identity = tracked_open_directory_identity(&parent)
-                .map_err(|error| KinError::io(parent_path, error))?;
-            let directory = open_directory_nofollow_for_removal(&parent, name)
-                .map_err(|error| KinError::io(path, error))?;
-            let identity = tracked_open_directory_identity(&directory)
-                .map_err(|error| KinError::io(path, error))?;
-            sync_directory_capability(&directory, path)?;
-            sync_directory_capability(&parent, parent_path)?;
-            let stage = Self {
-                parent,
-                parent_identity,
-                directory,
-                name: name.to_os_string(),
-                identity,
-                parent_display_path: parent_path.to_path_buf(),
-                display_path: path.to_path_buf(),
-            };
             stage.revalidate_named()?;
+            stage.proof = Some(proof.clone());
+            stage.expected_tree = Some(expected_tree.clone());
             Ok(stage)
         }
-        #[cfg(not(any(unix, windows)))]
+        #[cfg(not(unix))]
         {
-            let _ = path;
-            Err(unsupported_safe_projection_error())
+            let _ = (path, proof, expected_tree);
+            Err(KinError::Other(
+                "sealed exact Git staging is unsupported on this platform until durable no-replace directory namespace moves are available"
+                    .to_string(),
+            ))
         }
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
+    fn open_and_seal(path: &Path) -> Result<Self> {
+        if !path.is_absolute() {
+            return Err(KinError::Other(format!(
+                "staged Git directory must be absolute: {}",
+                path.display()
+            )));
+        }
+        let parent_path = path.parent().ok_or_else(|| {
+            KinError::Other(format!(
+                "staged Git directory has no parent: {}",
+                path.display()
+            ))
+        })?;
+        let name = path.file_name().ok_or_else(|| {
+            KinError::Other(format!(
+                "staged Git directory has no file name: {}",
+                path.display()
+            ))
+        })?;
+        let parent = open_projection_root_nofollow(parent_path)?;
+        let parent_identity = tracked_open_directory_identity(&parent)
+            .map_err(|error| KinError::io(parent_path, error))?;
+        let directory = open_directory_nofollow_for_removal(&parent, name)
+            .map_err(|error| KinError::io(path, error))?;
+        let identity = tracked_open_directory_identity(&directory)
+            .map_err(|error| KinError::io(path, error))?;
+        sync_directory_capability(&directory, path)?;
+        sync_directory_capability(&parent, parent_path)?;
+        let seal = seal_exact_git_directory(&directory, path)?;
+        if seal.multiply_linked_files != 0 {
+            return Err(KinError::Other(format!(
+                "staged Git directory {} contains {} externally aliased hard-linked files",
+                path.display(),
+                seal.multiply_linked_files
+            )));
+        }
+        let stage = Self {
+            parent,
+            parent_identity,
+            directory,
+            name: name.to_os_string(),
+            identity,
+            seal,
+            proof: None,
+            expected_tree: None,
+            parent_display_path: parent_path.to_path_buf(),
+            display_path: path.to_path_buf(),
+        };
+        stage.revalidate_named()?;
+        Ok(stage)
+    }
+
+    #[cfg(all(test, unix))]
+    fn open_existing_unverified_for_test(path: &Path) -> Result<Self> {
+        Self::open_and_seal(path)
+    }
+
+    #[cfg(all(test, not(unix)))]
+    fn open_existing_unverified_for_test(path: &Path) -> Result<Self> {
+        Ok(Self {
+            parent_display_path: path.parent().unwrap_or(path).to_path_buf(),
+            display_path: path.to_path_buf(),
+        })
+    }
+
+    #[cfg(unix)]
     fn revalidate_parent(&self) -> Result<()> {
         let visible_parent = open_projection_root_nofollow(&self.parent_display_path)?;
         if tracked_open_directory_identity(&visible_parent)
@@ -814,7 +875,7 @@ impl ExactProjectionGitStage {
         Ok(())
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     fn revalidate_named(&self) -> Result<()> {
         self.revalidate_parent()?;
         let named = open_directory_nofollow(&self.parent, &self.name)
@@ -825,6 +886,13 @@ impl ExactProjectionGitStage {
         {
             return Err(KinError::Other(format!(
                 "staged Git directory {} was replaced while retained",
+                self.display_path.display()
+            )));
+        }
+        let seal = seal_exact_git_directory(&self.directory, &self.display_path)?;
+        if seal != self.seal {
+            return Err(KinError::Other(format!(
+                "staged Git directory {} changed descendants after exact sealing",
                 self.display_path.display()
             )));
         }
@@ -1389,6 +1457,15 @@ impl ExactProjectionFreeze {
             archived_git_name,
             &target.display_path.join(archived_git_name),
         )?;
+        let mut eject_journal = self.prepare_exact_eject_journal(
+            &staged_git,
+            target,
+            archived_kin_name,
+            archived_git_name,
+            previous_git.as_ref(),
+        )?;
+        self.projection
+            .persist_exact_eject_journal(&eject_journal, true)?;
 
         let mut previous_git_archived = false;
         let mut staged_git_installed = false;
@@ -1423,6 +1500,9 @@ impl ExactProjectionFreeze {
                 &target.display_path.join(archived_git_name),
             )?;
 
+            eject_journal.phase = ExactEjectJournalPhase::PreviousGitMovePending;
+            self.projection
+                .persist_exact_eject_journal(&eject_journal, false)?;
             if let Some(previous) = previous_git.as_ref() {
                 self.projection.move_retained_git_entry_exact(
                     NamedEntryLocation {
@@ -1440,6 +1520,9 @@ impl ExactProjectionFreeze {
             }
             hook(ExactProjectionEjectHookPoint::AfterPreviousGitArchived);
 
+            eject_journal.phase = ExactEjectJournalPhase::StageInstallPending;
+            self.projection
+                .persist_exact_eject_journal(&eject_journal, false)?;
             self.projection
                 .move_open_directory_from_expected_source_exact(
                     NamedEntryLocation {
@@ -1465,6 +1548,9 @@ impl ExactProjectionFreeze {
             staged_git.revalidate_parent()?;
             self.validate_installed_git(&staged_git)?;
 
+            eject_journal.phase = ExactEjectJournalPhase::DetachPending;
+            self.projection
+                .persist_exact_eject_journal(&eject_journal, false)?;
             self.projection
                 .move_open_directory_from_expected_source_exact(
                     NamedEntryLocation {
@@ -1500,7 +1586,7 @@ impl ExactProjectionFreeze {
         })();
 
         if let Err(error) = transaction {
-            return Err(self.rollback_exact_eject(
+            let (mut error, rollback_complete) = self.rollback_exact_eject(
                 error,
                 &staged_git,
                 target,
@@ -1510,7 +1596,15 @@ impl ExactProjectionFreeze {
                 kin_detached,
                 staged_git_installed,
                 previous_git_archived,
-            ));
+            );
+            if rollback_complete {
+                if let Err(cleanup) = self.projection.remove_exact_eject_journal(&eject_journal) {
+                    error = KinError::Other(format!(
+                        "{error}; exact eject rollback completed but durable journal cleanup failed: {cleanup}"
+                    ));
+                }
+            }
+            return Err(error);
         }
 
         Ok(ExactProjectionEjectOutcome {
@@ -1539,6 +1633,100 @@ impl ExactProjectionFreeze {
     }
 
     #[cfg(unix)]
+    fn prepare_exact_eject_journal(
+        &self,
+        staged_git: &ExactProjectionGitStage,
+        target: &ExactProjectionDetachTarget,
+        archived_kin_name: &std::ffi::OsStr,
+        archived_git_name: &std::ffi::OsStr,
+        previous_git: Option<&RetainedGitEntry>,
+    ) -> Result<ExactEjectJournal> {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let (namespace_parent, actual_root_name) = self.projection.locate_open_directory(
+            &self.projection.root,
+            self.root_identity,
+            &self.projection.display_root,
+        )?;
+        let namespace_parent_identity = tracked_open_directory_identity(&namespace_parent)
+            .map_err(|error| KinError::io(&self.projection.display_root, error))?;
+        let expected_root_name = self.projection.display_root.file_name().ok_or_else(|| {
+            KinError::Other(format!(
+                "projection root has no namespace name: {}",
+                self.projection.display_root.display()
+            ))
+        })?;
+        if actual_root_name != expected_root_name {
+            return Err(KinError::Other(format!(
+                "projection root {} is not linked under its expected namespace name",
+                self.projection.display_root.display()
+            )));
+        }
+        if tracked_open_directory_identity(&target.parent)
+            .map_err(|error| KinError::io(&target.parent_display_path, error))?
+            != namespace_parent_identity
+        {
+            return Err(KinError::Other(
+                "exact eject archive must be a direct sibling of the projection root".to_string(),
+            ));
+        }
+
+        let root_parent_display = self.projection.display_root.parent().ok_or_else(|| {
+            KinError::Other(format!(
+                "projection root has no parent: {}",
+                self.projection.display_root.display()
+            ))
+        })?;
+        let stage_relative = staged_git
+            .parent_display_path
+            .strip_prefix(root_parent_display)
+            .map_err(|_| {
+                KinError::Other(format!(
+                    "staged Git parent {} must remain beneath projection namespace parent {}",
+                    staged_git.parent_display_path.display(),
+                    root_parent_display.display()
+                ))
+            })?;
+        let stage_parent_components =
+            exact_relative_directory_components(stage_relative, "staged Git parent")?;
+        let reopened_stage_parent = open_exact_relative_directory_components(
+            &namespace_parent,
+            &stage_parent_components,
+            &staged_git.parent_display_path,
+        )?;
+        if tracked_open_directory_identity(&reopened_stage_parent)
+            .map_err(|error| KinError::io(&staged_git.parent_display_path, error))?
+            != staged_git.parent_identity
+        {
+            return Err(KinError::Other(format!(
+                "staged Git parent {} is not identity-bound beneath the projection namespace",
+                staged_git.parent_display_path.display()
+            )));
+        }
+
+        Ok(ExactEjectJournal {
+            schema: EXACT_EJECT_JOURNAL_SCHEMA,
+            transaction_id: uuid::Uuid::new_v4().to_string(),
+            phase: ExactEjectJournalPhase::Prepared,
+            root_identity: self.root_identity,
+            kin_control_identity: self.projection.kin_control_identity,
+            control_identity: self.projection.control_identity,
+            namespace_parent_identity,
+            root_name: actual_root_name.as_bytes().to_vec(),
+            archive_name: target.name.as_bytes().to_vec(),
+            archive_identity: target.identity,
+            stage_parent_components,
+            stage_parent_identity: staged_git.parent_identity,
+            stage_name: staged_git.name.as_bytes().to_vec(),
+            stage_identity: staged_git.identity,
+            stage_seal: staged_git.seal,
+            archived_kin_name: archived_kin_name.as_bytes().to_vec(),
+            archived_git_name: archived_git_name.as_bytes().to_vec(),
+            previous_git: previous_git.map(RetainedGitEntry::journal_descriptor),
+        })
+    }
+
+    #[cfg(unix)]
     fn validate_installed_git(&self, staged_git: &ExactProjectionGitStage) -> Result<()> {
         let named = open_directory_nofollow(&self.projection.root, std::ffi::OsStr::new(".git"))
             .map_err(|error| KinError::io(self.projection.display_root.join(".git"), error))?;
@@ -1553,6 +1741,38 @@ impl ExactProjectionFreeze {
                 "installed Git directory {} changed identity during exact eject",
                 self.projection.display_root.join(".git").display()
             )));
+        }
+        let seal = seal_exact_git_directory(
+            &staged_git.directory,
+            &self.projection.display_root.join(".git"),
+        )?;
+        if seal != staged_git.seal {
+            return Err(KinError::Other(format!(
+                "installed Git directory {} changed descendants after exact sealing",
+                self.projection.display_root.join(".git").display()
+            )));
+        }
+        if let (Some(proof), Some(expected_tree)) = (&staged_git.proof, &staged_git.expected_tree) {
+            kin_git::verify_repository_git_export(
+                &self.projection.display_root.join(".git"),
+                proof,
+                expected_tree,
+            )
+            .map_err(|error| {
+                KinError::Other(format!(
+                    "installed Git repository failed post-move repository-v6 proof: {error}"
+                ))
+            })?;
+            let revalidated = seal_exact_git_directory(
+                &staged_git.directory,
+                &self.projection.display_root.join(".git"),
+            )?;
+            if revalidated != staged_git.seal {
+                return Err(KinError::Other(format!(
+                    "installed Git directory {} changed during post-move semantic proof",
+                    self.projection.display_root.join(".git").display()
+                )));
+            }
         }
         Ok(())
     }
@@ -1593,7 +1813,7 @@ impl ExactProjectionFreeze {
         kin_detached: bool,
         staged_git_installed: bool,
         previous_git_archived: bool,
-    ) -> KinError {
+    ) -> (KinError, bool) {
         let mut rollback_errors = Vec::new();
         if kin_detached {
             if let Err(rollback) = self
@@ -1654,12 +1874,15 @@ impl ExactProjectionFreeze {
             }
         }
         if rollback_errors.is_empty() {
-            error
+            (error, true)
         } else {
-            KinError::Other(format!(
-                "{error}; retained-capability eject rollback also failed: {}",
-                rollback_errors.join("; ")
-            ))
+            (
+                KinError::Other(format!(
+                    "{error}; retained-capability eject rollback also failed: {}",
+                    rollback_errors.join("; ")
+                )),
+                false,
+            )
         }
     }
 
@@ -2742,6 +2965,75 @@ struct TrackedObjectState {
     mode: u32,
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct ExactGitDirectorySeal {
+    digest: [u8; 32],
+    entry_count: u64,
+    multiply_linked_files: u64,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ExactEjectJournalPhase {
+    Prepared,
+    PreviousGitMovePending,
+    StageInstallPending,
+    DetachPending,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ExactEjectPreviousGit {
+    File {
+        identity: TrackedEntryIdentity,
+        state: TrackedObjectState,
+    },
+    Directory {
+        identity: TrackedEntryIdentity,
+        seal: ExactGitDirectorySeal,
+    },
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExactEjectJournal {
+    schema: u32,
+    transaction_id: String,
+    phase: ExactEjectJournalPhase,
+    root_identity: TrackedEntryIdentity,
+    kin_control_identity: TrackedEntryIdentity,
+    control_identity: TrackedEntryIdentity,
+    namespace_parent_identity: TrackedEntryIdentity,
+    root_name: Vec<u8>,
+    archive_name: Vec<u8>,
+    archive_identity: TrackedEntryIdentity,
+    stage_parent_components: Vec<Vec<u8>>,
+    stage_parent_identity: TrackedEntryIdentity,
+    stage_name: Vec<u8>,
+    stage_identity: TrackedEntryIdentity,
+    stage_seal: ExactGitDirectorySeal,
+    archived_kin_name: Vec<u8>,
+    archived_git_name: Vec<u8>,
+    previous_git: Option<ExactEjectPreviousGit>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct AuthenticatedExactEjectJournal {
+    journal: ExactEjectJournal,
+    authentication: Vec<u8>,
+}
+
+#[cfg(unix)]
+const MAX_EXACT_GIT_SEAL_ENTRIES: u64 = 10_000_000;
+#[cfg(unix)]
+const MAX_EXACT_GIT_SEAL_DEPTH: usize = 256;
+
 #[cfg(any(unix, windows))]
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 struct ReconciliationManifest {
@@ -2865,6 +3157,7 @@ enum RetainedGitEntry {
     Directory {
         directory: cap_std::fs::Dir,
         identity: TrackedEntryIdentity,
+        seal: ExactGitDirectorySeal,
     },
 }
 
@@ -2873,6 +3166,21 @@ impl RetainedGitEntry {
     fn identity(&self) -> TrackedEntryIdentity {
         match self {
             Self::File { identity, .. } | Self::Directory { identity, .. } => *identity,
+        }
+    }
+
+    fn journal_descriptor(&self) -> ExactEjectPreviousGit {
+        match self {
+            Self::File {
+                identity, state, ..
+            } => ExactEjectPreviousGit::File {
+                identity: *identity,
+                state: *state,
+            },
+            Self::Directory { identity, seal, .. } => ExactEjectPreviousGit::Directory {
+                identity: *identity,
+                seal: *seal,
+            },
         }
     }
 }
@@ -3017,6 +3325,18 @@ fn reconciliation_hmac(key: &[u8; 32], message: &[u8]) -> [u8; 32] {
 }
 
 #[cfg(any(unix, windows))]
+fn constant_time_bytes_equal(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .fold(0_u8, |difference, (left, right)| {
+                difference | (*left ^ *right)
+            })
+            == 0
+}
+
+#[cfg(any(unix, windows))]
 fn sync_directory_capability(directory: &cap_std::fs::Dir, display: &Path) -> Result<()> {
     #[cfg(unix)]
     rustix::fs::fsync(directory)
@@ -3064,6 +3384,84 @@ fn validate_exact_namespace_component(label: &str, name: &std::ffi::OsStr) -> Re
 }
 
 #[cfg(unix)]
+fn exact_relative_directory_components(relative: &Path, label: &str) -> Result<Vec<Vec<u8>>> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(component) if !component.as_bytes().is_empty() => {
+                Ok(component.as_bytes().to_vec())
+            }
+            _ => Err(KinError::Other(format!(
+                "{label} is not a safe relative directory path: {}",
+                relative.display()
+            ))),
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn exact_eject_journal_name(bytes: &[u8], label: &str) -> Result<OsString> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    if bytes.is_empty()
+        || bytes == b"."
+        || bytes == b".."
+        || bytes.contains(&0)
+        || bytes.contains(&b'/')
+    {
+        return Err(KinError::Other(format!(
+            "exact eject journal contains an unsafe {label} namespace name"
+        )));
+    }
+    Ok(OsString::from_vec(bytes.to_vec()))
+}
+
+#[cfg(unix)]
+fn exact_eject_previous_git_identity(previous: &ExactEjectPreviousGit) -> TrackedEntryIdentity {
+    match previous {
+        ExactEjectPreviousGit::File { identity, .. }
+        | ExactEjectPreviousGit::Directory { identity, .. } => *identity,
+    }
+}
+
+#[cfg(unix)]
+fn open_exact_relative_directory_components(
+    root: &cap_std::fs::Dir,
+    components: &[Vec<u8>],
+    display: &Path,
+) -> Result<cap_std::fs::Dir> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    if components.len() > MAX_EXACT_GIT_SEAL_DEPTH {
+        return Err(KinError::Other(format!(
+            "exact eject retained path {} exceeds depth limit {}",
+            display.display(),
+            MAX_EXACT_GIT_SEAL_DEPTH
+        )));
+    }
+    let mut directory = root
+        .try_clone()
+        .map_err(|error| KinError::io(display, error))?;
+    for component in components {
+        if component.is_empty() || component == b"." || component == b".." || component.contains(&0)
+        {
+            return Err(KinError::Other(format!(
+                "exact eject retained path {} contains an unsafe component",
+                display.display()
+            )));
+        }
+        directory = open_directory_nofollow(
+            &directory,
+            std::ffi::OsStr::from_bytes(component.as_slice()),
+        )
+        .map_err(|error| KinError::io(display, error))?;
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
 fn ensure_named_entry_absent(
     parent: &cap_std::fs::Dir,
     name: &std::ffi::OsStr,
@@ -3077,6 +3475,252 @@ fn ensure_named_entry_absent(
             display.display()
         ))),
     }
+}
+
+#[cfg(unix)]
+fn seal_exact_git_directory(
+    directory: &cap_std::fs::Dir,
+    display: &Path,
+) -> Result<ExactGitDirectorySeal> {
+    use sha2::{Digest, Sha256};
+
+    let root_identity =
+        tracked_open_directory_identity(directory).map_err(|error| KinError::io(display, error))?;
+    let mut digest = Sha256::new();
+    digest.update(b"kin.exact-git-directory-seal.v1\0");
+    update_exact_git_seal_identity(&mut digest, root_identity);
+    let mut entry_count = 0_u64;
+    let mut multiply_linked_files = 0_u64;
+    let mut relative = Vec::new();
+    seal_exact_git_directory_recursive(
+        directory,
+        display,
+        &mut relative,
+        0,
+        &mut entry_count,
+        &mut multiply_linked_files,
+        &mut digest,
+    )?;
+    let retained_identity =
+        tracked_open_directory_identity(directory).map_err(|error| KinError::io(display, error))?;
+    if retained_identity != root_identity {
+        return Err(KinError::Other(format!(
+            "staged Git directory {} changed identity while sealing descendants",
+            display.display()
+        )));
+    }
+    Ok(ExactGitDirectorySeal {
+        digest: digest.finalize().into(),
+        entry_count,
+        multiply_linked_files,
+    })
+}
+
+#[cfg(unix)]
+fn seal_exact_git_directory_recursive(
+    directory: &cap_std::fs::Dir,
+    display: &Path,
+    relative: &mut Vec<Vec<u8>>,
+    depth: usize,
+    entry_count: &mut u64,
+    multiply_linked_files: &mut u64,
+    digest: &mut sha2::Sha256,
+) -> Result<()> {
+    use cap_std::fs::{MetadataExt as _, PermissionsExt as _};
+    use sha2::Digest as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    if depth > MAX_EXACT_GIT_SEAL_DEPTH {
+        return Err(KinError::Other(format!(
+            "staged Git directory {} exceeds the exact-seal depth limit of {}",
+            display.display(),
+            MAX_EXACT_GIT_SEAL_DEPTH
+        )));
+    }
+    let directory_identity =
+        tracked_open_directory_identity(directory).map_err(|error| KinError::io(display, error))?;
+    let mut names = directory
+        .entries()
+        .map_err(|error| KinError::io(display, error))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name())
+                .map_err(|error| KinError::io(display, error))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    names.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+
+    for name in names {
+        *entry_count = entry_count.checked_add(1).ok_or_else(|| {
+            KinError::Other("staged Git exact-seal entry count overflow".to_string())
+        })?;
+        if *entry_count > MAX_EXACT_GIT_SEAL_ENTRIES {
+            return Err(KinError::Other(format!(
+                "staged Git directory {} exceeds the exact-seal entry limit of {}",
+                display.display(),
+                MAX_EXACT_GIT_SEAL_ENTRIES
+            )));
+        }
+        let raw_name = name.as_bytes().to_vec();
+        relative.push(raw_name);
+        let child_display = display.join(&name);
+        let metadata = directory
+            .symlink_metadata(&name)
+            .map_err(|error| KinError::io(&child_display, error))?;
+        if metadata_is_reparse(&metadata) {
+            return Err(KinError::Other(format!(
+                "staged Git descendant {} is a symbolic link; exact Git staging accepts only real directories and regular files",
+                child_display.display()
+            )));
+        }
+
+        update_exact_git_seal_path(digest, relative)?;
+        let identity = tracked_entry_identity(&metadata);
+        update_exact_git_seal_identity(digest, identity);
+        let mode = metadata.permissions().mode();
+        digest.update(mode.to_le_bytes());
+
+        if metadata.is_dir() {
+            digest.update([b'd']);
+            let child = open_directory_nofollow(directory, &name)
+                .map_err(|error| KinError::io(&child_display, error))?;
+            if tracked_open_directory_identity(&child)
+                .map_err(|error| KinError::io(&child_display, error))?
+                != identity
+            {
+                return Err(KinError::Other(format!(
+                    "staged Git directory {} changed identity while sealing",
+                    child_display.display()
+                )));
+            }
+            seal_exact_git_directory_recursive(
+                &child,
+                &child_display,
+                relative,
+                depth + 1,
+                entry_count,
+                multiply_linked_files,
+                digest,
+            )?;
+            let named = directory
+                .symlink_metadata(&name)
+                .map_err(|error| KinError::io(&child_display, error))?;
+            if metadata_is_reparse(&named)
+                || !named.is_dir()
+                || tracked_entry_identity(&named) != identity
+                || named.permissions().mode() != mode
+                || tracked_open_directory_identity(&child)
+                    .map_err(|error| KinError::io(&child_display, error))?
+                    != identity
+            {
+                return Err(KinError::Other(format!(
+                    "staged Git directory {} changed while sealing descendants",
+                    child_display.display()
+                )));
+            }
+        } else if metadata.is_file() {
+            digest.update([b'f']);
+            digest.update(metadata.len().to_le_bytes());
+            digest.update(metadata.nlink().to_le_bytes());
+            if metadata.nlink() > 1 {
+                *multiply_linked_files = multiply_linked_files.checked_add(1).ok_or_else(|| {
+                    KinError::Other("staged Git multiply-linked file count overflow".to_string())
+                })?;
+            }
+            let mut file = open_regular_file_nofollow_for_removal(directory, &name)
+                .map_err(|error| KinError::io(&child_display, error))?;
+            if tracked_cap_file_identity(&file)
+                .map_err(|error| KinError::io(&child_display, error))?
+                != identity
+            {
+                return Err(KinError::Other(format!(
+                    "staged Git file {} changed identity while sealing",
+                    child_display.display()
+                )));
+            }
+            let mut content_digest = sha2::Sha256::new();
+            let mut length = 0_u64;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = file
+                    .read(&mut buffer)
+                    .map_err(|error| KinError::io(&child_display, error))?;
+                if read == 0 {
+                    break;
+                }
+                length = length.checked_add(read as u64).ok_or_else(|| {
+                    KinError::Other(format!(
+                        "staged Git file length overflow for {}",
+                        child_display.display()
+                    ))
+                })?;
+                content_digest.update(&buffer[..read]);
+            }
+            file.sync_all()
+                .map_err(|error| KinError::io(&child_display, error))?;
+            let revalidated = file
+                .metadata()
+                .map_err(|error| KinError::io(&child_display, error))?;
+            if !revalidated.is_file()
+                || tracked_cap_file_identity(&file)
+                    .map_err(|error| KinError::io(&child_display, error))?
+                    != identity
+                || revalidated.len() != metadata.len()
+                || length != metadata.len()
+                || revalidated.nlink() != metadata.nlink()
+                || revalidated.permissions().mode() != mode
+            {
+                return Err(KinError::Other(format!(
+                    "staged Git file {} changed bytes, mode, length, or identity while sealing",
+                    child_display.display()
+                )));
+            }
+            digest.update(content_digest.finalize());
+        } else {
+            return Err(KinError::Other(format!(
+                "staged Git descendant {} has an unsupported filesystem kind",
+                child_display.display()
+            )));
+        }
+        relative.pop();
+    }
+
+    if tracked_open_directory_identity(directory).map_err(|error| KinError::io(display, error))?
+        != directory_identity
+    {
+        return Err(KinError::Other(format!(
+            "staged Git directory {} changed identity while sealing",
+            display.display()
+        )));
+    }
+    sync_directory_capability(directory, display)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn update_exact_git_seal_path(digest: &mut sha2::Sha256, components: &[Vec<u8>]) -> Result<()> {
+    use sha2::Digest as _;
+
+    let component_count = u32::try_from(components.len()).map_err(|_| {
+        KinError::Other("staged Git exact-seal path has too many components".to_string())
+    })?;
+    digest.update(component_count.to_le_bytes());
+    for component in components {
+        let length = u32::try_from(component.len()).map_err(|_| {
+            KinError::Other("staged Git exact-seal path component is too long".to_string())
+        })?;
+        digest.update(length.to_le_bytes());
+        digest.update(component);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn update_exact_git_seal_identity(digest: &mut sha2::Sha256, identity: TrackedEntryIdentity) {
+    use sha2::Digest as _;
+
+    digest.update(identity.device.to_le_bytes());
+    digest.update(identity.inode.to_le_bytes());
 }
 
 #[cfg(unix)]
@@ -3739,6 +4383,8 @@ impl ProjectionRoot {
             control_identity,
             authority_key,
         };
+        #[cfg(unix)]
+        projection.recover_exact_eject()?;
         projection.recover_reconciliation_transactions()?;
         Ok(projection)
     }
@@ -3785,6 +4431,8 @@ impl ProjectionRoot {
             authority_key,
         };
         projection.revalidate_projection_lock()?;
+        #[cfg(unix)]
+        projection.recover_exact_eject()?;
         projection.refuse_reconciliation_transactions()?;
         Ok(projection)
     }
@@ -3807,6 +4455,564 @@ impl ProjectionRoot {
             }
         }
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn authenticate_exact_eject_journal(&self, journal: &ExactEjectJournal) -> Result<Vec<u8>> {
+        let encoded = serde_json::to_vec(journal)
+            .map_err(|error| KinError::Other(format!("encode exact eject journal: {error}")))?;
+        let mut authenticated = b"kin.exact-eject-journal.v1\0".to_vec();
+        authenticated.extend_from_slice(&encoded);
+        Ok(reconciliation_hmac(&self.authority_key, &authenticated).to_vec())
+    }
+
+    #[cfg(unix)]
+    fn persist_exact_eject_journal(
+        &self,
+        journal: &ExactEjectJournal,
+        create_new: bool,
+    ) -> Result<()> {
+        let authenticated = AuthenticatedExactEjectJournal {
+            journal: journal.clone(),
+            authentication: self.authenticate_exact_eject_journal(journal)?,
+        };
+        let bytes = serde_json::to_vec(&authenticated)
+            .map_err(|error| KinError::Other(format!("encode exact eject journal: {error}")))?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_EXACT_EJECT_JOURNAL_BYTES {
+            return Err(KinError::Other(format!(
+                "exact eject journal exceeds {} KiB",
+                MAX_EXACT_EJECT_JOURNAL_BYTES / 1024
+            )));
+        }
+        let display = self
+            .reconciliation_control_path()
+            .join(EXACT_EJECT_JOURNAL_FILE);
+        if create_new {
+            ensure_named_entry_absent(
+                &self.control,
+                std::ffi::OsStr::new(EXACT_EJECT_JOURNAL_FILE),
+                &display,
+            )?;
+        }
+        let temporary = OsString::from(format!(".exact-eject-{}.tmp", uuid::Uuid::new_v4()));
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = self
+            .control
+            .open_with(&temporary, &options)
+            .map_err(|error| KinError::io(&display, error))?;
+        rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(0o600))
+            .map_err(|error| KinError::io(&display, error.into()))?;
+        if let Err(error) = file
+            .write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| KinError::io(&display, error))
+        {
+            drop(file);
+            let _ = self.control.remove_file(&temporary);
+            return Err(error);
+        }
+        let publish = if create_new {
+            self.control.hard_link(
+                &temporary,
+                &self.control,
+                std::ffi::OsStr::new(EXACT_EJECT_JOURNAL_FILE),
+            )
+        } else {
+            self.control.rename(
+                &temporary,
+                &self.control,
+                std::ffi::OsStr::new(EXACT_EJECT_JOURNAL_FILE),
+            )
+        };
+        if let Err(error) = publish {
+            drop(file);
+            let _ = self.control.remove_file(&temporary);
+            return Err(KinError::io(&display, error));
+        }
+        file.sync_all()
+            .map_err(|error| KinError::io(&display, error))?;
+        sync_directory_capability(&self.control, &display)?;
+        if create_new {
+            self.control
+                .remove_file(&temporary)
+                .map_err(|error| KinError::io(&display, error))?;
+            sync_directory_capability(&self.control, &display)?;
+        }
+        let persisted = self.load_exact_eject_journal()?.ok_or_else(|| {
+            KinError::Other(format!(
+                "exact eject journal disappeared after durable publication: {}",
+                display.display()
+            ))
+        })?;
+        if persisted != *journal {
+            return Err(KinError::Other(format!(
+                "exact eject journal changed after durable publication: {}",
+                display.display()
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn load_exact_eject_journal(&self) -> Result<Option<ExactEjectJournal>> {
+        let display = self
+            .reconciliation_control_path()
+            .join(EXACT_EJECT_JOURNAL_FILE);
+        let file = match open_reconciliation_control_file(
+            &self.control,
+            std::ffi::OsStr::new(EXACT_EJECT_JOURNAL_FILE),
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(KinError::io(&display, error)),
+        };
+        let metadata = file
+            .metadata()
+            .map_err(|error| KinError::io(&display, error))?;
+        if !metadata.is_file() || metadata_is_reparse(&metadata) {
+            return Err(KinError::Other(format!(
+                "exact eject journal {} is not a regular no-follow file",
+                display.display()
+            )));
+        }
+        if metadata.len() > MAX_EXACT_EJECT_JOURNAL_BYTES {
+            return Err(KinError::Other(format!(
+                "exact eject journal {} exceeds {} KiB",
+                display.display(),
+                MAX_EXACT_EJECT_JOURNAL_BYTES / 1024
+            )));
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_EXACT_EJECT_JOURNAL_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| KinError::io(&display, error))?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_EXACT_EJECT_JOURNAL_BYTES {
+            return Err(KinError::Other(format!(
+                "exact eject journal {} exceeds {} KiB",
+                display.display(),
+                MAX_EXACT_EJECT_JOURNAL_BYTES / 1024
+            )));
+        }
+        let authenticated: AuthenticatedExactEjectJournal = serde_json::from_slice(&bytes)
+            .map_err(|error| {
+                KinError::Other(format!(
+                    "decode exact eject journal {}: {error}",
+                    display.display()
+                ))
+            })?;
+        let expected = self.authenticate_exact_eject_journal(&authenticated.journal)?;
+        if !constant_time_bytes_equal(&authenticated.authentication, &expected) {
+            return Err(KinError::Other(format!(
+                "exact eject journal {} failed authentication",
+                display.display()
+            )));
+        }
+        Ok(Some(authenticated.journal))
+    }
+
+    #[cfg(unix)]
+    fn remove_exact_eject_journal(&self, expected: &ExactEjectJournal) -> Result<()> {
+        let display = self
+            .reconciliation_control_path()
+            .join(EXACT_EJECT_JOURNAL_FILE);
+        let actual = self.load_exact_eject_journal()?.ok_or_else(|| {
+            KinError::Other(format!(
+                "exact eject journal disappeared before cleanup: {}",
+                display.display()
+            ))
+        })?;
+        if actual != *expected {
+            return Err(KinError::Other(format!(
+                "exact eject journal changed before cleanup: {}",
+                display.display()
+            )));
+        }
+        self.control
+            .remove_file(std::ffi::OsStr::new(EXACT_EJECT_JOURNAL_FILE))
+            .map_err(|error| KinError::io(&display, error))?;
+        sync_directory_capability(&self.control, &display)
+    }
+
+    #[cfg(unix)]
+    fn recover_exact_eject(&self) -> Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let Some(journal) = self.load_exact_eject_journal()? else {
+            return Ok(());
+        };
+        self.revalidate_projection_lock()?;
+        let root_identity = tracked_open_directory_identity(&self.root)
+            .map_err(|error| KinError::io(&self.display_root, error))?;
+        if journal.schema != EXACT_EJECT_JOURNAL_SCHEMA
+            || uuid::Uuid::parse_str(&journal.transaction_id).is_err()
+            || journal.root_identity != root_identity
+            || journal.kin_control_identity != self.kin_control_identity
+            || journal.control_identity != self.control_identity
+        {
+            return Err(KinError::Other(format!(
+                "exact eject journal {} has an invalid identity-bound descriptor",
+                self.reconciliation_control_path()
+                    .join(EXACT_EJECT_JOURNAL_FILE)
+                    .display()
+            )));
+        }
+
+        let (namespace_parent, root_name) =
+            self.locate_open_directory(&self.root, root_identity, &self.display_root)?;
+        let namespace_parent_identity = tracked_open_directory_identity(&namespace_parent)
+            .map_err(|error| KinError::io(&self.display_root, error))?;
+        if namespace_parent_identity != journal.namespace_parent_identity
+            || root_name.as_bytes() != journal.root_name
+        {
+            return Err(KinError::Other(
+                "exact eject recovery refused because the projection root namespace changed"
+                    .to_string(),
+            ));
+        }
+
+        let archive_name = exact_eject_journal_name(&journal.archive_name, "archive directory")?;
+        let archive = open_directory_nofollow(&namespace_parent, &archive_name)
+            .map_err(|error| KinError::io(self.display_root.join(&archive_name), error))?;
+        if tracked_open_directory_identity(&archive)
+            .map_err(|error| KinError::io(self.display_root.join(&archive_name), error))?
+            != journal.archive_identity
+        {
+            return Err(KinError::Other(
+                "exact eject recovery archive changed identity".to_string(),
+            ));
+        }
+        let stage_parent = open_exact_relative_directory_components(
+            &namespace_parent,
+            &journal.stage_parent_components,
+            &self.display_root,
+        )?;
+        if tracked_open_directory_identity(&stage_parent)
+            .map_err(|error| KinError::io(&self.display_root, error))?
+            != journal.stage_parent_identity
+        {
+            return Err(KinError::Other(
+                "exact eject recovery stage parent changed identity".to_string(),
+            ));
+        }
+        let stage_name = exact_eject_journal_name(&journal.stage_name, "staged Git")?;
+        let archived_git_name =
+            exact_eject_journal_name(&journal.archived_git_name, "archived Git")?;
+        let archived_kin_name =
+            exact_eject_journal_name(&journal.archived_kin_name, "archived Kin")?;
+        ensure_named_entry_absent(
+            &archive,
+            &archived_kin_name,
+            &self
+                .display_root
+                .join(&archive_name)
+                .join(&archived_kin_name),
+        )?;
+        let git_name = std::ffi::OsStr::new(".git");
+
+        let root_entry = self.inspect_exact_eject_named_entry(
+            &self.root,
+            git_name,
+            &self.display_root.join(".git"),
+        )?;
+        let stage_entry = self.inspect_exact_eject_named_entry(
+            &stage_parent,
+            &stage_name,
+            &self.display_root.join(&stage_name),
+        )?;
+        let archive_entry = self.inspect_exact_eject_named_entry(
+            &archive,
+            &archived_git_name,
+            &self
+                .display_root
+                .join(&archive_name)
+                .join(&archived_git_name),
+        )?;
+        let previous_identity = journal
+            .previous_git
+            .as_ref()
+            .map(exact_eject_previous_git_identity);
+
+        let root_is_stage =
+            root_entry.is_some_and(|(_, identity)| identity == journal.stage_identity);
+        let root_is_previous = previous_identity
+            .is_some_and(|identity| root_entry.is_some_and(|(_, actual)| actual == identity));
+        let stage_is_stage =
+            stage_entry.is_some_and(|(_, identity)| identity == journal.stage_identity);
+        let archive_is_previous = previous_identity
+            .is_some_and(|identity| archive_entry.is_some_and(|(_, actual)| actual == identity));
+
+        if root_entry.is_some() && !root_is_stage && !root_is_previous {
+            return Err(KinError::Other(
+                "exact eject recovery found an unexpected replacement at root `.git`".to_string(),
+            ));
+        }
+        if stage_entry.is_some() && !stage_is_stage {
+            return Err(KinError::Other(
+                "exact eject recovery found an unexpected replacement at the staged Git name"
+                    .to_string(),
+            ));
+        }
+        if archive_entry.is_some() && !archive_is_previous {
+            return Err(KinError::Other(
+                "exact eject recovery found an unexpected replacement at the archived Git name"
+                    .to_string(),
+            ));
+        }
+
+        if root_is_stage {
+            self.validate_exact_eject_stage_at(
+                &self.root,
+                git_name,
+                &journal,
+                &self.display_root.join(".git"),
+            )?;
+        }
+        if stage_is_stage {
+            self.validate_exact_eject_stage_at(
+                &stage_parent,
+                &stage_name,
+                &journal,
+                &self.display_root.join(&stage_name),
+            )?;
+        }
+        if root_is_previous {
+            self.validate_exact_eject_previous_at(
+                &self.root,
+                git_name,
+                journal.previous_git.as_ref().expect("identity is present"),
+                &self.display_root.join(".git"),
+            )?;
+        }
+        if archive_is_previous {
+            self.validate_exact_eject_previous_at(
+                &archive,
+                &archived_git_name,
+                journal.previous_git.as_ref().expect("identity is present"),
+                &self
+                    .display_root
+                    .join(&archive_name)
+                    .join(&archived_git_name),
+            )?;
+        }
+
+        let valid_prepared = stage_is_stage
+            && archive_entry.is_none()
+            && match journal.previous_git.as_ref() {
+                Some(_) => root_is_previous,
+                None => root_entry.is_none(),
+            };
+        let valid_previous_archived = stage_is_stage
+            && root_entry.is_none()
+            && match journal.previous_git.as_ref() {
+                Some(_) => archive_is_previous,
+                None => archive_entry.is_none(),
+            };
+        let valid_stage_installed = root_is_stage
+            && stage_entry.is_none()
+            && match journal.previous_git.as_ref() {
+                Some(_) => archive_is_previous,
+                None => archive_entry.is_none(),
+            };
+        if !valid_prepared && !valid_previous_archived && !valid_stage_installed {
+            return Err(KinError::Other(format!(
+                "exact eject journal {} does not match any recoverable namespace state",
+                self.reconciliation_control_path()
+                    .join(EXACT_EJECT_JOURNAL_FILE)
+                    .display()
+            )));
+        }
+
+        if valid_stage_installed {
+            let stage = open_directory_nofollow_for_removal(&self.root, git_name)
+                .map_err(|error| KinError::io(self.display_root.join(".git"), error))?;
+            self.move_open_directory_from_expected_source_exact(
+                NamedEntryLocation {
+                    parent: &self.root,
+                    name: git_name,
+                },
+                NamedEntryLocation {
+                    parent: &stage_parent,
+                    name: &stage_name,
+                },
+                &stage,
+                journal.stage_identity,
+                &self.display_root.join(".git"),
+            )?;
+        }
+        if valid_previous_archived || valid_stage_installed {
+            if let Some(previous) = journal.previous_git.as_ref() {
+                let retained = self.open_exact_eject_previous_at(
+                    &archive,
+                    &archived_git_name,
+                    previous,
+                    &self
+                        .display_root
+                        .join(&archive_name)
+                        .join(&archived_git_name),
+                )?;
+                self.move_retained_git_entry_exact(
+                    NamedEntryLocation {
+                        parent: &archive,
+                        name: &archived_git_name,
+                    },
+                    NamedEntryLocation {
+                        parent: &self.root,
+                        name: git_name,
+                    },
+                    &retained,
+                    &self.display_root.join(".git"),
+                )?;
+            }
+        }
+
+        self.validate_exact_eject_stage_at(
+            &stage_parent,
+            &stage_name,
+            &journal,
+            &self.display_root.join(&stage_name),
+        )?;
+        ensure_named_entry_absent(
+            &archive,
+            &archived_git_name,
+            &self
+                .display_root
+                .join(&archive_name)
+                .join(&archived_git_name),
+        )?;
+        ensure_named_entry_absent(
+            &archive,
+            &archived_kin_name,
+            &self
+                .display_root
+                .join(&archive_name)
+                .join(&archived_kin_name),
+        )?;
+        match journal.previous_git.as_ref() {
+            Some(previous) => self.validate_exact_eject_previous_at(
+                &self.root,
+                git_name,
+                previous,
+                &self.display_root.join(".git"),
+            )?,
+            None => {
+                ensure_named_entry_absent(&self.root, git_name, &self.display_root.join(".git"))?
+            }
+        }
+        self.remove_exact_eject_journal(&journal)
+    }
+
+    #[cfg(unix)]
+    fn inspect_exact_eject_named_entry(
+        &self,
+        parent: &cap_std::fs::Dir,
+        name: &std::ffi::OsStr,
+        display: &Path,
+    ) -> Result<Option<(bool, TrackedEntryIdentity)>> {
+        let metadata = match parent.symlink_metadata(name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(KinError::io(display, error)),
+        };
+        if metadata_is_reparse(&metadata) || (!metadata.is_file() && !metadata.is_dir()) {
+            return Err(KinError::Other(format!(
+                "exact eject recovery entry {} has an unsupported kind",
+                display.display()
+            )));
+        }
+        Ok(Some((metadata.is_dir(), tracked_entry_identity(&metadata))))
+    }
+
+    #[cfg(unix)]
+    fn validate_exact_eject_stage_at(
+        &self,
+        parent: &cap_std::fs::Dir,
+        name: &std::ffi::OsStr,
+        journal: &ExactEjectJournal,
+        display: &Path,
+    ) -> Result<()> {
+        let directory =
+            open_directory_nofollow(parent, name).map_err(|error| KinError::io(display, error))?;
+        if tracked_open_directory_identity(&directory)
+            .map_err(|error| KinError::io(display, error))?
+            != journal.stage_identity
+            || seal_exact_git_directory(&directory, display)? != journal.stage_seal
+        {
+            return Err(KinError::Other(format!(
+                "exact eject recovery staged Git {} failed its identity or descendant seal",
+                display.display()
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn validate_exact_eject_previous_at(
+        &self,
+        parent: &cap_std::fs::Dir,
+        name: &std::ffi::OsStr,
+        expected: &ExactEjectPreviousGit,
+        display: &Path,
+    ) -> Result<()> {
+        let retained = self.open_exact_eject_previous_at(parent, name, expected, display)?;
+        self.validate_retained_git_entry_at(&retained, parent, name, display)
+    }
+
+    #[cfg(unix)]
+    fn open_exact_eject_previous_at(
+        &self,
+        parent: &cap_std::fs::Dir,
+        name: &std::ffi::OsStr,
+        expected: &ExactEjectPreviousGit,
+        display: &Path,
+    ) -> Result<RetainedGitEntry> {
+        match expected {
+            ExactEjectPreviousGit::File { identity, state } => {
+                let (actual_identity, actual_state) = self.inspect_named_existing_object(
+                    parent,
+                    name,
+                    ExistingObjectKind::File,
+                    display,
+                )?;
+                let file = open_regular_file_nofollow_for_removal(parent, name)
+                    .map_err(|error| KinError::io(display, error))?;
+                if actual_identity != *identity
+                    || actual_state != *state
+                    || tracked_cap_file_identity(&file)
+                        .map_err(|error| KinError::io(display, error))?
+                        != *identity
+                {
+                    return Err(KinError::Other(format!(
+                        "exact eject recovery previous Git file {} changed",
+                        display.display()
+                    )));
+                }
+                Ok(RetainedGitEntry::File {
+                    file,
+                    identity: *identity,
+                    state: *state,
+                })
+            }
+            ExactEjectPreviousGit::Directory { identity, seal } => {
+                let directory = open_directory_nofollow_for_removal(parent, name)
+                    .map_err(|error| KinError::io(display, error))?;
+                if tracked_open_directory_identity(&directory)
+                    .map_err(|error| KinError::io(display, error))?
+                    != *identity
+                    || seal_exact_git_directory(&directory, display)? != *seal
+                {
+                    return Err(KinError::Other(format!(
+                        "exact eject recovery previous Git directory {} changed",
+                        display.display()
+                    )));
+                }
+                Ok(RetainedGitEntry::Directory {
+                    directory,
+                    identity: *identity,
+                    seal: *seal,
+                })
+            }
+        }
     }
 
     fn create_reconciliation_transaction(&self) -> Result<ReconciliationTransaction> {
@@ -5891,9 +7097,11 @@ impl ProjectionRoot {
                     display.display()
                 )));
             }
+            let seal = seal_exact_git_directory(&directory, display)?;
             return Ok(Some(RetainedGitEntry::Directory {
                 directory,
                 identity,
+                seal,
             }));
         }
         if metadata.is_file() {
@@ -5963,6 +7171,7 @@ impl ProjectionRoot {
             RetainedGitEntry::Directory {
                 directory,
                 identity,
+                seal,
             } => {
                 if tracked_open_directory_identity(directory)
                     .map_err(|error| KinError::io(display, error))?
@@ -5981,6 +7190,12 @@ impl ProjectionRoot {
                 {
                     return Err(KinError::Other(format!(
                         "Git directory {} was replaced while retained",
+                        display.display()
+                    )));
+                }
+                if seal_exact_git_directory(directory, display)? != *seal {
+                    return Err(KinError::Other(format!(
+                        "Git directory {} changed descendants while retained",
                         display.display()
                     )));
                 }
@@ -6040,6 +7255,7 @@ impl ProjectionRoot {
         if let RetainedGitEntry::Directory {
             directory,
             identity,
+            ..
         } = entry
         {
             return self.move_open_directory_from_expected_source_exact(
@@ -9438,7 +10654,8 @@ mod tests {
             .verify_resolved_tree_from_blobs(&fixture.tree, &fixture.blobs)
             .unwrap();
         let target = ExactProjectionDetachTarget::open_existing(&fixture.archive).unwrap();
-        let stage = ExactProjectionGitStage::open_existing(&fixture.staged_git).unwrap();
+        let stage = ExactProjectionGitStage::open_existing_unverified_for_test(&fixture.staged_git)
+            .unwrap();
 
         let outcome = freeze
             .replace_git_and_detach_verified_to_from_blobs(
@@ -9486,7 +10703,8 @@ mod tests {
             .verify_resolved_tree_from_blobs(&fixture.tree, &fixture.blobs)
             .unwrap();
         let target = ExactProjectionDetachTarget::open_existing(&fixture.archive).unwrap();
-        let stage = ExactProjectionGitStage::open_existing(&fixture.staged_git).unwrap();
+        let stage = ExactProjectionGitStage::open_existing_unverified_for_test(&fixture.staged_git)
+            .unwrap();
 
         let outcome = freeze
             .replace_git_and_detach_verified_to_from_blobs(
@@ -9520,7 +10738,8 @@ mod tests {
             .verify_resolved_tree_from_blobs(&fixture.tree, &fixture.blobs)
             .unwrap();
         let target = ExactProjectionDetachTarget::open_existing(&fixture.archive).unwrap();
-        let stage = ExactProjectionGitStage::open_existing(&fixture.staged_git).unwrap();
+        let stage = ExactProjectionGitStage::open_existing_unverified_for_test(&fixture.staged_git)
+            .unwrap();
 
         let outcome = freeze
             .replace_git_and_detach_verified_to_from_blobs(
@@ -9540,6 +10759,245 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn exact_eject_recovers_after_process_death_with_previous_git_archived() {
+        let fixture = exact_eject_fixture(ExistingGitFixture::File);
+        let freeze = ExactProjectionFreeze::acquire_existing(&fixture.root).unwrap();
+        let verification = freeze
+            .verify_resolved_tree_from_blobs(&fixture.tree, &fixture.blobs)
+            .unwrap();
+        let target = ExactProjectionDetachTarget::open_existing(&fixture.archive).unwrap();
+        let stage = ExactProjectionGitStage::open_existing_unverified_for_test(&fixture.staged_git)
+            .unwrap();
+
+        let killed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = freeze.replace_git_and_detach_verified_to_from_blobs_with_hook(
+                &verification,
+                &fixture.tree,
+                &fixture.blobs,
+                stage,
+                &target,
+                std::ffi::OsStr::new("kin"),
+                std::ffi::OsStr::new("previous-git"),
+                |point| {
+                    if point == ExactProjectionEjectHookPoint::AfterPreviousGitArchived {
+                        panic!("simulated process death after previous Git archive");
+                    }
+                },
+            );
+        }));
+        assert!(killed.is_err());
+        assert!(!fixture.root.join(".git").exists());
+        assert!(fixture.archive.join("previous-git").is_file());
+        assert!(fixture
+            .root
+            .join(".kin/reconciliation/exact-eject-journal.json")
+            .is_file());
+
+        drop(ExactProjectionFreeze::acquire_existing(&fixture.root).unwrap());
+
+        assert_eq!(
+            std::fs::read(fixture.root.join(".git")).unwrap(),
+            b"gitdir: ../legacy.git\n"
+        );
+        assert!(fixture.staged_git.is_dir());
+        assert!(!fixture.archive.join("previous-git").exists());
+        assert!(!fixture
+            .root
+            .join(".kin/reconciliation/exact-eject-journal.json")
+            .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_eject_recovers_after_process_death_with_staged_git_installed() {
+        let fixture = exact_eject_fixture(ExistingGitFixture::Directory);
+        let freeze = ExactProjectionFreeze::acquire_existing(&fixture.root).unwrap();
+        let verification = freeze
+            .verify_resolved_tree_from_blobs(&fixture.tree, &fixture.blobs)
+            .unwrap();
+        let target = ExactProjectionDetachTarget::open_existing(&fixture.archive).unwrap();
+        let stage = ExactProjectionGitStage::open_existing_unverified_for_test(&fixture.staged_git)
+            .unwrap();
+
+        let killed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = freeze.replace_git_and_detach_verified_to_from_blobs_with_hook(
+                &verification,
+                &fixture.tree,
+                &fixture.blobs,
+                stage,
+                &target,
+                std::ffi::OsStr::new("kin"),
+                std::ffi::OsStr::new("previous-git"),
+                |point| {
+                    if point == ExactProjectionEjectHookPoint::AfterStagedGitInstalled {
+                        panic!("simulated process death after staged Git install");
+                    }
+                },
+            );
+        }));
+        assert!(killed.is_err());
+        assert_eq!(
+            std::fs::read(fixture.root.join(".git/stage-marker")).unwrap(),
+            b"prepared Git"
+        );
+        assert!(!fixture.staged_git.exists());
+        assert!(fixture.archive.join("previous-git").is_dir());
+
+        drop(ExactProjectionFreeze::acquire_existing(&fixture.root).unwrap());
+
+        assert_eq!(
+            std::fs::read(fixture.root.join(".git/legacy-marker")).unwrap(),
+            b"legacy Git"
+        );
+        assert!(fixture.staged_git.is_dir());
+        assert!(!fixture.archive.join("previous-git").exists());
+        assert!(!fixture
+            .root
+            .join(".kin/reconciliation/exact-eject-journal.json")
+            .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_eject_recovery_rejects_an_authenticated_journal_tamper() {
+        let fixture = exact_eject_fixture(ExistingGitFixture::File);
+        let freeze = ExactProjectionFreeze::acquire_existing(&fixture.root).unwrap();
+        let verification = freeze
+            .verify_resolved_tree_from_blobs(&fixture.tree, &fixture.blobs)
+            .unwrap();
+        let target = ExactProjectionDetachTarget::open_existing(&fixture.archive).unwrap();
+        let stage = ExactProjectionGitStage::open_existing_unverified_for_test(&fixture.staged_git)
+            .unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = freeze.replace_git_and_detach_verified_to_from_blobs_with_hook(
+                &verification,
+                &fixture.tree,
+                &fixture.blobs,
+                stage,
+                &target,
+                std::ffi::OsStr::new("kin"),
+                std::ffi::OsStr::new("previous-git"),
+                |point| {
+                    if point == ExactProjectionEjectHookPoint::AfterPreviousGitArchived {
+                        panic!("simulated process death");
+                    }
+                },
+            );
+        }));
+        let journal = fixture
+            .root
+            .join(".kin/reconciliation/exact-eject-journal.json");
+        let mut bytes = std::fs::read(&journal).unwrap();
+        let byte = bytes
+            .iter_mut()
+            .find(|byte| byte.is_ascii_alphabetic())
+            .unwrap();
+        *byte ^= 1;
+        std::fs::write(&journal, bytes).unwrap();
+
+        let error = ExactProjectionFreeze::acquire_existing(&fixture.root)
+            .expect_err("tampered recovery journal must fail closed");
+        assert!(
+            error.to_string().contains("decode") || error.to_string().contains("authentication"),
+            "unexpected journal tamper error: {error}"
+        );
+        assert!(!fixture.root.join(".git").exists());
+        assert!(fixture.archive.join("previous-git").is_file());
+        assert!(fixture.staged_git.is_dir());
+        assert!(journal.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_eject_recovery_rejects_staged_git_descendant_tamper() {
+        let fixture = exact_eject_fixture(ExistingGitFixture::File);
+        let freeze = ExactProjectionFreeze::acquire_existing(&fixture.root).unwrap();
+        let verification = freeze
+            .verify_resolved_tree_from_blobs(&fixture.tree, &fixture.blobs)
+            .unwrap();
+        let target = ExactProjectionDetachTarget::open_existing(&fixture.archive).unwrap();
+        let stage = ExactProjectionGitStage::open_existing_unverified_for_test(&fixture.staged_git)
+            .unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = freeze.replace_git_and_detach_verified_to_from_blobs_with_hook(
+                &verification,
+                &fixture.tree,
+                &fixture.blobs,
+                stage,
+                &target,
+                std::ffi::OsStr::new("kin"),
+                std::ffi::OsStr::new("previous-git"),
+                |point| {
+                    if point == ExactProjectionEjectHookPoint::AfterStagedGitInstalled {
+                        panic!("simulated process death");
+                    }
+                },
+            );
+        }));
+        std::fs::write(
+            fixture.root.join(".git/stage-marker"),
+            b"tampered staged Git",
+        )
+        .unwrap();
+
+        let error = ExactProjectionFreeze::acquire_existing(&fixture.root)
+            .expect_err("tampered staged Git must block journal recovery");
+        assert!(
+            error.to_string().contains("seal") || error.to_string().contains("changed"),
+            "unexpected staged Git tamper error: {error}"
+        );
+        assert!(fixture.root.join(".git").is_dir());
+        assert!(!fixture.staged_git.exists());
+        assert!(fixture.archive.join("previous-git").is_file());
+        assert!(fixture
+            .root
+            .join(".kin/reconciliation/exact-eject-journal.json")
+            .is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_eject_process_death_after_kin_detach_is_a_committed_git_handoff() {
+        let fixture = exact_eject_fixture(ExistingGitFixture::File);
+        let freeze = ExactProjectionFreeze::acquire_existing(&fixture.root).unwrap();
+        let verification = freeze
+            .verify_resolved_tree_from_blobs(&fixture.tree, &fixture.blobs)
+            .unwrap();
+        let target = ExactProjectionDetachTarget::open_existing(&fixture.archive).unwrap();
+        let stage = ExactProjectionGitStage::open_existing_unverified_for_test(&fixture.staged_git)
+            .unwrap();
+
+        let killed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = freeze.replace_git_and_detach_verified_to_from_blobs_with_hook(
+                &verification,
+                &fixture.tree,
+                &fixture.blobs,
+                stage,
+                &target,
+                std::ffi::OsStr::new("kin"),
+                std::ffi::OsStr::new("previous-git"),
+                |point| {
+                    if point == ExactProjectionEjectHookPoint::AfterKinDetached {
+                        panic!("simulated process death after commit point");
+                    }
+                },
+            );
+        }));
+        assert!(killed.is_err());
+        assert!(!fixture.root.join(".kin").exists());
+        assert_eq!(
+            std::fs::read(fixture.root.join(".git/stage-marker")).unwrap(),
+            b"prepared Git"
+        );
+        assert!(fixture
+            .archive
+            .join("kin/reconciliation/exact-eject-journal.json")
+            .is_file());
+        assert!(fixture.archive.join("previous-git").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn exact_eject_raced_archive_destination_fails_before_mutation() {
         let fixture = exact_eject_fixture(ExistingGitFixture::File);
         let freeze = ExactProjectionFreeze::acquire_existing(&fixture.root).unwrap();
@@ -9547,7 +11005,8 @@ mod tests {
             .verify_resolved_tree_from_blobs(&fixture.tree, &fixture.blobs)
             .unwrap();
         let target = ExactProjectionDetachTarget::open_existing(&fixture.archive).unwrap();
-        let stage = ExactProjectionGitStage::open_existing(&fixture.staged_git).unwrap();
+        let stage = ExactProjectionGitStage::open_existing_unverified_for_test(&fixture.staged_git)
+            .unwrap();
 
         let error = freeze
             .replace_git_and_detach_verified_to_from_blobs_with_hook(
@@ -9589,7 +11048,8 @@ mod tests {
             .verify_resolved_tree_from_blobs(&fixture.tree, &fixture.blobs)
             .unwrap();
         let target = ExactProjectionDetachTarget::open_existing(&fixture.archive).unwrap();
-        let stage = ExactProjectionGitStage::open_existing(&fixture.staged_git).unwrap();
+        let stage = ExactProjectionGitStage::open_existing_unverified_for_test(&fixture.staged_git)
+            .unwrap();
 
         let error = freeze
             .replace_git_and_detach_verified_to_from_blobs_with_hook(
@@ -9637,7 +11097,8 @@ mod tests {
             .verify_resolved_tree_from_blobs(&fixture.tree, &fixture.blobs)
             .unwrap();
         let target = ExactProjectionDetachTarget::open_existing(&fixture.archive).unwrap();
-        let stage = ExactProjectionGitStage::open_existing(&fixture.staged_git).unwrap();
+        let stage = ExactProjectionGitStage::open_existing_unverified_for_test(&fixture.staged_git)
+            .unwrap();
 
         let error = freeze
             .replace_git_and_detach_verified_to_from_blobs_with_hook(
@@ -9683,7 +11144,8 @@ mod tests {
             .verify_resolved_tree_from_blobs(&fixture.tree, &fixture.blobs)
             .unwrap();
         let target = ExactProjectionDetachTarget::open_existing(&fixture.archive).unwrap();
-        let stage = ExactProjectionGitStage::open_existing(&fixture.staged_git).unwrap();
+        let stage = ExactProjectionGitStage::open_existing_unverified_for_test(&fixture.staged_git)
+            .unwrap();
 
         let error = freeze
             .replace_git_and_detach_verified_to_from_blobs_with_hook(
@@ -9738,7 +11200,8 @@ mod tests {
             .verify_resolved_tree_from_blobs(&fixture.tree, &fixture.blobs)
             .unwrap();
         let target = ExactProjectionDetachTarget::open_existing(&fixture.archive).unwrap();
-        let stage = ExactProjectionGitStage::open_existing(&fixture.staged_git).unwrap();
+        let stage = ExactProjectionGitStage::open_existing_unverified_for_test(&fixture.staged_git)
+            .unwrap();
 
         let error = freeze
             .replace_git_and_detach_verified_to_from_blobs(
@@ -9785,7 +11248,8 @@ mod tests {
             .verify_resolved_tree_from_blobs(&tree, &blobs)
             .unwrap();
         let target = ExactProjectionDetachTarget::open_existing(&archive).unwrap();
-        let stage = ExactProjectionGitStage::open_existing(&staged_git).unwrap();
+        let stage =
+            ExactProjectionGitStage::open_existing_unverified_for_test(&staged_git).unwrap();
 
         let error = freeze
             .replace_git_and_detach_verified_to_from_blobs(
