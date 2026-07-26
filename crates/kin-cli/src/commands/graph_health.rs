@@ -2,11 +2,12 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::{EntityStore, GraphStats};
+use kin_model::{EntityStore, GraphStats, TreeEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::path::Path;
 
-use super::init::{collect_source_files, is_repo_owned_graph_path};
+use super::init::{collect_on_disk_tree_entries, is_repo_owned_graph_path};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GraphHealthReport {
@@ -56,12 +57,18 @@ pub(crate) fn inspect_graph(
 
 fn collect_supported_inputs(layout: &kin_core::KinLayout) -> Result<SupportedInputCounts> {
     let source_root = kin_core::source_dir(layout);
-    let all_files = collect_source_files(&source_root)?;
+    let admitted_entries = collect_on_disk_tree_entries(&source_root)?;
     let mut entity_source = 0usize;
     let mut shallow_source = 0usize;
 
-    for file in all_files {
-        match kin_index::FileClassifier::classify(&file) {
+    for (repo_path, entry) in admitted_entries {
+        if !matches!(entry, TreeEntry::Blob { .. }) {
+            continue;
+        }
+        let Some(path) = repo_path.as_utf8() else {
+            continue;
+        };
+        match kin_index::FileClassifier::classify(Path::new(path)) {
             kin_index::FileClassification::EntitySource => entity_source += 1,
             kin_index::FileClassification::ShallowSyntax { language_hint } => {
                 if kin_parser::get_shallow_grammar(&language_hint).is_some() {

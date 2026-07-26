@@ -21,6 +21,7 @@ pub use cochange::{mine_from_change_dag, mine_from_git_log, mine_from_git_log_wi
 pub use error::{GitError, Result};
 pub use export::{export_changes, export_to_git, ExportOptions, ExportResult};
 pub use genesis::is_genesis_change;
+#[allow(deprecated)]
 pub use import::{
     import_git_history, import_git_history_to_commit_with_blobs, import_git_history_with_blobs,
     semantic_change_id_from_git_oid_hex, GitImportMode, ImportOptions, ImportedChange,

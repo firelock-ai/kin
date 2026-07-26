@@ -8,9 +8,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const PREPARED_PUBLISH_SCHEMA: &str = "kin.prepared-state.publish.v1";
-const PREPARED_MATERIALIZE_SCHEMA: &str = "kin.prepared-state.materialize.v1";
-const PREPARED_MANIFEST_SCHEMA: &str = "kin.prepared-state.v1";
+const PREPARED_PUBLISH_SCHEMA: &str = "kin.prepared-state.publish.v2";
+const PREPARED_MATERIALIZE_SCHEMA: &str = "kin.prepared-state.materialize.v2";
+const PREPARED_MANIFEST_SCHEMA: &str = "kin.prepared-state.v2";
 const EMBEDDED_PREPARED_MANIFEST: &str = ".kin/bench/prepared-manifest.json";
 
 const VALIDATION_KEYS: &[&str] = &[
@@ -18,7 +18,7 @@ const VALIDATION_KEYS: &[&str] = &[
     "repo_identity",
     "git_head",
     "git_tree",
-    "init_pipeline_epoch",
+    "graph_build_pipeline_epoch",
     "parser_schema_epoch",
     "layout_schema_version",
     "graph_snapshot_version",

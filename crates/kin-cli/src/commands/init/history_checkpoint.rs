@@ -57,7 +57,7 @@ const DEFAULT_BYTE_CAP: u64 = 2 * 1024 * 1024 * 1024;
 const STORE_LOCK_FILE: &str = ".store.lock";
 static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
-pub(super) const BASE_LINK_MESSAGE: &str = "kin import: base-link (window base universe)";
+pub(super) const BASE_LINK_MESSAGE: &str = "kin history: base-link (window base universe)";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
