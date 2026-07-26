@@ -13,6 +13,125 @@ use kin_model::{ArtifactId, LocatedEntry, RepoPath, ResolvedTree, TreeDelta, Tre
 
 use crate::{KinError, Result};
 
+/// One explicit, identity-bearing operation over graph-owned repository truth.
+///
+/// Paths remain locations. A move keeps the source artifact identity, while a
+/// copy must carry a caller-stable fresh identity so transaction retries do not
+/// silently mint a different artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactTreeOperation {
+    Move {
+        artifact_id: ArtifactId,
+        destination: RepoPath,
+    },
+    Copy {
+        source_artifact_id: ArtifactId,
+        new_artifact_id: ArtifactId,
+        destination: RepoPath,
+    },
+}
+
+/// Plan explicit moves and copies as one exact tree transaction.
+///
+/// The planner never reads projected files and never classifies by language or
+/// content. Blob, executable, symlink, Gitlink, binary, configuration, and
+/// unsupported-language entries all follow the same identity rules. Every move
+/// is removed before any destination is inserted by [`ResolvedTree::apply`],
+/// so swaps and rename cycles are supported without order-dependent behavior.
+pub fn plan_artifact_operations(
+    current: &ResolvedTree,
+    operations: &[ArtifactTreeOperation],
+) -> Result<Vec<TreeDelta>> {
+    let mut deltas = Vec::with_capacity(operations.len());
+    for operation in operations {
+        let delta = match operation {
+            ArtifactTreeOperation::Move {
+                artifact_id,
+                destination,
+            } => {
+                let source = current.get(artifact_id).ok_or_else(|| {
+                    KinError::Other(format!(
+                        "cannot move unknown repository artifact {artifact_id:?}"
+                    ))
+                })?;
+                TreeDelta::Updated {
+                    artifact_id: *artifact_id,
+                    old: source.located_entry(),
+                    new: LocatedEntry::new(destination.clone(), source.entry),
+                }
+            }
+            ArtifactTreeOperation::Copy {
+                source_artifact_id,
+                new_artifact_id,
+                destination,
+            } => {
+                let source = current.get(source_artifact_id).ok_or_else(|| {
+                    KinError::Other(format!(
+                        "cannot copy unknown repository artifact {source_artifact_id:?}"
+                    ))
+                })?;
+                TreeDelta::Added {
+                    artifact_id: *new_artifact_id,
+                    new: LocatedEntry::new(destination.clone(), source.entry),
+                }
+            }
+        };
+        deltas.push(delta);
+    }
+
+    sort_deltas(&mut deltas);
+    current.apply(&deltas).map_err(|error| {
+        KinError::Other(format!("invalid explicit artifact operation: {error}"))
+    })?;
+    Ok(deltas)
+}
+
+/// Resolve one source path through graph truth and plan an identity-preserving
+/// move. This is a path-addressed convenience for CLI/API boundaries; the
+/// resulting delta is identity-addressed.
+pub fn plan_artifact_move(
+    current: &ResolvedTree,
+    source: &RepoPath,
+    destination: RepoPath,
+) -> Result<Vec<TreeDelta>> {
+    let artifact_id = current.artifact_id_at_path(source).ok_or_else(|| {
+        KinError::Other(format!(
+            "cannot move untracked repository path {source}; admit it before moving it"
+        ))
+    })?;
+    plan_artifact_operations(
+        current,
+        &[ArtifactTreeOperation::Move {
+            artifact_id,
+            destination,
+        }],
+    )
+}
+
+/// Resolve one source path through graph truth and plan a copy with an explicit
+/// fresh identity. The caller owns `new_artifact_id` so an operation can be
+/// retried idempotently through the repository transaction boundary.
+pub fn plan_artifact_copy(
+    current: &ResolvedTree,
+    source: &RepoPath,
+    destination: RepoPath,
+    new_artifact_id: ArtifactId,
+) -> Result<Vec<TreeDelta>> {
+    let source_artifact_id = current.artifact_id_at_path(source).ok_or_else(|| {
+        KinError::Other(format!(
+            "cannot copy untracked repository path {source}; admit it before copying it"
+        ))
+    })?;
+    plan_artifact_operations(
+        current,
+        &[ArtifactTreeOperation::Copy {
+            source_artifact_id,
+            new_artifact_id,
+            destination,
+        }],
+    )
+}
+
 /// Compute the exact identity-bearing correction between two graph trees.
 pub fn exact_tree_correction(
     current: &ResolvedTree,
@@ -227,7 +346,7 @@ fn sort_deltas(deltas: &mut [TreeDelta]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kin_model::{Hash256, ResolvedArtifact};
+    use kin_model::{GitObjectId, Hash256, ResolvedArtifact};
 
     fn resolved(artifacts: Vec<(ArtifactId, RepoPath, TreeEntry)>) -> ResolvedTree {
         ResolvedTree::from_artifacts(
@@ -334,5 +453,145 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("identity-underdetermined"));
+    }
+
+    #[test]
+    fn explicit_move_preserves_identity_for_arbitrary_artifact_bytes() {
+        let artifact_id = ArtifactId::new();
+        let source = RepoPath::from_utf8("compose.yaml").unwrap();
+        let destination = RepoPath::from_bytes(b"deploy/compose-\xff.yaml".to_vec()).unwrap();
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x81; 32]), true);
+        let current = resolved(vec![(artifact_id, source.clone(), entry)]);
+
+        let deltas = plan_artifact_move(&current, &source, destination.clone()).unwrap();
+        let next = current.apply(&deltas).unwrap();
+
+        assert!(next.artifact_at_path(&source).is_none());
+        assert_eq!(next.artifact_id_at_path(&destination), Some(artifact_id));
+        assert_eq!(next.get(&artifact_id).unwrap().entry, entry);
+    }
+
+    #[test]
+    fn explicit_copy_mints_identity_without_reinterpreting_entry_kind() {
+        let source_id = ArtifactId::new();
+        let copied_id = ArtifactId::new();
+        let source = RepoPath::from_utf8("vendor/module").unwrap();
+        let destination = RepoPath::from_utf8("vendor/module-copy").unwrap();
+        let entry = TreeEntry::gitlink(GitObjectId::sha1([0x91; 20]));
+        let current = resolved(vec![(source_id, source.clone(), entry)]);
+
+        let deltas = plan_artifact_copy(&current, &source, destination.clone(), copied_id).unwrap();
+        let next = current.apply(&deltas).unwrap();
+
+        assert_eq!(next.artifact_id_at_path(&source), Some(source_id));
+        assert_eq!(next.artifact_id_at_path(&destination), Some(copied_id));
+        assert_eq!(next.get(&copied_id).unwrap().entry, entry);
+    }
+
+    #[test]
+    fn explicit_operations_support_atomic_swaps_and_copy_from_a_moved_source() {
+        let left_id = ArtifactId::new();
+        let right_id = ArtifactId::new();
+        let copy_id = ArtifactId::new();
+        let left = RepoPath::from_utf8("left").unwrap();
+        let right = RepoPath::from_utf8("right").unwrap();
+        let copy = RepoPath::from_utf8("copies/left-link").unwrap();
+        let left_entry = TreeEntry::symlink(Hash256::from_bytes([0xa1; 32]));
+        let right_entry = TreeEntry::blob(Hash256::from_bytes([0xa2; 32]), false);
+        let current = resolved(vec![
+            (left_id, left.clone(), left_entry),
+            (right_id, right.clone(), right_entry),
+        ]);
+
+        let deltas = plan_artifact_operations(
+            &current,
+            &[
+                ArtifactTreeOperation::Move {
+                    artifact_id: left_id,
+                    destination: right.clone(),
+                },
+                ArtifactTreeOperation::Move {
+                    artifact_id: right_id,
+                    destination: left.clone(),
+                },
+                ArtifactTreeOperation::Copy {
+                    source_artifact_id: left_id,
+                    new_artifact_id: copy_id,
+                    destination: copy.clone(),
+                },
+            ],
+        )
+        .unwrap();
+        let next = current.apply(&deltas).unwrap();
+
+        assert_eq!(next.artifact_id_at_path(&right), Some(left_id));
+        assert_eq!(next.artifact_id_at_path(&left), Some(right_id));
+        assert_eq!(next.artifact_id_at_path(&copy), Some(copy_id));
+        assert_eq!(next.get(&copy_id).unwrap().entry, left_entry);
+    }
+
+    #[test]
+    fn explicit_operations_reject_colliding_paths_and_id_reuse_atomically() {
+        let source_id = ArtifactId::new();
+        let occupied_id = ArtifactId::new();
+        let source = RepoPath::from_utf8("source.bin").unwrap();
+        let occupied = RepoPath::from_utf8("occupied.bin").unwrap();
+        let current = resolved(vec![
+            (
+                source_id,
+                source,
+                TreeEntry::blob(Hash256::from_bytes([0xb1; 32]), false),
+            ),
+            (
+                occupied_id,
+                occupied.clone(),
+                TreeEntry::blob(Hash256::from_bytes([0xb2; 32]), false),
+            ),
+        ]);
+
+        let path_error = plan_artifact_operations(
+            &current,
+            &[ArtifactTreeOperation::Move {
+                artifact_id: source_id,
+                destination: occupied,
+            }],
+        )
+        .unwrap_err();
+        assert!(path_error.to_string().contains("remains occupied"));
+
+        let id_error = plan_artifact_operations(
+            &current,
+            &[ArtifactTreeOperation::Copy {
+                source_artifact_id: source_id,
+                new_artifact_id: occupied_id,
+                destination: RepoPath::from_utf8("copy.bin").unwrap(),
+            }],
+        )
+        .unwrap_err();
+        assert!(id_error.to_string().contains("already exists"));
+        assert_eq!(current.len(), 2);
+    }
+
+    #[test]
+    fn explicit_operations_reject_untracked_sources_and_noop_moves() {
+        let artifact_id = ArtifactId::new();
+        let tracked = RepoPath::from_utf8("tracked").unwrap();
+        let current = resolved(vec![(
+            artifact_id,
+            tracked.clone(),
+            TreeEntry::blob(Hash256::from_bytes([0xc1; 32]), false),
+        )]);
+
+        let untracked = RepoPath::from_utf8("untracked").unwrap();
+        let error = plan_artifact_move(
+            &current,
+            &untracked,
+            RepoPath::from_utf8("destination").unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot move untracked"));
+
+        let error = plan_artifact_move(&current, &tracked, tracked.clone()).unwrap_err();
+        assert!(error.to_string().contains("no-op"));
     }
 }
