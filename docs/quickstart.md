@@ -478,20 +478,13 @@ metadata and the pre-eject repository-local `.git` entry are retained in a
 private sibling archive as `kin/` and `previous-git/`. Credential-free remote
 URLs, refspecs, branch tracking, and push defaults sealed during Git import are
 restored; credentials and ambient Git configuration are never copied. The
-command prints the exact archive path. The capability-anchored transaction is
-currently supported on Unix hosts. Windows eject fails before namespace
-mutation until the same durable retained-handle guarantees are implemented
-there.
-
-For an intentional, irreversible removal:
-
-```sh
-kin eject --yes --purge-metadata
-```
-
-This performs the same graph/projection checks and atomic detach, then deletes
-the detached archive. Kin never restores an initialization-time filesystem
-snapshot or treats the old `.git/` as authority.
+command prints the exact archive path. Kin intentionally leaves irreversible
+archive deletion to the operator after an independent backup; the eject
+transaction never follows an ambient path to recursively delete detached
+authority. The capability-anchored transaction is currently supported on Unix
+hosts. Windows eject fails before namespace mutation until the same durable
+retained-handle guarantees are implemented there. Kin never restores an
+initialization-time filesystem snapshot or treats the old `.git/` as authority.
 
 To keep Kin attached and instead create a standalone interoperability
 projection, export one exact authority generation to a new bare repository:
