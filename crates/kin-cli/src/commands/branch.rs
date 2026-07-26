@@ -5,9 +5,11 @@
 
 use anyhow::{Context, Result};
 use kin_model::{
-    AuthorId, OperationId, RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy,
-    RepositoryCommitReceipt, RepositoryId, RepositoryTransaction, RootBundle, WorkspaceHead,
-    WorkspaceId, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    compute_resolved_tree_hash, AuthorId, EffectiveAdmissionPolicyStamp, OperationId,
+    RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy, RepoPath,
+    RepositoryCommitReceipt, RepositoryId, RepositoryTransaction, ResolvedTree, RootBundle,
+    TreeEntry, WorkspaceExpectation, WorkspaceHead, WorkspaceId, WorkspaceMutation,
+    REPOSITORY_TRANSACTION_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -135,6 +137,13 @@ pub fn delete(name: RefName) -> Result<()> {
     Ok(())
 }
 
+pub fn switch(name: RefName) -> Result<()> {
+    let layout = discover_layout()?;
+    let response = switch_at(&layout, &name)?;
+    print_lines(response);
+    Ok(())
+}
+
 pub fn parse_branch_ref(name: Option<&str>, ref_hex: Option<&str>) -> Result<RefName> {
     let name = match (name, ref_hex) {
         (Some(name), None) => parse_ref_name(name)?,
@@ -174,10 +183,7 @@ pub fn execute_branch_request(
         }
         BranchRequest::Create { name } => create_at(layout, name),
         BranchRequest::Delete { name } => delete_at(layout, name),
-        BranchRequest::Switch { .. } => {
-            super::capabilities::require_ready("branch switch")?;
-            anyhow::bail!("branch switch was declared ready without an executor")
-        }
+        BranchRequest::Switch { name } => switch_at(layout, name),
     }
 }
 
@@ -318,6 +324,186 @@ fn delete_ref_with_hook(
         .manager()
         .commit_repository_transaction(transaction)
         .with_context(|| format!("delete repository-v6 branch {name}"))
+}
+
+fn switch_at(layout: &kin_core::KinLayout, name: &RefName) -> Result<BranchResponse> {
+    require_branch_ref(name)?;
+    let authority = ActiveRepositoryAuthority::open(layout)?;
+    let lease = authority.manager().read_authority();
+    let roots = lease.roots().clone();
+    let metadata = lease.metadata();
+    let workspace = metadata
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == authority.workspace_id)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "repository {} has no workspace {} in repository-v6 authority",
+                authority.repository_id,
+                authority.workspace_id
+            )
+        })?;
+    if workspace.is_dirty() {
+        anyhow::bail!(
+            "workspace {} has graph-owned changes; commit or explicitly preserve them before \
+             switching branches",
+            workspace.workspace_id
+        );
+    }
+    let target = lease
+        .resolve_ref_target(name)
+        .with_context(|| format!("resolve repository branch {name} from one authority lease"))?
+        .ok_or_else(|| anyhow::anyhow!("repository branch {name} does not exist"))?;
+    let target_change_id = lease
+        .resolve_target_change_id(&target)
+        .with_context(|| format!("resolve exact semantic target for branch {name}"))?;
+    let target_shared_policy = metadata
+        .admission_policies
+        .iter()
+        .find(|resolved| resolved.change_id == target_change_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "target change {target_change_id} has no repository-v6 admission-policy record"
+            )
+        })?
+        .policy
+        .clone()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "target change {target_change_id} has unresolved admission policy and cannot \
+                 become a clean workspace"
+            )
+        })?;
+    let mut snapshot = lease.snapshot().clone();
+    snapshot.repository_authority = None;
+    drop(lease);
+
+    let graph = kin_db::InMemoryGraph::from_snapshot(snapshot)
+        .context("prepare graph-owned branch target")?;
+    let target_tree = kin_core::tree::resolve_change_tree(&graph, &target_change_id)
+        .with_context(|| format!("resolve exact tree for branch {name}"))?;
+    let target_tree_hash =
+        compute_resolved_tree_hash(&target_tree).context("hash exact branch target tree")?;
+    if matches!(&workspace.head, WorkspaceHead::Symbolic { target } if target == name)
+        && workspace.base_target.as_ref() == Some(&target)
+        && workspace.tree == target_tree
+    {
+        return Ok(BranchResponse {
+            lines: vec![format!(
+                "Already on {} (authority generation {})",
+                name, roots.generation
+            )],
+            mutated: false,
+            report: None,
+        });
+    }
+
+    let tree_deltas = kin_core::exact_tree_correction(&workspace.tree, &target_tree)
+        .context("plan exact branch workspace transition")?;
+    let transaction = RepositoryTransaction {
+        schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        operation_id: OperationId::new(),
+        repository_id: authority.repository_id.clone(),
+        expected_generation: roots.generation,
+        expected_roots: roots,
+        actor: AuthorId::new("kin-branch-command"),
+        reason: "switch exact repository workspace branch".to_string(),
+        external_objects: Vec::new(),
+        git_authority_delta: None,
+        changes: Vec::new(),
+        aliases: Vec::new(),
+        ref_mutations: Vec::new(),
+        default_ref_mutation: None,
+        workspace_mutation: Some(WorkspaceMutation {
+            workspace_id: workspace.workspace_id,
+            expected: WorkspaceExpectation::MustEqual {
+                generation: workspace.generation,
+                head: workspace.head.clone(),
+                base_target: workspace.base_target.clone(),
+                base_tree_hash: workspace.base_tree_hash,
+                tree_hash: workspace.tree_hash,
+                admission_policy: workspace.admission_policy,
+            },
+            new_generation: workspace
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("workspace generation overflow"))?,
+            new_head: WorkspaceHead::Symbolic {
+                target: name.clone(),
+            },
+            new_base_target: Some(target),
+            new_base_tree_hash: Some(target_tree_hash),
+            tree_deltas,
+            new_tree_hash: target_tree_hash,
+            new_shared_admission_policy: target_shared_policy.clone(),
+            new_admission_policy: EffectiveAdmissionPolicyStamp {
+                shared: target_shared_policy.stamp(),
+                local: workspace.admission_policy.local,
+            },
+        }),
+        local_overlay_delta: None,
+    };
+    let previous_bodies = load_tree_bodies(&authority, &workspace.tree, "current workspace")?;
+    let target_bodies = load_tree_bodies(&authority, &target_tree, "branch target")?;
+    let (materialized, receipt) =
+        kin_core::tree::reconcile_source_tree_and_commit_repository_transaction(
+            layout.working_dir(),
+            &workspace.tree,
+            &target_tree,
+            previous_bodies
+                .iter()
+                .map(|body| (&body.path, body.entry, body.bytes.as_slice())),
+            target_bodies
+                .iter()
+                .map(|body| (&body.path, body.entry, body.bytes.as_slice())),
+            authority.manager(),
+            transaction,
+        )
+        .with_context(|| format!("switch repository-v6 workspace to branch {name}"))?;
+
+    Ok(BranchResponse {
+        lines: vec![format!(
+            "Switched to {} at change {} ({} projected entries, authority generation {})",
+            name, target_change_id, materialized, receipt.generation
+        )],
+        mutated: true,
+        report: None,
+    })
+}
+
+struct SourceBody {
+    path: RepoPath,
+    entry: TreeEntry,
+    bytes: Vec<u8>,
+}
+
+fn load_tree_bodies(
+    authority: &ActiveRepositoryAuthority,
+    tree: &ResolvedTree,
+    label: &str,
+) -> Result<Vec<SourceBody>> {
+    let mut bodies = Vec::with_capacity(tree.len());
+    for artifact in tree.artifacts() {
+        let digest = artifact.entry.blob_identity().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{label} contains gitlink {}; exact submodule projection is not implemented",
+                artifact.path
+            )
+        })?;
+        bodies.push(SourceBody {
+            path: artifact.path.clone(),
+            entry: artifact.entry,
+            bytes: authority.load_source_blob(digest).with_context(|| {
+                format!(
+                    "load {label} body {} for graph-owned path {}",
+                    digest, artifact.path
+                )
+            })?,
+        });
+    }
+    bodies.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(bodies)
 }
 
 fn ref_transaction(

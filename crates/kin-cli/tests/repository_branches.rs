@@ -22,8 +22,41 @@ fn initialize_git_repo(repo: &Path) {
     run_git(repo, &["config", "user.email", "kin@example.invalid"]);
     run_git(repo, &["config", "user.name", "Kin"]);
     fs::write(repo.join("compose.yaml"), b"services: {}\n").expect("write Compose file");
+    fs::write(repo.join("unchanged.txt"), b"shared branch bytes\n")
+        .expect("write unchanged tracked file");
     run_git(repo, &["add", "--all"]);
     run_git(repo, &["commit", "-m", "base"]);
+}
+
+#[cfg(unix)]
+fn add_feature_branch(repo: &Path) {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    run_git(repo, &["switch", "-c", "feature"]);
+    fs::write(
+        repo.join("compose.yaml"),
+        b"services:\n  api:\n    build: .\n",
+    )
+    .expect("write target Compose file");
+    fs::write(repo.join("Dockerfile"), b"FROM scratch\n").expect("write Dockerfile");
+    fs::create_dir_all(repo.join("src")).expect("create Rust source directory");
+    fs::write(repo.join("src/lib.rs"), b"pub fn feature() {}\n").expect("write Rust source");
+    fs::write(repo.join("worker.py"), b"def feature():\n    return True\n")
+        .expect("write Python source");
+    fs::write(repo.join("notes.mystery"), b"unsupported-language bytes\n")
+        .expect("write unsupported-language file");
+    fs::create_dir_all(repo.join("assets")).expect("create asset directory");
+    fs::write(repo.join("assets/data.bin"), [0_u8, 0xff, 0x10, 0x00]).expect("write binary asset");
+    fs::write(repo.join("run-tool"), b"#!/bin/sh\nexit 0\n").expect("write executable");
+    let mut permissions = fs::metadata(repo.join("run-tool"))
+        .expect("stat executable")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(repo.join("run-tool"), permissions).expect("mark executable");
+    symlink("compose.yaml", repo.join("compose-link")).expect("create source symlink");
+    run_git(repo, &["add", "--all"]);
+    run_git(repo, &["commit", "-m", "feature tree"]);
+    run_git(repo, &["switch", "main"]);
 }
 
 fn initialize_kin_repo(repo: &Path, home: &Path) -> kin_core::KinLayout {
@@ -486,4 +519,181 @@ fn branch_create_uses_detached_workspace_target_without_git_fallback() {
         .find(|repository_ref| repository_ref.name == RefName::branch(b"detached-copy").unwrap())
         .expect("branch copied from detached target");
     assert_eq!(Some(copied.target.clone()), workspace.base_target.clone());
+    drop(lease);
+
+    let switched = run_kin(&repo, &home, &["branch", "switch", "main"]);
+    assert!(
+        switched.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&switched.stdout),
+        String::from_utf8_lossy(&switched.stderr)
+    );
+    let reopened = RepositoryAuthorityManager::open(
+        manager.read_authority().metadata().repository_id.clone(),
+        Arc::new(LocalFileBackend::new(layout.kindb_dir())),
+    )
+    .expect("reopen switched authority");
+    let workspace = reopened
+        .read_authority()
+        .metadata()
+        .workspaces
+        .first()
+        .expect("switched workspace")
+        .clone();
+    assert_eq!(
+        workspace.head,
+        kin_model::WorkspaceHead::Symbolic {
+            target: RefName::branch(b"main").unwrap()
+        }
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn branch_switch_projects_complete_polyglot_and_non_code_tree_from_repository_cas() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&home).expect("create home");
+    initialize_git_repo(&repo);
+    add_feature_branch(&repo);
+    let layout = initialize_kin_repo(&repo, &home);
+    let (repository_id, manager) = open_authority(&layout);
+    let lease = manager.read_authority();
+    let roots = lease.roots().clone();
+    let feature_target = lease
+        .metadata()
+        .ref_state
+        .refs
+        .iter()
+        .find(|repository_ref| repository_ref.name == RefName::branch(b"feature").unwrap())
+        .expect("imported feature branch")
+        .target
+        .clone();
+    drop(lease);
+    let raw_branch = RefName::from_bytes([
+        b'r', b'e', b'f', b's', b'/', b'h', b'e', b'a', b'd', b's', b'/', b'f', b'e', b'a', b't',
+        b'u', b'r', b'e', b'-', 0xff,
+    ])
+    .unwrap();
+    manager
+        .commit_repository_transaction(exact_ref_create_transaction(
+            &repository_id,
+            &roots,
+            raw_branch.clone(),
+            feature_target.clone(),
+            "install byte-exact switch target",
+        ))
+        .expect("commit byte-exact branch");
+    fs::rename(repo.join(".git"), repo.join("git-authority-disabled"))
+        .expect("hide admitted Git metadata");
+
+    let switched = run_kin(
+        &repo,
+        &home,
+        &[
+            "branch",
+            "switch",
+            "--ref-hex",
+            &hex::encode(raw_branch.as_bytes()),
+        ],
+    );
+    assert!(
+        switched.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&switched.stdout),
+        String::from_utf8_lossy(&switched.stderr)
+    );
+
+    assert_eq!(
+        fs::read(repo.join("compose.yaml")).unwrap(),
+        b"services:\n  api:\n    build: .\n"
+    );
+    assert_eq!(
+        fs::read(repo.join("Dockerfile")).unwrap(),
+        b"FROM scratch\n"
+    );
+    assert_eq!(
+        fs::read(repo.join("src/lib.rs")).unwrap(),
+        b"pub fn feature() {}\n"
+    );
+    assert_eq!(
+        fs::read(repo.join("worker.py")).unwrap(),
+        b"def feature():\n    return True\n"
+    );
+    assert_eq!(
+        fs::read(repo.join("notes.mystery")).unwrap(),
+        b"unsupported-language bytes\n"
+    );
+    assert_eq!(
+        fs::read(repo.join("assets/data.bin")).unwrap(),
+        [0_u8, 0xff, 0x10, 0x00]
+    );
+    assert_ne!(
+        fs::metadata(repo.join("run-tool"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o111,
+        0
+    );
+    assert_eq!(
+        fs::read_link(repo.join("compose-link")).unwrap(),
+        Path::new("compose.yaml")
+    );
+    assert!(!layout.root().join("HEAD").exists());
+
+    let reopened = RepositoryAuthorityManager::open(
+        repository_id,
+        Arc::new(LocalFileBackend::new(layout.kindb_dir())),
+    )
+    .expect("reopen switched authority");
+    let lease = reopened.read_authority();
+    let workspace = lease.metadata().workspaces.first().unwrap();
+    assert_eq!(
+        workspace.head,
+        kin_model::WorkspaceHead::Symbolic { target: raw_branch }
+    );
+    assert_eq!(workspace.base_target, Some(feature_target));
+    assert_eq!(workspace.base_tree_hash, Some(workspace.tree_hash));
+    let operation = lease.metadata().operation_log.last().unwrap();
+    assert!(operation.workspace_mutation.is_some());
+    assert!(operation.ref_mutations.is_empty());
+    assert_eq!(lease.roots().generation, 3);
+    assert!(fs::symlink_metadata(repo.join("compose-link"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[cfg(unix)]
+#[test]
+fn branch_switch_rejects_local_tracked_edits_and_preserves_authority() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&home).expect("create home");
+    initialize_git_repo(&repo);
+    add_feature_branch(&repo);
+    let layout = initialize_kin_repo(&repo, &home);
+    let (_, manager) = open_authority(&layout);
+    let before = manager.read_authority().roots().clone();
+    fs::write(repo.join("unchanged.txt"), b"local uncommitted edit\n").expect("write local edit");
+
+    let switched = run_kin(&repo, &home, &["branch", "switch", "feature"]);
+    assert!(!switched.status.success());
+    assert!(
+        String::from_utf8_lossy(&switched.stderr).contains("differs from prior workspace source")
+    );
+    assert_eq!(
+        fs::read(repo.join("unchanged.txt")).unwrap(),
+        b"local uncommitted edit\n"
+    );
+    assert_eq!(
+        manager.read_authority().roots(),
+        &before,
+        "rejected projection advanced repository authority"
+    );
 }

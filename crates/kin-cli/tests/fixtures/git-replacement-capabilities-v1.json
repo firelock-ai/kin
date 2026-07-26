@@ -120,16 +120,19 @@
     },
     {
       "command": "branch switch",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "repository-v6 workspace transaction and graph-derived projection",
       "required_for_bounded_dogfood": true,
       "acceptance_spec": [
         "transition exact workspace head and tree atomically against expected generation and roots",
         "materialize the committed graph tree with rollback and verify all source bodies from repository CAS"
       ],
-      "evidence_tests": [],
-      "note": "The previous switch path depended on .kin/HEAD, legacy branches, and .kin/objects."
+      "evidence_tests": [
+        "crates/kin-core/src/tree.rs",
+        "crates/kin-cli/tests/repository_branches.rs"
+      ],
+      "note": "Branch switch resolves byte-exact repository refs from one authority lease, loads complete blob and symlink bodies from repository CAS, and commits the exact workspace mutation through a crash-recoverable projection WAL. Dirty graph workspaces and gitlink projection fail closed."
     },
     {
       "command": "git export",
