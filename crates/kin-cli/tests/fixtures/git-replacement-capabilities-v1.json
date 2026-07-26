@@ -50,16 +50,18 @@
     },
     {
       "command": "log",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "repository-v6 workspace/ref plus immutable change DAG",
       "required_for_bounded_dogfood": true,
       "acceptance_spec": [
         "resolve the active workspace head through exact repository refs and external aliases",
         "walk immutable semantic parents without legacy branch state or Git/filesystem fallback"
       ],
-      "evidence_tests": [],
-      "note": "The daemon log builder still reads the removed legacy branch store."
+      "evidence_tests": [
+        "crates/kin-cli/tests/repository_log.rs"
+      ],
+      "note": "Log resolves one exact workspace base and walks the immutable change DAG from one repository-v6 lease; Git, checkout files, and legacy branch state are not consulted."
     },
     {
       "command": "diff",
