@@ -386,7 +386,7 @@ mod tests {
     fn native_commit_atomically_publishes_exact_non_code_tree_and_ref() {
         let root = tempfile::tempdir().unwrap();
         let init = kin_core::init(root.path()).unwrap();
-        let blobs = kin_blobs::BlobStore::new(init.layout.objects_dir()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
         let graph = kin_db::InMemoryGraph::new();
         let compose = add_artifact(
             &graph,
@@ -461,7 +461,7 @@ mod tests {
     fn stale_plan_cannot_split_change_workspace_and_ref_authority() {
         let root = tempfile::tempdir().unwrap();
         let init = kin_core::init(root.path()).unwrap();
-        let blobs = kin_blobs::BlobStore::new(init.layout.objects_dir()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
         let graph = kin_db::InMemoryGraph::new();
         add_artifact(&graph, &blobs, b"compose.yaml", b"services: {}\n", |hash| {
             TreeEntry::blob(hash, false)
@@ -510,7 +510,7 @@ mod tests {
     fn ignored_new_artifact_is_rejected_without_partial_authority() {
         let root = tempfile::tempdir().unwrap();
         let init = kin_core::init(root.path()).unwrap();
-        let blobs = kin_blobs::BlobStore::new(init.layout.objects_dir()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
         let graph = kin_db::InMemoryGraph::new();
         add_artifact(&graph, &blobs, b".gitignore", b"secret.txt\n", |hash| {
             TreeEntry::blob(hash, false)
@@ -551,7 +551,7 @@ mod tests {
     fn missing_graph_blob_fails_before_repository_authority_moves() {
         let root = tempfile::tempdir().unwrap();
         let init = kin_core::init(root.path()).unwrap();
-        let blobs = kin_blobs::BlobStore::new(init.layout.objects_dir()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
         let graph = kin_db::InMemoryGraph::new();
         let artifact = ResolvedArtifact::new(
             ArtifactId::new(),

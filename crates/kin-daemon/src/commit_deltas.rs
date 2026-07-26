@@ -619,7 +619,7 @@ mod tests {
         let init = kin_core::init(tmp.path()).unwrap();
         let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
-        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
 
         let genesis = kin_core::build_genesis_change();
         graph.create_change(&genesis).unwrap();
@@ -691,7 +691,7 @@ mod tests {
         let init = kin_core::init(tmp.path()).unwrap();
         let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
-        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
 
         let genesis = kin_core::build_genesis_change();
         graph.create_change(&genesis).unwrap();
@@ -761,7 +761,7 @@ mod tests {
         let init = kin_core::init(tmp.path()).unwrap();
         let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
-        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
         let genesis = kin_core::build_genesis_change();
         graph.create_change(&genesis).unwrap();
         graph
@@ -834,7 +834,7 @@ mod tests {
         let init = kin_core::init(tmp.path()).unwrap();
         let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
-        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
 
         let genesis = kin_core::build_genesis_change();
         graph.create_change(&genesis).unwrap();
@@ -890,7 +890,7 @@ mod tests {
         let init = kin_core::init(tmp.path()).unwrap();
         let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
-        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
         let genesis = kin_core::build_genesis_change();
         graph.create_change(&genesis).unwrap();
         graph
@@ -1002,7 +1002,7 @@ mod tests {
         let init = kin_core::init(tmp.path()).unwrap();
         let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
-        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
         let genesis = kin_core::build_genesis_change();
         graph.create_change(&genesis).unwrap();
         graph
@@ -1057,7 +1057,7 @@ mod tests {
         let init = kin_core::init(tmp.path()).unwrap();
         let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
-        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
         let genesis = kin_core::build_genesis_change();
         graph.create_change(&genesis).unwrap();
         graph
@@ -1096,7 +1096,7 @@ mod tests {
         let init = kin_core::init(tmp.path()).unwrap();
         let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
-        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
         let genesis = kin_core::build_genesis_change();
         graph.create_change(&genesis).unwrap();
         graph
@@ -1163,7 +1163,7 @@ mod tests {
         let init = kin_core::init(tmp.path()).unwrap();
         let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
-        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
         let genesis = kin_core::build_genesis_change();
         graph.create_change(&genesis).unwrap();
         graph
@@ -1213,7 +1213,7 @@ mod tests {
         let init = kin_core::init(tmp.path()).unwrap();
         let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
-        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
 
         let genesis = kin_core::build_genesis_change();
         graph.create_change(&genesis).unwrap();

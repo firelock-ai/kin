@@ -14,7 +14,6 @@ use kin_model::{
     ArtifactId, EntityFilter, EntityId, EntityStore, FilePathId, Hash256, LocatedEntry, RepoPath,
     ShallowTrackedFile, TransactionDelta, TreeDelta, TreeEntry,
 };
-use kin_reconcile::apply_overlay_to_graph;
 use tracing::{debug, error, info, warn};
 
 use crate::error::{DaemonError, Result};
@@ -337,6 +336,7 @@ fn exact_tree_admission(state: &DaemonState) -> Result<ExactTreeAdmission> {
             entity_deltas: Vec::new(),
             relation_deltas: Vec::new(),
             tree_deltas: deltas.clone(),
+            ..TransactionDelta::default()
         })?;
     }
 
@@ -383,6 +383,7 @@ fn apply_tree_delta(state: &DaemonState, delta: Option<TreeDelta>) -> Result<boo
         entity_deltas: Vec::new(),
         relation_deltas: Vec::new(),
         tree_deltas: vec![delta],
+        ..TransactionDelta::default()
     })?;
     Ok(true)
 }
@@ -833,9 +834,10 @@ pub async fn run_loop(
         // exclusion boundary.
         let coordination = state.coordination_gate.lock().await;
 
-        // Acquire write locks for reconciliation.
+        // Acquire the reconciler lock. Reconciliation derives one validated
+        // TransactionDelta which is applied atomically to the live graph
+        // staging view; there is no second mutable overlay authority.
         let mut reconciler = state.reconciler.write().await;
-        let mut working_copy = state.working_copy.write().await;
         let mut graph_changed = false;
         let mut projection_changed = ProjectionChangedSet::default();
 
@@ -856,7 +858,6 @@ pub async fn run_loop(
                     FileEvent::Changed(path) | FileEvent::Removed(path) => path.clone(),
                 }));
                 drop(graph_mutation);
-                drop(working_copy);
                 drop(reconciler);
                 drop(coordination);
                 state
@@ -1100,9 +1101,9 @@ pub async fn run_loop(
                 &semantic_event,
                 &state.blobs,
                 state.graph.as_ref(),
-                &mut working_copy.uncommitted_mutations,
             ) {
-                Ok(outcome) => {
+                Ok(result) => {
+                    let (outcome, delta) = result.into_parts();
                     debug!(?outcome, "reconcile outcome");
 
                     use kin_reconcile::ReconcileOutcome;
@@ -1114,11 +1115,9 @@ pub async fn run_loop(
                         match host_entry_matches_graph(&state, path, &semantic_repo_path) {
                             Ok(true) => {}
                             Ok(false) => {
-                                working_copy.uncommitted_mutations =
-                                    kin_model::GraphOverlay::default();
                                 warn!(
                                     file = %semantic_repo_path,
-                                    "host entry changed during semantic reconciliation; discarded overlay and queued retry"
+                                    "host entry changed during semantic reconciliation; discarded transaction and queued retry"
                                 );
                                 retry_queue.push(path.clone());
                                 if tree_changed {
@@ -1127,12 +1126,10 @@ pub async fn run_loop(
                                 continue;
                             }
                             Err(error) => {
-                                working_copy.uncommitted_mutations =
-                                    kin_model::GraphOverlay::default();
                                 warn!(
                                     file = %semantic_repo_path,
                                     error = %error,
-                                    "could not revalidate reconciled host entry; discarded overlay and queued retry"
+                                    "could not revalidate reconciled host entry; discarded transaction and queued retry"
                                 );
                                 retry_queue.push(path.clone());
                                 if tree_changed {
@@ -1141,11 +1138,8 @@ pub async fn run_loop(
                                 continue;
                             }
                         }
-                        if let Err(e) = apply_overlay_to_graph(
-                            state.graph.as_ref(),
-                            &mut working_copy.uncommitted_mutations,
-                        ) {
-                            warn!(error = %e, "failed to apply reconciled mutations into primary graph");
+                        if let Err(e) = state.graph.apply_transaction_delta(&delta) {
+                            warn!(error = %e, "failed to apply reconciled transaction into primary graph");
                             if tree_changed {
                                 state.bump_version();
                             }
@@ -1232,9 +1226,8 @@ pub async fn run_loop(
                             });
                         }
                         match clear_incompatible_facets(&state, file_id, EnrichmentFacet::None) {
-                            Ok(cleanup) => {
+                            Ok(_) => {
                                 projection_changed.remove(file_id.clone());
-                                graph_changed |= cleanup.changed;
                             }
                             Err(error) => {
                                 warn!(
@@ -1277,7 +1270,6 @@ pub async fn run_loop(
         drop(graph_mutation);
 
         // Drop write locks before rebuilding projection (it takes its own locks).
-        drop(working_copy);
         drop(reconciler);
         drop(coordination);
 
@@ -1595,6 +1587,7 @@ mod tests {
                     artifact_id: ArtifactId::new(),
                     new: LocatedEntry::new(test_repo_path("submodule"), gitlink),
                 }],
+                ..TransactionDelta::default()
             })
             .unwrap();
         std::fs::create_dir_all(repo.path().join("submodule/src")).unwrap();
@@ -2033,7 +2026,6 @@ pub(crate) async fn sync_filesystem_with_graph_under_coordination(
     // Optional semantic enrichment follows exact admission. Parser support
     // never controls repository membership.
     let mut reconciler = state.reconciler.write().await;
-    let mut working_copy = state.working_copy.write().await;
     let mut graph_changed = true;
     let mut projection_changed = ProjectionChangedSet::default();
     let enrichment_pipeline = IndexPipeline::new();
@@ -2206,13 +2198,10 @@ pub(crate) async fn sync_filesystem_with_graph_under_coordination(
             AdmittedFileEvent::Ignored => unreachable!(),
         };
 
-        match reconciler.reconcile_file_change(
-            &semantic_event,
-            &state.blobs,
-            state.graph.as_ref(),
-            &mut working_copy.uncommitted_mutations,
-        ) {
-            Ok(outcome) => {
+        match reconciler.reconcile_file_change(&semantic_event, &state.blobs, state.graph.as_ref())
+        {
+            Ok(result) => {
+                let (outcome, delta) = result.into_parts();
                 use kin_reconcile::ReconcileOutcome;
                 let should_apply = matches!(
                     &outcome,
@@ -2220,17 +2209,13 @@ pub(crate) async fn sync_filesystem_with_graph_under_coordination(
                 );
                 if should_apply {
                     if !host_entry_matches_graph(state, path, &semantic_repo_path)? {
-                        working_copy.uncommitted_mutations = kin_model::GraphOverlay::default();
                         return Err(DaemonError::Io(std::io::Error::other(format!(
                             "host entry changed during semantic reconciliation: \
                              {semantic_repo_path}"
                         ))));
                     }
-                    if let Err(e) = apply_overlay_to_graph(
-                        state.graph.as_ref(),
-                        &mut working_copy.uncommitted_mutations,
-                    ) {
-                        warn!(error = %e, "failed to apply synced mutations into primary graph");
+                    if let Err(e) = state.graph.apply_transaction_delta(&delta) {
+                        warn!(error = %e, "failed to apply synced transaction into primary graph");
                         continue;
                     }
                     if let Err(e) =
@@ -2245,9 +2230,8 @@ pub(crate) async fn sync_filesystem_with_graph_under_coordination(
                     } = &outcome
                     {
                         match clear_incompatible_facets(state, file_id, EnrichmentFacet::None) {
-                            Ok(cleanup) => {
+                            Ok(_) => {
                                 projection_changed.remove(file_id.clone());
-                                graph_changed |= cleanup.changed;
                             }
                             Err(error) => warn!(
                                 file = %file_id,
@@ -2276,7 +2260,6 @@ pub(crate) async fn sync_filesystem_with_graph_under_coordination(
         }
     }
 
-    drop(working_copy);
     drop(reconciler);
 
     if graph_changed {
