@@ -279,64 +279,32 @@ fn open_source_directory_at(
 }
 
 #[cfg(unix)]
-fn missing_source_root_ancestors(base_path: &Path) -> Result<Vec<PathBuf>, KinDbError> {
-    let mut missing = Vec::new();
-    let mut cursor = base_path.to_path_buf();
-    loop {
-        match std::fs::symlink_metadata(&cursor) {
-            Ok(_) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                missing.push(cursor.clone());
-            }
-            Err(error) => {
-                return Err(KinDbError::StorageError(format!(
-                    "failed to inspect immutable source blob trust-root ancestor {}: {error}",
-                    cursor.display()
-                )));
-            }
-        }
-
-        let Some(parent) = cursor.parent() else {
-            break;
-        };
-        let parent = if parent.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            parent
-        };
-        if parent == cursor {
-            break;
-        }
-        cursor = parent.to_path_buf();
-    }
-    missing.reverse();
-    Ok(missing)
-}
-
-#[cfg(unix)]
 fn prepare_source_trust_root(
     base_path: &Path,
     confirm_durability: bool,
     confirmed_for_process: &parking_lot::Mutex<bool>,
 ) -> Result<(), KinDbError> {
-    // A failed `create_dir_all` durability confirmation leaves every component
-    // visible even though one or more parent entries may not survive a crash.
-    // In-memory pending paths are insufficient because a restarted process can
-    // no longer distinguish that state from an old, durable tree. Therefore
-    // every backend process conservatively confirms the complete resolved root
-    // chain before its first source-object acknowledgement. Later calls reuse
-    // that proof unless the root has to be recreated in this process.
-    let mut confirmed = confirmed_for_process.lock();
-    if !missing_source_root_ancestors(base_path)?.is_empty() {
-        *confirmed = false;
-    }
-    std::fs::create_dir_all(base_path).map_err(|error| {
+    // The storage root is an explicit repository-layout boundary. Source-body
+    // IO may create descendants beneath it, but must never recreate the root:
+    // exact eject revokes this backend by atomically moving the whole `.kin`
+    // namespace while already-open processes may still exist.
+    let metadata = std::fs::symlink_metadata(base_path).map_err(|error| {
         KinDbError::StorageError(format!(
-            "failed to create immutable source blob trust root {}: {error}",
+            "immutable source blob trust root {} is unavailable; refusing to recreate a detached repository namespace: {error}",
             base_path.display()
         ))
     })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(KinDbError::StorageError(format!(
+            "immutable source blob trust root {} is not a real directory",
+            base_path.display()
+        )));
+    }
 
+    // A new process cannot infer that an externally created visible root is
+    // durable, so its first source-object acknowledgement conservatively
+    // confirms the complete resolved ancestor chain.
+    let mut confirmed = confirmed_for_process.lock();
     if confirm_durability && !*confirmed {
         let resolved = std::fs::canonicalize(base_path).map_err(|error| {
             KinDbError::StorageError(format!(
@@ -550,44 +518,6 @@ fn read_source_file_at(
         )));
     }
     Ok(Some(OpenedSourceBlob { file, data }))
-}
-
-#[cfg(unix)]
-fn acquire_source_blob_lock(repo_dir: &std::fs::File) -> Result<std::fs::File, KinDbError> {
-    let name = source_component(".lock")?;
-    // SAFETY: repo_dir is pinned and name is a single validated component.
-    let fd = unsafe {
-        libc::openat(
-            repo_dir.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
-        )
-    };
-    if fd < 0 {
-        return Err(KinDbError::StorageError(format!(
-            "failed to open pinned immutable source repo lock: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    // SAFETY: fd is uniquely owned after successful openat.
-    let lock_file = unsafe { std::fs::File::from_raw_fd(fd) };
-    if !lock_file
-        .metadata()
-        .map_err(|error| KinDbError::StorageError(error.to_string()))?
-        .is_file()
-    {
-        return Err(KinDbError::StorageError(
-            "refusing non-regular immutable source repo lock".to_string(),
-        ));
-    }
-    use fs2::FileExt;
-    lock_file.lock_exclusive().map_err(|error| {
-        KinDbError::StorageError(format!(
-            "failed to acquire pinned immutable source repo lock: {error}"
-        ))
-    })?;
-    Ok(lock_file)
 }
 
 #[cfg(unix)]
@@ -894,7 +824,7 @@ fn open_windows_source_blob_capability(
                 .expect("filesystem root capability was inserted"),
             name,
             &display,
-            create,
+            false,
         )?;
         directories.push(next);
     }
@@ -1102,51 +1032,6 @@ fn read_windows_source_file_at(
         )));
     }
     Ok(Some(WindowsOpenedSourceBlob { file, data }))
-}
-
-#[cfg(windows)]
-fn acquire_windows_source_blob_lock(
-    repo_dir: &cap_std::fs::Dir,
-) -> Result<std::fs::File, KinDbError> {
-    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
-    use cap_std::fs::OpenOptionsExt;
-    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
-
-    let name = std::ffi::OsStr::new(".lock");
-    let mut options = cap_std::fs::OpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .create(true)
-        .access_mode(GENERIC_READ | GENERIC_WRITE)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .follow(FollowSymlinks::No)
-        .maybe_dir(false);
-    let file = repo_dir.open_with(name, &options).map_err(|error| {
-        KinDbError::StorageError(format!(
-            "failed to open pinned immutable source repo lock on Windows: {error}"
-        ))
-    })?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| KinDbError::StorageError(error.to_string()))?;
-    if windows_source_metadata_is_reparse(&metadata) || !metadata.is_file() {
-        return Err(KinDbError::StorageError(
-            "refusing reparse-point or non-regular immutable source repo lock".to_string(),
-        ));
-    }
-    let lock_file = file.into_std();
-    use fs2::FileExt;
-    lock_file.lock_exclusive().map_err(|error| {
-        KinDbError::StorageError(format!(
-            "failed to acquire pinned immutable source repo lock on Windows: {error}"
-        ))
-    })?;
-    Ok(lock_file)
 }
 
 #[cfg(windows)]
@@ -1805,6 +1690,8 @@ pub trait StorageBackend: Send + Sync {
 /// complete base-to-head chain.
 pub struct LocalFileBackend {
     base_path: PathBuf,
+    #[cfg(any(unix, windows))]
+    storage_root_identity: parking_lot::Mutex<Option<LocalStorageRootIdentity>>,
     #[cfg(unix)]
     source_root_confirmed_for_process: parking_lot::Mutex<bool>,
     #[cfg(test)]
@@ -1822,9 +1709,23 @@ pub struct LocalFileBackend {
     snapshot_before_authority_commit_hook:
         parking_lot::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
     #[cfg(test)]
-    source_blob_before_lock_hook: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
+    source_blob_after_capability_hook:
+        parking_lot::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
     #[cfg(test)]
     source_blob_before_publish_hook: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LocalStorageRootIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    volume_serial: u32,
+    #[cfg(windows)]
+    file_index: u64,
 }
 
 /// One existing local repository authority held beneath its exclusive
@@ -1883,8 +1784,15 @@ struct LocalAuthorityRecord {
 impl LocalFileBackend {
     /// Create a new local backend rooted at `base_path`.
     pub fn new(base_path: impl Into<PathBuf>) -> Self {
+        let base_path = base_path.into();
+        #[cfg(any(unix, windows))]
+        let storage_root_identity = Self::inspect_storage_root_identity(&base_path)
+            .ok()
+            .flatten();
         Self {
-            base_path: base_path.into(),
+            base_path,
+            #[cfg(any(unix, windows))]
+            storage_root_identity: parking_lot::Mutex::new(storage_root_identity),
             #[cfg(unix)]
             source_root_confirmed_for_process: parking_lot::Mutex::new(false),
             #[cfg(test)]
@@ -1900,7 +1808,7 @@ impl LocalFileBackend {
             #[cfg(test)]
             snapshot_before_authority_commit_hook: parking_lot::Mutex::new(None),
             #[cfg(test)]
-            source_blob_before_lock_hook: parking_lot::Mutex::new(None),
+            source_blob_after_capability_hook: parking_lot::Mutex::new(None),
             #[cfg(test)]
             source_blob_before_publish_hook: parking_lot::Mutex::new(None),
         }
@@ -1909,6 +1817,111 @@ impl LocalFileBackend {
     /// Return the base path.
     pub fn base_path(&self) -> &Path {
         &self.base_path
+    }
+
+    #[cfg(any(unix, windows))]
+    fn inspect_storage_root_identity(
+        path: &Path,
+    ) -> Result<Option<LocalStorageRootIdentity>, KinDbError> {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(KinDbError::StorageError(format!(
+                    "failed to inspect local storage root {}: {error}",
+                    path.display()
+                )))
+            }
+        };
+        #[cfg(unix)]
+        {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(KinDbError::StorageError(format!(
+                    "local storage root {} is not a real directory",
+                    path.display()
+                )));
+            }
+            Ok(Some(LocalStorageRootIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }))
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_dir()
+            {
+                return Err(KinDbError::StorageError(format!(
+                    "local storage root {} is not a real directory",
+                    path.display()
+                )));
+            }
+            let volume_serial = metadata.volume_serial_number().ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "local storage root {} has no stable volume identity",
+                    path.display()
+                ))
+            })?;
+            let file_index = metadata.file_index().ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "local storage root {} has no stable file identity",
+                    path.display()
+                ))
+            })?;
+            Ok(Some(LocalStorageRootIdentity {
+                volume_serial,
+                file_index,
+            }))
+        }
+    }
+
+    /// Confirm that this backend still names the same storage-root directory it
+    /// first observed. A missing root is acceptable only for a backend that has
+    /// never observed one; writes still refuse to create it.
+    fn confirm_storage_root_identity(&self) -> Result<bool, KinDbError> {
+        #[cfg(any(unix, windows))]
+        {
+            let current = Self::inspect_storage_root_identity(&self.base_path)?;
+            let mut expected = self.storage_root_identity.lock();
+            match (*expected, current) {
+                (Some(expected), Some(current)) if expected == current => Ok(true),
+                (Some(_), Some(_)) => Err(KinDbError::StorageError(format!(
+                    "local storage root {} changed since this backend opened; refusing to bind a replacement repository namespace",
+                    self.base_path.display()
+                ))),
+                (Some(_), None) => Err(KinDbError::StorageError(format!(
+                    "local storage root {} was detached after this backend opened",
+                    self.base_path.display()
+                ))),
+                (None, Some(current)) => {
+                    *expected = Some(current);
+                    Ok(true)
+                }
+                (None, None) => Ok(false),
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let metadata = match std::fs::symlink_metadata(&self.base_path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => {
+                    return Err(KinDbError::StorageError(format!(
+                        "failed to inspect local storage root {}: {error}",
+                        self.base_path.display()
+                    )))
+                }
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(KinDbError::StorageError(format!(
+                    "local storage root {} is not a real directory",
+                    self.base_path.display()
+                )));
+            }
+            Ok(true)
+        }
     }
 
     fn authority_path(&self, repo_id: &str) -> PathBuf {
@@ -1954,6 +1967,9 @@ impl LocalFileBackend {
 
     fn existing_repository_path(&self, repo_id: &str) -> Result<Option<PathBuf>, KinDbError> {
         validate_source_blob_repo_id(repo_id)?;
+        if !self.confirm_storage_root_identity()? {
+            return Ok(None);
+        }
         let repository_path = self.base_path.join(repo_id);
         let metadata = match std::fs::symlink_metadata(&repository_path) {
             Ok(metadata) => metadata,
@@ -1976,15 +1992,9 @@ impl LocalFileBackend {
 
     fn acquire_lock(&self, repo_id: &str) -> Result<std::fs::File, KinDbError> {
         validate_source_blob_repo_id(repo_id)?;
-        let base_metadata = std::fs::symlink_metadata(&self.base_path).map_err(|error| {
-            KinDbError::StorageError(format!(
-                "local storage root {} is unavailable; refusing to recreate a detached authority namespace: {error}",
-                self.base_path.display()
-            ))
-        })?;
-        if base_metadata.file_type().is_symlink() || !base_metadata.is_dir() {
+        if !self.confirm_storage_root_identity()? {
             return Err(KinDbError::StorageError(format!(
-                "local storage root {} is not a real directory",
+                "local storage root {} is unavailable; refusing to recreate a detached authority namespace",
                 self.base_path.display()
             )));
         }
@@ -2045,6 +2055,12 @@ impl LocalFileBackend {
             ))
         })?;
         self.confirm_existing_lock_visible(&lock_path, &lock_file)?;
+        if !self.confirm_storage_root_identity()? {
+            return Err(KinDbError::StorageError(format!(
+                "local storage root {} disappeared while Kin acquired its initialization lock",
+                self.base_path.display()
+            )));
+        }
         Ok(lock_file)
     }
 
@@ -2110,6 +2126,12 @@ impl LocalFileBackend {
             ))
         })?;
         self.confirm_existing_lock_visible(&lock_path, &lock_file)?;
+        if !self.confirm_storage_root_identity()? {
+            return Err(KinDbError::StorageError(format!(
+                "local storage root {} disappeared while Kin acquired its existing-authority lock",
+                self.base_path.display()
+            )));
+        }
         Ok(lock_file)
     }
 
@@ -3006,8 +3028,8 @@ impl LocalFileBackend {
     }
 
     #[cfg(test)]
-    fn set_source_blob_before_lock_hook(&self, hook: impl FnOnce() + Send + 'static) {
-        *self.source_blob_before_lock_hook.lock() = Some(Box::new(hook));
+    fn set_source_blob_after_capability_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.source_blob_after_capability_hook.lock() = Some(Box::new(hook));
     }
 
     #[cfg(test)]
@@ -3041,6 +3063,12 @@ impl StorageBackend for LocalFileBackend {
         })?;
         validate_source_blob_size(byte_len, &format!("repo {repo_id}"))?;
         verify_source_blob_digest(digest, data, &format!("repo {repo_id}"))?;
+        #[cfg(any(unix, windows))]
+        let _authority_lock = if self.existing_repository_path(repo_id)?.is_some() {
+            self.acquire_existing_lock(repo_id)?
+        } else {
+            self.acquire_lock(repo_id)?
+        };
         #[cfg(not(any(unix, windows)))]
         {
             let _ = (repo_id, digest, data);
@@ -3054,10 +3082,9 @@ impl StorageBackend for LocalFileBackend {
             let capability =
                 open_windows_source_blob_capability(&self.base_path, repo_id, digest, true)?;
             #[cfg(test)]
-            if let Some(hook) = self.source_blob_before_lock_hook.lock().take() {
+            if let Some(hook) = self.source_blob_after_capability_hook.lock().take() {
                 hook();
             }
-            let _lock = acquire_windows_source_blob_lock(capability.repo_dir())?;
             confirm_windows_source_blob_namespace(&self.base_path, repo_id, digest, &capability)?;
             let digest_hex = hex::encode(digest);
 
@@ -3142,10 +3169,9 @@ impl StorageBackend for LocalFileBackend {
                 &self.source_root_confirmed_for_process,
             )?;
             #[cfg(test)]
-            if let Some(hook) = self.source_blob_before_lock_hook.lock().take() {
+            if let Some(hook) = self.source_blob_after_capability_hook.lock().take() {
                 hook();
             }
-            let _lock = acquire_source_blob_lock(&capability.repo_dir)?;
             let digest_hex = hex::encode(digest);
 
             if let Some(existing) =
@@ -3234,6 +3260,11 @@ impl StorageBackend for LocalFileBackend {
         max_bytes: u64,
     ) -> Result<Option<Vec<u8>>, KinDbError> {
         validate_source_blob_repo_id(repo_id)?;
+        if self.existing_repository_path(repo_id)?.is_none() {
+            return Ok(None);
+        }
+        #[cfg(any(unix, windows))]
+        let _authority_lock = self.acquire_existing_lock(repo_id)?;
         #[cfg(not(any(unix, windows)))]
         {
             let _ = (repo_id, digest, max_bytes);
@@ -3246,7 +3277,6 @@ impl StorageBackend for LocalFileBackend {
         {
             let capability =
                 open_windows_source_blob_capability(&self.base_path, repo_id, digest, true)?;
-            let _lock = acquire_windows_source_blob_lock(capability.repo_dir())?;
             confirm_windows_source_blob_namespace(&self.base_path, repo_id, digest, &capability)?;
             let digest_hex = hex::encode(digest);
             let Some(data) = read_windows_source_file_at(
@@ -3278,7 +3308,6 @@ impl StorageBackend for LocalFileBackend {
                 false,
                 &self.source_root_confirmed_for_process,
             )?;
-            let _lock = acquire_source_blob_lock(&capability.repo_dir)?;
             let digest_hex = hex::encode(digest);
             let Some(data) = read_source_file_at(&capability.leaf_dir, &digest_hex, max_bytes)?
             else {
@@ -3295,6 +3324,11 @@ impl StorageBackend for LocalFileBackend {
 
     fn source_blob_len(&self, repo_id: &str, digest: [u8; 32]) -> Result<Option<u64>, KinDbError> {
         validate_source_blob_repo_id(repo_id)?;
+        if self.existing_repository_path(repo_id)?.is_none() {
+            return Ok(None);
+        }
+        #[cfg(any(unix, windows))]
+        let _authority_lock = self.acquire_existing_lock(repo_id)?;
         #[cfg(not(any(unix, windows)))]
         {
             let _ = (repo_id, digest);
@@ -3307,7 +3341,6 @@ impl StorageBackend for LocalFileBackend {
         {
             let capability =
                 open_windows_source_blob_capability(&self.base_path, repo_id, digest, true)?;
-            let _lock = acquire_windows_source_blob_lock(capability.repo_dir())?;
             confirm_windows_source_blob_namespace(&self.base_path, repo_id, digest, &capability)?;
             let digest_hex = hex::encode(digest);
             let opened = open_windows_source_file_at(
@@ -3329,7 +3362,6 @@ impl StorageBackend for LocalFileBackend {
                 false,
                 &self.source_root_confirmed_for_process,
             )?;
-            let _lock = acquire_source_blob_lock(&capability.repo_dir)?;
             let digest_hex = hex::encode(digest);
             Ok(open_source_file_at(&capability.leaf_dir, &digest_hex)?
                 .map(|(_, byte_len)| byte_len))
@@ -3637,6 +3669,7 @@ impl StorageBackend for LocalFileBackend {
     }
 
     fn save_overlay(&self, repo_id: &str, session_id: &str, data: &[u8]) -> Result<(), KinDbError> {
+        let _lock = self.acquire_existing_lock(repo_id)?;
         let path = self.overlay_path(repo_id, session_id);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -3652,6 +3685,10 @@ impl StorageBackend for LocalFileBackend {
     }
 
     fn load_overlay(&self, repo_id: &str, session_id: &str) -> Result<Option<Vec<u8>>, KinDbError> {
+        if self.existing_repository_path(repo_id)?.is_none() {
+            return Ok(None);
+        }
+        let _lock = self.acquire_existing_lock(repo_id)?;
         let path = self.overlay_path(repo_id, session_id);
         if !path.exists() {
             return Ok(None);
@@ -3663,6 +3700,10 @@ impl StorageBackend for LocalFileBackend {
     }
 
     fn delete_overlay(&self, repo_id: &str, session_id: &str) -> Result<(), KinDbError> {
+        if self.existing_repository_path(repo_id)?.is_none() {
+            return Ok(());
+        }
+        let _lock = self.acquire_existing_lock(repo_id)?;
         let path = self.overlay_path(repo_id, session_id);
         if !path.exists() {
             return Ok(());
@@ -3674,7 +3715,7 @@ impl StorageBackend for LocalFileBackend {
 
     fn list_repos(&self) -> Result<Vec<String>, KinDbError> {
         let mut repos = Vec::new();
-        if !self.base_path.exists() {
+        if !self.confirm_storage_root_identity()? {
             return Ok(repos);
         }
         let entries = std::fs::read_dir(&self.base_path).map_err(|e| {
@@ -3781,6 +3822,14 @@ mod tests {
 
     fn source_digest(data: &[u8]) -> [u8; 32] {
         Sha256::digest(data).into()
+    }
+
+    fn initialize_local_repository_namespace(backend: &LocalFileBackend, repo_id: &str) {
+        drop(
+            backend
+                .acquire_lock(repo_id)
+                .expect("test repository namespace must initialize"),
+        );
     }
 
     #[test]
@@ -3893,6 +3942,7 @@ mod tests {
             assert!(error.to_string().contains("invalid repo id"));
         }
 
+        initialize_local_repository_namespace(&backend, "repo-a");
         let path = backend.source_blob_path("repo-a", digest).unwrap();
         LocalFileBackend::atomic_write(&path, b"corrupt").unwrap();
         let read_error = backend
@@ -3943,6 +3993,7 @@ mod tests {
         let backend = LocalFileBackend::new(dir.path());
         let data = b"source";
         let digest = source_digest(data);
+        initialize_local_repository_namespace(&backend, "repo-a");
         let path = backend.source_blob_path("repo-a", digest).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let victim = dir.path().join("victim");
@@ -3964,6 +4015,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let backend = LocalFileBackend::new(dir.path());
         let digest = source_digest(b"fifo must not be read");
+        initialize_local_repository_namespace(&backend, "repo-a");
         let path = backend.source_blob_path("repo-a", digest).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
@@ -3994,12 +4046,12 @@ mod tests {
             let source_blobs = repo.join("source-blobs");
             let sha256 = source_blobs.join("sha256");
             let prefix = sha256.join(&digest_hex[..2]);
+            if ancestor != "repo" {
+                initialize_local_repository_namespace(&backend, "repo-a");
+            }
             let link_path = match ancestor {
                 "repo" => repo,
-                "source-blobs" => {
-                    std::fs::create_dir(&repo).unwrap();
-                    source_blobs
-                }
+                "source-blobs" => source_blobs,
                 "sha256" => {
                     std::fs::create_dir_all(&source_blobs).unwrap();
                     sha256
@@ -4016,7 +4068,8 @@ mod tests {
                 .save_source_blob("repo-a", digest, data)
                 .expect_err("a symlinked object ancestor must fail closed");
             assert!(
-                error.to_string().contains("symlinked or non-directory"),
+                error.to_string().contains("symlinked or non-directory")
+                    || error.to_string().contains("not a real directory"),
                 "unexpected error for {ancestor}: {error}"
             );
             assert_eq!(
@@ -4032,6 +4085,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let backend = LocalFileBackend::new(dir.path());
         let digest = [42; 32];
+        initialize_local_repository_namespace(&backend, "repo-a");
         let path = backend.source_blob_path("repo-a", digest).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let file = std::fs::OpenOptions::new()
@@ -4119,7 +4173,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn local_source_blob_lock_stays_inside_pinned_repo_directory() {
+    fn local_source_blob_rejects_repo_displacement_after_capability_open() {
         use std::os::unix::fs::symlink;
 
         let dir = TempDir::new().unwrap();
@@ -4130,7 +4184,7 @@ mod tests {
         let repo = dir.path().join("repo-a");
         let displaced_repo = dir.path().join("repo-a-displaced");
         let outside_path = outside.path().to_path_buf();
-        backend.set_source_blob_before_lock_hook(move || {
+        backend.set_source_blob_after_capability_hook(move || {
             std::fs::rename(&repo, &displaced_repo).unwrap();
             symlink(outside_path, repo).unwrap();
         });
@@ -4161,7 +4215,7 @@ mod tests {
         let repo = dir.path().join("repo-a");
         let displaced_repo = dir.path().join("repo-a-displaced");
         let outside_path = outside.path().to_path_buf();
-        backend.set_source_blob_before_lock_hook(move || {
+        backend.set_source_blob_after_capability_hook(move || {
             std::fs::rename(&repo, &displaced_repo).unwrap();
             symlink(outside_path, repo).unwrap();
         });
@@ -4182,6 +4236,7 @@ mod tests {
     fn local_source_blob_confirms_new_trust_root_parent_directory() {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("new-storage-root");
+        std::fs::create_dir(&base).unwrap();
         let backend = LocalFileBackend::new(&base);
         let data = b"durable trust root";
         let digest = source_digest(data);
@@ -4212,6 +4267,7 @@ mod tests {
             .join("source-root-one")
             .join("source-root-two")
             .join("source-root-three");
+        std::fs::create_dir_all(&base).unwrap();
         let backend = LocalFileBackend::new(&base);
         let data = b"nested durable trust root";
         let digest = source_digest(data);
@@ -4245,6 +4301,7 @@ mod tests {
     fn source_trust_root_reconfirms_visible_ancestors_after_process_restart() {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("restart-root-one").join("restart-root-two");
+        std::fs::create_dir_all(&base).unwrap();
 
         let first_process_confirmation = parking_lot::Mutex::new(false);
         mmap::fail_parent_sync_after(0);
@@ -4359,6 +4416,139 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn local_source_writer_blocked_by_freeze_cannot_recreate_detached_root() {
+        let directory = TempDir::new().unwrap();
+        let base = directory.path().join("kindb");
+        std::fs::create_dir(&base).unwrap();
+        let backend = LocalFileBackend::new(&base);
+        let snapshot = GraphSnapshot::empty().to_bytes().unwrap();
+        backend
+            .save_snapshot("repo-a", &snapshot, GENERATION_INIT)
+            .unwrap();
+        let freeze = backend.freeze_existing_authority("repo-a").unwrap();
+        let competing = LocalFileBackend::new(&base);
+        let data = b"must not survive detach";
+        let digest = source_digest(data);
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx
+                .send(competing.save_source_blob("repo-a", digest, data))
+                .unwrap();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "source writer must wait on the same repository authority lock"
+        );
+
+        let detached = directory.path().join("detached-kindb");
+        std::fs::rename(&base, &detached).unwrap();
+        drop(freeze);
+        let error = finished_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("blocked source writer must wake after freeze release")
+            .expect_err("blocked source writer must be revoked by namespace detach");
+        assert!(
+            error.to_string().contains("namespace changed")
+                || error
+                    .to_string()
+                    .contains("unavailable for existing-authority access"),
+            "unexpected post-detach source-writer error: {error}"
+        );
+        writer.join().unwrap();
+        assert!(
+            !base.exists(),
+            "blocked source writer must not recreate the detached storage root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preopened_local_writers_cannot_recreate_a_detached_root() {
+        let directory = TempDir::new().unwrap();
+        let base = directory.path().join("kindb");
+        std::fs::create_dir(&base).unwrap();
+        let backend = LocalFileBackend::new(&base);
+        let snapshot = GraphSnapshot::empty().to_bytes().unwrap();
+        backend
+            .save_snapshot("repo-a", &snapshot, GENERATION_INIT)
+            .unwrap();
+        let preopened = LocalFileBackend::new(&base);
+
+        std::fs::rename(&base, directory.path().join("detached-kindb")).unwrap();
+        let data = b"revoked source body";
+        let source_error = preopened
+            .save_source_blob("repo-a", source_digest(data), data)
+            .expect_err("preopened source writer must not recreate detached storage");
+        assert!(
+            source_error
+                .to_string()
+                .contains("refusing to recreate a detached authority namespace")
+                || source_error
+                    .to_string()
+                    .contains("unavailable for existing-authority access")
+                || source_error
+                    .to_string()
+                    .contains("was detached after this backend opened"),
+            "unexpected preopened source-writer error: {source_error}"
+        );
+        let overlay_error = preopened
+            .save_overlay("repo-a", "session-a", b"revoked overlay")
+            .expect_err("preopened overlay writer must not recreate detached storage");
+        assert!(
+            overlay_error
+                .to_string()
+                .contains("unavailable for existing-authority access")
+                || overlay_error
+                    .to_string()
+                    .contains("was detached after this backend opened"),
+            "unexpected preopened overlay-writer error: {overlay_error}"
+        );
+        assert!(
+            !base.exists(),
+            "no preopened local writer may recreate the detached storage root"
+        );
+
+        std::fs::create_dir(&base).unwrap();
+        let replacement = LocalFileBackend::new(&base);
+        replacement
+            .save_snapshot(
+                "repo-a",
+                &GraphSnapshot::empty().to_bytes().unwrap(),
+                GENERATION_INIT,
+            )
+            .unwrap();
+        let replacement_error = preopened
+            .save_source_blob("repo-a", source_digest(data), data)
+            .expect_err("stale backend must not bind a newly created storage-root epoch");
+        assert!(
+            replacement_error
+                .to_string()
+                .contains("changed since this backend opened"),
+            "unexpected replacement-epoch error: {replacement_error}"
+        );
+        assert!(
+            !replacement
+                .source_blob_path("repo-a", source_digest(data))
+                .unwrap()
+                .exists(),
+            "stale backend must not add source bytes to the replacement storage epoch"
+        );
+        assert!(
+            !replacement.overlay_path("repo-a", "session-a").exists(),
+            "stale backend must not add overlays to the replacement storage epoch"
+        );
+    }
+
     #[test]
     fn local_backend_roundtrip_snapshot() {
         let dir = TempDir::new().unwrap();
@@ -4419,6 +4609,7 @@ mod tests {
     fn local_backend_overlay_roundtrip() {
         let dir = TempDir::new().unwrap();
         let backend = LocalFileBackend::new(dir.path());
+        initialize_local_repository_namespace(&backend, "test-repo");
 
         // No overlay yet
         assert!(backend
@@ -4444,6 +4635,7 @@ mod tests {
     fn local_backend_delete_overlay() {
         let dir = TempDir::new().unwrap();
         let backend = LocalFileBackend::new(dir.path());
+        initialize_local_repository_namespace(&backend, "test-repo");
 
         // Save an overlay
         backend
@@ -4602,6 +4794,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let backend = LocalFileBackend::new(dir.path());
         let repo_id = "initial-save-unbound-journal";
+        initialize_local_repository_namespace(&backend, repo_id);
         std::fs::create_dir_all(backend.deltas_dir(repo_id)).unwrap();
         LocalFileBackend::atomic_write(
             &backend.delta_path(repo_id, 1),
@@ -5087,6 +5280,7 @@ mod tests {
         assert!(!quarantine.exists());
 
         let unbound_repo = "unbound-direct-delta-quarantine";
+        initialize_local_repository_namespace(&backend, unbound_repo);
         std::fs::create_dir_all(backend.deltas_dir(unbound_repo)).unwrap();
         let unbound_canonical = backend.delta_path(unbound_repo, 1);
         let unbound = quarantine_delta_path(
