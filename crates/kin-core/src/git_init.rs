@@ -80,9 +80,11 @@ fn init_from_git_with_hook(
     let source_proof = preflight_git_migration(&source, &snapshot, &semantic_plan, &capture_store)
         .map_err(|error| git_boundary_error("prove mutable Git workspace", error))?;
 
+    let final_kin_dir = source.join(".kin");
     let staging_dir = source_parent.join(format!(".kin.init-{}", uuid::Uuid::new_v4()));
     let config = config_for_source(&snapshot, &source_proof.remote_mapping)?;
-    let mut prepared = prepare_repository_layout_at(&staging_dir, config, manifest)?;
+    let mut prepared =
+        prepare_repository_layout_at(&staging_dir, &final_kin_dir, config, manifest)?;
     copy_captured_authority(&prepared, &snapshot, &capture_store, &source_proof)?;
 
     let workspace_seed = admitted.workspace_seed.clone();
@@ -109,8 +111,7 @@ fn init_from_git_with_hook(
         .map_err(|error| KinError::Other(format!("invalid Git bootstrap transaction: {error}")))?;
     prepared.commit_repository_bootstrap(&transaction)?;
 
-    let final_kin_dir = source.join(".kin");
-    let result = publish_repository_layout_after_check(prepared, &final_kin_dir, || {
+    let result = publish_repository_layout_after_check(prepared, || {
         before_final_source_proof();
         let final_proof =
             preflight_git_migration(&source, &snapshot, &semantic_plan, &capture_store)
@@ -823,8 +824,10 @@ mod tests {
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
                 .find(|path| {
-                    path.file_name()
-                        .is_some_and(|name| name.to_string_lossy().starts_with(".kin.init-"))
+                    path.is_dir()
+                        && path
+                            .file_name()
+                            .is_some_and(|name| name.to_string_lossy().starts_with(".kin.init-"))
                 })
                 .expect("complete unpublished staging directory");
             assert_eq!(
