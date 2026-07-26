@@ -57,11 +57,7 @@ pub use disambiguation::{fallback_leaf_trace_matches, query_trace_matches};
 pub use ranking::{
     normalize_symbol_hint, normalize_trace_name, qualifier_hint_from_query, select_best_match,
 };
-pub use ref_view::{
-    build_change_oid_cache, build_graph_at_git_ref_with_repo, build_graph_at_ref,
-    build_graph_at_ref_with_repo, collect_changes_at_ref, filter_vector_results_to_scope,
-    ChangeOidCache,
-};
+pub use ref_view::{build_graph_at_ref, collect_changes_at_ref, filter_vector_results_to_scope};
 
 use kin_model::BranchName;
 

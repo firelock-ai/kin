@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::Result;
 #[cfg(any(unix, windows))]
 use cap_fs_ext::DirExt;
-use kin_model::ChangeStore;
+use kin_model::{ChangeStore, TreeEntry, TreeEntryKind};
 use kin_runtime::workspace::{
     MaterializationSourceKind, MaterializeStrategy, MaterializedWorkspace,
 };
@@ -240,7 +240,7 @@ fn create_session_workspace_from_graph_with_hooks(
             session_name,
             &blob_store,
             &entries,
-            branch.head.to_string(),
+            branch.head,
             after_child_created,
             after_root_created,
             before_base_recorded,
@@ -263,20 +263,20 @@ fn create_session_workspace_from_graph_with_hooks(
 }
 
 #[derive(Debug)]
-struct PreflightedBlob {
+struct PreflightedEntry {
     file_id: String,
     relative_path: PathBuf,
-    hash: kin_model::Hash256,
+    entry: TreeEntry,
 }
 
 fn preflight_blob_tree(
-    tree: &HashMap<kin_model::FilePathId, kin_model::Hash256>,
+    tree: &HashMap<kin_model::FilePathId, TreeEntry>,
     scope_filter: Option<&Path>,
-) -> Result<Vec<PreflightedBlob>> {
+) -> Result<Vec<PreflightedEntry>> {
     let mut entries = Vec::with_capacity(tree.len());
     let mut portable_paths = BTreeMap::new();
 
-    for (file_id, hash) in tree {
+    for (file_id, entry) in tree {
         let relative_path = validate_portable_relative_path(&file_id.0, "graph FilePathId")?;
         let collision_key = portable_path_collision_key(&relative_path)?;
         if let Some(existing) = portable_paths.insert(collision_key, relative_path.clone()) {
@@ -286,10 +286,10 @@ fn preflight_blob_tree(
                 existing.display()
             );
         }
-        entries.push(PreflightedBlob {
+        entries.push(PreflightedEntry {
             file_id: file_id.0.clone(),
             relative_path,
-            hash: *hash,
+            entry: *entry,
         });
     }
 
@@ -371,9 +371,6 @@ fn validate_portable_relative_path(raw: &str, subject: &str) -> Result<PathBuf> 
             ".." => anyhow::bail!("{subject} '{raw}' contains parent traversal"),
             _ => validate_portable_component(component, subject, raw)?,
         }
-        if kin_index::should_skip_dir(component) {
-            anyhow::bail!("{subject} '{raw}' contains graph-excluded component '{component}'");
-        }
         relative_path.push(component);
     }
 
@@ -413,7 +410,10 @@ fn validate_portable_component(component: &str, subject: &str, full_path: &str) 
     }
 
     let portable_case = component.to_ascii_lowercase();
-    if matches!(portable_case.as_str(), ".kin-session" | ".kin" | ".git") {
+    if matches!(
+        portable_case.as_str(),
+        ".kin-session" | ".kin" | ".git" | ".git-export"
+    ) {
         anyhow::bail!(
             "{subject} '{full_path}' contains reserved control-plane component '{component}'"
         );
@@ -1157,84 +1157,136 @@ fn materialize_preflighted_blob_tree(
     session_dir: &Path,
     session_name: OsString,
     blob_store: &kin_blobs::BlobStore,
-    entries: &[PreflightedBlob],
-    base_head: String,
+    entries: &[PreflightedEntry],
+    base_head: kin_model::SemanticChangeId,
     after_child_created: impl FnOnce(&Path) -> Result<()>,
     after_root_created: impl FnOnce(&Path) -> Result<()>,
     before_base_recorded: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<MaterializedWorkspace> {
     let base = super::session_base::SessionBase {
-        base_head: Some(base_head),
-        files: entries
+        base_head,
+        tree: entries
             .iter()
             .map(|entry| {
                 (
                     entry.relative_path.to_string_lossy().into_owned(),
-                    kin_blobs::Hash256(*entry.hash.as_bytes()).to_string(),
+                    entry.entry,
                 )
             })
             .collect(),
     };
     let capabilities =
         SessionCapabilities::create(layout, session_dir, session_name, after_child_created)?;
-    let result = (|| {
-        after_root_created(session_dir)?;
-        for entry in entries {
-            let blob_hash = kin_blobs::Hash256(*entry.hash.as_bytes());
-            let content = blob_store.read(&blob_hash).map_err(|error| {
-                anyhow::anyhow!("failed to read blob for {}: {}", entry.file_id, error)
-            })?;
-            if let Some(parent) = entry
-                .relative_path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-            {
-                capabilities
-                    .session_root()
-                    .create_dir_all(parent)
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "failed to create capability-rooted parent for '{}': {}",
-                            entry.file_id,
-                            error
-                        )
-                    })?;
+    let result =
+        (|| {
+            after_root_created(session_dir)?;
+            for entry in entries {
+                let blob_hash = kin_blobs::Hash256(*entry.entry.blob_hash.as_bytes());
+                let content = blob_store.read(&blob_hash).map_err(|error| {
+                    anyhow::anyhow!("failed to read blob for {}: {}", entry.file_id, error)
+                })?;
+                let actual_hash = kin_blobs::digest(&content);
+                if actual_hash != entry.entry.blob_hash {
+                    anyhow::bail!(
+                        "graph blob integrity failure for {}: expected {}, got {}",
+                        entry.file_id,
+                        entry.entry.blob_hash,
+                        actual_hash
+                    );
+                }
+                if let Some(parent) = entry
+                    .relative_path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                {
+                    capabilities
+                        .session_root()
+                        .create_dir_all(parent)
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "failed to create capability-rooted parent for '{}': {}",
+                                entry.file_id,
+                                error
+                            )
+                        })?;
+                }
+
+                match entry.entry.kind {
+                    TreeEntryKind::Regular { executable } => {
+                        let mut options = cap_std::fs::OpenOptions::new();
+                        options.write(true).create_new(true);
+                        let mut file = capabilities
+                            .session_root()
+                            .open_with(&entry.relative_path, &options)
+                            .map_err(|error| {
+                                anyhow::anyhow!(
+                                    "failed to create capability-rooted graph file '{}': {}",
+                                    entry.file_id,
+                                    error
+                                )
+                            })?;
+                        file.write_all(&content).map_err(|error| {
+                            anyhow::anyhow!(
+                                "failed to write capability-rooted graph file '{}': {}",
+                                entry.file_id,
+                                error
+                            )
+                        })?;
+                        #[cfg(unix)]
+                        {
+                            use cap_std::fs::PermissionsExt;
+                            file.set_permissions(cap_std::fs::Permissions::from_mode(
+                                if executable { 0o755 } else { 0o644 },
+                            ))
+                            .map_err(|error| {
+                                anyhow::anyhow!(
+                                    "failed to set exact executable mode for '{}': {}",
+                                    entry.file_id,
+                                    error
+                                )
+                            })?;
+                        }
+                        #[cfg(windows)]
+                        let _ = executable;
+                    }
+                    TreeEntryKind::Symlink => {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::ffi::OsStrExt;
+                            let target = OsStr::from_bytes(&content);
+                            capabilities
+                                .session_root()
+                                .symlink_contents(Path::new(target), &entry.relative_path)
+                                .map_err(|error| {
+                                    anyhow::anyhow!(
+                                        "failed to create capability-rooted graph symlink '{}': {}",
+                                        entry.file_id,
+                                        error
+                                    )
+                                })?;
+                        }
+                        #[cfg(windows)]
+                        anyhow::bail!(
+                        "exact symbolic-link session materialization is unsupported on Windows: {}",
+                        entry.file_id
+                    );
+                    }
+                }
             }
 
-            let mut options = cap_std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            let mut file = capabilities
-                .session_root()
-                .open_with(&entry.relative_path, &options)
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "failed to create capability-rooted graph file '{}': {}",
-                        entry.file_id,
-                        error
-                    )
-                })?;
-            file.write_all(&content).map_err(|error| {
-                anyhow::anyhow!(
-                    "failed to write capability-rooted graph file '{}': {}",
-                    entry.file_id,
-                    error
-                )
-            })?;
-        }
-
-        before_base_recorded(session_dir)?;
-        super::session_base::record_preflighted_graph_base_in_dir(
-            capabilities.session_root(),
-            &base,
-        )?;
-        let workspace = MaterializedWorkspace::from_existing(
-            session_dir.to_path_buf(),
-            MaterializeStrategy::Copy,
-            MaterializationSourceKind::BlobTree,
-        );
-        capabilities.verify_direct_child_identity()?;
-        Ok(workspace)
-    })();
+            before_base_recorded(session_dir)?;
+            super::session_base::record_preflighted_graph_base_in_dir(
+                capabilities.session_root(),
+                &base,
+            )?;
+            let workspace = MaterializedWorkspace::from_existing(
+                session_dir.to_path_buf(),
+                MaterializeStrategy::Copy,
+                MaterializationSourceKind::BlobTree,
+            );
+            capabilities.verify_direct_child_identity()?;
+            Ok(workspace)
+        })();
 
     match result {
         Ok(workspace) => {
@@ -1362,8 +1414,8 @@ mod tests {
     use super::*;
     use kin_core::init as init_repo;
     use kin_model::{
-        ArtifactDelta, ArtifactDeltaKind, AuthorId, BranchName, ChangeStore, FilePathId, Hash256,
-        SemanticChange, SemanticChangeId,
+        AuthorId, BranchName, ChangeStore, FilePathId, Hash256, SemanticChange, SemanticChangeId,
+        TreeDelta,
     };
     use std::fs;
 
@@ -1445,6 +1497,22 @@ mod tests {
         rel_path: &str,
         content: &[u8],
     ) -> anyhow::Result<()> {
+        write_native_graph_entry(
+            layout,
+            rel_path,
+            content,
+            TreeEntryKind::Regular { executable: false },
+            9,
+        )
+    }
+
+    fn write_native_graph_entry(
+        layout: &kin_core::KinLayout,
+        rel_path: &str,
+        content: &[u8],
+        kind: TreeEntryKind,
+        id_byte: u8,
+    ) -> anyhow::Result<()> {
         let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())?;
         let blob_hash = blob_store.write(content)?;
         let snap = crate::backend::open_kindb_snapshot(layout)?;
@@ -1452,18 +1520,19 @@ mod tests {
         let branch_name = BranchName::new("main");
         let branch = graph.get_branch(&branch_name)?.expect("main branch");
         let change = SemanticChange {
-            id: commit_id(9),
+            id: commit_id(id_byte),
             parents: vec![branch.head],
             timestamp: kin_model::Timestamp::now(),
             author: AuthorId::new("test"),
             message: "add artifact".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
+            tree_deltas: vec![TreeDelta::Added {
                 file_id: FilePathId::new(rel_path),
-                kind: ArtifactDeltaKind::Added,
-                old_hash: None,
-                new_hash: Some(blob_hash),
+                new_entry: TreeEntry {
+                    blob_hash: Hash256::from_bytes(blob_hash.0),
+                    kind,
+                },
             }],
             projected_files: vec![FilePathId::new(rel_path)],
             spec_link: None,
@@ -1594,6 +1663,7 @@ mod tests {
             ".kin-session/reconcile-base.json",
             "src/.KIN/manifest.json",
             ".GiT/config",
+            ".git-export/payload.rs",
         ] {
             assert!(
                 validate_portable_relative_path(invalid, "graph FilePathId").is_err(),
@@ -1612,34 +1682,28 @@ mod tests {
     }
 
     #[test]
-    fn portable_graph_paths_reject_every_graph_excluded_namespace_component() {
-        let excluded_components = kin_index::SKIP_DIRS.iter().copied().chain([
+    fn portable_graph_paths_allow_non_control_namespaces() {
+        for component in [
+            "target",
+            "node_modules",
+            "vendor",
+            "dist",
+            "build",
             ".kin-shadow",
-            ".git-export",
             ".bench-run",
-        ]);
-
-        for component in excluded_components {
+        ] {
             let path = format!("prefix/{component}/payload.rs");
-            let error = validate_portable_relative_path(&path, "graph FilePathId")
-                .unwrap_err()
-                .to_string();
-            assert!(
-                error.contains("graph-excluded component"),
-                "unexpected error for {path:?}: {error}"
-            );
-            assert!(
-                error.contains(component),
-                "error must identify excluded component {component:?}: {error}"
+            assert_eq!(
+                validate_portable_relative_path(&path, "graph FilePathId").unwrap(),
+                PathBuf::from(path)
             );
         }
     }
 
     #[test]
-    fn graph_excluded_namespaces_fail_before_session_child_creation() {
+    fn unrelated_namespaces_materialize_from_graph_truth() {
         for (case, graph_path) in [
             ".kin-shadow/payload.rs",
-            ".git-export/payload.rs",
             ".bench-run/payload.rs",
             "target/payload.rs",
             "node_modules/payload.js",
@@ -1652,26 +1716,21 @@ mod tests {
             write_native_graph_file(&layout, graph_path, b"must not materialize\n").unwrap();
             let session_dir = layout
                 .runs_dir()
-                .join(format!("session-excluded-namespace-{case}"));
+                .join(format!("session-unrelated-namespace-{case}"));
             let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
 
-            let error = create_session_workspace_from_graph(
+            let workspace = create_session_workspace_from_graph(
                 &layout,
                 snap.graph().as_ref(),
                 &session_dir,
                 None,
                 None,
             )
-            .unwrap_err()
-            .to_string();
+            .unwrap();
 
-            assert!(
-                error.contains("graph-excluded component"),
-                "unexpected error for {graph_path:?}: {error}"
-            );
-            assert!(
-                !session_dir.exists(),
-                "preflight created a session child for {graph_path:?}"
+            assert_eq!(
+                fs::read(workspace.root.join(graph_path)).unwrap(),
+                b"must materialize\n"
             );
         }
     }
@@ -1681,11 +1740,11 @@ mod tests {
         let mut tree = HashMap::new();
         tree.insert(
             FilePathId::new("src/Foo.rs"),
-            Hash256::from_bytes([0x41; 32]),
+            TreeEntry::regular(Hash256::from_bytes([0x41; 32]), false),
         );
         tree.insert(
             FilePathId::new("src/foo.rs"),
-            Hash256::from_bytes([0x42; 32]),
+            TreeEntry::regular(Hash256::from_bytes([0x42; 32]), false),
         );
 
         let error = preflight_blob_tree(&tree, None).unwrap_err().to_string();
@@ -1698,11 +1757,11 @@ mod tests {
         let mut tree = HashMap::new();
         tree.insert(
             FilePathId::new("src/caf\u{e9}.rs"),
-            Hash256::from_bytes([0x51; 32]),
+            TreeEntry::regular(Hash256::from_bytes([0x51; 32]), false),
         );
         tree.insert(
             FilePathId::new("src/cafe\u{301}.rs"),
-            Hash256::from_bytes([0x52; 32]),
+            TreeEntry::regular(Hash256::from_bytes([0x52; 32]), false),
         );
 
         let error = preflight_blob_tree(&tree, None).unwrap_err().to_string();
@@ -1715,11 +1774,11 @@ mod tests {
         let mut tree = HashMap::new();
         tree.insert(
             FilePathId::new("src/Stra\u{df}e.rs"),
-            Hash256::from_bytes([0x53; 32]),
+            TreeEntry::regular(Hash256::from_bytes([0x53; 32]), false),
         );
         tree.insert(
             FilePathId::new("src/STRASSE.rs"),
-            Hash256::from_bytes([0x54; 32]),
+            TreeEntry::regular(Hash256::from_bytes([0x54; 32]), false),
         );
 
         let error = preflight_blob_tree(&tree, None).unwrap_err().to_string();
@@ -1730,10 +1789,13 @@ mod tests {
     #[test]
     fn portable_graph_preflight_rejects_case_folded_file_parent_collisions() {
         let mut tree = HashMap::new();
-        tree.insert(FilePathId::new("Foo"), Hash256::from_bytes([0x43; 32]));
+        tree.insert(
+            FilePathId::new("Foo"),
+            TreeEntry::regular(Hash256::from_bytes([0x43; 32]), false),
+        );
         tree.insert(
             FilePathId::new("foo/bar.rs"),
-            Hash256::from_bytes([0x44; 32]),
+            TreeEntry::regular(Hash256::from_bytes([0x44; 32]), false),
         );
 
         let error = preflight_blob_tree(&tree, None).unwrap_err().to_string();
@@ -2536,12 +2598,13 @@ mod tests {
             fs::read_to_string(workspace.root.join("src/lib.rs")).unwrap(),
             "graph truth\n"
         );
-        let base = super::super::session_base::load_base(&workspace.root)
-            .unwrap()
-            .expect("capability-rooted base manifest");
+        let base = super::super::session_base::load_base(&workspace.root).unwrap();
         assert_eq!(
-            base.files.get("src/lib.rs"),
-            Some(&kin_blobs::digest(b"graph truth\n").to_string())
+            base.tree.get("src/lib.rs"),
+            Some(&TreeEntry::regular(
+                kin_blobs::digest(b"graph truth\n"),
+                false
+            ))
         );
 
         let artifact_dir = std::path::Path::new("/tmp/workstreamC-materialization-dispatch-proof");
@@ -2555,6 +2618,91 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn materializes_config_binary_executable_symlink_and_unrelated_paths_exactly() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = init_repo(dir.path()).unwrap().layout;
+        write_native_graph_entry(
+            &layout,
+            "docker-compose.yml",
+            b"services:\n  app:\n    image: alpine\n",
+            TreeEntryKind::Regular { executable: false },
+            0xa1,
+        )
+        .unwrap();
+        write_native_graph_entry(
+            &layout,
+            "bin/run",
+            b"#!/bin/sh\nexit 0\n",
+            TreeEntryKind::Regular { executable: true },
+            0xa2,
+        )
+        .unwrap();
+        write_native_graph_entry(
+            &layout,
+            "compose-current",
+            b"docker-compose.yml",
+            TreeEntryKind::Symlink,
+            0xa3,
+        )
+        .unwrap();
+        write_native_graph_entry(
+            &layout,
+            "node_modules/pkg/data.unknown",
+            b"\0\xffopaque",
+            TreeEntryKind::Regular { executable: false },
+            0xa4,
+        )
+        .unwrap();
+
+        let session_dir = layout.runs_dir().join("session-heterogeneous-tree");
+        let snapshot = crate::backend::open_kindb_snapshot(&layout).unwrap();
+        let workspace = create_session_workspace_from_graph(
+            &layout,
+            snapshot.graph().as_ref(),
+            &session_dir,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(workspace.root.join("docker-compose.yml")).unwrap(),
+            b"services:\n  app:\n    image: alpine\n"
+        );
+        assert_eq!(
+            fs::read(workspace.root.join("node_modules/pkg/data.unknown")).unwrap(),
+            b"\0\xffopaque"
+        );
+        assert_eq!(
+            fs::symlink_metadata(workspace.root.join("bin/run"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0o111
+        );
+        assert_eq!(
+            fs::read_link(workspace.root.join("compose-current")).unwrap(),
+            PathBuf::from("docker-compose.yml")
+        );
+
+        let base = super::super::session_base::load_base(&workspace.root).unwrap();
+        assert_eq!(
+            base.tree.get("bin/run").map(|entry| entry.kind),
+            Some(TreeEntryKind::Regular { executable: true })
+        );
+        assert_eq!(
+            base.tree.get("compose-current").map(|entry| entry.kind),
+            Some(TreeEntryKind::Symlink)
+        );
+        assert!(base.tree.contains_key("node_modules/pkg/data.unknown"));
     }
 
     #[test]
@@ -2581,19 +2729,17 @@ mod tests {
         )
         .unwrap();
 
-        let base = super::super::session_base::load_base(&workspace.root)
-            .unwrap()
-            .expect("graph-authoritative base manifest");
+        let base = super::super::session_base::load_base(&workspace.root).unwrap();
         assert_eq!(
-            base.files.get("src/lib.rs"),
-            Some(&kin_blobs::digest(graph_bytes).to_string()),
-            "a late mutation must not replace the preflighted graph hash"
+            base.tree.get("src/lib.rs"),
+            Some(&TreeEntry::regular(kin_blobs::digest(graph_bytes), false)),
+            "a late mutation must not replace the preflighted graph entry"
         );
         assert!(
-            !base.files.contains_key("ambient-insertion.rs"),
+            !base.tree.contains_key("ambient-insertion.rs"),
             "a late insertion must not be discovered into the graph base"
         );
-        assert_eq!(base.files.len(), 1);
+        assert_eq!(base.tree.len(), 1);
         assert_eq!(
             fs::read_to_string(workspace.root.join("src/lib.rs")).unwrap(),
             "late ambient mutation\n"

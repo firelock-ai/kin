@@ -544,6 +544,15 @@ fn persist_semantic_index<G: GraphStore>(
         .upsert_relations_batch(&all_relations)
         .map_err(|e| MigrateError::Graph(e.to_string()))?;
 
+    let mut artifact_ids = kin_index::linker::ArtifactIdentityMap::new();
+    for file in &file_parse_data {
+        let file_id = kin_model::FilePathId::new(&file.file_path);
+        let artifact_id = graph
+            .ensure_artifact_id(&file_id)
+            .map_err(|e| MigrateError::Graph(e.to_string()))?;
+        artifact_ids.insert(file.file_path.clone(), artifact_id);
+    }
+
     // Cross-file relation linking
     let cross_file_relations = {
         let _span =
@@ -551,8 +560,10 @@ fn persist_semantic_index<G: GraphStore>(
                 .entered();
         kin_index::linker::link_cross_file_with_tests_and_completeness(
             &file_parse_data,
+            &artifact_ids,
             &parse_completeness_by_file,
         )
+        .map_err(|e| MigrateError::Index(e.to_string()))?
     };
     graph
         .upsert_relations_batch(&cross_file_relations)

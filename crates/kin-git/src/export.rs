@@ -668,7 +668,7 @@ mod tests {
         id_byte: u8,
         parents: Vec<SemanticChangeId>,
         message: &str,
-        deltas: Vec<ArtifactDelta>,
+        tree_deltas: Vec<TreeDelta>,
     ) -> SemanticChange {
         SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
@@ -678,7 +678,7 @@ mod tests {
             message: message.to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: deltas,
+            tree_deltas,
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -697,12 +697,25 @@ mod tests {
         Hash256::from_bytes(blob_hash.0)
     }
 
-    fn make_delta(path: &str, kind: ArtifactDeltaKind, new_hash: Option<Hash256>) -> ArtifactDelta {
-        ArtifactDelta {
+    fn added_tree_entry(path: &str, new_entry: TreeEntry) -> TreeDelta {
+        TreeDelta::Added {
             file_id: FilePathId::new(path),
-            kind,
-            old_hash: None,
-            new_hash,
+            new_entry,
+        }
+    }
+
+    fn modified_tree_entry(path: &str, old_entry: TreeEntry, new_entry: TreeEntry) -> TreeDelta {
+        TreeDelta::Modified {
+            file_id: FilePathId::new(path),
+            old_entry,
+            new_entry,
+        }
+    }
+
+    fn removed_tree_entry(path: &str, old_entry: TreeEntry) -> TreeDelta {
+        TreeDelta::Removed {
+            file_id: FilePathId::new(path),
+            old_entry,
         }
     }
 
@@ -869,6 +882,15 @@ mod tests {
         ) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
+        fn artifact_id_for_path(&self, _: &kin_model::FilePathId) -> Option<kin_model::ArtifactId> {
+            None
+        }
+        fn ensure_artifact_id(
+            &self,
+            path: &kin_model::FilePathId,
+        ) -> std::result::Result<kin_model::ArtifactId, Self::Error> {
+            Ok(kin_model::ArtifactId::seed_from_file_id(path))
+        }
         fn upsert_file_layout(
             &self,
             _: &kin_model::FileLayout,
@@ -886,9 +908,21 @@ mod tests {
         ) -> std::result::Result<Vec<kin_model::FileLayout>, Self::Error> {
             Ok(vec![])
         }
+        fn get_tree_entry(
+            &self,
+            _: &kin_model::FilePathId,
+        ) -> std::result::Result<Option<kin_model::TreeEntry>, Self::Error> {
+            Ok(None)
+        }
         fn delete_file_layout(
             &self,
             _: &kin_model::FilePathId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn apply_transaction_delta(
+            &self,
+            _: &kin_model::TransactionDelta,
         ) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
@@ -916,12 +950,6 @@ mod tests {
             &self,
             _: &kin_model::FilePathId,
         ) -> std::result::Result<Option<kin_model::OpaqueArtifact>, Self::Error> {
-            Ok(None)
-        }
-        fn get_file_hash(
-            &self,
-            _: &kin_model::FilePathId,
-        ) -> std::result::Result<Option<kin_model::Hash256>, Self::Error> {
             Ok(None)
         }
     }
@@ -1576,10 +1604,9 @@ mod tests {
             1,
             vec![genesis.id],
             "add greeting",
-            vec![make_delta(
+            vec![added_tree_entry(
                 "hello.txt",
-                ArtifactDeltaKind::AddedRegularFile,
-                Some(hash),
+                TreeEntry::regular(hash, false),
             )],
         );
 
@@ -1611,7 +1638,7 @@ mod tests {
     }
 
     #[test]
-    fn export_preserves_regular_executable_and_symlink_modes() {
+    fn export_preserves_regular_executable_symlink_and_mode_only_transitions() {
         let tmp = tempfile::tempdir().unwrap();
         let blob_store = make_blob_store(tmp.path());
         let genesis = make_genesis();
@@ -1623,34 +1650,36 @@ mod tests {
             vec![genesis.id],
             "add exact source modes",
             vec![
-                make_delta(
+                added_tree_entry("plain.txt", TreeEntry::regular(regular_hash, false)),
+                added_tree_entry("run.sh", TreeEntry::regular(executable_hash, true)),
+                added_tree_entry("plain-link", TreeEntry::symlink(symlink_hash)),
+            ],
+        );
+        let mode_change = make_change(
+            2,
+            vec![change.id],
+            "flip executable bits without changing content",
+            vec![
+                modified_tree_entry(
                     "plain.txt",
-                    ArtifactDeltaKind::AddedRegularFile,
-                    Some(regular_hash),
+                    TreeEntry::regular(regular_hash, false),
+                    TreeEntry::regular(regular_hash, true),
                 ),
-                make_delta(
+                modified_tree_entry(
                     "run.sh",
-                    ArtifactDeltaKind::AddedExecutableFile,
-                    Some(executable_hash),
-                ),
-                make_delta(
-                    "plain-link",
-                    ArtifactDeltaKind::AddedSymlink,
-                    Some(symlink_hash),
+                    TreeEntry::regular(executable_hash, true),
+                    TreeEntry::regular(executable_hash, false),
                 ),
             ],
         );
         let branch_name = BranchName::new("main");
-        let graph = MockGraph::with_branch_and_changes("main", change.id, vec![genesis, change]);
+        let graph = MockGraph::with_branch_and_changes(
+            "main",
+            mode_change.id,
+            vec![genesis.clone(), change, mode_change],
+        );
         let git_path = tmp.path().join("repo.git");
-        export_to_git(
-            &graph,
-            &blob_store,
-            make_genesis().id,
-            &branch_name,
-            &git_path,
-        )
-        .unwrap();
+        export_to_git(&graph, &blob_store, genesis.id, &branch_name, &git_path).unwrap();
 
         let repo = gix::open(&git_path).unwrap();
         let head = repo
@@ -1660,11 +1689,11 @@ mod tests {
             .detach();
         assert_eq!(
             entry_kind_from_commit(&git_path, head, "plain.txt"),
-            EntryKind::Blob
+            EntryKind::BlobExecutable
         );
         assert_eq!(
             entry_kind_from_commit(&git_path, head, "run.sh"),
-            EntryKind::BlobExecutable
+            EntryKind::Blob
         );
         assert_eq!(
             entry_kind_from_commit(&git_path, head, "plain-link"),
@@ -1674,36 +1703,6 @@ mod tests {
             read_file_from_commit(&git_path, head, "plain-link"),
             b"plain.txt"
         );
-    }
-
-    #[test]
-    fn export_rejects_legacy_mode_unknown_deltas() {
-        let tmp = tempfile::tempdir().unwrap();
-        let blob_store = make_blob_store(tmp.path());
-        let genesis = make_genesis();
-        let hash = store_blob(&blob_store, b"legacy\n");
-        let change = make_change(
-            1,
-            vec![genesis.id],
-            "legacy source",
-            vec![make_delta(
-                "legacy.txt",
-                ArtifactDeltaKind::Added,
-                Some(hash),
-            )],
-        );
-        let branch_name = BranchName::new("main");
-        let graph =
-            MockGraph::with_branch_and_changes("main", change.id, vec![genesis.clone(), change]);
-        let error = export_to_git(
-            &graph,
-            &blob_store,
-            genesis.id,
-            &branch_name,
-            &tmp.path().join("repo.git"),
-        )
-        .expect_err("legacy mode-unknown history must not be normalized during export");
-        assert!(error.to_string().contains("mode-unknown"));
     }
 
     #[test]
@@ -1717,10 +1716,9 @@ mod tests {
             1,
             vec![genesis.id],
             "initial file",
-            vec![make_delta(
+            vec![added_tree_entry(
                 "file.txt",
-                ArtifactDeltaKind::AddedRegularFile,
-                Some(hash1),
+                TreeEntry::regular(hash1, false),
             )],
         );
 
@@ -1729,10 +1727,10 @@ mod tests {
             2,
             vec![change1.id],
             "update file",
-            vec![make_delta(
+            vec![modified_tree_entry(
                 "file.txt",
-                ArtifactDeltaKind::ModifiedRegularFile,
-                Some(hash2),
+                TreeEntry::regular(hash1, false),
+                TreeEntry::regular(hash2, false),
             )],
         );
 
@@ -1741,10 +1739,9 @@ mod tests {
             3,
             vec![change2.id],
             "add another file",
-            vec![make_delta(
+            vec![added_tree_entry(
                 "src/lib.rs",
-                ArtifactDeltaKind::AddedRegularFile,
-                Some(hash3),
+                TreeEntry::regular(hash3, false),
             )],
         );
 
@@ -1806,10 +1803,9 @@ mod tests {
             1,
             vec![genesis.id],
             "feature work",
-            vec![make_delta(
+            vec![added_tree_entry(
                 "feature.rs",
-                ArtifactDeltaKind::AddedRegularFile,
-                Some(hash),
+                TreeEntry::regular(hash, false),
             )],
         );
 
@@ -2111,10 +2107,9 @@ mod tests {
             1,
             vec![genesis.id],
             "first commit",
-            vec![make_delta(
+            vec![added_tree_entry(
                 "file.txt",
-                ArtifactDeltaKind::AddedRegularFile,
-                Some(hash1),
+                TreeEntry::regular(hash1, false),
             )],
         );
 
@@ -2134,10 +2129,10 @@ mod tests {
             2,
             vec![change1.id],
             "second commit",
-            vec![make_delta(
+            vec![modified_tree_entry(
                 "file.txt",
-                ArtifactDeltaKind::ModifiedRegularFile,
-                Some(hash2),
+                TreeEntry::regular(hash1, false),
+                TreeEntry::regular(hash2, false),
             )],
         );
 
@@ -2180,10 +2175,9 @@ mod tests {
             1,
             vec![genesis.id],
             "add file",
-            vec![make_delta(
+            vec![added_tree_entry(
                 "temp.txt",
-                ArtifactDeltaKind::AddedRegularFile,
-                Some(hash),
+                TreeEntry::regular(hash, false),
             )],
         );
 
@@ -2191,7 +2185,10 @@ mod tests {
             2,
             vec![change1.id],
             "remove file",
-            vec![make_delta("temp.txt", ArtifactDeltaKind::Removed, None)],
+            vec![removed_tree_entry(
+                "temp.txt",
+                TreeEntry::regular(hash, false),
+            )],
         );
 
         let branch_name = BranchName::new("main");
@@ -2237,21 +2234,9 @@ mod tests {
             vec![genesis.id],
             "add nested files",
             vec![
-                make_delta(
-                    "src/lib/mod.rs",
-                    ArtifactDeltaKind::AddedRegularFile,
-                    Some(hash1),
-                ),
-                make_delta(
-                    "src/main.rs",
-                    ArtifactDeltaKind::AddedRegularFile,
-                    Some(hash2),
-                ),
-                make_delta(
-                    "README.md",
-                    ArtifactDeltaKind::AddedRegularFile,
-                    Some(hash3),
-                ),
+                added_tree_entry("src/lib/mod.rs", TreeEntry::regular(hash1, false)),
+                added_tree_entry("src/main.rs", TreeEntry::regular(hash2, false)),
+                added_tree_entry("README.md", TreeEntry::regular(hash3, false)),
             ],
         );
 

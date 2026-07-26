@@ -3554,7 +3554,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
 }
 
 pub fn run_with_graph_capture_at_ref(
-    layout: &kin_core::KinLayout,
+    _layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,
     blob_store: &kin_blobs::BlobStore,
     head: &SemanticChangeId,
@@ -3567,25 +3567,8 @@ pub fn run_with_graph_capture_at_ref(
 ) -> Result<LocateResult> {
     let changes = kin_core::collect_changes_at_ref(graph, head)
         .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-    let historical = if let Some(git_oid) = reference.strip_prefix("git:") {
-        kin_core::build_graph_at_git_ref_with_repo(
-            graph,
-            blob_store,
-            head,
-            layout.working_dir(),
-            git_oid,
-            None,
-        )
-    } else {
-        kin_core::build_graph_at_ref_with_repo(
-            graph,
-            blob_store,
-            head,
-            Some(layout.working_dir()),
-            None,
-        )
-    }
-    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    let historical = kin_core::build_graph_at_ref(graph, blob_store, head)
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
     let _ = crate::commands::cochange::refresh_from_changes(&historical, &changes);
     let extra_priority_files =
         discover_historical_test_artifact_priority_files(&historical, reference, text);
@@ -4223,8 +4206,8 @@ fn graph_named_test_artifact_paths(graph: &kin_db::InMemoryGraph) -> Vec<String>
 /// the "named test artifacts that contain triple-quoted strings" signal is read
 /// from those graph surfaces rather than by shelling out to `git grep`/`git
 /// show` over raw working-tree contents. `graph` is the ref-scoped graph
-/// (`build_graph_at_git_ref_with_repo` output); a file with no graph-owned body
-/// is dropped honestly instead of being re-read from disk.
+/// (`build_graph_at_ref` output); a file with no graph-owned body is dropped
+/// honestly instead of being re-read from disk or Git.
 pub fn discover_historical_test_artifact_priority_files(
     graph: &kin_db::InMemoryGraph,
     reference: &str,
