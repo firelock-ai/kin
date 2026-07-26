@@ -379,8 +379,9 @@ mod tests {
     #[test]
     fn all_dirs_count() {
         let layout = KinLayout::new(PathBuf::from("/repo/.kin"));
-        // kindb, stashes, backups, projections, docs, bench, runs, logs, adapters, shallow
-        assert_eq!(layout.all_dirs().len(), 10);
+        // kindb, ingest-cas, stashes, backups, projections, docs, bench, runs,
+        // logs, adapters, shallow
+        assert_eq!(layout.all_dirs().len(), 11);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (412 total, 310 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (410 total, 310 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -152,12 +152,6 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_INFER_CPU_BACKEND` | enum | accelerate | correctness | kin-infer CPU matmul backend: 'pure-rust' forces the deterministic pure-Rust GEMM for bit-reproducible runs; 'accelerate' uses Apple Accelerate BLAS (the macOS default). BLAS differs from pure-Rust in the last ULPs |
 | `KIN_INFER_METAL_PROFILE` | string | *(unset)* | operational | Metal inference profile selection |
 | `KIN_INFER_OCCUPANCY_DISPATCH` | bool | false | operational | kin-infer Metal occupancy-informed pointwise threadgroup sizing; numerically identical to the one-simdgroup baseline (a perf A/B lever), default off |
-
-## Init
-
-| Variable | Kind | Default | Sensitivity | Description |
-| --- | --- | --- | --- | --- |
-| `KIN_INIT_MAX_FILES` | usize | *(unset)* | operational | cap on files ingested during init |
 
 ## Storage
 
@@ -496,7 +490,6 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
-| `KIN_HYDRATE_STAGE_TIMINGS` | bool | false | diagnostic | emit one machine-readable JSON line of per-phase history-hydration stage timings to stderr, alongside the human summary |
 | `KIN_PROFILE_DISABLE_RESOURCES` | bool | false | diagnostic | disable resource sampling in the profiler |
 | `KIN_PROFILE_OUT` | path | *(unset)* | diagnostic | write a command profiling session to this path |
 | `KIN_PROFILE_SAMPLE_MS` | usize | 250 | diagnostic | resource sampling interval for the profiler |

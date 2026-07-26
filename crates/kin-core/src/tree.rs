@@ -33,6 +33,10 @@ const RECONCILIATION_AUTHORITY_FILE: &str = "authority.key";
 const RECONCILIATION_MANIFEST_FILE: &str = "manifest.json";
 #[cfg(any(unix, windows))]
 const RECONCILIATION_PROJECTION_LOCK_FILE: &str = "projection.lock";
+#[cfg(any(unix, windows))]
+const SESSION_PROJECTION_CONTROL_DIRECTORY: &str = ".kin-session";
+#[cfg(any(unix, windows))]
+const SESSION_PROJECTION_BASE_FILE: &str = "base.json";
 
 /// How long a caller waits for a live exact-source projection to finish before
 /// failing loud. Bounded so an undiscovered lock-order cycle degrades to a
@@ -120,6 +124,27 @@ pub fn materialize_source_tree<'a>(
 ) -> Result<usize> {
     let entries = validated_source_entries(entries)?;
     project_validated_source_tree(root, &entries, None, || {})
+}
+
+/// Materialize one exact repository tree as a disposable session projection.
+///
+/// Session metadata is installed under `.kin-session/base.json`, while the
+/// projection recovery journal lives under `.kin-session/reconciliation`.
+/// Keeping this control plane separate from `.kin/` ensures repository
+/// discovery from inside the session continues to bind the owning repository
+/// rather than mistaking the derived workspace for an independent authority.
+pub fn materialize_session_source_tree<'a>(
+    root: &Path,
+    base_metadata: &[u8],
+    entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
+) -> Result<usize> {
+    if base_metadata.is_empty() {
+        return Err(KinError::Other(
+            "session projection base metadata must not be empty".to_string(),
+        ));
+    }
+    let entries = validated_source_entries(entries)?;
+    project_validated_session_source_tree(root, &entries, base_metadata)
 }
 
 /// Replace a working tree from exact graph-owned source under one retained
@@ -638,6 +663,28 @@ fn project_validated_source_tree(
     }
 }
 
+fn project_validated_session_source_tree(
+    root: &Path,
+    entries: &[ValidatedSourceEntry<'_>],
+    base_metadata: &[u8],
+) -> Result<usize> {
+    #[cfg(any(unix, windows))]
+    {
+        let projection = ProjectionRoot::open_session(root)?;
+        let tracked = TrackedPathClassifier::new(entries.iter().map(|entry| entry.file_id))?;
+        let plan = projection.plan_full_replacement(&tracked, None)?;
+        projection.apply_full_replacement(entries, plan)?;
+        projection.install_session_base_metadata(base_metadata)?;
+        Ok(entries.len())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (root, entries, base_metadata);
+        Err(unsupported_safe_projection_error())
+    }
+}
+
 fn project_reconciled_source_tree(
     root: &Path,
     previous_entries: &[ValidatedSourceEntry<'_>],
@@ -1009,6 +1056,9 @@ struct ProjectionRoot {
     projection_lock: std::fs::File,
     projection_lock_identity: TrackedEntryIdentity,
     display_root: PathBuf,
+    projection_control_name: OsString,
+    display_projection_control: PathBuf,
+    repository_authority_kindb: Option<PathBuf>,
     kin_control_identity: TrackedEntryIdentity,
     control_identity: TrackedEntryIdentity,
     authority_key: [u8; 32],
@@ -1724,8 +1774,31 @@ impl ProjectionRoot {
         Self::open_with_projection_lock_deadline(root, PROJECTION_LOCK_WAIT_DEADLINE)
     }
 
+    fn open_session(root: &Path) -> Result<Self> {
+        Self::open_with_control_directory(
+            root,
+            std::ffi::OsStr::new(SESSION_PROJECTION_CONTROL_DIRECTORY),
+            None,
+            PROJECTION_LOCK_WAIT_DEADLINE,
+        )
+    }
+
     fn open_with_projection_lock_deadline(
         root: &Path,
+        lock_deadline: std::time::Duration,
+    ) -> Result<Self> {
+        Self::open_with_control_directory(
+            root,
+            std::ffi::OsStr::new(".kin"),
+            Some(root.join(".kin").join("kindb")),
+            lock_deadline,
+        )
+    }
+
+    fn open_with_control_directory(
+        root: &Path,
+        projection_control_name: &std::ffi::OsStr,
+        repository_authority_kindb: Option<PathBuf>,
         lock_deadline: std::time::Duration,
     ) -> Result<Self> {
         #[cfg(unix)]
@@ -1745,25 +1818,26 @@ impl ProjectionRoot {
         #[cfg(windows)]
         let capability =
             open_windows_projection_root(root).map_err(|error| KinError::io(root, error))?;
+        let display_projection_control = root.join(projection_control_name);
         let kin_control = open_or_create_private_directory(
             &capability,
-            std::ffi::OsStr::new(".kin"),
-            &root.join(".kin"),
+            projection_control_name,
+            &display_projection_control,
         )?;
         let kin_control_identity = tracked_open_directory_identity(&kin_control)
-            .map_err(|error| KinError::io(root.join(".kin"), error))?;
+            .map_err(|error| KinError::io(&display_projection_control, error))?;
         let control = open_or_create_private_directory(
             &kin_control,
             std::ffi::OsStr::new(RECONCILIATION_CONTROL_DIRECTORY),
-            &root.join(".kin").join(RECONCILIATION_CONTROL_DIRECTORY),
+            &display_projection_control.join(RECONCILIATION_CONTROL_DIRECTORY),
         )?;
         let control_identity = tracked_open_directory_identity(&control).map_err(|error| {
             KinError::io(
-                root.join(".kin").join(RECONCILIATION_CONTROL_DIRECTORY),
+                display_projection_control.join(RECONCILIATION_CONTROL_DIRECTORY),
                 error,
             )
         })?;
-        let display_control = root.join(".kin").join(RECONCILIATION_CONTROL_DIRECTORY);
+        let display_control = display_projection_control.join(RECONCILIATION_CONTROL_DIRECTORY);
         let (projection_lock, projection_lock_identity) =
             acquire_reconciliation_projection_lock(&control, &display_control, lock_deadline)?;
         let authority_key =
@@ -1775,6 +1849,9 @@ impl ProjectionRoot {
             projection_lock,
             projection_lock_identity,
             display_root: root.to_path_buf(),
+            projection_control_name: projection_control_name.to_os_string(),
+            display_projection_control,
+            repository_authority_kindb,
             kin_control_identity,
             control_identity,
             authority_key,
@@ -1894,30 +1971,61 @@ impl ProjectionRoot {
     }
 
     fn reconciliation_control_path(&self) -> PathBuf {
-        self.display_root
-            .join(".kin")
+        self.display_projection_control
             .join(RECONCILIATION_CONTROL_DIRECTORY)
+    }
+
+    fn install_session_base_metadata(&self, metadata: &[u8]) -> Result<()> {
+        if self.projection_control_name
+            != std::ffi::OsStr::new(SESSION_PROJECTION_CONTROL_DIRECTORY)
+        {
+            return Err(KinError::Other(
+                "session base metadata may only be installed in a session projection".to_string(),
+            ));
+        }
+        self.revalidate_projection_lock()?;
+        let display = self
+            .display_projection_control
+            .join(SESSION_PROJECTION_BASE_FILE);
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = self
+            .kin_control
+            .open_with(SESSION_PROJECTION_BASE_FILE, &options)
+            .map_err(|error| KinError::io(&display, error))?;
+        #[cfg(unix)]
+        rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(0o600))
+            .map_err(|error| KinError::io(&display, error.into()))?;
+        file.write_all(metadata)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| KinError::io(&display, error))?;
+        sync_directory_capability(&self.kin_control, &self.display_projection_control)?;
+        self.revalidate_projection_lock()
     }
 
     fn revalidate_projection_lock(&self) -> Result<()> {
         // Read-only identity check, not a removal: requesting DELETE access on
-        // `.kin` here would be vetoed on Windows by the graph store's live handle
-        // opened without FILE_SHARE_DELETE (the same bilateral collision as the
-        // use-path open).
-        let named_kin = open_directory_nofollow(&self.root, std::ffi::OsStr::new(".kin"))
-            .map_err(|error| KinError::io(self.display_root.join(".kin"), error))?;
+        // the control directory here would be vetoed on Windows by a live
+        // graph-store handle under a primary `.kin`, and is unnecessary for
+        // the session-owned `.kin-session` control plane.
+        let named_kin = open_directory_nofollow(&self.root, &self.projection_control_name)
+            .map_err(|error| KinError::io(&self.display_projection_control, error))?;
         if tracked_open_directory_identity(&named_kin)
-            .map_err(|error| KinError::io(self.display_root.join(".kin"), error))?
+            .map_err(|error| KinError::io(&self.display_projection_control, error))?
             != self.kin_control_identity
         {
+            let control_kind =
+                if self.projection_control_name.as_os_str() == std::ffi::OsStr::new(".kin") {
+                    "repository control directory"
+                } else {
+                    "session projection control directory"
+                };
             return Err(KinError::Other(format!(
-                "repository control directory {} was replaced while the projection lock was held",
-                self.display_root.join(".kin").display()
+                "{control_kind} {} was replaced while the projection lock was held",
+                self.display_projection_control.display()
             )));
         }
-        // Read-only identity check, matching the `.kin` open above: `.kin/control`
-        // is projection-owned and does not collide today, but narrowing it now
-        // closes the gratuitous-DELETE-access class rather than only the instance.
+        // Read-only identity check, matching the control-root open above.
         let named_control = open_directory_nofollow(
             &self.kin_control,
             std::ffi::OsStr::new(RECONCILIATION_CONTROL_DIRECTORY),
@@ -1963,11 +2071,15 @@ impl ProjectionRoot {
         &self,
         marker: &ReconciliationAuthorityCommit,
     ) -> Result<bool> {
+        let authority_kindb = self.repository_authority_kindb.as_ref().ok_or_else(|| {
+            KinError::Other(format!(
+                "session projection recovery at {} unexpectedly contains a repository-authority commit marker",
+                self.display_root.display()
+            ))
+        })?;
         let manager = RepositoryAuthorityManager::open(
             marker.repository_id.clone(),
-            Arc::new(LocalFileBackend::new(
-                self.display_root.join(".kin").join("kindb"),
-            )),
+            Arc::new(LocalFileBackend::new(authority_kindb)),
         )
         .map_err(|error| {
             KinError::Other(format!(
@@ -2982,9 +3094,7 @@ impl ProjectionRoot {
             let name = entry.file_name();
             let relative = relative_directory.join(&name);
             if relative_directory.as_os_str().is_empty()
-                && name
-                    .to_str()
-                    .is_some_and(|component| component.eq_ignore_ascii_case(".kin"))
+                && name.as_os_str() == self.projection_control_name.as_os_str()
             {
                 all_children_removed = false;
                 continue;
@@ -5723,6 +5833,92 @@ mod tests {
                 .to_string()
                 .contains("repository history, not a repository-owned source blob"),
             "unexpected gitlink projection error: {error}"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn session_projection_keeps_repository_discovery_control_separate() {
+        let root = tempfile::tempdir().unwrap();
+        let compose = repo_path("compose.yaml");
+        let executable = repo_path("bin/run");
+        let metadata = br#"{"schema":1,"tree":"exact"}"#;
+
+        let count = materialize_session_source_tree(
+            root.path(),
+            metadata,
+            [
+                (
+                    &compose,
+                    TreeEntry::blob(Hash256::from_bytes([0x41; 32]), false),
+                    b"services:\n  app:\n    image: kin\n".as_slice(),
+                ),
+                (
+                    &executable,
+                    TreeEntry::blob(Hash256::from_bytes([0x42; 32]), true),
+                    b"#!/bin/sh\nexit 0\n".as_slice(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(count, 2);
+        assert_eq!(
+            std::fs::read(root.path().join("compose.yaml")).unwrap(),
+            b"services:\n  app:\n    image: kin\n"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join(".kin-session/base.json")).unwrap(),
+            metadata
+        );
+        assert!(root.path().join(".kin-session/reconciliation").is_dir());
+        assert!(
+            !root.path().join(".kin").exists(),
+            "a session projection must not shadow owning-repository discovery"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_ne!(
+                std::fs::metadata(root.path().join("bin/run"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_projection_preserves_symbolic_link_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let target = repo_path("config/app.toml");
+        let link = repo_path("current-config");
+
+        materialize_session_source_tree(
+            root.path(),
+            br#"{"schema":1}"#,
+            [
+                (
+                    &target,
+                    TreeEntry::blob(Hash256::from_bytes([0x51; 32]), false),
+                    b"enabled = true\n".as_slice(),
+                ),
+                (
+                    &link,
+                    TreeEntry::symlink(Hash256::from_bytes([0x52; 32])),
+                    b"config/app.toml".as_slice(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_link(root.path().join("current-config")).unwrap(),
+            PathBuf::from("config/app.toml")
         );
     }
 

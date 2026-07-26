@@ -58,10 +58,11 @@ pub use manifest::KinManifest;
 pub use resolver::{ImportResolver, PythonResolver, SymbolTable, TypeScriptResolver};
 pub use sync_state::SyncStateStore;
 pub use tree::{
-    materialize_source_entry, materialize_source_tree, prepare_source_tree, reconcile_source_tree,
-    replace_source_tree, resolve_change_tree, should_preserve_checkout_path,
-    validate_portable_source_paths, validate_portable_source_symlink, validate_source_entry,
-    validate_source_paths, validate_source_tree,
+    materialize_session_source_tree, materialize_source_entry, materialize_source_tree,
+    prepare_source_tree, reconcile_source_tree, replace_source_tree, resolve_change_tree,
+    should_preserve_checkout_path, validate_portable_source_paths,
+    validate_portable_source_symlink, validate_source_entry, validate_source_paths,
+    validate_source_tree,
 };
 
 pub use diff::{compute_semantic_change_id, content_identity_from_deltas, whoami};
