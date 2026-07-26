@@ -56,7 +56,7 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// [OPEN GATE] Create an exact semantic and artifact commit
+    /// Create an exact semantic and artifact commit
     Commit {
         /// Commit message
         #[arg(short, long)]
@@ -64,9 +64,6 @@ enum Command {
         /// Suppress progress output (only print final summary)
         #[arg(short, long)]
         quiet: bool,
-        /// Run the full pipeline but do not save the snapshot or update branch head
-        #[arg(long)]
-        dry_run: bool,
     },
     /// Show the immutable repository-v6 change log
     Log {
@@ -1905,7 +1902,7 @@ fn main() -> Result<()> {
                         commands::resources::run(json, profile).await
                     }
                 },
-                Command::Commit { .. } => commands::capabilities::require_ready("commit"),
+                Command::Commit { message, quiet } => commands::commit::run(message, quiet).await,
                 Command::Log { count, json } => commands::log::run(count, json),
                 Command::Branch { action } => match action {
                     BranchAction::List { json } => commands::branch::list(json),

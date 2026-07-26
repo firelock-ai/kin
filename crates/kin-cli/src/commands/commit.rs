@@ -59,14 +59,13 @@ async fn run_daemon_commit(
     let timestamp = kin_model::Timestamp::now();
     let mut request = client
         .post(format!(
-            "{}/v1/commands/commit",
+            "{}/commands/commit",
             daemon_url.trim_end_matches('/')
         ))
         .json(&serde_json::json!({
             "operation_id": operation_id,
             "timestamp": timestamp,
             "message": message,
-            "dry_run": false,
         }));
     if let Some(token) = crate::daemon_client::resolve_daemon_auth_token() {
         request = request.bearer_auth(token);

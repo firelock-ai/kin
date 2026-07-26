@@ -259,6 +259,7 @@ pub fn reconcile_source_tree_and_commit_repository_transaction<'a, 'b>(
         &entries,
         &transaction,
     )?;
+    let materialized_count = entries.len();
     let marker = ReconciliationAuthorityCommit {
         repository_id: transaction.repository_id.clone(),
         operation_id: transaction.operation_id,
@@ -276,6 +277,50 @@ pub fn reconcile_source_tree_and_commit_repository_transaction<'a, 'b>(
         Some(marker),
         || commit_repository_transaction_exact(authority, transaction),
     )
+    .map(|(_, receipt)| (materialized_count, receipt))
+}
+
+/// Verify an already-current source projection and publish one repository
+/// transaction while the retained projection capability remains frozen.
+///
+/// Explicit filesystem admission commonly advances the workspace tree before
+/// an explicit commit records semantic deltas, the new base, and the named ref.
+/// In that case there is no source namespace transition to journal. This seam
+/// verifies every materializable repository member twice through no-follow
+/// capabilities—including byte-exact Unix paths—then commits the repository
+/// transaction while the same projection lock and root capability remain
+/// held. Graph-only Gitlinks stay in the complete tree but never acquire fake
+/// local blob bodies.
+pub fn verify_unchanged_source_tree_and_commit_repository_transaction<'a>(
+    root: &Path,
+    tree: &ResolvedTree,
+    entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    transaction: RepositoryTransaction,
+) -> Result<(usize, RepositoryCommitReceipt)> {
+    let entries = validated_projection_proof_entries(entries)?;
+    validate_repository_projection_transaction(tree, tree, &entries, &entries, &transaction)?;
+
+    #[cfg(any(unix, windows))]
+    {
+        let freeze = ExactProjectionFreeze::acquire_existing(root)?;
+        let entry_refs = entries.iter().collect::<Vec<_>>();
+        let identities = freeze
+            .projection
+            .validate_frozen_entries_unchanged(&entry_refs)?;
+        freeze
+            .projection
+            .revalidate_frozen_entries_unchanged(&entry_refs, &identities)?;
+        freeze.revalidate_namespace()?;
+        let receipt = commit_repository_transaction_exact(authority, transaction)?;
+        Ok((entries.len(), receipt))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (root, authority, transaction);
+        Err(unsupported_safe_projection_error())
+    }
 }
 
 fn validate_repository_projection_transaction(
@@ -306,9 +351,145 @@ fn validate_repository_projection_transaction(
             mutation.new_tree_hash, target_tree_hash
         )));
     }
-    validate_projection_entries_match_tree("previous", previous_tree, previous_entries)?;
-    validate_projection_entries_match_tree("target", target_tree, entries)?;
+    validate_unchanged_graph_only_entries(previous_tree, target_tree)?;
+    validate_repository_projection_entries_match_tree("previous", previous_tree, previous_entries)?;
+    validate_repository_projection_entries_match_tree("target", target_tree, entries)?;
     Ok(())
+}
+
+/// Require graph-only repository members to remain byte-for-byte repository
+/// identity across a source-projection transaction.
+///
+/// Gitlinks are exact repository tree entries, but they are not source blobs
+/// owned by this repository and may have an independently managed derived
+/// checkout at their path. Moving, adding, removing, or retargeting one needs a
+/// dedicated subrepository transaction; an ordinary source projection must
+/// never infer that transition from ambient directory contents.
+fn validate_unchanged_graph_only_entries(
+    previous_tree: &ResolvedTree,
+    target_tree: &ResolvedTree,
+) -> Result<()> {
+    let graph_only = |tree: &ResolvedTree| -> Result<Vec<_>> {
+        tree.artifacts_by_path()
+            .filter_map(|artifact| {
+                match source_projection_disposition(&artifact.path, artifact.entry) {
+                    Ok(SourceProjectionDisposition::Materialized) => None,
+                    Ok(_) => Some(Ok((
+                        artifact.artifact_id,
+                        artifact.path.clone(),
+                        artifact.entry,
+                    ))),
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect()
+    };
+    if graph_only(previous_tree)? != graph_only(target_tree)? {
+        return Err(KinError::Other(
+            "exact-source repository projection cannot mutate graph-only repository members; use \
+             a dedicated graph-native operation"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Bind the materializable source bodies to the complete repository tree
+/// without pretending graph-only entries have local blob bodies.
+///
+/// The caller separately proves that the complete previous tree transitions
+/// to the complete target tree and that every graph-only member is unchanged.
+/// This comparison therefore must cover exactly every blob and symlink, while
+/// excluding exactly the typed Gitlink set—never an arbitrary unsupported
+/// path.
+fn validate_repository_projection_entries_match_tree(
+    label: &str,
+    tree: &ResolvedTree,
+    entries: &[ValidatedSourceEntry<'_>],
+) -> Result<()> {
+    let mut expected = Vec::new();
+    for artifact in tree.artifacts() {
+        if source_projection_disposition(&artifact.path, artifact.entry)?
+            == SourceProjectionDisposition::Materialized
+        {
+            expected.push((&artifact.path, artifact.entry));
+        }
+    }
+    expected.sort_by(|left, right| left.0.cmp(right.0));
+    if expected.len() != entries.len()
+        || expected
+            .iter()
+            .zip(entries)
+            .any(|((path, kind), entry)| *path != entry.file_id || *kind != entry.kind)
+    {
+        return Err(KinError::Other(format!(
+            "{label} exact-source bodies do not cover every materializable member of the complete graph tree"
+        )));
+    }
+    for entry in entries {
+        let expected_hash = entry.kind.blob_identity().ok_or_else(|| {
+            KinError::Other(format!(
+                "{label} exact-source body list contains a graph-only repository member {}",
+                entry.file_id
+            ))
+        })?;
+        let actual_hash = kin_blobs::digest(entry.content);
+        if actual_hash != expected_hash {
+            return Err(KinError::Other(format!(
+                "{label} source body for {} hashes to {}, expected repository CAS object {}",
+                entry.file_id, actual_hash, expected_hash
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// How one exact repository entry maps onto the current host projection.
+///
+/// This is deliberately separate from repository membership. Every entry
+/// remains in [`ResolvedTree`] regardless of whether this host can expose it
+/// as a local source object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceProjectionDisposition {
+    /// A repository-owned blob or symbolic link that this host can represent.
+    Materialized,
+    /// A Gitlink is exact repository history whose optional nested checkout is
+    /// independently owned, never a blob in this repository's source CAS.
+    GraphOnlyGitlink,
+    /// The repository path or entry kind cannot be represented faithfully on
+    /// this host (for example a non-UTF-8 Git path on macOS).
+    GraphOnlyHostUnrepresentable,
+}
+
+/// Classify one repository member without consulting ambient filesystem state.
+///
+/// Invalid/reserved control-plane paths still fail loud. Host limitations only
+/// affect projection; they never erase exact graph membership.
+pub fn source_projection_disposition(
+    path: &RepoPath,
+    entry: TreeEntry,
+) -> Result<SourceProjectionDisposition> {
+    if matches!(entry, TreeEntry::Gitlink { .. }) {
+        return Ok(SourceProjectionDisposition::GraphOnlyGitlink);
+    }
+    #[cfg(windows)]
+    if matches!(entry, TreeEntry::Symlink { .. }) {
+        return Ok(SourceProjectionDisposition::GraphOnlyHostUnrepresentable);
+    }
+    if let Some(path) = path.as_utf8() {
+        validate_source_path(path)?;
+        return Ok(SourceProjectionDisposition::Materialized);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        validate_projection_proof_path(path)?;
+        Ok(SourceProjectionDisposition::Materialized)
+    }
+    #[cfg(any(target_os = "macos", windows, not(any(unix, windows))))]
+    {
+        Ok(SourceProjectionDisposition::GraphOnlyHostUnrepresentable)
+    }
 }
 
 fn validate_projection_entries_match_tree(
@@ -9521,6 +9702,62 @@ mod tests {
                 .to_string()
                 .contains("repository history, not a repository-owned source blob"),
             "unexpected gitlink projection error: {error}"
+        );
+    }
+
+    #[test]
+    fn repository_projection_covers_materializable_entries_and_preserves_gitlinks() {
+        let source_path = repo_path("compose.yaml");
+        let source_body = b"services: {}\n";
+        let source_entry = exact_blob(source_body, false);
+        let gitlink_path = repo_path("vendor/runtime");
+        let gitlink_entry = TreeEntry::gitlink(GitObjectId::sha1([0x44; 20]));
+        let source_artifact =
+            ResolvedArtifact::new(ArtifactId::new(), source_path.clone(), source_entry);
+        let gitlink_artifact =
+            ResolvedArtifact::new(ArtifactId::new(), gitlink_path, gitlink_entry);
+        let tree = ResolvedTree::from_artifacts([source_artifact, gitlink_artifact]).unwrap();
+        let entries =
+            validated_source_entries([(&source_path, source_entry, source_body.as_slice())])
+                .unwrap();
+
+        validate_unchanged_graph_only_entries(&tree, &tree).unwrap();
+        validate_repository_projection_entries_match_tree("target", &tree, &entries).unwrap();
+    }
+
+    #[test]
+    fn repository_projection_rejects_gitlink_transition_before_namespace_mutation() {
+        let path = repo_path("vendor/runtime");
+        let artifact_id = ArtifactId::new();
+        let previous = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+            artifact_id,
+            path.clone(),
+            TreeEntry::gitlink(GitObjectId::sha1([0x44; 20])),
+        )])
+        .unwrap();
+        let target = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+            artifact_id,
+            path,
+            TreeEntry::gitlink(GitObjectId::sha1([0x55; 20])),
+        )])
+        .unwrap();
+
+        let error = validate_unchanged_graph_only_entries(&previous, &target).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("dedicated graph-native operation"),
+            "unexpected graph-only transition error: {error}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn non_utf8_repository_path_is_graph_only_when_macos_cannot_materialize_it() {
+        let path = RepoPath::from_bytes(b"assets/icon-\xff.bin".to_vec()).unwrap();
+        assert_eq!(
+            source_projection_disposition(&path, regular()).unwrap(),
+            SourceProjectionDisposition::GraphOnlyHostUnrepresentable
         );
     }
 

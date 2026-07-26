@@ -270,19 +270,23 @@ fn host_entry_matches_graph(
     Ok(observed == expected)
 }
 
-fn is_within_graph_only_member(state: &DaemonState, path: &RepoPath) -> bool {
-    state
-        .graph
-        .resolved_tree()
-        .artifacts_by_path()
-        .any(|artifact| {
-            matches!(artifact.entry, TreeEntry::Gitlink { .. })
-                && (path == &artifact.path
-                    || path
-                        .as_bytes()
-                        .strip_prefix(artifact.path.as_bytes())
-                        .is_some_and(|suffix| suffix.starts_with(b"/")))
-        })
+fn is_within_graph_only_member(state: &DaemonState, path: &RepoPath) -> Result<bool> {
+    for artifact in state.graph.resolved_tree().artifacts_by_path() {
+        if kin_core::source_projection_disposition(&artifact.path, artifact.entry)?
+            == kin_core::SourceProjectionDisposition::Materialized
+        {
+            continue;
+        }
+        if path == &artifact.path
+            || path
+                .as_bytes()
+                .strip_prefix(artifact.path.as_bytes())
+                .is_some_and(|suffix| suffix.starts_with(b"/"))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn publish_exact_workspace_tree(
@@ -325,11 +329,14 @@ fn exact_tree_admission(state: &DaemonState) -> Result<ExactTreeAdmission> {
         .artifacts_by_path()
         .map(|artifact| artifact.path.clone())
         .collect::<Vec<_>>();
-    let graph_only_paths = previous
-        .artifacts_by_path()
-        .filter(|artifact| matches!(artifact.entry, TreeEntry::Gitlink { .. }))
-        .map(|artifact| artifact.path.clone())
-        .collect::<Vec<_>>();
+    let mut graph_only_paths = Vec::new();
+    for artifact in previous.artifacts_by_path() {
+        if kin_core::source_projection_disposition(&artifact.path, artifact.entry)?
+            != kin_core::SourceProjectionDisposition::Materialized
+        {
+            graph_only_paths.push(artifact.path.clone());
+        }
+    }
     let ignore =
         kin_index::RepositoryIgnore::load(working_dir).map_err(kin_index::IndexError::from)?;
     let scan = kin_index::scan_repository_preserving_graph_only(
@@ -472,10 +479,10 @@ fn admit_file_event_with_exact_tree(
     let Some(repo_path) = repo_path(path, working_dir)? else {
         return Ok(AdmittedFileEvent::Ignored);
     };
-    if is_within_graph_only_member(state, &repo_path) {
+    if is_within_graph_only_member(state, &repo_path)? {
         debug!(
             path = %repo_path,
-            "ignoring host event beneath graph-owned Gitlink"
+            "ignoring host event beneath graph-only repository member"
         );
         return Ok(AdmittedFileEvent::Ignored);
     }

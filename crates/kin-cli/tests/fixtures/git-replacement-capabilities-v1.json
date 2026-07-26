@@ -36,8 +36,8 @@
     },
     {
       "command": "commit",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "repository-v6 transaction and compare-and-swap ref publication",
       "required_for_bounded_dogfood": true,
       "acceptance_spec": [
@@ -45,8 +45,14 @@
         "preserve all unsupported-language and non-code artifacts, modes, symlinks, gitlinks, and byte-exact paths",
         "publish the target ref with generation and root-bundle compare-and-swap and no raw-filesystem rebuild"
       ],
-      "evidence_tests": [],
-      "note": "The daemon commit endpoint still reconciles from raw files and mutates legacy graph branches."
+      "evidence_tests": [
+        "kin_daemon::repository_commit::tests::native_commit_atomically_projects_exact_non_code_tree_and_ref",
+        "kin_daemon::repository_commit::tests::native_commit_preserves_host_unrepresentable_byte_exact_path",
+        "kin_daemon::api::tests::command_commit_preserves_complete_arbitrary_repository_tree",
+        "kin_core::tree::tests::repository_projection_covers_materializable_entries_and_preserves_gitlinks",
+        "kin_core::tree::tests::repository_projection_rejects_gitlink_transition_before_namespace_mutation"
+      ],
+      "note": "The daemon serializes explicit filesystem admission, complete graph-owned artifact coverage, exact projection verification, semantic change creation, workspace base, and ref publication through repository-v6 authority."
     },
     {
       "command": "log",
