@@ -122,7 +122,6 @@ impl ActiveRepositoryAuthority {
             .save_source_blob(digest, data)
             .with_context(|| format!("save immutable repository source blob {digest}"))
     }
-
 }
 
 fn resolve_target_in_authority(

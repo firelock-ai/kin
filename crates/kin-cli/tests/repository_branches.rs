@@ -160,7 +160,6 @@ fn add_exact_refs(layout: &kin_core::KinLayout) {
         default_ref_mutation: None,
         workspace_mutation: None,
         local_overlay_delta: None,
-        admission_scan_token: None,
     };
     let receipt = manager
         .commit_repository_transaction(transaction)
@@ -196,7 +195,6 @@ fn exact_ref_create_transaction(
         default_ref_mutation: None,
         workspace_mutation: None,
         local_overlay_delta: None,
-        admission_scan_token: None,
     }
 }
 
