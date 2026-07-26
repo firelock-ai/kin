@@ -93,7 +93,7 @@ fn fresh_native_init_json_reports_exact_unborn_authority() {
 
     let payload: Value =
         serde_json::from_slice(&output.stdout).expect("native init stdout should be JSON");
-    assert_eq!(payload["schema"], "kin.init-result.v3");
+    assert_eq!(payload["schema"], "kin.init-result.v4");
     assert_eq!(payload["authority"], "repository-v6");
     assert_eq!(payload["source_boundary"], "native-unborn");
     assert_eq!(payload["history"], "unborn");
@@ -122,7 +122,7 @@ fn fresh_git_init_json_reports_exact_reachable_authority() {
 
     let payload: Value =
         serde_json::from_slice(&output.stdout).expect("Git init stdout should be JSON");
-    assert_eq!(payload["schema"], "kin.init-result.v3");
+    assert_eq!(payload["schema"], "kin.init-result.v4");
     assert_eq!(payload["authority"], "repository-v6");
     assert_eq!(payload["source_boundary"], "git-exact-reachable-history");
     assert_eq!(payload["history"], "exact-reachable");
@@ -136,7 +136,7 @@ fn fresh_git_init_json_reports_exact_reachable_authority() {
 }
 
 #[test]
-fn git_remote_mapping_fails_closed_without_publishing() {
+fn exact_git_remote_mapping_is_sealed_during_admission() {
     let root = tempdir().expect("temp root");
     let home = root.path().join("home");
     let repo = root.path().join("remote-backed");
@@ -153,13 +153,18 @@ fn git_remote_mapping_fails_closed_without_publishing() {
     );
 
     let output = kin_init(&repo, &home, &[]);
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("exact Kin remote mapping is required"),
-        "{stderr}"
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!repo.join(".kin").exists());
+    let config = fs::read_to_string(repo.join(".kin/config.toml")).expect("read Kin config");
+    assert!(config.contains("name = \"origin\""), "{config}");
+    assert!(
+        config.contains("https://example.invalid/acme/repository.git"),
+        "{config}"
+    );
 }
 
 #[test]
