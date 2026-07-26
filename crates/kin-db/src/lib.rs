@@ -39,6 +39,10 @@ pub use storage::{
     SnapshotAuthority, SnapshotRecoveryState, StorageBackend, GENERATION_INIT,
     MAX_SOURCE_BLOB_BYTES,
 };
+pub use storage::{
+    AuthorityCommitDecision, AuthorityPublication, AuthorityReadLease, DurableAuthorityPersistence,
+    VersionedAuthorityState,
+};
 pub use storage::{LoadStrategy, SystemMemInfo, TieredConfig, TieredGraph};
 pub use store::{
     ChangeStore, EntityStore, GraphStore, ProvenanceStore, SessionStore, VerificationStore,

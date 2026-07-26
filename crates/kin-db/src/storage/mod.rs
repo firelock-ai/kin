@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+pub mod authority;
 pub mod backend;
 pub(crate) mod change_validation;
 pub mod delta;
@@ -16,6 +17,10 @@ mod snapshot;
 pub mod sql;
 pub mod tiered;
 
+pub use authority::{
+    AuthorityCommitDecision, AuthorityPublication, AuthorityReadLease, DurableAuthorityPersistence,
+    VersionedAuthorityState,
+};
 pub use backend::{
     load_recovered_snapshot, Generation, LocalFileBackend, PersistedDelta, RecoveredSnapshot,
     SnapshotAuthority, SnapshotRecoveryState, StorageBackend, GENERATION_INIT,
