@@ -1029,11 +1029,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        AdmissionPolicyStamp, AdmissionRuleSource, AdmissionRuleSourceKind, ArtifactId,
-        ExternalObjectId, FrozenLocalOverlay, GitExternalAuthority, GitObjectBodyLoader,
-        GitObjectFormat, GitRawRef, GitRawTarget, LocalOverlayHash, LocalOverlayStamp,
-        LocatedEntry, RefExpectation, RefUpdatePolicy, RepoPath, SharedAdmissionPolicy, TreeEntry,
-        ADMISSION_POLICY_SEMANTICS_VERSION,
+        AdmissionCase, AdmissionPolicyStamp, AdmissionRuleSource, AdmissionRuleSourceKind,
+        ArtifactId, ExternalObjectId, FrozenLocalOverlay, GitExternalAuthority,
+        GitObjectBodyLoader, GitObjectFormat, GitRawRef, GitRawTarget, LocalOverlayHash,
+        LocalOverlayStamp, LocatedEntry, RefExpectation, RefUpdatePolicy, RepoPath,
+        SharedAdmissionPolicy, TreeEntry, ADMISSION_POLICY_SEMANTICS_VERSION,
     };
     use uuid::Uuid;
 
@@ -1159,7 +1159,8 @@ mod tests {
         FrozenLocalOverlayDelta,
     ) {
         let shared = SharedAdmissionPolicy::empty(0);
-        let local = FrozenLocalOverlay::new(workspace_id, 0, Vec::new()).unwrap();
+        let local =
+            FrozenLocalOverlay::new(workspace_id, 0, AdmissionCase::Sensitive, Vec::new()).unwrap();
         (
             shared.clone(),
             EffectiveAdmissionPolicyStamp {

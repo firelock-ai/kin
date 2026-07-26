@@ -12,7 +12,7 @@ use crate::{
     AuthorId, Hash256, ModelError, RepoPath, RepositoryId, Result, WorkspaceHead, WorkspaceId,
 };
 
-pub const ADMISSION_POLICY_SEMANTICS_VERSION: u32 = 1;
+pub const ADMISSION_POLICY_SEMANTICS_VERSION: u32 = 2;
 
 /// Content identity of a resolved shared admission policy.
 #[derive(
@@ -298,6 +298,19 @@ pub enum LocalAdmissionRuleSourceKind {
     KinLocal,
 }
 
+/// Filesystem case behavior frozen into one local admission overlay.
+///
+/// This is authority, not a host hint: the exact same policy bytes produce
+/// different answers under case-sensitive and ASCII-folded matching. Persisting
+/// the behavior in the overlay identity keeps reopen, replication-local
+/// workspace state, and later scans on the same matcher semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionCase {
+    Sensitive,
+    FoldAscii,
+}
+
 /// One captured local-only gitwildmatch source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -314,12 +327,14 @@ pub struct LocalAdmissionRuleSource {
 pub struct FrozenLocalOverlay {
     pub workspace_id: WorkspaceId,
     pub generation: u64,
+    pub case: AdmissionCase,
     pub sources: Vec<LocalAdmissionRuleSource>,
     pub hash: LocalOverlayHash,
 }
 
 #[derive(Serialize)]
 struct LocalOverlayIdentity<'a> {
+    case: AdmissionCase,
     sources: &'a [LocalAdmissionRuleSource],
 }
 
@@ -327,16 +342,21 @@ impl FrozenLocalOverlay {
     pub fn new(
         workspace_id: WorkspaceId,
         generation: u64,
+        case: AdmissionCase,
         mut sources: Vec<LocalAdmissionRuleSource>,
     ) -> Result<Self> {
         sources.sort_by_key(|source| source.precedence);
         let hash = LocalOverlayHash(hash_json(
-            b"kin-local-admission-overlay-v1\0",
-            &LocalOverlayIdentity { sources: &sources },
+            b"kin-local-admission-overlay-v2\0",
+            &LocalOverlayIdentity {
+                case,
+                sources: &sources,
+            },
         )?);
         let overlay = Self {
             workspace_id,
             generation,
+            case,
             sources,
             hash,
         };
@@ -359,8 +379,9 @@ impl FrozenLocalOverlay {
             }
         }
         let computed = LocalOverlayHash(hash_json(
-            b"kin-local-admission-overlay-v1\0",
+            b"kin-local-admission-overlay-v2\0",
             &LocalOverlayIdentity {
+                case: self.case,
                 sources: &self.sources,
             },
         )?);
@@ -622,10 +643,12 @@ mod tests {
     #[test]
     fn frozen_local_overlay_refresh_is_explicit_and_self_inverting() {
         let workspace_id = WorkspaceId::new();
-        let old = FrozenLocalOverlay::new(workspace_id, 0, Vec::new()).unwrap();
+        let old =
+            FrozenLocalOverlay::new(workspace_id, 0, AdmissionCase::Sensitive, Vec::new()).unwrap();
         let new = FrozenLocalOverlay::new(
             workspace_id,
             1,
+            AdmissionCase::Sensitive,
             vec![LocalAdmissionRuleSource {
                 kind: LocalAdmissionRuleSourceKind::KinLocal,
                 body_hash: Hash256::from_bytes([0x41; 32]),
@@ -641,5 +664,19 @@ mod tests {
         assert_eq!(inverse.old, Some(new));
         assert_eq!(inverse.new, Some(old));
         assert_eq!(inverse.inverse(), delta);
+    }
+
+    #[test]
+    fn frozen_local_overlay_identity_binds_case_behavior() {
+        let workspace_id = WorkspaceId::new();
+        let sensitive =
+            FrozenLocalOverlay::new(workspace_id, 0, AdmissionCase::Sensitive, Vec::new()).unwrap();
+        let folded =
+            FrozenLocalOverlay::new(workspace_id, 0, AdmissionCase::FoldAscii, Vec::new()).unwrap();
+
+        assert_ne!(sensitive.hash, folded.hash);
+        assert_ne!(sensitive.stamp(), folded.stamp());
+        sensitive.validate().unwrap();
+        folded.validate().unwrap();
     }
 }
