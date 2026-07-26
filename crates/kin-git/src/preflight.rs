@@ -45,6 +45,8 @@ pub struct GitMigrationPreflightProof {
     pub source_worktree: PathBuf,
     pub source_git_dir: PathBuf,
     pub object_format: GitObjectFormat,
+    /// Material workspace HEAD from the semantic seed. The lossless snapshot
+    /// fingerprint separately binds exact raw Git HEAD identity.
     pub head: WorkspaceHead,
     pub refs: RepositoryRefState,
     pub base_target: Option<RefTarget>,
@@ -388,7 +390,7 @@ fn observe(
         source_worktree,
         source_git_dir,
         object_format: snapshot.object_format,
-        head: snapshot.head.clone(),
+        head: plan.workspace_seed.head.clone(),
         refs: snapshot.refs.clone(),
         base_target: plan.workspace_seed.base_target.clone(),
         base_commit_oid: plan.workspace_seed.base_commit_oid,
