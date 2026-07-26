@@ -34,7 +34,6 @@ pub mod graph_health;
 pub mod graph_viz;
 pub mod health;
 pub mod history;
-pub(crate) mod hydration_depth;
 pub mod impact;
 pub mod import;
 pub mod init;
