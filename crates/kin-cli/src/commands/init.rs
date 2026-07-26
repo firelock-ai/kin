@@ -12,7 +12,7 @@ use kin_model::{
     GraphNodeId, Hash256, LocatedEntry, OpaqueArtifact, ParseCompleteness, Relation, RelationDelta,
     RelationId, RelationKind, RelationOrigin, RepoPath, ResolvedTree, SemanticChange,
     SemanticChangeId, ShallowTrackedFile, SourceRegion, StructuredArtifact, TestCase, TestId,
-    TestKind, TestRunner, Timestamp, TreeDelta, TreeEntry, TreeEntryKind, WorkScope,
+    TestKind, TestRunner, Timestamp, TransactionDelta, TreeDelta, TreeEntry, WorkScope,
 };
 use kin_projection::build_layout;
 use rayon::prelude::*;
@@ -21,7 +21,6 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -37,6 +36,11 @@ use history_checkpoint::{
 /// found, init refuses to grind unless the caller explicitly opts in (`--force`)
 /// or raises the limit via `KIN_INIT_MAX_FILES`.
 const INIT_MAX_DISCOVERED_FILES: usize = 100_000;
+
+/// Invalidates prepared graph state whenever the canonical graph-build
+/// pipeline changes in a way that can alter persisted semantic truth.
+pub(crate) const GRAPH_BUILD_PIPELINE_EPOCH: &str =
+    "graph-build-2026-07-26-exact-tree-semantic-history-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ResourcePoolConfig {
@@ -103,45 +107,16 @@ fn init_max_discovered_files() -> usize {
         .unwrap_or(INIT_MAX_DISCOVERED_FILES)
 }
 
-const INIT_WARM_CACHE_SCHEMA_VERSION: &str = "v1";
-pub(crate) const INIT_WARM_CACHE_PIPELINE_EPOCH: &str =
-    "init-warm-2026-06-15-stable-delta-entity-ids";
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct WarmCacheBundleManifestEntry {
-    graph_root_hash: String,
-    entity_count: usize,
-    relation_count: usize,
-    indexed_files: usize,
-    published_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct WarmCacheRepoManifest {
-    schema: String,
-    pipeline_epoch: String,
-    repo_identity: String,
-    #[serde(default)]
-    git_head: Option<String>,
-    #[serde(default)]
-    current_bundle_id: Option<String>,
-    #[serde(default)]
-    heads: BTreeMap<String, String>,
-    #[serde(default)]
-    bundles: BTreeMap<String, WarmCacheBundleManifestEntry>,
-}
-
 #[derive(Debug, Clone)]
 struct IndexableFile {
-    abs_path: PathBuf,
     rel_path: String,
     hash: [u8; 32],
     classification: FileClassification,
+    content: Arc<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
 struct ExactInitSourceEntry {
-    abs_path: PathBuf,
     repo_path: RepoPath,
     hash: [u8; 32],
     entry: TreeEntry,
@@ -152,18 +127,6 @@ struct InitIndexSummary {
     total_entity_count: usize,
     total_files: usize,
     linked_relations: usize,
-    warm_cache_hit: bool,
-    warm_text_index_reused: bool,
-    warm_vector_index_reused: bool,
-    warm_requeued_embeddings: usize,
-    warm_changed_files: usize,
-    warm_reparsed_files: usize,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct WarmEmbeddingRestoreStatus {
-    vector_index_reused: bool,
-    requeued_embeddings: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -179,48 +142,33 @@ struct InitResultPayload {
     summary: InitIndexSummary,
 }
 
-#[derive(Debug, Clone, Default)]
-struct WarmCacheDeltaResult {
-    reparsed_files: usize,
-    queued_embeddings: Vec<EntityId>,
-    queued_artifacts: Vec<ArtifactId>,
-}
-
-/// Take an independent snapshot of the working tree before `kin init` mutates
-/// it. Regular files are copied rather than hardlinked; symbolic links are
-/// recreated with their exact target bytes.
-/// Take snapshot BEFORE kin init creates `.kin/`.
+/// Read one explicit native-filesystem admission boundary and persist every
+/// admitted byte sequence in Kin's content-addressed object authority.
 ///
-/// The staging directory is unique and lives beside the repository whenever
-/// possible. No fixed in-repository name is reserved or deleted: a user path
-/// such as `.kin-snapshot-tmp` is ordinary repository truth.
-///
-/// Returns `(snapshot_path, manifest_json)`.  The manifest is NOT written to
-/// disk here — the caller must write it *after* `collect_source_files` has
-/// finished so that `manifest.json` never appears in `file_hashes`.
-fn snapshot_repo(dir: &Path, force: bool) -> Result<(PathBuf, serde_json::Value)> {
+/// This is ingestion, not a second repository copy. No `.kin/snapshot` tree or
+/// manifest is created. After this function returns, parsing reads only the
+/// persisted blobs named by graph-owned exact tree entries.
+fn collect_native_boundary_entries(
+    dir: &Path,
+    graph: &kin_db::InMemoryGraph,
+    blob_store: &kin_blobs::BlobStore,
+    force: bool,
+) -> Result<Vec<ExactInitSourceEntry>> {
     let _span = tracing::info_span!(
-        "kin.init.snapshot_repo",
+        "kin.init.collect_native_boundary_entries",
         root = %dir.display()
     )
     .entered();
-    let (tracked_paths, graph_only_paths) = if let Some(layout) = kin_core::KinLayout::discover(dir)
-    {
-        let snapshot = crate::backend::open_kindb_snapshot_read_only(&layout)
-            .context("open existing graph truth before warm init snapshot")?;
-        let tree = snapshot.graph().resolved_tree();
-        (
-            tree.artifacts_by_path()
-                .map(|artifact| artifact.path.clone())
-                .collect::<Vec<_>>(),
-            tree.artifacts_by_path()
-                .filter(|artifact| matches!(artifact.entry, TreeEntry::Gitlink { .. }))
-                .map(|artifact| artifact.path.clone())
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        (Vec::new(), Vec::new())
-    };
+    let current_tree = graph.resolved_tree();
+    let tracked_paths = current_tree
+        .artifacts_by_path()
+        .map(|artifact| artifact.path.clone())
+        .collect::<Vec<_>>();
+    let graph_only_paths = current_tree
+        .artifacts_by_path()
+        .filter(|artifact| matches!(artifact.entry, TreeEntry::Gitlink { .. }))
+        .map(|artifact| artifact.path.clone())
+        .collect::<Vec<_>>();
     let ignore = kin_index::RepositoryIgnore::load(dir)?;
     let scan = kin_index::scan_repository_preserving_graph_only(
         dir,
@@ -246,119 +194,40 @@ fn snapshot_repo(dir: &Path, force: bool) -> Result<(PathBuf, serde_json::Value)
         );
     }
 
-    let staging_parent = dir
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(dir);
-    let tmp_snapshot = tempfile::Builder::new()
-        .prefix(".kin-init-snapshot-")
-        .tempdir_in(staging_parent)
-        .with_context(|| {
-            format!(
-                "create exact init snapshot staging directory beside {}",
-                dir.display()
-            )
-        })?
-        .keep();
-    let snapshot_dir = &tmp_snapshot;
-
-    if let Err(err) = snapshot_complete_scan(dir, snapshot_dir, &scan) {
-        let _ = fs::remove_dir_all(&tmp_snapshot);
-        return Err(err);
-    }
-    let file_count = scan.len() as u64;
-    let total_bytes = scan.diagnostics().content_bytes_read;
-
-    // Try to capture git HEAD for the manifest.
-    let git_head = read_git_head(dir);
-
-    let manifest = serde_json::json!({
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        "file_count": file_count,
-        "total_bytes": total_bytes,
-        "git_head": git_head,
-    });
-    Ok((tmp_snapshot, manifest))
-}
-
-/// Write the snapshot manifest to disk.  Called after `collect_source_files` so
-/// that `manifest.json` is never walked as a repo source file.
-fn write_snapshot_manifest(snapshot_dir: &Path, manifest: &serde_json::Value) -> Result<()> {
-    fs::write(
-        snapshot_dir.join("manifest.json"),
-        serde_json::to_string_pretty(manifest)?,
-    )?;
-    Ok(())
-}
-
-fn snapshot_complete_scan(
-    root: &Path,
-    snapshot_dir: &Path,
-    scan: &kin_index::CompleteRepositoryScan,
-) -> Result<()> {
+    let mut entries = Vec::with_capacity(scan.len());
     for entry in scan.entries() {
-        let rel = entry.host_path.strip_prefix(root).with_context(|| {
-            format!(
-                "scanned path {} escaped repository root {}",
-                entry.host_path.display(),
-                root.display()
-            )
-        })?;
-        let dest = snapshot_dir.join(rel);
         let verified_bytes = kin_index::read_verified_scanned_entry(entry).with_context(|| {
             format!(
-                "re-read exact repository entry while snapshotting {}",
+                "re-read exact repository entry while admitting {}",
                 entry.repo_path
             )
         })?;
-        match entry.kind {
-            kin_index::ScannedEntryKind::Regular { executable } => {
-                if let Some(parent) = dest.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(&dest, &verified_bytes)
-                    .with_context(|| format!("snapshot repository file {}", entry.repo_path))?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    fs::set_permissions(
-                        &dest,
-                        fs::Permissions::from_mode(if executable { 0o755 } else { 0o644 }),
-                    )?;
-                }
-            }
-            kin_index::ScannedEntryKind::Symlink => {
-                #[cfg(not(unix))]
-                anyhow::bail!(
-                    "kin init cannot preserve symbolic link {} on this platform",
-                    rel.display()
-                );
-                #[cfg(unix)]
-                {
-                    let dest = snapshot_dir.join(rel);
-                    if let Some(parent) = dest.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    use std::os::unix::ffi::OsStringExt;
-                    let target = PathBuf::from(std::ffi::OsString::from_vec(verified_bytes));
-                    std::os::unix::fs::symlink(&target, &dest)?;
-                }
-            }
-        }
-
-        let (snapshot_bytes, snapshot_kind) = read_exact_init_source(&dest)?;
-        let snapshot_hash = kin_blobs::digest_bytes(&snapshot_bytes);
-        let snapshot_entry = exact_tree_entry(snapshot_hash, snapshot_kind);
+        let observed_hash = kin_blobs::digest_bytes(&verified_bytes);
+        let observed_entry = exact_tree_entry(observed_hash, entry.kind);
         let expected_entry = exact_tree_entry(entry.content_hash, entry.kind);
-        if snapshot_hash != entry.content_hash || snapshot_entry != expected_entry {
+        if observed_hash != entry.content_hash || observed_entry != expected_entry {
             anyhow::bail!(
-                "repository entry changed while taking the init snapshot: {}",
+                "repository entry changed while admitting graph truth: {}",
                 entry.repo_path
             );
         }
+        let stored = blob_store
+            .write(&verified_bytes)
+            .with_context(|| format!("store exact init source {}", entry.repo_path))?;
+        if stored.0 != entry.content_hash {
+            anyhow::bail!(
+                "blob authority returned the wrong identity while admitting {}",
+                entry.repo_path
+            );
+        }
+        entries.push(ExactInitSourceEntry {
+            repo_path: entry.repo_path.clone(),
+            hash: entry.content_hash,
+            entry: expected_entry,
+        });
     }
 
-    Ok(())
+    Ok(entries)
 }
 
 fn read_git_head(dir: &Path) -> Option<String> {
@@ -421,88 +290,6 @@ fn print_fresh_native_next_steps(layout: &kin_core::KinLayout, agent_doc_changed
     println!("  Git escape hatch: kin git export --output <path>");
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeterministicChangeProvenance {
-    /// `kin init: auto-parse` regenerates these machine-local fields on retry.
-    Regenerated,
-    /// Imported Git provenance is part of the immutable source record.
-    Stable,
-}
-
-/// Whether two records with the same deterministic change id carry the same
-/// authoritative payload. Only the auto-parse retry path may ignore its
-/// regenerated wall-clock provenance. Imported Git author/timestamp fields are
-/// stable source truth and a same-id mismatch must be refused.
-fn deterministic_change_payload_matches(
-    left: &SemanticChange,
-    right: &SemanticChange,
-    provenance: DeterministicChangeProvenance,
-) -> bool {
-    fn graph_payload(change: &SemanticChange) -> Option<serde_json::Value> {
-        let mut value = serde_json::to_value(change).ok()?;
-        let object = value.as_object_mut()?;
-        object.remove("timestamp");
-        object.remove("author");
-        Some(value)
-    }
-
-    fn normalized_auto_parse_entities(change: &SemanticChange) -> Option<Vec<serde_json::Value>> {
-        if change.message != "kin init: auto-parse" {
-            return None;
-        }
-        let mut entities = change
-            .entity_deltas
-            .iter()
-            .map(|delta| match delta {
-                EntityDelta::Added(entity) => Some(entity),
-                EntityDelta::Modified { .. } | EntityDelta::Removed(_) => None,
-            })
-            .collect::<Option<Vec<_>>>()?;
-        entities.sort_by_key(|entity| entity.id);
-        if entities.windows(2).any(|pair| pair[0].id == pair[1].id) {
-            return None;
-        }
-        entities
-            .into_iter()
-            .map(serde_json::to_value)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .ok()
-    }
-
-    fn auto_parse_payload_without_entities(change: &SemanticChange) -> Option<serde_json::Value> {
-        let mut value = graph_payload(change)?;
-        *value.as_object_mut()?.get_mut("entity_deltas")? = serde_json::Value::Array(Vec::new());
-        Some(value)
-    }
-
-    match provenance {
-        DeterministicChangeProvenance::Regenerated => {
-            match (graph_payload(left), graph_payload(right)) {
-                (Some(left_payload), Some(right_payload)) => {
-                    left_payload == right_payload
-                        || matches!(
-                            (
-                                auto_parse_payload_without_entities(left),
-                                auto_parse_payload_without_entities(right),
-                                normalized_auto_parse_entities(left),
-                                normalized_auto_parse_entities(right),
-                            ),
-                            (Some(left_rest), Some(right_rest), Some(left_entities), Some(right_entities))
-                                if left_rest == right_rest && left_entities == right_entities
-                        )
-                }
-                _ => false,
-            }
-        }
-        DeterministicChangeProvenance::Stable => {
-            match (serde_json::to_value(left), serde_json::to_value(right)) {
-                (Ok(left), Ok(right)) => left == right,
-                _ => false,
-            }
-        }
-    }
-}
-
 pub async fn run(
     path: Option<String>,
     json: bool,
@@ -530,6 +317,11 @@ pub async fn run(
              hint: use `kin migrate` later for full Git history import."
         );
     }
+    let git_import_options = if is_git_repo {
+        git_history_import_options(&git_history)?
+    } else {
+        None
+    };
 
     // Phase timing: emit wall-clock timers for each init phase to stderr.
     let phase_timer = std::time::Instant::now();
@@ -543,27 +335,21 @@ pub async fn run(
         };
     }
 
-    // Snapshot the working tree once and reuse that frozen view for indexing.
-    let (tmp_snapshot, snapshot_manifest) = snapshot_repo(&dir, force)?;
-    phase!("snapshot_repo");
-
-    let is_warm = kin_dir.exists();
+    let is_initialized = kin_dir.exists();
     // Full Git history has one repository-invariant, non-colliding boundary
     // root: Kin's canonical genesis. It must never be replaced with the current
-    // branch head on a warm init. Snapshot mode also attaches its standalone
+    // branch head on a repeated init. Snapshot mode also attaches its standalone
     // exact-tree change to genesis so it makes no ancestry claim.
     let history_boundary_root = kin_core::build_genesis_change().id;
-    let (layout, snap, blob_store, auto_parse_parent_id) = if is_warm {
+    let (layout, snap, blob_store, auto_parse_parent_id) = if is_initialized {
         let layout = kin_core::KinLayout::discover(&dir)
             .ok_or_else(|| anyhow::anyhow!("layout not found in existing .kin"))?;
         let snap = crate::backend::open_kindb_snapshot(&layout)?;
         let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
             .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
-        // For a warm cache hit, the genesis change isn't created anew.
-        // We look up the current head of the default branch to use as the parent
-        // for the new auto-parse change. Legacy Git-boundary recovery waits for
-        // the fresh canonical import below so it never guesses ancestry from a
-        // malformed stored graph alone.
+        // For an existing repository, use the current default-branch head as
+        // the parent of any real native semantic/tree transition. Git import
+        // still attaches its repository boundary to canonical genesis below.
         let config = kin_core::KinConfig::load(&layout.config_path())?;
         let parent_id = snap
             .graph()
@@ -599,258 +385,178 @@ pub async fn run(
     }
     phase!("kin_core::init");
 
-    let all_files = collect_source_files(&tmp_snapshot)?;
-    phase!("collect_source_files");
+    let graph = snap.graph();
+    let branch_name = kin_core::read_current_branch(&layout)?;
 
-    let exact_source_entries = collect_exact_init_source_entries(&tmp_snapshot, &all_files)?;
-    phase!("collect_exact_source_entries");
-
-    // Persist exact bytes while the frozen snapshot still lives at its
-    // temporary path. `move_snapshot_into_place` renames that directory, so
-    // deferring this backfill until after the move makes every retained
-    // `abs_path` stale (most visibly for symlinks, which parsing skips).
-    for entry in &exact_source_entries {
-        let blob_hash = kin_blobs::Hash256::from_bytes(entry.hash);
-        if !blob_store.exists(&blob_hash).unwrap_or(false) {
-            let (content, observed_kind) = read_exact_init_source(&entry.abs_path)?;
-            let observed_entry = exact_tree_entry(entry.hash, observed_kind);
-            if observed_entry != entry.entry || kin_blobs::digest_bytes(&content) != entry.hash {
-                anyhow::bail!(
-                    "frozen init source changed while building graph authority: {}",
-                    entry.repo_path
-                );
-            }
-            blob_store
-                .write(&content)
-                .with_context(|| format!("store exact init source {}", entry.repo_path))?;
-        }
+    // Re-init is a rebuild request over an already-admitted repository. Drop
+    // derived semantic surfaces while every old artifact identity is still
+    // live; the exact target tree is installed below, then enrichment is
+    // reconstructed from graph/blob truth.
+    if is_initialized {
+        clear_all_file_semantic_state(graph.as_ref())?;
     }
-    phase!("persist_exact_source_entries");
 
-    let indexable_files = collect_indexable_files(&tmp_snapshot, &all_files)?;
-    phase!("collect_indexable_files");
+    let mut native_tree_deltas = None;
+    let mut imported_mode = None;
+    if let Some(import_opts) = git_import_options.as_ref() {
+        let mut imported = kin_git::import_git_history_with_blobs(
+            &dir,
+            history_boundary_root,
+            import_opts,
+            Some(&blob_store),
+        )
+        .with_context(|| format!("import Git repository boundary ({git_history})"))?;
+        if imported.is_empty() {
+            anyhow::bail!("Git import produced no exact repository head");
+        }
+
+        // Historical enrichment consumes only the exact tree transitions and
+        // immutable blobs produced by kin-git. It never reads the checkout and
+        // never changes membership, path, mode, link kind, or artifact id.
+        enrich_imported_changes_with_semantics_checkpointed(
+            &mut imported,
+            &blob_store,
+            layout.root(),
+            history_boundary_root,
+            false,
+        )
+        .with_context(|| {
+            format!("enrich imported Git history with semantic deltas ({git_history})")
+        })?;
+
+        let imported_head = imported
+            .last()
+            .map(|entry| entry.change.id)
+            .ok_or_else(|| anyhow!("Git import produced no head"))?;
+        graph.create_changes(imported.iter().map(|entry| entry.change.clone()).collect())?;
+        let imported_tree = graph.resolve_tree_at(&imported_head)?;
+        apply_resolved_tree_transition(graph.as_ref(), &imported_tree)?;
+        graph.update_branch_head(&branch_name, &imported_head)?;
+        imported_mode = Some((import_opts.mode, imported.len()));
+
+        if !json {
+            match import_opts.mode {
+                kin_git::GitImportMode::Snapshot => {
+                    println!("  Imported exact Git HEAD snapshot as graph-owned truth.");
+                }
+                kin_git::GitImportMode::Full => {
+                    println!(
+                        "  Imported {} Git commit(s) as exact semantic history.",
+                        imported.len()
+                    );
+                }
+            }
+        }
+        phase!("import_exact_git_history");
+    } else {
+        // Native init (including explicit `--git-history off`) has one
+        // filesystem ingestion boundary. Persist its bytes, install exact tree
+        // identity, and never consult raw files again during enrichment.
+        let exact_source_entries =
+            collect_native_boundary_entries(&dir, graph.as_ref(), &blob_store, force)?;
+        let tree_deltas = build_exact_init_tree_deltas(
+            graph.resolve_tree_at(&auto_parse_parent_id)?,
+            &exact_source_entries,
+        );
+        graph.apply_transaction_delta(&TransactionDelta {
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: tree_deltas.clone(),
+        })?;
+        native_tree_deltas = Some(tree_deltas);
+        phase!("admit_native_repository_tree");
+    }
+
+    let indexable_files = collect_indexable_files_from_graph(graph.as_ref(), &blob_store)?;
+    phase!("collect_graph_indexable_files");
     let (entity_source_input_count, shallow_source_input_count) =
         count_supported_source_inputs(&indexable_files);
 
-    let init_summary = if !all_files.is_empty() || is_warm {
-        if is_warm {
-            // NATIVE WARM CACHE: Run the diff directly against the existing graph!
-            let graph = snap.graph();
-            let current_files: Vec<(RepoPath, TreeEntry)> = exact_source_entries
-                .iter()
-                .map(|file| (file.repo_path.clone(), file.entry))
-                .collect();
-            let diff = kin_db::engine::compute_diff(graph.as_ref(), &current_files);
-
-            let delta =
-                apply_warm_cache_delta(graph.as_ref(), &blob_store, &indexable_files, &diff)?;
-            let scrubbed_paths = scrub_internal_graph_truth(graph.as_ref())?;
-            if !scrubbed_paths.is_empty() {
-                warn!(
-                    count = scrubbed_paths.len(),
-                    "scrubbed internal control-plane paths from native warm cache"
-                );
-            }
-            // We just reuse the existing text/vector indexes implicitly since we're in-place.
-
-            phase!("native_warm_cache_diff");
-
-            InitIndexSummary {
-                total_entity_count: graph.entity_count(),
-                total_files: graph.working_tree_paths().len(),
-                linked_relations: graph.relation_count(),
-                warm_cache_hit: true,
-                warm_text_index_reused: true,
-                warm_vector_index_reused: true,
-                warm_changed_files: diff.changed_count(),
-                warm_reparsed_files: delta.reparsed_files,
-                warm_requeued_embeddings: delta.queued_embeddings.len(),
-            }
-        } else {
-            match try_warm_init_from_cache(&dir, &layout, &snap, &blob_store, &indexable_files) {
-                Ok(Some(summary)) => {
-                    phase!("warm_cache_path (full)");
-                    summary
-                }
-                Ok(None) | Err(_) => {
-                    phase!("warm_cache_miss");
-                    let summary =
-                        parse_and_index(snap.graph().as_ref(), &blob_store, &indexable_files)?;
-                    phase!("parse_and_index");
-                    summary
-                }
-            }
-        }
+    let has_repository_entries = !graph.resolved_tree().is_empty();
+    let init_summary = if !indexable_files.is_empty() {
+        let summary = parse_and_index(graph.as_ref(), &blob_store, &indexable_files)?;
+        phase!("parse_and_index_graph_blobs");
+        summary
     } else {
-        InitIndexSummary::default()
+        InitIndexSummary {
+            total_files: graph.resolved_tree().len(),
+            ..InitIndexSummary::default()
+        }
     };
 
-    if !all_files.is_empty() {
+    if !indexable_files.is_empty() {
         ensure_graph_surface_materialized(
-            snap.graph().as_ref(),
+            graph.as_ref(),
             entity_source_input_count,
             shallow_source_input_count,
         )?;
     }
 
-    // Write the manifest after discovery so it never enters graph-owned tree truth.
-    write_snapshot_manifest(&tmp_snapshot, &snapshot_manifest)?;
-    move_snapshot_into_place(&tmp_snapshot, &dir.join(".kin/snapshot"))?;
-    if !json {
-        let snapshot_file_count = snapshot_manifest
-            .get("file_count")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0);
-        println!("  Snapshot saved ({} files)", snapshot_file_count);
-    }
-
-    let mut graph = snap.graph();
-    let branch_name = kin_core::read_current_branch(&layout)?;
-    if !all_files.is_empty() || is_warm {
-        // Build a semantic change for the initial parse.
-        // Include exact tree deltas for every admitted entry so the change DAG
-        // owns the complete repository tree independent of parser support.
-        let change_id = compute_init_change_id(
-            &auto_parse_parent_id,
-            &compute_artifact_fingerprint(
-                exact_source_entries
-                    .iter()
-                    .map(|entry| (&entry.repo_path, &entry.hash, entry.entry)),
-            ),
+    if let Some(tree_deltas) = native_tree_deltas {
+        // Native admission and semantic enrichment publish as one immutable
+        // model-owned change. The tree was installed before parsing; this DAG
+        // record captures that already-validated transition without reapplying
+        // it to the live graph.
+        let parent_state = graph.resolve_graph_at(&auto_parse_parent_id)?;
+        let current_state = graph.to_snapshot();
+        let (entity_deltas, relation_deltas) = exact_semantic_deltas(
+            &parent_state,
+            &current_state.entities,
+            &current_state.relations,
         );
 
-        let tree_deltas = build_exact_init_tree_deltas(
-            graph.resolve_tree_at(&auto_parse_parent_id)?,
-            &exact_source_entries,
-        );
-        let mut all_entities = graph.list_all_entities()?;
-        // `list_all_entities` is backed by a hash map. Canonicalize its order
-        // before it becomes a deterministic init change payload so a repeated
-        // warm init cannot look different solely because hash iteration moved.
-        all_entities.sort_by_key(|entity| entity.id);
-        // Gather relation deltas while only borrowing the entity list, then
-        // consume the list itself into the entity deltas. Building the Added
-        // entity deltas by value (instead of `.iter().cloned()`) avoids holding
-        // a second full copy of every entity during genesis — a ~repo-sized
-        // transient that inflates the init RSS peak on constrained machines.
-        let mut relation_ids = HashSet::new();
-        let mut relation_deltas = Vec::new();
-        for entity in &all_entities {
-            for relation in graph.get_all_relations_for_entity(&entity.id)? {
-                if relation_ids.insert(relation.id) {
-                    relation_deltas.push(RelationDelta::Added(relation));
-                }
-            }
+        if !entity_deltas.is_empty() || !relation_deltas.is_empty() || !tree_deltas.is_empty() {
+            let mut change = SemanticChange {
+                id: placeholder_semantic_change_id(),
+                parents: vec![auto_parse_parent_id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new(whoami()),
+                message: "kin init: auto-parse".to_string(),
+                entity_deltas,
+                relation_deltas,
+                tree_deltas,
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: Some(branch_name.clone()),
+            };
+            change.id = kin_model::compute_semantic_change_id(&change)?;
+            kin_model::validate_semantic_change_id(&change)?;
+            graph.create_change(&change)?;
+            graph.update_branch_head(&branch_name, &change.id)?;
+        } else {
+            debug!(
+                parent = %auto_parse_parent_id,
+                "native init rebuilt identical graph/tree truth; keeping branch head unchanged"
+            );
         }
-        // Store-iteration order is not a contract; sort by relation id so the
-        // committed change record is deterministic.
-        relation_deltas.sort_by_key(|delta| match delta {
-            RelationDelta::Added(relation) => relation.id.0,
-            RelationDelta::Removed(relation_id) => relation_id.0,
-        });
-        let entity_deltas = all_entities.into_iter().map(EntityDelta::Added).collect();
-
-        let change = SemanticChange {
-            id: change_id,
-            parents: vec![auto_parse_parent_id],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new(whoami()),
-            message: "kin init: auto-parse".to_string(),
-            entity_deltas,
-            relation_deltas,
-            tree_deltas,
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(branch_name.clone()),
-        };
-        create_deterministic_change_once(
-            graph.as_ref(),
-            &change,
-            DeterministicChangeProvenance::Regenerated,
-        )?;
-        graph.update_branch_head(&branch_name, &change_id)?;
 
         phase!("change_dag+blob_backfill");
     }
 
-    // Git history is independent of whether the current checkout contains a
-    // source file. In particular, a repository whose HEAD deletes its final
-    // file still has authoritative committed history to import or repair.
-    if is_git_repo {
-        if let Some(import_opts) = git_history_import_options(&git_history)? {
-            let cochange_limit = match import_opts.mode {
-                kin_git::GitImportMode::Snapshot => 50,
-                kin_git::GitImportMode::Full => 0,
-            };
-            match crate::commands::cochange::refresh_from_git_history_with_limit(
-                graph.as_ref(),
-                &dir,
-                cochange_limit,
-            ) {
-                Ok(count) if count > 0 => {
-                    if !json {
-                        println!("  Mined {} co-change relation(s) from Git history.", count);
-                    }
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    warn!(
-                        error = %err,
-                        mode = %git_history,
-                        "failed to mine co-change relations from git history"
-                    );
+    if let Some((mode, _)) = imported_mode {
+        let cochange_limit = match mode {
+            kin_git::GitImportMode::Snapshot => 50,
+            kin_git::GitImportMode::Full => 0,
+        };
+        match crate::commands::cochange::refresh_from_git_history_with_limit(
+            graph.as_ref(),
+            &dir,
+            cochange_limit,
+        ) {
+            Ok(count) if count > 0 => {
+                if !json {
+                    println!("  Mined {} co-change relation(s) from Git history.", count);
                 }
             }
-
-            let mut imported = kin_git::import_git_history_with_blobs(
-                &dir,
-                history_boundary_root,
-                &import_opts,
-                Some(&blob_store),
-            )
-            .with_context(|| format!("import Git repository boundary ({git_history})"))?;
-            if !imported.is_empty() {
-                // Imported repository state is an authority path. Invalid
-                // enrichment/checkpoint state must stop init rather than
-                // silently publish artifact-only history.
-                enrich_imported_changes_with_semantics_checkpointed(
-                    &mut imported,
-                    &blob_store,
-                    layout.root(),
-                    history_boundary_root,
-                    false,
-                )
-                .with_context(|| {
-                    format!("enrich imported Git history with semantic deltas ({git_history})")
-                })?;
-
-                let mut last_id = None;
-                for imported_change in &imported {
-                    create_deterministic_change_once(
-                        graph.as_ref(),
-                        &imported_change.change,
-                        DeterministicChangeProvenance::Stable,
-                    )?;
-                    last_id = Some(imported_change.change.id);
-                }
-                if let Some(head) = last_id {
-                    graph.update_branch_head(&branch_name, &head)?;
-                }
-                if !json {
-                    match import_opts.mode {
-                        kin_git::GitImportMode::Snapshot => {
-                            println!("  Imported exact Git HEAD snapshot as graph-owned truth.");
-                        }
-                        kin_git::GitImportMode::Full => {
-                            println!(
-                                "  Imported {} Git commit(s) as exact semantic history.",
-                                imported.len()
-                            );
-                        }
-                    }
-                }
+            Ok(_) => {}
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    mode = %git_history,
+                    "failed to mine co-change relations from Git provenance"
+                );
             }
         }
     }
@@ -859,7 +565,7 @@ pub async fn run(
 
     phase!("cochange_mining");
 
-    let saved_root_hash = snap.save()?;
+    snap.save()?;
     phase!("snapshot_save");
 
     // Build and save the read-only index for fast CLI queries.
@@ -870,7 +576,7 @@ pub async fn run(
     phase!("read_index_save");
 
     // Optional LSP enrichment: discover servers, enrich entities with type-resolved relations.
-    if !all_files.is_empty() && !no_lsp {
+    if has_repository_entries && !no_lsp {
         let discovered = kin_lsp::discovery::discover_servers();
         if !discovered.is_empty() && !json {
             println!("  Discovering LSP servers for enrichment...");
@@ -906,7 +612,7 @@ pub async fn run(
         }
     }
 
-    if !all_files.is_empty() && !json {
+    if has_repository_entries && !json {
         println!(
                 "  Initialized with {} entities from {} files ({} relations) [{} embeddings indexed, {} queued]",
                 init_summary.total_entity_count,
@@ -919,7 +625,7 @@ pub async fn run(
             println!("  Run `kin embed` to build semantic vector search.");
         }
     }
-    if !all_files.is_empty() && verbose {
+    if has_repository_entries && verbose {
         // Role classification summary
         let all_entities = graph.list_all_entities()?;
         let mut role_counts: std::collections::HashMap<kin_model::EntityRole, usize> =
@@ -990,21 +696,6 @@ pub async fn run(
             }
         );
     }
-    if init_summary.warm_cache_hit {
-        info!(
-            changed_files = init_summary.warm_changed_files,
-            reparsed_files = init_summary.warm_reparsed_files,
-            indexed_files = init_summary.total_files,
-            "warm init cache reused prior semantic snapshot"
-        );
-    }
-
-    if !all_files.is_empty() {
-        if let Err(err) = refresh_init_cache(&dir, graph.as_ref(), saved_root_hash) {
-            warn!(error = %err, "failed to refresh warm init cache");
-        }
-    }
-
     // Register in the global ~/.kin/registry.toml with the current-tree count.
     let repo_id = dir
         .file_name()
@@ -1021,7 +712,7 @@ pub async fn run(
         println!(
             "{}",
             serde_json::to_string_pretty(&InitResultPayload {
-                schema: "kin.init-result.v1",
+                schema: "kin.init-result.v2",
                 repo_root: layout.root().display().to_string(),
                 kindb_snapshot_path: layout.kindb_snapshot_path().display().to_string(),
                 objects_dir: layout.objects_dir().display().to_string(),
@@ -1050,6 +741,246 @@ fn git_history_import_options(mode: &str) -> Result<Option<kin_git::ImportOption
             "invalid Git history mode {other:?}; expected off, snapshot, or full"
         )),
     }
+}
+
+fn placeholder_semantic_change_id() -> SemanticChangeId {
+    SemanticChangeId::from_hash(Hash256::from_bytes([0; 32]))
+}
+
+/// Recompute enriched imported changes in parent-first order.
+///
+/// kin-git identifies its exact artifact-only payloads. Historical semantic
+/// enrichment changes that immutable payload, so every affected ID and every
+/// descendant parent reference must be remapped before graph insertion.
+fn reidentify_enriched_imported_changes(
+    imported: &mut [kin_git::ImportedChange],
+    boundary_root: SemanticChangeId,
+) -> Result<()> {
+    validate_imported_parent_closure(imported, boundary_root)?;
+
+    let old_index = imported
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.change.id, index))
+        .collect::<HashMap<_, _>>();
+    let parent_indices = imported
+        .iter()
+        .map(|entry| {
+            entry
+                .change
+                .parents
+                .iter()
+                .filter(|parent| **parent != boundary_root)
+                .map(|parent| {
+                    old_index.get(parent).copied().ok_or_else(|| {
+                        anyhow!(
+                            "cannot reidentify imported change {}: parent {} is absent",
+                            entry.change.id,
+                            parent
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let order = full_parent_topological_order(&parent_indices)?;
+    let mut remapped = HashMap::<SemanticChangeId, SemanticChangeId>::with_capacity(imported.len());
+
+    for index in order {
+        let old_id = imported[index].change.id;
+        for parent in &mut imported[index].change.parents {
+            if *parent == boundary_root {
+                continue;
+            }
+            *parent = remapped.get(parent).copied().ok_or_else(|| {
+                anyhow!(
+                    "cannot reidentify imported change {} before parent {}",
+                    old_id,
+                    parent
+                )
+            })?;
+        }
+        imported[index].change.id = placeholder_semantic_change_id();
+        imported[index].change.id = kin_model::compute_semantic_change_id(&imported[index].change)
+            .with_context(|| format!("identify enriched imported change {}", old_id))?;
+        kin_model::validate_semantic_change_id(&imported[index].change)
+            .with_context(|| format!("validate enriched imported change {}", old_id))?;
+        remapped.insert(old_id, imported[index].change.id);
+    }
+
+    validate_imported_parent_closure(imported, boundary_root)?;
+    for entry in imported {
+        kin_model::validate_semantic_change_id(&entry.change).with_context(|| {
+            format!(
+                "validate final imported payload for Git object {}",
+                entry.git_oid
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Install one exact resolved tree as the live repository view without
+/// allocating new identities or deriving them from locations.
+fn apply_resolved_tree_transition(
+    graph: &kin_db::InMemoryGraph,
+    target: &ResolvedTree,
+) -> Result<()> {
+    let current = graph.resolved_tree();
+    let mut deltas = Vec::new();
+
+    for old in current.artifacts() {
+        if target.get(&old.artifact_id).is_none() {
+            deltas.push(TreeDelta::Removed {
+                artifact_id: old.artifact_id,
+                old: old.located_entry(),
+            });
+        }
+    }
+    for new in target.artifacts() {
+        match current.get(&new.artifact_id) {
+            Some(old) if old.path == new.path && old.entry == new.entry => {}
+            Some(old) => deltas.push(TreeDelta::Updated {
+                artifact_id: new.artifact_id,
+                old: old.located_entry(),
+                new: new.located_entry(),
+            }),
+            None => deltas.push(TreeDelta::Added {
+                artifact_id: new.artifact_id,
+                new: new.located_entry(),
+            }),
+        }
+    }
+
+    let staged = current
+        .apply(&deltas)
+        .context("validate exact init tree transition")?;
+    if &staged != target {
+        anyhow::bail!("exact init tree transition did not reproduce the imported target");
+    }
+    if !deltas.is_empty() {
+        graph.apply_transaction_delta(&TransactionDelta {
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: deltas,
+        })?;
+    }
+    Ok(())
+}
+
+fn clear_all_file_semantic_state(graph: &kin_db::InMemoryGraph) -> Result<()> {
+    let paths = graph
+        .resolved_tree()
+        .artifacts_by_path()
+        .filter_map(|artifact| artifact.path.as_utf8().map(str::to_owned))
+        .collect::<Vec<_>>();
+    let artifact_relations = collect_artifact_relation_ids_for_files(graph, paths.iter())?;
+    remove_relations_batch_by_id(graph, &artifact_relations)?;
+    for path in paths {
+        clear_file_semantic_state(graph, &path)?;
+    }
+    Ok(())
+}
+
+/// Diff a rebuilt live semantic graph against its immutable parent ref.
+///
+/// Re-init is allowed to rebuild parser-derived state, but its history record
+/// must describe only the actual parent-to-current transition. Replaying every
+/// current entity as `Added` would make an identical second init look like new
+/// history and can collide with entities already present at the parent.
+fn exact_semantic_deltas(
+    parent: &kin_model::graph::ResolvedGraphState,
+    current_entities: &HashMap<EntityId, Entity>,
+    current_relations: &HashMap<RelationId, Relation>,
+) -> (Vec<EntityDelta>, Vec<RelationDelta>) {
+    let entity_ids = parent
+        .entities
+        .keys()
+        .chain(current_entities.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut entity_deltas = Vec::new();
+    for entity_id in entity_ids {
+        match (
+            parent.entities.get(&entity_id),
+            current_entities.get(&entity_id),
+        ) {
+            (Some(old), Some(new)) if imported_entities_exactly_equivalent(old, new) => {}
+            (Some(old), Some(new)) => entity_deltas.push(EntityDelta::Modified {
+                old: old.clone(),
+                new: new.clone(),
+            }),
+            (Some(_), None) => entity_deltas.push(EntityDelta::Removed(entity_id)),
+            (None, Some(new)) => entity_deltas.push(EntityDelta::Added(new.clone())),
+            (None, None) => unreachable!("entity id came from one side of the semantic diff"),
+        }
+    }
+
+    let mut relation_ids = parent
+        .relations
+        .keys()
+        .chain(current_relations.keys())
+        .copied()
+        .collect::<Vec<_>>();
+    relation_ids.sort_by_key(|relation_id| relation_id.0);
+    relation_ids.dedup();
+    let mut relation_deltas = Vec::new();
+    for relation_id in relation_ids {
+        match (
+            parent.relations.get(&relation_id),
+            current_relations.get(&relation_id),
+        ) {
+            (Some(old), Some(new)) if imported_relations_exactly_equivalent(old, new) => {}
+            (Some(_), Some(new)) => {
+                relation_deltas.push(RelationDelta::Removed(relation_id));
+                relation_deltas.push(RelationDelta::Added(new.clone()));
+            }
+            (Some(_), None) => relation_deltas.push(RelationDelta::Removed(relation_id)),
+            (None, Some(new)) => relation_deltas.push(RelationDelta::Added(new.clone())),
+            (None, None) => unreachable!("relation id came from one side of the semantic diff"),
+        }
+    }
+
+    (entity_deltas, relation_deltas)
+}
+
+/// Select semantic-enrichment inputs exclusively from admitted tree/blob truth.
+fn collect_indexable_files_from_graph(
+    graph: &kin_db::InMemoryGraph,
+    blob_store: &kin_blobs::BlobStore,
+) -> Result<Vec<IndexableFile>> {
+    let mut files = Vec::new();
+    for artifact in graph.resolved_tree().artifacts_by_path() {
+        let TreeEntry::Blob { hash, .. } = artifact.entry else {
+            continue;
+        };
+        let Some(path) = artifact.path.as_utf8() else {
+            // Exact non-UTF8 membership remains graph-owned and projectable;
+            // parser adapters currently accept UTF-8 file identifiers only.
+            continue;
+        };
+        let blob_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+        let content = blob_store.read(&blob_hash).with_context(|| {
+            format!(
+                "read admitted source blob {} for semantic enrichment",
+                artifact.path
+            )
+        })?;
+        if kin_blobs::digest_bytes(&content) != *hash.as_bytes() {
+            anyhow::bail!(
+                "admitted source blob for {} does not match graph identity {}",
+                artifact.path,
+                hash
+            );
+        }
+        files.push(IndexableFile {
+            rel_path: path.to_string(),
+            hash: *hash.as_bytes(),
+            classification: FileClassifier::classify(Path::new(path)),
+            content: Arc::new(content),
+        });
+    }
+    Ok(files)
 }
 
 /// Parse all source files, extract entities, store blobs, link cross-file relations.
@@ -1107,14 +1038,8 @@ fn parse_and_index(
 
     Ok(InitIndexSummary {
         total_entity_count,
-        total_files: graph.working_tree_paths().len(),
+        total_files: graph.resolved_tree().len(),
         linked_relations: linked_relations.len(),
-        warm_cache_hit: false,
-        warm_text_index_reused: false,
-        warm_vector_index_reused: false,
-        warm_requeued_embeddings: 0,
-        warm_changed_files: 0,
-        warm_reparsed_files: 0,
     })
 }
 
@@ -1163,6 +1088,7 @@ struct DiscoveredTest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ImportedSemanticFileState {
+    artifact_id: ArtifactId,
     file_path: String,
     parse_completeness: ParseCompleteness,
     entities: Vec<Entity>,
@@ -1223,21 +1149,13 @@ impl Clone for ImportedCommitSemanticState {
             relations_by_src: self.relations_by_src.clone(),
             relations_by_src_artifact: self.relations_by_src_artifact.clone(),
             relations_by_dst: self.relations_by_dst.clone(),
-            // `IncrementalLinker` derives no `Clone`; its fields are all public
-            // and cloneable, so copy them explicitly. A new field there makes
-            // this fail to compile (fail loud) rather than silently drop linker
-            // state from a forked baseline.
-            linker: kin_index::IncrementalLinker {
-                entity_by_file_name: self.linker.entity_by_file_name.clone(),
-                entity_by_name: self.linker.entity_by_name.clone(),
-                entity_by_bare_name: self.linker.entity_by_bare_name.clone(),
-                entity_kind_by_id: self.linker.entity_kind_by_id.clone(),
-                entity_arity_by_id: self.linker.entity_arity_by_id.clone(),
-                known_files: self.linker.known_files.clone(),
-                entities_by_file: self.linker.entities_by_file.clone(),
-                include_targets_by_file: self.linker.include_targets_by_file.clone(),
-                class_bases_by_file: self.linker.class_bases_by_file.clone(),
-            },
+            // The checkpoint conversion is the exhaustive, versioned linker
+            // clone contract, including graph-assigned artifact identities and
+            // language gates. A new linker field must update that contract.
+            linker: kin_index::IncrementalLinker::from_checkpoint_v1(
+                self.linker.to_checkpoint_v1(),
+            )
+            .expect("a live incremental linker must round-trip its own checkpoint"),
         }
     }
 }
@@ -1393,8 +1311,11 @@ fn take_imported_parent_baseline(
     }
 }
 
-/// Pre-reconciliation parse payload memoized per `(blob_hash,
-/// PARSER_SEMANTICS_VERSION)` for one hydration pass. Holds exactly the fields
+/// Pre-reconciliation parse payload memoized per `(blob_hash, exact UTF-8
+/// location, PARSER_SEMANTICS_VERSION)` for one hydration pass. Parser output
+/// carries file origins and path-sensitive entity ids, so content identity
+/// alone is deliberately insufficient across a rename or duplicate blob.
+/// Holds exactly the fields
 /// the replay consumes between the parse and commit-relative entity
 /// reconciliation; reconciliation itself is deliberately excluded because it
 /// re-keys entity ids per commit. Shared via `Arc` so a blob recurring across
@@ -1437,7 +1358,8 @@ pub(crate) fn enrich_imported_changes_with_semantics(
     imported: &mut [kin_git::ImportedChange],
     blob_store: &kin_blobs::BlobStore,
 ) -> Result<()> {
-    enrich_imported_changes_with_semantics_inner(imported, blob_store, true).map(|_| ())
+    enrich_imported_changes_with_semantics_inner(imported, blob_store, true)?;
+    reidentify_enriched_imported_changes(imported, kin_core::build_genesis_change().id)
 }
 
 #[cfg(test)]
@@ -1448,8 +1370,8 @@ fn enrich_imported_changes_with_semantics_and_genesis(
 ) -> Result<()> {
     enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
         imported, blob_store, true, None, genesis_id, false,
-    )
-    .map(|_| ())
+    )?;
+    reidentify_enriched_imported_changes(imported, genesis_id)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1483,6 +1405,7 @@ pub(crate) fn enrich_imported_changes_with_semantics_checkpointed(
         boundary_root,
         tolerant,
     )?;
+    reidentify_enriched_imported_changes(imported, boundary_root)?;
     debug!(
         resumed_from = stats.resumed_from,
         parse_memo_hits = stats.parse_memo_hits,
@@ -1575,7 +1498,8 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
     // Parse memo (per-pass lifetime; the replay loop is single-threaded, so a
     // plain HashMap is sound and deterministic). Bounds live memory to the
     // pass's distinct source blobs.
-    let mut parse_memo: HashMap<(kin_blobs::Hash256, u32), Arc<CachedParse>> = HashMap::new();
+    let mut parse_memo: HashMap<(kin_blobs::Hash256, String, u32), Arc<CachedParse>> =
+        HashMap::new();
     let mut parse_memo_hits = 0usize;
     let mut parse_memo_misses = 0usize;
 
@@ -1710,15 +1634,6 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
             mut relations_by_dst,
             linker: mut incremental_linker,
         } = baseline;
-        let mut merge_runtime_baseline = if imported[i].change.parents.len() > 1 {
-            Some(ImportedRuntimeSemanticState {
-                entities: imported_target_entities(&current_files, tolerant)?,
-                relations: current_relations.clone(),
-            })
-        } else {
-            None
-        };
-
         let mut entity_deltas = Vec::new();
         let mut relation_deltas = Vec::new();
         let mut changed_source_files = BTreeSet::<String>::new();
@@ -1738,32 +1653,44 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
         let mut resolutions: Vec<Option<ImportedFileResolution>> =
             (0..deltas.len()).map(|_| None).collect();
         let mut parse_jobs: Vec<ImportedParseJob> = Vec::new();
-        let mut scheduled_jobs: HashMap<(kin_blobs::Hash256, u32), usize> = HashMap::new();
+        let mut scheduled_jobs: HashMap<(kin_blobs::Hash256, String, u32), usize> = HashMap::new();
 
         for (delta_idx, tree_delta) in deltas.iter().enumerate() {
-            let file_path = &tree_delta.file_id().0;
-            let Some(new_entry) = tree_delta.new_entry() else {
+            let new_state = match tree_delta {
+                TreeDelta::Added { new, .. } | TreeDelta::Updated { new, .. } => Some(new),
+                TreeDelta::Removed { .. } => None,
+            };
+            let Some(new_state) = new_state else {
+                resolutions[delta_idx] = Some(ImportedFileResolution::Remove);
+                continue;
+            };
+            let Some(file_path) = new_state.path.as_utf8() else {
+                resolutions[delta_idx] = Some(ImportedFileResolution::Remove);
+                continue;
+            };
+            let TreeEntry::Blob {
+                hash: new_blob_hash,
+                ..
+            } = new_state.entry
+            else {
                 resolutions[delta_idx] = Some(ImportedFileResolution::Remove);
                 continue;
             };
 
-            if !matches!(new_entry.kind, TreeEntryKind::Regular { .. })
-                || !matches!(
-                    FileClassifier::classify(Path::new(file_path)),
-                    FileClassification::EntitySource
-                )
-            {
+            if !matches!(
+                FileClassifier::classify(Path::new(file_path)),
+                FileClassification::EntitySource
+            ) {
                 resolutions[delta_idx] = Some(ImportedFileResolution::Remove);
                 continue;
             }
 
-            // A blob hash uniquely determines the file bytes, and a parse is a
-            // pure function of (bytes, parser semantics), so the same file
-            // version recurring across commits — git blobs dedup across history —
-            // is read and parsed once. The parser-semantics version is part of
-            // the key so a grammar/extractor upgrade never serves a stale parse.
+            // Parsing is keyed by exact bytes, exact UTF-8 location, and parser
+            // semantics. Parser output carries path-derived origins/ids, so a
+            // rename must be reparsed even when Git reuses the same blob.
             let memo_key = (
-                kin_blobs::Hash256::from_bytes(*new_entry.blob_hash.as_bytes()),
+                kin_blobs::Hash256::from_bytes(*new_blob_hash.as_bytes()),
+                file_path.to_string(),
                 kin_parser::PARSER_SEMANTICS_VERSION,
             );
 
@@ -1783,7 +1710,7 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
                     continue;
                 }
                 parse_memo_misses += 1;
-                scheduled_jobs.insert(memo_key, parse_jobs.len());
+                scheduled_jobs.insert(memo_key.clone(), parse_jobs.len());
                 parse_jobs.push(ImportedParseJob {
                     blob_hash: memo_key.0,
                     file_id: FilePathId::new(file_path),
@@ -1807,9 +1734,16 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
             let job_contents: Vec<Result<Vec<u8>, String>> = parse_jobs
                 .par_iter()
                 .map(|job| {
-                    blob_store
+                    let content = blob_store
                         .read(&job.blob_hash)
-                        .map_err(|err| err.to_string())
+                        .map_err(|err| err.to_string())?;
+                    if kin_blobs::digest_bytes(&content) != job.blob_hash.0 {
+                        return Err(format!(
+                            "blob content does not match admitted identity {}",
+                            job.blob_hash
+                        ));
+                    }
+                    Ok(content)
                 })
                 .collect();
             total_blob_read_time += blob_read_start.elapsed();
@@ -1860,7 +1794,11 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
                     Some(Ok(parsed)) => {
                         if parse_memo_enabled {
                             parse_memo.insert(
-                                (job.blob_hash, kin_parser::PARSER_SEMANTICS_VERSION),
+                                (
+                                    job.blob_hash,
+                                    job.file_id.0.clone(),
+                                    kin_parser::PARSER_SEMANTICS_VERSION,
+                                ),
                                 Arc::clone(parsed),
                             );
                         }
@@ -1889,6 +1827,14 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
                         // Blob read failed: same removal + miss accounting.
                         parse_memo_misses += extra_appearances;
                         let err = read_errors[job_idx].as_deref().unwrap_or("missing content");
+                        if !tolerant {
+                            return Err(anyhow!(
+                                "historical enrichment cannot read admitted blob {} for {}: {}",
+                                job.blob_hash,
+                                job.file_id.0,
+                                err
+                            ));
+                        }
                         warn!(
                             file = %job.file_id.0,
                             error = %err,
@@ -1902,33 +1848,75 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
             }
         }
 
-        // Reconcile serially in delta order — byte-identical to the pre-rung-3
-        // per-file body, now fed pre-resolved parses. Each commit changes a given
-        // path at most once, so a delta's baseline `old_state` is independent of
-        // its siblings and this fold reproduces the serial result exactly.
-        for (delta_idx, tree_delta) in imported[i].change.tree_deltas.iter().enumerate() {
-            let file_path = tree_delta.file_id().0.clone();
-            let old_state = current_files.get(&file_path).cloned();
-            if let Some(old_state) = &old_state {
-                previous_file_states.insert(file_path.clone(), old_state.clone());
+        // Remove every old semantic location before inserting any new one.
+        // Exact tree transactions permit swaps and rename cycles; processing
+        // move A→B before B→A in-place would otherwise overwrite B's semantic
+        // state and silently transfer it to A.
+        let mut old_states = HashMap::<ArtifactId, ImportedSemanticFileState>::new();
+        for tree_delta in &imported[i].change.tree_deltas {
+            let (artifact_id, old) = match tree_delta {
+                TreeDelta::Added { artifact_id, .. } => (*artifact_id, None),
+                TreeDelta::Updated {
+                    artifact_id, old, ..
+                }
+                | TreeDelta::Removed { artifact_id, old } => (*artifact_id, Some(old)),
+            };
+            let Some(old) = old else {
+                continue;
+            };
+            let Some(old_path) = old.path.as_utf8() else {
+                continue;
+            };
+            if let Some(old_state) = current_files.remove(old_path) {
+                if old_state.artifact_id != artifact_id {
+                    anyhow::bail!(
+                        "historical semantic state at {} belongs to artifact {:?}, not delta artifact {:?}",
+                        old.path,
+                        old_state.artifact_id,
+                        artifact_id
+                    );
+                }
+                previous_file_states.insert(old_path.to_string(), old_state.clone());
+                changed_source_files.insert(old_path.to_string());
+                incremental_linker.remove_file(old_path);
+                old_states.insert(artifact_id, old_state);
             }
+        }
+
+        // Reconcile serially in canonical delta order, now against the exact
+        // graph-assigned identity removed above. Unsupported/non-source files
+        // intentionally receive no semantic state; their tree membership and
+        // byte identity remain untouched.
+        for (delta_idx, tree_delta) in imported[i].change.tree_deltas.iter().enumerate() {
+            let (artifact_id, new_state) = match tree_delta {
+                TreeDelta::Added { artifact_id, new }
+                | TreeDelta::Updated {
+                    artifact_id, new, ..
+                } => (*artifact_id, Some(new)),
+                TreeDelta::Removed { artifact_id, .. } => (*artifact_id, None),
+            };
+            let old_state = old_states.remove(&artifact_id);
 
             match resolutions[delta_idx]
                 .take()
                 .expect("every tree delta must be resolved by the plan/parse phase")
             {
                 ImportedFileResolution::Remove => {
-                    if remove_imported_file_semantic_state(
-                        &file_path,
-                        old_state,
-                        &mut current_files,
-                        &mut entity_deltas,
-                    ) {
-                        changed_source_files.insert(file_path.clone());
-                        incremental_linker.remove_file(&file_path);
+                    if let Some(old_state) = old_state {
+                        for entity in old_state.entities {
+                            entity_deltas.push(EntityDelta::Removed(entity.id));
+                        }
                     }
                 }
                 ImportedFileResolution::Parsed(parsed) => {
+                    let new_state =
+                        new_state.expect("a parsed imported delta must have an exact new location");
+                    let file_path = new_state.path.as_utf8().ok_or_else(|| {
+                        anyhow!(
+                            "parsed imported artifact {:?} has a non-UTF8 location",
+                            artifact_id
+                        )
+                    })?;
                     let old_entities = old_state
                         .as_ref()
                         .map(|state| state.entities.as_slice())
@@ -1937,24 +1925,43 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
                     // the entities it stabilizes, so a memo hit never deep-clones
                     // the entire entity vector.
                     let (file_entity_deltas, stabilized_entities) =
-                        reconcile_imported_file_entities(old_entities, &parsed.entities);
+                        reconcile_imported_file_entities(
+                            artifact_id,
+                            old_entities,
+                            &parsed.entities,
+                        );
                     entity_deltas.extend(file_entity_deltas);
 
-                    incremental_linker.add_file(&file_path, &stabilized_entities);
+                    incremental_linker.add_file(file_path, artifact_id, &stabilized_entities);
 
-                    current_files.insert(
-                        file_path.clone(),
-                        ImportedSemanticFileState {
-                            file_path: file_path.clone(),
-                            parse_completeness: parsed.parse_completeness.clone(),
-                            entities: stabilized_entities,
-                            relations: parsed.extracted_relations.clone(),
-                            imports: parsed.imports.clone(),
-                        },
-                    );
-                    changed_source_files.insert(file_path);
+                    if current_files
+                        .insert(
+                            file_path.to_string(),
+                            ImportedSemanticFileState {
+                                artifact_id,
+                                file_path: file_path.to_string(),
+                                parse_completeness: parsed.parse_completeness.clone(),
+                                entities: stabilized_entities,
+                                relations: parsed.extracted_relations.clone(),
+                                imports: parsed.imports.clone(),
+                            },
+                        )
+                        .is_some()
+                    {
+                        anyhow::bail!(
+                            "historical semantic transaction produced two artifacts at {}",
+                            new_state.path
+                        );
+                    }
+                    changed_source_files.insert(file_path.to_string());
                 }
             }
+        }
+        if !old_states.is_empty() {
+            anyhow::bail!(
+                "historical semantic transaction retained {} unconsumed artifact baseline(s)",
+                old_states.len()
+            );
         }
 
         let closure_diff_start = std::time::Instant::now();
@@ -1969,6 +1976,8 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
         let old_relation_ids = collect_relation_ids_for_imported_files(
             &impacted_files,
             &semantic_entities_by_file,
+            &current_files,
+            &previous_file_states,
             &relations_by_src,
             &relations_by_src_artifact,
         );
@@ -2007,7 +2016,7 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
                 &changed_parse_data,
                 &incremental_linker,
                 &changed_parse_completeness,
-            ) {
+            )? {
                 new_relations_by_id.insert(relation.id, relation);
             }
             total_linking_time += link_start_time.elapsed();
@@ -2071,26 +2080,6 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
             RelationDelta::Removed(relation_id) => relation_id.0,
         });
 
-        // Tree deltas describe the merge target against its first parent,
-        // while runtime DAG replay reaches a merge by replaying every parent.
-        // Rebase the computed target onto that actual all-parent baseline so a
-        // secondary-parent-only entity or relation cannot leak through merely
-        // because the merge's first-parent target deleted it.
-        if let Some(all_parent_baseline) = merge_runtime_baseline.as_mut() {
-            replay_imported_secondary_parents(
-                all_parent_baseline,
-                imported,
-                &index_by_change_id,
-                boundary_root,
-                &imported[i].change.parents,
-            )?;
-            (entity_deltas, relation_deltas) = rebase_imported_merge_semantic_deltas(
-                all_parent_baseline,
-                &current_files,
-                &current_relations,
-                tolerant,
-            )?;
-        }
         imported[i].change.entity_deltas = entity_deltas;
         imported[i].change.relation_deltas = relation_deltas;
 
@@ -2320,24 +2309,6 @@ fn hydrate_stage_timings_json(
     serde_json::to_string(&line).unwrap_or_else(|_| "{}".to_string())
 }
 
-fn remove_imported_file_semantic_state(
-    file_path: &str,
-    old_state: Option<ImportedSemanticFileState>,
-    current_files: &mut HashMap<String, ImportedSemanticFileState>,
-    entity_deltas: &mut Vec<EntityDelta>,
-) -> bool {
-    let removed_state = old_state.or_else(|| current_files.remove(file_path));
-    if let Some(old_state) = removed_state {
-        current_files.remove(file_path);
-        for entity in old_state.entities {
-            entity_deltas.push(EntityDelta::Removed(entity.id));
-        }
-        true
-    } else {
-        false
-    }
-}
-
 fn build_imported_semantic_entities_by_file(
     current_files: &HashMap<String, ImportedSemanticFileState>,
     previous_file_states: &HashMap<String, ImportedSemanticFileState>,
@@ -2412,6 +2383,8 @@ fn imported_reverse_dependency_closure(
 fn collect_relation_ids_for_imported_files(
     files: &BTreeSet<String>,
     semantic_entities_by_file: &HashMap<String, Vec<Entity>>,
+    current_files: &HashMap<String, ImportedSemanticFileState>,
+    previous_file_states: &HashMap<String, ImportedSemanticFileState>,
     relations_by_src: &HashMap<EntityId, HashSet<RelationId>>,
     relations_by_src_artifact: &HashMap<ArtifactId, HashSet<RelationId>>,
 ) -> HashSet<RelationId> {
@@ -2424,16 +2397,20 @@ fn collect_relation_ids_for_imported_files(
                 }
             }
         }
-        // Import/include edges are anchored to the file artifact (not an
-        // entity), so collect them by the file's artifact id too — otherwise a
-        // stable cross-file import edge is invisible to the incremental diff
-        // and gets re-added on every relink of an impacted file.
-        // Graph-less map key: `relations_by_src_artifact` is keyed by the same
-        // path-derived id used when the map was built, so this lookup must derive
-        // the id identically (no graph/snapshot handle is in scope here).
-        let artifact_id = ArtifactId::seed_from_path(file_path);
-        if let Some(existing_ids) = relations_by_src_artifact.get(&artifact_id) {
-            relation_ids.extend(existing_ids.iter().copied());
+        // Import/include edges are anchored to admitted artifact identity.
+        // During a move/path-reuse transaction, both the old and new artifact
+        // states may name this impacted path, so inspect both exact states and
+        // never derive identity from the path string.
+        let artifact_ids = current_files
+            .get(file_path)
+            .into_iter()
+            .chain(previous_file_states.get(file_path))
+            .map(|state| state.artifact_id)
+            .collect::<BTreeSet<_>>();
+        for artifact_id in artifact_ids {
+            if let Some(existing_ids) = relations_by_src_artifact.get(&artifact_id) {
+                relation_ids.extend(existing_ids.iter().copied());
+            }
         }
     }
 
@@ -2549,233 +2526,25 @@ fn imported_relations_exactly_equivalent(old: &Relation, new: &Relation) -> bool
         && old.evidence == new.evidence
 }
 
-fn imported_target_entities(
-    files: &HashMap<String, ImportedSemanticFileState>,
-    tolerant: bool,
-) -> Result<HashMap<EntityId, Entity>> {
-    let mut entities: HashMap<EntityId, Entity> = HashMap::new();
-    // Deterministic file order so the tolerant conflict resolution below is
-    // stable across runs (the map iterates in an unspecified order); reproducible
-    // hydration is required for a citable review.
-    let mut ordered: Vec<(&String, &ImportedSemanticFileState)> = files.iter().collect();
-    ordered.sort_by(|left, right| left.0.cmp(right.0));
-    for (_path, file) in ordered {
-        for entity in &file.entities {
-            match entities.get(&entity.id) {
-                // A content-addressed entity is not owned by one file: an
-                // identical definition projected into more than one file (a
-                // header and an amalgamated single-include copy, a vendored
-                // duplicate) resolves to the same entity id. Identical
-                // projections are the same entity, not a collision.
-                Some(existing) if imported_entities_exactly_equivalent(existing, entity) => {}
-                // Same id, diverging content: an entity-id derivation collision.
-                // Certification (strict) rejects it. Lazy-ref reads (review /
-                // history / blame) over arbitrary repos keep the first by
-                // deterministic file order and continue rather than failing the
-                // read on ancestry the caller is not certifying.
-                Some(_) if tolerant => {
-                    tracing::debug!(
-                        entity = %entity.id,
-                        "tolerant hydration: keeping first of diverging entity projections"
-                    );
-                }
-                Some(_) => {
-                    return Err(anyhow!(
-                        "historical hydration invariant violated: entity {} occurs with diverging content in more than one imported file state",
-                        entity.id
-                    ));
-                }
-                None => {
-                    entities.insert(entity.id, entity.clone());
-                }
-            }
-        }
-    }
-    Ok(entities)
-}
-
-struct ImportedRuntimeSemanticState {
-    entities: HashMap<EntityId, Entity>,
-    relations: HashMap<RelationId, Relation>,
-}
-
-fn imported_relation_mentions_entity(relation: &Relation, entity_id: EntityId) -> bool {
-    relation.src.as_entity() == Some(entity_id) || relation.dst.as_entity() == Some(entity_id)
-}
-
-/// Apply only the live entity/relation portion of runtime graph replay. This is
-/// deliberately kept field-for-field aligned with `kin_model`'s authoritative
-/// `replay_graph_state`; revisions, tombstones, and artifacts do not affect the
-/// live semantic diff produced by history hydration.
-fn apply_imported_change_to_runtime_state(
-    state: &mut ImportedRuntimeSemanticState,
-    change: &SemanticChange,
-) {
-    for delta in &change.entity_deltas {
-        match delta {
-            EntityDelta::Added(entity) => {
-                state.entities.insert(entity.id, entity.clone());
-            }
-            EntityDelta::Modified { new, .. } => {
-                state.entities.insert(new.id, new.clone());
-            }
-            EntityDelta::Removed(entity_id) => {
-                state.entities.remove(entity_id);
-                state
-                    .relations
-                    .retain(|_, relation| !imported_relation_mentions_entity(relation, *entity_id));
-            }
-        }
-    }
-    for delta in &change.relation_deltas {
-        match delta {
-            RelationDelta::Added(relation) => {
-                state.relations.insert(relation.id, relation.clone());
-            }
-            RelationDelta::Removed(relation_id) => {
-                state.relations.remove(relation_id);
-            }
-        }
-    }
-}
-
-/// Starting from the already-resolved first-parent state, replay exactly the
-/// changes runtime DFS contributes from each later parent. Shared ancestry is
-/// marked visited but never replayed twice. Unlike `resolve_graph_at` per merge,
-/// this traverses only change IDs through shared history and applies semantic
-/// payloads only for secondary-parent-unique changes, avoiding repeated full
-/// graph/revision reconstruction and its high-RSS quadratic behavior.
-fn replay_imported_secondary_parents(
-    state: &mut ImportedRuntimeSemanticState,
-    imported: &[kin_git::ImportedChange],
-    index_by_change_id: &HashMap<SemanticChangeId, usize>,
-    boundary_root: SemanticChangeId,
-    parents: &[SemanticChangeId],
-) -> Result<()> {
-    let Some(first_parent) = parents.first().copied() else {
-        return Err(anyhow!(
-            "historical hydration invariant violated: merge has no first parent"
-        ));
-    };
-
-    let mut visited = HashSet::new();
-    visited.insert(boundary_root);
-
-    // The supplied state already includes the complete first-parent history;
-    // mark that ancestry visited without replaying its semantic payloads.
-    let mut mark_stack = vec![first_parent];
-    while let Some(change_id) = mark_stack.pop() {
-        if !visited.insert(change_id) {
-            continue;
-        }
-        let imported_index = *index_by_change_id.get(&change_id).ok_or_else(|| {
-            anyhow!(
-                "historical hydration invariant violated: runtime replay cannot find imported ancestor {}",
-                change_id
-            )
-        })?;
-        mark_stack.extend(imported[imported_index].change.parents.iter().copied());
-    }
-
-    enum ReplayFrame {
-        Visit(SemanticChangeId),
-        Emit(usize),
-    }
-
-    // Match `collect_changes_topologically`: visit parents left-to-right,
-    // emit each change after its parents, and skip every ID already reached by
-    // an earlier direct parent.
-    for secondary_parent in parents.iter().skip(1).copied() {
-        let mut stack = vec![ReplayFrame::Visit(secondary_parent)];
-        while let Some(frame) = stack.pop() {
-            match frame {
-                ReplayFrame::Visit(change_id) => {
-                    if !visited.insert(change_id) {
-                        continue;
-                    }
-                    let imported_index =
-                        *index_by_change_id.get(&change_id).ok_or_else(|| {
-                            anyhow!(
-                                "historical hydration invariant violated: runtime replay cannot find imported ancestor {}",
-                                change_id
-                            )
-                        })?;
-                    stack.push(ReplayFrame::Emit(imported_index));
-                    for parent in imported[imported_index].change.parents.iter().rev() {
-                        stack.push(ReplayFrame::Visit(*parent));
-                    }
-                }
-                ReplayFrame::Emit(imported_index) => {
-                    apply_imported_change_to_runtime_state(state, &imported[imported_index].change);
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Build the semantic delta that transforms runtime's all-parent merge state
-/// into the target Git tree parsed against the commit's first parent.
-fn rebase_imported_merge_semantic_deltas(
-    all_parent_baseline: &ImportedRuntimeSemanticState,
-    target_files: &HashMap<String, ImportedSemanticFileState>,
-    target_relations: &HashMap<RelationId, Relation>,
-    tolerant: bool,
-) -> Result<(Vec<EntityDelta>, Vec<RelationDelta>)> {
-    let target_entities = imported_target_entities(target_files, tolerant)?;
-    let mut entity_ids = BTreeSet::new();
-    entity_ids.extend(all_parent_baseline.entities.keys().copied());
-    entity_ids.extend(target_entities.keys().copied());
-
-    let mut entity_deltas = Vec::new();
-    for entity_id in entity_ids {
-        match (
-            all_parent_baseline.entities.get(&entity_id),
-            target_entities.get(&entity_id),
-        ) {
-            (Some(old), Some(new)) if !imported_entities_exactly_equivalent(old, new) => {
-                entity_deltas.push(EntityDelta::Modified {
-                    old: old.clone(),
-                    new: new.clone(),
-                });
-            }
-            (Some(_), None) => entity_deltas.push(EntityDelta::Removed(entity_id)),
-            (None, Some(new)) => entity_deltas.push(EntityDelta::Added(new.clone())),
-            _ => {}
-        }
-    }
-
-    let mut relation_ids = HashSet::new();
-    relation_ids.extend(all_parent_baseline.relations.keys().copied());
-    relation_ids.extend(target_relations.keys().copied());
-    let mut relation_ids: Vec<_> = relation_ids.into_iter().collect();
-    relation_ids.sort_by_key(|relation_id| relation_id.0);
-
-    let mut relation_deltas = Vec::new();
-    for relation_id in relation_ids {
-        match (
-            all_parent_baseline.relations.get(&relation_id),
-            target_relations.get(&relation_id),
-        ) {
-            (Some(old), Some(new)) if !imported_relations_exactly_equivalent(old, new) => {
-                relation_deltas.push(RelationDelta::Removed(relation_id));
-                relation_deltas.push(RelationDelta::Added(new.clone()));
-            }
-            (Some(_), None) => relation_deltas.push(RelationDelta::Removed(relation_id)),
-            (None, Some(new)) => relation_deltas.push(RelationDelta::Added(new.clone())),
-            _ => {}
-        }
-    }
-
-    Ok((entity_deltas, relation_deltas))
-}
-
 pub(crate) fn entity_fingerprint_changed(old: &Entity, new: &Entity) -> bool {
     kin_index::entity_semantics_changed(old, new)
 }
 
+fn imported_entity_id(artifact_id: ArtifactId, parser_id: EntityId) -> EntityId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kin.imported-entity.v1\0");
+    hasher.update(artifact_id.0.as_bytes());
+    hasher.update(parser_id.0.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    EntityId(uuid::Uuid::from_bytes(bytes))
+}
+
 fn reconcile_imported_file_entities(
+    artifact_id: ArtifactId,
     old_entities: &[Entity],
     parsed_entities: &[Entity],
 ) -> (Vec<EntityDelta>, Vec<Entity>) {
@@ -2801,26 +2570,33 @@ fn reconcile_imported_file_entities(
             });
 
         match existing {
-            Some(old) if entity_fingerprint_changed(old, parsed_entity) => {
-                // Re-key the parser-assigned id onto the stable existing id for
-                // this commit. The parse output is shared across commits through
-                // the memo, so clone rather than mutate the borrowed entity.
+            Some(old) => {
+                // Re-key the parser-assigned id onto the stable existing id.
+                // Exact location and metadata changes (including a rename with
+                // byte-identical content) are still real Modified payloads.
                 let mut stabilized = parsed_entity.clone();
                 stabilized.id = old.id;
+                stabilized.lineage_parent = old.lineage_parent;
+                stabilized.created_in = old.created_in;
+                stabilized.superseded_by = old.superseded_by;
                 matched_old_entities.insert(old.id);
-                entity_deltas.push(EntityDelta::Modified {
-                    old: old.clone(),
-                    new: stabilized.clone(),
-                });
+                if !imported_entities_exactly_equivalent(old, &stabilized) {
+                    entity_deltas.push(EntityDelta::Modified {
+                        old: old.clone(),
+                        new: stabilized.clone(),
+                    });
+                }
                 current_entities.push(stabilized);
             }
-            Some(old) => {
-                matched_old_entities.insert(old.id);
-                current_entities.push(old.clone());
-            }
             None => {
-                entity_deltas.push(EntityDelta::Added(parsed_entity.clone()));
-                current_entities.push(parsed_entity.clone());
+                // Parser ids are path-derived and can repeat when a path is
+                // deleted then reused. Namespace first-introduction identity by
+                // the graph-assigned artifact so unrelated lifetimes never
+                // collapse into one semantic entity lineage.
+                let mut introduced = parsed_entity.clone();
+                introduced.id = imported_entity_id(artifact_id, parsed_entity.id);
+                entity_deltas.push(EntityDelta::Added(introduced.clone()));
+                current_entities.push(introduced);
             }
         }
     }
@@ -2929,7 +2705,7 @@ fn link_parse_completeness_from_layouts(
 
 fn index_files_with_stable_entity_ids(
     graph: &kin_db::InMemoryGraph,
-    blob_store: &kin_blobs::BlobStore,
+    _blob_store: &kin_blobs::BlobStore,
     files: &[IndexableFile],
     prior_entities_by_file: &HashMap<String, Vec<Entity>>,
 ) -> Result<(
@@ -2952,12 +2728,7 @@ fn index_files_with_stable_entity_ids(
             Ok(files
                 .par_iter()
                 .map(|file| {
-                    let source = match fs::read(&file.abs_path) {
-                        Ok(source) => source,
-                        Err(_) => return ParsedFileResult::Skipped,
-                    };
-
-                    let _ = blob_store.write(&source);
+                    let source = file.content.as_slice();
 
                     let file_id = FilePathId::new(&file.rel_path);
                     let projection_markers =
@@ -2977,8 +2748,7 @@ fn index_files_with_stable_entity_ids(
                     match &file.classification {
                         FileClassification::EntitySource => {
                             let registry = kin_parser::AdapterRegistry::new();
-                            let ext = file
-                                .abs_path
+                            let ext = Path::new(&file.rel_path)
                                 .extension()
                                 .and_then(|e| e.to_str())
                                 .unwrap_or("");
@@ -3255,7 +3025,11 @@ fn build_projection_relations_from_markers(
         return Vec::new();
     }
 
-    let known_files: HashSet<String> = graph.working_tree_paths().into_iter().collect();
+    let known_files: HashSet<String> = graph
+        .resolved_tree()
+        .artifacts_by_path()
+        .filter_map(|artifact| artifact.path.as_utf8().map(str::to_owned))
+        .collect();
     projection_marker_files
         .iter()
         .flat_map(|(file_path, markers)| {
@@ -3263,7 +3037,11 @@ fn build_projection_relations_from_markers(
                 file_path,
                 markers,
                 &known_files,
-                |path| graph.artifact_id_for_path(&FilePathId::new(path)),
+                |path| {
+                    RepoPath::from_utf8(path)
+                        .ok()
+                        .and_then(|repo_path| graph.artifact_id_at_path(&repo_path))
+                },
             )
         })
         .collect()
@@ -3459,87 +3237,6 @@ fn file_language_hint(file_id: &FilePathId) -> String {
         .to_string()
 }
 
-fn collect_indexable_files(
-    source_root: &Path,
-    all_files: &[PathBuf],
-) -> Result<Vec<IndexableFile>> {
-    let _span = tracing::info_span!(
-        "kin.init.collect_indexable_files",
-        root = %source_root.display(),
-        files = all_files.len()
-    )
-    .entered();
-
-    let files = run_with_init_resource_pool("collect_indexable_files", || {
-        Ok(all_files
-            .par_iter()
-            .filter_map(|file_path| {
-                if fs::symlink_metadata(file_path)
-                    .ok()?
-                    .file_type()
-                    .is_symlink()
-                {
-                    return None;
-                }
-                let source = fs::read(file_path).ok()?;
-                let classification = FileClassifier::classify(file_path);
-                Some(IndexableFile {
-                    abs_path: file_path.clone(),
-                    rel_path: file_path
-                        .strip_prefix(source_root)
-                        .unwrap_or(file_path)
-                        .to_string_lossy()
-                        .to_string(),
-                    hash: kin_blobs::digest_bytes(&source),
-                    classification,
-                })
-            })
-            .collect())
-    })?;
-
-    Ok(files)
-}
-
-fn read_exact_init_source(path: &Path) -> Result<(Vec<u8>, kin_index::ScannedEntryKind)> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("inspect exact init source {}", path.display()))?;
-    if metadata.file_type().is_symlink() {
-        let target = fs::read_link(path)
-            .with_context(|| format!("read symbolic link {}", path.display()))?;
-        #[cfg(unix)]
-        let target = {
-            use std::os::unix::ffi::OsStrExt;
-            target.as_os_str().as_bytes().to_vec()
-        };
-        #[cfg(not(unix))]
-        let target = target
-            .to_str()
-            .ok_or_else(|| {
-                anyhow!(
-                    "symbolic link target cannot be represented exactly on this platform: {}",
-                    path.display()
-                )
-            })?
-            .as_bytes()
-            .to_vec();
-        return Ok((target, kin_index::ScannedEntryKind::Symlink));
-    }
-    if !metadata.is_file() {
-        anyhow::bail!("unsupported source entry type: {}", path.display());
-    }
-    #[cfg(unix)]
-    let executable = {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    };
-    #[cfg(not(unix))]
-    let executable = false;
-    Ok((
-        fs::read(path).with_context(|| format!("read exact init source {}", path.display()))?,
-        kin_index::ScannedEntryKind::Regular { executable },
-    ))
-}
-
 fn exact_tree_entry(hash: [u8; 32], kind: kin_index::ScannedEntryKind) -> TreeEntry {
     let hash = Hash256::from_bytes(hash);
     match kind {
@@ -3548,36 +3245,9 @@ fn exact_tree_entry(hash: [u8; 32], kind: kin_index::ScannedEntryKind) -> TreeEn
     }
 }
 
-fn collect_exact_init_source_entries(
-    source_root: &Path,
-    all_files: &[PathBuf],
-) -> Result<Vec<ExactInitSourceEntry>> {
-    all_files
-        .iter()
-        .map(|path| {
-            let relative = path.strip_prefix(source_root).with_context(|| {
-                format!(
-                    "frozen source path {} escaped root {}",
-                    path.display(),
-                    source_root.display()
-                )
-            })?;
-            let repo_path = kin_index::repo_path_from_host_relative(relative)?;
-            let (bytes, kind) = read_exact_init_source(path)?;
-            let hash = kin_blobs::digest_bytes(&bytes);
-            Ok(ExactInitSourceEntry {
-                abs_path: path.clone(),
-                repo_path,
-                hash,
-                entry: exact_tree_entry(hash, kind),
-            })
-        })
-        .collect()
-}
-
-/// Diff the frozen source snapshot against the exact parent tree. Warm init
-/// must record removals as well as additions/mode changes, including deletion
-/// of the final source file, or graph-owned source history keeps ghost files.
+/// Diff the admitted source scan against the exact parent tree. Native init
+/// records removals as well as additions and mode changes so graph-owned truth
+/// cannot retain files that no longer exist at the ingestion boundary.
 fn build_exact_init_tree_deltas(
     parent: ResolvedTree,
     current: &[ExactInitSourceEntry],
@@ -3629,353 +3299,6 @@ fn build_exact_init_tree_deltas(
     deltas
 }
 
-fn try_warm_init_from_cache(
-    dir: &Path,
-    layout: &kin_core::KinLayout,
-    local_snap: &kin_db::SnapshotManager,
-    blob_store: &kin_blobs::BlobStore,
-    indexable_files: &[IndexableFile],
-) -> Result<Option<InitIndexSummary>> {
-    let _span = tracing::info_span!(
-        "kin.init.try_warm_init_from_cache",
-        root = %dir.display(),
-        files = indexable_files.len()
-    )
-    .entered();
-    let wt = std::time::Instant::now();
-    macro_rules! wphase {
-        ($name:expr) => {
-            eprintln!("  [warm-timer] {:>35}: {:.2}s", $name, wt.elapsed().as_secs_f64());
-        };
-        ($name:expr, $($arg:tt)*) => {
-            eprintln!("  [warm-timer] {:>35}: {:.2}s ({})", $name, wt.elapsed().as_secs_f64(), format!($($arg)*));
-        };
-    }
-
-    let Some(cache_dir) = init_cache_repo_path(dir) else {
-        return Ok(None);
-    };
-    // A HEAD recorded in the manifest resolves to a trusted bundle. An
-    // unrecorded HEAD may still share semantic truth with a cached bundle (a
-    // sibling clone, a no-op commit, or a doc-only change); adopt that
-    // content-addressed candidate only speculatively, and confirm below that no
-    // entity-source file diverged before grafting so a divergent HEAD still
-    // cold-inits.
-    let (cache_graph_path, speculative_candidate) =
-        match resolve_warm_cache_graph_path(dir, &cache_dir)? {
-            Some(path) => (path, false),
-            None => match resolve_warm_cache_content_candidate(dir, &cache_dir)? {
-                Some(path) => (path, true),
-                None => return Ok(None),
-            },
-        };
-    if !cache_graph_path.exists() {
-        return Ok(None);
-    }
-    wphase!("resolve_cache_path");
-
-    let cache_snap = match kin_db::SnapshotManager::open_without_text_index(&cache_graph_path) {
-        Ok(snap) => snap,
-        Err(err) => {
-            warn!(path = %cache_graph_path.display(), error = %err, "failed to open warm init cache");
-            return Ok(None);
-        }
-    };
-    let cache_graph = cache_snap.graph();
-    load_warm_cache_vector_index(cache_graph.as_ref(), &cache_graph_path)?;
-    wphase!("open_cache_graph");
-
-    let current_files: Vec<(String, [u8; 32])> = indexable_files
-        .iter()
-        .map(|file| (file.rel_path.clone(), file.hash))
-        .collect();
-    let diff = kin_db::engine::compute_diff(cache_graph.as_ref(), &current_files);
-    let changed_files = diff.changed_count();
-    wphase!(
-        "compute_diff",
-        "changed={} added={} modified={} removed={}",
-        changed_files,
-        diff.added_files.len(),
-        diff.modified_files.len(),
-        diff.removed_files.len()
-    );
-
-    // A speculative candidate (the current HEAD is not recorded in the manifest)
-    // may only be grafted when the working tree's parsed semantic truth matches
-    // it. An added, modified, or removed entity-source or shallow-syntax file
-    // diverges that truth, so reject to a cold init rather than graft a foreign
-    // semantic base onto an unrecorded HEAD. Artifact and opaque deltas (docs,
-    // configs, manifests) carry no entity truth and stay reusable.
-    if speculative_candidate {
-        let semantic_source_diverged = diff
-            .added_files
-            .iter()
-            .chain(diff.modified_files.iter())
-            .chain(diff.removed_files.iter())
-            .any(|path| {
-                matches!(
-                    FileClassifier::classify(Path::new(path)),
-                    FileClassification::EntitySource | FileClassification::ShallowSyntax { .. }
-                )
-            });
-        if semantic_source_diverged {
-            return Ok(None);
-        }
-    }
-
-    let delta = if diff.is_empty() {
-        wphase!("apply_delta (skipped — no changes)");
-        WarmCacheDeltaResult::default()
-    } else {
-        let delta =
-            apply_warm_cache_delta(cache_graph.as_ref(), blob_store, indexable_files, &diff)?;
-        wphase!("apply_delta", "reparsed={}", delta.reparsed_files);
-        delta
-    };
-    let scrubbed_paths = scrub_internal_graph_truth(cache_graph.as_ref())?;
-    wphase!("scrub_internal_graph_truth");
-    if !scrubbed_paths.is_empty() {
-        warn!(
-            count = scrubbed_paths.len(),
-            "scrubbed internal control-plane paths from warm init cache"
-        );
-    }
-    let mut warm_text_index_reused = sync_warm_text_index_sidecar(
-        local_snap,
-        layout,
-        &cache_graph_path,
-        diff.is_empty() && scrubbed_paths.is_empty(),
-    )?;
-    wphase!("sync_warm_text_index_sidecar");
-
-    graft_semantic_state(local_snap, layout, cache_graph.as_ref());
-    wphase!("graft_semantic_state");
-    if warm_text_index_reused {
-        warm_text_index_reused =
-            ensure_reused_warm_text_index_complete(local_snap, layout, cache_graph.as_ref())?;
-        wphase!("validate_warm_text_index_sidecar");
-    }
-
-    let warm_embedding_status = restore_warm_embedding_state(
-        local_snap,
-        layout,
-        cache_graph.as_ref(),
-        Some(cache_graph_path.with_extension("kvec").as_path()),
-        &delta.queued_embeddings,
-        &delta.queued_artifacts,
-    )?;
-    wphase!("restore_warm_embedding_state");
-    let local_graph = local_snap.graph();
-    Ok(Some(InitIndexSummary {
-        total_entity_count: local_graph.entity_count(),
-        total_files: local_graph.working_tree_paths().len(),
-        linked_relations: local_graph.relation_count(),
-        warm_cache_hit: true,
-        warm_text_index_reused,
-        warm_vector_index_reused: warm_embedding_status.vector_index_reused,
-        warm_requeued_embeddings: warm_embedding_status.requeued_embeddings,
-        warm_changed_files: changed_files,
-        warm_reparsed_files: delta.reparsed_files,
-    }))
-}
-
-fn apply_warm_cache_delta(
-    graph: &kin_db::InMemoryGraph,
-    blob_store: &kin_blobs::BlobStore,
-    indexable_files: &[IndexableFile],
-    diff: &kin_db::engine::IncrementalDiff,
-) -> Result<WarmCacheDeltaResult> {
-    let _span = tracing::info_span!(
-        "kin.init.apply_warm_cache_delta",
-        added = diff.added_files.len(),
-        modified = diff.modified_files.len(),
-        removed = diff.removed_files.len()
-    )
-    .entered();
-    let dt = std::time::Instant::now();
-    macro_rules! dphase {
-        ($name:expr) => {
-            eprintln!("  [delta-timer] {:>35}: {:.2}s", $name, dt.elapsed().as_secs_f64());
-        };
-        ($name:expr, $($arg:tt)*) => {
-            eprintln!("  [delta-timer] {:>35}: {:.2}s ({})", $name, dt.elapsed().as_secs_f64(), format!($($arg)*));
-        };
-    }
-
-    let file_map: HashMap<&str, &IndexableFile> = indexable_files
-        .iter()
-        .map(|file| (file.rel_path.as_str(), file))
-        .collect();
-
-    let old_entities_by_file = collect_prior_entities_by_file(graph, diff.modified_files.iter())?;
-    let old_source_relations =
-        collect_source_relations_for_files(graph, diff.modified_files.iter())?;
-    dphase!(
-        "snapshot_changed_file_state",
-        "modified={} source_rels={}",
-        old_entities_by_file.len(),
-        old_source_relations.len()
-    );
-
-    let removed_artifact_relation_ids =
-        collect_artifact_relation_ids_for_files(graph, diff.removed_files.iter())?;
-    remove_relations_batch_by_id(graph, &removed_artifact_relation_ids)?;
-    for path in &diff.removed_files {
-        clear_file_semantic_state(graph, path)?;
-    }
-    dphase!(
-        "clear_removed_file_state",
-        "removed={} artifact_rels={}",
-        diff.removed_files.len(),
-        removed_artifact_relation_ids.len()
-    );
-
-    let mut reparsed_paths = BTreeSet::new();
-    reparsed_paths.extend(diff.modified_files.iter().cloned());
-    reparsed_paths.extend(diff.added_files.iter().cloned());
-    if reparsed_paths.is_empty() {
-        return Ok(WarmCacheDeltaResult::default());
-    }
-
-    let selected_files: Vec<IndexableFile> = reparsed_paths
-        .iter()
-        .filter_map(|path| file_map.get(path.as_str()).copied().cloned())
-        .collect();
-    let selected_paths: BTreeSet<String> = selected_files
-        .iter()
-        .map(|file| file.rel_path.clone())
-        .collect();
-    let unindexed_modified_files: Vec<String> = diff
-        .modified_files
-        .iter()
-        .filter(|path| !selected_paths.contains(*path))
-        .cloned()
-        .collect();
-    for path in &unindexed_modified_files {
-        clear_file_semantic_state(graph, path)?;
-    }
-    for file in &selected_files {
-        clear_file_tracking_for_reparse(graph, &file.rel_path, &file.classification)?;
-    }
-    dphase!(
-        "select_files_to_reparse",
-        "selected={} unindexed_modified={}",
-        selected_files.len(),
-        unindexed_modified_files.len()
-    );
-
-    let (_, _, file_parse_data, _, projection_relations) = index_files_with_stable_entity_ids(
-        graph,
-        blob_store,
-        &selected_files,
-        &old_entities_by_file,
-    )?;
-    let parse_completeness_by_file = link_parse_completeness_from_layouts(graph, &file_parse_data)?;
-    dphase!("index_files (reparse)");
-
-    remove_stale_reparsed_entities(graph, &old_entities_by_file, &file_parse_data)?;
-    dphase!("remove_stale_reparsed_entities");
-
-    let queued_embeddings = file_parse_data
-        .iter()
-        .flat_map(|file| file.entities.iter().map(|entity| entity.id))
-        .collect();
-    let mut queued_artifacts: Vec<ArtifactId> = selected_files
-        .iter()
-        .filter_map(|file| match file.classification {
-            FileClassification::EntitySource => None,
-            FileClassification::ShallowSyntax { .. }
-            | FileClassification::StructuredArtifact(_)
-            | FileClassification::OpaqueArtifact { .. } => Some(&file.rel_path),
-        })
-        .map(|path| artifact_id_for_file(graph, path))
-        .collect::<Result<_>>()?;
-    queued_artifacts.sort_unstable();
-    queued_artifacts.dedup();
-    let incremental_linker = build_incremental_linker_from_graph(graph)?;
-    dphase!(
-        "build_incremental_linker",
-        "known_files={}",
-        incremental_linker.known_files.len()
-    );
-
-    let mut linked_relations = kin_index::link_cross_file_incremental_with_completeness(
-        &file_parse_data,
-        &incremental_linker,
-        &parse_completeness_by_file,
-    )?;
-    linked_relations.extend(projection_relations);
-    let new_relation_ids: HashSet<RelationId> = linked_relations
-        .iter()
-        .map(|relation| relation.id)
-        .collect();
-    let stale_source_relation_ids: Vec<RelationId> = old_source_relations
-        .keys()
-        .filter(|relation_id| !new_relation_ids.contains(relation_id))
-        .copied()
-        .collect();
-    remove_relations_batch_by_id(graph, &stale_source_relation_ids)?;
-    dphase!(
-        "link_changed_files_incremental",
-        "relations={} stale_source_rels={}",
-        linked_relations.len(),
-        stale_source_relation_ids.len()
-    );
-
-    graph.upsert_relations_batch(&linked_relations)?;
-    dphase!("upsert_relations_batch");
-
-    Ok(WarmCacheDeltaResult {
-        reparsed_files: selected_files.len(),
-        queued_embeddings,
-        queued_artifacts,
-    })
-}
-
-fn collect_prior_entities_by_file<'a, I>(
-    graph: &kin_db::InMemoryGraph,
-    files: I,
-) -> Result<HashMap<String, Vec<Entity>>>
-where
-    I: IntoIterator<Item = &'a String>,
-{
-    let mut by_file = HashMap::new();
-    for file in files {
-        let entities = entities_for_file(graph, file)?;
-        if !entities.is_empty() {
-            by_file.insert(file.clone(), entities);
-        }
-    }
-    Ok(by_file)
-}
-
-fn collect_source_relations_for_files<'a, I>(
-    graph: &kin_db::InMemoryGraph,
-    files: I,
-) -> Result<HashMap<RelationId, Relation>>
-where
-    I: IntoIterator<Item = &'a String>,
-{
-    let mut relations = HashMap::new();
-    for file in files {
-        for entity in entities_for_file(graph, file)? {
-            for relation in graph.get_all_relations_for_entity(&entity.id)? {
-                if relation.src == GraphNodeId::Entity(entity.id) {
-                    relations.insert(relation.id, relation);
-                }
-            }
-        }
-
-        let artifact_node = GraphNodeId::Artifact(artifact_id_for_file(graph, file)?);
-        for relation in graph.get_all_relations_for_node(&artifact_node)? {
-            if relation.src == artifact_node {
-                relations.insert(relation.id, relation);
-            }
-        }
-    }
-    Ok(relations)
-}
-
 fn collect_artifact_relation_ids_for_files<'a, I>(
     graph: &kin_db::InMemoryGraph,
     files: I,
@@ -4025,158 +3348,6 @@ fn remove_relations_batch_by_id(
     Ok(())
 }
 
-fn clear_file_tracking_for_reparse(
-    graph: &kin_db::InMemoryGraph,
-    path: &str,
-    classification: &FileClassification,
-) -> Result<()> {
-    let file_id = FilePathId::new(path);
-    match classification {
-        FileClassification::EntitySource => {
-            graph.delete_shallow_file(&file_id)?;
-            graph.delete_structured_artifact(&file_id)?;
-            graph.delete_opaque_artifact(&file_id)?;
-        }
-        FileClassification::ShallowSyntax { .. } => {
-            graph.delete_file_layout(&file_id)?;
-            graph.delete_structured_artifact(&file_id)?;
-            graph.delete_opaque_artifact(&file_id)?;
-        }
-        FileClassification::StructuredArtifact(_) => {
-            graph.delete_file_layout(&file_id)?;
-            graph.delete_shallow_file(&file_id)?;
-            graph.delete_opaque_artifact(&file_id)?;
-        }
-        FileClassification::OpaqueArtifact { .. } => {
-            graph.delete_file_layout(&file_id)?;
-            graph.delete_shallow_file(&file_id)?;
-            graph.delete_structured_artifact(&file_id)?;
-        }
-    }
-    Ok(())
-}
-
-fn remove_stale_reparsed_entities(
-    graph: &kin_db::InMemoryGraph,
-    old_entities_by_file: &HashMap<String, Vec<Entity>>,
-    file_parse_data: &[kin_index::FileParseData],
-) -> Result<()> {
-    let current_ids_by_file: HashMap<&str, HashSet<EntityId>> = file_parse_data
-        .iter()
-        .map(|file| {
-            (
-                file.file_path.as_str(),
-                file.entities.iter().map(|entity| entity.id).collect(),
-            )
-        })
-        .collect();
-
-    for (file, old_entities) in old_entities_by_file {
-        let current_ids = current_ids_by_file.get(file.as_str());
-        let stale_ids: Vec<EntityId> = old_entities
-            .iter()
-            .filter(|entity| {
-                current_ids
-                    .map(|ids| !ids.contains(&entity.id))
-                    .unwrap_or(true)
-            })
-            .map(|entity| entity.id)
-            .collect();
-        graph.remove_entities_batch(&stale_ids)?;
-    }
-    Ok(())
-}
-
-fn build_incremental_linker_from_graph(
-    graph: &kin_db::InMemoryGraph,
-) -> Result<kin_index::IncrementalLinker> {
-    let mut linker = kin_index::IncrementalLinker::new();
-    let indexed_paths = graph
-        .repository_paths()
-        .into_iter()
-        .filter_map(|path| path.as_utf8().map(str::to_owned))
-        .collect::<Vec<_>>();
-    for path in &indexed_paths {
-        linker.known_files.insert(path.clone());
-    }
-
-    let mut entities_by_file = BTreeMap::<String, Vec<Entity>>::new();
-    let mut entity_meta = HashMap::<EntityId, (String, String)>::new();
-    for entity in graph.query_entities(&EntityFilter::default())? {
-        let Some(file_path) = entity.file_origin.as_ref().map(|path| path.0.clone()) else {
-            continue;
-        };
-        entity_meta.insert(entity.id, (entity.name.clone(), file_path.clone()));
-        entities_by_file.entry(file_path).or_default().push(entity);
-    }
-    for (file_path, entities) in entities_by_file {
-        let artifact_id = artifact_id_for_file(graph, &file_path)?;
-        linker.add_file(&file_path, artifact_id, &entities);
-    }
-
-    // Rehydrate per-file class hierarchies from the committed Extends edges so
-    // inheritance-aware method resolution keeps working across reopen — the
-    // reparsed subset alone would only see step-local hierarchies, and an
-    // inheritance walk crossing into an unchanged file would dead-end.
-    // Committed edges carry no declaration order, so bases are sorted
-    // lexicographically — the same order every other recording path uses.
-    let mut bases_by_file_class = BTreeMap::<(String, String), Vec<String>>::new();
-    for (src, kind, dst, _confidence) in graph.list_all_entity_edges() {
-        if kind != RelationKind::Extends {
-            continue;
-        }
-        let (Some((src_name, src_file)), Some((dst_name, _))) =
-            (entity_meta.get(&src), entity_meta.get(&dst))
-        else {
-            continue;
-        };
-        let bases = bases_by_file_class
-            .entry((src_file.clone(), src_name.clone()))
-            .or_default();
-        if !bases.contains(dst_name) {
-            bases.push(dst_name.clone());
-        }
-    }
-    for ((file_path, class_name), mut bases) in bases_by_file_class {
-        bases.sort_unstable();
-        linker
-            .class_bases_by_file
-            .entry(file_path)
-            .or_default()
-            .push((class_name, bases));
-    }
-
-    // Rehydrate per-file include state from the committed artifact include
-    // edges so include-closure disambiguation keeps working across reopen —
-    // the reparsed subset alone would only see step-local includes.
-    for path in &indexed_paths {
-        let artifact_node = GraphNodeId::Artifact(artifact_id_for_file(graph, path)?);
-        let mut targets = Vec::new();
-        for relation in graph.get_all_relations_for_node(&artifact_node)? {
-            if relation.kind != RelationKind::Includes || relation.src != artifact_node {
-                continue;
-            }
-            let GraphNodeId::Artifact(dst_artifact) = relation.dst else {
-                continue;
-            };
-            let Some(dst_path) = graph.repo_path_for_artifact_id(&dst_artifact) else {
-                continue;
-            };
-            let Some(dst_path) = dst_path.as_utf8() else {
-                continue;
-            };
-            targets.push(dst_path.to_owned());
-        }
-        if !targets.is_empty() {
-            targets.sort();
-            targets.dedup();
-            linker.include_targets_by_file.insert(path.clone(), targets);
-        }
-    }
-
-    Ok(linker)
-}
-
 fn entities_for_file(graph: &kin_db::InMemoryGraph, path: &str) -> Result<Vec<Entity>> {
     let filter = EntityFilter {
         file_path: Some(FilePathId::new(path)),
@@ -4206,13 +3377,21 @@ pub(crate) fn is_repo_owned_graph_path(path: &str) -> bool {
 
 fn scrub_internal_graph_truth(graph: &kin_db::InMemoryGraph) -> Result<Vec<String>> {
     let mut stale_paths = BTreeSet::new();
-
-    stale_paths.extend(
-        graph
-            .working_tree_paths()
-            .into_iter()
-            .filter(|path| !is_repo_owned_graph_path(path)),
-    );
+    let stale_tree_entries: Vec<(String, ArtifactId, LocatedEntry)> = graph
+        .resolved_tree()
+        .artifacts_by_path()
+        .filter_map(|artifact| {
+            let path = artifact.path.as_utf8()?;
+            (!is_repo_owned_graph_path(path)).then(|| {
+                (
+                    path.to_owned(),
+                    artifact.artifact_id,
+                    artifact.located_entry(),
+                )
+            })
+        })
+        .collect();
+    stale_paths.extend(stale_tree_entries.iter().map(|(path, _, _)| path.clone()));
     stale_paths.extend(
         graph
             .list_shallow_files()?
@@ -4237,7 +3416,16 @@ fn scrub_internal_graph_truth(graph: &kin_db::InMemoryGraph) -> Result<Vec<Strin
 
     for path in &stale_paths {
         clear_file_semantic_state(graph, path)?;
-        graph.remove_working_tree_entry(path);
+    }
+    if !stale_tree_entries.is_empty() {
+        graph.apply_transaction_delta(&TransactionDelta {
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: stale_tree_entries
+                .into_iter()
+                .map(|(_, artifact_id, old)| TreeDelta::Removed { artifact_id, old })
+                .collect(),
+        })?;
     }
 
     Ok(stale_paths.into_iter().collect())
@@ -4302,633 +3490,20 @@ fn summarize_shallow_items(items: impl IntoIterator<Item = String>) -> Vec<Strin
     result
 }
 
-fn graft_semantic_state(
-    local_snap: &kin_db::SnapshotManager,
-    layout: &kin_core::KinLayout,
-    source_graph: &kin_db::InMemoryGraph,
-) {
-    let _span = tracing::info_span!("kin.init.graft_semantic_state").entered();
-    let mut local_snapshot = local_snap.graph().to_snapshot();
-    let source_snapshot = source_graph.to_snapshot();
-    local_snapshot.entities = source_snapshot.entities;
-    local_snapshot.relations = source_snapshot.relations;
-    local_snapshot.outgoing = source_snapshot.outgoing;
-    local_snapshot.incoming = source_snapshot.incoming;
-    local_snapshot.shallow_files = source_snapshot.shallow_files;
-    local_snapshot.structured_artifacts = source_snapshot.structured_artifacts;
-    local_snapshot.opaque_artifacts = source_snapshot.opaque_artifacts;
-    local_snapshot.working_tree = source_snapshot.working_tree;
-    local_snapshot.artifact_index = source_snapshot.artifact_index;
-    local_snapshot.changes = source_snapshot.changes;
-    local_snapshot.change_children = source_snapshot.change_children;
-    local_snapshot.branches = source_snapshot.branches;
-
-    local_snap.swap(kin_db::InMemoryGraph::from_snapshot_with_text_index(
-        local_snapshot,
-        layout.text_index_dir(),
-    ));
-}
-
-fn sync_warm_text_index_sidecar(
-    local_snap: &kin_db::SnapshotManager,
-    layout: &kin_core::KinLayout,
-    cache_graph_path: &Path,
-    reuse_cached_sidecar: bool,
-) -> Result<bool> {
-    if !reuse_cached_sidecar {
-        return Ok(false);
-    }
-
-    let Some(cache_dir) = cache_graph_path.parent() else {
-        return Ok(false);
-    };
-    let cache_text_index_dir = cache_dir.join("text-index");
-    if !cache_text_index_dir.exists() {
-        return Ok(false);
-    }
-
-    // Release local persistent text-index handles before replacing the sidecar.
-    let local_snapshot = local_snap.graph().to_snapshot();
-    let local_root_hash = kin_db::compute_graph_root_hash(&local_snapshot);
-    local_snap.swap(kin_db::InMemoryGraph::from_snapshot_with_root_hash(
-        local_snapshot,
-        local_root_hash,
-    ));
-
-    let local_text_index_dir = layout.text_index_dir();
-    if local_text_index_dir.exists() {
-        fs::remove_dir_all(&local_text_index_dir)?;
-    }
-    copy_dir_recursive(&cache_text_index_dir, &local_text_index_dir)?;
-    Ok(true)
-}
-
-fn ensure_reused_warm_text_index_complete(
-    local_snap: &kin_db::SnapshotManager,
-    layout: &kin_core::KinLayout,
-    source_graph: &kin_db::InMemoryGraph,
-) -> Result<bool> {
-    let stats = local_snap.graph().graph_stats();
-    if stats.total_entities == 0 || stats.text_indexed_entity_count >= stats.total_entities {
-        return Ok(true);
-    }
-
-    warn!(
-        total_entities = stats.total_entities,
-        text_indexed_entity_count = stats.text_indexed_entity_count,
-        "warm init cache text index sidecar had incomplete entity coverage; rebuilding"
-    );
-
-    // Release any open persistent text-index handle before deleting the reused
-    // sidecar, then graft the cached graph again so kin-db rebuilds a fresh
-    // text index from semantic truth.
-    let local_snapshot = local_snap.graph().to_snapshot();
-    let local_root_hash = kin_db::compute_graph_root_hash(&local_snapshot);
-    local_snap.swap(kin_db::InMemoryGraph::from_snapshot_with_root_hash(
-        local_snapshot,
-        local_root_hash,
-    ));
-
-    let local_text_index_dir = layout.text_index_dir();
-    if local_text_index_dir.exists() {
-        fs::remove_dir_all(&local_text_index_dir)?;
-    }
-    graft_semantic_state(local_snap, layout, source_graph);
-
-    let rebuilt_stats = local_snap.graph().graph_stats();
-    if rebuilt_stats.total_entities > 0
-        && rebuilt_stats.text_indexed_entity_count < rebuilt_stats.total_entities
-    {
-        warn!(
-            total_entities = rebuilt_stats.total_entities,
-            text_indexed_entity_count = rebuilt_stats.text_indexed_entity_count,
-            "rebuilt warm init text index still has incomplete entity coverage"
-        );
-        return Ok(false);
-    }
-
-    Ok(true)
-}
-
-#[cfg(feature = "vector")]
-fn restore_warm_embedding_state(
-    local_snap: &kin_db::SnapshotManager,
-    layout: &kin_core::KinLayout,
-    source_graph: &kin_db::InMemoryGraph,
-    source_vector_path: Option<&Path>,
-    queued_embeddings: &[EntityId],
-    queued_artifacts: &[ArtifactId],
-) -> Result<WarmEmbeddingRestoreStatus> {
-    let _span = tracing::info_span!(
-        "kin.init.restore_warm_embedding_state",
-        queued_embeddings = queued_embeddings.len(),
-        queued_artifacts = queued_artifacts.len()
-    )
-    .entered();
-    let local_vector_path = layout.kindb_vector_index_path();
-    let has_delta_embedding_work = !queued_embeddings.is_empty() || !queued_artifacts.is_empty();
-    if let Some(source_vector_path) = source_vector_path {
-        if source_vector_path.exists() {
-            if let Some(parent) = local_vector_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            if has_delta_embedding_work {
-                tracing::debug!(
-                    source = %source_vector_path.display(),
-                    destination = %local_vector_path.display(),
-                    "saving delta-mutated warm cache vector index sidecar"
-                );
-                source_graph.save_vector_index(&local_vector_path)?;
-            } else {
-                tracing::debug!(
-                    source = %source_vector_path.display(),
-                    destination = %local_vector_path.display(),
-                    "copying warm cache vector index sidecar"
-                );
-                fs::copy(source_vector_path, &local_vector_path)?;
-
-                let source_metadata_path = source_vector_path.with_extension("kvec.meta.json");
-                let local_metadata_path = local_vector_path.with_extension("kvec.meta.json");
-                if source_metadata_path.exists() {
-                    fs::copy(source_metadata_path, local_metadata_path)?;
-                }
-            }
-        } else {
-            source_graph.save_vector_index(&local_vector_path)?;
-        }
-    } else {
-        source_graph.save_vector_index(&local_vector_path)?;
-    }
-
-    let local_graph = local_snap.graph();
-    let mut indexed = local_graph.load_vector_index(&local_vector_path)?;
-    if indexed == 0 {
-        source_graph.save_vector_index(&local_vector_path)?;
-        indexed = local_graph.load_vector_index(&local_vector_path)?;
-    }
-    tracing::debug!(
-        indexed,
-        path = %local_vector_path.display(),
-        "restored warm embedding state into local graph"
-    );
-    if indexed == 0 {
-        local_graph.queue_all_for_embedding();
-        local_graph.queue_all_artifacts_for_embedding();
-        return Ok(WarmEmbeddingRestoreStatus {
-            vector_index_reused: false,
-            requeued_embeddings: local_graph.embedding_status().pending,
-        });
-    }
-
-    if !queued_embeddings.is_empty() {
-        local_graph.queue_for_embedding(queued_embeddings);
-    }
-    if !queued_artifacts.is_empty() {
-        local_graph.queue_artifacts_for_embedding(queued_artifacts);
-    }
-
-    Ok(WarmEmbeddingRestoreStatus {
-        vector_index_reused: true,
-        requeued_embeddings: queued_embeddings.len(),
-    })
-}
-
-#[cfg(feature = "vector")]
-fn load_warm_cache_vector_index(
-    cache_graph: &kin_db::InMemoryGraph,
-    cache_graph_path: &Path,
-) -> Result<()> {
-    let cache_vector_path = cache_graph_path.with_extension("kvec");
-    if !cache_vector_path.exists() {
-        return Ok(());
-    }
-
-    let indexed = cache_graph.load_vector_index(&cache_vector_path)?;
-    tracing::debug!(
-        indexed,
-        path = %cache_vector_path.display(),
-        "loaded warm cache vector index sidecar"
-    );
-    Ok(())
-}
-
-#[cfg(not(feature = "vector"))]
-fn load_warm_cache_vector_index(
-    _cache_graph: &kin_db::InMemoryGraph,
-    _cache_graph_path: &Path,
-) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(not(feature = "vector"))]
-fn restore_warm_embedding_state(
-    _local_snap: &kin_db::SnapshotManager,
-    _layout: &kin_core::KinLayout,
-    _source_graph: &kin_db::InMemoryGraph,
-    _source_vector_path: Option<&Path>,
-    _queued_embeddings: &[EntityId],
-    _queued_artifacts: &[ArtifactId],
-) -> Result<WarmEmbeddingRestoreStatus> {
-    Ok(WarmEmbeddingRestoreStatus::default())
-}
-
-pub(crate) fn refresh_init_cache(
-    dir: &Path,
-    graph: &kin_db::InMemoryGraph,
-    precomputed_root_hash: [u8; 32],
-) -> Result<()> {
-    let Some(cache_dir) = init_cache_repo_path(dir) else {
-        return Ok(());
-    };
-    fs::create_dir_all(&cache_dir)?;
-
-    // Fast path: if the manifest already has this git HEAD, skip the expensive
-    // graph serialization + root hash computation.
-    let current_head = read_git_head(dir);
-    let manifest_path = warm_cache_manifest_path(&cache_dir);
-    let current_entity_count = graph.entity_count();
-    let current_relation_count = graph.relation_count();
-    let current_indexed_files = graph.working_tree_paths().len();
-    if let Some(ref head) = current_head {
-        if let Ok(Some(manifest)) = read_warm_cache_manifest(&manifest_path) {
-            if let Some(bundle_id) = manifest.heads.get(head) {
-                if let Some(entry) = manifest.bundles.get(bundle_id) {
-                    if entry.entity_count == current_entity_count
-                        && entry.relation_count == current_relation_count
-                        && entry.indexed_files == current_indexed_files
-                    {
-                        return Ok(());
-                    }
-                }
-            }
-        }
-    }
-
-    let graph_root_hash = hex::encode(precomputed_root_hash);
-    let bundle_id = graph_root_hash.clone();
-    let cache_graph_path = warm_cache_bundle_graph_path(&cache_dir, &bundle_id);
-    if !cache_graph_path.exists() {
-        kin_db::SnapshotManager::save_graph_with_hash(
-            &cache_graph_path,
-            graph,
-            Some(precomputed_root_hash),
-        )
-        .with_context(|| {
-            format!(
-                "failed to save warm init cache bundle at {}",
-                cache_graph_path.display()
-            )
-        })?;
-
-        // Co-locate the text index with the cache bundle so warm loads don't
-        // trigger a 300s+ full rebuild. SnapshotManager::open auto-discovers
-        // a `text-index/` sibling of the graph file.
-        if let Some(bundle_dir) = cache_graph_path.parent() {
-            let cache_ti_dir = bundle_dir.join("text-index");
-            // Find the live text index: .kin/kindb/text-index/
-            let live_ti_dir = dir.join(".kin/kindb/text-index");
-            if live_ti_dir.is_dir() {
-                let _ = fs::create_dir_all(&cache_ti_dir);
-                // Copy all text index files (tantivy segments)
-                if let Ok(entries) = fs::read_dir(&live_ti_dir) {
-                    for entry in entries.flatten() {
-                        let dest = cache_ti_dir.join(entry.file_name());
-                        let _ = fs::copy(entry.path(), &dest);
-                    }
-                }
-            }
-        }
-    }
-
-    let manifest_path = warm_cache_manifest_path(&cache_dir);
-    let mut manifest =
-        read_warm_cache_manifest(&manifest_path)?.unwrap_or_else(|| WarmCacheRepoManifest {
-            schema: INIT_WARM_CACHE_SCHEMA_VERSION.to_string(),
-            pipeline_epoch: INIT_WARM_CACHE_PIPELINE_EPOCH.to_string(),
-            repo_identity: repo_cache_identity(dir),
-            ..Default::default()
-        });
-    manifest.schema = INIT_WARM_CACHE_SCHEMA_VERSION.to_string();
-    manifest.pipeline_epoch = INIT_WARM_CACHE_PIPELINE_EPOCH.to_string();
-    manifest.repo_identity = repo_cache_identity(dir);
-    manifest.git_head = read_git_head(dir);
-    manifest.current_bundle_id = Some(bundle_id.clone());
-    if let Some(git_head) = manifest.git_head.clone() {
-        manifest.heads.insert(git_head, bundle_id.clone());
-    }
-    manifest
-        .bundles
-        .entry(bundle_id.clone())
-        .or_insert_with(|| WarmCacheBundleManifestEntry {
-            graph_root_hash,
-            entity_count: current_entity_count,
-            relation_count: current_relation_count,
-            indexed_files: current_indexed_files,
-            published_at: chrono::Utc::now().to_rfc3339(),
-        });
-
-    fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
-    fs::write(
-        warm_cache_ready_marker_path(&cache_dir, &bundle_id),
-        b"ready",
-    )?;
-    Ok(())
-}
-
-fn init_cache_repo_path(dir: &Path) -> Option<PathBuf> {
-    let root = init_cache_root()?;
-    let mut hasher = Sha256::new();
-    hasher.update(repo_cache_identity(dir).as_bytes());
-    let repo_key = hex::encode(hasher.finalize());
-    Some(root.join(repo_key))
-}
-
-fn warm_cache_manifest_path(cache_dir: &Path) -> PathBuf {
-    cache_dir.join("manifest.json")
-}
-
-fn warm_cache_bundle_graph_path(cache_dir: &Path, bundle_id: &str) -> PathBuf {
-    cache_dir.join("bundles").join(bundle_id).join("graph.kndb")
-}
-
-fn warm_cache_ready_marker_path(cache_dir: &Path, bundle_id: &str) -> PathBuf {
-    cache_dir.join("bundles").join(bundle_id).join(".ready")
-}
-
-fn read_warm_cache_manifest(manifest_path: &Path) -> Result<Option<WarmCacheRepoManifest>> {
-    if !manifest_path.exists() {
-        return Ok(None);
-    }
-
-    let manifest =
-        serde_json::from_str::<WarmCacheRepoManifest>(&fs::read_to_string(manifest_path)?)
-            .with_context(|| {
-                format!(
-                    "failed to parse warm init manifest at {}",
-                    manifest_path.display()
-                )
-            })?;
-    Ok(Some(manifest))
-}
-
-fn warm_cache_manifest_is_valid(dir: &Path, manifest: &WarmCacheRepoManifest) -> bool {
-    if manifest.schema != INIT_WARM_CACHE_SCHEMA_VERSION {
-        return false;
-    }
-    if manifest.pipeline_epoch != INIT_WARM_CACHE_PIPELINE_EPOCH {
-        return false;
-    }
-    manifest.repo_identity == repo_cache_identity(dir)
-}
-
-fn resolve_warm_cache_graph_path(dir: &Path, cache_dir: &Path) -> Result<Option<PathBuf>> {
-    resolve_warm_cache_graph_path_for_head(dir, cache_dir, read_git_head(dir))
-}
-
-/// Resolve the warm-cache bundle graph to graft for a working tree currently at
-/// `current_head`, or `None` to fall back to a cold init.
-///
-/// The bundle is selected by the tree's CURRENT git HEAD (via the manifest's
-/// `heads` map), NOT by the manifest's last-written `current_bundle_id`.
-/// `current_bundle_id` is whatever state was published LAST under this repo
-/// identity, so adopting it grafts that state into any checkout that merely
-/// shares the identity — the cross-state contamination where a warm init's
-/// entity count swings with publish order. When the tree has a HEAD, only a
-/// bundle recorded for exactly that HEAD is trustworthy; every other case
-/// rejects rather than adopts a foreign state, and a cold init re-derives truth.
-/// A non-git working tree has no HEAD to key on: its cache is
-/// path-identity-scoped and single-state, so the last bundle is the only
-/// meaningful one.
-fn resolve_warm_cache_graph_path_for_head(
-    dir: &Path,
-    cache_dir: &Path,
-    current_head: Option<String>,
-) -> Result<Option<PathBuf>> {
-    let manifest_path = warm_cache_manifest_path(cache_dir);
-    if let Some(manifest) = read_warm_cache_manifest(&manifest_path)? {
-        if !warm_cache_manifest_is_valid(dir, &manifest) {
-            return Ok(None);
-        }
-        let bundle_id = match &current_head {
-            Some(head) => match manifest.heads.get(head) {
-                Some(id) => id.clone(),
-                // Reject-don't-adopt: no bundle recorded for this exact HEAD, so
-                // a cold init is the only trustworthy path — never graft another
-                // HEAD's (or the last-published) state.
-                None => return Ok(None),
-            },
-            None => match manifest.current_bundle_id.clone() {
-                Some(id) => id,
-                None => return Ok(None),
-            },
-        };
-        let bundle_graph_path = warm_cache_bundle_graph_path(cache_dir, &bundle_id);
-        if bundle_graph_path.exists()
-            && warm_cache_ready_marker_path(cache_dir, &bundle_id).exists()
-        {
-            return Ok(Some(bundle_graph_path));
-        }
-        // The resolved bundle is absent or not yet marked ready: reject rather
-        // than fall back to a legacy or foreign bundle.
-        return Ok(None);
-    }
-
-    // No manifest: only the un-versioned legacy single-graph cache may exist. It
-    // carries no HEAD provenance, so a git working tree cannot trust it
-    // (reject-don't-adopt); a non-git, path-scoped tree may still reuse it.
-    if current_head.is_none() {
-        let legacy_graph_path = cache_dir.join("graph.kndb");
-        if legacy_graph_path.exists() {
-            return Ok(Some(legacy_graph_path));
-        }
-    }
-
-    Ok(None)
-}
-
-/// Resolve a *content-addressed* warm-cache bundle candidate for a working tree
-/// whose current HEAD is not recorded in the manifest.
-///
-/// The trusted head-scoped resolver rejects an unrecorded HEAD so it never
-/// grafts a foreign or last-published state. That correctly refuses divergent
-/// truth, but it also refuses the legitimate case where a different HEAD carries
-/// *identical* graph truth — a sibling clone, a fresh checkout, or a commit that
-/// changes no indexed file. Because a bundle is addressed by its graph root
-/// hash, identical file content always maps to the same bundle, so such a tree
-/// can safely reuse the last-published state.
-///
-/// This returns only a CANDIDATE: the caller MUST confirm no entity-source file
-/// diverged (a semantic-truth-preserving diff) before grafting. An entity-level
-/// divergence falls back to a cold init instead of adopting the candidate,
-/// preserving the reject-don't-adopt guarantee against publish-order
-/// contamination while still reusing shared semantic truth across doc- or
-/// config-only changes.
-fn resolve_warm_cache_content_candidate(dir: &Path, cache_dir: &Path) -> Result<Option<PathBuf>> {
-    let manifest_path = warm_cache_manifest_path(cache_dir);
-    let Some(manifest) = read_warm_cache_manifest(&manifest_path)? else {
-        return Ok(None);
-    };
-    if !warm_cache_manifest_is_valid(dir, &manifest) {
-        return Ok(None);
-    }
-    let Some(bundle_id) = manifest.current_bundle_id.as_deref() else {
-        return Ok(None);
-    };
-    let bundle_graph_path = warm_cache_bundle_graph_path(cache_dir, bundle_id);
-    if bundle_graph_path.exists() && warm_cache_ready_marker_path(cache_dir, bundle_id).exists() {
-        return Ok(Some(bundle_graph_path));
-    }
-    Ok(None)
-}
-
-fn init_cache_root() -> Option<PathBuf> {
-    if !init_cache_enabled() {
-        return None;
-    }
-
-    if let Ok(path) = std::env::var("KIN_INIT_CACHE_DIR") {
-        return Some(PathBuf::from(path));
-    }
-
-    directories::BaseDirs::new().map(|dirs| {
-        dirs.home_dir()
-            .join(".kin/cache/init")
-            .join(init_cache_namespace())
-    })
-}
-
-fn init_cache_enabled() -> bool {
-    std::env::var("KIN_INIT_WARM_CACHE")
-        .map(|value| value != "0")
-        .unwrap_or(true)
-}
-
-fn init_cache_namespace() -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(INIT_WARM_CACHE_SCHEMA_VERSION.as_bytes());
-    hasher.update(b":");
-    hasher.update(INIT_WARM_CACHE_PIPELINE_EPOCH.as_bytes());
-    let digest = hex::encode(hasher.finalize());
-    format!("{INIT_WARM_CACHE_SCHEMA_VERSION}-{}", &digest[..16])
-}
-
-fn repo_cache_identity(dir: &Path) -> String {
-    if let Some(remote) = git_origin_remote(dir) {
-        return format!("git:{remote}");
-    }
-
-    let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    format!("path:{}", canonical.display())
-}
-
-fn git_origin_remote(dir: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(dir)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let remote = String::from_utf8(output.stdout).ok()?;
-    let remote = remote.trim();
-    if remote.is_empty() {
-        None
-    } else {
-        Some(remote.to_string())
-    }
-}
-
-fn move_snapshot_into_place(src: &Path, dst: &Path) -> Result<()> {
-    if !src.exists() {
-        return Ok(());
-    }
-    if dst.exists() {
-        fs::remove_dir_all(dst)?;
-    }
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    match fs::rename(src, dst) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            copy_dir_recursive(src, dst)?;
-            fs::remove_dir_all(src)?;
-            Ok(())
-        }
-    }
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else if file_type.is_symlink() {
-            if let Some(parent) = dst_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let target = fs::read_link(&src_path)?;
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&target, &dst_path)?;
-            #[cfg(windows)]
-            {
-                if src_path.is_dir() {
-                    std::os::windows::fs::symlink_dir(&target, &dst_path)?;
-                } else {
-                    std::os::windows::fs::symlink_file(&target, &dst_path)?;
-                }
-            }
-        } else if file_type.is_file() {
-            if let Some(parent) = dst_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(&src_path, &dst_path)?;
-        }
-    }
-    Ok(())
-}
-
-/// Collect every admitted repository leaf from one complete scan.
-///
-/// This is a compatibility view for semantic-enrichment callers that still
-/// consume host paths. Repository membership itself is owned by
-/// `kin_index::scan_repository`.
-pub(crate) fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>> {
-    let ignore = kin_index::RepositoryIgnore::load(root)?;
-    let scan = kin_index::scan_repository(root, &ignore, std::iter::empty())?;
-    Ok(scan
-        .entries()
-        .map(|entry| entry.host_path.clone())
-        .collect())
-}
-
 /// Enumerate every admitted working-tree entry and preserve its exact content
 /// identity and materialization kind. Parser support does not affect drift
 /// admission.
-pub(crate) fn collect_on_disk_tree_entries(source_root: &Path) -> Result<Vec<(String, TreeEntry)>> {
-    let all_files = collect_source_files(source_root)?;
-    all_files
-        .into_iter()
-        .map(|path| {
-            let rel_path = path
-                .strip_prefix(source_root)
-                .unwrap_or(&path)
-                .to_str()
-                .ok_or_else(|| anyhow!("working-tree path is not valid UTF-8: {}", path.display()))?
-                .replace(std::path::MAIN_SEPARATOR, "/");
-            let (content, kind) = read_exact_init_source(&path)?;
-            Ok((
-                rel_path,
-                TreeEntry {
-                    blob_hash: Hash256::from_bytes(kin_blobs::digest_bytes(&content)),
-                    kind,
-                },
-            ))
+pub(crate) fn collect_on_disk_tree_entries(
+    source_root: &Path,
+) -> Result<Vec<(RepoPath, TreeEntry)>> {
+    let ignore = kin_index::RepositoryIgnore::load(source_root)?;
+    let scan = kin_index::scan_repository(source_root, &ignore, std::iter::empty())?;
+    scan.entries()
+        .map(|entry| {
+            let content = kin_index::read_verified_scanned_entry(entry)
+                .with_context(|| format!("read exact working-tree entry {}", entry.repo_path))?;
+            let hash = kin_blobs::digest_bytes(&content);
+            Ok((entry.repo_path.clone(), exact_tree_entry(hash, entry.kind)))
         })
         .collect()
 }
@@ -4979,61 +3554,6 @@ fn ensure_graph_surface_materialized(
     Ok(())
 }
 
-/// Deterministic digest of the (path, content-hash, source-kind) set,
-/// independent of wall-clock time, machine path, and walk order. The path
-/// length prefix keeps the digest unambiguous across path boundaries.
-fn compute_artifact_fingerprint<'a>(
-    entries: impl IntoIterator<Item = (&'a RepoPath, &'a [u8; 32], TreeEntry)>,
-) -> [u8; 32] {
-    let mut entries: Vec<_> = entries.into_iter().collect();
-    entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
-    let mut hasher = Sha256::new();
-    hasher.update(b"kin-init-artifacts-v3:");
-    for (path, hash, entry) in entries {
-        hasher.update((path.as_bytes().len() as u64).to_le_bytes());
-        hasher.update(path.as_bytes());
-        hasher.update(hash);
-        match entry {
-            TreeEntry::Blob {
-                executable: false, ..
-            } => hasher.update([0]),
-            TreeEntry::Blob {
-                executable: true, ..
-            } => hasher.update([1]),
-            TreeEntry::Symlink { .. } => hasher.update([2]),
-            TreeEntry::Gitlink { target } => {
-                hasher.update([3]);
-                hasher.update((target.as_bytes().len() as u64).to_le_bytes());
-                hasher.update(target.as_bytes());
-            }
-        }
-    }
-    let result = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&result);
-    bytes
-}
-
-/// Deterministic change ID for the init auto-parse commit: a pure function of
-/// the parent change and the artifact content fingerprint, so two independent
-/// preps of the same graph produce the same ID.
-fn compute_init_change_id(
-    parent: &SemanticChangeId,
-    artifact_fingerprint: &[u8; 32],
-) -> SemanticChangeId {
-    let mut hasher = Sha256::new();
-    hasher.update(b"kin-change-v1:");
-    hasher.update(b"kin init: auto-parse");
-    hasher.update(b":");
-    hasher.update(parent.0.as_bytes());
-    hasher.update(b":");
-    hasher.update(artifact_fingerprint);
-    let result = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&result);
-    SemanticChangeId::from_hash(Hash256::from_bytes(bytes))
-}
-
 /// Get a human-readable author name.
 fn whoami() -> String {
     std::env::var("USER")
@@ -5044,14 +3564,16 @@ fn whoami() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_git::GitImportMode;
     use kin_index::COMMAND_EFFECT_CONTRACT_KEY;
     use kin_model::{
-        EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, LanguageId,
+        BranchName, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, LanguageId,
         SemanticFingerprint, Visibility,
     };
     use serial_test::serial;
     use std::collections::BTreeSet;
     use std::fs;
+    use std::process::Command;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -5077,49 +3599,21 @@ mod tests {
         unreachable!()
     }
 
-    #[test]
-    fn deterministic_change_retry_only_relaxes_regenerated_provenance() {
-        let mut original = kin_core::build_genesis_change();
-        original.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x81; 32]));
-        original.parents = vec![kin_core::build_genesis_change().id];
-        original.message = "kin init: auto-parse".to_string();
-        original.entity_deltas = vec![
-            EntityDelta::Added(test_entity("first", "src/lib.rs")),
-            EntityDelta::Added(test_entity("second", "src/lib.rs")),
-        ];
-        let mut retried = original.clone();
-        retried.author = AuthorId::new("different-local-user");
-        retried.timestamp = Timestamp::now();
-        retried.entity_deltas.reverse();
-
-        assert!(deterministic_change_payload_matches(
-            &original,
-            &retried,
-            DeterministicChangeProvenance::Regenerated,
-        ));
-        assert!(!deterministic_change_payload_matches(
-            &original,
-            &retried,
-            DeterministicChangeProvenance::Stable,
-        ));
-
-        let mut changed_entity = retried.clone();
-        match &mut changed_entity.entity_deltas[0] {
-            EntityDelta::Added(entity) => entity.signature.push_str(" -> changed"),
-            _ => unreachable!(),
-        }
-        assert!(!deterministic_change_payload_matches(
-            &original,
-            &changed_entity,
-            DeterministicChangeProvenance::Regenerated,
-        ));
-
-        retried.message = "changed semantic payload".to_string();
-        assert!(!deterministic_change_payload_matches(
-            &original,
-            &retried,
-            DeterministicChangeProvenance::Regenerated,
-        ));
+    fn admit_test_repository(
+        root: &Path,
+        graph: &kin_db::InMemoryGraph,
+        blob_store: &kin_blobs::BlobStore,
+    ) -> Vec<IndexableFile> {
+        let entries = collect_native_boundary_entries(root, graph, blob_store, false).unwrap();
+        let tree_deltas = build_exact_init_tree_deltas(graph.resolved_tree(), &entries);
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas,
+            })
+            .unwrap();
+        collect_indexable_files_from_graph(graph, blob_store).unwrap()
     }
 
     #[test]
@@ -5232,41 +3726,6 @@ mod tests {
         assert!(git_history_import_options("partial").is_err());
     }
 
-    #[test]
-    fn init_change_id_is_content_addressed_not_wall_clock() {
-        let parent = SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32]));
-        let a: [u8; 32] = [0xaa; 32];
-        let b: [u8; 32] = [0xbb; 32];
-        let regular = TreeEntryKind::Regular { executable: false };
-        let fingerprint =
-            compute_artifact_fingerprint([("src/a.rs", &a, regular), ("src/b.rs", &b, regular)]);
-
-        let id1 = compute_init_change_id(&parent, &fingerprint);
-        let id2 = compute_init_change_id(&parent, &fingerprint);
-        assert_eq!(
-            id1.to_string(),
-            id2.to_string(),
-            "same parent + content must yield an identical change id (no wall-clock)"
-        );
-
-        assert_eq!(
-            fingerprint,
-            compute_artifact_fingerprint([("src/b.rs", &b, regular), ("src/a.rs", &a, regular)]),
-            "fingerprint must be independent of walk order"
-        );
-
-        let c: [u8; 32] = [0xcc; 32];
-        let id3 = compute_init_change_id(
-            &parent,
-            &compute_artifact_fingerprint([("src/a.rs", &c, regular)]),
-        );
-        assert_ne!(
-            id1.to_string(),
-            id3.to_string(),
-            "different artifact content must yield a different change id"
-        );
-    }
-
     fn with_env_var<T>(name: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
         let prior = std::env::var_os(name);
         match value {
@@ -5306,25 +3765,6 @@ mod tests {
             let error = init_resource_pool_config().unwrap_err().to_string();
             assert!(error.contains("invalid KIN_RESOURCE_PROFILE"));
         });
-    }
-
-    #[test]
-    fn collect_source_files_returns_sorted_repo_relative_paths() {
-        let repo_dir = tempfile::tempdir().unwrap();
-        let root = repo_dir.path();
-        fs::create_dir_all(root.join("z")).unwrap();
-        fs::create_dir_all(root.join("a")).unwrap();
-        fs::write(root.join("z/mod.rs"), "pub fn zed() {}\n").unwrap();
-        fs::write(root.join("a/mod.rs"), "pub fn alpha() {}\n").unwrap();
-        fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
-
-        let rels = collect_source_files(root)
-            .unwrap()
-            .into_iter()
-            .map(|path| source_file_sort_key(root, &path))
-            .collect::<Vec<_>>();
-
-        assert_eq!(rels, vec!["a/mod.rs", "main.rs", "z/mod.rs"]);
     }
 
     fn single_added_function_id(deltas: &[EntityDelta]) -> EntityId {
@@ -5439,10 +3879,118 @@ mod tests {
         .expect("canonical json must serialize")
     }
 
+    fn canonical_live_repository_state(graph: &kin_db::InMemoryGraph) -> String {
+        let snapshot = graph.to_snapshot();
+        let mut entities = snapshot
+            .entities
+            .values()
+            .map(canonical_json)
+            .collect::<Vec<_>>();
+        entities.sort();
+        let mut relations = snapshot
+            .relations
+            .values()
+            .map(canonical_json)
+            .collect::<Vec<_>>();
+        relations.sort();
+        let changes = snapshot
+            .changes
+            .iter()
+            .map(|(id, change)| (id.to_string(), canonical_json(change)))
+            .collect::<BTreeMap<_, _>>();
+        let mut shallow_files = snapshot
+            .shallow_files
+            .iter()
+            .map(canonical_json)
+            .collect::<Vec<_>>();
+        shallow_files.sort();
+        let mut file_layouts = snapshot
+            .file_layouts
+            .iter()
+            .map(canonical_json)
+            .collect::<Vec<_>>();
+        file_layouts.sort();
+        let mut structured_artifacts = snapshot
+            .structured_artifacts
+            .iter()
+            .map(canonical_json)
+            .collect::<Vec<_>>();
+        structured_artifacts.sort();
+        let mut opaque_artifacts = snapshot
+            .opaque_artifacts
+            .iter()
+            .map(canonical_json)
+            .collect::<Vec<_>>();
+        opaque_artifacts.sort();
+
+        canonical_json(&(
+            entities,
+            relations,
+            changes,
+            snapshot.change_children,
+            snapshot.entity_revisions,
+            snapshot.resolved_tree,
+            shallow_files,
+            file_layouts,
+            structured_artifacts,
+            opaque_artifacts,
+        ))
+    }
+
+    #[test]
+    fn exact_semantic_diff_emits_modifications_removals_and_replacements() {
+        let retained = test_entity("retained", "src/lib.rs");
+        let removed = test_entity("removed", "src/lib.rs");
+        let added = test_entity("added", "src/lib.rs");
+        let mut modified = retained.clone();
+        modified.signature = "fn retained(value: u8)".to_string();
+        let old_relation = test_relation(RelationKind::Calls, retained.id, removed.id);
+        let mut replacement_relation = old_relation.clone();
+        replacement_relation.confidence = 0.75;
+
+        let mut parent = kin_model::graph::ResolvedGraphState::default();
+        parent.entities.insert(retained.id, retained.clone());
+        parent.entities.insert(removed.id, removed.clone());
+        parent
+            .relations
+            .insert(old_relation.id, old_relation.clone());
+        let current_entities =
+            HashMap::from([(modified.id, modified.clone()), (added.id, added.clone())]);
+        let current_relations =
+            HashMap::from([(replacement_relation.id, replacement_relation.clone())]);
+
+        let (entity_deltas, relation_deltas) =
+            exact_semantic_deltas(&parent, &current_entities, &current_relations);
+        assert!(entity_deltas.iter().any(|delta| matches!(
+            delta,
+            EntityDelta::Modified { old, new }
+                if old.id == retained.id && new.signature == modified.signature
+        )));
+        assert!(entity_deltas
+            .iter()
+            .any(|delta| matches!(delta, EntityDelta::Removed(id) if *id == removed.id)));
+        assert!(entity_deltas
+            .iter()
+            .any(|delta| matches!(delta, EntityDelta::Added(entity) if entity.id == added.id)));
+        assert_eq!(relation_deltas.len(), 2);
+        assert!(matches!(
+            relation_deltas[0],
+            RelationDelta::Removed(id) if id == old_relation.id
+        ));
+        assert!(matches!(
+            &relation_deltas[1],
+            RelationDelta::Added(relation)
+                if relation.id == replacement_relation.id
+                    && relation.confidence.to_bits()
+                        == replacement_relation.confidence.to_bits()
+        ));
+    }
+
     #[test]
     fn parse_memo_hit_shares_arc_and_version_participates_in_key() {
         let blob = kin_blobs::Hash256::from_bytes([0x42; 32]);
-        let mut memo: HashMap<(kin_blobs::Hash256, u32), Arc<CachedParse>> = HashMap::new();
+        let path = "src/original.py".to_string();
+        let mut memo: HashMap<(kin_blobs::Hash256, String, u32), Arc<CachedParse>> = HashMap::new();
         let payload = Arc::new(CachedParse {
             parse_completeness: ParseCompleteness::Full,
             entities: Vec::new(),
@@ -5450,13 +3998,14 @@ mod tests {
             imports: Vec::new(),
         });
         memo.insert(
-            (blob, kin_parser::PARSER_SEMANTICS_VERSION),
+            (blob, path.clone(), kin_parser::PARSER_SEMANTICS_VERSION),
             Arc::clone(&payload),
         );
 
-        // Same (blob, version): a hit hands back the SAME allocation, not a clone.
+        // Same (blob, exact location, version): a hit hands back the SAME
+        // allocation, not a clone.
         let hit = memo
-            .get(&(blob, kin_parser::PARSER_SEMANTICS_VERSION))
+            .get(&(blob, path.clone(), kin_parser::PARSER_SEMANTICS_VERSION))
             .expect("same key must hit");
         assert!(
             Arc::ptr_eq(hit, &payload),
@@ -5466,14 +4015,29 @@ mod tests {
         // Same blob, a bumped parser-semantics version: miss. A grammar or
         // extractor upgrade can therefore never serve a stale parse.
         assert!(
-            !memo.contains_key(&(blob, kin_parser::PARSER_SEMANTICS_VERSION.wrapping_add(1))),
+            !memo.contains_key(&(
+                blob,
+                path.clone(),
+                kin_parser::PARSER_SEMANTICS_VERSION.wrapping_add(1),
+            )),
             "a parser-semantics version change must key to a different (missing) entry"
+        );
+
+        // Parser output carries the exact file origin. Reusing it at a rename
+        // destination would leak the old location into entity identity.
+        assert!(
+            !memo.contains_key(&(
+                blob,
+                "src/renamed.py".to_string(),
+                kin_parser::PARSER_SEMANTICS_VERSION,
+            )),
+            "the same bytes at a different location must be reparsed"
         );
 
         // Different blob, same version: miss.
         let other_blob = kin_blobs::Hash256::from_bytes([0x43; 32]);
         assert!(
-            !memo.contains_key(&(other_blob, kin_parser::PARSER_SEMANTICS_VERSION)),
+            !memo.contains_key(&(other_blob, path, kin_parser::PARSER_SEMANTICS_VERSION,)),
             "a different blob must not collide with the cached entry"
         );
     }
@@ -5484,6 +4048,7 @@ mod tests {
             "one recovered error range in historical source".to_string(),
         );
         let state = ImportedSemanticFileState {
+            artifact_id: test_artifact_id("src/history.py"),
             file_path: "src/history.py".to_string(),
             parse_completeness: expected.clone(),
             entities: Vec::new(),
@@ -5499,12 +4064,13 @@ mod tests {
             state.parse_completeness.clone(),
         )]);
         let mut linker = kin_index::IncrementalLinker::new();
-        linker.add_file(&state.file_path, &state.entities);
+        linker.add_file(&state.file_path, state.artifact_id, &state.entities);
         let relations = kin_index::link_cross_file_incremental_with_completeness(
             &[link_data],
             &linker,
             &completeness,
-        );
+        )
+        .unwrap();
         assert!(relations
             .iter()
             .any(|relation| relation.evidence.iter().any(|evidence| {
@@ -6242,18 +4808,14 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 added_regular_delta("secondary.py", Hash256::from_bytes(secondary_only.0)),
             ],
         );
+        // Exact Git tree deltas are first-parent-relative. A merge that keeps
+        // its first parent's tree therefore has no tree transition; semantic
+        // rebase still removes state contributed only by secondary parents.
         let mut merge = imported_change(
             [0x84; 32],
             [0x82; 32],
             "merge choosing first-parent tree",
-            vec![
-                modified_regular_delta(
-                    "app.py",
-                    Hash256::from_bytes(app_secondary_parent.0),
-                    Hash256::from_bytes(app_first_parent.0),
-                ),
-                removed_regular_delta("secondary.py", Hash256::from_bytes(secondary_only.0)),
-            ],
+            Vec::new(),
         );
         merge.change.parents = vec![first_parent.change.id, secondary_parent.change.id];
 
@@ -6300,7 +4862,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 "relation {relation_id} differs: expected {expected_relation:#?}, actual {actual_relation:#?}"
             );
         }
-        assert_eq!(expected.file_tree, actual.file_tree);
+        assert_eq!(expected.tree, actual.tree);
     }
 
     fn identity_neutral_semantic_shape(
@@ -6374,221 +4936,20 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         (entities, relations)
     }
 
-    fn assert_secondary_parent_replay_matches_authoritative_model(
-        imported: &[kin_git::ImportedChange],
-        merge_id: SemanticChangeId,
-    ) {
-        let merge = imported
-            .iter()
-            .find(|entry| entry.change.id == merge_id)
-            .unwrap();
-        let first_parent = merge.change.parents[0];
-        let first_parent_state = resolve_imported_semantics(imported, first_parent);
-        let mut lightweight = ImportedRuntimeSemanticState {
-            entities: first_parent_state.entities,
-            relations: first_parent_state.relations,
-        };
-        let index_by_change_id: HashMap<_, _> = imported
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| (entry.change.id, index))
-            .collect();
-        replay_imported_secondary_parents(
-            &mut lightweight,
-            imported,
-            &index_by_change_id,
-            kin_core::build_genesis_change().id,
-            &merge.change.parents,
-        )
-        .unwrap();
-
-        let graph = kin_db::InMemoryGraph::new();
-        graph
-            .create_change(&kin_core::build_genesis_change())
-            .unwrap();
-        for imported_change in imported {
-            graph.create_change(&imported_change.change).unwrap();
-        }
-        let mut probe = merge.change.clone();
-        probe.id = SemanticChangeId::from_hash(Hash256::from_bytes([0xf9; 32]));
-        probe.entity_deltas.clear();
-        probe.relation_deltas.clear();
-        probe.tree_deltas.clear();
-        graph.create_change(&probe).unwrap();
-        let authoritative = graph.resolve_graph_at(&probe.id).unwrap();
-
-        assert_eq!(lightweight.entities.len(), authoritative.entities.len());
-        for (entity_id, expected) in &authoritative.entities {
-            let actual = lightweight
-                .entities
-                .get(entity_id)
-                .unwrap_or_else(|| panic!("lightweight replay missed entity {entity_id}"));
-            assert!(imported_entities_exactly_equivalent(expected, actual));
-        }
-        assert_eq!(lightweight.relations.len(), authoritative.relations.len());
-        for (relation_id, expected) in &authoritative.relations {
-            let actual = lightweight
-                .relations
-                .get(relation_id)
-                .unwrap_or_else(|| panic!("lightweight replay missed relation {relation_id}"));
-            assert!(imported_relations_exactly_equivalent(expected, actual));
-        }
-    }
-
-    #[test]
-    fn enrich_imported_merge_rebases_runtime_union_to_first_parent_target() {
-        let dir = tempfile::tempdir().unwrap();
-        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
-        let fixture = merge_rebase_fixture(&blob_store);
-        let first_parent_id = fixture[1].change.id;
-        let merge_id = fixture[3].change.id;
-
-        // Put the merge before both of its parents in input order. A
-        // first-parent-only scheduler can process it after parent A but before
-        // secondary parent B; complete-DAG ordering must wait for both.
-        let mut imported = vec![
-            fixture[0].clone(),
-            fixture[3].clone(),
-            fixture[1].clone(),
-            fixture[2].clone(),
-        ];
-        enrich_imported_changes_with_semantics(&mut imported, &blob_store).unwrap();
-        assert_secondary_parent_replay_matches_authoritative_model(&imported, merge_id);
-
-        let expected = resolve_imported_semantics(&imported, first_parent_id);
-        let actual = resolve_imported_semantics(&imported, merge_id);
-        assert_imported_semantics_exact(&expected, &actual);
-
-        let merge = imported
-            .iter()
-            .find(|entry| entry.change.id == merge_id)
-            .unwrap();
-        assert!(
-            merge
-                .change
-                .entity_deltas
-                .iter()
-                .any(|delta| matches!(delta, EntityDelta::Removed(_))),
-            "merge must explicitly remove secondary-parent-only semantic state"
-        );
-        assert!(
-            merge
-                .change
-                .relation_deltas
-                .iter()
-                .any(|delta| matches!(delta, RelationDelta::Removed(_))),
-            "merge must explicitly remove secondary-parent-only relations"
-        );
-    }
-
-    #[test]
-    fn enrich_imported_octopus_merge_removes_every_unselected_parent_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
-        let mut fixture = merge_rebase_fixture(&blob_store);
-        let first_parent_id = fixture[1].change.id;
-        let tertiary_blob = blob_store
-            .write(b"def tertiary_only():\n    return 'tertiary'\n")
-            .unwrap();
-        let tertiary = imported_change(
-            [0x85; 32],
-            [0x81; 32],
-            "tertiary parent",
-            vec![added_regular_delta(
-                "tertiary.py",
-                Hash256::from_bytes(tertiary_blob.0),
-            )],
-        );
-        let mut merge = fixture.pop().unwrap();
-        merge.change.parents.push(tertiary.change.id);
-        merge.change.tree_deltas.push(removed_regular_delta(
-            "tertiary.py",
-            Hash256::from_bytes(tertiary_blob.0),
-        ));
-        let merge_id = merge.change.id;
-
-        // Keep the octopus merge ahead of all three parent records in the
-        // slice; complete-DAG scheduling still has to delay it until each arm
-        // has been enriched for the exact secondary-parent replay.
-        let mut imported = vec![
-            fixture[0].clone(),
-            merge,
-            fixture[1].clone(),
-            fixture[2].clone(),
-            tertiary,
-        ];
-        enrich_imported_changes_with_semantics(&mut imported, &blob_store).unwrap();
-        assert_secondary_parent_replay_matches_authoritative_model(&imported, merge_id);
-
-        let expected = resolve_imported_semantics(&imported, first_parent_id);
-        let actual = resolve_imported_semantics(&imported, merge_id);
-        assert_imported_semantics_exact(&expected, &actual);
-        assert!(actual
-            .entities
-            .values()
-            .all(|entity| !matches!(entity.name.as_str(), "secondary_only" | "tertiary_only")));
-    }
-
-    #[test]
-    fn secondary_parent_replay_prunes_relation_when_removed_entity_is_already_absent() {
-        let removed = test_entity("removed", "removed.py");
-        let peer = test_entity("peer", "peer.py");
-        let relation = test_relation(RelationKind::Calls, peer.id, removed.id);
-
-        // First-parent runtime state contains a dangling cross-branch relation
-        // but not the referenced entity. The secondary parent removes that
-        // absent entity. Authoritative replay still prunes every relation that
-        // mentions the ID; conditioning pruning on `entities.remove()` would
-        // leak this edge through the merge baseline.
-        let mut first_parent = imported_change(
-            [0xa1; 32],
-            [0; 32],
-            "first parent adds cross-branch relation",
-            Vec::new(),
-        );
-        first_parent.change.relation_deltas = vec![RelationDelta::Added(relation)];
-        let mut secondary_parent = imported_change(
-            [0xa2; 32],
-            [0; 32],
-            "secondary parent removes absent entity",
-            Vec::new(),
-        );
-        secondary_parent.change.entity_deltas = vec![EntityDelta::Removed(removed.id)];
-        let mut merge = imported_change([0xa3; 32], [0xa1; 32], "merge", Vec::new());
-        merge.change.parents = vec![first_parent.change.id, secondary_parent.change.id];
-        let merge_id = merge.change.id;
-        let imported = vec![first_parent, secondary_parent, merge];
-
-        assert_secondary_parent_replay_matches_authoritative_model(&imported, merge_id);
-    }
-
     #[test]
     fn imported_merge_target_can_select_secondary_state_and_add_novel_content() {
         let dir = tempfile::tempdir().unwrap();
         let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
         let mut imported = merge_rebase_fixture(&blob_store);
-        let tools_entry = imported[0]
-            .change
-            .tree_deltas
-            .iter()
-            .find(|delta| delta.file_id().0 == "tools.py")
-            .and_then(|delta| delta.new_entry())
-            .unwrap();
-        let app_first_parent_entry = imported[1].change.tree_deltas[0].new_entry().unwrap();
-        let app_secondary_entry = imported[2]
-            .change
-            .tree_deltas
-            .iter()
-            .find(|delta| delta.file_id().0 == "app.py")
-            .and_then(|delta| delta.new_entry())
-            .unwrap();
-        let secondary_entry = imported[2]
-            .change
-            .tree_deltas
-            .iter()
-            .find(|delta| delta.file_id().0 == "secondary.py")
-            .and_then(|delta| delta.new_entry())
-            .unwrap();
+        let first_parent_oid = imported[1].git_oid.clone();
+        let secondary_parent_oid = imported[2].git_oid.clone();
+        let (tools_id, tools_entry) = exact_new_artifact(&imported[0].change, "tools.py");
+        let (app_id, app_first_parent_entry) = exact_new_artifact(&imported[1].change, "app.py");
+        let (secondary_app_id, app_secondary_entry) =
+            exact_new_artifact(&imported[2].change, "app.py");
+        assert_eq!(app_id, secondary_app_id);
+        let (secondary_id, secondary_entry) =
+            exact_new_artifact(&imported[2].change, "secondary.py");
         let novel_hash = Hash256::from_bytes(
             blob_store
                 .write(b"def novel_at_merge():\n    return 'novel'\n")
@@ -6597,38 +4958,53 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         );
 
         let merge = imported.last_mut().unwrap();
-        let app_delta = merge
-            .change
-            .tree_deltas
-            .iter_mut()
-            .find(|delta| delta.file_id().0 == "app.py")
-            .unwrap();
-        *app_delta = TreeDelta::Modified {
-            file_id: FilePathId::new("app.py"),
-            old_entry: app_first_parent_entry,
-            new_entry: app_secondary_entry,
-        };
-        // The merge keeps the secondary parent's entry for this path, restated
-        // unchanged the way a complete correction over the parent union is.
-        let secondary_delta = merge
-            .change
-            .tree_deltas
-            .iter_mut()
-            .find(|delta| delta.file_id().0 == "secondary.py")
-            .unwrap();
-        *secondary_delta = TreeDelta::Modified {
-            file_id: FilePathId::new("secondary.py"),
-            old_entry: secondary_entry,
-            new_entry: secondary_entry,
-        };
-        merge
-            .change
-            .tree_deltas
-            .push(added_regular_delta("novel.py", novel_hash));
-        let merge_id = merge.change.id;
+        merge.change.tree_deltas = vec![
+            TreeDelta::Updated {
+                artifact_id: app_id,
+                old: app_first_parent_entry,
+                new: app_secondary_entry.clone(),
+            },
+            TreeDelta::Added {
+                artifact_id: secondary_id,
+                new: secondary_entry.clone(),
+            },
+            added_regular_delta("novel.py", novel_hash),
+        ];
+        let merge_oid = merge.git_oid.clone();
+        let mut repeated = imported.clone();
 
         enrich_imported_changes_with_semantics(&mut imported, &blob_store).unwrap();
-        assert_secondary_parent_replay_matches_authoritative_model(&imported, merge_id);
+        enrich_imported_changes_with_semantics(&mut repeated, &blob_store).unwrap();
+        let merge_id = imported_id(&imported, &merge_oid);
+        let merge = imported
+            .iter()
+            .find(|entry| entry.change.id == merge_id)
+            .unwrap();
+        assert_eq!(
+            merge.change.parents,
+            vec![
+                imported_id(&imported, &first_parent_oid),
+                imported_id(&imported, &secondary_parent_oid),
+            ],
+            "every Git parent edge must survive while payload deltas stay first-parent-relative"
+        );
+        kin_model::validate_semantic_change_id(&merge.change).unwrap();
+        assert_eq!(
+            merge.change.id,
+            imported_id(&repeated, &merge_oid),
+            "the enriched full-payload identity must be deterministic"
+        );
+        assert_eq!(
+            serde_json::to_vec(&merge.change).unwrap(),
+            serde_json::to_vec(
+                &repeated
+                    .iter()
+                    .find(|entry| entry.git_oid == merge_oid)
+                    .unwrap()
+                    .change
+            )
+            .unwrap()
+        );
 
         // Hydrate the exact selected merge tree independently as a single
         // root. This oracle proves the merge is not hardwired to reset to its
@@ -6640,16 +5016,16 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             "independent exact merge target",
             vec![
                 TreeDelta::Added {
-                    file_id: FilePathId::new("tools.py"),
-                    new_entry: tools_entry,
+                    artifact_id: tools_id,
+                    new: tools_entry,
                 },
                 TreeDelta::Added {
-                    file_id: FilePathId::new("app.py"),
-                    new_entry: app_secondary_entry,
+                    artifact_id: app_id,
+                    new: app_secondary_entry,
                 },
                 TreeDelta::Added {
-                    file_id: FilePathId::new("secondary.py"),
-                    new_entry: secondary_entry,
+                    artifact_id: secondary_id,
+                    new: secondary_entry,
                 },
                 added_regular_delta("novel.py", novel_hash),
             ],
@@ -6663,7 +5039,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             identity_neutral_semantic_shape(&actual),
             "selected merge tree must match an independently hydrated exact-tree oracle after neutralizing expected lineage-preserving IDs"
         );
-        assert_eq!(expected.file_tree, actual.file_tree);
+        assert_eq!(expected.tree, actual.tree);
         assert!(actual
             .entities
             .values()
@@ -6672,12 +5048,12 @@ func prCheckout(cmd *cobra.Command, args []string) error {
     }
 
     #[test]
-    fn checkpoint_resume_seeds_all_parent_merge_rebase_prefix() {
+    fn checkpoint_resume_preserves_complete_parent_closure() {
         let dir = tempfile::tempdir().unwrap();
         let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
         let fixture = merge_rebase_fixture(&blob_store);
-        let first_parent_id = fixture[1].change.id;
-        let merge_id = fixture[3].change.id;
+        let first_parent_oid = fixture[1].git_oid.clone();
+        let merge_oid = fixture[3].git_oid.clone();
         let config = HydrationCheckpointConfig::clean_for_test(
             &dir.path().join("kin"),
             "merge-rebase-clean-sha",
@@ -6711,6 +5087,10 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         );
         assert_same_hydration_deltas(&oracle, &resumed);
 
+        reidentify_enriched_imported_changes(&mut resumed, kin_core::build_genesis_change().id)
+            .unwrap();
+        let first_parent_id = imported_id(&resumed, &first_parent_oid);
+        let merge_id = imported_id(&resumed, &merge_oid);
         let expected = resolve_imported_semantics(&resumed, first_parent_id);
         let actual = resolve_imported_semantics(&resumed, merge_id);
         assert_imported_semantics_exact(&expected, &actual);
@@ -6773,87 +5153,299 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 .unwrap_or(false)
     }
 
+    #[cfg(unix)]
     #[test]
-    fn warm_cache_delta_reuses_entity_ids_and_remaps_relation_endpoints() {
+    fn historical_enrichment_preserves_every_exact_tree_surface() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
         let repo_dir = tempfile::tempdir().unwrap();
-        let blob_dir = tempfile::tempdir().unwrap();
         let root = repo_dir.path();
+        if !init_git_repo_for_test(root) {
+            return;
+        }
 
-        let tools_path = root.join("src/utils/tools.ts");
-        let api_path = root.join("src/routes/api.ts");
-        fs::create_dir_all(tools_path.parent().unwrap()).unwrap();
-        fs::create_dir_all(api_path.parent().unwrap()).unwrap();
-        fs::write(&tools_path, "export function executeTool() { return 1; }\n").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
         fs::write(
-            &api_path,
-            "import { executeTool } from '../utils/tools';\nexport function handler() { executeTool(); }\n",
+            root.join("src/lib.rs"),
+            b"pub fn rust_answer() -> u8 { 42 }\n",
         )
         .unwrap();
-
-        let blob_store = kin_blobs::BlobStore::new(blob_dir.path().join("objects")).unwrap();
-        let graph = kin_db::InMemoryGraph::new();
-        let all_files = collect_source_files(root).unwrap();
-        let indexable_files = collect_indexable_files(root, &all_files).unwrap();
-        parse_and_index(&graph, &blob_store, &indexable_files).unwrap();
-
-        let handler_before = entity_by_name(&graph, "src/routes/api.ts", "handler");
-        let handler_start_line_before = handler_before.span.as_ref().unwrap().start_line;
-        let callee = entity_by_name(&graph, "src/utils/tools.ts", "executeTool");
-        assert!(
-            has_call_relation(&graph, handler_before.id, callee.id),
-            "initial graph should link handler -> executeTool"
-        );
-
         fs::write(
-            &api_path,
-            "// inserted header shifts parser start_line\nimport { executeTool } from '../utils/tools';\nexport function handler() { executeTool(); }\n",
+            root.join("tools.py"),
+            b"def python_answer():\n    return 42\n",
         )
         .unwrap();
-        let all_files = collect_source_files(root).unwrap();
-        let indexable_files = collect_indexable_files(root, &all_files).unwrap();
-        let diff = kin_db::engine::IncrementalDiff {
-            added_files: Vec::new(),
-            modified_files: vec!["src/routes/api.ts".to_string()],
-            removed_files: Vec::new(),
-        };
+        fs::write(
+            root.join("docker-compose.yml"),
+            b"services:\n  app:\n    image: example/app:latest\n",
+        )
+        .unwrap();
+        fs::write(root.join("Cargo.lock"), b"version = 3\n").unwrap();
+        fs::write(root.join("asset.bin"), [0, 0xff, 1, 2, 3]).unwrap();
+        fs::write(root.join("notes.unsupported"), b"opaque but exact\n").unwrap();
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/run"), b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(root.join("bin/run")).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(root.join("bin/run"), permissions).unwrap();
+        symlink("docker-compose.yml", root.join("compose-current")).unwrap();
+        let non_utf8_name = OsString::from_vec(b"odd-\xff.bin".to_vec());
+        fs::write(root.join(&non_utf8_name), b"non-utf8 path\n").unwrap();
 
-        let delta = apply_warm_cache_delta(&graph, &blob_store, &indexable_files, &diff).unwrap();
-        assert_eq!(delta.reparsed_files, 1);
+        assert!(Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-q", "-m", "exact mixed tree"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        let gitlink_target = read_git_head(root).unwrap();
+        let cache_info = format!("160000,{gitlink_target},vendor/submodule");
+        assert!(Command::new("git")
+            .args(["update-index", "--add", "--cacheinfo", &cache_info])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-q", "-m", "add gitlink"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
 
-        let handler_after = entity_by_name(&graph, "src/routes/api.ts", "handler");
+        let blob_root = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(blob_root.path().join("objects")).unwrap();
+        let mut imported = kin_git::import_git_history_with_blobs(
+            root,
+            kin_core::build_genesis_change().id,
+            &kin_git::ImportOptions::default(),
+            Some(&blob_store),
+        )
+        .unwrap();
+        let exact_before = imported
+            .iter()
+            .map(|entry| entry.change.tree_deltas.clone())
+            .collect::<Vec<_>>();
+
+        enrich_imported_changes_with_semantics(&mut imported, &blob_store).unwrap();
+
         assert_eq!(
-            handler_after.id, handler_before.id,
-            "warm delta must preserve stable entity ID across parser start_line drift"
+            imported
+                .iter()
+                .map(|entry| entry.change.tree_deltas.clone())
+                .collect::<Vec<_>>(),
+            exact_before,
+            "semantic enrichment must not rewrite membership, identity, path, mode, or blob truth"
         );
-        assert!(
-            handler_after.span.as_ref().unwrap().start_line > handler_start_line_before,
-            "the entity span should reflect the shifted source location"
+        for entry in &imported {
+            kin_model::validate_semantic_change_id(&entry.change).unwrap();
+        }
+
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .create_change(&kin_core::build_genesis_change())
+            .unwrap();
+        graph
+            .create_changes(imported.iter().map(|entry| entry.change.clone()).collect())
+            .unwrap();
+        let head = imported.last().unwrap().change.id;
+        let tree = graph.resolve_tree_at(&head).unwrap();
+
+        assert!(matches!(
+            tree.artifact_at_path(&RepoPath::from_utf8("bin/run").unwrap())
+                .unwrap()
+                .entry,
+            TreeEntry::Blob {
+                executable: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            tree.artifact_at_path(&RepoPath::from_utf8("compose-current").unwrap())
+                .unwrap()
+                .entry,
+            TreeEntry::Symlink { .. }
+        ));
+        assert!(matches!(
+            tree.artifact_at_path(&RepoPath::from_utf8("vendor/submodule").unwrap())
+                .unwrap()
+                .entry,
+            TreeEntry::Gitlink { .. }
+        ));
+        assert!(tree
+            .artifact_at_path(&RepoPath::from_bytes(b"odd-\xff.bin".to_vec()).unwrap())
+            .is_some());
+        for path in [
+            "docker-compose.yml",
+            "Cargo.lock",
+            "asset.bin",
+            "notes.unsupported",
+        ] {
+            assert!(
+                tree.artifact_at_path(&RepoPath::from_utf8(path).unwrap())
+                    .is_some(),
+                "{path} must remain exact tree truth even without entity parsing"
+            );
+        }
+
+        let parsed_origins = imported
+            .iter()
+            .flat_map(|entry| &entry.change.entity_deltas)
+            .filter_map(|delta| match delta {
+                EntityDelta::Added(entity) | EntityDelta::Modified { new: entity, .. } => {
+                    entity.file_origin.as_ref().map(|origin| origin.0.as_str())
+                }
+                EntityDelta::Removed(_) => None,
+            })
+            .collect::<HashSet<_>>();
+        assert!(parsed_origins.contains("src/lib.rs"));
+        assert!(parsed_origins.contains("tools.py"));
+    }
+
+    #[test]
+    fn historical_rename_preserves_lineage_but_path_reuse_does_not() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let root = repo_dir.path();
+        if !init_git_repo_for_test(root)
+            || !commit_git_file_for_test(
+                root,
+                "old.py",
+                "def stable_name():\n    return 1\n",
+                "introduce",
+            )
+        {
+            return;
+        }
+        assert!(Command::new("git")
+            .args(["mv", "old.py", "renamed.py"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-q", "-m", "rename"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["rm", "renamed.py"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-q", "-m", "delete"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(commit_git_file_for_test(
+            root,
+            "renamed.py",
+            "def stable_name():\n    return 1\n",
+            "reuse path",
+        ));
+
+        let objects = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(objects.path().join("objects")).unwrap();
+        let mut imported = kin_git::import_git_history_with_blobs(
+            root,
+            kin_core::build_genesis_change().id,
+            &kin_git::ImportOptions::default(),
+            Some(&blob_store),
+        )
+        .unwrap();
+        let first_artifact = imported[0].change.tree_deltas[0].artifact_id();
+        let renamed_artifact = imported[1].change.tree_deltas[0].artifact_id();
+        let reintroduced_artifact = imported[3].change.tree_deltas[0].artifact_id();
+        assert_eq!(first_artifact, renamed_artifact);
+        assert_ne!(renamed_artifact, reintroduced_artifact);
+
+        enrich_imported_changes_with_semantics(&mut imported, &blob_store).unwrap();
+        let introduced_entity = single_added_function_id(&imported[0].change.entity_deltas);
+        let (rename_old, rename_new) = single_modified_function(&imported[1].change.entity_deltas);
+        assert_eq!(rename_old.id, introduced_entity);
+        assert_eq!(rename_new.id, introduced_entity);
+        assert_eq!(
+            rename_new
+                .file_origin
+                .as_ref()
+                .map(|origin| origin.0.as_str()),
+            Some("renamed.py")
         );
-        assert!(
-            has_call_relation(&graph, handler_after.id, callee.id),
-            "relation endpoints must be remapped to stable entity IDs"
+        let reintroduced_entity = single_added_function_id(&imported[3].change.entity_deltas);
+        assert_ne!(
+            reintroduced_entity, introduced_entity,
+            "delete/re-add at the same path is a new artifact and must start a new entity lineage"
         );
+        for entry in &imported {
+            kin_model::validate_semantic_change_id(&entry.change).unwrap();
+        }
+    }
+
+    fn test_artifact_id(label: &str) -> ArtifactId {
+        let digest = Sha256::digest(label.as_bytes());
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        ArtifactId(uuid::Uuid::from_bytes(bytes))
+    }
+
+    fn regular_location(file_path: &str, hash: Hash256) -> LocatedEntry {
+        LocatedEntry::new(
+            RepoPath::from_utf8(file_path).unwrap(),
+            TreeEntry::blob(hash, false),
+        )
+    }
+
+    fn exact_new_artifact(change: &SemanticChange, file_path: &str) -> (ArtifactId, LocatedEntry) {
+        change
+            .tree_deltas
+            .iter()
+            .find_map(|delta| {
+                let new = delta.new_state()?;
+                (new.path.as_utf8() == Some(file_path)).then(|| (delta.artifact_id(), new.clone()))
+            })
+            .unwrap_or_else(|| panic!("missing exact new artifact at {file_path}"))
+    }
+
+    fn imported_id(imported: &[kin_git::ImportedChange], git_oid: &str) -> SemanticChangeId {
+        imported
+            .iter()
+            .find(|entry| entry.git_oid == git_oid)
+            .map(|entry| entry.change.id)
+            .unwrap_or_else(|| panic!("missing imported Git object {git_oid}"))
     }
 
     fn added_regular_delta(file_path: &str, new_hash: Hash256) -> TreeDelta {
         TreeDelta::Added {
-            file_id: FilePathId::new(file_path),
-            new_entry: TreeEntry::regular(new_hash, false),
+            artifact_id: test_artifact_id(file_path),
+            new: regular_location(file_path, new_hash),
         }
     }
 
     fn modified_regular_delta(file_path: &str, old_hash: Hash256, new_hash: Hash256) -> TreeDelta {
-        TreeDelta::Modified {
-            file_id: FilePathId::new(file_path),
-            old_entry: TreeEntry::regular(old_hash, false),
-            new_entry: TreeEntry::regular(new_hash, false),
+        TreeDelta::Updated {
+            artifact_id: test_artifact_id(file_path),
+            old: regular_location(file_path, old_hash),
+            new: regular_location(file_path, new_hash),
         }
     }
 
     fn removed_regular_delta(file_path: &str, old_hash: Hash256) -> TreeDelta {
         TreeDelta::Removed {
-            file_id: FilePathId::new(file_path),
-            old_entry: TreeEntry::regular(old_hash, false),
+            artifact_id: test_artifact_id(file_path),
+            old: regular_location(file_path, old_hash),
         }
     }
 
@@ -8016,8 +6608,8 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let artifact_edge = Relation {
             id: RelationId::new(),
             kind: RelationKind::Includes,
-            src: GraphNodeId::Artifact(ArtifactId::seed_from_path("src/g.rs")),
-            dst: GraphNodeId::Artifact(ArtifactId::seed_from_path("src/a.rs")),
+            src: GraphNodeId::Artifact(test_artifact_id("src/g.rs")),
+            dst: GraphNodeId::Artifact(test_artifact_id("src/a.rs")),
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,
@@ -8244,9 +6836,11 @@ func prCheckout(cmd *cobra.Command, args []string) error {
     }
 
     fn tracked_graph_paths(graph: &kin_db::InMemoryGraph) -> BTreeSet<String> {
-        let mut tracked = BTreeSet::new();
-
-        tracked.extend(graph.indexed_file_paths());
+        let mut tracked: BTreeSet<String> = graph
+            .resolved_tree()
+            .artifacts_by_path()
+            .filter_map(|artifact| artifact.path.as_utf8().map(str::to_owned))
+            .collect();
         tracked.extend(
             graph
                 .list_shallow_files()
@@ -8282,7 +6876,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             .iter()
             .all(|path| is_repo_owned_graph_path(path)));
 
-        assert_eq!(graph.indexed_file_paths().len(), expected_paths.len());
+        assert_eq!(graph.resolved_tree().len(), expected_paths.len());
         // Swift is an entity-source language, so docs/guide.swift is fully
         // indexed rather than shallow-tracked. Fresh native init also writes
         // AGENTS.md before the first snapshot, so it is graph-tracked as
@@ -8301,8 +6895,10 @@ func prCheckout(cmd *cobra.Command, args []string) error {
     }
 
     fn assert_makefile_is_text_searchable(graph: &kin_db::InMemoryGraph) {
-        let makefile_key =
-            kin_db::RetrievalKey::Artifact(kin_db::ArtifactId::seed_from_path("Makefile"));
+        let makefile_id = graph
+            .artifact_id_at_path(&RepoPath::from_utf8("Makefile").unwrap())
+            .expect("Makefile must have admitted graph identity");
+        let makefile_key = kin_db::RetrievalKey::Artifact(makefile_id);
         let hits = graph.text_search("cargo build", 10).unwrap();
         assert!(
             hits.iter().any(|(key, _)| *key == makefile_key),
@@ -8374,32 +6970,42 @@ func prCheckout(cmd *cobra.Command, args []string) error {
     }
 
     #[test]
-    fn snapshot_creates_correct_structure() {
+    fn native_boundary_admits_all_files_without_creating_a_snapshot_copy() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-
-        // Create some files.
         fs::write(root.join("README.md"), "hello").unwrap();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
-
-        // Generated/vendor-style names are still repository truth.
         fs::create_dir_all(root.join("node_modules/foo")).unwrap();
         fs::write(root.join("node_modules/foo/index.js"), "track me").unwrap();
 
-        let (snapshot, manifest) = snapshot_repo(root, false).unwrap();
-        assert!(snapshot.join("README.md").exists());
-        assert!(snapshot.join("src/main.rs").exists());
-        assert!(snapshot.join("node_modules/foo/index.js").exists());
-        // manifest.json should NOT exist on disk until explicitly written
-        assert!(!snapshot.join("manifest.json").exists());
-        write_snapshot_manifest(&snapshot, &manifest).unwrap();
-        assert!(snapshot.join("manifest.json").exists());
+        let init = kin_core::init(root).unwrap();
+        let snap = open_snapshot_with_retry(init.layout.kindb_snapshot_path());
+        let blob_store = kin_blobs::BlobStore::new(init.layout.objects_dir()).unwrap();
+        let entries =
+            collect_native_boundary_entries(root, snap.graph().as_ref(), &blob_store, false)
+                .unwrap();
+        let paths = entries
+            .iter()
+            .filter_map(|entry| entry.repo_path.as_utf8())
+            .collect::<BTreeSet<_>>();
+
+        assert!(paths.contains("README.md"));
+        assert!(paths.contains("src/main.rs"));
+        assert!(paths.contains("node_modules/foo/index.js"));
+        assert!(
+            !root.join(".kin/snapshot").exists(),
+            "native admission must persist CAS blobs, never a second raw tree"
+        );
+        for entry in entries {
+            let hash = kin_blobs::Hash256::from_bytes(entry.hash);
+            assert!(blob_store.read(&hash).is_ok());
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn snapshot_and_exact_init_entries_preserve_modes_and_symlink_targets() {
+    fn native_boundary_preserves_modes_and_symlink_targets() {
         use std::os::unix::fs::{symlink, PermissionsExt};
 
         let dir = tempfile::tempdir().unwrap();
@@ -8412,23 +7018,12 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         fs::set_permissions(root.join("bin/run"), permissions).unwrap();
         symlink("plain.txt", root.join("current")).unwrap();
 
-        let (snapshot, manifest) = snapshot_repo(root, false).unwrap();
-        assert_eq!(manifest["file_count"], 3);
-        assert_eq!(
-            fs::read_link(snapshot.join("current")).unwrap(),
-            Path::new("plain.txt")
-        );
-        assert_ne!(
-            fs::metadata(snapshot.join("bin/run"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o111,
-            0
-        );
-
-        let all_files = collect_source_files(&snapshot).unwrap();
-        let exact = collect_exact_init_source_entries(&snapshot, &all_files).unwrap();
+        let init = kin_core::init(root).unwrap();
+        let snap = open_snapshot_with_retry(init.layout.kindb_snapshot_path());
+        let blob_store = kin_blobs::BlobStore::new(init.layout.objects_dir()).unwrap();
+        let exact =
+            collect_native_boundary_entries(root, snap.graph().as_ref(), &blob_store, false)
+                .unwrap();
         let kinds: BTreeMap<_, _> = exact
             .iter()
             .map(|entry| (entry.repo_path.as_utf8().unwrap(), entry.entry))
@@ -8457,8 +7052,12 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             .iter()
             .find(|entry| entry.repo_path.as_utf8() == Some("current"))
             .unwrap();
-        let (target, _) = read_exact_init_source(&link.abs_path).unwrap();
+        let target_hash = link.entry.blob_identity().unwrap();
+        let target = blob_store
+            .read(&kin_blobs::Hash256::from_bytes(*target_hash.as_bytes()))
+            .unwrap();
         assert_eq!(target, b"plain.txt");
+        assert!(!root.join(".kin/snapshot").exists());
     }
 
     #[test]
@@ -8490,19 +7089,16 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         .unwrap();
         let current = vec![
             ExactInitSourceEntry {
-                abs_path: PathBuf::from("legacy.sh"),
                 repo_path: RepoPath::from_utf8("legacy.sh").unwrap(),
                 hash: *retained_hash.as_bytes(),
                 entry: TreeEntry::blob(retained_hash, true),
             },
             ExactInitSourceEntry {
-                abs_path: PathBuf::from("new-link"),
                 repo_path: RepoPath::from_utf8("new-link").unwrap(),
                 hash: added_hash,
                 entry: TreeEntry::symlink(Hash256::from_bytes(added_hash)),
             },
             ExactInitSourceEntry {
-                abs_path: PathBuf::from("unchanged.txt"),
                 repo_path: RepoPath::from_utf8("unchanged.txt").unwrap(),
                 hash: *unchanged_hash.as_bytes(),
                 entry: TreeEntry::blob(unchanged_hash, false),
@@ -8553,179 +7149,6 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 .or_else(|| delta.old_state())
                 .is_none_or(|state| state.path.as_utf8() != Some("unchanged.txt"))),
             "a path whose exact entry is unchanged must not produce a delta"
-        );
-    }
-
-    #[test]
-    fn manifest_has_correct_file_count() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-
-        fs::write(root.join("a.txt"), "aaa").unwrap();
-        fs::write(root.join("b.txt"), "bbb").unwrap();
-        fs::create_dir_all(root.join("sub")).unwrap();
-        fs::write(root.join("sub/c.txt"), "ccc").unwrap();
-
-        let (_snapshot, manifest) = snapshot_repo(root, false).unwrap();
-
-        assert_eq!(manifest["file_count"], 3);
-        assert_eq!(manifest["total_bytes"], 9); // 3 + 3 + 3
-    }
-
-    #[test]
-    fn snapshot_includes_generated_and_vendor_named_directories() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-
-        let repository_dirs = [
-            "node_modules",
-            "target",
-            "__pycache__",
-            "vendor",
-            ".next",
-            "dist",
-            "build",
-            "out",
-        ];
-        for directory in repository_dirs {
-            let p = root.join(directory);
-            fs::create_dir_all(&p).unwrap();
-            fs::write(p.join("file.txt"), "repository truth").unwrap();
-        }
-
-        fs::write(root.join("keep.txt"), "keep").unwrap();
-
-        let (snapshot, _manifest) = snapshot_repo(root, false).unwrap();
-        assert!(snapshot.join("keep.txt").exists());
-        for directory in repository_dirs {
-            assert!(
-                snapshot.join(directory).join("file.txt").exists(),
-                "missing repository directory {directory}"
-            );
-        }
-    }
-
-    #[test]
-    fn snapshot_preserves_arbitrary_kin_like_names_and_skips_real_control() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-
-        fs::create_dir_all(root.join(".kin-snapshot-tmp/nested")).unwrap();
-        fs::write(root.join(".kin-snapshot-tmp/nested/file.txt"), "skip").unwrap();
-        fs::create_dir_all(root.join(".kin-other/tmp")).unwrap();
-        fs::write(root.join(".kin-other/tmp/file.txt"), "track").unwrap();
-        fs::create_dir_all(root.join(".kin-session")).unwrap();
-        fs::write(root.join(".kin-session/base.json"), "control").unwrap();
-        fs::write(root.join("keep.txt"), "keep").unwrap();
-
-        let (snapshot, _manifest) = snapshot_repo(root, false).unwrap();
-        assert!(snapshot.join("keep.txt").exists());
-        assert!(snapshot.join(".kin-snapshot-tmp/nested/file.txt").exists());
-        assert!(snapshot.join(".kin-other/tmp/file.txt").exists());
-        assert!(!snapshot.join(".kin-session").exists());
-    }
-
-    #[test]
-    fn snapshot_prunes_only_nested_git_and_kin_control_dirs() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(root.join("src/lib.rs"), "pub fn f() {}").unwrap();
-
-        // Nested vendored dir is repository truth.
-        fs::create_dir_all(root.join("pkg/inner/node_modules/dep")).unwrap();
-        fs::write(root.join("pkg/inner/node_modules/dep/index.js"), "vendored").unwrap();
-
-        // Nested sub-repo `.git` directory.
-        fs::create_dir_all(root.join("sub/.git/objects")).unwrap();
-        fs::write(root.join("sub/.git/config"), "[core]").unwrap();
-
-        // Nested Kin graph dir is control metadata. An arbitrary `.kindb`
-        // directory is not implicitly treated as control.
-        fs::create_dir_all(root.join("sub/.kin/snapshot")).unwrap();
-        fs::write(root.join("sub/.kin/graph.bin"), "graph").unwrap();
-        fs::create_dir_all(root.join("data/.kindb")).unwrap();
-        fs::write(root.join("data/.kindb/blob"), "blob").unwrap();
-
-        let (snapshot, manifest) = snapshot_repo(root, false).unwrap();
-        let rels: BTreeSet<String> = collect_source_files(&snapshot)
-            .unwrap()
-            .iter()
-            .map(|p| {
-                p.strip_prefix(&snapshot)
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .collect();
-
-        assert!(rels.contains("src/lib.rs"), "got: {:?}", rels);
-        assert!(
-            rels.contains("pkg/inner/node_modules/dep/index.js"),
-            "nested vendored dir was not admitted: {:?}",
-            rels
-        );
-        assert!(
-            !rels.iter().any(|p| p.contains(".git")),
-            "nested sub-repo git plumbing leaked: {:?}",
-            rels
-        );
-        assert!(
-            !rels.iter().any(|p| p.starts_with("sub/.kin/")),
-            "nested Kin graph dir leaked: {:?}",
-            rels
-        );
-        assert!(
-            rels.contains("data/.kindb/blob"),
-            "unrelated dot-directory was not admitted: {:?}",
-            rels
-        );
-        assert_eq!(manifest["file_count"], 3);
-    }
-
-    #[test]
-    fn snapshot_honors_kinignore_names_and_prefixes() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-
-        fs::write(
-            root.join(".kinignore"),
-            "# scope discovery\ngenerated\nthirdparty/big/\n",
-        )
-        .unwrap();
-
-        fs::write(root.join("keep.rs"), "fn k() {}").unwrap();
-        fs::create_dir_all(root.join("generated/sub")).unwrap();
-        fs::write(root.join("generated/sub/g.rs"), "fn g() {}").unwrap();
-        fs::create_dir_all(root.join("thirdparty/big/x")).unwrap();
-        fs::write(root.join("thirdparty/big/x/t.rs"), "fn t() {}").unwrap();
-        fs::create_dir_all(root.join("thirdparty/small")).unwrap();
-        fs::write(root.join("thirdparty/small/s.rs"), "fn s() {}").unwrap();
-
-        let (snapshot, _manifest) = snapshot_repo(root, false).unwrap();
-        let rels: BTreeSet<String> = collect_source_files(&snapshot)
-            .unwrap()
-            .iter()
-            .map(|p| {
-                p.strip_prefix(&snapshot)
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .collect();
-
-        assert!(rels.contains("keep.rs"), "got: {:?}", rels);
-        assert!(rels.contains("thirdparty/small/s.rs"), "got: {:?}", rels);
-        assert!(
-            !rels.iter().any(|p| p.starts_with("generated")),
-            "name-pattern dir leaked: {:?}",
-            rels
-        );
-        assert!(
-            !rels.iter().any(|p| p.starts_with("thirdparty/big")),
-            "prefix-pattern dir leaked: {:?}",
-            rels
         );
     }
 
@@ -8816,7 +7239,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
     }
 
     #[test]
-    fn snapshot_reads_git_head() {
+    fn read_git_head_reports_source_provenance() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
@@ -8848,12 +7271,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             .current_dir(root)
             .output();
 
-        let (_snapshot, manifest) = snapshot_repo(root, false).unwrap();
-
-        // git_head should be a 40-char hex SHA.
-        let head = manifest["git_head"]
-            .as_str()
-            .expect("git_head should be a string");
+        let head = read_git_head(root).expect("Git HEAD should be available");
         assert_eq!(head.len(), 40, "expected 40-char SHA, got: {}", head);
         assert!(
             head.chars().all(|c| c.is_ascii_hexdigit()),
@@ -8870,8 +7288,6 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let expected_paths = repo_truth_fixture_with_agent_doc(repo_dir.path());
 
         let _home_guard = EnvVarGuard::set("HOME", home_dir.path());
-        let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
-        let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
 
         run(
             Some(repo_dir.path().display().to_string()),
@@ -8888,10 +7304,85 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
         let graph = snap.graph();
 
-        assert!(repo_dir.path().join(".kin/snapshot/manifest.json").exists());
+        assert!(
+            !repo_dir.path().join(".kin/snapshot").exists(),
+            "init must not create a raw repository snapshot"
+        );
         assert_repo_owned_graph_truth(graph.as_ref(), &expected_paths);
         assert_makefile_is_text_searchable(graph.as_ref());
         assert!(!tracked_graph_paths(graph.as_ref()).contains(".kin/snapshot/manifest.json"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn identical_native_reinit_keeps_head_and_graph_state_unchanged() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(repo_dir.path().join("src")).unwrap();
+        fs::write(
+            repo_dir.path().join("src/lib.rs"),
+            "pub fn answer() -> u32 { 42 }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo_dir.path().join("docker-compose.yml"),
+            "services:\n  app:\n    image: example/app:latest\n",
+        )
+        .unwrap();
+        fs::write(repo_dir.path().join("asset.bin"), [0, 0xff, 1, 2]).unwrap();
+
+        let _home_guard = EnvVarGuard::set("HOME", home_dir.path());
+
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "off".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
+        let (first_head, first_resolved, first_live) = {
+            let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+            let graph = snap.graph();
+            let branch_name = kin_core::read_current_branch(&layout).unwrap();
+            let head = graph.get_branch(&branch_name).unwrap().unwrap().head;
+            (
+                head,
+                graph.resolve_graph_at(&head).unwrap(),
+                canonical_live_repository_state(graph.as_ref()),
+            )
+        };
+
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "off".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+        let graph = snap.graph();
+        let branch_name = kin_core::read_current_branch(&layout).unwrap();
+        let second_head = graph.get_branch(&branch_name).unwrap().unwrap().head;
+        assert_eq!(
+            second_head, first_head,
+            "an identical native re-init must not manufacture a new semantic change"
+        );
+        let second_resolved = graph.resolve_graph_at(&second_head).unwrap();
+        assert_imported_semantics_exact(&first_resolved, &second_resolved);
+        assert_eq!(
+            canonical_live_repository_state(graph.as_ref()),
+            first_live,
+            "an identical native re-init must rebuild byte-equivalent live semantic state"
+        );
     }
 
     #[tokio::test]
@@ -8908,12 +7399,8 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         {
             return;
         }
-        let git_oid = read_git_head(repo_dir.path()).unwrap();
-        let git_change = kin_git::semantic_change_id_from_git_oid_hex(&git_oid).unwrap();
         let home_dir = tempfile::tempdir().unwrap();
         let _home_guard = EnvVarGuard::set("HOME", home_dir.path());
-        let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
-        let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
 
         let mut second_change_children = None;
         let mut second_entity_revisions = None;
@@ -8994,7 +7481,13 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
         let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
         let graph = snap.graph();
+        let git_change = graph
+            .get_branch(&BranchName::new("main"))
+            .unwrap()
+            .unwrap()
+            .head;
         let imported = graph.get_change(&git_change).unwrap().unwrap();
+        kin_model::validate_semantic_change_id(&imported).unwrap();
         assert_eq!(
             imported.parents,
             vec![kin_core::build_genesis_change().id],
@@ -9028,12 +7521,8 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         {
             return;
         }
-        let git_oid = read_git_head(repo_dir.path()).unwrap();
-        let git_change = kin_git::semantic_change_id_from_git_oid_hex(&git_oid).unwrap();
         let home_dir = tempfile::tempdir().unwrap();
         let _home_guard = EnvVarGuard::set("HOME", home_dir.path());
-        let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
-        let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
 
         run(
             Some(repo_dir.path().display().to_string()),
@@ -9058,7 +7547,14 @@ func prCheckout(cmd *cobra.Command, args []string) error {
 
         let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
         let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+        let git_change = snap
+            .graph()
+            .get_branch(&BranchName::new("main"))
+            .unwrap()
+            .unwrap()
+            .head;
         let imported = snap.graph().get_change(&git_change).unwrap().unwrap();
+        kin_model::validate_semantic_change_id(&imported).unwrap();
         assert_eq!(
             imported.parents,
             vec![kin_core::build_genesis_change().id],
@@ -9074,22 +7570,11 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let expected_paths = repo_truth_fixture_with_agent_doc(repo_dir.path());
 
         let daemon_graph = kin_db::InMemoryGraph::new();
-        daemon_graph.set_file_hash(".kin/snapshot/manifest.json", [5; 32]);
-        daemon_graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
-                file_id: FilePathId::new(".kin/snapshot/manifest.json"),
-                content_hash: Hash256::from_bytes([5; 32]),
-                mime_type: Some("application/json".to_string()),
-                text_preview: Some("{\"daemon\":true}".to_string()),
-            })
-            .unwrap();
 
         let (daemon_url, daemon_hits, daemon_task) =
             spawn_bootstrap_server(daemon_graph.to_snapshot()).await;
 
         let _home_guard = EnvVarGuard::set("HOME", home_dir.path());
-        let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
-        let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
         let _daemon_guard = EnvVarGuard::set("KIN_DAEMON_URL", &daemon_url);
 
         run(
@@ -9117,552 +7602,6 @@ func prCheckout(cmd *cobra.Command, args []string) error {
     }
 
     #[test]
-    #[serial]
-    fn warm_init_cache_path_cleans_internal_control_plane_entries() {
-        let repo_dir = tempfile::tempdir().unwrap();
-        let cache_dir = tempfile::tempdir().unwrap();
-        let expected_paths = repo_truth_fixture(repo_dir.path());
-        let _cache_guard = EnvVarGuard::set("KIN_INIT_CACHE_DIR", cache_dir.path());
-        let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "1");
-
-        let init_result = kin_core::init(repo_dir.path()).unwrap();
-        let local_snap = open_snapshot_with_retry(init_result.layout.kindb_snapshot_path());
-        let blob_store = kin_blobs::BlobStore::new(init_result.layout.objects_dir()).unwrap();
-
-        let all_files = collect_source_files(repo_dir.path()).unwrap();
-        let indexable_files = collect_indexable_files(repo_dir.path(), &all_files).unwrap();
-
-        let cache_graph = kin_db::InMemoryGraph::new();
-        parse_and_index(&cache_graph, &blob_store, &indexable_files).unwrap();
-
-        cache_graph.set_file_hash(".kin/snapshot/manifest.json", [9; 32]);
-        cache_graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
-                file_id: FilePathId::new(".kin/snapshot/manifest.json"),
-                content_hash: Hash256::from_bytes([9; 32]),
-                mime_type: Some("application/json".to_string()),
-                text_preview: Some("{\"stale\":true}".to_string()),
-            })
-            .unwrap();
-        cache_graph.set_file_hash(".kin/internal/build.swift", [8; 32]);
-        cache_graph
-            .upsert_shallow_file(&ShallowTrackedFile {
-                file_id: FilePathId::new(".kin/internal/build.swift"),
-                language_hint: "swift".to_string(),
-                declaration_count: 1,
-                import_count: 1,
-                syntax_hash: Hash256::from_bytes([8; 32]),
-                signature_hash: Some(Hash256::from_bytes([7; 32])),
-                declaration_names: vec!["render".to_string()],
-                import_paths: vec!["Foundation".to_string()],
-            })
-            .unwrap();
-        cache_graph.set_file_hash(".kin/workflows/ci.yml", [6; 32]);
-        cache_graph
-            .upsert_structured_artifact(&StructuredArtifact {
-                file_id: FilePathId::new(".kin/workflows/ci.yml"),
-                kind: kin_model::ArtifactKind::CiConfig,
-                content_hash: Hash256::from_bytes([6; 32]),
-                text_preview: Some("name: kin".to_string()),
-            })
-            .unwrap();
-        cache_graph
-            .upsert_shallow_file(&ShallowTrackedFile {
-                file_id: FilePathId::new(".kin/orphan/guide.swift"),
-                language_hint: "swift".to_string(),
-                declaration_count: 1,
-                import_count: 0,
-                syntax_hash: Hash256::from_bytes([4; 32]),
-                signature_hash: Some(Hash256::from_bytes([3; 32])),
-                declaration_names: vec!["orphan".to_string()],
-                import_paths: Vec::new(),
-            })
-            .unwrap();
-        cache_graph
-            .upsert_structured_artifact(&StructuredArtifact {
-                file_id: FilePathId::new(".kin/orphan/ci.yml"),
-                kind: kin_model::ArtifactKind::CiConfig,
-                content_hash: Hash256::from_bytes([2; 32]),
-                text_preview: Some("name: orphan".to_string()),
-            })
-            .unwrap();
-        cache_graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
-                file_id: FilePathId::new(".kin/orphan/notes.md"),
-                content_hash: Hash256::from_bytes([1; 32]),
-                mime_type: Some("text/markdown".to_string()),
-                text_preview: Some("orphan".to_string()),
-            })
-            .unwrap();
-
-        let root_hash = cache_graph.compute_root_hash();
-        refresh_init_cache(repo_dir.path(), &cache_graph, root_hash).unwrap();
-
-        let summary = try_warm_init_from_cache(
-            repo_dir.path(),
-            &init_result.layout,
-            &local_snap,
-            &blob_store,
-            &indexable_files,
-        )
-        .unwrap()
-        .expect("warm init cache should be reused");
-
-        assert!(summary.warm_cache_hit);
-
-        let graph = local_snap.graph();
-        assert_repo_owned_graph_truth(graph.as_ref(), &expected_paths);
-        assert!(tracked_graph_paths(graph.as_ref())
-            .iter()
-            .all(|path| is_repo_owned_graph_path(path)));
-    }
-
-    #[cfg(feature = "vector")]
-    #[test]
-    fn warm_embedding_state_restores_cached_vectors_and_requeues_delta() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = kin_core::init(dir.path()).unwrap();
-        let local_snap = open_snapshot_with_retry(result.layout.kindb_snapshot_path());
-
-        let source_graph = kin_db::InMemoryGraph::new();
-        let entity_a = test_entity("alpha", "src/lib.rs");
-        let entity_b = test_entity("beta", "src/lib.rs");
-        source_graph.upsert_entity(&entity_a).unwrap();
-        source_graph.upsert_entity(&entity_b).unwrap();
-
-        let source_vector_path = dir.path().join("source.kvec");
-        let source_index = kin_db::VectorIndex::new(2).unwrap();
-        source_index.upsert(entity_a.id, &[1.0, 0.0]).unwrap();
-        source_index.upsert(entity_b.id, &[0.0, 1.0]).unwrap();
-        source_index.save(&source_vector_path).unwrap();
-        source_graph.load_vector_index(&source_vector_path).unwrap();
-
-        graft_semantic_state(&local_snap, &result.layout, &source_graph);
-        restore_warm_embedding_state(
-            &local_snap,
-            &result.layout,
-            &source_graph,
-            Some(&source_vector_path),
-            &[entity_b.id],
-            &[],
-        )
-        .unwrap();
-
-        let local_graph = local_snap.graph();
-        let status = local_graph.embedding_status();
-        assert_eq!(status.indexed, 2);
-        assert_eq!(status.pending, 1);
-        assert!(result.layout.kindb_vector_index_path().exists());
-    }
-
-    #[test]
-    fn warm_text_index_sidecar_reopens_with_queryable_docs() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = kin_core::init(dir.path()).unwrap();
-        let local_snap = open_snapshot_with_retry(result.layout.kindb_snapshot_path());
-
-        let cache_graph_path = dir.path().join("warm-cache/graph.kndb");
-        let cache_snap = kin_db::SnapshotManager::new(&cache_graph_path);
-        let cache_graph = cache_snap.graph();
-        let entity = test_entity("render_widget", "src/lib.rs");
-        cache_graph.upsert_entity(&entity).unwrap();
-        cache_snap.save().unwrap();
-
-        assert!(
-            sync_warm_text_index_sidecar(&local_snap, &result.layout, &cache_graph_path, true,)
-                .unwrap()
-        );
-        graft_semantic_state(&local_snap, &result.layout, cache_graph.as_ref());
-
-        let local_graph = local_snap.graph();
-        let stats = local_graph.graph_stats();
-        assert_eq!(stats.text_indexed_entity_count, 1);
-        let hits = local_graph.text_search("render_widget", 5).unwrap();
-        assert!(hits
-            .iter()
-            .any(|(key, _)| *key == kin_model::RetrievalKey::Entity(entity.id)));
-    }
-
-    #[test]
-    fn warm_graft_preserves_tracked_non_entity_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = kin_core::init(dir.path()).unwrap();
-        let local_snap = open_snapshot_with_retry(result.layout.kindb_snapshot_path());
-
-        let source_graph = kin_db::InMemoryGraph::new();
-        let shallow = kin_model::ShallowTrackedFile {
-            file_id: FilePathId::new("docs/guide.swift"),
-            language_hint: "swift".to_string(),
-            declaration_count: 3,
-            import_count: 2,
-            syntax_hash: Hash256::from_bytes([1; 32]),
-            signature_hash: Some(Hash256::from_bytes([2; 32])),
-            declaration_names: vec!["render".to_string()],
-            import_paths: vec!["Foundation".to_string()],
-        };
-        let structured = kin_model::StructuredArtifact {
-            file_id: FilePathId::new("Makefile"),
-            kind: kin_model::ArtifactKind::Makefile,
-            content_hash: Hash256::from_bytes([3; 32]),
-            text_preview: Some("build test".to_string()),
-        };
-        let opaque = kin_model::OpaqueArtifact {
-            file_id: FilePathId::new("README.md"),
-            content_hash: Hash256::from_bytes([4; 32]),
-            mime_type: Some("text/markdown".to_string()),
-            text_preview: Some("usage guide".to_string()),
-        };
-        source_graph.upsert_shallow_file(&shallow).unwrap();
-        source_graph
-            .upsert_structured_artifact(&structured)
-            .unwrap();
-        source_graph.upsert_opaque_artifact(&opaque).unwrap();
-
-        graft_semantic_state(&local_snap, &result.layout, &source_graph);
-
-        let local_graph = local_snap.graph();
-        assert_eq!(
-            local_graph.list_shallow_files().unwrap()[0].file_id,
-            shallow.file_id
-        );
-        assert_eq!(
-            local_graph.list_structured_artifacts().unwrap()[0].file_id,
-            structured.file_id
-        );
-        assert_eq!(
-            local_graph.list_opaque_artifacts().unwrap()[0].file_id,
-            opaque.file_id
-        );
-    }
-
-    /// One change in the shape a lazy artifact-only ref hydration leaves in the
-    /// graph, plus the semantically replayed copy of it a later Git import
-    /// produces.
-    #[test]
-    fn warm_graft_preserves_change_dag_and_branches() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = kin_core::init(dir.path()).unwrap();
-        let local_snap = open_snapshot_with_retry(result.layout.kindb_snapshot_path());
-
-        let source_graph = kin_db::InMemoryGraph::new();
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32]));
-        let child_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x22; 32]));
-        let branch_name = kin_model::BranchName::new("main");
-
-        let genesis = SemanticChange {
-            id: genesis_id,
-            parents: vec![],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("test"),
-            message: "genesis".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            tree_deltas: vec![],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(branch_name.clone()),
-        };
-        let child = SemanticChange {
-            id: child_id,
-            parents: vec![genesis_id],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("test"),
-            message: "child".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            tree_deltas: vec![],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(branch_name.clone()),
-        };
-
-        source_graph.create_change(&genesis).unwrap();
-        source_graph.create_change(&child).unwrap();
-        source_graph
-            .create_branch(&kin_model::Branch {
-                name: branch_name.clone(),
-                head: child_id,
-            })
-            .unwrap();
-
-        graft_semantic_state(&local_snap, &result.layout, &source_graph);
-
-        let local_graph = local_snap.graph();
-        assert_eq!(
-            local_graph.get_change(&genesis_id).unwrap().unwrap().id,
-            genesis_id
-        );
-        let reloaded_child = local_graph.get_change(&child_id).unwrap().unwrap();
-        assert_eq!(reloaded_child.parents, vec![genesis_id]);
-        let branch = local_graph.get_branch(&branch_name).unwrap().unwrap();
-        assert_eq!(branch.head, child_id);
-    }
-
-    #[test]
-    fn warm_cache_manifest_validation_tracks_pipeline_epoch() {
-        let repo_dir = tempfile::tempdir().unwrap();
-        let repo_identity = repo_cache_identity(repo_dir.path());
-        let valid_manifest = WarmCacheRepoManifest {
-            schema: INIT_WARM_CACHE_SCHEMA_VERSION.to_string(),
-            pipeline_epoch: INIT_WARM_CACHE_PIPELINE_EPOCH.to_string(),
-            repo_identity: repo_identity.clone(),
-            ..Default::default()
-        };
-
-        assert!(warm_cache_manifest_is_valid(
-            repo_dir.path(),
-            &valid_manifest
-        ));
-
-        let stale_manifest = WarmCacheRepoManifest {
-            pipeline_epoch: "stale-pipeline".to_string(),
-            ..valid_manifest
-        };
-        assert!(!warm_cache_manifest_is_valid(
-            repo_dir.path(),
-            &stale_manifest
-        ));
-    }
-
-    #[test]
-    fn resolve_warm_cache_graph_path_requires_ready_marker_for_bundle() {
-        let repo_dir = tempfile::tempdir().unwrap();
-        let cache_dir = tempfile::tempdir().unwrap();
-        let bundle_id = "bundle-123".to_string();
-        let manifest = WarmCacheRepoManifest {
-            schema: INIT_WARM_CACHE_SCHEMA_VERSION.to_string(),
-            pipeline_epoch: INIT_WARM_CACHE_PIPELINE_EPOCH.to_string(),
-            repo_identity: repo_cache_identity(repo_dir.path()),
-            current_bundle_id: Some(bundle_id.clone()),
-            bundles: BTreeMap::from([(
-                bundle_id.clone(),
-                WarmCacheBundleManifestEntry {
-                    graph_root_hash: "deadbeef".to_string(),
-                    entity_count: 1,
-                    relation_count: 1,
-                    indexed_files: 1,
-                    published_at: chrono::Utc::now().to_rfc3339(),
-                },
-            )]),
-            ..Default::default()
-        };
-
-        fs::create_dir_all(cache_dir.path().join("bundles").join(&bundle_id)).unwrap();
-        fs::write(
-            warm_cache_manifest_path(cache_dir.path()),
-            serde_json::to_string_pretty(&manifest).unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            warm_cache_bundle_graph_path(cache_dir.path(), &bundle_id),
-            b"graph",
-        )
-        .unwrap();
-
-        assert!(
-            resolve_warm_cache_graph_path(repo_dir.path(), cache_dir.path())
-                .unwrap()
-                .is_none(),
-            "bundle should fast-fail before graph open when the ready marker is missing"
-        );
-
-        fs::write(
-            warm_cache_ready_marker_path(cache_dir.path(), &bundle_id),
-            b"ready",
-        )
-        .unwrap();
-        assert_eq!(
-            resolve_warm_cache_graph_path(repo_dir.path(), cache_dir.path())
-                .unwrap()
-                .as_deref(),
-            Some(warm_cache_bundle_graph_path(cache_dir.path(), &bundle_id).as_path())
-        );
-    }
-
-    #[test]
-    fn warm_cache_resolves_by_current_head_not_last_published_bundle() {
-        // Publish-order contamination guard: two commits of the same repo
-        // identity each publish a bundle, and `current_bundle_id` points at
-        // whichever was published LAST. Resolving must return the bundle for the
-        // CURRENT head, not the last-published one — otherwise a checkout at head
-        // A grafts head B's state (the 10k <-> 127k entity swing).
-        let repo_dir = tempfile::tempdir().unwrap();
-        let cache_dir = tempfile::tempdir().unwrap();
-
-        let entry = |root: &str, entities: usize| WarmCacheBundleManifestEntry {
-            graph_root_hash: root.to_string(),
-            entity_count: entities,
-            relation_count: entities,
-            indexed_files: 1,
-            published_at: chrono::Utc::now().to_rfc3339(),
-        };
-        let bundle_a = "bundle-a".to_string();
-        let bundle_b = "bundle-b".to_string();
-        let manifest = WarmCacheRepoManifest {
-            schema: INIT_WARM_CACHE_SCHEMA_VERSION.to_string(),
-            pipeline_epoch: INIT_WARM_CACHE_PIPELINE_EPOCH.to_string(),
-            repo_identity: repo_cache_identity(repo_dir.path()),
-            // Head B was published last, so the manifest's current_bundle_id
-            // points at it — the pre-fix contamination source.
-            current_bundle_id: Some(bundle_b.clone()),
-            heads: BTreeMap::from([
-                ("head_a".to_string(), bundle_a.clone()),
-                ("head_b".to_string(), bundle_b.clone()),
-            ]),
-            bundles: BTreeMap::from([
-                (bundle_a.clone(), entry("aaaa", 10)),
-                (bundle_b.clone(), entry("bbbb", 127)),
-            ]),
-            ..Default::default()
-        };
-        fs::write(
-            warm_cache_manifest_path(cache_dir.path()),
-            serde_json::to_string_pretty(&manifest).unwrap(),
-        )
-        .unwrap();
-        for bundle in [&bundle_a, &bundle_b] {
-            fs::create_dir_all(cache_dir.path().join("bundles").join(bundle)).unwrap();
-            fs::write(
-                warm_cache_bundle_graph_path(cache_dir.path(), bundle),
-                b"graph",
-            )
-            .unwrap();
-            fs::write(
-                warm_cache_ready_marker_path(cache_dir.path(), bundle),
-                b"ready",
-            )
-            .unwrap();
-        }
-
-        // At head A, resolve MUST pick bundle A — not the last-published B.
-        assert_eq!(
-            resolve_warm_cache_graph_path_for_head(
-                repo_dir.path(),
-                cache_dir.path(),
-                Some("head_a".to_string()),
-            )
-            .unwrap()
-            .as_deref(),
-            Some(warm_cache_bundle_graph_path(cache_dir.path(), &bundle_a).as_path()),
-            "head A must resolve its own bundle, not the last-published bundle B",
-        );
-
-        // At head B, resolve picks bundle B.
-        assert_eq!(
-            resolve_warm_cache_graph_path_for_head(
-                repo_dir.path(),
-                cache_dir.path(),
-                Some("head_b".to_string()),
-            )
-            .unwrap()
-            .as_deref(),
-            Some(warm_cache_bundle_graph_path(cache_dir.path(), &bundle_b).as_path()),
-        );
-
-        // An uncached head rejects-don't-adopt: cold init, never graft B.
-        assert!(
-            resolve_warm_cache_graph_path_for_head(
-                repo_dir.path(),
-                cache_dir.path(),
-                Some("head_unknown".to_string()),
-            )
-            .unwrap()
-            .is_none(),
-            "an uncached head must cold-init rather than adopt the last-published bundle",
-        );
-
-        // A non-git (path-scoped) tree has no head; the single last bundle is
-        // still the one meaningful state, so it is reused.
-        assert_eq!(
-            resolve_warm_cache_graph_path_for_head(repo_dir.path(), cache_dir.path(), None)
-                .unwrap()
-                .as_deref(),
-            Some(warm_cache_bundle_graph_path(cache_dir.path(), &bundle_b).as_path()),
-        );
-    }
-
-    #[test]
-    fn warm_cache_content_candidate_offers_ready_last_bundle_head_agnostically() {
-        // The speculative content candidate recovers reuse for an unrecorded
-        // HEAD that still shares semantic truth (a sibling clone or a doc-only
-        // change). It offers the last-published bundle head-agnostically; the
-        // caller diff-gates it on entity-source divergence, so the candidate
-        // itself only needs to exist and be marked ready.
-        let repo_dir = tempfile::tempdir().unwrap();
-        let cache_dir = tempfile::tempdir().unwrap();
-
-        // No manifest yet: nothing to offer.
-        assert!(
-            resolve_warm_cache_content_candidate(repo_dir.path(), cache_dir.path())
-                .unwrap()
-                .is_none(),
-            "no manifest means no candidate",
-        );
-
-        let bundle_id = "content-bundle".to_string();
-        let manifest = WarmCacheRepoManifest {
-            schema: INIT_WARM_CACHE_SCHEMA_VERSION.to_string(),
-            pipeline_epoch: INIT_WARM_CACHE_PIPELINE_EPOCH.to_string(),
-            repo_identity: repo_cache_identity(repo_dir.path()),
-            current_bundle_id: Some(bundle_id.clone()),
-            // A different HEAD is the only one recorded; the candidate must not
-            // depend on the current tree's HEAD being present.
-            heads: BTreeMap::from([("recorded_head".to_string(), bundle_id.clone())]),
-            bundles: BTreeMap::from([(
-                bundle_id.clone(),
-                WarmCacheBundleManifestEntry {
-                    graph_root_hash: bundle_id.clone(),
-                    entity_count: 1,
-                    relation_count: 1,
-                    indexed_files: 1,
-                    published_at: chrono::Utc::now().to_rfc3339(),
-                },
-            )]),
-            ..Default::default()
-        };
-        fs::write(
-            warm_cache_manifest_path(cache_dir.path()),
-            serde_json::to_string_pretty(&manifest).unwrap(),
-        )
-        .unwrap();
-        fs::create_dir_all(cache_dir.path().join("bundles").join(&bundle_id)).unwrap();
-        fs::write(
-            warm_cache_bundle_graph_path(cache_dir.path(), &bundle_id),
-            b"graph",
-        )
-        .unwrap();
-
-        // Bundle present but not yet marked ready: still nothing to offer.
-        assert!(
-            resolve_warm_cache_content_candidate(repo_dir.path(), cache_dir.path())
-                .unwrap()
-                .is_none(),
-            "an unready bundle is not a candidate",
-        );
-
-        fs::write(
-            warm_cache_ready_marker_path(cache_dir.path(), &bundle_id),
-            b"ready",
-        )
-        .unwrap();
-
-        // Ready last-published bundle: offered regardless of the current HEAD.
-        assert_eq!(
-            resolve_warm_cache_content_candidate(repo_dir.path(), cache_dir.path())
-                .unwrap()
-                .as_deref(),
-            Some(warm_cache_bundle_graph_path(cache_dir.path(), &bundle_id).as_path()),
-        );
-    }
-
-    /// Prove that the snapshot→collect→index pipeline never lets manifest.json
-    /// or any `.kin/*` path leak into graph truth (file_hashes, shallow_files,
-    /// structured_artifacts, opaque_artifacts).
-    #[test]
     fn cold_init_pipeline_excludes_control_plane_from_all_surfaces() {
         let repo_dir = tempfile::tempdir().unwrap();
         let root = repo_dir.path();
@@ -9686,50 +7625,19 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let expected_paths: BTreeSet<String> =
             files.iter().map(|(p, _)| (*p).to_string()).collect();
 
-        // Phase 1: snapshot (returns deferred manifest — not yet on disk).
-        let (snapshot_path, manifest) = snapshot_repo(root, false).unwrap();
-        assert!(
-            !snapshot_path.join("manifest.json").exists(),
-            "manifest.json must not exist before write_snapshot_manifest"
-        );
-
-        // Phase 2: collect files from the snapshot — should be repo files only.
-        let all_files = collect_source_files(&snapshot_path).unwrap();
-        let rel_paths: BTreeSet<String> = all_files
-            .iter()
-            .map(|p| {
-                p.strip_prefix(&snapshot_path)
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .collect();
-        assert!(
-            !rel_paths.contains("manifest.json"),
-            "collect_source_files must not return manifest.json; got: {:?}",
-            rel_paths
-        );
-        for path in &rel_paths {
-            assert!(
-                is_repo_owned_graph_path(path),
-                "non-repo path leaked into collect_source_files: {}",
-                path
-            );
-        }
-
-        // Phase 3: classify and index into a graph.
-        let indexable = collect_indexable_files(&snapshot_path, &all_files).unwrap();
         let init_result = kin_core::init(root).unwrap();
+        let snap = open_snapshot_with_retry(init_result.layout.kindb_snapshot_path());
         let blob_store = kin_blobs::BlobStore::new(init_result.layout.objects_dir()).unwrap();
-        let graph = kin_db::InMemoryGraph::new();
-        parse_and_index(&graph, &blob_store, &indexable).unwrap();
-
-        // Phase 4: write manifest now (as the real run() does).
-        write_snapshot_manifest(&snapshot_path, &manifest).unwrap();
-        assert!(snapshot_path.join("manifest.json").exists());
+        let graph = snap.graph();
+        let indexable = admit_test_repository(root, graph.as_ref(), &blob_store);
+        parse_and_index(graph.as_ref(), &blob_store, &indexable).unwrap();
+        assert!(
+            !root.join(".kin/snapshot").exists(),
+            "graph/blob admission must not make a raw tree copy"
+        );
 
         // Assert graph truth contains ONLY repo-owned paths.
-        let tracked = tracked_graph_paths(&graph);
+        let tracked = tracked_graph_paths(graph.as_ref());
         assert_eq!(
             tracked, expected_paths,
             "graph truth must match repo files exactly; got: {:?}",
@@ -9741,7 +7649,11 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         );
 
         // Double-check individual surfaces.
-        let file_hash_paths: BTreeSet<String> = graph.indexed_file_paths().into_iter().collect();
+        let file_hash_paths: BTreeSet<String> = graph
+            .resolved_tree()
+            .artifacts_by_path()
+            .filter_map(|artifact| artifact.path.as_utf8().map(str::to_owned))
+            .collect();
         assert!(
             !file_hash_paths.contains("manifest.json"),
             "manifest.json must not appear in file_hashes"
@@ -9775,17 +7687,13 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 artifact.file_id.0
             );
         }
-
-        // Verify manifest data is correct.
-        assert_eq!(manifest["file_count"], 5);
     }
 
-    /// Regression: a git *worktree* root carries `.git` as a FILE whose contents
+    /// Regression: a Git worktree root carries `.git` as a FILE whose contents
     /// are a `gitdir:` pointer holding a machine-absolute path. Indexing that file
     /// would bake an ambient filesystem path into graph truth, so two preps of
-    /// identical content at different checkout paths would diverge by one entity
-    /// (and its embedding). Prove the full snapshot→collect→index pipeline excludes
-    /// it on every surface, while git-adjacent *repo* files (`.gitignore`,
+    /// identical content at different checkout paths would diverge. Prove the
+    /// graph/blob admission boundary excludes it while git-adjacent repo files (`.gitignore`,
     /// `.github/`) are still indexed.
     #[test]
     fn cold_init_pipeline_excludes_git_worktree_pointer_file() {
@@ -9808,36 +7716,27 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         fs::create_dir_all(root.join(".github/workflows")).unwrap();
         fs::write(root.join(".github/workflows/ci.yml"), "name: ci\n").unwrap();
 
-        // Phase 1: the snapshot must not copy the worktree `.git` pointer file.
-        let (snapshot_path, _manifest) = snapshot_repo(root, false).unwrap();
-        assert!(
-            !snapshot_path.join(".git").exists(),
-            "worktree `.git` pointer file leaked into the snapshot"
-        );
-
-        // Phase 2: collect must yield no `.git`-pathed entry, and every collected
-        // path must be repo-owned and free of the machine-absolute path.
-        let all_files = collect_source_files(&snapshot_path).unwrap();
-        let rel_paths: BTreeSet<String> = all_files
-            .iter()
-            .map(|p| {
-                p.strip_prefix(&snapshot_path)
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .collect();
+        let init_result = kin_core::init(root).unwrap();
+        let snap = open_snapshot_with_retry(init_result.layout.kindb_snapshot_path());
+        let graph = snap.graph();
+        let blob_store = kin_blobs::BlobStore::new(init_result.layout.objects_dir()).unwrap();
+        let indexable = admit_test_repository(root, graph.as_ref(), &blob_store);
+        let rel_paths = graph
+            .resolved_tree()
+            .artifacts_by_path()
+            .filter_map(|artifact| artifact.path.as_utf8().map(str::to_owned))
+            .collect::<BTreeSet<_>>();
         assert!(
             !rel_paths
                 .iter()
                 .any(|p| p.as_str() == ".git" || p.starts_with(".git/")),
-            "`.git` plumbing leaked into collect_source_files: {:?}",
+            "`.git` plumbing leaked into exact tree truth: {:?}",
             rel_paths
         );
         for p in &rel_paths {
             assert!(
                 is_repo_owned_graph_path(p),
-                "non-repo path leaked into collect_source_files: {}",
+                "non-repo path leaked into exact tree truth: {}",
                 p
             );
         }
@@ -9850,26 +7749,18 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             rel_paths
         );
 
-        // Phase 2b: the machine-absolute path must appear in no collected input
-        // (the pointer file was its only carrier).
-        for p in &all_files {
-            let text = String::from_utf8_lossy(&fs::read(p).unwrap()).into_owned();
+        for file in &indexable {
+            let text = String::from_utf8_lossy(file.content.as_slice()).into_owned();
             assert!(
                 !text.contains(worktree_abs),
-                "machine-absolute worktree path leaked into snapshot content: {}",
-                p.display()
+                "machine-absolute worktree path leaked into admitted content: {}",
+                file.rel_path
             );
         }
 
-        // Phase 3: index into a real graph and assert no `.git`-pathed entity or
-        // artifact — and no machine path — reaches graph truth on any surface.
-        let indexable = collect_indexable_files(&snapshot_path, &all_files).unwrap();
-        let init_result = kin_core::init(root).unwrap();
-        let blob_store = kin_blobs::BlobStore::new(init_result.layout.objects_dir()).unwrap();
-        let graph = kin_db::InMemoryGraph::new();
-        parse_and_index(&graph, &blob_store, &indexable).unwrap();
+        parse_and_index(graph.as_ref(), &blob_store, &indexable).unwrap();
 
-        let tracked = tracked_graph_paths(&graph);
+        let tracked = tracked_graph_paths(graph.as_ref());
         assert!(
             !tracked
                 .iter()
@@ -9923,8 +7814,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let graph = snap.graph();
         let blob_store = kin_blobs::BlobStore::new(init_result.layout.objects_dir()).unwrap();
 
-        let all_files = collect_source_files(root).unwrap();
-        let indexable_files = collect_indexable_files(root, &all_files).unwrap();
+        let indexable_files = admit_test_repository(root, graph.as_ref(), &blob_store);
         let _summary = parse_and_index(graph.as_ref(), &blob_store, &indexable_files).unwrap();
         snap.save().unwrap();
 
@@ -10028,8 +7918,7 @@ fn test_parse_json() {
         let graph = snap.graph();
         let blob_store = kin_blobs::BlobStore::new(init_result.layout.objects_dir()).unwrap();
 
-        let all_files = collect_source_files(root).unwrap();
-        let indexable_files = collect_indexable_files(root, &all_files).unwrap();
+        let indexable_files = admit_test_repository(root, graph.as_ref(), &blob_store);
         parse_and_index(graph.as_ref(), &blob_store, &indexable_files).unwrap();
 
         let entities = graph.list_all_entities().unwrap();
@@ -10116,8 +8005,7 @@ pub struct Config {
         let snap = open_snapshot_with_retry(init_result.layout.kindb_snapshot_path());
         let graph = snap.graph();
         let blob_store = kin_blobs::BlobStore::new(init_result.layout.objects_dir()).unwrap();
-        let all_files = collect_source_files(root).unwrap();
-        let indexable_files = collect_indexable_files(root, &all_files).unwrap();
+        let indexable_files = admit_test_repository(root, graph.as_ref(), &blob_store);
         let summary = parse_and_index(graph.as_ref(), &blob_store, &indexable_files).unwrap();
         snap.save().unwrap();
 

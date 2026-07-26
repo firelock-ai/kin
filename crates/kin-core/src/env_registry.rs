@@ -146,7 +146,6 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_HOME", kind: Kind::Path, default: "~/.kin", sensitivity: Sensitivity::Operational, summary: "preferred root for the managed Kin install used by the launcher, setup, and shell hooks" },
     EnvVarSpec { name: "KIN_DIR", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "compatibility alias for the managed Kin install root; KIN_HOME wins when both are set" },
     // ---- correctness / retrieval-affecting ------------------------------------
-    EnvVarSpec { name: "KIN_INIT_WARM_CACHE", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Correctness, summary: "reuse a warm init cache; a cross-store warm cache can depress F1, so an override is loud" },
     EnvVarSpec { name: "KIN_SEMLOC_RERANK", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "enable semantic-locate reranking of daemon locate results" },
     EnvVarSpec { name: "KIN_SEARCH_MODE", kind: Kind::OneOf(&["precise"]), default: "", sensitivity: Sensitivity::Correctness, summary: "search strictness; 'precise' rejects broad show-body searches" },
     EnvVarSpec { name: "KIN_DISABLE_SPINE", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "disable the spine federation layer, narrowing retrieval scope" },
@@ -228,7 +227,6 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_SUPERVISOR_REEXEC_DISABLE", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "disable supervisor self-reexec on binary mtime change" },
 
     // ---- init / embed / registry / storage -----------------------------------
-    EnvVarSpec { name: "KIN_INIT_CACHE_DIR", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "directory used for the init warm cache" },
     EnvVarSpec { name: "KIN_INIT_MAX_FILES", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "cap on files ingested during init" },
     EnvVarSpec { name: "KIN_EMBED_MAX_PASSES", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "cap on embedding passes per embed run" },
     EnvVarSpec { name: "KIN_EMBED_PASS_SECONDS", kind: Kind::Secs, default: "", sensitivity: Sensitivity::Operational, summary: "per-pass wall-clock budget for an embed run" },
@@ -322,8 +320,10 @@ pub const DOWNSTREAM: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_EMBED_CACHE", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Operational, summary: "kin-db on-disk embedding cache; set to 0 to disable and always recompute (only the literal '0' disables), default on" },
     EnvVarSpec { name: "KIN_EMBED_CACHE_BUDGET_GB", kind: Kind::NonNegF32, default: "", sensitivity: Sensitivity::Operational, summary: "kin-db on-disk embedding cache disk budget in GB for `kin cache gc`; unset (default) evicts nothing — the cache is pruned only by an explicit budget or command" },
     EnvVarSpec { name: "KIN_EMBED_CACHE_DIR", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "kin-db on-disk embedding cache directory; unset uses ~/.kin/cache/embeddings" },
-    // ---- kin-vfs shim: projection bypass --------------------------------------
+    // ---- kin-vfs shim: projection authority -----------------------------------
     EnvVarSpec { name: "KIN_NO_VFS", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "kin-vfs shim projection bypass: set to 1 to skip VFS initialization and exec the real binary directly (only the literal '1' bypasses), default off" },
+    EnvVarSpec { name: "KIN_VFS_DISABLE", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "kin-vfs interception kill switch: the literal 1 disables every projected read and write, default off" },
+    EnvVarSpec { name: "KIN_VFS_STRICT", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "require graph-authoritative projection misses to fail loud when the daemon is unreachable instead of passing through to raw files" },
     // ---- container entrypoint (shell-consumed; inherited by the daemon) -------
     EnvVarSpec { name: "KIN_WORKSPACE_DIR", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "docker-entrypoint workspace override for both storage modes; unset uses /tmp/kin-workspace (backed by an emptyDir in k8s); set to /workspace to opt into a legacy mounted volume" },
 ];
@@ -950,7 +950,6 @@ mod tests {
     #[test]
     fn known_hazard_vars_are_present_and_correctness_relevant() {
         for name in [
-            "KIN_INIT_WARM_CACHE",
             "KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE",
             "KIN_LOCATE_MULTIHOP_TIMEOUT_MS",
             "KIN_LOCATE_RERANK_LATENCY_BUDGET_MS",
@@ -1151,6 +1150,8 @@ mod tests {
             "KIN_EMBED_CACHE",
             "KIN_EMBED_CACHE_DIR",
             "KIN_NO_VFS",
+            "KIN_VFS_DISABLE",
+            "KIN_VFS_STRICT",
         ] {
             assert!(
                 spec(name).is_some(),

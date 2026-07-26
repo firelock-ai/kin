@@ -46,12 +46,13 @@ fn git(dir: &Path, args: &[&str]) -> Output {
     output
 }
 
+/// Run the real `kin` binary in `dir` with an isolated registry so the test
+/// never touches shared repository state.
 fn run_kin(dir: &Path, registry: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_kin"))
         .args(args)
         .current_dir(dir)
         .env("KIN_REGISTRY_PATH", registry)
-        .env("KIN_INIT_WARM_CACHE", "0")
         .output()
         .expect("run kin binary")
 }

@@ -70,11 +70,10 @@ pub struct ImportedChange {
 /// is assigned.
 #[derive(Debug, Clone)]
 pub(crate) struct CommitFileDelta {
-    pub path: RepoPath,
     /// Prior side of the transition. A file or symlink carries a blob id; a
     /// gitlink carries the pinned commit id.
-    pub old: Option<(gix::ObjectId, GitEntryClass)>,
-    pub new: Option<(gix::ObjectId, GitEntryClass)>,
+    pub old: Option<(RepoPath, gix::ObjectId, GitEntryClass)>,
+    pub new: Option<(RepoPath, gix::ObjectId, GitEntryClass)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,27 +88,22 @@ fn update_oid_identity(hasher: &mut Sha256, oid: &gix::ObjectId) {
     hasher.update(oid.as_bytes());
 }
 
-/// Compute the canonical full-history SemanticChangeId for a Git commit.
-fn change_id_from_git_oid(oid: &gix::ObjectId) -> SemanticChangeId {
-    let mut hasher = Sha256::new();
-    hasher.update(b"kin.git.semantic-change.v2\0");
-    update_oid_identity(&mut hasher, oid);
-    let result = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&result);
-    SemanticChangeId::from_hash(Hash256::from_bytes(bytes))
+fn placeholder_change_id() -> SemanticChangeId {
+    SemanticChangeId::from_hash(Hash256::from_bytes([0; 32]))
 }
 
-/// Snapshot IDs use a separate domain because the same Git commit imported as
-/// full history has different parents and deltas.
-fn snapshot_change_id_from_git_oid(oid: &gix::ObjectId) -> SemanticChangeId {
-    let mut hasher = Sha256::new();
-    hasher.update(b"kin.git.snapshot-change.v1\0");
-    update_oid_identity(&mut hasher, oid);
-    let result = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&result);
-    SemanticChangeId::from_hash(Hash256::from_bytes(bytes))
+/// Assign and validate the model-owned identity of a complete imported change.
+///
+/// A Git object id remains source provenance. It cannot be a Kin change id:
+/// snapshot/full imports, parent mappings, semantic enrichment, and future
+/// provenance fields all produce distinct immutable Kin payloads for the same
+/// Git object.
+fn identify_imported_change(mut change: SemanticChange) -> Result<SemanticChange> {
+    change.id = kin_model::compute_semantic_change_id(&change)
+        .map_err(|error| GitError::Other(format!("identify imported Git change: {error}")))?;
+    kin_model::validate_semantic_change_id(&change)
+        .map_err(|error| GitError::Other(format!("validate imported Git change: {error}")))?;
+    Ok(change)
 }
 
 /// Allocate a stable graph identity for one Git introduction event.
@@ -148,11 +142,21 @@ fn timestamp_from_git_seconds(seconds: i64, oid: &gix::ObjectId) -> Result<Times
         })
 }
 
-/// Compute the canonical full-history SemanticChangeId for a Git commit hash.
+/// Git object ids are provenance, not Kin semantic-change identities.
+///
+/// Resolving an imported Git object therefore requires the persisted import
+/// provenance index. Deriving an id from the object bytes would bypass the
+/// model-owned full-payload identity contract.
+#[deprecated(
+    note = "Git object ids are provenance; resolve them through imported graph metadata instead"
+)]
 pub fn semantic_change_id_from_git_oid_hex(oid_hex: &str) -> Result<SemanticChangeId> {
-    let oid = gix::ObjectId::from_hex(oid_hex.as_bytes())
+    let _ = gix::ObjectId::from_hex(oid_hex.as_bytes())
         .map_err(|error| GitError::Git(format!("invalid git oid {oid_hex:?}: {error}")))?;
-    Ok(change_id_from_git_oid(&oid))
+    Err(GitError::Other(
+        "a Git object id does not determine a Kin semantic-change id; resolve the imported provenance mapping from graph authority"
+            .to_string(),
+    ))
 }
 
 pub fn import_git_history(
@@ -247,8 +251,8 @@ fn import_snapshot(
         blob_store,
     )?;
     let (author, timestamp, message) = commit_metadata(&commit)?;
-    let change = SemanticChange {
-        id: snapshot_change_id_from_git_oid(&head_id),
+    let change = identify_imported_change(SemanticChange {
+        id: placeholder_change_id(),
         parents: vec![genesis_id],
         timestamp,
         author,
@@ -261,7 +265,7 @@ fn import_snapshot(
         evidence: vec![],
         risk_summary: None,
         authored_on: Some(BranchName::new("main")),
-    };
+    })?;
     info!(git_oid = %head_id, kin_id = %change.id, "imported exact Git snapshot");
     Ok(vec![ImportedChange {
         change,
@@ -297,6 +301,7 @@ fn import_full(
     let oids = order_selected_oids_parent_first(repo, selected)?;
 
     let mut states = HashMap::<gix::ObjectId, ResolvedTree>::with_capacity(oids.len());
+    let mut change_ids = HashMap::<gix::ObjectId, SemanticChangeId>::with_capacity(oids.len());
     let mut changes = Vec::with_capacity(oids.len());
     for oid in oids {
         let commit = repo
@@ -306,10 +311,20 @@ fn import_full(
             .parent_ids()
             .map(|parent| parent.detach())
             .collect::<Vec<_>>();
-        let parents = if git_parents.is_empty() {
+        let parents = git_parents
+            .iter()
+            .map(|parent| {
+                change_ids.get(parent).copied().ok_or_else(|| {
+                    GitError::Git(format!(
+                        "Git parent {parent} has no model-owned change identity before child {oid}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let parents = if parents.is_empty() {
             vec![genesis_id]
         } else {
-            git_parents.iter().map(change_id_from_git_oid).collect()
+            parents
         };
         let base_state = match git_parents.first() {
             Some(parent) => states.get(parent).cloned().ok_or_else(|| {
@@ -345,8 +360,8 @@ fn import_full(
             blob_store,
         )?;
         let (author, timestamp, message) = commit_metadata(&commit)?;
-        let change = SemanticChange {
-            id: change_id_from_git_oid(&oid),
+        let change = identify_imported_change(SemanticChange {
+            id: placeholder_change_id(),
             parents,
             timestamp,
             author,
@@ -359,7 +374,7 @@ fn import_full(
             evidence: vec![],
             risk_summary: None,
             authored_on: git_parents.is_empty().then(|| BranchName::new("main")),
-        };
+        })?;
         debug!(
             git_oid = %oid,
             kin_id = %change.id,
@@ -368,6 +383,7 @@ fn import_full(
             "imported Git commit"
         );
         states.insert(oid, resolved);
+        change_ids.insert(oid, change.id);
         changes.push(ImportedChange {
             change,
             git_oid: oid.to_string(),
@@ -442,22 +458,36 @@ fn materialize_tree_deltas(
     identity_domain: &[u8],
     blob_store: Option<&BlobStore>,
 ) -> Result<(Vec<TreeDelta>, ResolvedTree)> {
-    raw_deltas.sort_by(|left, right| left.path.cmp(&right.path));
+    raw_deltas.sort_by(|left, right| {
+        let left_path = left
+            .new
+            .as_ref()
+            .map(|(path, _, _)| path)
+            .or_else(|| left.old.as_ref().map(|(path, _, _)| path))
+            .expect("a Git tree delta has one exact side");
+        let right_path = right
+            .new
+            .as_ref()
+            .map(|(path, _, _)| path)
+            .or_else(|| right.old.as_ref().map(|(path, _, _)| path))
+            .expect("a Git tree delta has one exact side");
+        left_path.cmp(right_path)
+    });
     let mut deltas = Vec::with_capacity(raw_deltas.len());
 
     for (ordinal, raw) in raw_deltas.into_iter().enumerate() {
         let old = raw
             .old
-            .map(|(oid, class)| {
+            .map(|(path, oid, class)| {
                 exact_tree_entry(repo, oid, class, blob_store)
-                    .map(|entry| LocatedEntry::new(raw.path.clone(), entry))
+                    .map(|entry| LocatedEntry::new(path, entry))
             })
             .transpose()?;
         let new = raw
             .new
-            .map(|(oid, class)| {
+            .map(|(path, oid, class)| {
                 exact_tree_entry(repo, oid, class, blob_store)
-                    .map(|entry| LocatedEntry::new(raw.path.clone(), entry))
+                    .map(|entry| LocatedEntry::new(path, entry))
             })
             .transpose()?;
 
@@ -535,8 +565,13 @@ fn secondary_artifact_identity(
 ) -> Option<ArtifactId> {
     let mut candidate = None;
     for state in secondary_states {
-        let artifact = state.artifact_at_path(&new.path)?;
-        if artifact.entry != new.entry || base_state.get(&artifact.artifact_id).is_some() {
+        let Some(artifact) = state.artifact_at_path(&new.path) else {
+            continue;
+        };
+        if artifact.entry != new.entry {
+            continue;
+        }
+        if base_state.get(&artifact.artifact_id).is_some() {
             return None;
         }
         match candidate {
@@ -559,9 +594,8 @@ fn full_tree_file_deltas(
         entries
             .into_iter()
             .map(|(path, oid, class)| CommitFileDelta {
-                path,
                 old: None,
-                new: Some((oid, class)),
+                new: Some((path, oid, class)),
             })
             .collect()
     })
@@ -610,7 +644,15 @@ pub(crate) fn commit_file_deltas(
                 .map_err(|error| GitError::Git(error.to_string()))
         })
         .transpose()?;
-    let options = gix::diff::Options::default().with_rewrites(None);
+    // Git stores trees, not rename records. Preserve identity only for
+    // byte-exact renames; fuzzy similarity is insufficient authority to merge
+    // two graph artifact identities.
+    let options = gix::diff::Options::default().with_rewrites(Some(gix::diff::Rewrites {
+        copies: None,
+        percentage: None,
+        limit: 0,
+        track_empty: true,
+    }));
     let changes = repo
         .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(options))
         .map_err(|error| GitError::Git(error.to_string()))?;
@@ -624,10 +666,10 @@ pub(crate) fn commit_file_deltas(
                 ..
             } => {
                 if let Some(class) = classify_git_entry(entry_mode) {
+                    let path = repo_path(location.as_ref())?;
                     deltas.push(CommitFileDelta {
-                        path: repo_path(location.as_ref())?,
                         old: None,
-                        new: Some((id, class)),
+                        new: Some((path, id, class)),
                     });
                 }
             }
@@ -638,9 +680,9 @@ pub(crate) fn commit_file_deltas(
                 ..
             } => {
                 if let Some(class) = classify_git_entry(entry_mode) {
+                    let path = repo_path(location.as_ref())?;
                     deltas.push(CommitFileDelta {
-                        path: repo_path(location.as_ref())?,
-                        old: Some((id, class)),
+                        old: Some((path, id, class)),
                         new: None,
                     });
                 }
@@ -655,17 +697,63 @@ pub(crate) fn commit_file_deltas(
                 let old = classify_git_entry(previous_entry_mode).map(|class| (previous_id, class));
                 let new = classify_git_entry(entry_mode).map(|class| (id, class));
                 if old.is_some() || new.is_some() {
+                    let path = repo_path(location.as_ref())?;
                     deltas.push(CommitFileDelta {
-                        path: repo_path(location.as_ref())?,
-                        old,
-                        new,
+                        old: old.map(|(oid, class)| (path.clone(), oid, class)),
+                        new: new.map(|(oid, class)| (path, oid, class)),
                     });
                 }
             }
-            _ => {}
+            gix::object::tree::diff::ChangeDetached::Rewrite {
+                source_location,
+                source_entry_mode,
+                source_id,
+                entry_mode,
+                id,
+                location,
+                copy,
+                ..
+            } => {
+                let new_class = classify_git_entry(entry_mode);
+                if copy {
+                    if let Some(class) = new_class {
+                        deltas.push(CommitFileDelta {
+                            old: None,
+                            new: Some((repo_path(location.as_ref())?, id, class)),
+                        });
+                    }
+                    continue;
+                }
+                let old_class = classify_git_entry(source_entry_mode);
+                if old_class.is_some() || new_class.is_some() {
+                    let old = old_class
+                        .map(|class| {
+                            repo_path(source_location.as_ref()).map(|path| (path, source_id, class))
+                        })
+                        .transpose()?;
+                    let new = new_class
+                        .map(|class| repo_path(location.as_ref()).map(|path| (path, id, class)))
+                        .transpose()?;
+                    deltas.push(CommitFileDelta { old, new });
+                }
+            }
         }
     }
-    deltas.sort_by(|left, right| left.path.cmp(&right.path));
+    deltas.sort_by(|left, right| {
+        let left_path = left
+            .new
+            .as_ref()
+            .map(|(path, _, _)| path)
+            .or_else(|| left.old.as_ref().map(|(path, _, _)| path))
+            .expect("Git delta has one side");
+        let right_path = right
+            .new
+            .as_ref()
+            .map(|(path, _, _)| path)
+            .or_else(|| right.old.as_ref().map(|(path, _, _)| path))
+            .expect("Git delta has one side");
+        left_path.cmp(right_path)
+    });
     Ok(deltas)
 }
 
@@ -869,6 +957,17 @@ mod tests {
         SemanticChangeId::from_hash(Hash256::from_bytes([0x55; 32]))
     }
 
+    fn assert_model_owned_ids(imported: &[ImportedChange]) {
+        for entry in imported {
+            kin_model::validate_semantic_change_id(&entry.change).unwrap_or_else(|error| {
+                panic!(
+                    "Git object {} produced an invalid Kin identity: {error}",
+                    entry.git_oid
+                )
+            });
+        }
+    }
+
     #[test]
     fn default_import_is_full_history() {
         assert_eq!(ImportOptions::default().mode, GitImportMode::Full);
@@ -892,9 +991,38 @@ mod tests {
         .unwrap();
         let full = import_git_history(dir.path(), genesis(), &ImportOptions::default()).unwrap();
 
+        assert_model_owned_ids(&snapshot);
+        assert_model_owned_ids(&full);
         assert_ne!(snapshot[0].change.id, full[0].change.id);
         assert_eq!(snapshot[0].change.parents, vec![genesis()]);
         assert_eq!(full[0].change.parents, vec![genesis()]);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn git_oid_is_provenance_and_full_payload_owns_change_identity() {
+        let dir = init_repo();
+        fs::write(dir.path().join("compose.yaml"), b"services: {}\n").unwrap();
+        git(dir.path(), &["add", "compose.yaml"]);
+        git(dir.path(), &["commit", "-m", "root"]);
+
+        let imported =
+            import_git_history(dir.path(), genesis(), &ImportOptions::default()).unwrap();
+        let original = &imported[0];
+        kin_model::validate_semantic_change_id(&original.change).unwrap();
+
+        let mut distinct_payload = original.change.clone();
+        distinct_payload
+            .message
+            .push_str(" with semantic enrichment");
+        distinct_payload.id = kin_model::compute_semantic_change_id(&distinct_payload).unwrap();
+        kin_model::validate_semantic_change_id(&distinct_payload).unwrap();
+        assert_ne!(original.change.id, distinct_payload.id);
+
+        let error = semantic_change_id_from_git_oid_hex(&original.git_oid).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not determine a Kin semantic-change id"));
     }
 
     #[test]
@@ -911,6 +1039,7 @@ mod tests {
 
         let imported =
             import_git_history(dir.path(), genesis(), &ImportOptions::default()).unwrap();
+        assert_model_owned_ids(&imported);
         assert_eq!(imported.len(), 2);
         let added = imported[0].change.tree_deltas[0].artifact_id();
         let updated = imported[1].change.tree_deltas[0].artifact_id();
@@ -922,6 +1051,37 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn exact_rename_preserves_identity_and_both_locations() {
+        let dir = init_repo();
+        fs::write(
+            dir.path().join("old-name.rs"),
+            b"pub fn answer() -> u8 { 42 }\n",
+        )
+        .unwrap();
+        git(dir.path(), &["add", "old-name.rs"]);
+        git(dir.path(), &["commit", "-m", "add"]);
+        git(dir.path(), &["mv", "old-name.rs", "new-name.rs"]);
+        git(dir.path(), &["commit", "-m", "rename"]);
+
+        let imported =
+            import_git_history(dir.path(), genesis(), &ImportOptions::default()).unwrap();
+        assert_model_owned_ids(&imported);
+        let added_id = imported[0].change.tree_deltas[0].artifact_id();
+        let TreeDelta::Updated {
+            artifact_id,
+            old,
+            new,
+        } = &imported[1].change.tree_deltas[0]
+        else {
+            panic!("exact Git rename must be one identity-bearing update");
+        };
+        assert_eq!(*artifact_id, added_id);
+        assert_eq!(old.path.as_utf8(), Some("old-name.rs"));
+        assert_eq!(new.path.as_utf8(), Some("new-name.rs"));
+        assert_eq!(old.entry, new.entry);
     }
 
     #[test]
@@ -938,6 +1098,7 @@ mod tests {
 
         let imported =
             import_git_history(dir.path(), genesis(), &ImportOptions::default()).unwrap();
+        assert_model_owned_ids(&imported);
         assert_ne!(
             imported[0].change.tree_deltas[0].artifact_id(),
             imported[2].change.tree_deltas[0].artifact_id()
@@ -952,6 +1113,8 @@ mod tests {
         git(dir.path(), &["commit", "-m", "lock"]);
         let first = import_git_history(dir.path(), genesis(), &ImportOptions::default()).unwrap();
         let second = import_git_history(dir.path(), genesis(), &ImportOptions::default()).unwrap();
+        assert_model_owned_ids(&first);
+        assert_model_owned_ids(&second);
         assert_eq!(
             serde_json::to_vec(&first[0].change).unwrap(),
             serde_json::to_vec(&second[0].change).unwrap()
@@ -1004,6 +1167,7 @@ mod tests {
 
         let imported =
             import_git_history(dir.path(), genesis(), &ImportOptions::default()).unwrap();
+        assert_model_owned_ids(&imported);
         assert_eq!(
             imported[0].change.tree_deltas[0]
                 .new_state()
@@ -1037,6 +1201,7 @@ mod tests {
 
         let imported =
             import_git_history(dir.path(), genesis(), &ImportOptions::default()).unwrap();
+        assert_model_owned_ids(&imported);
         let right_change = imported
             .iter()
             .find(|change| change.git_oid == right_oid)
@@ -1098,6 +1263,7 @@ mod tests {
 
         let imported =
             import_git_history(dir.path(), genesis(), &ImportOptions::default()).unwrap();
+        assert_model_owned_ids(&imported);
         assert!(matches!(
             imported[0].change.tree_deltas[0].new_state().unwrap().entry,
             TreeEntry::Gitlink { .. }

@@ -132,7 +132,12 @@ where
                     .into_commit();
                 let files = commit_file_deltas(&local, &commit)?
                     .into_iter()
-                    .filter_map(|delta| delta.path.as_utf8().map(str::to_owned))
+                    .flat_map(|delta| {
+                        [delta.old, delta.new]
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|(path, _, _)| path.as_utf8().map(str::to_owned))
+                    })
                     .collect::<BTreeSet<_>>();
                 Ok(files)
             })
