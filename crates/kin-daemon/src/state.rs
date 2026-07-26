@@ -906,6 +906,10 @@ pub struct DaemonState {
     /// concurrency those reads contend and surface as opaque "Core error"
     /// shutdown-save failures (SP-20).
     pub cached_repo_id: String,
+    /// Exact local workspace bound by the manifest at startup. Hosted
+    /// storage-backend daemons currently expose repository snapshots rather
+    /// than repository-v6 workspace authority and therefore carry `None`.
+    cached_workspace_id: Option<WorkspaceId>,
     /// True when the daemon is shutting down.
     pub is_shutdown: AtomicBool,
     /// Entity count of the last graph snapshot successfully written to disk,
@@ -1415,6 +1419,7 @@ impl DaemonState {
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
             cached_repo_id,
+            cached_workspace_id: Some(workspace_id),
             is_shutdown: AtomicBool::new(false),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
             mass_deletion_blocked: AtomicBool::new(false),
@@ -1577,6 +1582,7 @@ impl DaemonState {
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
             cached_repo_id: repo_id.to_string(),
+            cached_workspace_id: None,
             is_shutdown: AtomicBool::new(false),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
             mass_deletion_blocked: AtomicBool::new(false),
@@ -3515,29 +3521,17 @@ impl DaemonState {
                 }
             }
         } else {
-            let manifest = kin_core::manifest::KinManifest::load(&self.layout.manifest_path())
-                .map_err(DaemonError::from)?;
-            if manifest.repo_id != self.cached_repo_id {
-                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
-                    format!(
-                        "manifest repository {} does not match daemon authority {}",
-                        manifest.repo_id, self.cached_repo_id
-                    ),
-                )));
-            }
             let repository_id =
                 RepositoryId::new(self.cached_repo_id.clone()).map_err(|error| {
                     DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
                         "invalid daemon repository identity: {error}"
                     )))
                 })?;
-            let workspace_uuid =
-                uuid::Uuid::parse_str(&manifest.workspace_id).map_err(|error| {
-                    DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
-                        "invalid manifest workspace identity: {error}"
-                    )))
-                })?;
-            let workspace_id = WorkspaceId::from_uuid(workspace_uuid);
+            let workspace_id = self.cached_workspace_id.ok_or_else(|| {
+                DaemonError::Graph(kin_db::KinDbError::StorageError(
+                    "local daemon is missing its startup workspace binding".to_string(),
+                ))
+            })?;
             let authority = RepositoryAuthorityManager::open(
                 repository_id,
                 Arc::new(LocalFileBackend::new(self.layout.kindb_dir())),
