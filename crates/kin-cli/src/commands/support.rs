@@ -16,7 +16,7 @@ pub struct SupportJson {
     shallow_file_count: usize,
     structured_artifact_count: usize,
     opaque_artifact_count: usize,
-    file_hash_count: usize,
+    working_tree_entry_count: usize,
     text_indexed_entity_count: usize,
     text_index_coverage_percent: f64,
     indexed_embedding_count: usize,
@@ -42,7 +42,7 @@ impl SupportJson {
             shallow_file_count: stats.shallow_file_count,
             structured_artifact_count: stats.structured_artifact_count,
             opaque_artifact_count: stats.opaque_artifact_count,
-            file_hash_count: stats.file_hash_count,
+            working_tree_entry_count: stats.working_tree_entry_count,
             text_indexed_entity_count: stats.text_indexed_entity_count,
             text_index_coverage_percent: stats.text_index_coverage_percent,
             indexed_embedding_count: stats.indexed_embedding_count,
@@ -133,7 +133,10 @@ fn render_support_json(report: &SupportJson) -> Vec<String> {
             report.structured_artifact_count
         ),
         format!("  opaque artifacts: {}", report.opaque_artifact_count),
-        format!("  file hashes: {}", report.file_hash_count),
+        format!(
+            "  working tree entries: {}",
+            report.working_tree_entry_count
+        ),
         format!(
             "  text index coverage: {} / {} entities ({:.1}%)",
             report.text_indexed_entity_count,
@@ -253,7 +256,7 @@ mod tests {
             file_layout_count: 3,
             structured_artifact_count: 5,
             opaque_artifact_count: 6,
-            file_hash_count: 7,
+            working_tree_entry_count: 7,
             text_indexed_entity_count: 2,
             text_index_coverage_percent: 66.7,
             indexed_embedding_count: 1,
@@ -274,7 +277,6 @@ mod tests {
             graph_empty_for_supported_inputs: false,
             contaminated_entity_count: 0,
             contaminated_non_entity_count: 0,
-            contaminated_file_hash_count: 0,
             contaminated_path_count: 0,
             contaminated_paths_sample: Vec::new(),
             test_role_entity_count: 1,
@@ -297,7 +299,7 @@ mod tests {
                 "  shallow files: 4".to_string(),
                 "  structured artifacts: 5".to_string(),
                 "  opaque artifacts: 6".to_string(),
-                "  file hashes: 7".to_string(),
+                "  working tree entries: 7".to_string(),
                 "  text index coverage: 2 / 3 entities (66.7%)".to_string(),
                 "  embedding coverage: 1 / 3 entities (33.3%)".to_string(),
                 "  pending embeddings: 1".to_string(),
@@ -341,7 +343,7 @@ mod tests {
             file_layout_count: 1,
             structured_artifact_count: 2,
             opaque_artifact_count: 3,
-            file_hash_count: 4,
+            working_tree_entry_count: 4,
             text_indexed_entity_count: 1,
             text_index_coverage_percent: 50.0,
             indexed_embedding_count: 1,
@@ -364,7 +366,6 @@ mod tests {
                 graph_empty_for_supported_inputs: false,
                 contaminated_entity_count: 0,
                 contaminated_non_entity_count: 0,
-                contaminated_file_hash_count: 0,
                 contaminated_path_count: 0,
                 contaminated_paths_sample: Vec::new(),
                 test_role_entity_count: 0,
@@ -379,6 +380,7 @@ mod tests {
         assert_eq!(payload.total_entities, 2);
         assert_eq!(payload.total_relations, 1);
         assert_eq!(payload.file_layout_count, 1);
+        assert_eq!(payload.working_tree_entry_count, 4);
         assert_eq!(payload.text_indexed_entity_count, 1);
         assert_eq!(payload.indexed_embedding_count, 1);
         assert_eq!(payload.entity_counts.get("Function"), Some(&2));
