@@ -1050,8 +1050,8 @@ mod tests {
 
     use kin_blobs::{BlobError, BlobStore};
     use kin_model::{
-        compute_semantic_change_id, ArtifactId, AuthorId, LocatedEntry, RepoPath, Timestamp,
-        TreeDelta,
+        compute_semantic_change_id, ArtifactId, AuthorId, LocatedEntry, RepoPath, ResolvedArtifact,
+        Timestamp, TreeDelta,
     };
     use tempfile::tempdir;
     use uuid::Uuid;
@@ -1106,6 +1106,17 @@ mod tests {
         symlink("scripts/run.sh", source.join("run")).unwrap();
         git(&source, &["add", "--all"]);
         add_raw_index_entry(&source, b"fixtures/imported-\xff.bin", &[17, 0, 255, 34]);
+        let gitlink_target = GitObjectId::sha1([0x42; 20]);
+        let gitlink_oid = "4242424242424242424242424242424242424242";
+        git(
+            &source,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{gitlink_oid},vendor/dependency"),
+            ],
+        );
         git(&source, &["commit", "-m", "import exact mixed repository"]);
         let imported_oid = String::from_utf8(git(&source, &["rev-parse", "HEAD"]))
             .unwrap()
@@ -1126,6 +1137,12 @@ mod tests {
                 ChangeOrigin::Native => panic!("fixture import produced a native change"),
             })
             .unwrap();
+        let gitlink_path = RepoPath::from_utf8("vendor/dependency").unwrap();
+        assert_eq!(
+            base_tree.artifact_at_path(&gitlink_path).unwrap().entry,
+            TreeEntry::gitlink(gitlink_target),
+            "semantic import must preserve the exact Gitlink target"
+        );
 
         let compose_path = RepoPath::from_utf8("compose.yaml").unwrap();
         let compose = base_tree.artifact_at_path(&compose_path).unwrap();
@@ -1225,6 +1242,25 @@ mod tests {
         let mut loader = StoreLoader { store: &store };
         let result = export_repository_to_git(&export_plan, &mut loader, &exported).unwrap();
         verify_repository_git_export(&exported, &result.proof, &expected_tree).unwrap();
+        let wrong_gitlink_tree =
+            ResolvedTree::from_artifacts(expected_tree.artifacts().map(|artifact| {
+                ResolvedArtifact::new(
+                    artifact.artifact_id,
+                    artifact.path.clone(),
+                    if artifact.path == gitlink_path {
+                        TreeEntry::gitlink(GitObjectId::sha1([0x43; 20]))
+                    } else {
+                        artifact.entry
+                    },
+                )
+            }))
+            .unwrap();
+        let error = verify_repository_git_export(&exported, &result.proof, &wrong_gitlink_tree)
+            .expect_err("the export proof must bind the exact Gitlink commit pointer");
+        assert!(
+            error.to_string().contains("graph-owned projection tree"),
+            "unexpected Gitlink export-proof error: {error}"
+        );
         let wrong_tree = ResolvedTree::default();
         let error = verify_repository_git_export(&exported, &result.proof, &wrong_tree)
             .expect_err("the export proof must bind the graph-owned HEAD tree");
@@ -1243,6 +1279,15 @@ mod tests {
         );
 
         git_bare(&exported, &["fsck", "--strict"]);
+        assert_eq!(
+            String::from_utf8(git_bare(
+                &exported,
+                &["ls-tree", "main", "--", "vendor/dependency"],
+            ))
+            .unwrap(),
+            format!("160000 commit {gitlink_oid}\tvendor/dependency\n"),
+            "repository export must retain the exact Gitlink target"
+        );
         assert_eq!(
             String::from_utf8(git_bare(&exported, &["rev-list", "--count", "main"]))
                 .unwrap()
