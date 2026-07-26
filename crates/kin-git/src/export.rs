@@ -9,7 +9,9 @@ use std::time::Duration;
 use gix::objs::tree::{Entry, EntryKind, EntryMode};
 use gix::objs::{Commit, Tree};
 use kin_blobs::BlobStore;
-use kin_model::{BranchName, GraphStore, SemanticChange, SemanticChangeId, SourceEntryKind};
+use kin_model::{
+    BranchName, GraphStore, SemanticChange, SemanticChangeId, TreeDelta, TreeEntryKind,
+};
 use tracing::{debug, info};
 
 use crate::error::{GitError, Result};
@@ -151,7 +153,7 @@ pub fn export_changes(
                 }
             }
         }
-        apply_artifact_deltas(change, blob_store, &mut file_state)?;
+        apply_tree_deltas(change, blob_store, &mut file_state)?;
 
         // Build the Git tree from the current file state.
         let tree_id = build_tree(&git_repo, &file_state)?;
@@ -198,38 +200,38 @@ pub fn export_changes(
     })
 }
 
-/// Apply artifact deltas from a change to the cumulative file state.
-fn apply_artifact_deltas(
+/// Apply exact repository-tree deltas from a change to the cumulative file state.
+fn apply_tree_deltas(
     change: &SemanticChange,
     blob_store: &BlobStore,
     file_state: &mut BTreeMap<String, SourceFileState>,
 ) -> Result<()> {
-    for delta in &change.artifact_deltas {
-        if delta.kind.is_removed() {
-            file_state.remove(&delta.file_id.0);
-            continue;
-        }
-        let kind = delta.kind.source_entry_kind().ok_or_else(|| {
-            GitError::Other(format!(
-                "cannot export legacy mode-unknown artifact delta for {} in change {}; exact source mode backfill is required",
-                delta.file_id, change.id
-            ))
-        })?;
-        let hash = delta.new_hash.ok_or_else(|| {
-            GitError::Other(format!(
-                "cannot export artifact delta for {} in change {} without an exact content identity",
-                delta.file_id, change.id
-            ))
-        })?;
+    for delta in &change.tree_deltas {
+        let (file_id, entry) = match delta {
+            TreeDelta::Removed { file_id, .. } => {
+                file_state.remove(&file_id.0);
+                continue;
+            }
+            TreeDelta::Added { file_id, new_entry }
+            | TreeDelta::Modified {
+                file_id, new_entry, ..
+            } => (file_id, new_entry),
+        };
         let content = blob_store
-            .read(&kin_blobs::Hash256(hash.0))
+            .read(&kin_blobs::Hash256(entry.blob_hash.0))
             .map_err(|error| {
                 GitError::Other(format!(
-                    "cannot export exact source blob {} for {} in change {}: {error}",
-                    hash, delta.file_id, change.id
+                    "cannot export exact tree blob {} for {} in change {}: {error}",
+                    entry.blob_hash, file_id, change.id
                 ))
             })?;
-        file_state.insert(delta.file_id.0.clone(), SourceFileState { content, kind });
+        file_state.insert(
+            file_id.0.clone(),
+            SourceFileState {
+                content,
+                kind: entry.kind,
+            },
+        );
     }
     Ok(())
 }
@@ -322,11 +324,11 @@ fn build_tree(
                     DirEntry::Source { id, kind } => {
                         entries.push(Entry {
                             mode: EntryMode::from(match kind {
-                                SourceEntryKind::File { executable: false } => EntryKind::Blob,
-                                SourceEntryKind::File { executable: true } => {
+                                TreeEntryKind::Regular { executable: false } => EntryKind::Blob,
+                                TreeEntryKind::Regular { executable: true } => {
                                     EntryKind::BlobExecutable
                                 }
-                                SourceEntryKind::Symlink => EntryKind::Link,
+                                TreeEntryKind::Symlink => EntryKind::Link,
                             }),
                             filename: name.clone().into(),
                             oid: *id,
@@ -370,14 +372,14 @@ fn build_tree(
 #[derive(Debug, Clone)]
 struct SourceFileState {
     content: Vec<u8>,
-    kind: SourceEntryKind,
+    kind: TreeEntryKind,
 }
 
 #[derive(Debug)]
 enum DirEntry {
     Source {
         id: gix::ObjectId,
-        kind: SourceEntryKind,
+        kind: TreeEntryKind,
     },
 }
 
@@ -653,7 +655,7 @@ mod tests {
             message: "kin init".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],

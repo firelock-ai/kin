@@ -8,11 +8,11 @@ use kin_model::ChangeStore;
 use kin_model::EntityStore;
 use kin_model::VerificationStore;
 use kin_model::{
-    ArtifactDeltaKind, ArtifactId, AuthorId, Entity, EntityDelta, EntityFilter, EntityId,
-    FileLayout, FilePathId, GraphNodeId, Hash256, OpaqueArtifact, ParseCompleteness, Relation,
-    RelationDelta, RelationId, RelationKind, RelationOrigin, ResolvedSourceEntry, SemanticChange,
-    SemanticChangeId, ShallowTrackedFile, SourceEntryKind, SourceRegion, SourceTreeResolution,
-    StructuredArtifact, TestCase, TestId, TestKind, TestRunner, Timestamp, WorkScope,
+    ArtifactId, AuthorId, Entity, EntityDelta, EntityFilter, EntityId, FileLayout, FilePathId,
+    GraphNodeId, Hash256, OpaqueArtifact, ParseCompleteness, Relation, RelationDelta, RelationId,
+    RelationKind, RelationOrigin, SemanticChange, SemanticChangeId, ShallowTrackedFile,
+    SourceRegion, StructuredArtifact, TestCase, TestId, TestKind, TestRunner, Timestamp, TreeDelta,
+    TreeEntry, TreeEntryKind, WorkScope,
 };
 use kin_projection::build_layout;
 use rayon::prelude::*;
@@ -254,7 +254,7 @@ struct ExactInitSourceEntry {
     abs_path: PathBuf,
     rel_path: String,
     hash: [u8; 32],
-    kind: kin_model::SourceEntryKind,
+    kind: TreeEntryKind,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
@@ -589,53 +589,6 @@ fn stable_change_payload_without_parents_matches(
     }
 
     matches!((payload(left), payload(right)), (Some(left), Some(right)) if left == right)
-        || legacy_git_source_mode_upgrade_matches(left, right, true)
-}
-
-/// Prove that an existing Git-derived change differs from the freshly
-/// imported canonical record only because pre-0.3 history lacked exact source
-/// entry kinds. Git OID-derived change IDs intentionally remain stable, so
-/// this narrow matcher authorizes an in-place history migration instead of
-/// treating the exact-mode payload upgrade as an unrelated ID collision.
-fn legacy_git_source_mode_upgrade_matches(
-    existing: &SemanticChange,
-    canonical: &SemanticChange,
-    ignore_parents: bool,
-) -> bool {
-    if existing.id != canonical.id
-        || existing.artifact_deltas.len() != canonical.artifact_deltas.len()
-    {
-        return false;
-    }
-    let mut normalized = existing.clone();
-    if ignore_parents {
-        normalized.parents = canonical.parents.clone();
-    }
-    let mut upgraded_any = false;
-    for (old, exact) in normalized
-        .artifact_deltas
-        .iter_mut()
-        .zip(&canonical.artifact_deltas)
-    {
-        let compatible_legacy_kind = match old.kind {
-            ArtifactDeltaKind::Added => {
-                exact.kind.is_added() && exact.kind.source_entry_kind().is_some()
-            }
-            ArtifactDeltaKind::Modified => {
-                exact.kind.is_modified() && exact.kind.source_entry_kind().is_some()
-            }
-            _ => false,
-        };
-        if compatible_legacy_kind {
-            old.kind = exact.kind;
-            upgraded_any = true;
-        }
-    }
-    upgraded_any
-        && matches!(
-            (serde_json::to_value(&normalized), serde_json::to_value(canonical)),
-            (Ok(normalized), Ok(canonical)) if normalized == canonical
-        )
 }
 
 /// Publish a deterministic init/import change exactly once.
@@ -952,43 +905,6 @@ fn rebuild_history_derived_indexes(snapshot: &mut kin_db::GraphSnapshot) {
 struct LegacyImportRepairOutcome {
     corrected_changes: usize,
     rebuilt_derived_indexes: bool,
-}
-
-fn upgrade_legacy_git_import_source_modes(
-    manager: &kin_db::SnapshotManager,
-    layout: &kin_core::KinLayout,
-    boundary_root: SemanticChangeId,
-    canonical_imported: &[kin_git::ImportedChange],
-) -> Result<usize> {
-    if canonical_imported.is_empty() {
-        return Ok(0);
-    }
-    let mut snapshot = manager.graph().to_snapshot();
-    let mut upgraded = 0_usize;
-    for canonical in canonical_imported {
-        let Some(existing) = snapshot.changes.get(&canonical.change.id) else {
-            continue;
-        };
-        if legacy_git_source_mode_upgrade_matches(existing, &canonical.change, false) {
-            snapshot
-                .changes
-                .insert(canonical.change.id, canonical.change.clone());
-            upgraded += 1;
-        }
-    }
-    if upgraded == 0 {
-        return Ok(0);
-    }
-
-    validate_repaired_change_history(&snapshot.changes, &snapshot.branches, boundary_root)?;
-    rebuild_history_derived_indexes(&mut snapshot);
-    let upgraded_graph =
-        kin_db::InMemoryGraph::from_snapshot_with_text_index(snapshot, layout.text_index_dir());
-    manager.swap(upgraded_graph);
-    manager
-        .save()
-        .context("persist exact-source mode upgrade for Git-derived history")?;
-    Ok(upgraded)
 }
 
 /// Repair only provable legacy Git-import defects.
@@ -1411,9 +1327,17 @@ pub async fn run(
         if is_warm {
             // NATIVE WARM CACHE: Run the diff directly against the existing graph!
             let graph = snap.graph();
-            let current_files: Vec<(String, [u8; 32])> = indexable_files
+            let current_files: Vec<(String, TreeEntry)> = exact_source_entries
                 .iter()
-                .map(|file| (file.rel_path.clone(), file.hash))
+                .map(|file| {
+                    (
+                        file.rel_path.clone(),
+                        TreeEntry {
+                            blob_hash: Hash256::from_bytes(file.hash),
+                            kind: file.kind,
+                        },
+                    )
+                })
                 .collect();
             let diff = kin_db::engine::compute_diff(graph.as_ref(), &current_files);
 
@@ -1432,7 +1356,7 @@ pub async fn run(
 
             InitIndexSummary {
                 total_entity_count: graph.entity_count(),
-                total_files: graph.indexed_file_paths().len(),
+                total_files: graph.working_tree_paths().len(),
                 linked_relations: graph.relation_count(),
                 warm_cache_hit: true,
                 warm_text_index_reused: true,
@@ -1468,7 +1392,7 @@ pub async fn run(
         )?;
     }
 
-    // Write manifest AFTER collect_source_files so it never enters file_hashes.
+    // Write the manifest after discovery so it never enters graph-owned tree truth.
     write_snapshot_manifest(&tmp_snapshot, &snapshot_manifest)?;
     move_snapshot_into_place(&tmp_snapshot, &dir.join(".kin/snapshot"))?;
     if !json {
@@ -1483,8 +1407,8 @@ pub async fn run(
     let branch_name = kin_core::read_current_branch(&layout)?;
     if !all_files.is_empty() || is_warm {
         // Build a semantic change for the initial parse.
-        // Include artifact_deltas for every file so that the VFS tree
-        // (built from the change DAG) knows which files exist.
+        // Include exact tree deltas for every admitted entry so the change DAG
+        // owns the complete repository tree independent of parser support.
         let change_id = compute_init_change_id(
             &auto_parse_parent_id,
             &compute_artifact_fingerprint(
@@ -1494,20 +1418,10 @@ pub async fn run(
             ),
         );
 
-        let artifact_deltas = match graph.resolve_source_tree_at(&auto_parse_parent_id)? {
-            SourceTreeResolution::Exact { entries } => {
-                build_exact_init_artifact_deltas(entries, &exact_source_entries)
-            }
-            SourceTreeResolution::Incomplete { gaps } => {
-                warn!(
-                    gap_count = gaps.len(),
-                    parent = %auto_parse_parent_id,
-                    "repairing incomplete legacy source history from the frozen init snapshot"
-                );
-                let parent_file_tree = graph.resolve_file_tree_at(&auto_parse_parent_id)?;
-                build_exact_init_repair_deltas(parent_file_tree, &exact_source_entries)
-            }
-        };
+        let tree_deltas = build_exact_init_tree_deltas(
+            graph.resolve_tree_at(&auto_parse_parent_id)?,
+            &exact_source_entries,
+        );
         let mut all_entities = graph.list_all_entities()?;
         // `list_all_entities` is backed by a hash map. Canonicalize its order
         // before it becomes a deterministic init change payload so a repeated
@@ -1543,7 +1457,7 @@ pub async fn run(
             message: "kin init: auto-parse".to_string(),
             entity_deltas,
             relation_deltas,
-            artifact_deltas,
+            tree_deltas,
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -1648,20 +1562,6 @@ pub async fn run(
                         // `SnapshotManager::swap` is RCU-style. Refresh the
                         // caller's Arc so exact-once collision checks target
                         // the repaired graph rather than the retired view.
-                        graph = snap.graph();
-                    }
-
-                    let upgraded_source_modes = upgrade_legacy_git_import_source_modes(
-                        &snap,
-                        &layout,
-                        history_boundary_root,
-                        &imported,
-                    )?;
-                    if upgraded_source_modes > 0 {
-                        warn!(
-                            upgraded_changes = upgraded_source_modes,
-                            "upgraded Git-derived history to exact source entry modes"
-                        );
                         graph = snap.graph();
                     }
 
@@ -1976,7 +1876,7 @@ fn parse_and_index(
 
     Ok(InitIndexSummary {
         total_entity_count,
-        total_files: graph.indexed_file_paths().len(),
+        total_files: graph.working_tree_paths().len(),
         linked_relations: linked_relations.len(),
         warm_cache_hit: false,
         warm_text_index_reused: false,
@@ -2301,7 +2201,7 @@ enum ImportedFileResolution {
 struct ImportedParseJob {
     blob_hash: kin_blobs::Hash256,
     file_id: FilePathId,
-    /// Indices into the commit's `artifact_deltas` this parse resolves. The
+    /// Indices into the commit's `tree_deltas` this parse resolves. The
     /// first entry was counted as a memo miss when the job was scheduled; any
     /// later entries are same-commit reappearances whose hit/miss accounting is
     /// settled in the merge once the parse's success is known.
@@ -2610,27 +2510,28 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
         // (blob bytes, parser semantics) and every order-sensitive step
         // (reconcile, linker mutation, current_files, delta accumulation) stays
         // serial, so the resulting graph is byte-identical to the serial path.
-        let deltas = &imported[i].change.artifact_deltas;
+        let deltas = &imported[i].change.tree_deltas;
         let mut resolutions: Vec<Option<ImportedFileResolution>> =
             (0..deltas.len()).map(|_| None).collect();
         let mut parse_jobs: Vec<ImportedParseJob> = Vec::new();
         let mut scheduled_jobs: HashMap<(kin_blobs::Hash256, u32), usize> = HashMap::new();
 
-        for (delta_idx, artifact_delta) in deltas.iter().enumerate() {
-            let file_path = &artifact_delta.file_id.0;
-
-            if !matches!(
-                FileClassifier::classify(Path::new(file_path)),
-                FileClassification::EntitySource
-            ) {
-                resolutions[delta_idx] = Some(ImportedFileResolution::Remove);
-                continue;
-            }
-
-            let Some(new_hash) = artifact_delta.new_hash else {
+        for (delta_idx, tree_delta) in deltas.iter().enumerate() {
+            let file_path = &tree_delta.file_id().0;
+            let Some(new_entry) = tree_delta.new_entry() else {
                 resolutions[delta_idx] = Some(ImportedFileResolution::Remove);
                 continue;
             };
+
+            if !matches!(new_entry.kind, TreeEntryKind::Regular { .. })
+                || !matches!(
+                    FileClassifier::classify(Path::new(file_path)),
+                    FileClassification::EntitySource
+                )
+            {
+                resolutions[delta_idx] = Some(ImportedFileResolution::Remove);
+                continue;
+            }
 
             // A blob hash uniquely determines the file bytes, and a parse is a
             // pure function of (bytes, parser semantics), so the same file
@@ -2638,7 +2539,7 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
             // is read and parsed once. The parser-semantics version is part of
             // the key so a grammar/extractor upgrade never serves a stale parse.
             let memo_key = (
-                kin_blobs::Hash256::from_bytes(*new_hash.as_bytes()),
+                kin_blobs::Hash256::from_bytes(*new_entry.blob_hash.as_bytes()),
                 kin_parser::PARSER_SEMANTICS_VERSION,
             );
 
@@ -2781,8 +2682,8 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
         // per-file body, now fed pre-resolved parses. Each commit changes a given
         // path at most once, so a delta's baseline `old_state` is independent of
         // its siblings and this fold reproduces the serial result exactly.
-        for (delta_idx, artifact_delta) in imported[i].change.artifact_deltas.iter().enumerate() {
-            let file_path = artifact_delta.file_id.0.clone();
+        for (delta_idx, tree_delta) in imported[i].change.tree_deltas.iter().enumerate() {
+            let file_path = tree_delta.file_id().0.clone();
             let old_state = current_files.get(&file_path).cloned();
             if let Some(old_state) = &old_state {
                 previous_file_states.insert(file_path.clone(), old_state.clone());
@@ -2790,7 +2691,7 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
 
             match resolutions[delta_idx]
                 .take()
-                .expect("every artifact delta must be resolved by the plan/parse phase")
+                .expect("every tree delta must be resolved by the plan/parse phase")
             {
                 ImportedFileResolution::Remove => {
                     if remove_imported_file_semantic_state(
@@ -4032,7 +3933,7 @@ fn index_files_with_stable_entity_ids(
         match result {
             ParsedFileResult::EntitySource {
                 rel_path,
-                hash,
+                hash: _,
                 entities,
                 discovered_tests: file_tests,
                 relations,
@@ -4040,7 +3941,6 @@ fn index_files_with_stable_entity_ids(
                 projection_markers,
                 layout,
             } => {
-                graph.set_file_hash(rel_path, *hash);
                 total_files += 1;
                 if !projection_markers.is_empty() {
                     projection_marker_files.push((rel_path.clone(), projection_markers.clone()));
@@ -4063,11 +3963,10 @@ fn index_files_with_stable_entity_ids(
             }
             ParsedFileResult::ShallowSyntax {
                 rel_path,
-                hash,
+                hash: _,
                 shallow,
                 projection_markers,
             } => {
-                graph.set_file_hash(rel_path, *hash);
                 total_files += 1;
                 if !projection_markers.is_empty() {
                     projection_marker_files.push((rel_path.clone(), projection_markers.clone()));
@@ -4076,11 +3975,10 @@ fn index_files_with_stable_entity_ids(
             }
             ParsedFileResult::StructuredArtifact {
                 rel_path,
-                hash,
+                hash: _,
                 artifact,
                 projection_markers,
             } => {
-                graph.set_file_hash(rel_path, *hash);
                 total_files += 1;
                 if !projection_markers.is_empty() {
                     projection_marker_files.push((rel_path.clone(), projection_markers.clone()));
@@ -4089,11 +3987,10 @@ fn index_files_with_stable_entity_ids(
             }
             ParsedFileResult::OpaqueArtifact {
                 rel_path,
-                hash,
+                hash: _,
                 artifact,
                 projection_markers,
             } => {
-                graph.set_file_hash(rel_path, *hash);
                 total_files += 1;
                 if !projection_markers.is_empty() {
                     projection_marker_files.push((rel_path.clone(), projection_markers.clone()));
@@ -4134,7 +4031,7 @@ fn build_projection_relations_from_markers(
         return Vec::new();
     }
 
-    let known_files: HashSet<String> = graph.indexed_file_paths().into_iter().collect();
+    let known_files: HashSet<String> = graph.working_tree_paths().into_iter().collect();
     projection_marker_files
         .iter()
         .flat_map(|(file_path, markers)| {
@@ -4379,22 +4276,29 @@ fn collect_indexable_files(
     Ok(files)
 }
 
-fn read_exact_init_source(path: &Path) -> Result<(Vec<u8>, kin_model::SourceEntryKind)> {
+fn read_exact_init_source(path: &Path) -> Result<(Vec<u8>, TreeEntryKind)> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("inspect exact init source {}", path.display()))?;
     if metadata.file_type().is_symlink() {
         let target = fs::read_link(path)
             .with_context(|| format!("read symbolic link {}", path.display()))?;
-        let target = target.to_str().ok_or_else(|| {
-            anyhow!(
-                "symbolic link target is not valid UTF-8: {}",
-                path.display()
-            )
-        })?;
-        return Ok((
-            target.as_bytes().to_vec(),
-            kin_model::SourceEntryKind::Symlink,
-        ));
+        #[cfg(unix)]
+        let target = {
+            use std::os::unix::ffi::OsStrExt;
+            target.as_os_str().as_bytes().to_vec()
+        };
+        #[cfg(not(unix))]
+        let target = target
+            .to_str()
+            .ok_or_else(|| {
+                anyhow!(
+                    "symbolic link target cannot be represented exactly on this platform: {}",
+                    path.display()
+                )
+            })?
+            .as_bytes()
+            .to_vec();
+        return Ok((target, TreeEntryKind::Symlink));
     }
     if !metadata.is_file() {
         anyhow::bail!("unsupported source entry type: {}", path.display());
@@ -4408,7 +4312,7 @@ fn read_exact_init_source(path: &Path) -> Result<(Vec<u8>, kin_model::SourceEntr
     let executable = false;
     Ok((
         fs::read(path).with_context(|| format!("read exact init source {}", path.display()))?,
-        kin_model::SourceEntryKind::File { executable },
+        TreeEntryKind::Regular { executable },
     ))
 }
 
@@ -4436,42 +4340,18 @@ fn collect_exact_init_source_entries(
         .collect()
 }
 
-fn added_exact_init_kind(kind: SourceEntryKind) -> kin_model::ArtifactDeltaKind {
-    match kind {
-        SourceEntryKind::File { executable: false } => {
-            kin_model::ArtifactDeltaKind::AddedRegularFile
-        }
-        SourceEntryKind::File { executable: true } => {
-            kin_model::ArtifactDeltaKind::AddedExecutableFile
-        }
-        SourceEntryKind::Symlink => kin_model::ArtifactDeltaKind::AddedSymlink,
-    }
-}
-
-fn modified_exact_init_kind(kind: SourceEntryKind) -> kin_model::ArtifactDeltaKind {
-    match kind {
-        SourceEntryKind::File { executable: false } => {
-            kin_model::ArtifactDeltaKind::ModifiedRegularFile
-        }
-        SourceEntryKind::File { executable: true } => {
-            kin_model::ArtifactDeltaKind::ModifiedExecutableFile
-        }
-        SourceEntryKind::Symlink => kin_model::ArtifactDeltaKind::ModifiedSymlink,
-    }
-}
-
 /// Diff the frozen source snapshot against the exact parent tree. Warm init
 /// must record removals as well as additions/mode changes, including deletion
 /// of the final source file, or graph-owned source history keeps ghost files.
-fn build_exact_init_artifact_deltas(
-    parent: HashMap<FilePathId, ResolvedSourceEntry>,
+fn build_exact_init_tree_deltas(
+    parent: HashMap<FilePathId, TreeEntry>,
     current: &[ExactInitSourceEntry],
-) -> Vec<kin_model::ArtifactDelta> {
+) -> Vec<TreeDelta> {
     let current: BTreeMap<&str, &ExactInitSourceEntry> = current
         .iter()
         .map(|entry| (entry.rel_path.as_str(), entry))
         .collect();
-    let parent: BTreeMap<String, ResolvedSourceEntry> = parent
+    let parent: BTreeMap<String, TreeEntry> = parent
         .into_iter()
         .map(|(path, entry)| (path.0, entry))
         .collect();
@@ -4479,79 +4359,31 @@ fn build_exact_init_artifact_deltas(
 
     for (path, old) in &parent {
         if !current.contains_key(path.as_str()) {
-            deltas.push(kin_model::ArtifactDelta {
+            deltas.push(TreeDelta::Removed {
                 file_id: FilePathId::new(path),
-                kind: kin_model::ArtifactDeltaKind::Removed,
-                old_hash: Some(old.hash),
-                new_hash: None,
+                old_entry: *old,
             });
         }
     }
     for (path, entry) in current {
-        let new_hash = Hash256::from_bytes(entry.hash);
+        let new_entry = TreeEntry {
+            blob_hash: Hash256::from_bytes(entry.hash),
+            kind: entry.kind,
+        };
         match parent.get(path) {
-            Some(old) if old.hash == new_hash && old.kind == entry.kind => {}
-            Some(old) => deltas.push(kin_model::ArtifactDelta {
+            Some(old) if *old == new_entry => {}
+            Some(old) => deltas.push(TreeDelta::Modified {
                 file_id: FilePathId::new(path),
-                kind: modified_exact_init_kind(entry.kind),
-                old_hash: Some(old.hash),
-                new_hash: Some(new_hash),
+                old_entry: *old,
+                new_entry,
             }),
-            None => deltas.push(kin_model::ArtifactDelta {
+            None => deltas.push(TreeDelta::Added {
                 file_id: FilePathId::new(path),
-                kind: added_exact_init_kind(entry.kind),
-                old_hash: None,
-                new_hash: Some(new_hash),
+                new_entry,
             }),
         }
     }
-    deltas.sort_by(|left, right| left.file_id.0.cmp(&right.file_id.0));
-    deltas
-}
-
-/// Repair an incomplete legacy source parent by restating the entire current
-/// tree with exact entry kinds and explicitly removing every parent path that
-/// no longer exists. Replaying this correction clears both legacy-mode gaps on
-/// retained paths and gaps for deleted paths, without consulting the live
-/// filesystem as an authority source.
-fn build_exact_init_repair_deltas(
-    parent: HashMap<FilePathId, Hash256>,
-    current: &[ExactInitSourceEntry],
-) -> Vec<kin_model::ArtifactDelta> {
-    let current: BTreeMap<&str, &ExactInitSourceEntry> = current
-        .iter()
-        .map(|entry| (entry.rel_path.as_str(), entry))
-        .collect();
-    let parent: BTreeMap<String, Hash256> = parent
-        .into_iter()
-        .map(|(path, hash)| (path.0, hash))
-        .collect();
-    let mut deltas = Vec::new();
-
-    for (path, old_hash) in &parent {
-        if !current.contains_key(path.as_str()) {
-            deltas.push(kin_model::ArtifactDelta {
-                file_id: FilePathId::new(path),
-                kind: kin_model::ArtifactDeltaKind::Removed,
-                old_hash: Some(*old_hash),
-                new_hash: None,
-            });
-        }
-    }
-    for (path, entry) in current {
-        let old_hash = parent.get(path).copied();
-        deltas.push(kin_model::ArtifactDelta {
-            file_id: FilePathId::new(path),
-            kind: if old_hash.is_some() {
-                modified_exact_init_kind(entry.kind)
-            } else {
-                added_exact_init_kind(entry.kind)
-            },
-            old_hash,
-            new_hash: Some(Hash256::from_bytes(entry.hash)),
-        });
-    }
-    deltas.sort_by(|left, right| left.file_id.0.cmp(&right.file_id.0));
+    deltas.sort_by(|left, right| left.file_id().0.cmp(&right.file_id().0));
     deltas
 }
 
@@ -4694,7 +4526,7 @@ fn try_warm_init_from_cache(
     let local_graph = local_snap.graph();
     Ok(Some(InitIndexSummary {
         total_entity_count: local_graph.entity_count(),
-        total_files: local_graph.indexed_file_paths().len(),
+        total_files: local_graph.working_tree_paths().len(),
         linked_relations: local_graph.relation_count(),
         warm_cache_hit: true,
         warm_text_index_reused,
@@ -5001,7 +4833,7 @@ fn build_incremental_linker_from_graph(
     graph: &kin_db::InMemoryGraph,
 ) -> Result<kin_index::IncrementalLinker> {
     let mut linker = kin_index::IncrementalLinker::new();
-    let indexed_paths = graph.indexed_file_paths();
+    let indexed_paths = graph.working_tree_paths();
     for path in &indexed_paths {
         linker.known_files.insert(path.clone());
     }
@@ -5111,7 +4943,7 @@ fn scrub_internal_graph_truth(graph: &kin_db::InMemoryGraph) -> Result<Vec<Strin
 
     stale_paths.extend(
         graph
-            .indexed_file_paths()
+            .working_tree_paths()
             .into_iter()
             .filter(|path| !is_repo_owned_graph_path(path)),
     );
@@ -5139,6 +4971,7 @@ fn scrub_internal_graph_truth(graph: &kin_db::InMemoryGraph) -> Result<Vec<Strin
 
     for path in &stale_paths {
         clear_file_semantic_state(graph, path)?;
+        graph.remove_working_tree_entry(path);
     }
 
     Ok(stale_paths.into_iter().collect())
@@ -5218,7 +5051,8 @@ fn graft_semantic_state(
     local_snapshot.shallow_files = source_snapshot.shallow_files;
     local_snapshot.structured_artifacts = source_snapshot.structured_artifacts;
     local_snapshot.opaque_artifacts = source_snapshot.opaque_artifacts;
-    local_snapshot.file_hashes = source_snapshot.file_hashes;
+    local_snapshot.working_tree = source_snapshot.working_tree;
+    local_snapshot.artifact_index = source_snapshot.artifact_index;
     local_snapshot.changes = source_snapshot.changes;
     local_snapshot.change_children = source_snapshot.change_children;
     local_snapshot.branches = source_snapshot.branches;
@@ -5448,7 +5282,7 @@ pub(crate) fn refresh_init_cache(
     let manifest_path = warm_cache_manifest_path(&cache_dir);
     let current_entity_count = graph.entity_count();
     let current_relation_count = graph.relation_count();
-    let current_indexed_files = graph.indexed_file_paths().len();
+    let current_indexed_files = graph.working_tree_paths().len();
     if let Some(ref head) = current_head {
         if let Ok(Some(manifest)) = read_warm_cache_manifest(&manifest_path) {
             if let Some(bundle_id) = manifest.heads.get(head) {
@@ -5842,19 +5676,30 @@ fn collect_source_files_recursive(root: &Path, dir: &Path, files: &mut Vec<PathB
     Ok(())
 }
 
-/// Enumerate the on-disk source files under `source_root` and pair each
-/// repo-relative path with its content hash, using the exact enumeration and
-/// hashing the indexer uses. Sharing this path with indexing guarantees the
-/// hashes are directly comparable to graph truth, so a drift check can never
-/// report a false mismatch caused by hashing a file differently than it was
-/// indexed.
-pub(crate) fn collect_on_disk_file_hashes(source_root: &Path) -> Result<Vec<(String, [u8; 32])>> {
+/// Enumerate every admitted working-tree entry and preserve its exact content
+/// identity and materialization kind. Parser support does not affect drift
+/// admission.
+pub(crate) fn collect_on_disk_tree_entries(source_root: &Path) -> Result<Vec<(String, TreeEntry)>> {
     let all_files = collect_source_files(source_root)?;
-    let indexable = collect_indexable_files(source_root, &all_files)?;
-    Ok(indexable
+    all_files
         .into_iter()
-        .map(|file| (file.rel_path, file.hash))
-        .collect())
+        .map(|path| {
+            let rel_path = path
+                .strip_prefix(source_root)
+                .unwrap_or(&path)
+                .to_str()
+                .ok_or_else(|| anyhow!("working-tree path is not valid UTF-8: {}", path.display()))?
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            let (content, kind) = read_exact_init_source(&path)?;
+            Ok((
+                rel_path,
+                TreeEntry {
+                    blob_hash: Hash256::from_bytes(kin_blobs::digest_bytes(&content)),
+                    kind,
+                },
+            ))
+        })
+        .collect()
 }
 
 fn count_supported_source_inputs(indexable_files: &[IndexableFile]) -> (usize, usize) {
@@ -5907,7 +5752,7 @@ fn ensure_graph_surface_materialized(
 /// independent of wall-clock time, machine path, and walk order. The path
 /// length prefix keeps the digest unambiguous across path boundaries.
 fn compute_artifact_fingerprint<'a>(
-    entries: impl IntoIterator<Item = (&'a str, &'a [u8; 32], kin_model::SourceEntryKind)>,
+    entries: impl IntoIterator<Item = (&'a str, &'a [u8; 32], TreeEntryKind)>,
 ) -> [u8; 32] {
     let mut entries: Vec<_> = entries.into_iter().collect();
     entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
@@ -5918,9 +5763,9 @@ fn compute_artifact_fingerprint<'a>(
         hasher.update(path.as_bytes());
         hasher.update(hash);
         hasher.update([match kind {
-            kin_model::SourceEntryKind::File { executable: false } => 0,
-            kin_model::SourceEntryKind::File { executable: true } => 1,
-            kin_model::SourceEntryKind::Symlink => 2,
+            TreeEntryKind::Regular { executable: false } => 0,
+            TreeEntryKind::Regular { executable: true } => 1,
+            TreeEntryKind::Symlink => 2,
         }]);
     }
     let result = hasher.finalize();
@@ -6260,7 +6105,7 @@ mod tests {
             message: "parent".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -6275,7 +6120,7 @@ mod tests {
             message: "child".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -6292,7 +6137,7 @@ mod tests {
             message: history_checkpoint::BASE_LINK_MESSAGE.to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -6363,7 +6208,7 @@ mod tests {
             message: "parent".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -6378,7 +6223,7 @@ mod tests {
             message: "child".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -6404,7 +6249,7 @@ mod tests {
             message: history_checkpoint::BASE_LINK_MESSAGE.to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -11732,7 +11577,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             message: "kin import: git commit".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -11880,7 +11725,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             message: "genesis".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -11895,7 +11740,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             message: "child".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],

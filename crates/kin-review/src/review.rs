@@ -204,7 +204,7 @@ mod tests {
             message: "add my_func".into(),
             entity_deltas: vec![EntityDelta::Added(entity)],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],

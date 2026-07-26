@@ -40,17 +40,17 @@ impl ProjectionState {
             .map_err(|err| ProjectionError::Graph(err.to_string()))?;
 
         for layout in layouts {
-            let Some(file_hash) = graph
-                .get_file_hash(&layout.file_id)
+            let Some(tree_entry) = graph
+                .get_tree_entry(&layout.file_id)
                 .map_err(|err| ProjectionError::Graph(err.to_string()))?
             else {
                 return Err(ProjectionError::BaseContentUnavailable {
                     file_id: layout.file_id.to_string(),
-                    reason: "missing persisted file hash".to_string(),
+                    reason: "missing persisted tree entry".to_string(),
                 });
             };
 
-            let content = blob_store.read(&file_hash).map_err(|err| {
+            let content = blob_store.read(&tree_entry.blob_hash).map_err(|err| {
                 ProjectionError::BaseContentUnavailable {
                     file_id: layout.file_id.to_string(),
                     reason: format!("failed to read blob-backed file content: {err}"),
@@ -596,7 +596,7 @@ mod tests {
         let file_id = FilePathId::new("src/main.rs");
         let content = b"fn main() { println!(\"graph truth\"); }\n".to_vec();
         let hash = blob_store.write(&content).unwrap();
-        graph.set_file_hash(&file_id.0, hash.0);
+        graph.set_working_tree_entry(&file_id.0, kin_model::TreeEntry::regular(hash, false));
         graph
             .upsert_file_layout(&FileLayout {
                 file_id: file_id.clone(),

@@ -14,9 +14,10 @@ use kin_index::{
     FileParseCompletenessMap, FileParseData, IndexPipeline,
 };
 use kin_model::{
-    ArtifactDeltaKind, ArtifactId, ChangeStore, EntityId, EntityKind, FileLayout, FilePathId,
-    GraphStore, Hash256, ImportSection, OpaqueArtifact, ParseCompleteness, RelationKind,
-    SemanticChange, SemanticChangeId, ShallowTrackedFile, SourceRegion, StructuredArtifact,
+    ArtifactId, ChangeStore, EntityId, EntityKind, EntityStore, FileLayout, FilePathId, GraphStore,
+    Hash256, ImportSection, OpaqueArtifact, ParseCompleteness, RelationKind, SemanticChange,
+    SemanticChangeId, ShallowTrackedFile, SourceRegion, StructuredArtifact, TreeDelta, TreeEntry,
+    TreeEntryKind,
 };
 use kin_parser::extract::{EMBEDDING_BODY_PREVIEW_KEY, FILE_SURFACE_CONTEXT_KEY};
 
@@ -119,24 +120,24 @@ fn build_graph_at_ref_with_repo_inner(
         .map(|repair| repair.materialize_file_tree(blob_store))
     {
         Some(Ok(git_tree)) if !git_tree.is_empty() => {
-            if git_tree != resolved.file_tree {
+            if git_tree != resolved.tree {
                 tracing::warn!(
-                    graph_files = resolved.file_tree.len(),
+                    graph_files = resolved.tree.len(),
                     git_files = git_tree.len(),
-                    "historical ref graph file tree differed from git tree; using git object tree for scoped source truth"
+                    "historical ref graph tree differed from git tree; using Git object tree for scoped source truth"
                 );
             }
             git_tree
         }
-        Some(Ok(_)) => resolved.file_tree.clone(),
+        Some(Ok(_)) => resolved.tree.clone(),
         Some(Err(err)) => {
             tracing::warn!(
                 error = %err,
-                "failed to materialize git tree for historical ref; falling back to graph artifact deltas"
+                "failed to materialize Git tree for historical ref; falling back to exact graph tree"
             );
-            resolved.file_tree.clone()
+            resolved.tree.clone()
         }
-        None => resolved.file_tree.clone(),
+        None => resolved.tree.clone(),
     };
     if timing {
         eprintln!(
@@ -156,10 +157,18 @@ fn build_graph_at_ref_with_repo_inner(
         .map(|change| (change.id, change.clone()))
         .collect();
     snapshot.change_children = build_change_children(&changes);
-    snapshot.file_hashes = ref_file_tree
+    snapshot.working_tree = ref_file_tree
         .iter()
-        .map(|(file_id, hash)| (file_id.0.clone(), *hash.as_bytes()))
+        .map(|(file_id, entry)| (file_id.0.clone(), *entry))
         .collect();
+    snapshot.artifact_index = ref_file_tree
+        .keys()
+        .map(|file_id| {
+            EntityStore::ensure_artifact_id(graph, file_id)
+                .map(|artifact_id| (file_id.clone(), artifact_id))
+                .map_err(|error| KinError::Graph(error.to_string()))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
     let mut branches = HashMap::new();
     if let Ok(parent_branches) = graph.list_branches() {
         let reachable_ids: HashSet<SemanticChangeId> = changes.iter().map(|c| c.id).collect();
@@ -436,7 +445,7 @@ impl GitBlobRepair {
     fn materialize_file_tree(
         &self,
         blob_store: &BlobStore,
-    ) -> std::result::Result<HashMap<FilePathId, Hash256>, String> {
+    ) -> std::result::Result<HashMap<FilePathId, TreeEntry>, String> {
         let timing = std::env::var("KIN_SCOPE_TIMING").is_ok();
         let t_lstree = std::time::Instant::now();
         let output = Command::new("git")
@@ -469,16 +478,33 @@ impl GitBlobRepair {
                 continue;
             };
             let mut meta_parts = meta.split_whitespace();
-            let _mode = meta_parts.next();
+            let Some(mode) = meta_parts.next() else {
+                continue;
+            };
             let Some(kind) = meta_parts.next() else {
                 continue;
             };
             let Some(oid) = meta_parts.next() else {
                 continue;
             };
+            if kind == "commit" {
+                return Err(format!(
+                    "historical Git tree contains unsupported gitlink {path}; exact TreeEntryKind has no gitlink variant"
+                ));
+            }
             if kind != "blob" {
                 continue;
             }
+            let entry_kind = match mode {
+                "100644" => TreeEntryKind::Regular { executable: false },
+                "100755" => TreeEntryKind::Regular { executable: true },
+                "120000" => TreeEntryKind::Symlink,
+                other => {
+                    return Err(format!(
+                        "historical Git tree contains unsupported mode {other} for {path}"
+                    ));
+                }
+            };
             blob_count += 1;
 
             let content = Command::new("git")
@@ -499,7 +525,13 @@ impl GitBlobRepair {
             let hash = blob_store
                 .write(&content.stdout)
                 .map_err(|err| format!("failed to write git blob for {path}: {err}"))?;
-            file_tree.insert(FilePathId::new(path), hash);
+            file_tree.insert(
+                FilePathId::new(path),
+                TreeEntry {
+                    blob_hash: Hash256::from_bytes(hash.0),
+                    kind: entry_kind,
+                },
+            );
         }
         if timing {
             eprintln!(
@@ -666,35 +698,30 @@ struct HistoricalPathResolver {
 }
 
 impl HistoricalPathResolver {
-    fn from_changes(changes: &[SemanticChange], file_tree: &HashMap<FilePathId, Hash256>) -> Self {
+    fn from_changes(
+        changes: &[SemanticChange],
+        file_tree: &HashMap<FilePathId, TreeEntry>,
+    ) -> Self {
         let mut canonical_for_legacy: HashMap<String, FilePathId> = HashMap::new();
 
-        // Replay artifact deltas to learn rename chains. A rename is detected
-        // when one change contains both a Removed and an Added (or Modified
-        // with no old_hash) sharing a blob hash. The Removed path becomes a
+        // Replay exact tree deltas to learn rename chains. A rename is detected
+        // when one change contains both a removal and an addition/modification
+        // sharing a blob identity. The removed path becomes a
         // legacy alias of the new canonical path.
         for change in changes {
             let mut removed_by_hash: HashMap<Hash256, FilePathId> = HashMap::new();
-            for delta in &change.artifact_deltas {
-                if delta.kind == ArtifactDeltaKind::Removed {
-                    if let Some(hash) = delta.old_hash {
-                        removed_by_hash.insert(hash, delta.file_id.clone());
-                    }
+            for delta in &change.tree_deltas {
+                if let TreeDelta::Removed { file_id, old_entry } = delta {
+                    removed_by_hash.insert(old_entry.blob_hash, file_id.clone());
                 }
             }
-            for delta in &change.artifact_deltas {
-                if !matches!(
-                    delta.kind,
-                    ArtifactDeltaKind::Added | ArtifactDeltaKind::Modified
-                ) {
-                    continue;
-                }
-                let Some(new_hash) = delta.new_hash else {
+            for delta in &change.tree_deltas {
+                let Some(new_entry) = delta.new_entry() else {
                     continue;
                 };
-                if let Some(legacy_path) = removed_by_hash.get(&new_hash) {
-                    if *legacy_path != delta.file_id {
-                        canonical_for_legacy.insert(legacy_path.0.clone(), delta.file_id.clone());
+                if let Some(legacy_path) = removed_by_hash.get(&new_entry.blob_hash) {
+                    if legacy_path != delta.file_id() {
+                        canonical_for_legacy.insert(legacy_path.0.clone(), delta.file_id().clone());
                     }
                 }
             }
@@ -743,7 +770,7 @@ impl HistoricalPathResolver {
     fn resolve(
         &self,
         file_id: &FilePathId,
-        file_tree: &HashMap<FilePathId, Hash256>,
+        file_tree: &HashMap<FilePathId, TreeEntry>,
     ) -> Option<FilePathId> {
         if file_tree.contains_key(file_id) {
             return Some(file_id.clone());
@@ -925,7 +952,7 @@ fn filter_temporal_cochange_relations(snapshot: &mut GraphSnapshot) {
 
 fn normalize_entity_file_origins_to_historical_tree(
     snapshot: &mut GraphSnapshot,
-    file_tree: &HashMap<FilePathId, Hash256>,
+    file_tree: &HashMap<FilePathId, TreeEntry>,
     path_resolver: &HistoricalPathResolver,
 ) {
     for entity in snapshot.entities.values_mut() {
@@ -964,7 +991,7 @@ fn normalize_entity_file_origins_to_historical_tree(
 
 fn rebuild_non_entity_tracked_files(
     snapshot: &mut GraphSnapshot,
-    file_tree: &HashMap<FilePathId, Hash256>,
+    file_tree: &HashMap<FilePathId, TreeEntry>,
     reader: &BlobReader<'_>,
     build_start: std::time::Instant,
     build_timeout_secs: f64,
@@ -976,7 +1003,7 @@ fn rebuild_non_entity_tracked_files(
         .map(|file_id| file_id.0.clone())
         .collect();
 
-    for (file_id, hash) in file_tree {
+    for (file_id, entry) in file_tree {
         if build_start.elapsed().as_secs_f64() > build_timeout_secs {
             tracing::warn!(
                 "rebuild_non_entity_tracked_files: timeout after {:.1}s, returning partial results",
@@ -988,15 +1015,15 @@ fn rebuild_non_entity_tracked_files(
             continue;
         }
 
-        let content = match reader.read(hash, &file_id.0) {
+        let content = match reader.read(&entry.blob_hash, &file_id.0) {
             Some(content) => content,
             None => {
-                tracing::warn!(file = %file_id, hash = %hash, "skipping historical tracked file with missing blob");
+                tracing::warn!(file = %file_id, hash = %entry.blob_hash, "skipping historical tracked file with missing blob");
                 continue;
             }
         };
 
-        match FileClassifier::classify(Path::new(&file_id.0)) {
+        match FileClassifier::classify_with_content(Path::new(&file_id.0), &content) {
             FileClassification::EntitySource => {}
             FileClassification::ShallowSyntax { language_hint } => {
                 if let Some(shallow) =
@@ -1017,9 +1044,12 @@ fn rebuild_non_entity_tracked_files(
                         ),
                     });
                 } else {
-                    snapshot
-                        .opaque_artifacts
-                        .push(build_opaque_artifact(file_id, *hash, None, &content));
+                    snapshot.opaque_artifacts.push(build_opaque_artifact(
+                        file_id,
+                        entry.blob_hash,
+                        None,
+                        &content,
+                    ));
                 }
             }
             FileClassification::StructuredArtifact(kind) => {
@@ -1027,15 +1057,18 @@ fn rebuild_non_entity_tracked_files(
                     extract_artifact(kind, &content, file_id).unwrap_or(StructuredArtifact {
                         file_id: file_id.clone(),
                         kind,
-                        content_hash: *hash,
+                        content_hash: entry.blob_hash,
                         text_preview: preview_text(&content),
                     });
                 snapshot.structured_artifacts.push(artifact);
             }
             FileClassification::OpaqueArtifact { mime_hint } => {
-                snapshot
-                    .opaque_artifacts
-                    .push(build_opaque_artifact(file_id, *hash, mime_hint, &content));
+                snapshot.opaque_artifacts.push(build_opaque_artifact(
+                    file_id,
+                    entry.blob_hash,
+                    mime_hint,
+                    &content,
+                ));
             }
         }
     }
@@ -1045,7 +1078,7 @@ fn rebuild_non_entity_tracked_files(
 
 fn rebuild_entity_source_file_layouts(
     snapshot: &mut GraphSnapshot,
-    file_tree: &HashMap<FilePathId, Hash256>,
+    file_tree: &HashMap<FilePathId, TreeEntry>,
     reader: &BlobReader<'_>,
     lifecycle: &RefLifecycle,
     build_start: std::time::Instant,
@@ -1059,7 +1092,7 @@ fn rebuild_entity_source_file_layouts(
     let mut projection_relations = Vec::new();
     let known_files: HashSet<String> = file_tree.keys().map(|file_id| file_id.0.clone()).collect();
 
-    for (file_id, hash) in file_tree {
+    for (file_id, entry) in file_tree {
         if build_start.elapsed().as_secs_f64() > build_timeout_secs {
             tracing::warn!(
                 "rebuild_entity_source_file_layouts: timeout after {:.1}s, returning partial results",
@@ -1067,30 +1100,35 @@ fn rebuild_entity_source_file_layouts(
             );
             break;
         }
-        if !matches!(
-            FileClassifier::classify(Path::new(&file_id.0)),
-            FileClassification::EntitySource
-        ) {
-            continue;
-        }
-
-        let content = match reader.read(hash, &file_id.0) {
+        let content = match reader.read(&entry.blob_hash, &file_id.0) {
             Some(content) => content,
             None => {
                 tracing::warn!(
                     file = %file_id,
-                    hash = %hash,
+                    hash = %entry.blob_hash,
                     "skipping historical source layout with missing blob"
                 );
                 continue;
             }
         };
+        if entry.kind == TreeEntryKind::Symlink
+            || !matches!(
+                FileClassifier::classify_with_content(Path::new(&file_id.0), &content),
+                FileClassification::EntitySource
+            )
+        {
+            continue;
+        }
 
         // Keep raw historical source text searchable for ref-scoped locate,
         // even when semantic entity replay succeeds for the file.
         snapshot
             .opaque_artifacts
-            .push(build_historical_source_artifact(file_id, *hash, &content));
+            .push(build_historical_source_artifact(
+                file_id,
+                entry.blob_hash,
+                &content,
+            ));
         projection_relations.extend(build_projection_derived_relations_for_file(
             &file_id.0,
             &content,
@@ -1112,13 +1150,13 @@ fn rebuild_entity_source_file_layouts(
             match pipeline.index_file_content_with_tests(
                 file_id,
                 &content,
-                kin_blobs::Hash256::from_bytes(*hash.as_bytes()),
+                kin_blobs::Hash256::from_bytes(*entry.blob_hash.as_bytes()),
             ) {
                 Ok(indexed) => Some(indexed),
                 Err(err) => {
                     tracing::warn!(
                         file = %file_id,
-                        hash = %hash,
+                        hash = %entry.blob_hash,
                         error = %err,
                         "skipping historical source fallback parse that could not be indexed"
                     );
@@ -1239,13 +1277,7 @@ fn rebuild_entity_source_file_layouts(
 
 fn snapshot_artifact_id_for_path(snapshot: &GraphSnapshot, path: &str) -> Option<ArtifactId> {
     let file_id = FilePathId::new(path);
-    Some(
-        snapshot
-            .artifact_index
-            .get(&file_id)
-            .copied()
-            .unwrap_or_else(|| ArtifactId::seed_from_file_id(&file_id)),
-    )
+    snapshot.artifact_index.get(&file_id).copied()
 }
 
 fn should_probe_sparse_historical_source(
@@ -2381,7 +2413,7 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
         snapshot.entities.insert(amalgamated_id, amalgamated);
         snapshot.entities.insert(real_source_id, real_source);
 
-        let file_tree: HashMap<FilePathId, Hash256> = [
+        let file_tree: HashMap<FilePathId, TreeEntry> = [
             (
                 FilePathId::new("single_include/catch.hpp"),
                 Hash256::from_bytes([0x11; 32]),
@@ -2516,7 +2548,7 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
             message: "create".into(),
             entity_deltas: vec![EntityDelta::Added(victim.clone())],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -2531,7 +2563,7 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
             message: "remove".into(),
             entity_deltas: vec![EntityDelta::Removed(victim.id)],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],

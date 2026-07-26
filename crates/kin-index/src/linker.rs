@@ -20,6 +20,29 @@ use kin_parser::{
     is_call_extraction_incomplete_marker, CallArgShape, ExtractedRelation, FileImport,
 };
 
+use crate::error::{IndexError, Result as IndexResult};
+
+/// Graph-assigned artifact identities keyed by repository-relative path.
+///
+/// Linking never derives identity from a path. Callers must resolve or allocate
+/// these IDs through graph authority before asking the linker to create
+/// artifact-level relations.
+pub type ArtifactIdentityMap = HashMap<String, ArtifactId>;
+
+fn require_artifact_identities<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+    artifact_ids: &ArtifactIdentityMap,
+) -> IndexResult<()> {
+    for path in paths {
+        if !artifact_ids.contains_key(path) {
+            return Err(IndexError::Graph(format!(
+                "missing graph-assigned artifact identity for {path}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Persisted provenance marker for call-shape evidence produced by a linker
 /// that preserves every occurrence on one logical `(src, dst, Calls)` edge.
 ///
@@ -150,8 +173,11 @@ const INDEX_FILENAMES: &[&str] = &["index.ts", "index.tsx", "index.js", "index.j
 /// 4. Resolves each ExtractedRelation to entity-ID-based Relations
 ///
 /// Returns a deduplicated list of resolved Relations.
-pub fn link_cross_file(files: &[FileParseData]) -> Vec<Relation> {
-    link_cross_file_internal(files, None)
+pub fn link_cross_file(
+    files: &[FileParseData],
+    artifact_ids: &ArtifactIdentityMap,
+) -> IndexResult<Vec<Relation>> {
+    link_cross_file_internal(files, artifact_ids, None)
 }
 
 /// Resolve cross-file relations with explicit parser completeness.
@@ -161,25 +187,30 @@ pub fn link_cross_file(files: &[FileParseData]) -> Vec<Relation> {
 /// recovery omitted every call relation in that file.
 pub fn link_cross_file_with_completeness(
     files: &[FileParseData],
+    artifact_ids: &ArtifactIdentityMap,
     completeness: &FileParseCompletenessMap,
-) -> Vec<Relation> {
-    link_cross_file_internal(files, Some(completeness))
+) -> IndexResult<Vec<Relation>> {
+    link_cross_file_internal(files, artifact_ids, Some(completeness))
 }
 
 fn link_cross_file_internal(
     files: &[FileParseData],
+    artifact_ids: &ArtifactIdentityMap,
     completeness: Option<&FileParseCompletenessMap>,
-) -> Vec<Relation> {
+) -> IndexResult<Vec<Relation>> {
     let _span = tracing::info_span!("kin.index.link_cross_file", files = files.len()).entered();
     let universe_entities: Vec<Entity> = files
         .iter()
         .flat_map(|file| file.entities.iter().cloned())
         .collect();
-    link_cross_file_against_entities_internal(files, &universe_entities, completeness)
+    link_cross_file_against_entities_internal(files, &universe_entities, artifact_ids, completeness)
 }
 
 /// Resolve cross-file relations while carrying parser-emitted tests alongside the input.
-pub fn link_cross_file_with_tests(files: &[FileParseDataWithTests]) -> Vec<Relation> {
+pub fn link_cross_file_with_tests(
+    files: &[FileParseDataWithTests],
+    artifact_ids: &ArtifactIdentityMap,
+) -> IndexResult<Vec<Relation>> {
     let linkable: Vec<FileParseData> = files
         .iter()
         .map(|file| FileParseData {
@@ -189,15 +220,16 @@ pub fn link_cross_file_with_tests(files: &[FileParseDataWithTests]) -> Vec<Relat
             imports: file.imports.clone(),
         })
         .collect();
-    link_cross_file(&linkable)
+    link_cross_file(&linkable, artifact_ids)
 }
 
 /// Resolve cross-file relations while retaining parser tests and explicit
 /// parse completeness.
 pub fn link_cross_file_with_tests_and_completeness(
     files: &[FileParseDataWithTests],
+    artifact_ids: &ArtifactIdentityMap,
     completeness: &FileParseCompletenessMap,
-) -> Vec<Relation> {
+) -> IndexResult<Vec<Relation>> {
     let linkable: Vec<FileParseData> = files
         .iter()
         .map(|file| FileParseData {
@@ -207,7 +239,7 @@ pub fn link_cross_file_with_tests_and_completeness(
             imports: file.imports.clone(),
         })
         .collect();
-    link_cross_file_with_completeness(&linkable, completeness)
+    link_cross_file_with_completeness(&linkable, artifact_ids, completeness)
 }
 
 /// Total order over entities so cross-file linking is order-independent.
@@ -253,8 +285,9 @@ fn bare_entity_name(name: &str) -> &str {
 pub fn link_cross_file_against_entities(
     files: &[FileParseData],
     universe_entities: &[Entity],
-) -> Vec<Relation> {
-    link_cross_file_against_entities_internal(files, universe_entities, None)
+    artifact_ids: &ArtifactIdentityMap,
+) -> IndexResult<Vec<Relation>> {
+    link_cross_file_against_entities_internal(files, universe_entities, artifact_ids, None)
 }
 
 /// Resolve a parsed subset against a broader entity universe while honoring
@@ -262,16 +295,23 @@ pub fn link_cross_file_against_entities(
 pub fn link_cross_file_against_entities_with_completeness(
     files: &[FileParseData],
     universe_entities: &[Entity],
+    artifact_ids: &ArtifactIdentityMap,
     completeness: &FileParseCompletenessMap,
-) -> Vec<Relation> {
-    link_cross_file_against_entities_internal(files, universe_entities, Some(completeness))
+) -> IndexResult<Vec<Relation>> {
+    link_cross_file_against_entities_internal(
+        files,
+        universe_entities,
+        artifact_ids,
+        Some(completeness),
+    )
 }
 
 fn link_cross_file_against_entities_internal(
     files: &[FileParseData],
     universe_entities: &[Entity],
+    artifact_ids: &ArtifactIdentityMap,
     completeness: Option<&FileParseCompletenessMap>,
-) -> Vec<Relation> {
+) -> IndexResult<Vec<Relation>> {
     let _span = tracing::info_span!(
         "kin.index.link_cross_file_against_entities",
         files = files.len(),
@@ -280,6 +320,7 @@ fn link_cross_file_against_entities_internal(
     .entered();
 
     let ctx = build_link_context(files, universe_entities);
+    require_artifact_identities(ctx.known_files.iter().copied(), artifact_ids)?;
 
     let total_files = files.len();
     let progress_interval = std::cmp::max(total_files / 50, 1);
@@ -323,13 +364,13 @@ fn link_cross_file_against_entities_internal(
             .collect()
     };
 
-    let resolved = merge_resolved(per_file_relations, files, &ctx, completeness);
+    let resolved = merge_resolved(per_file_relations, files, &ctx, artifact_ids, completeness);
 
     if total_files > 0 {
         eprintln!(); // newline after \r progress
     }
     debug!(resolved = resolved.len(), "cross-file linking complete");
-    resolved
+    Ok(resolved)
 }
 
 /// Read-only indices shared across per-file relation resolution.
@@ -948,6 +989,7 @@ fn merge_resolved(
     per_file_relations: Vec<Vec<Relation>>,
     files: &[FileParseData],
     ctx: &LinkContext<'_>,
+    artifact_ids: &ArtifactIdentityMap,
     completeness: Option<&FileParseCompletenessMap>,
 ) -> Vec<Relation> {
     let mut resolved = Vec::new();
@@ -981,7 +1023,12 @@ fn merge_resolved(
                 file.imports
                     .iter()
                     .filter_map(|imp| {
-                        make_artifact_import_relation(&file.file_path, imp, &ctx.known_files)
+                        make_artifact_import_relation(
+                            &file.file_path,
+                            imp,
+                            &ctx.known_files,
+                            artifact_ids,
+                        )
                     })
                     .collect()
             })
@@ -996,7 +1043,7 @@ fn merge_resolved(
         }
     }
 
-    append_parse_coverage_relations(&mut resolved, files, completeness);
+    append_parse_coverage_relations(&mut resolved, files, artifact_ids, completeness);
 
     resolved
 }
@@ -1007,13 +1054,14 @@ fn merge_resolved(
 fn link_cross_file_against_entities_serial(
     files: &[FileParseData],
     universe_entities: &[Entity],
+    artifact_ids: &ArtifactIdentityMap,
 ) -> Vec<Relation> {
     let ctx = build_link_context(files, universe_entities);
     let per_file_relations: Vec<Vec<Relation>> = files
         .iter()
         .map(|file| resolve_one_file(file, &ctx, None))
         .collect();
-    merge_resolved(per_file_relations, files, &ctx, None)
+    merge_resolved(per_file_relations, files, &ctx, artifact_ids, None)
 }
 
 /// Serial counterpart of [`build_include_graph`], retained as the byte-identical
@@ -1056,6 +1104,7 @@ fn merge_resolved_serial(
     per_file_relations: Vec<Vec<Relation>>,
     files: &[FileParseData],
     ctx: &LinkContext<'_>,
+    artifact_ids: &ArtifactIdentityMap,
 ) -> Vec<Relation> {
     let mut resolved = Vec::new();
     let mut relation_indices = HashMap::new();
@@ -1067,7 +1116,8 @@ fn merge_resolved_serial(
     let mut seen_artifact: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
     for file in files {
         for imp in &file.imports {
-            if let Some(rel) = make_artifact_import_relation(&file.file_path, imp, &ctx.known_files)
+            if let Some(rel) =
+                make_artifact_import_relation(&file.file_path, imp, &ctx.known_files, artifact_ids)
             {
                 let key = (rel.src, rel.dst, rel.kind);
                 if seen_artifact.insert(key) {
@@ -2671,18 +2721,11 @@ where
     })
 }
 
-// Graph-less caller: the cross-file linker pipeline builds these artifact
-// import/include edges purely from parse data (`FileParseData` + `known_files`)
-// before any `GraphSnapshot`/`artifact_index` exists — its output is what the
-// graph is later constructed from (commit/init/import/migrate/ref_view). There
-// is no `artifact_index` to resolve graph-assigned IDs against here, so we keep
-// the deterministic path derivation. This matches the canonical kin-db approach
-// for index-time, snapshot-less artifact IDs (e.g. `ensure_artifact_id` /
-// `build_artifact_indexes_from_paths`), which also stay path-derived.
 fn make_artifact_import_relation<S>(
     importer_file: &str,
     import: &FileImport,
     known_files: &HashSet<S>,
+    artifact_ids: &ArtifactIdentityMap,
 ) -> Option<Relation>
 where
     S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
@@ -2693,8 +2736,8 @@ where
     } else {
         RelationKind::Imports
     };
-    let src = GraphNodeId::Artifact(ArtifactId::seed_from_path(importer_file));
-    let dst = GraphNodeId::Artifact(ArtifactId::seed_from_path(&resolved_path));
+    let src = GraphNodeId::Artifact(*artifact_ids.get(importer_file)?);
+    let dst = GraphNodeId::Artifact(*artifact_ids.get(&resolved_path)?);
     let evidence = RelationEvidence {
         source_path: Some(import.module_path.clone()),
         resolved_path: Some(resolved_path.clone()),
@@ -2721,47 +2764,36 @@ where
     })
 }
 
-const CALL_SHAPE_COVERAGE_FULL_HUB_PREFIX: &str =
-    "kin-internal://call-shape-parse-coverage/full-v1/";
-const CALL_SHAPE_COVERAGE_INCOMPLETE_HUB_PREFIX: &str =
-    "kin-internal://call-shape-parse-coverage/incomplete-v1/";
-
 /// Build the graph-owned file-level call-coverage certificate used by
-/// ref-scoped review. The destination hub differs across states so a
-/// Full-to-Partial transition changes relation identity even in history paths
-/// that compare relation IDs before deciding what to replace.
+/// ref-scoped review. Coverage state lives in relation evidence; history paths
+/// compare the complete relation payload and replace changed evidence.
 fn make_parse_coverage_relation(
     file_path: &str,
+    artifact_id: ArtifactId,
     completeness: Option<&ParseCompleteness>,
     call_extraction_complete: bool,
 ) -> Relation {
     let is_full = call_extraction_complete && matches!(completeness, Some(ParseCompleteness::Full));
-    let (hub_prefix, parser_rule, token) = if !call_extraction_complete {
+    let (parser_rule, token) = if !call_extraction_complete {
         (
-            CALL_SHAPE_COVERAGE_INCOMPLETE_HUB_PREFIX,
             CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1,
             "call-extraction-incomplete",
         )
     } else if is_full {
-        (
-            CALL_SHAPE_COVERAGE_FULL_HUB_PREFIX,
-            CALL_SHAPE_PARSE_COVERAGE_FULL_V1,
-            "full",
-        )
+        (CALL_SHAPE_PARSE_COVERAGE_FULL_V1, "full")
     } else {
         (
-            CALL_SHAPE_COVERAGE_INCOMPLETE_HUB_PREFIX,
             CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1,
             completeness
                 .map(ParseCompleteness::bucket)
                 .unwrap_or("missing"),
         )
     };
-    // Each file gets its own reserved status endpoint. A shared hub would make
-    // unrelated source artifacts appear connected at traversal depth two.
-    let hub = format!("{hub_prefix}{file_path}");
-    let src = GraphNodeId::Artifact(ArtifactId::seed_from_path(file_path));
-    let dst = GraphNodeId::Artifact(ArtifactId::seed_from_path(&hub));
+    // Coverage is evidence about the graph-owned artifact itself. A self-loop
+    // avoids fabricating a second path-derived pseudo-artifact; evidence
+    // changes still replace the relation when completeness changes.
+    let src = GraphNodeId::Artifact(artifact_id);
+    let dst = src;
     let kind = RelationKind::DependsOn;
     Relation {
         id: stable_relation_node_id(&src, &dst, &kind),
@@ -2785,6 +2817,7 @@ fn make_parse_coverage_relation(
 fn append_parse_coverage_relations(
     resolved: &mut Vec<Relation>,
     files: &[FileParseData],
+    artifact_ids: &ArtifactIdentityMap,
     completeness: Option<&FileParseCompletenessMap>,
 ) {
     let Some(completeness) = completeness else {
@@ -2793,12 +2826,16 @@ fn append_parse_coverage_relations(
     let mut seen = HashSet::new();
     for file in files {
         if seen.insert(file.file_path.as_str()) {
+            let artifact_id = *artifact_ids
+                .get(&file.file_path)
+                .expect("artifact identities were validated before linking");
             let call_extraction_complete = !file
                 .relations
                 .iter()
                 .any(is_call_extraction_incomplete_marker);
             resolved.push(make_parse_coverage_relation(
                 &file.file_path,
+                artifact_id,
                 completeness.get(&file.file_path),
                 call_extraction_complete,
             ));
@@ -3331,6 +3368,8 @@ fn resolve_default_export(target_file: &str, universe_entities: &[&Entity]) -> O
 /// Keeps entity indices in-memory to avoid O(N) universe cloning and map rebuilding
 /// per commit during history hydration.
 pub struct IncrementalLinker {
+    /// Graph-assigned artifact identity for every known repository path.
+    pub artifact_ids: ArtifactIdentityMap,
     /// file_path -> entity_name -> EntityId
     pub entity_by_file_name: HashMap<String, HashMap<String, EntityId>>,
     /// entity_name -> Vec<(file_path, EntityId)>
@@ -3379,6 +3418,7 @@ type ClassBasesByFileCheckpointV1 = Vec<(String, Vec<(String, Vec<String>)>)>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IncrementalLinkerCheckpointV1 {
+    artifact_ids: Vec<(String, ArtifactId)>,
     entity_by_file_name: Vec<(String, Vec<(String, EntityId)>)>,
     entity_by_name: Vec<(String, Vec<(String, EntityId)>)>,
     entity_by_bare_name: Vec<(String, Vec<(String, EntityId)>)>,
@@ -3391,7 +3431,7 @@ pub struct IncrementalLinkerCheckpointV1 {
 }
 
 /// Bump whenever [`IncrementalLinkerCheckpointV1`] or linker semantics change.
-pub const INCREMENTAL_LINKER_CHECKPOINT_VERSION: u32 = 1;
+pub const INCREMENTAL_LINKER_CHECKPOINT_VERSION: u32 = 2;
 
 /// Build-time kin-index identity included in the composite hydration
 /// checkpoint version key.
@@ -3432,6 +3472,7 @@ where
 impl IncrementalLinker {
     pub fn new() -> Self {
         Self {
+            artifact_ids: HashMap::new(),
             entity_by_file_name: HashMap::new(),
             entity_by_name: HashMap::new(),
             entity_by_bare_name: HashMap::new(),
@@ -3444,9 +3485,15 @@ impl IncrementalLinker {
         }
     }
 
+    /// Install graph-assigned identity for one repository path.
+    pub fn set_artifact_id(&mut self, file_path: impl Into<String>, artifact_id: ArtifactId) {
+        self.artifact_ids.insert(file_path.into(), artifact_id);
+    }
+
     /// Convert the live linker to its canonical checkpoint representation.
     pub fn to_checkpoint_v1(&self) -> IncrementalLinkerCheckpointV1 {
         let Self {
+            artifact_ids,
             entity_by_file_name,
             entity_by_name,
             entity_by_bare_name,
@@ -3457,6 +3504,12 @@ impl IncrementalLinker {
             include_targets_by_file,
             class_bases_by_file,
         } = self;
+
+        let mut artifact_ids: Vec<_> = artifact_ids
+            .iter()
+            .map(|(path, id)| (path.clone(), *id))
+            .collect();
+        artifact_ids.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut entity_by_file_name: Vec<_> = entity_by_file_name
             .iter()
@@ -3517,6 +3570,7 @@ impl IncrementalLinker {
         class_bases_by_file.sort_by(|a, b| a.0.cmp(&b.0));
 
         IncrementalLinkerCheckpointV1 {
+            artifact_ids,
             entity_by_file_name,
             entity_by_name,
             entity_by_bare_name,
@@ -3532,6 +3586,7 @@ impl IncrementalLinker {
     /// Restore a linker checkpoint, refusing duplicate keys or set members.
     pub fn from_checkpoint_v1(checkpoint: IncrementalLinkerCheckpointV1) -> Result<Self, String> {
         let IncrementalLinkerCheckpointV1 {
+            artifact_ids,
             entity_by_file_name,
             entity_by_name,
             entity_by_bare_name,
@@ -3555,6 +3610,7 @@ impl IncrementalLinker {
         )?;
 
         Ok(Self {
+            artifact_ids: checkpoint_hash_map(artifact_ids, "artifact_ids")?,
             entity_by_file_name,
             entity_by_name: checkpoint_hash_map(entity_by_name, "entity_by_name")?,
             entity_by_bare_name: checkpoint_hash_map(entity_by_bare_name, "entity_by_bare_name")?,
@@ -3701,7 +3757,7 @@ fn resolve_default_export_incremental(
 pub fn link_cross_file_incremental(
     files: &[FileParseData],
     linker: &IncrementalLinker,
-) -> Vec<Relation> {
+) -> IndexResult<Vec<Relation>> {
     link_cross_file_incremental_internal(files, linker, None)
 }
 
@@ -3711,7 +3767,7 @@ pub fn link_cross_file_incremental_with_completeness(
     files: &[FileParseData],
     linker: &IncrementalLinker,
     completeness: &FileParseCompletenessMap,
-) -> Vec<Relation> {
+) -> IndexResult<Vec<Relation>> {
     link_cross_file_incremental_internal(files, linker, Some(completeness))
 }
 
@@ -3719,9 +3775,13 @@ fn link_cross_file_incremental_internal(
     files: &[FileParseData],
     linker: &IncrementalLinker,
     completeness: Option<&FileParseCompletenessMap>,
-) -> Vec<Relation> {
+) -> IndexResult<Vec<Relation>> {
     let _span =
         tracing::info_span!("kin.index.link_cross_file_incremental", files = files.len()).entered();
+    require_artifact_identities(
+        linker.known_files.iter().map(String::as_str),
+        &linker.artifact_ids,
+    )?;
 
     // Read-only step-local overlays shared by every per-file resolution. Built
     // once so the parallel per-file pass and its serial reference both resolve
@@ -3776,7 +3836,12 @@ fn link_cross_file_incremental_internal(
         eprintln!(); // newline after \r progress
     }
 
-    merge_incremental_resolved(per_file_relations, files, linker, completeness)
+    Ok(merge_incremental_resolved(
+        per_file_relations,
+        files,
+        linker,
+        completeness,
+    ))
 }
 
 /// Resolve the name-based relations of a single file into entity-ID relations
@@ -4314,9 +4379,12 @@ fn merge_incremental_resolved(
     let mut seen_artifact: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
     for file in files {
         for imp in &file.imports {
-            if let Some(rel) =
-                make_artifact_import_relation(&file.file_path, imp, &linker.known_files)
-            {
+            if let Some(rel) = make_artifact_import_relation(
+                &file.file_path,
+                imp,
+                &linker.known_files,
+                &linker.artifact_ids,
+            ) {
                 let key = (rel.src, rel.dst, rel.kind);
                 if seen_artifact.insert(key) {
                     resolved.push(rel);
@@ -4325,7 +4393,7 @@ fn merge_incremental_resolved(
         }
     }
 
-    append_parse_coverage_relations(&mut resolved, files, completeness);
+    append_parse_coverage_relations(&mut resolved, files, &linker.artifact_ids, completeness);
 
     resolved
 }

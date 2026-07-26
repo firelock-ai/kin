@@ -12,7 +12,7 @@ use kin_core::KinLayout;
 use kin_db::StorageBackend;
 use kin_model::{
     ChangeStore, EntityId, EntityStore, FilePathId, GraphOverlay, Hash256, SemanticChange,
-    SemanticChangeId, SourceEntryKind, SourceTreeResolution, WorkingCopy,
+    SemanticChangeId, TreeDelta, TreeEntry, TreeEntryKind, WorkingCopy,
 };
 use kin_projection::ProjectionState;
 use kin_reconcile::Reconciler;
@@ -661,7 +661,7 @@ pub(crate) struct VfsTreeCacheKey {
 #[derive(Debug)]
 pub(crate) struct VfsTreeSnapshot {
     pub key: VfsTreeCacheKey,
-    pub files: Arc<HashMap<FilePathId, Hash256>>,
+    pub files: Arc<HashMap<FilePathId, kin_model::TreeEntry>>,
     pub timestamps: Arc<HashMap<FilePathId, u64>>,
 }
 
@@ -715,25 +715,18 @@ fn exact_source_storage_error(message: impl Into<String>) -> DaemonError {
 
 fn exact_source_objects<'a>(
     changes: impl IntoIterator<Item = &'a SemanticChange>,
-) -> Result<Vec<(Hash256, FilePathId, SemanticChangeId, SourceEntryKind)>> {
+) -> Result<Vec<(Hash256, FilePathId, SemanticChangeId, TreeEntryKind)>> {
     let mut objects = Vec::new();
     for change in changes {
-        for delta in &change.artifact_deltas {
-            if delta.kind.is_removed() {
-                continue;
-            }
-            let Some(kind) = delta.kind.source_entry_kind() else {
-                // Legacy mode-unknown history stays an explicit exact-tree gap;
-                // this object preflight must not normalize it into a mode.
-                continue;
+        for delta in &change.tree_deltas {
+            let (file_id, entry) = match delta {
+                TreeDelta::Added { file_id, new_entry }
+                | TreeDelta::Modified {
+                    file_id, new_entry, ..
+                } => (file_id, new_entry),
+                TreeDelta::Removed { .. } => continue,
             };
-            let hash = delta.new_hash.ok_or_else(|| {
-                exact_source_storage_error(format!(
-                    "exact source delta for {} in change {} has no content identity",
-                    delta.file_id, change.id
-                ))
-            })?;
-            objects.push((hash, delta.file_id.clone(), change.id, kind));
+            objects.push((entry.blob_hash, file_id.clone(), change.id, entry.kind));
         }
     }
     objects.sort_by(|left, right| {
@@ -748,7 +741,7 @@ fn exact_source_objects<'a>(
 
 fn validate_exact_source_bytes(
     file_id: &FilePathId,
-    kind: SourceEntryKind,
+    kind: TreeEntryKind,
     expected: Hash256,
     data: &[u8],
     authority: &str,
@@ -2540,8 +2533,22 @@ impl DaemonState {
                 self.graph
                     .upsert_file_layout(&layout)
                     .map_err(DaemonError::from)?;
-                self.graph
-                    .set_file_hash(&file_id.0, kin_blobs::digest_bytes(content));
+                let entry = self
+                    .graph
+                    .get_tree_entry(file_id)
+                    .map_err(DaemonError::from)?
+                    .ok_or_else(|| {
+                        exact_source_storage_error(format!(
+                            "semantic enrichment for {file_id} preceded exact working-tree admission"
+                        ))
+                    })?;
+                let actual = kin_blobs::digest_bytes(content);
+                if actual != *entry.blob_hash.as_bytes() {
+                    return Err(exact_source_storage_error(format!(
+                        "semantic enrichment bytes for {file_id} do not match graph-owned tree entry {}",
+                        entry.blob_hash
+                    )));
+                }
             }
             kin_reconcile::ReconcileOutcome::FileRemoved { file_id, .. } => {
                 self.graph
@@ -2901,8 +2908,7 @@ impl DaemonState {
     /// Persist every exact-mode source object referenced by `changes` before
     /// the graph authority that names those objects is committed.
     ///
-    /// Legacy mode-unknown deltas remain explicit graph gaps and are skipped;
-    /// exact deltas fail closed when neither the local content-addressed store
+    /// Exact deltas fail closed when neither the local content-addressed store
     /// nor the backend already has the named bytes. Durable source objects may
     /// safely precede a failed graph CAS because they are immutable and
     /// content-addressed, while committing the graph first would create an
@@ -3021,29 +3027,15 @@ impl DaemonState {
             graph,
             incoming: change,
         };
-        let entries = match prospective
-            .resolve_source_tree_at(&change.id)
-            .map_err(DaemonError::from)?
-        {
-            SourceTreeResolution::Exact { entries } => entries,
-            SourceTreeResolution::Incomplete { gaps } => {
-                let gaps = gaps
-                    .iter()
-                    .map(|gap| format!("{}@{}:{:?}", gap.file_id, gap.change_id, gap.reason))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(exact_source_storage_error(format!(
-                    "incoming source history at {} is not exact: {gaps}",
-                    change.id
-                )));
-            }
-        };
+        let entries = prospective
+            .resolve_tree_at(&change.id)
+            .map_err(DaemonError::from)?;
         self.preflight_materializable_source_entries(entries, "incoming exact")
     }
 
     fn preflight_materializable_source_entries(
         &self,
-        entries: HashMap<FilePathId, kin_model::ResolvedSourceEntry>,
+        entries: HashMap<FilePathId, TreeEntry>,
         purpose: &str,
     ) -> Result<()> {
         let mut entries: Vec<_> = entries.into_iter().collect();
@@ -3057,16 +3049,16 @@ impl DaemonState {
         )?;
         entries.sort_by(|left, right| {
             left.1
-                .hash
+                .blob_hash
                 .as_bytes()
-                .cmp(right.1.hash.as_bytes())
+                .cmp(right.1.blob_hash.as_bytes())
                 .then_with(|| left.0 .0.cmp(&right.0 .0))
         });
         let mut start = 0;
         while start < entries.len() {
-            let source_hash = entries[start].1.hash;
+            let source_hash = entries[start].1.blob_hash;
             let mut end = start + 1;
-            while end < entries.len() && entries[end].1.hash == source_hash {
+            while end < entries.len() && entries[end].1.blob_hash == source_hash {
                 end += 1;
             }
             let digest = *source_hash.as_bytes();
@@ -3094,7 +3086,13 @@ impl DaemonState {
                 (data, "local")
             };
             for (file_id, source) in &entries[start..end] {
-                validate_exact_source_bytes(file_id, source.kind, source.hash, &data, authority)?;
+                validate_exact_source_bytes(
+                    file_id,
+                    source.kind,
+                    source.blob_hash,
+                    &data,
+                    authority,
+                )?;
             }
             start = end;
         }
@@ -3112,22 +3110,7 @@ impl DaemonState {
         graph: &kin_db::InMemoryGraph,
         head: &SemanticChangeId,
     ) -> Result<()> {
-        let entries = match graph
-            .resolve_source_tree_at(head)
-            .map_err(DaemonError::from)?
-        {
-            SourceTreeResolution::Exact { entries } => entries,
-            SourceTreeResolution::Incomplete { gaps } => {
-                let gaps = gaps
-                    .iter()
-                    .map(|gap| format!("{}@{}:{:?}", gap.file_id, gap.change_id, gap.reason))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(exact_source_storage_error(format!(
-                    "release source history at {head} is not exact: {gaps}"
-                )));
-            }
-        };
+        let entries = graph.resolve_tree_at(head).map_err(DaemonError::from)?;
 
         self.preflight_materializable_source_entries(entries, &format!("release source at {head}"))
     }
@@ -3601,94 +3584,22 @@ impl DaemonState {
 
     /// Rebuild projection state from the current graph.
     ///
-    /// Primary path: loads each persisted [`FileLayout`] and its blob-backed
-    /// base content from graph truth via [`ProjectionState::from_graph`].
-    ///
-    /// Fallback path: if a file layout exists in the graph but its file hash
-    /// has not yet been persisted (older snapshots from before file hashes were
-    /// always written), `from_graph` returns
-    /// [`ProjectionError::BaseContentUnavailable`].  Rather than hard-failing
-    /// and leaving the daemon unable to serve VFS reads or accept projected
-    /// writes, the fallback iterates layouts individually: files whose hash IS
-    /// present are loaded from blobs (graph-backed); files whose hash is absent
-    /// are loaded from the working-directory copy on disk (migration-debt path).
-    /// Files that are neither in blobs nor on disk are skipped with a warning.
+    /// Loads every persisted [`FileLayout`] and its blob-backed base content
+    /// from graph truth via [`ProjectionState::from_graph`]. Missing entries or
+    /// blobs are authority gaps and fail loudly; runtime projection never
+    /// repairs graph truth from raw filesystem contents.
     ///
     /// Called after graph init, snapshot load, or a write-notify reconcile.
     pub async fn rebuild_projection(&self) -> Result<()> {
         let mut projection = self.projection.write().await;
 
-        // Fast path: all file hashes persisted — build directly from graph truth.
-        match ProjectionState::from_graph(self.graph.as_ref(), self.blobs.as_ref()) {
-            Ok(state) => {
-                let registered = state.file_ids().len();
-                *projection = state;
-                info!(
-                    files = registered,
-                    "rebuilt projection state from persisted graph truth"
-                );
-                return Ok(());
-            }
-            Err(kin_projection::ProjectionError::BaseContentUnavailable { .. }) => {
-                // Fall through to the per-file fallback below.
-            }
-            Err(e) => return Err(DaemonError::from(e)),
-        }
-
-        // Fallback path: some file hashes are absent (older snapshot).
-        // Build the projection file-by-file, reading from disk when blobs lack
-        // the content.  This is migration debt — once all snapshots are on the
-        // current schema (hashes always persisted) this path becomes unreachable.
-        let layouts = self.graph.list_file_layouts().map_err(DaemonError::from)?;
-        let mut new_projection = ProjectionState::new();
-        let mut loaded = 0usize;
-        let mut disk_fallback = 0usize;
-        let mut skipped = 0usize;
-
-        for layout in layouts {
-            let file_id = layout.file_id.clone();
-
-            // Try to load content from blobs (graph-backed, preferred).
-            // InMemoryGraph::get_file_hash takes &str and returns Option<[u8; 32]>.
-            let blob_content = self
-                .graph
-                .get_file_hash(&file_id.0)
-                .and_then(|raw| self.blobs.read(&kin_blobs::Hash256::from_bytes(raw)).ok());
-
-            if let Some(content) = blob_content {
-                new_projection.register_file(layout, content);
-                loaded += 1;
-                continue;
-            }
-
-            // Blob not available: fall back to the on-disk working copy.
-            let file_path = self.layout.working_dir().join(file_id.0.as_str());
-            match std::fs::read(&file_path) {
-                Ok(content) => {
-                    new_projection.register_file(layout, content);
-                    disk_fallback += 1;
-                }
-                Err(e) => {
-                    // File is neither in blobs nor on disk (deleted, not yet
-                    // checked out, etc.) — skip it rather than hard-failing.
-                    warn!(
-                        file = %file_id,
-                        error = %e,
-                        "skipping projection rebuild for file not in blobs or disk \
-                         (migration-debt fallback)"
-                    );
-                    skipped += 1;
-                }
-            }
-        }
-
-        *projection = new_projection;
+        let state = ProjectionState::from_graph(self.graph.as_ref(), self.blobs.as_ref())
+            .map_err(DaemonError::from)?;
+        let registered = state.file_ids().len();
+        *projection = state;
         info!(
-            files = loaded + disk_fallback,
-            graph_backed = loaded,
-            disk_fallback = disk_fallback,
-            skipped = skipped,
-            "rebuilt projection state via per-file fallback (older snapshot without file hashes)"
+            files = registered,
+            "rebuilt projection state from persisted graph truth"
         );
         Ok(())
     }
@@ -3697,8 +3608,8 @@ impl DaemonState {
     ///
     /// This is the warm path after reconcile/VFS writes: removed files are
     /// evicted from the projection cache, and added/modified files are loaded
-    /// from graph-owned layout + blob content. Missing hashes retain the same
-    /// per-file working-tree fallback used by `rebuild_projection`.
+    /// from graph-owned layout + blob content. Missing entries or blobs fail
+    /// loudly instead of being repaired from the filesystem.
     pub async fn refresh_projection(&self, changed: &ProjectionChangedSet) -> Result<()> {
         if changed.is_empty() {
             return Ok(());
@@ -3706,7 +3617,6 @@ impl DaemonState {
 
         let mut projection = self.projection.write().await;
         let mut loaded = 0usize;
-        let mut disk_fallback = 0usize;
         let mut removed = 0usize;
         let mut skipped = 0usize;
 
@@ -3726,39 +3636,31 @@ impl DaemonState {
                 continue;
             };
 
-            let blob_content = self
+            let entry = self
                 .graph
-                .get_file_hash(&file_id.0)
-                .and_then(|raw| self.blobs.read(&kin_blobs::Hash256::from_bytes(raw)).ok());
-
-            if let Some(content) = blob_content {
-                projection.register_file(layout, content);
-                loaded += 1;
-                continue;
-            }
-
-            let file_path = self.layout.working_dir().join(file_id.0.as_str());
-            match std::fs::read(&file_path) {
-                Ok(content) => {
-                    projection.register_file(layout, content);
-                    disk_fallback += 1;
-                }
-                Err(e) => {
-                    projection.remove_file(file_id);
-                    warn!(
-                        file = %file_id,
-                        error = %e,
-                        "skipping projection refresh for file not in blobs or disk"
-                    );
-                    skipped += 1;
-                }
-            }
+                .get_tree_entry(file_id)
+                .map_err(DaemonError::from)?
+                .ok_or_else(|| {
+                    exact_source_storage_error(format!(
+                        "projection refresh for {file_id} has no graph-owned tree entry"
+                    ))
+                })?;
+            let content = self
+                .blobs
+                .read(&kin_blobs::Hash256(*entry.blob_hash.as_bytes()))
+                .map_err(|error| {
+                    exact_source_storage_error(format!(
+                        "projection refresh for {file_id} cannot load graph-owned blob {}: {error}",
+                        entry.blob_hash
+                    ))
+                })?;
+            projection.register_file(layout, content);
+            loaded += 1;
         }
 
         info!(
-            upserted = loaded + disk_fallback,
+            upserted = loaded,
             graph_backed = loaded,
-            disk_fallback,
             removed,
             skipped,
             "refreshed projection state for changed files"
@@ -5413,7 +5315,7 @@ mod tests {
             timestamp: Timestamp::now(),
             entity_deltas: vec![EntityDelta::Added(entity.clone())],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],

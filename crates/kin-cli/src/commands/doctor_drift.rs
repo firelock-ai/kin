@@ -25,11 +25,11 @@
 //! no truth for) are never silently absorbed.
 
 use anyhow::{anyhow, Result};
-use kin_model::{EntityFilter, EntityStore, FilePathId};
+use kin_model::{EntityFilter, EntityStore, FilePathId, TreeEntry};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use super::init::{collect_on_disk_file_hashes, is_repo_owned_graph_path};
+use super::init::{collect_on_disk_tree_entries, is_repo_owned_graph_path};
 
 /// Classified graph⇄file drift. Serialized verbatim as the `--json` payload.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,7 +61,7 @@ impl DriftReport {
 /// (`.kin/…`) the graph tracks but the working tree never projects are dropped
 /// from `missing` so they cannot masquerade as drift. Each class is sorted so
 /// the report is deterministic.
-pub fn detect_drift(graph: &kin_db::InMemoryGraph, on_disk: &[(String, [u8; 32])]) -> DriftReport {
+pub fn detect_drift(graph: &kin_db::InMemoryGraph, on_disk: &[(String, TreeEntry)]) -> DriftReport {
     let diff = kin_db::engine::compute_diff(graph, on_disk);
 
     let mut drifted = diff.modified_files.clone();
@@ -108,7 +108,7 @@ pub async fn run(heal: bool, json: bool) -> Result<()> {
     let graph = snap.graph();
 
     let source_root = kin_core::source_dir(&layout);
-    let on_disk = collect_on_disk_file_hashes(&source_root)?;
+    let on_disk = collect_on_disk_tree_entries(&source_root)?;
 
     let report = detect_drift(graph.as_ref(), &on_disk);
 
@@ -161,37 +161,30 @@ fn heal_drift(
     Ok(HealOutcome { healed, failed })
 }
 
-/// Restore one file to graph truth: read the blob the graph's file-hash points
-/// to and write it to disk. Content flows graph → disk only — the drifted
-/// on-disk bytes are never read to decide truth (Zero File-Search Authority).
+/// Restore one entry to graph truth, including executable mode or symlink
+/// identity. Content flows graph → disk only — drifted on-disk bytes are never
+/// read to decide truth (Zero File-Search Authority).
 fn heal_file(
     layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,
     source_root: &Path,
     path: &str,
 ) -> Result<()> {
-    // `InMemoryGraph::get_file_hash` is the inherent `&str -> Option<[u8; 32]>`
-    // accessor — the same raw-hash space as `set_file_hash` and `compute_diff`.
-    let expected_bytes = graph
-        .get_file_hash(path)
-        .ok_or_else(|| anyhow!("graph has no expected hash for {path}"))?;
-    let expected = kin_model::Hash256::from_bytes(expected_bytes);
-    let bytes = kin_core::read_blob_from_layout(layout, &expected)
+    let file_id = FilePathId::new(path);
+    let expected = graph
+        .get_tree_entry(&file_id)?
+        .ok_or_else(|| anyhow!("graph has no exact tree entry for {path}"))?;
+    let bytes = kin_core::read_blob_from_layout(layout, &expected.blob_hash)
         .ok_or_else(|| anyhow!("graph-owned blob for {path} is unavailable; cannot heal"))?;
     // The blob must actually hash to the graph's expectation before we let it
     // overwrite the working tree.
-    if kin_blobs::digest(&bytes) != expected {
+    if kin_blobs::digest(&bytes) != expected.blob_hash {
         return Err(anyhow!(
             "graph-owned blob for {path} failed its integrity check; refusing to write"
         ));
     }
-    let dest = source_root.join(path);
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow!("failed to create {}: {e}", parent.display()))?;
-    }
-    std::fs::write(&dest, &bytes)
-        .map_err(|e| anyhow!("failed to write {}: {e}", dest.display()))?;
+    kin_core::materialize_source_entry(source_root, &file_id, expected.kind, &bytes)
+        .map_err(|error| anyhow!("failed to materialize exact tree entry {path}: {error}"))?;
     Ok(())
 }
 

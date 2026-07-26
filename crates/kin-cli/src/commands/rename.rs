@@ -535,8 +535,8 @@ impl<'a, G: GraphStore> GraphSourceReader<'a, G> {
 
     fn resolve(&self, rel_path: &str) -> Result<String> {
         let file_id = FilePathId::new(rel_path);
-        let hash = self.recorded_hash(&file_id)?;
-        let blob_hash = kin_blobs::Hash256(*hash.as_bytes());
+        let entry = self.recorded_entry(&file_id)?;
+        let blob_hash = kin_blobs::Hash256(*entry.blob_hash.as_bytes());
         let bytes = self.blobs.read(&blob_hash).with_context(|| {
             format!("graph blob for file '{rel_path}' is unavailable (hash {blob_hash})")
         })?;
@@ -545,12 +545,12 @@ impl<'a, G: GraphStore> GraphSourceReader<'a, G> {
         })
     }
 
-    /// The content hash graph truth records for `file_id`, preferring the
-    /// graph's file-layout store and falling back to the file tree at the
-    /// current branch head. Both are graph reads; neither consults the tree.
-    fn recorded_hash(&self, file_id: &FilePathId) -> Result<kin_model::Hash256> {
-        if let Some(hash) = self.graph.get_file_hash(file_id)? {
-            return Ok(hash);
+    /// The exact graph-owned tree entry for `file_id`, preferring working-tree
+    /// truth and falling back to the committed tree at the current branch head.
+    /// Both are graph reads; neither consults the filesystem.
+    fn recorded_entry(&self, file_id: &FilePathId) -> Result<kin_model::TreeEntry> {
+        if let Some(entry) = self.graph.get_tree_entry(file_id)? {
+            return Ok(entry);
         }
 
         let branch_name = kin_core::read_current_branch(self.layout)?;
@@ -563,7 +563,7 @@ impl<'a, G: GraphStore> GraphSourceReader<'a, G> {
                 .next()
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "graph records no content hash for file '{}' and no branch is available to resolve one",
+                        "graph records no tree entry for file '{}' and no branch is available to resolve one",
                         file_id.0
                     )
                 })?,

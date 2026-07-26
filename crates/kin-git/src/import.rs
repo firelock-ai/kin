@@ -8,8 +8,8 @@ use std::path::Path;
 use chrono::TimeZone;
 use kin_blobs::BlobStore;
 use kin_model::{
-    ArtifactDelta, ArtifactDeltaKind, AuthorId, BranchName, FilePathId, Hash256, SemanticChange,
-    SemanticChangeId, SourceEntryKind, Timestamp,
+    AuthorId, BranchName, FilePathId, Hash256, SemanticChange, SemanticChangeId, Timestamp,
+    TreeDelta, TreeEntry, TreeEntryKind,
 };
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
@@ -751,12 +751,12 @@ fn commit_to_change(
     // to the union of all direct-parent trees: semantic history replays the
     // complete DAG, while a Git merge diff against only its first parent can
     // otherwise leak second-parent content that the merge did not select.
-    let artifact_deltas = if is_root {
-        extract_full_tree_artifact_deltas(repo, commit, blob_store)?
+    let tree_deltas = if is_root {
+        extract_full_tree_deltas(repo, commit, blob_store)?
     } else if commit.parent_ids().count() > 1 {
-        extract_merge_artifact_deltas(repo, commit, blob_store)?
+        extract_merge_tree_deltas(repo, commit, blob_store)?
     } else {
-        extract_artifact_deltas(repo, commit, blob_store)?
+        extract_tree_deltas(repo, commit, blob_store)?
     };
 
     let authored_on = if is_root {
@@ -773,7 +773,7 @@ fn commit_to_change(
         message,
         entity_deltas: vec![],   // Populated by indexing pipeline
         relation_deltas: vec![], // Populated by indexing pipeline
-        artifact_deltas,
+        tree_deltas,
         projected_files: vec![],
         spec_link: None,
         evidence: vec![],
@@ -784,64 +784,56 @@ fn commit_to_change(
 
 /// Importer-internal classification of a Git tree entry.
 ///
-/// Distinct from the canonical [`SourceEntryKind`] so a submodule pointer can be
-/// carried through import as a tracked, mode-unknown change without adding a
-/// Git-compatibility construct to the shared type vocabulary. A gitlink is not
-/// exact-source materializable (it names another repository's commit, not file
-/// content), so it resolves to a source-tree gap rather than a synthesized file.
+/// Distinct from the canonical [`TreeEntryKind`] because the exact tree schema
+/// intentionally has no representation for a Git submodule pointer. Import
+/// fails loudly when materializing a gitlink instead of fabricating a regular
+/// file or symlink entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GitEntryClass {
-    /// A file or symbolic link — an exact source entry with a known mode.
-    Source(SourceEntryKind),
-    /// A gitlink (submodule pointer). Recorded as a mode-unknown artifact delta;
-    /// its pinned commit id is captured as the delta's content identity.
+    /// A regular file or symbolic link with an exact Git-relevant mode.
+    Tree(TreeEntryKind),
+    /// A gitlink (submodule pointer), which is not representable as `TreeEntry`.
     Gitlink,
 }
 
 /// Classify a Git tree entry mode. `None` for a tree (directory), which is not a
 /// source entry.
 ///
-/// A gitlink is classified, not refused: it is recorded as a tracked,
-/// mode-unknown pointer change so a submodule move is visible to review and the
-/// presence of a submodule anywhere in history does not block ref hydration.
+/// A gitlink remains classified here so co-change analysis can still observe
+/// it. Exact tree import rejects it when converting the entry.
 fn classify_git_entry(mode: gix::objs::tree::EntryMode) -> Option<GitEntryClass> {
     use gix::objs::tree::EntryKind;
 
     match mode.kind() {
-        EntryKind::Blob => Some(GitEntryClass::Source(SourceEntryKind::File {
+        EntryKind::Blob => Some(GitEntryClass::Tree(TreeEntryKind::Regular {
             executable: false,
         })),
-        EntryKind::BlobExecutable => Some(GitEntryClass::Source(SourceEntryKind::File {
+        EntryKind::BlobExecutable => Some(GitEntryClass::Tree(TreeEntryKind::Regular {
             executable: true,
         })),
-        EntryKind::Link => Some(GitEntryClass::Source(SourceEntryKind::Symlink)),
+        EntryKind::Link => Some(GitEntryClass::Tree(TreeEntryKind::Symlink)),
         EntryKind::Tree => None,
         EntryKind::Commit => Some(GitEntryClass::Gitlink),
     }
 }
 
-/// Content-identity hash for one side of an artifact delta. A file or symlink
-/// hashes its Git blob; a gitlink hashes the textual pointer form Git itself
-/// uses in diffs (`Subproject commit <hex>`), so a pointer move is a visible
-/// content change and the pinned commit stays recoverable from the blob store.
-fn entry_content_hash(
+/// Convert a Git tree side into an exact Kin tree entry and materialize its
+/// bytes in the blob store when one is available.
+fn exact_tree_entry(
     repo: &gix::Repository,
     oid: gix::ObjectId,
     class: GitEntryClass,
     blob_store: Option<&BlobStore>,
-) -> Result<Hash256> {
+) -> Result<TreeEntry> {
     match class {
-        GitEntryClass::Source(_) => blob_hash(repo, oid, blob_store),
-        GitEntryClass::Gitlink => gitlink_pointer_hash(oid, blob_store),
+        GitEntryClass::Tree(kind) => Ok(TreeEntry {
+            blob_hash: blob_hash(repo, oid, blob_store)?,
+            kind,
+        }),
+        GitEntryClass::Gitlink => Err(GitError::Other(format!(
+            "exact Git import cannot represent gitlink {oid}; TreeEntryKind needs an explicit gitlink variant before submodules can be imported losslessly"
+        ))),
     }
-}
-
-fn gitlink_pointer_hash(oid: gix::ObjectId, blob_store: Option<&BlobStore>) -> Result<Hash256> {
-    let content = format!("Subproject commit {oid}\n").into_bytes();
-    if let Some(store) = blob_store {
-        store.write(&content)?;
-    }
-    Ok(Hash256::from_bytes(kin_blobs::digest(&content).0))
 }
 
 fn utf8_git_path(path: &[u8]) -> Result<String> {
@@ -853,90 +845,50 @@ fn utf8_git_path(path: &[u8]) -> Result<String> {
     })
 }
 
-fn added_artifact_kind(kind: SourceEntryKind) -> ArtifactDeltaKind {
-    match kind {
-        SourceEntryKind::File { executable: false } => ArtifactDeltaKind::AddedRegularFile,
-        SourceEntryKind::File { executable: true } => ArtifactDeltaKind::AddedExecutableFile,
-        SourceEntryKind::Symlink => ArtifactDeltaKind::AddedSymlink,
-    }
-}
-
-fn modified_artifact_kind(kind: SourceEntryKind) -> ArtifactDeltaKind {
-    match kind {
-        SourceEntryKind::File { executable: false } => ArtifactDeltaKind::ModifiedRegularFile,
-        SourceEntryKind::File { executable: true } => ArtifactDeltaKind::ModifiedExecutableFile,
-        SourceEntryKind::Symlink => ArtifactDeltaKind::ModifiedSymlink,
-    }
-}
-
-/// Resulting delta kind for an added entry. A gitlink has no exact file mode, so
-/// it is recorded as a mode-unknown addition rather than a fabricated file kind.
-fn added_delta_kind(class: GitEntryClass) -> ArtifactDeltaKind {
-    match class {
-        GitEntryClass::Source(kind) => added_artifact_kind(kind),
-        GitEntryClass::Gitlink => ArtifactDeltaKind::Added,
-    }
-}
-
-/// Resulting delta kind for a modified entry. A gitlink pointer move is recorded
-/// as a mode-unknown modification.
-fn modified_delta_kind(class: GitEntryClass) -> ArtifactDeltaKind {
-    match class {
-        GitEntryClass::Source(kind) => modified_artifact_kind(kind),
-        GitEntryClass::Gitlink => ArtifactDeltaKind::Modified,
-    }
-}
-
-fn extract_artifact_deltas(
+fn extract_tree_deltas(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     blob_store: Option<&BlobStore>,
-) -> Result<Vec<ArtifactDelta>> {
+) -> Result<Vec<TreeDelta>> {
     let mut deltas = Vec::new();
     for delta in commit_file_deltas(repo, commit)? {
-        let kind = match (&delta.old, &delta.new) {
-            (None, Some((_, class))) => added_delta_kind(*class),
-            (Some(_), None) => ArtifactDeltaKind::Removed,
-            (Some(_), Some((_, class))) => modified_delta_kind(*class),
+        let file_id = FilePathId::new(delta.path);
+        let tree_delta = match (delta.old, delta.new) {
+            (None, Some((new_oid, new_class))) => TreeDelta::Added {
+                file_id,
+                new_entry: exact_tree_entry(repo, new_oid, new_class, blob_store)?,
+            },
+            (Some((old_oid, old_class)), None) => TreeDelta::Removed {
+                file_id,
+                old_entry: exact_tree_entry(repo, old_oid, old_class, blob_store)?,
+            },
+            (Some((old_oid, old_class)), Some((new_oid, new_class))) => TreeDelta::Modified {
+                file_id,
+                old_entry: exact_tree_entry(repo, old_oid, old_class, blob_store)?,
+                new_entry: exact_tree_entry(repo, new_oid, new_class, blob_store)?,
+            },
             (None, None) => continue,
         };
-
-        let old_hash = delta
-            .old
-            .map(|(oid, class)| entry_content_hash(repo, oid, class, blob_store))
-            .transpose()?;
-        let new_hash = delta
-            .new
-            .map(|(oid, class)| entry_content_hash(repo, oid, class, blob_store))
-            .transpose()?;
-
-        deltas.push(ArtifactDelta {
-            file_id: FilePathId::new(delta.path),
-            kind,
-            old_hash,
-            new_hash,
-        });
+        deltas.push(tree_delta);
     }
 
     Ok(deltas)
 }
 
-fn extract_full_tree_artifact_deltas(
+fn extract_full_tree_deltas(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     blob_store: Option<&BlobStore>,
-) -> Result<Vec<ArtifactDelta>> {
+) -> Result<Vec<TreeDelta>> {
     let tree = commit
         .tree()
         .map_err(|error| GitError::Git(error.to_string()))?;
     full_tree_blob_entries(repo, &tree)?
         .into_iter()
         .map(|(path, oid, class)| {
-            Ok(ArtifactDelta {
+            Ok(TreeDelta::Added {
                 file_id: FilePathId::new(path),
-                kind: added_delta_kind(class),
-                old_hash: None,
-                new_hash: Some(entry_content_hash(repo, oid, class, blob_store)?),
+                new_entry: exact_tree_entry(repo, oid, class, blob_store)?,
             })
         })
         .collect()
@@ -945,11 +897,11 @@ fn extract_full_tree_artifact_deltas(
 /// Encode a merge as a complete correction over the union of its direct
 /// parent trees. This makes the semantic DAG replay converge on the exact Git
 /// merge tree regardless of sibling topological order.
-fn extract_merge_artifact_deltas(
+fn extract_merge_tree_deltas(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     blob_store: Option<&BlobStore>,
-) -> Result<Vec<ArtifactDelta>> {
+) -> Result<Vec<TreeDelta>> {
     let current_tree = commit
         .tree()
         .map_err(|error| GitError::Git(error.to_string()))?;
@@ -978,31 +930,26 @@ fn extract_merge_artifact_deltas(
     let mut deltas = Vec::with_capacity(current.len() + parent_union.len());
     for (path, (old_id, old_class)) in &parent_union {
         if !current.contains_key(path) {
-            deltas.push(ArtifactDelta {
+            deltas.push(TreeDelta::Removed {
                 file_id: FilePathId::new(path),
-                kind: ArtifactDeltaKind::Removed,
-                old_hash: Some(entry_content_hash(repo, *old_id, *old_class, blob_store)?),
-                new_hash: None,
+                old_entry: exact_tree_entry(repo, *old_id, *old_class, blob_store)?,
             });
         }
     }
     for (path, (new_id, new_class)) in current {
-        let old_hash = parent_union
-            .get(&path)
-            .map(|(old_id, old_class)| entry_content_hash(repo, *old_id, *old_class, blob_store))
-            .transpose()?;
-        deltas.push(ArtifactDelta {
-            file_id: FilePathId::new(path),
-            kind: if old_hash.is_some() {
-                modified_delta_kind(new_class)
-            } else {
-                added_delta_kind(new_class)
-            },
-            old_hash,
-            new_hash: Some(entry_content_hash(repo, new_id, new_class, blob_store)?),
-        });
+        let file_id = FilePathId::new(path.clone());
+        let new_entry = exact_tree_entry(repo, new_id, new_class, blob_store)?;
+        if let Some((old_id, old_class)) = parent_union.get(&path) {
+            deltas.push(TreeDelta::Modified {
+                file_id,
+                old_entry: exact_tree_entry(repo, *old_id, *old_class, blob_store)?,
+                new_entry,
+            });
+        } else {
+            deltas.push(TreeDelta::Added { file_id, new_entry });
+        }
     }
-    deltas.sort_by(|left, right| left.file_id.0.cmp(&right.file_id.0));
+    deltas.sort_by(|left, right| left.file_id().0.cmp(&right.file_id().0));
     Ok(deltas)
 }
 
@@ -1156,7 +1103,7 @@ fn full_tree_blob_entries(
     Ok(entries)
 }
 
-/// Enumerate at most `max_entries` source entries without first materializing
+/// Enumerate at most `max_entries` exact tree entries without first materializing
 /// the complete tree diff. This is used at the truncated-history boundary,
 /// where an adversarial or unexpectedly large parent tree must fail before its
 /// full path set is retained in memory.
@@ -1164,11 +1111,7 @@ fn bounded_full_tree_blob_entries(
     repo: &gix::Repository,
     tree: &gix::Tree<'_>,
     max_entries: usize,
-) -> Result<Vec<(String, gix::ObjectId, SourceEntryKind)>> {
-    // Returns only exact-source (file/symlink) entries. A gitlink in a
-    // truncated-history boundary tree is left as an exact-source gap here rather
-    // than routed through the byte-budget blob-load path below; its pointer
-    // moves are still recorded by the per-commit diff path.
+) -> Result<Vec<(String, gix::ObjectId, GitEntryClass)>> {
     let empty_tree = repo.empty_tree();
     let mut changes = empty_tree
         .changes()
@@ -1195,19 +1138,21 @@ fn bounded_full_tree_blob_entries(
                     return Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Break(()));
                 }
             };
-            let kind = match classify_git_entry(entry_mode) {
-                Some(GitEntryClass::Source(kind)) => kind,
-                // Gitlink (see the fn-level note) and directories are not
-                // exact-source entries at this boundary; skip.
-                Some(GitEntryClass::Gitlink) | None => {
-                    return Ok(std::ops::ControlFlow::Continue(()))
+            let class = match classify_git_entry(entry_mode) {
+                Some(class @ GitEntryClass::Tree(_)) => class,
+                Some(GitEntryClass::Gitlink) => {
+                    callback_error = Some(GitError::Other(format!(
+                        "exact truncated-history import cannot represent gitlink {path}"
+                    )));
+                    return Ok(std::ops::ControlFlow::Break(()));
                 }
+                None => return Ok(std::ops::ControlFlow::Continue(())),
             };
             if entries.len() == max_entries {
                 over_limit = true;
                 return Ok(std::ops::ControlFlow::Break(()));
             }
-            entries.push((path, id.detach(), kind));
+            entries.push((path, id.detach(), class));
         }
         Ok(std::ops::ControlFlow::Continue(()))
     });
@@ -1376,7 +1321,7 @@ pub fn anchor_imported_history_at_base_link(
             aggregate_entries,
             aggregate_expanded_bytes,
         )?;
-        let mut artifact_deltas = Vec::with_capacity(entries.len());
+        let mut tree_deltas = Vec::with_capacity(entries.len());
         for (path, blob_id, entry_kind) in entries {
             let (new_hash, byte_len) = if let Some(cached) = blob_cache.get(&blob_id) {
                 *cached
@@ -1424,11 +1369,20 @@ pub fn anchor_imported_history_at_base_link(
                 aggregate_entries,
                 aggregate_expanded_bytes,
             )?;
-            artifact_deltas.push(ArtifactDelta {
+            tree_deltas.push(TreeDelta::Added {
                 file_id: FilePathId::new(path),
-                kind: added_artifact_kind(entry_kind),
-                old_hash: None,
-                new_hash: Some(new_hash),
+                new_entry: TreeEntry {
+                    blob_hash: new_hash,
+                    kind: match entry_kind {
+                        GitEntryClass::Tree(kind) => kind,
+                        GitEntryClass::Gitlink => {
+                            return Err(GitError::Other(
+                                "exact truncated-history import cannot represent a gitlink"
+                                    .to_string(),
+                            ));
+                        }
+                    },
+                },
             });
         }
 
@@ -1452,7 +1406,7 @@ pub fn anchor_imported_history_at_base_link(
                 message: "kin import: base-link (window base universe)".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas,
+                tree_deltas,
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -2822,7 +2776,7 @@ mod tests {
                 message: String::new(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],

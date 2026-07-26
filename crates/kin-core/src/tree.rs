@@ -12,9 +12,7 @@ use std::path::Path;
 #[cfg(any(unix, windows))]
 use std::path::PathBuf;
 
-use kin_model::{
-    FilePathId, GraphStore, Hash256, SemanticChangeId, SourceEntryKind, SourceTreeResolution,
-};
+use kin_model::{FilePathId, GraphStore, SemanticChangeId, TreeEntry, TreeEntryKind};
 
 use crate::{KinError, KinLayout, Result};
 
@@ -45,27 +43,18 @@ const MAX_RECONCILIATION_ACTION_RECORD_BYTES: u64 = 256 * 1024;
 #[cfg(any(unix, windows))]
 const MAX_RECONCILIATION_ACTION_LOG_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Walk the SemanticChange DAG from genesis to branch_head and build
-/// the current file tree: Map<FilePathId, Hash256>.
+/// Resolve the exact repository tree at `branch_head`.
+///
+/// The genesis argument remains part of the public checkout seam for now, but
+/// exact tree replay is owned by `ChangeStore::resolve_tree_at`.
 pub fn build_file_tree<G: GraphStore>(
     graph: &G,
-    genesis_id: &SemanticChangeId,
+    _genesis_id: &SemanticChangeId,
     branch_head: &SemanticChangeId,
-) -> Result<HashMap<FilePathId, Hash256>> {
-    let changes = graph
-        .get_changes_since(genesis_id, branch_head)
-        .map_err(|e| KinError::Graph(format!("{}", e)))?;
-    let mut tree = HashMap::new();
-    for change in &changes {
-        for delta in &change.artifact_deltas {
-            if delta.kind.is_removed() {
-                tree.remove(&delta.file_id);
-            } else if let Some(hash) = delta.new_hash {
-                tree.insert(delta.file_id.clone(), hash);
-            }
-        }
-    }
-    Ok(tree)
+) -> Result<HashMap<FilePathId, TreeEntry>> {
+    graph
+        .resolve_tree_at(branch_head)
+        .map_err(|error| KinError::Graph(error.to_string()))
 }
 
 /// Re-project the working directory to match a branch's committed file state.
@@ -233,17 +222,17 @@ pub fn checkout_branch_between_heads_transactional_with_hooks<G: GraphStore>(
 
 fn load_source_tree_blobs(
     blob_store: &kin_blobs::BlobStore,
-    tree: HashMap<FilePathId, kin_model::ResolvedSourceEntry>,
-) -> Result<Vec<(FilePathId, SourceEntryKind, Vec<u8>)>> {
+    tree: HashMap<FilePathId, TreeEntry>,
+) -> Result<Vec<(FilePathId, TreeEntryKind, Vec<u8>)>> {
     let mut entries: Vec<_> = tree.into_iter().collect();
     entries.sort_by(|left, right| left.0 .0.cmp(&right.0 .0));
     entries
         .into_iter()
-        .map(|(file_id, source)| {
+        .map(|(file_id, entry)| {
             // Convert kin_model::Hash256 to kin_blobs::Hash256.
-            let blob_hash = kin_blobs::Hash256(*source.hash.as_bytes());
+            let blob_hash = kin_blobs::Hash256(*entry.blob_hash.as_bytes());
             let content = blob_store.read(&blob_hash)?;
-            Ok((file_id, source.kind, content))
+            Ok((file_id, entry.kind, content))
         })
         .collect()
 }
@@ -251,23 +240,10 @@ fn load_source_tree_blobs(
 fn resolve_exact_source_tree<G: GraphStore>(
     graph: &G,
     head: &SemanticChangeId,
-) -> Result<HashMap<FilePathId, kin_model::ResolvedSourceEntry>> {
-    match graph
-        .resolve_source_tree_at(head)
-        .map_err(|error| KinError::Graph(error.to_string()))?
-    {
-        SourceTreeResolution::Exact { entries } => Ok(entries),
-        SourceTreeResolution::Incomplete { gaps } => {
-            let gaps = gaps
-                .iter()
-                .map(|gap| format!("{}@{}:{:?}", gap.file_id, gap.change_id, gap.reason))
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(KinError::Graph(format!(
-                "checkout requires exact source history at {head}, but found unresolved gaps: {gaps}"
-            )))
-        }
-    }
+) -> Result<HashMap<FilePathId, TreeEntry>> {
+    graph
+        .resolve_tree_at(head)
+        .map_err(|error| KinError::Graph(error.to_string()))
 }
 
 /// Preserve control-plane and generated dependency/build directories during
@@ -309,7 +285,7 @@ pub fn should_preserve_checkout_path(relative: &Path) -> bool {
 pub fn materialize_source_entry(
     root: &Path,
     file_id: &FilePathId,
-    kind: SourceEntryKind,
+    kind: TreeEntryKind,
     content: &[u8],
 ) -> Result<()> {
     materialize_source_tree(root, [(file_id, kind, content)]).map(|_| ())
@@ -324,7 +300,7 @@ pub fn materialize_source_entry(
 /// entry to a different ambient path.
 pub fn materialize_source_tree<'a>(
     root: &Path,
-    entries: impl IntoIterator<Item = (&'a FilePathId, SourceEntryKind, &'a [u8])>,
+    entries: impl IntoIterator<Item = (&'a FilePathId, TreeEntryKind, &'a [u8])>,
 ) -> Result<usize> {
     let entries = validated_source_entries(entries)?;
     project_validated_source_tree(root, &entries, None, || {})
@@ -339,7 +315,7 @@ pub fn materialize_source_tree<'a>(
 /// same retained capability rather than ambient pathnames.
 pub fn replace_source_tree<'a>(
     root: &Path,
-    entries: impl IntoIterator<Item = (&'a FilePathId, SourceEntryKind, &'a [u8])>,
+    entries: impl IntoIterator<Item = (&'a FilePathId, TreeEntryKind, &'a [u8])>,
     should_preserve: impl Fn(&Path) -> bool,
 ) -> Result<usize> {
     let entries = validated_source_entries(entries)?;
@@ -357,8 +333,8 @@ pub fn replace_source_tree<'a>(
 /// ancestor.
 pub fn reconcile_source_tree<'a, 'b>(
     root: &Path,
-    previous_entries: impl IntoIterator<Item = (&'b FilePathId, SourceEntryKind, &'b [u8])>,
-    entries: impl IntoIterator<Item = (&'a FilePathId, SourceEntryKind, &'a [u8])>,
+    previous_entries: impl IntoIterator<Item = (&'b FilePathId, TreeEntryKind, &'b [u8])>,
+    entries: impl IntoIterator<Item = (&'a FilePathId, TreeEntryKind, &'a [u8])>,
     should_preserve: impl Fn(&Path) -> bool,
 ) -> Result<usize> {
     reconcile_source_tree_with_pre_mutation_hook(
@@ -373,8 +349,8 @@ pub fn reconcile_source_tree<'a, 'b>(
 #[doc(hidden)]
 pub fn reconcile_source_tree_with_pre_mutation_hook<'a, 'b>(
     root: &Path,
-    previous_entries: impl IntoIterator<Item = (&'b FilePathId, SourceEntryKind, &'b [u8])>,
-    entries: impl IntoIterator<Item = (&'a FilePathId, SourceEntryKind, &'a [u8])>,
+    previous_entries: impl IntoIterator<Item = (&'b FilePathId, TreeEntryKind, &'b [u8])>,
+    entries: impl IntoIterator<Item = (&'a FilePathId, TreeEntryKind, &'a [u8])>,
     should_preserve: impl Fn(&Path) -> bool,
     after_read_only_preflight: impl FnOnce(),
 ) -> Result<usize> {
@@ -393,8 +369,8 @@ pub fn reconcile_source_tree_with_pre_mutation_hook<'a, 'b>(
 #[doc(hidden)]
 pub fn reconcile_source_tree_with_mutation_hooks<'a, 'b>(
     root: &Path,
-    previous_entries: impl IntoIterator<Item = (&'b FilePathId, SourceEntryKind, &'b [u8])>,
-    entries: impl IntoIterator<Item = (&'a FilePathId, SourceEntryKind, &'a [u8])>,
+    previous_entries: impl IntoIterator<Item = (&'b FilePathId, TreeEntryKind, &'b [u8])>,
+    entries: impl IntoIterator<Item = (&'a FilePathId, TreeEntryKind, &'a [u8])>,
     should_preserve: impl Fn(&Path) -> bool,
     after_read_only_preflight: impl FnOnce(),
     after_identity_revalidation: impl FnOnce(),
@@ -416,7 +392,7 @@ pub fn reconcile_source_tree_with_mutation_hooks<'a, 'b>(
 #[derive(Clone, Copy)]
 struct ValidatedSourceEntry<'a> {
     file_id: &'a FilePathId,
-    kind: SourceEntryKind,
+    kind: TreeEntryKind,
     content: &'a [u8],
 }
 
@@ -458,7 +434,7 @@ fn fail_publication_if_injected() -> Result<()> {
 }
 
 fn validated_source_entries<'a>(
-    entries: impl IntoIterator<Item = (&'a FilePathId, SourceEntryKind, &'a [u8])>,
+    entries: impl IntoIterator<Item = (&'a FilePathId, TreeEntryKind, &'a [u8])>,
 ) -> Result<Vec<ValidatedSourceEntry<'a>>> {
     let mut entries: Vec<_> = entries
         .into_iter()
@@ -484,7 +460,7 @@ fn validated_source_entries<'a>(
 /// before any file/directory transition is applied.
 pub fn validate_source_entry(
     file_id: &FilePathId,
-    kind: SourceEntryKind,
+    kind: TreeEntryKind,
     content: &[u8],
 ) -> Result<()> {
     validate_source_entry_components(file_id, kind, content).map(|_| ())
@@ -492,12 +468,12 @@ pub fn validate_source_entry(
 
 fn validate_source_entry_components<'a>(
     file_id: &'a FilePathId,
-    kind: SourceEntryKind,
+    kind: TreeEntryKind,
     content: &[u8],
 ) -> Result<Vec<&'a str>> {
     let components = validate_source_path(&file_id.0)?;
 
-    if kind == SourceEntryKind::Symlink {
+    if kind == TreeEntryKind::Symlink {
         let target = std::str::from_utf8(content).map_err(|_| {
             KinError::Other(format!(
                 "symbolic link target is not valid UTF-8 for {}",
@@ -520,7 +496,7 @@ fn validate_source_entry_components<'a>(
 /// rejects path-prefix conflicts such as `a` and `a/b` before callers remove a
 /// blocking file or directory.
 pub fn validate_source_tree<'a>(
-    entries: impl IntoIterator<Item = (&'a FilePathId, SourceEntryKind, &'a [u8])>,
+    entries: impl IntoIterator<Item = (&'a FilePathId, TreeEntryKind, &'a [u8])>,
 ) -> Result<()> {
     let entries: Vec<_> = entries.into_iter().collect();
     validate_source_paths(entries.iter().map(|(file_id, _, _)| *file_id))?;
@@ -3274,8 +3250,8 @@ impl ProjectionRoot {
             let name = format!("stage-{name_index}");
             let identity = self.stage_reconciliation_entry(transaction, &name, &entry)?;
             let kind = match entry.kind {
-                SourceEntryKind::File { .. } => ExistingObjectKind::File,
-                SourceEntryKind::Symlink => ExistingObjectKind::Symlink,
+                TreeEntryKind::Regular { .. } => ExistingObjectKind::File,
+                TreeEntryKind::Symlink => ExistingObjectKind::Symlink,
             };
             let (inspected_identity, state) = self.inspect_named_existing_object(
                 transaction,
@@ -3311,7 +3287,7 @@ impl ProjectionRoot {
     ) -> Result<TrackedEntryIdentity> {
         let display = self.display_root.join(&entry.file_id.0);
         match entry.kind {
-            SourceEntryKind::File { executable } => {
+            TreeEntryKind::Regular { executable } => {
                 let fd = rustix::fs::openat(
                     transaction,
                     name,
@@ -3338,7 +3314,7 @@ impl ProjectionRoot {
                     .map_err(|error| KinError::io(&display, error))?;
                 Ok(tracked_open_file_identity(&metadata))
             }
-            SourceEntryKind::Symlink => {
+            TreeEntryKind::Symlink => {
                 let target =
                     std::str::from_utf8(entry.content).expect("validated UTF-8 symlink target");
                 rustix::fs::symlinkat(target, transaction, name)
@@ -3363,7 +3339,7 @@ impl ProjectionRoot {
         use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
         use windows_sys::Win32::Storage::FileSystem::DELETE;
 
-        if entry.kind == SourceEntryKind::Symlink {
+        if entry.kind == TreeEntryKind::Symlink {
             return Err(KinError::Other(
                 "safe exact symbolic-link checkout is unsupported on Windows".to_string(),
             ));
@@ -3759,7 +3735,7 @@ impl ProjectionRoot {
         display: &Path,
     ) -> Result<TrackedEntryIdentity> {
         match entry.kind {
-            SourceEntryKind::File { executable } => {
+            TreeEntryKind::Regular { executable } => {
                 #[cfg(unix)]
                 let mut file = rustix::fs::openat(
                     parent,
@@ -3827,7 +3803,7 @@ impl ProjectionRoot {
                     tracked_open_file_identity(&file).map_err(|error| KinError::io(display, error))
                 }
             }
-            SourceEntryKind::Symlink => {
+            TreeEntryKind::Symlink => {
                 #[cfg(unix)]
                 {
                     let metadata = parent
@@ -4267,8 +4243,8 @@ impl ProjectionRoot {
         display: &Path,
     ) -> Result<()> {
         let kind = match entry.kind {
-            SourceEntryKind::File { .. } => ExistingObjectKind::File,
-            SourceEntryKind::Symlink => ExistingObjectKind::Symlink,
+            TreeEntryKind::Regular { .. } => ExistingObjectKind::File,
+            TreeEntryKind::Symlink => ExistingObjectKind::Symlink,
         };
         let (inspected_identity, inspected_state) =
             self.inspect_named_existing_object(source.parent, source.name, kind, display)?;
@@ -4655,8 +4631,8 @@ impl ProjectionRoot {
         let backup_name = format!("backup-{name_index}");
         let display = self.display_path(&components);
         let kind = match entry.kind {
-            SourceEntryKind::File { .. } => ExistingObjectKind::File,
-            SourceEntryKind::Symlink => ExistingObjectKind::Symlink,
+            TreeEntryKind::Regular { .. } => ExistingObjectKind::File,
+            TreeEntryKind::Symlink => ExistingObjectKind::Symlink,
         };
         let (actual_identity, state) =
             self.inspect_named_existing_object(&parent, source_name, kind, &display)?;
@@ -4703,8 +4679,8 @@ impl ProjectionRoot {
         let stage_name = format!("stage-{}", staged.name_index);
         let display = self.display_path(&components);
         let kind = match staged.entry.kind {
-            SourceEntryKind::File { .. } => ExistingObjectKind::File,
-            SourceEntryKind::Symlink => ExistingObjectKind::Symlink,
+            TreeEntryKind::Regular { .. } => ExistingObjectKind::File,
+            TreeEntryKind::Symlink => ExistingObjectKind::Symlink,
         };
         self.record_reconciliation_action(
             transaction,
@@ -4806,7 +4782,7 @@ impl ProjectionRoot {
             Err(error) => return Err(KinError::io(&display, error)),
         };
         let identity = match entry.kind {
-            SourceEntryKind::File { executable } => {
+            TreeEntryKind::Regular { executable } => {
                 if !metadata.is_file() || metadata_is_reparse(&metadata) {
                     return Err(conflict("the tracked path kind changed"));
                 }
@@ -4868,7 +4844,7 @@ impl ProjectionRoot {
                         .map_err(|error| KinError::io(&display, error))?
                 }
             }
-            SourceEntryKind::Symlink => {
+            TreeEntryKind::Symlink => {
                 #[cfg(windows)]
                 return Err(KinError::Other(
                     "safe exact symbolic-link checkout is unsupported on Windows".to_string(),
@@ -5730,8 +5706,8 @@ fn validate_source_symlink_target_with_windows_rules(
 mod tests {
     use super::*;
 
-    fn regular() -> SourceEntryKind {
-        SourceEntryKind::File { executable: false }
+    fn regular() -> TreeEntryKind {
+        TreeEntryKind::Regular { executable: false }
     }
 
     #[test]
@@ -5880,7 +5856,7 @@ mod tests {
     fn windows_symlink_entry_validates_target_before_reporting_unsupported_publication() {
         let error = validate_source_entry(
             &FilePathId("dir/link".to_string()),
-            SourceEntryKind::Symlink,
+            TreeEntryKind::Symlink,
             b"CON/file",
         )
         .expect_err("Windows-invalid target must fail before publication");
@@ -5903,7 +5879,7 @@ mod tests {
             let result = materialize_source_entry(
                 root.path(),
                 &FilePathId("dir/link".to_string()),
-                SourceEntryKind::Symlink,
+                TreeEntryKind::Symlink,
                 target.as_bytes(),
             );
             assert!(
@@ -6011,7 +5987,7 @@ mod tests {
         reconcile_source_tree(
             root.path(),
             [(&old, regular(), b"graph-owned bytes".as_slice())],
-            std::iter::empty::<(&FilePathId, SourceEntryKind, &[u8])>(),
+            std::iter::empty::<(&FilePathId, TreeEntryKind, &[u8])>(),
             should_preserve_checkout_path,
         )
         .unwrap();
@@ -6133,7 +6109,7 @@ mod tests {
         let error = reconcile_source_tree_with_pre_mutation_hook(
             root.path(),
             [(&removed, regular(), b"old graph bytes".as_slice())],
-            std::iter::empty::<(&FilePathId, SourceEntryKind, &[u8])>(),
+            std::iter::empty::<(&FilePathId, TreeEntryKind, &[u8])>(),
             should_preserve_checkout_path,
             || {
                 let replacement = root.path().join("src/editor.tmp");
@@ -7125,14 +7101,14 @@ mod tests {
         materialize_source_entry(
             root.path(),
             &FilePathId("bin/tool".to_string()),
-            SourceEntryKind::File { executable: true },
+            TreeEntryKind::Regular { executable: true },
             b"#!/bin/sh\n",
         )
         .unwrap();
         materialize_source_entry(
             root.path(),
             &FilePathId("bin/readme".to_string()),
-            SourceEntryKind::Symlink,
+            TreeEntryKind::Symlink,
             b"../README.md",
         )
         .unwrap();

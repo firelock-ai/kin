@@ -4,10 +4,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use kin_model::{
-    ChangeStore, FilePathId, Hash256, ResolvedSourceEntry, SemanticChangeId, SourceEntryKind,
-    SourceTreeResolution,
-};
+use kin_model::{ChangeStore, FilePathId, Hash256, SemanticChangeId, TreeEntry, TreeEntryKind};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,7 +138,7 @@ pub fn execute_checkout_request(
 
 struct PreparedCheckoutEntry {
     file_id: FilePathId,
-    kind: SourceEntryKind,
+    kind: TreeEntryKind,
     content: Vec<u8>,
 }
 
@@ -151,14 +148,14 @@ struct PreparedCheckoutEntry {
 /// path set, entry kinds, UTF-8 link payloads, and link targets without IO.
 fn load_and_validate_checkout_entries<'a>(
     blob_store: &kin_blobs::BlobStore,
-    entries: impl IntoIterator<Item = (&'a FilePathId, &'a ResolvedSourceEntry)>,
+    entries: impl IntoIterator<Item = (&'a FilePathId, &'a TreeEntry)>,
 ) -> Result<Vec<PreparedCheckoutEntry>> {
     let mut entries: Vec<_> = entries.into_iter().collect();
     entries.sort_by(|left, right| left.0 .0.cmp(&right.0 .0));
 
     let mut prepared = Vec::with_capacity(entries.len());
     for (file_id, source) in entries {
-        let blob_key = kin_blobs::Hash256(*source.hash.as_bytes());
+        let blob_key = kin_blobs::Hash256(*source.blob_hash.as_bytes());
         let content = blob_store.read(&blob_key).map_err(|error| {
             anyhow::anyhow!("failed to read blob for '{}': {}", file_id.0, error)
         })?;
@@ -179,22 +176,8 @@ fn load_and_validate_checkout_entries<'a>(
 fn resolve_exact_checkout_tree(
     graph: &kin_db::InMemoryGraph,
     target_head: &SemanticChangeId,
-) -> Result<HashMap<FilePathId, ResolvedSourceEntry>> {
-    match graph.resolve_source_tree_at(target_head)? {
-        SourceTreeResolution::Exact { entries } => Ok(entries),
-        SourceTreeResolution::Incomplete { gaps } => {
-            let gaps = gaps
-                .iter()
-                .map(|gap| format!("{}@{}:{:?}", gap.file_id, gap.change_id, gap.reason))
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(anyhow::anyhow!(
-                "checkout requires exact source history at {}, but found unresolved gaps: {}",
-                target_head,
-                gaps
-            ))
-        }
-    }
+) -> Result<HashMap<FilePathId, TreeEntry>> {
+    Ok(graph.resolve_tree_at(target_head)?)
 }
 
 fn should_skip_checkout_clean(rel: &std::path::Path) -> bool {

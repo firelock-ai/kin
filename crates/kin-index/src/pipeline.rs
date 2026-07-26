@@ -559,10 +559,14 @@ impl IndexPipeline {
     }
 
     /// Resolve cross-file relations given parse data from all files.
-    pub fn resolve_cross_file(&self, files: &[crate::linker::FileParseData]) -> Vec<Relation> {
+    pub fn resolve_cross_file(
+        &self,
+        files: &[crate::linker::FileParseData],
+        artifact_ids: &crate::linker::ArtifactIdentityMap,
+    ) -> Result<Vec<Relation>> {
         let _span =
             tracing::info_span!("kin.index.resolve_cross_file", files = files.len()).entered();
-        crate::linker::link_cross_file(files)
+        crate::linker::link_cross_file(files, artifact_ids)
     }
 
     /// Get the adapter registry for direct access.

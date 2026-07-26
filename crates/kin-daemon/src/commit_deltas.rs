@@ -3,7 +3,7 @@
 
 //! Reconstructive commit-delta computation for `command_commit`.
 //!
-//! Computes entity / relation / artifact deltas by diffing current graph
+//! Computes entity, relation, and exact tree deltas by diffing current graph
 //! state against the last-committed change-DAG node.  This approach is
 //! robust regardless of when the reconcile loop drained the working-copy
 //! overlay — the overlay is never consulted here.
@@ -16,7 +16,7 @@
 //! 2. Read current state from the live graph (`list_all_entities`,
 //!    `get_all_relations_for_entity`) and scan working-directory files.
 //! 3. Diff current vs committed to produce typed `EntityDelta`,
-//!    `RelationDelta`, and `ArtifactDelta` slices.
+//!    `RelationDelta`, and `TreeDelta` slices.
 //!
 //! Because `apply_overlay_to_graph` folds reconcile mutations into the
 //! primary graph before clearing the overlay, `graph.list_all_entities()`
@@ -27,9 +27,8 @@ use std::collections::{HashMap, HashSet};
 
 use kin_db::InMemoryGraph;
 use kin_model::{
-    relation::GraphNodeId, ArtifactDelta, ArtifactDeltaKind, ChangeStore, Entity, EntityDelta,
-    EntityId, EntityStore, FilePathId, Hash256, RelationDelta, RelationId, SemanticChangeId,
-    SourceEntryKind,
+    relation::GraphNodeId, ChangeStore, Entity, EntityDelta, EntityId, EntityStore, FilePathId,
+    Hash256, RelationDelta, RelationId, SemanticChangeId, TreeDelta, TreeEntry, TreeEntryKind,
 };
 
 use crate::error::{DaemonError, Result};
@@ -38,31 +37,7 @@ use crate::error::{DaemonError, Result};
 pub struct CommitDeltas {
     pub entity_deltas: Vec<EntityDelta>,
     pub relation_deltas: Vec<RelationDelta>,
-    pub artifact_deltas: Vec<ArtifactDelta>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct CommittedSourceEntry {
-    hash: Hash256,
-    /// `None` identifies pre-0.3 mode-unknown history. An unchanged working
-    /// entry then emits an exact modification to backfill its mode.
-    kind: Option<SourceEntryKind>,
-}
-
-fn added_artifact_kind(kind: SourceEntryKind) -> ArtifactDeltaKind {
-    match kind {
-        SourceEntryKind::File { executable: false } => ArtifactDeltaKind::AddedRegularFile,
-        SourceEntryKind::File { executable: true } => ArtifactDeltaKind::AddedExecutableFile,
-        SourceEntryKind::Symlink => ArtifactDeltaKind::AddedSymlink,
-    }
-}
-
-fn modified_artifact_kind(kind: SourceEntryKind) -> ArtifactDeltaKind {
-    match kind {
-        SourceEntryKind::File { executable: false } => ArtifactDeltaKind::ModifiedRegularFile,
-        SourceEntryKind::File { executable: true } => ArtifactDeltaKind::ModifiedExecutableFile,
-        SourceEntryKind::Symlink => ArtifactDeltaKind::ModifiedSymlink,
-    }
+    pub tree_deltas: Vec<TreeDelta>,
 }
 
 /// Compute commit deltas by diffing current graph state against the
@@ -84,8 +59,9 @@ pub fn compute_deltas_vs_last_commit(
 
     // entity_id → Entity (state at last commit)
     let mut committed_entities: HashMap<EntityId, Entity> = HashMap::new();
-    // file_id → content hash + exact source kind (state at last commit)
-    let mut committed_files: HashMap<FilePathId, CommittedSourceEntry> = HashMap::new();
+    let committed_tree = graph
+        .resolve_tree_at(branch_head)
+        .map_err(DaemonError::Graph)?;
     // relation IDs present at last commit
     let mut committed_relation_ids: HashSet<RelationId> = HashSet::new();
 
@@ -101,19 +77,6 @@ pub fn compute_deltas_vs_last_commit(
                 EntityDelta::Removed(id) => {
                     committed_entities.remove(id);
                 }
-            }
-        }
-        for delta in &change.artifact_deltas {
-            if delta.kind.is_removed() {
-                committed_files.remove(&delta.file_id);
-            } else if let Some(hash) = delta.new_hash {
-                committed_files.insert(
-                    delta.file_id.clone(),
-                    CommittedSourceEntry {
-                        hash,
-                        kind: delta.kind.source_entry_kind(),
-                    },
-                );
             }
         }
         for delta in &change.relation_deltas {
@@ -186,26 +149,24 @@ pub fn compute_deltas_vs_last_commit(
         }
     }
 
-    // ── Artifact deltas (file content hashes) ────────────────────────────
-    let artifact_deltas = compute_artifact_deltas(layout, blobs, committed_files)?;
+    // ── Exact repository-tree deltas ─────────────────────────────────────
+    let tree_deltas = compute_tree_deltas(layout, blobs, committed_tree)?;
 
     Ok(CommitDeltas {
         entity_deltas,
         relation_deltas,
-        artifact_deltas,
+        tree_deltas,
     })
 }
 
-/// Compare working-directory source entries against the committed tree,
-/// producing mode-faithful artifact deltas. A mode-only change and an exact
-/// backfill over legacy mode-unknown history both produce a modification.
-fn compute_artifact_deltas(
+/// Compare working-directory entries against the committed exact tree.
+fn compute_tree_deltas(
     layout: &kin_core::KinLayout,
     blobs: &kin_blobs::BlobStore,
-    committed_files: HashMap<FilePathId, CommittedSourceEntry>,
-) -> Result<Vec<ArtifactDelta>> {
+    committed_tree: HashMap<FilePathId, TreeEntry>,
+) -> Result<Vec<TreeDelta>> {
     let source_root = kin_core::source_dir(layout);
-    let mut artifact_deltas = Vec::new();
+    let mut tree_deltas = Vec::new();
     let mut current_file_ids: HashSet<FilePathId> = HashSet::new();
 
     for abs_path in collect_tracked_files(&source_root)? {
@@ -228,18 +189,16 @@ fn compute_artifact_deltas(
         current_file_ids.insert(file_id.clone());
 
         let metadata = std::fs::symlink_metadata(&abs_path).map_err(DaemonError::Io)?;
-        let (content, source_kind) = if metadata.file_type().is_symlink() {
+        let (content, entry_kind) = if metadata.file_type().is_symlink() {
             let target = std::fs::read_link(&abs_path).map_err(DaemonError::Io)?;
-            let target = target.to_str().ok_or_else(|| {
-                DaemonError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "symbolic link target is not valid UTF-8: {}",
-                        abs_path.display()
-                    ),
-                ))
-            })?;
-            (target.as_bytes().to_vec(), SourceEntryKind::Symlink)
+            #[cfg(unix)]
+            let target = {
+                use std::os::unix::ffi::OsStrExt;
+                target.as_os_str().as_bytes().to_vec()
+            };
+            #[cfg(not(unix))]
+            let target = target.to_string_lossy().as_bytes().to_vec();
+            (target, TreeEntryKind::Symlink)
         } else if metadata.is_file() {
             #[cfg(unix)]
             let executable = {
@@ -250,7 +209,7 @@ fn compute_artifact_deltas(
             let executable = false;
             (
                 std::fs::read(&abs_path).map_err(DaemonError::Io)?,
-                SourceEntryKind::File { executable },
+                TreeEntryKind::Regular { executable },
             )
         } else {
             continue;
@@ -259,25 +218,20 @@ fn compute_artifact_deltas(
         // A graph delta must never name bytes that failed to enter the local
         // object store: the backend persistence path relies on this object.
         let blob_digest = blobs.write(&content).map_err(DaemonError::from)?;
-        let new_hash = Hash256::from_bytes(blob_digest.0);
+        let new_entry = TreeEntry {
+            blob_hash: Hash256::from_bytes(blob_digest.0),
+            kind: entry_kind,
+        };
 
-        match committed_files.get(&file_id).copied() {
+        match committed_tree.get(&file_id).copied() {
             None => {
-                artifact_deltas.push(ArtifactDelta {
-                    file_id,
-                    kind: added_artifact_kind(source_kind),
-                    old_hash: None,
-                    new_hash: Some(new_hash),
-                });
+                tree_deltas.push(TreeDelta::Added { file_id, new_entry });
             }
-            Some(committed)
-                if committed.hash != new_hash || committed.kind != Some(source_kind) =>
-            {
-                artifact_deltas.push(ArtifactDelta {
+            Some(old_entry) if old_entry != new_entry => {
+                tree_deltas.push(TreeDelta::Modified {
                     file_id,
-                    kind: modified_artifact_kind(source_kind),
-                    old_hash: Some(committed.hash),
-                    new_hash: Some(new_hash),
+                    old_entry,
+                    new_entry,
                 });
             }
             _ => {} // Unchanged
@@ -285,18 +239,16 @@ fn compute_artifact_deltas(
     }
 
     // Files in committed tree but missing from working directory → Removed
-    for (file_id, committed) in &committed_files {
+    for (file_id, old_entry) in &committed_tree {
         if !current_file_ids.contains(file_id) {
-            artifact_deltas.push(ArtifactDelta {
+            tree_deltas.push(TreeDelta::Removed {
                 file_id: file_id.clone(),
-                kind: ArtifactDeltaKind::Removed,
-                old_hash: Some(committed.hash),
-                new_hash: None,
+                old_entry: *old_entry,
             });
         }
     }
 
-    Ok(artifact_deltas)
+    Ok(tree_deltas)
 }
 
 /// Recursively collect all tracked (non-skip) files under `root`.
