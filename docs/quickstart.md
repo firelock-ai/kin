@@ -6,7 +6,8 @@ Windows (via WSL2):
 1. **Install** the binaries with the one-line installer.
 2. **`kin setup`** — answer a couple of questions; the guided wizard configures your
    shell, PATH, daemon, and AI clients.
-3. **`kin init`** + **`kin embed`** — build the semantic graph and the vector index.
+3. **`kin init`** — atomically admit repository authority; semantic enrichment
+   and embeddings are separate graph-native stages.
 4. **Verify** with `kin setup status` and read the health checklist.
 
 Manual / per-tool configuration is available in the
@@ -123,14 +124,14 @@ Start a brand-new Kin-native repository:
 
 ```sh
 mkdir my-app
-kin init my-app --git-history off
+kin init my-app
 cd my-app
 ```
 
-In a directory with no `.git/`, `kin init` creates the native `.kin/` graph store and a
-managed `AGENTS.md` before the first snapshot. Agents that open the folder immediately see
-the Kin-native workflow: graph tools first, session workspaces for execution, `kin commit`
-for graph history, and `kin git export` only as an interoperability escape hatch.
+In an empty directory with no `.git/`, `kin init` creates an unborn native
+repository-v6 authority with an empty exact workspace and no synthetic commit.
+It refuses a non-empty non-Git directory rather than silently treating
+filesystem contents as graph truth.
 
 Convert an existing Git repository or folder:
 
@@ -142,24 +143,21 @@ kin init
 kin init path/to/project
 ```
 
-In a detected Git repository, `kin init` imports the exact current tree into
-graph-owned truth by default. Git stays in place as an explicit interoperability
-boundary; Kin runtime queries do not fall back to it.
+In a clean detected Git repository, `kin init` imports complete reachable
+history, refs, raw objects, the exact workspace tree, and admission policy into
+graph-owned authority. Git stays in place as an explicit interoperability
+boundary; Kin runtime queries do not fall back to it. Repositories with remotes
+currently fail closed until exact Kin remote mapping is available.
 
 *Flags:*
-- `--git-history <off|snapshot|full>`: the Git import boundary
-  (default: `snapshot`, one exact HEAD tree with no ancestry claim; `full`
-  imports complete reachable ancestry and exact parent edges).
-- `--force`: initialize even if a `.git/` directory is already present.
-- `--no-lsp`: skip LSP enrichment (faster, tree-sitter-only init).
+- `--json`: report the exact committed repository/workspace authority result.
 
 ---
 
 ## 4. Add embeddings for semantic search
 
-`kin init` builds the graph instantly **without** embeddings. To enable semantic
-(vector) search, `kin locate`, and the MCP `semantic_locate` tool, build the vector
-index:
+Repository admission does not run semantic enrichment. Once graph-native
+semantic entities exist, build their vector index with:
 
 ```sh
 kin embed

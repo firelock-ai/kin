@@ -156,7 +156,8 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
         "Pull over a git-export remote ('{remote}') is not yet enabled in this build.\n\
          Inbound Git re-import would rewrite local graph snapshots outside the daemon, so it is coming in a later alpha.\n\
          For a working pull today, configure a native Kin remote: `kin remote add {remote} --transport native-kin --url <url> --default`.\n\
-         To bring in external Git history offline, use `kin init --git-history ...` or `kin migrate`.",
+         To admit an external Git checkout, run `kin init` from that clean checkout; Kin imports \
+         its complete reachable history or fails closed.",
         remote = remote.name
     );
 }

@@ -1,12 +1,15 @@
 # Language Support
 
-Kin classifies every file at ingest and extracts as much semantic structure as
-the language's adapter provides. This page states exactly what each language
-gets today — no tier is implied beyond what the extraction actually emits.
+Kin preserves every admitted file in exact repository authority regardless of
+language. A separate graph-native enrichment stage classifies supported content
+and extracts as much semantic structure as the language's adapter provides.
+This page states exactly what each language gets from that enrichment — no tier
+is implied beyond what the extraction actually emits.
 
 ## How classification works
 
-Whole-repo ingest (`kin init`) routes each file into one of four tiers:
+Graph-native semantic enrichment routes each admitted file into one of four
+tiers:
 
 | Tier | What the graph stores |
 | --- | --- |
