@@ -10,7 +10,10 @@
 //! - reconstructs imported Git objects from repository CAS without consulting
 //!   drifted working files;
 //! - refuses a working tree that diverges from the current graph ref;
-//! - refuses to flatten a graph-owned gitlink during eject;
+//! - preserves exact graph-owned gitlink pointers without flattening or
+//!   traversing independently owned directory contents;
+//! - keeps host-unrepresentable byte paths in exact graph/Git history without
+//!   inventing a lossy working-copy alias;
 //! - keeps metadata recoverable outside the repository by default; and
 //! - has no legacy initialization-snapshot restore surface.
 
@@ -42,6 +45,22 @@ fn git(dir: &Path, args: &[&str]) -> Output {
     assert!(
         output.status.success(),
         "git {args:?} failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+#[cfg(target_os = "macos")]
+fn git_os(dir: &Path, args: &[OsString]) -> Output {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("run byte-exact git command");
+    assert!(
+        output.status.success(),
+        "git byte arguments failed: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -495,7 +514,7 @@ fn exact_git_repo_ejects_without_language_support() {
 }
 
 #[test]
-fn eject_refuses_gitlinks_before_replacing_git_or_detaching_kin() {
+fn eject_preserves_gitlink_pointer_and_independently_owned_directory() {
     let root = tempdir().unwrap();
     let repo = root.path().join("repo");
     let dependency = repo.join("vendor/dependency");
@@ -520,6 +539,17 @@ fn eject_refuses_gitlinks_before_replacing_git_or_detaching_kin() {
     let head_before = git_head(&repo);
 
     run_kin_ok(&repo, &registry, &["init", "."]);
+    fs::create_dir(dependency.join("nested")).unwrap();
+    fs::write(
+        dependency.join("owned.txt"),
+        b"independent submodule bytes\n",
+    )
+    .unwrap();
+    fs::write(
+        dependency.join("nested/config"),
+        b"not part of the parent repository\n",
+    )
+    .unwrap();
     run_kin_ok(
         &repo,
         &registry,
@@ -546,12 +576,124 @@ fn eject_refuses_gitlinks_before_replacing_git_or_detaching_kin() {
         "bare Git export must preserve the exact gitlink pointer"
     );
 
-    let output = run_kin(&repo, &registry, &["eject", "--yes"]);
-    assert_refused(&output, "gitlink");
-    assert!(repo.join(".kin").is_dir());
+    run_kin_ok(&repo, &registry, &["eject", "--yes"]);
+
+    assert!(!repo.join(".kin").exists());
+    let installed_git = fs::symlink_metadata(repo.join(".git")).unwrap();
+    assert!(
+        installed_git.is_dir() && !installed_git.file_type().is_symlink(),
+        "eject must install a real ordinary Git directory"
+    );
+    assert_eq!(git_head(&repo), head_before);
+    let installed_tree = git(&repo, &["ls-tree", "HEAD", "vendor/dependency"]);
+    assert_eq!(
+        String::from_utf8(installed_tree.stdout).unwrap(),
+        format!("160000 commit {dependency_target}\tvendor/dependency\n"),
+        "installed Git must retain the exact graph-owned gitlink pointer"
+    );
+    assert_eq!(
+        fs::read(dependency.join("owned.txt")).unwrap(),
+        b"independent submodule bytes\n"
+    );
+    assert_eq!(
+        fs::read(dependency.join("nested/config")).unwrap(),
+        b"not part of the parent repository\n"
+    );
+    let archives = metadata_archives(&repo);
+    assert_eq!(archives.len(), 1);
+    assert!(archives[0].join("kin").is_dir());
+    assert!(archives[0].join("previous-git").is_dir());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn eject_preserves_host_unrepresentable_byte_path_in_exact_git_history() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let root = tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let exported = root.path().join("export.git");
+    let registry = root.path().join("registry.toml");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "kin@example.invalid"]);
+    git(&repo, &["config", "user.name", "Kin Test"]);
+    fs::write(repo.join("README.md"), b"materialized source\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+
+    fs::write(repo.join("raw-body.tmp"), b"graph-only source bytes\n").unwrap();
+    let blob_oid = String::from_utf8(git(&repo, &["hash-object", "-w", "raw-body.tmp"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    fs::remove_file(repo.join("raw-body.tmp")).unwrap();
+    let raw_path = b"opaque-\xff.bin";
+    let mut cache_info = format!("100644,{blob_oid},").into_bytes();
+    cache_info.extend_from_slice(raw_path);
+    git_os(
+        &repo,
+        &[
+            OsString::from("update-index"),
+            OsString::from("--add"),
+            OsString::from("--cacheinfo"),
+            OsString::from_vec(cache_info),
+        ],
+    );
+    git(
+        &repo,
+        &["commit", "-q", "-m", "host-unrepresentable exact path"],
+    );
+    let head_before = git_head(&repo);
+
+    let mut expected_entry = format!("100644 blob {blob_oid}\t").into_bytes();
+    expected_entry.extend_from_slice(raw_path);
+    let exact_tree_contains_path = |listing: &[u8]| {
+        listing
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == expected_entry)
+    };
+
+    run_kin_ok(&repo, &registry, &["init", "."]);
+    run_kin_ok(
+        &repo,
+        &registry,
+        &[
+            "git",
+            "export",
+            "--output",
+            exported.to_str().expect("UTF-8 temp path"),
+        ],
+    );
+    let exported_tree = git(
+        root.path(),
+        &[
+            "--git-dir",
+            exported.to_str().expect("UTF-8 temp path"),
+            "ls-tree",
+            "-rz",
+            "HEAD",
+        ],
+    );
+    assert!(
+        exact_tree_contains_path(&exported_tree.stdout),
+        "bare export lost the host-unrepresentable byte-exact path"
+    );
+
+    run_kin_ok(&repo, &registry, &["eject", "--yes"]);
+
+    assert!(!repo.join(".kin").exists());
     assert!(repo.join(".git").is_dir());
     assert_eq!(git_head(&repo), head_before);
-    assert!(metadata_archives(&repo).is_empty());
+    let installed_tree = git(&repo, &["ls-tree", "-rz", "HEAD"]);
+    assert!(
+        exact_tree_contains_path(&installed_tree.stdout),
+        "installed ordinary Git lost the host-unrepresentable byte-exact path"
+    );
+    git(&repo, &["fsck", "--strict"]);
+    let archives = metadata_archives(&repo);
+    assert_eq!(archives.len(), 1);
+    assert!(archives[0].join("kin").is_dir());
+    assert!(archives[0].join("previous-git").is_dir());
 }
 
 #[test]
