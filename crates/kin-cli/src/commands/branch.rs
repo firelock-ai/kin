@@ -528,7 +528,6 @@ fn ref_transaction(
         default_ref_mutation: None,
         workspace_mutation: None,
         local_overlay_delta: None,
-        admission_scan_token: None,
     }
 }
 

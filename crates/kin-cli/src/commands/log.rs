@@ -91,7 +91,7 @@ pub fn inspect(layout: &kin_core::KinLayout, count: usize) -> Result<LogReport> 
     let start_target = workspace.base_target.clone();
     let start_change = start_target
         .as_ref()
-        .map(|target| authority.resolve_target_in_state(&lease, target))
+        .map(|target| lease.resolve_target_change_id(target))
         .transpose()
         .context("resolve active repository-v6 workspace history")?;
 
