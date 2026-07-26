@@ -479,10 +479,58 @@ pub enum ChangeType {
 /// Request sent from the reconcile loop to the LSP enrichment worker.
 #[derive(Debug)]
 pub struct LspEnrichmentRequest {
-    /// Path to the changed file.
-    pub file_path: std::path::PathBuf,
+    /// Graph-owned repository path of the changed file. The LSP worker may
+    /// derive a compatibility URI from this identity, but must load didOpen
+    /// bytes from repository authority rather than the working filesystem.
+    pub file_id: FilePathId,
     /// Entity IDs that were added or modified — only these get queried via LSP.
     pub changed_entity_ids: Vec<kin_model::EntityId>,
+}
+
+/// Reusable graph/CAS source view for daemon-side enrichment.
+///
+/// The repository manager is opened once per worker rather than once per file.
+/// Source bodies are immutable and addressed by the live graph entry hash, so
+/// later workspace admissions remain visible through the same backend without
+/// trusting a stale metadata snapshot.
+pub(crate) struct GraphOwnedSourceView {
+    graph: Arc<kin_db::InMemoryGraph>,
+    authority: RepositoryAuthorityManager<LocalFileBackend>,
+}
+
+impl GraphOwnedSourceView {
+    pub(crate) fn load_text(&self, file_id: &FilePathId) -> Result<String> {
+        let path = RepoPath::from_utf8(file_id.0.clone()).map_err(|error| {
+            exact_source_storage_error(format!(
+                "LSP source path {file_id} is not an exact repository path: {error}"
+            ))
+        })?;
+        let entry = self
+            .graph
+            .get_tree_entry(file_id)
+            .map_err(DaemonError::from)?
+            .ok_or_else(|| {
+                exact_source_storage_error(format!(
+                    "LSP source path {file_id} has no graph-owned tree entry"
+                ))
+            })?;
+        let TreeEntry::Blob { hash, .. } = entry else {
+            return Err(exact_source_storage_error(format!(
+                "LSP source path {file_id} is not a source blob"
+            )));
+        };
+        let data = self.authority.load_source_blob(hash)?.ok_or_else(|| {
+            exact_source_storage_error(format!(
+                "graph-owned LSP source {file_id} references body {hash} absent from repository authority"
+            ))
+        })?;
+        validate_exact_source_bytes(&path, entry, hash, &data, "repository")?;
+        String::from_utf8(data).map_err(|error| {
+            exact_source_storage_error(format!(
+                "graph-owned LSP source {file_id} at {hash} is not UTF-8: {error}"
+            ))
+        })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -3018,6 +3066,34 @@ impl DaemonState {
         self.preflight_materializable_source_entries(entries, "incoming exact")
     }
 
+    /// Open a reusable UTF-8 source view for graph-backed LSP enrichment.
+    ///
+    /// The live graph selects the exact tree entry; repository-v6 immutable CAS
+    /// supplies and verifies its bytes. The working filesystem and the derived
+    /// ingestion CAS are never consulted, so a checkout drift or cache loss
+    /// cannot silently become semantic-relation authority.
+    pub(crate) fn graph_owned_source_view(&self) -> Result<GraphOwnedSourceView> {
+        if self.storage_backend.is_some() {
+            return Err(exact_source_storage_error(
+                "local LSP source reads require repository-v6 workspace authority",
+            ));
+        }
+        let repository_id = RepositoryId::new(self.cached_repo_id.clone()).map_err(|error| {
+            exact_source_storage_error(format!(
+                "invalid daemon repository identity for LSP source: {error}"
+            ))
+        })?;
+        let authority = RepositoryAuthorityManager::open(
+            repository_id,
+            Arc::new(LocalFileBackend::new(self.layout.kindb_dir())),
+        )
+        .map_err(DaemonError::from)?;
+        Ok(GraphOwnedSourceView {
+            graph: Arc::clone(&self.graph),
+            authority,
+        })
+    }
+
     fn preflight_materializable_source_entries(
         &self,
         entries: ResolvedTree,
@@ -5219,6 +5295,48 @@ mod tests {
             let target_hash = symlink_artifact.entry.blob_identity().unwrap();
             assert_eq!(state.blobs.read(&target_hash).unwrap(), b"compose.yaml");
         }
+    }
+
+    #[test]
+    fn lsp_source_text_uses_graph_and_repository_cas_not_checkout_or_ingest_cache() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let blobs = BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let authority_bytes = b"pub fn authority_owned() {}\n";
+        let hash = Hash256::from_bytes(blobs.write(authority_bytes).unwrap().0);
+        let desired = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+            ArtifactId::new(),
+            RepoPath::from_utf8("src/lib.rs").unwrap(),
+            TreeEntry::blob(hash, false),
+        )])
+        .unwrap();
+        crate::repository_commit::publish_workspace_tree(
+            &init.layout,
+            &blobs,
+            &desired,
+            kin_model::OperationId::new(),
+            kin_model::AuthorId::new("lsp-authority-test"),
+        )
+        .unwrap()
+        .expect("exact source admission must advance authority");
+
+        let state = DaemonState::open(init.layout).unwrap();
+        std::fs::create_dir_all(repo_dir.path().join("src")).unwrap();
+        std::fs::write(
+            repo_dir.path().join("src/lib.rs"),
+            b"pub fn unadmitted_checkout_drift() {}\n",
+        )
+        .unwrap();
+        std::fs::remove_file(local_object_path(&state.layout, hash)).unwrap();
+
+        assert_eq!(
+            state
+                .graph_owned_source_view()
+                .unwrap()
+                .load_text(&FilePathId::new("src/lib.rs"))
+                .unwrap(),
+            std::str::from_utf8(authority_bytes).unwrap()
+        );
     }
 
     #[test]

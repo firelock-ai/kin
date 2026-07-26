@@ -885,7 +885,7 @@ pub async fn run_loop(
         let mut graph_changed = false;
         let mut projection_changed = ProjectionChangedSet::default();
 
-        let mut lsp_changed: Vec<(PathBuf, Vec<kin_model::EntityId>)> = Vec::new();
+        let mut lsp_changed: Vec<(kin_model::FilePathId, Vec<kin_model::EntityId>)> = Vec::new();
         let graph_mutation = state.begin_graph_authority_mutation();
 
         // One complete observation produces one exact tree transaction. This
@@ -1199,6 +1199,7 @@ pub async fn run_loop(
                     }
 
                     if let ReconcileOutcome::Updated {
+                        file_id,
                         added,
                         modified,
                         removed,
@@ -1252,7 +1253,7 @@ pub async fn run_loop(
                             "reconcile entity counts for LSP enrichment"
                         );
                         if !changed_ids.is_empty() {
-                            lsp_changed.push((path.clone(), changed_ids));
+                            lsp_changed.push((file_id.clone(), changed_ids));
                         }
                     } else if let ReconcileOutcome::FileRemoved {
                         removed, file_id, ..
@@ -1318,9 +1319,9 @@ pub async fn run_loop(
         drop(coordination);
 
         // Queue only changed entities for LSP enrichment.
-        for (path, entity_ids) in lsp_changed {
+        for (file_id, entity_ids) in lsp_changed {
             state.queue_lsp_enrichment(LspEnrichmentRequest {
-                file_path: path,
+                file_id,
                 changed_entity_ids: entity_ids,
             });
         }
