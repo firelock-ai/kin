@@ -3358,7 +3358,7 @@ impl DaemonState {
             )));
         }
         let embedder_identity = kin_buildinfo::sha_with_dirty(kin_buildinfo::get());
-        kin_db::SnapshotManager::save_vector_index_for_graph(
+        kin_db::SnapshotManager::checkpoint_vector_index_for_graph(
             self.layout.kindb_snapshot_path(),
             self.graph.as_ref(),
             Some(embedder_identity.as_str()),
