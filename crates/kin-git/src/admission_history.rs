@@ -76,6 +76,39 @@ impl AdmittedSemanticGitImportPlan {
             head: self.head.clone(),
         };
         let semantic = plan_semantic_git_import(&snapshot, blob_store)?;
+        let mut by_oid = BTreeMap::new();
+        for change in &self.changes {
+            let ChangeOrigin::GitCommit { oid } = change.origin else {
+                return Err(GitError::InvalidSnapshot(
+                    "admitted semantic Git import contains a native-origin change".to_string(),
+                ));
+            };
+            if by_oid.insert(oid, change).is_some() {
+                return Err(GitError::InvalidSnapshot(format!(
+                    "admitted semantic Git import repeats commit {oid}"
+                )));
+            }
+        }
+        let deltas = semantic
+            .changes
+            .iter()
+            .map(|base_change| {
+                let ChangeOrigin::GitCommit { oid } = base_change.origin else {
+                    unreachable!("the exact Git planner only emits Git-origin changes");
+                };
+                let admitted = by_oid.get(&oid).ok_or_else(|| {
+                    GitError::InvalidSnapshot(format!(
+                        "admitted semantic Git import is missing commit {oid}"
+                    ))
+                })?;
+                Ok((
+                    base_change.id,
+                    admitted.entity_deltas.clone(),
+                    admitted.relation_deltas.clone(),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let semantic = semantic.with_historical_semantics(blob_store, &deltas)?;
         let rebuilt = build_admitted_semantic_git_import_plan(&semantic, blob_store)?;
         if rebuilt != *self {
             return Err(GitError::InvalidSnapshot(

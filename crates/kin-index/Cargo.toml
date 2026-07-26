@@ -23,6 +23,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+uuid = { workspace = true }
 tokio = { workspace = true }
 rustix = { workspace = true }
 gix-ignore = { workspace = true }
@@ -30,6 +31,7 @@ bstr = { workspace = true }
 
 [dev-dependencies]
 kin-spine = { workspace = true }
+kin-git = { workspace = true }
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
 serde_json = { workspace = true }
