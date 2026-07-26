@@ -2314,18 +2314,18 @@ mod tests {
     }
 
     fn change_with_deltas(
-        id: SemanticChangeId,
+        fixture_id: SemanticChangeId,
         parents: Vec<SemanticChangeId>,
         entity_deltas: Vec<EntityDelta>,
         relation_deltas: Vec<RelationDelta>,
         tree_deltas: Vec<TreeDelta>,
     ) -> SemanticChange {
-        SemanticChange {
-            id,
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
             parents,
             timestamp: Timestamp::now(),
             author: AuthorId::new("test-author"),
-            message: "test change".into(),
+            message: format!("test change {fixture_id}"),
             entity_deltas,
             relation_deltas,
             tree_deltas,
@@ -2333,8 +2333,11 @@ mod tests {
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
-        }
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        };
+        change.id = kin_model::compute_semantic_change_id(&change).unwrap();
+        change
     }
 
     fn repo_path(path: &str) -> RepoPath {
@@ -2437,24 +2440,25 @@ mod tests {
         graph.upsert_relation(&calls_rel).unwrap();
         graph.upsert_relation(&tests_rel).unwrap();
 
-        let base_id = change_id(1);
-        let head_id = change_id(2);
         let base = change_with_deltas(
-            base_id,
+            change_id(1),
             vec![],
             vec![
-                EntityDelta::Added(target_v1.clone()),
-                EntityDelta::Added(caller),
-                EntityDelta::Added(test),
+                EntityDelta::Added {
+                    new: target_v1.clone(),
+                },
+                EntityDelta::Added { new: caller },
+                EntityDelta::Added { new: test },
             ],
             vec![
-                RelationDelta::Added(calls_rel),
-                RelationDelta::Added(tests_rel),
+                RelationDelta::Added { new: calls_rel },
+                RelationDelta::Added { new: tests_rel },
             ],
             vec![],
         );
+        let base_id = base.id;
         let head = change_with_deltas(
-            head_id,
+            change_id(2),
             vec![base_id],
             vec![EntityDelta::Modified {
                 old: target_v1,
@@ -2463,6 +2467,7 @@ mod tests {
             vec![],
             vec![],
         );
+        let head_id = head.id;
         graph.create_change(&base).unwrap();
         graph.create_change(&head).unwrap();
 
@@ -2645,26 +2650,29 @@ mod tests {
         // treated as risk: the verdict is an honest pass with gaps attached.
         let graph = InMemoryGraph::new();
         let entity = entity_with_span("helper", "src/lib.rs", 1, EntityRole::Source);
-        graph.upsert_entity(&entity).unwrap();
+        let mut updated_entity = entity.clone();
+        updated_entity.doc_summary = Some("clarified helper documentation".into());
+        graph.upsert_entity(&updated_entity).unwrap();
         let artifact_id = ArtifactId::new();
         let old_entry = TreeEntry::blob(Hash256::from_bytes([7; 32]), false);
         let new_entry = TreeEntry::blob(Hash256::from_bytes([8; 32]), false);
 
-        let base_id = change_id(3);
-        let head_id = change_id(4);
         let base = change_with_deltas(
-            base_id,
+            change_id(3),
             vec![],
-            vec![EntityDelta::Added(entity.clone())],
+            vec![EntityDelta::Added {
+                new: entity.clone(),
+            }],
             vec![],
             vec![tree_add(artifact_id, "config/policy.yaml", old_entry)],
         );
+        let base_id = base.id;
         let head = change_with_deltas(
-            head_id,
+            change_id(4),
             vec![base_id],
             vec![EntityDelta::Modified {
-                old: entity.clone(),
-                new: entity,
+                old: entity,
+                new: updated_entity,
             }],
             vec![],
             vec![tree_update(
@@ -2675,6 +2683,7 @@ mod tests {
                 new_entry,
             )],
         );
+        let head_id = head.id;
         graph.create_change(&base).unwrap();
         graph.create_change(&head).unwrap();
 
@@ -2988,22 +2997,22 @@ mod tests {
     fn converged_range_activity_remains_exact_and_fail_closed() {
         let artifact_id = ArtifactId::new();
         let entry = TreeEntry::blob(Hash256::from_bytes([0x71; 32]), false);
-        let add_id = change_id(0x71);
-        let remove_id = change_id(0x72);
         let add = change_with_deltas(
-            add_id,
+            change_id(0x71),
             vec![],
             vec![],
             vec![],
             vec![tree_add(artifact_id, "scratch.bin", entry)],
         );
+        let add_id = add.id;
         let remove = change_with_deltas(
-            remove_id,
+            change_id(0x72),
             vec![add_id],
             vec![],
             vec![],
             vec![tree_remove(artifact_id, "scratch.bin", entry)],
         );
+        let remove_id = remove.id;
         let activity = collect_artifact_activity(&[remove, add]);
 
         assert_eq!(activity.len(), 2);
@@ -3046,22 +3055,20 @@ mod tests {
         let old_entry = TreeEntry::blob(Hash256::from_bytes([9; 32]), false);
         let new_entry = TreeEntry::blob(Hash256::from_bytes([10; 32]), false);
 
-        let base_id = change_id(6);
-        let head_id = change_id(7);
         let base = change_with_deltas(
-            base_id,
+            change_id(6),
             vec![],
-            vec![EntityDelta::Added(entity.clone())],
+            vec![EntityDelta::Added {
+                new: entity.clone(),
+            }],
             vec![],
             vec![tree_add(artifact_id, "src/legacy.c", old_entry)],
         );
+        let base_id = base.id;
         let head = change_with_deltas(
-            head_id,
+            change_id(7),
             vec![base_id],
-            vec![EntityDelta::Modified {
-                old: entity.clone(),
-                new: entity,
-            }],
+            vec![],
             vec![],
             vec![tree_update(
                 artifact_id,
@@ -3071,6 +3078,7 @@ mod tests {
                 new_entry,
             )],
         );
+        let head_id = head.id;
         graph.create_change(&base).unwrap();
         graph.create_change(&head).unwrap();
 
@@ -3236,13 +3244,15 @@ mod tests {
 
         // Deep range but a NON-empty blast radius: impact was proven, so there is
         // nothing to attribute to a substrate ceiling.
-        let mut nonempty = ImpactReport::default();
-        nonempty.affected_callers = vec![entity_with_span(
-            "consumer",
-            "src/c.rs",
-            1,
-            EntityRole::Source,
-        )];
+        let nonempty = ImpactReport {
+            affected_callers: vec![entity_with_span(
+                "consumer",
+                "src/c.rs",
+                1,
+                EntityRole::Source,
+            )],
+            ..ImpactReport::default()
+        };
         let (gaps, _) = collect_evidence_gaps::<InMemoryGraph>(
             &review_with_impact(nonempty),
             &deep,
@@ -3337,25 +3347,33 @@ mod tests {
         graph.upsert_entity(&consumer).unwrap();
         graph.upsert_relation(&calls_rel).unwrap();
 
-        let base_id = change_id(8);
-        let head_id = change_id(9);
         let base = change_with_deltas(
-            base_id,
+            change_id(8),
             vec![],
             vec![
-                EntityDelta::Added(legacy.clone()),
-                EntityDelta::Added(consumer.clone()),
+                EntityDelta::Added {
+                    new: legacy.clone(),
+                },
+                EntityDelta::Added {
+                    new: consumer.clone(),
+                },
             ],
-            vec![RelationDelta::Added(calls_rel)],
+            vec![RelationDelta::Added {
+                new: calls_rel.clone(),
+            }],
             vec![],
         );
+        let base_id = base.id;
         let head = change_with_deltas(
-            head_id,
+            change_id(9),
             vec![base_id],
-            vec![EntityDelta::Removed(legacy.id)],
-            vec![],
+            vec![EntityDelta::Removed {
+                old: legacy.clone(),
+            }],
+            vec![RelationDelta::Removed { old: calls_rel }],
             vec![],
         );
+        let head_id = head.id;
         graph.create_change(&base).unwrap();
         graph.create_change(&head).unwrap();
 
@@ -3410,22 +3428,31 @@ mod tests {
         };
         let consume_rel = relation(&consumer, &validate, calls_kind);
 
-        let base_id = change_id(20);
-        let head_id = change_id(21);
-        let mut base_entities = vec![EntityDelta::Added(validate.clone())];
+        let mut base_entities = vec![EntityDelta::Added {
+            new: validate.clone(),
+        }];
         let mut base_relations = vec![];
         if include_consumer {
-            base_entities.push(EntityDelta::Added(consumer));
-            base_relations.push(RelationDelta::Added(consume_rel));
+            base_entities.push(EntityDelta::Added { new: consumer });
+            base_relations.push(RelationDelta::Added {
+                new: consume_rel.clone(),
+            });
         }
-        let base = change_with_deltas(base_id, vec![], base_entities, base_relations, vec![]);
+        let base = change_with_deltas(change_id(20), vec![], base_entities, base_relations, vec![]);
+        let base_id = base.id;
         let head = change_with_deltas(
-            head_id,
+            change_id(21),
             vec![base_id],
-            vec![EntityDelta::Removed(validate.id)],
-            vec![],
+            vec![EntityDelta::Removed {
+                old: validate.clone(),
+            }],
+            include_consumer
+                .then_some(RelationDelta::Removed { old: consume_rel })
+                .into_iter()
+                .collect(),
             vec![],
         );
+        let head_id = head.id;
         graph.create_change(&base).unwrap();
         graph.create_change(&head).unwrap();
         (graph, base_id, head_id)
@@ -3520,28 +3547,34 @@ mod tests {
             entity_with_span("run_from_argv", "src/runserver.rs", 111, EntityRole::Source);
         let calls_rel = relation(&consumer, &validate_old, RelationKind::Calls);
 
-        let base_id = change_id(22);
-        let head_id = change_id(23);
         let base = change_with_deltas(
-            base_id,
+            change_id(22),
             vec![],
             vec![
-                EntityDelta::Added(validate_old.clone()),
-                EntityDelta::Added(consumer),
+                EntityDelta::Added {
+                    new: validate_old.clone(),
+                },
+                EntityDelta::Added { new: consumer },
             ],
-            vec![RelationDelta::Added(calls_rel)],
+            vec![RelationDelta::Added {
+                new: calls_rel.clone(),
+            }],
             vec![],
         );
+        let base_id = base.id;
         let head = change_with_deltas(
-            head_id,
+            change_id(23),
             vec![base_id],
             vec![
-                EntityDelta::Removed(validate_old.id),
-                EntityDelta::Added(validate_new),
+                EntityDelta::Removed {
+                    old: validate_old.clone(),
+                },
+                EntityDelta::Added { new: validate_new },
             ],
-            vec![],
+            vec![RelationDelta::Removed { old: calls_rel }],
             vec![],
         );
+        let head_id = head.id;
         graph.create_change(&base).unwrap();
         graph.create_change(&head).unwrap();
 
@@ -3781,24 +3814,25 @@ mod tests {
             .upsert_relation(&relation(&live_only, &target_v2, RelationKind::Calls))
             .unwrap();
 
-        let base_id = change_id(0x21);
-        let head_id = change_id(0x22);
         let base = change_with_deltas(
-            base_id,
+            change_id(0x21),
             vec![],
             vec![
-                EntityDelta::Added(target_v1.clone()),
-                EntityDelta::Added(caller.clone()),
+                EntityDelta::Added {
+                    new: target_v1.clone(),
+                },
+                EntityDelta::Added {
+                    new: caller.clone(),
+                },
             ],
-            vec![RelationDelta::Added(relation(
-                &caller,
-                &target_v1,
-                RelationKind::Calls,
-            ))],
+            vec![RelationDelta::Added {
+                new: relation(&caller, &target_v1, RelationKind::Calls),
+            }],
             vec![],
         );
+        let base_id = base.id;
         let head = change_with_deltas(
-            head_id,
+            change_id(0x22),
             vec![base_id],
             vec![EntityDelta::Modified {
                 old: target_v1,
@@ -3807,6 +3841,7 @@ mod tests {
             vec![],
             vec![],
         );
+        let head_id = head.id;
         graph.create_change(&base).unwrap();
         graph.create_change(&head).unwrap();
 
@@ -3852,17 +3887,18 @@ mod tests {
         // base's parent was never imported, so the state at head cannot be
         // replayed even though the base..head rows themselves exist.
         let ghost_parent = change_id(0x31);
-        let base_id = change_id(0x32);
-        let head_id = change_id(0x33);
         let base = change_with_deltas(
-            base_id,
+            change_id(0x32),
             vec![ghost_parent],
-            vec![EntityDelta::Added(target_v1.clone())],
+            vec![EntityDelta::Added {
+                new: target_v1.clone(),
+            }],
             vec![],
             vec![],
         );
+        let base_id = base.id;
         let head = change_with_deltas(
-            head_id,
+            change_id(0x33),
             vec![base_id],
             vec![EntityDelta::Modified {
                 old: target_v1,
@@ -3871,6 +3907,7 @@ mod tests {
             vec![],
             vec![],
         );
+        let head_id = head.id;
         graph.create_change(&base).unwrap();
         graph.create_change(&head).unwrap();
 
@@ -3910,17 +3947,18 @@ mod tests {
         let stray = entity_with_span("stray_entity", "src/stray.rs", 9, EntityRole::Source);
 
         // Main line: root -> head, fully materializable.
-        let root_id = change_id(0x41);
-        let head_id = change_id(0x42);
         let root = change_with_deltas(
-            root_id,
+            change_id(0x41),
             vec![],
-            vec![EntityDelta::Added(target_v1.clone())],
+            vec![EntityDelta::Added {
+                new: target_v1.clone(),
+            }],
             vec![],
             vec![],
         );
+        let root_id = root.id;
         let head = change_with_deltas(
-            head_id,
+            change_id(0x42),
             vec![root_id],
             vec![EntityDelta::Modified {
                 old: target_v1,
@@ -3929,15 +3967,16 @@ mod tests {
             vec![],
             vec![],
         );
+        let head_id = head.id;
         // Disjoint branch: a change that is NOT on head's ancestry.
-        let disjoint_id = change_id(0x43);
         let disjoint = change_with_deltas(
-            disjoint_id,
+            change_id(0x43),
             vec![],
-            vec![EntityDelta::Added(stray)],
+            vec![EntityDelta::Added { new: stray }],
             vec![],
             vec![],
         );
+        let disjoint_id = disjoint.id;
         graph.create_change(&root).unwrap();
         graph.create_change(&head).unwrap();
         graph.create_change(&disjoint).unwrap();
@@ -3991,41 +4030,40 @@ mod tests {
         // store's backward walk from head reaches G through B because it
         // only stops at the literal base node, so an unscoped diff would
         // carry G's deltas — history the base already contains.
-        let genesis_id = change_id(0x51);
-        let base_id = change_id(0x52);
-        let branch_id = change_id(0x53);
-        let head_id = change_id(0x54);
         let genesis = change_with_deltas(
-            genesis_id,
+            change_id(0x51),
             vec![],
-            vec![EntityDelta::Added(stale.clone())],
+            vec![EntityDelta::Added { new: stale.clone() }],
             vec![],
             vec![],
         );
+        let genesis_id = genesis.id;
         let base = change_with_deltas(
-            base_id,
+            change_id(0x52),
             vec![genesis_id],
-            vec![EntityDelta::Added(mainline.clone())],
-            vec![],
-            vec![],
-        );
-        let branch = change_with_deltas(
-            branch_id,
-            vec![genesis_id],
-            vec![EntityDelta::Added(branch_v1.clone())],
-            vec![],
-            vec![],
-        );
-        let head = change_with_deltas(
-            head_id,
-            vec![base_id, branch_id],
-            vec![EntityDelta::Modified {
-                old: branch_v1,
-                new: branch_v2,
+            vec![EntityDelta::Added {
+                new: mainline.clone(),
             }],
             vec![],
             vec![],
         );
+        let base_id = base.id;
+        let branch = change_with_deltas(
+            change_id(0x53),
+            vec![genesis_id],
+            vec![EntityDelta::Added { new: branch_v2 }],
+            vec![],
+            vec![],
+        );
+        let branch_id = branch.id;
+        let head = change_with_deltas(
+            change_id(0x54),
+            vec![base_id, branch_id],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let head_id = head.id;
         graph.create_change(&genesis).unwrap();
         graph.create_change(&base).unwrap();
         graph.create_change(&branch).unwrap();
@@ -4061,8 +4099,8 @@ mod tests {
     #[test]
     fn empty_range_fails_loud() {
         let graph = InMemoryGraph::new();
-        let base_id = change_id(5);
-        let base = change_with_deltas(base_id, vec![], vec![], vec![], vec![]);
+        let base = change_with_deltas(change_id(5), vec![], vec![], vec![], vec![]);
+        let base_id = base.id;
         graph.create_change(&base).unwrap();
 
         let result = build_shadow_report(&graph, &request(base_id, base_id));
@@ -4682,25 +4720,23 @@ mod tests {
         let old_entry = TreeEntry::blob(Hash256::from_bytes([11; 32]), false);
         let new_entry = TreeEntry::blob(Hash256::from_bytes([12; 32]), false);
 
-        let base_id = change_id(0x61);
-        let head_id = change_id(0x62);
         let base = change_with_deltas(
-            base_id,
+            change_id(0x61),
             vec![],
             vec![
-                EntityDelta::Added(sensor.clone()),
-                EntityDelta::Added(app.clone()),
+                EntityDelta::Added {
+                    new: sensor.clone(),
+                },
+                EntityDelta::Added { new: app.clone() },
             ],
             vec![],
             vec![tree_add(artifact_id, "src/sensor.c", old_entry)],
         );
+        let base_id = base.id;
         let head = change_with_deltas(
-            head_id,
+            change_id(0x62),
             vec![base_id],
-            vec![EntityDelta::Modified {
-                old: app.clone(),
-                new: app,
-            }],
+            vec![],
             vec![],
             vec![tree_update(
                 artifact_id,
@@ -4710,6 +4746,7 @@ mod tests {
                 new_entry,
             )],
         );
+        let head_id = head.id;
         graph.create_change(&base).unwrap();
         graph.create_change(&head).unwrap();
 
@@ -4751,19 +4788,22 @@ mod tests {
         let old_entry = TreeEntry::blob(Hash256::from_bytes([21; 32]), false);
         let new_entry = TreeEntry::blob(Hash256::from_bytes([22; 32]), false);
 
-        let base_id = change_id(0x71);
-        let head_id = change_id(0x72);
         let base = change_with_deltas(
-            base_id,
+            change_id(0x71),
             vec![],
-            vec![EntityDelta::Added(legacy.clone())],
+            vec![EntityDelta::Added {
+                new: legacy.clone(),
+            }],
             vec![],
             vec![tree_add(artifact_id, "src/shared/keyed-each.js", old_entry)],
         );
+        let base_id = base.id;
         let head = change_with_deltas(
-            head_id,
+            change_id(0x72),
             vec![base_id],
-            vec![EntityDelta::Removed(legacy.id)],
+            vec![EntityDelta::Removed {
+                old: legacy.clone(),
+            }],
             vec![],
             vec![tree_update(
                 artifact_id,
@@ -4773,6 +4813,7 @@ mod tests {
                 new_entry,
             )],
         );
+        let head_id = head.id;
         graph.create_change(&base).unwrap();
         graph.create_change(&head).unwrap();
 
@@ -4802,17 +4843,18 @@ mod tests {
         widget_v2.signature = "fn widget(scale: u8)".into();
         graph.upsert_entity(&widget_v2).unwrap();
 
-        let base_id = change_id(0x71);
-        let head_id = change_id(0x72);
         let base = change_with_deltas(
-            base_id,
+            change_id(0x71),
             vec![],
-            vec![EntityDelta::Added(widget_v1.clone())],
+            vec![EntityDelta::Added {
+                new: widget_v1.clone(),
+            }],
             vec![],
             vec![],
         );
+        let base_id = base.id;
         let head = change_with_deltas(
-            head_id,
+            change_id(0x72),
             vec![base_id],
             vec![EntityDelta::Modified {
                 old: widget_v1,
@@ -4821,6 +4863,7 @@ mod tests {
             vec![],
             vec![],
         );
+        let head_id = head.id;
         graph.create_change(&base).unwrap();
         graph.create_change(&head).unwrap();
 
@@ -4861,20 +4904,23 @@ mod tests {
                 .upsert_relation(&relation(&caller, &target_v2, RelationKind::Calls))
                 .unwrap();
 
-            let base_id = change_id(0x73);
-            let head_id = change_id(0x74);
             let base = change_with_deltas(
-                base_id,
+                change_id(0x73),
                 vec![],
                 vec![
-                    EntityDelta::Added(target_v1.clone()),
-                    EntityDelta::Added(caller.clone()),
+                    EntityDelta::Added {
+                        new: target_v1.clone(),
+                    },
+                    EntityDelta::Added {
+                        new: caller.clone(),
+                    },
                 ],
                 vec![],
                 vec![],
             );
+            let base_id = base.id;
             let head = change_with_deltas(
-                head_id,
+                change_id(0x74),
                 vec![base_id],
                 vec![EntityDelta::Modified {
                     old: target_v1,
@@ -4883,6 +4929,7 @@ mod tests {
                 vec![],
                 vec![],
             );
+            let head_id = head.id;
             graph.create_change(&base).unwrap();
             graph.create_change(&head).unwrap();
 
@@ -5066,14 +5113,16 @@ mod tests {
         let artifact_id = ArtifactId::new();
         let old_entry = TreeEntry::blob(old_hash, false);
         let new_entry = TreeEntry::blob(new_hash, false);
-        let base_id = change_id(0x91);
         let base = change_with_deltas(
-            base_id,
+            change_id(0x91),
             vec![],
-            vec![EntityDelta::Added(sensor.clone())],
+            vec![EntityDelta::Added {
+                new: sensor.clone(),
+            }],
             vec![],
             vec![tree_add(artifact_id, "src/sensor.c", old_entry)],
         );
+        let base_id = base.id;
         graph.create_change(&base).unwrap();
         let at_head = GraphAtRef::materialize(&graph, &base_id).unwrap();
 
@@ -5148,7 +5197,17 @@ mod tests {
         second_deltas: Vec<EntityDelta>,
         n: u8,
     ) -> SemanticChangeId {
+        padded_history_graph_with_root(graph, first_deltas, second_deltas, n).1
+    }
+
+    fn padded_history_graph_with_root(
+        graph: &InMemoryGraph,
+        first_deltas: Vec<EntityDelta>,
+        second_deltas: Vec<EntityDelta>,
+        n: u8,
+    ) -> (SemanticChangeId, SemanticChangeId) {
         let mut prev: Option<SemanticChangeId> = None;
+        let mut root = None;
         for i in 1..=n {
             let deltas = match i {
                 1 => first_deltas.clone(),
@@ -5163,9 +5222,13 @@ mod tests {
                 vec![],
             );
             graph.create_change(&change).unwrap();
-            prev = Some(change_id(i));
+            root.get_or_insert(change.id);
+            prev = Some(change.id);
         }
-        prev.expect("chain is non-empty")
+        (
+            root.expect("chain is non-empty"),
+            prev.expect("chain is non-empty"),
+        )
     }
 
     // An ancestry reference the graph cannot produce costs the window twice:
@@ -5178,14 +5241,14 @@ mod tests {
         let graph = InMemoryGraph::new();
         let reachable_tail = padded_history_graph(&graph, vec![], vec![], 30);
         let dangling = change_id(199);
-        let base_id = change_id(150);
         let base = change_with_deltas(
-            base_id,
+            change_id(150),
             vec![reachable_tail, dangling],
             vec![],
             vec![],
             vec![],
         );
+        let base_id = base.id;
         graph.create_change(&base).unwrap();
 
         let (_, gaps) =
@@ -5237,19 +5300,25 @@ mod tests {
         readded.id = EntityId::from_content("src/net.rs", "retry_budget", "Function", 77);
         let base_id = padded_history_graph(
             &graph,
-            vec![EntityDelta::Added(original.clone())],
-            vec![EntityDelta::Removed(original.id)],
+            vec![EntityDelta::Added {
+                new: original.clone(),
+            }],
+            vec![EntityDelta::Removed {
+                old: original.clone(),
+            }],
             30,
         );
         graph.upsert_entity(&readded).unwrap();
-        let head_id = change_id(200);
         let head = change_with_deltas(
-            head_id,
+            change_id(200),
             vec![base_id],
-            vec![EntityDelta::Added(readded.clone())],
+            vec![EntityDelta::Added {
+                new: readded.clone(),
+            }],
             vec![],
             vec![],
         );
+        let head_id = head.id;
         graph.create_change(&head).unwrap();
 
         let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
@@ -5287,21 +5356,27 @@ mod tests {
         original.fingerprint.behavior_hash = Hash256::from_bytes([7; 32]);
         let base_id = padded_history_graph(
             &graph,
-            vec![EntityDelta::Added(original.clone())],
-            vec![EntityDelta::Removed(original.id)],
+            vec![EntityDelta::Added {
+                new: original.clone(),
+            }],
+            vec![EntityDelta::Removed {
+                old: original.clone(),
+            }],
             30,
         );
         let mut readded = entity_with_span("retry_budget", "src/net.rs", 77, EntityRole::Source);
         readded.fingerprint.behavior_hash = Hash256::from_bytes([8; 32]);
         graph.upsert_entity(&readded).unwrap();
-        let head_id = change_id(204);
         let head = change_with_deltas(
-            head_id,
+            change_id(204),
             vec![base_id],
-            vec![EntityDelta::Added(readded.clone())],
+            vec![EntityDelta::Added {
+                new: readded.clone(),
+            }],
             vec![],
             vec![],
         );
+        let head_id = head.id;
         graph.create_change(&head).unwrap();
 
         let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
@@ -5327,16 +5402,24 @@ mod tests {
         // without an independent risk channel.
         let graph = InMemoryGraph::new();
         let recent = entity_with_span("beta_flag", "src/flags.rs", 12, EntityRole::Source);
-        let base_id =
-            padded_history_graph(&graph, vec![], vec![EntityDelta::Added(recent.clone())], 30);
-        let head_id = change_id(201);
+        let base_id = padded_history_graph(
+            &graph,
+            vec![],
+            vec![EntityDelta::Added {
+                new: recent.clone(),
+            }],
+            30,
+        );
         let head = change_with_deltas(
-            head_id,
+            change_id(201),
             vec![base_id],
-            vec![EntityDelta::Removed(recent.id)],
+            vec![EntityDelta::Removed {
+                old: recent.clone(),
+            }],
             vec![],
             vec![],
         );
+        let head_id = head.id;
         graph.create_change(&head).unwrap();
 
         let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
@@ -5366,19 +5449,23 @@ mod tests {
         let fresh = entity_with_span("brand_new_api", "src/api.rs", 21, EntityRole::Source);
         let base_id = padded_history_graph(
             &graph,
-            vec![EntityDelta::Added(unrelated.clone())],
-            vec![EntityDelta::Removed(unrelated.id)],
+            vec![EntityDelta::Added {
+                new: unrelated.clone(),
+            }],
+            vec![EntityDelta::Removed {
+                old: unrelated.clone(),
+            }],
             30,
         );
         graph.upsert_entity(&fresh).unwrap();
-        let head_id = change_id(202);
         let head = change_with_deltas(
-            head_id,
+            change_id(202),
             vec![base_id],
-            vec![EntityDelta::Added(fresh)],
+            vec![EntityDelta::Added { new: fresh }],
             vec![],
             vec![],
         );
+        let head_id = head.id;
         graph.create_change(&head).unwrap();
 
         let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
@@ -5401,14 +5488,14 @@ mod tests {
         let fresh = entity_with_span("early_api", "src/api.rs", 5, EntityRole::Source);
         let base_id = padded_history_graph(&graph, vec![], vec![], 2);
         graph.upsert_entity(&fresh).unwrap();
-        let head_id = change_id(203);
         let head = change_with_deltas(
-            head_id,
+            change_id(203),
             vec![base_id],
-            vec![EntityDelta::Added(fresh)],
+            vec![EntityDelta::Added { new: fresh }],
             vec![],
             vec![],
         );
+        let head_id = head.id;
         graph.create_change(&head).unwrap();
 
         let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
@@ -5442,28 +5529,32 @@ mod tests {
         // 29 pads, then the base change REMOVES the entity, then head re-adds.
         let pad_tail = padded_history_graph(
             &graph,
-            vec![EntityDelta::Added(original.clone())],
+            vec![EntityDelta::Added {
+                new: original.clone(),
+            }],
             vec![],
             29,
         );
-        let base_id = change_id(150);
         let base = change_with_deltas(
-            base_id,
+            change_id(150),
             vec![pad_tail],
-            vec![EntityDelta::Removed(original.id)],
+            vec![EntityDelta::Removed {
+                old: original.clone(),
+            }],
             vec![],
             vec![],
         );
+        let base_id = base.id;
         graph.create_change(&base).unwrap();
         graph.upsert_entity(&readded).unwrap();
-        let head_id = change_id(151);
         let head = change_with_deltas(
-            head_id,
+            change_id(151),
             vec![base_id],
-            vec![EntityDelta::Added(readded)],
+            vec![EntityDelta::Added { new: readded }],
             vec![],
             vec![],
         );
+        let head_id = head.id;
         graph.create_change(&head).unwrap();
 
         let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
@@ -5494,7 +5585,7 @@ mod tests {
 
         let pad_tail = padded_history_graph(
             &graph,
-            vec![EntityDelta::Added(v1.clone())],
+            vec![EntityDelta::Added { new: v1.clone() }],
             vec![EntityDelta::Modified {
                 old: v1.clone(),
                 new: v2.clone(),
@@ -5502,9 +5593,8 @@ mod tests {
             30,
         );
         graph.upsert_entity(&v_back).unwrap();
-        let head_id = change_id(210);
         let head = change_with_deltas(
-            head_id,
+            change_id(210),
             vec![pad_tail],
             vec![EntityDelta::Modified {
                 old: v2.clone(),
@@ -5513,6 +5603,7 @@ mod tests {
             vec![],
             vec![],
         );
+        let head_id = head.id;
         graph.create_change(&head).unwrap();
 
         let report = build_shadow_report(&graph, &request(pad_tail, head_id)).unwrap();
@@ -5547,7 +5638,7 @@ mod tests {
         v3.fingerprint.behavior_hash = Hash256::from_bytes([3; 32]);
         let pad_tail2 = padded_history_graph(
             &graph2,
-            vec![EntityDelta::Added(v1.clone())],
+            vec![EntityDelta::Added { new: v1.clone() }],
             vec![EntityDelta::Modified {
                 old: v1.clone(),
                 new: v2.clone(),
@@ -5565,8 +5656,9 @@ mod tests {
             vec![],
             vec![],
         );
+        let head2_id = head2.id;
         graph2.create_change(&head2).unwrap();
-        let report2 = build_shadow_report(&graph2, &request(pad_tail2, change_id(211))).unwrap();
+        let report2 = build_shadow_report(&graph2, &request(pad_tail2, head2_id)).unwrap();
         assert!(
             !report2
                 .policy
@@ -5597,8 +5689,8 @@ mod tests {
         for i in 1..=30u8 {
             let deltas = match i {
                 1 => vec![
-                    EntityDelta::Added(a1.clone()),
-                    EntityDelta::Added(b1.clone()),
+                    EntityDelta::Added { new: a1.clone() },
+                    EntityDelta::Added { new: b1.clone() },
                 ],
                 2 => vec![
                     EntityDelta::Modified {
@@ -5620,7 +5712,7 @@ mod tests {
                 vec![],
             );
             graph.create_change(&change).unwrap();
-            prev = Some(change_id(i));
+            prev = Some(change.id);
         }
         let base_id = prev.unwrap();
         let mut a_back = a2.clone();
@@ -5629,9 +5721,8 @@ mod tests {
         b_back.fingerprint.behavior_hash = Hash256::from_bytes([21; 32]);
         graph.upsert_entity(&a_back).unwrap();
         graph.upsert_entity(&b_back).unwrap();
-        let head_id = change_id(220);
         let head = change_with_deltas(
-            head_id,
+            change_id(220),
             vec![base_id],
             vec![
                 EntityDelta::Modified {
@@ -5646,6 +5737,7 @@ mod tests {
             vec![],
             vec![],
         );
+        let head_id = head.id;
         graph.create_change(&head).unwrap();
 
         let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
@@ -5692,8 +5784,8 @@ mod tests {
         for i in 1..=30u8 {
             let deltas = match i {
                 1 => vec![
-                    EntityDelta::Added(a1.clone()),
-                    EntityDelta::Added(b1.clone()),
+                    EntityDelta::Added { new: a1.clone() },
+                    EntityDelta::Added { new: b1.clone() },
                 ],
                 2 => vec![
                     EntityDelta::Modified {
@@ -5715,7 +5807,7 @@ mod tests {
                 vec![],
             );
             graph.create_change(&change).unwrap();
-            prev = Some(change_id(i));
+            prev = Some(change.id);
         }
         let base_id = prev.unwrap();
         let mut a_back = a2.clone();
@@ -5724,9 +5816,8 @@ mod tests {
         b_back.fingerprint.behavior_hash = Hash256::from_bytes([21; 32]);
         graph.upsert_entity(&a_back).unwrap();
         graph.upsert_entity(&b_back).unwrap();
-        let head_id = change_id(220);
         let head = change_with_deltas(
-            head_id,
+            change_id(220),
             vec![base_id],
             vec![
                 EntityDelta::Modified {
@@ -5741,6 +5832,7 @@ mod tests {
             vec![],
             vec![],
         );
+        let head_id = head.id;
         graph.create_change(&head).unwrap();
 
         let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
@@ -5775,7 +5867,7 @@ mod tests {
         v2.fingerprint.behavior_hash = Hash256::from_bytes([32; 32]);
         let pad_tail = padded_history_graph(
             &graph,
-            vec![EntityDelta::Added(v1.clone())],
+            vec![EntityDelta::Added { new: v1.clone() }],
             vec![EntityDelta::Modified {
                 old: v1.clone(),
                 new: v2.clone(),
@@ -5786,9 +5878,8 @@ mod tests {
         let mut v_new = v2.clone();
         v_new.fingerprint.behavior_hash = Hash256::from_bytes([33; 32]);
         graph.upsert_entity(&v_new).unwrap();
-        let head_id = change_id(240);
         let head = change_with_deltas(
-            head_id,
+            change_id(240),
             vec![pad_tail],
             vec![EntityDelta::Modified {
                 old: v2.clone(),
@@ -5797,6 +5888,7 @@ mod tests {
             vec![],
             vec![],
         );
+        let head_id = head.id;
         graph.create_change(&head).unwrap();
         // A future edit whose pre-state IS the head's result.
         let mut v_future = v_new.clone();
@@ -5840,9 +5932,9 @@ mod tests {
         v1.fingerprint.behavior_hash = Hash256::from_bytes([51; 32]);
         let mut v2 = v1.clone();
         v2.fingerprint.behavior_hash = Hash256::from_bytes([52; 32]);
-        let pad_tail = padded_history_graph(
+        let (root_id, pad_tail) = padded_history_graph_with_root(
             &graph,
-            vec![EntityDelta::Added(v1.clone())],
+            vec![EntityDelta::Added { new: v1.clone() }],
             vec![EntityDelta::Modified {
                 old: v1.clone(),
                 new: v2.clone(),
@@ -5858,7 +5950,7 @@ mod tests {
         v_branch.fingerprint.behavior_hash = Hash256::from_bytes([54; 32]);
         let branch = change_with_deltas(
             change_id(250),
-            vec![change_id(1)],
+            vec![root_id],
             vec![EntityDelta::Modified {
                 old: v_new.clone(),
                 new: v_branch,
@@ -5866,12 +5958,12 @@ mod tests {
             vec![],
             vec![],
         );
+        let branch_id = branch.id;
         graph.create_change(&branch).unwrap();
         graph.upsert_entity(&v_new).unwrap();
-        let head_id = change_id(251);
         let head = change_with_deltas(
-            head_id,
-            vec![pad_tail, change_id(250)],
+            change_id(251),
+            vec![pad_tail, branch_id],
             vec![EntityDelta::Modified {
                 old: v2.clone(),
                 new: v_new.clone(),
@@ -5879,6 +5971,7 @@ mod tests {
             vec![],
             vec![],
         );
+        let head_id = head.id;
         graph.create_change(&head).unwrap();
 
         let report = build_shadow_report(&graph, &request(pad_tail, head_id)).unwrap();

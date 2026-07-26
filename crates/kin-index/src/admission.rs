@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use bstr::{BString, ByteSlice};
-use kin_model::{Hash256, RepoPath};
+use kin_model::{Hash256, RepoPath, SensitiveArtifactAllowance, SensitiveArtifactKind};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -526,34 +526,6 @@ pub fn is_intrinsic_repository_control_path(path: &RepoPath) -> bool {
         .any(is_intrinsic_control_component)
 }
 
-/// Byte-bearing artifact kind bound into sensitive admission identity.
-///
-/// Gitlinks do not carry candidate bytes and therefore cannot enter this
-/// byte-scanning API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SensitiveArtifactKind {
-    Blob { executable: bool },
-    Symlink,
-}
-
-/// One explicit approval for one exact sensitive path, digest, and entry kind.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SensitiveAdmissionGrant {
-    pub path: RepoPath,
-    pub content_hash: Hash256,
-    pub kind: SensitiveArtifactKind,
-}
-
-impl SensitiveAdmissionGrant {
-    pub const fn new(path: RepoPath, content_hash: Hash256, kind: SensitiveArtifactKind) -> Self {
-        Self {
-            path,
-            content_hash,
-            kind,
-        }
-    }
-}
-
 /// High-confidence reason an untracked candidate requires explicit approval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SensitiveFindingKind {
@@ -599,7 +571,7 @@ pub fn enforce_sensitive_admission(
     kind: SensitiveArtifactKind,
     contents: &[u8],
     tracked: bool,
-    grants: &[SensitiveAdmissionGrant],
+    allowances: &[SensitiveArtifactAllowance],
 ) -> Result<(), SensitiveAdmissionError> {
     let observed = sha256(contents);
     if observed != content_hash {
@@ -616,9 +588,10 @@ pub fn enforce_sensitive_admission(
     let Some(finding) = sensitive_finding(path, contents) else {
         return Ok(());
     };
-    if grants.iter().any(|grant| {
-        grant.path == *path && grant.content_hash == content_hash && grant.kind == kind
-    }) {
+    if allowances
+        .iter()
+        .any(|allowance| allowance.matches(path, content_hash, kind))
+    {
         return Ok(());
     }
     Err(SensitiveAdmissionError::Blocked {
@@ -780,11 +753,26 @@ fn is_placeholder_secret(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_model::AuthorId;
     use std::fs;
     use std::process::Command;
 
     fn path(value: &str) -> RepoPath {
         RepoPath::from_utf8(value).unwrap()
+    }
+
+    fn allowance(
+        path: RepoPath,
+        content_hash: Hash256,
+        kind: SensitiveArtifactKind,
+    ) -> SensitiveArtifactAllowance {
+        SensitiveArtifactAllowance {
+            path,
+            content_hash,
+            kind,
+            approved_by: AuthorId::new("security-reviewer"),
+            reason: "test fixture approval".to_string(),
+        }
     }
 
     fn root_rule(
@@ -1118,7 +1106,7 @@ a/**/b
             }
         );
 
-        let grant = SensitiveAdmissionGrant::new(secret_path.clone(), digest, regular);
+        let grant = allowance(secret_path.clone(), digest, regular);
         enforce_sensitive_admission(
             &secret_path,
             digest,
@@ -1170,11 +1158,7 @@ a/**/b
             Err(SensitiveAdmissionError::Blocked { .. })
         ));
 
-        let symlink_grant = SensitiveAdmissionGrant::new(
-            secret_path.clone(),
-            digest,
-            SensitiveArtifactKind::Symlink,
-        );
+        let symlink_grant = allowance(secret_path.clone(), digest, SensitiveArtifactKind::Symlink);
         enforce_sensitive_admission(
             &secret_path,
             digest,

@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use kin_model::{GraphStore, RepoPath, ResolvedTree, SemanticChangeId, TreeEntry};
 
-use crate::{KinError, KinLayout, Result};
+use crate::{KinError, Result};
 
 #[cfg(any(unix, windows))]
 use fs2::FileExt as _;
@@ -43,217 +43,19 @@ const MAX_RECONCILIATION_ACTION_RECORD_BYTES: u64 = 256 * 1024;
 #[cfg(any(unix, windows))]
 const MAX_RECONCILIATION_ACTION_LOG_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Resolve the exact repository tree at `branch_head`.
-///
-/// The genesis argument remains part of the public checkout seam for now, but
-/// exact tree replay is owned by `ChangeStore::resolve_tree_at`.
-pub fn build_file_tree<G: GraphStore>(
+/// Resolve the exact repository tree at one semantic change.
+pub fn resolve_change_tree<G: GraphStore>(
     graph: &G,
-    _genesis_id: &SemanticChangeId,
-    branch_head: &SemanticChangeId,
+    change_id: &SemanticChangeId,
 ) -> Result<ResolvedTree> {
     graph
-        .resolve_tree_at(branch_head)
-        .map_err(|error| KinError::Graph(error.to_string()))
-}
-
-/// Re-project the working directory to match a branch's committed file state.
-///
-/// Returns the number of files written.
-pub fn checkout_branch<G: GraphStore>(
-    graph: &G,
-    blob_store: &kin_blobs::BlobStore,
-    layout: &KinLayout,
-    _genesis_id: &SemanticChangeId,
-    branch_head: &SemanticChangeId,
-) -> Result<usize> {
-    checkout_branch_with_pre_mutation_hook(
-        graph,
-        blob_store,
-        layout,
-        _genesis_id,
-        branch_head,
-        || {},
-    )
-}
-
-/// Test seam for deterministically exercising a working-copy edit that lands
-/// after reconciliation's first read-only preflight but before mutation.
-/// Production callers use [`checkout_branch`], which supplies a no-op hook.
-#[doc(hidden)]
-pub fn checkout_branch_with_pre_mutation_hook<G: GraphStore>(
-    graph: &G,
-    blob_store: &kin_blobs::BlobStore,
-    layout: &KinLayout,
-    _genesis_id: &SemanticChangeId,
-    branch_head: &SemanticChangeId,
-    after_read_only_preflight: impl FnOnce(),
-) -> Result<usize> {
-    // VFS projects files from the graph — no physical checkout needed.
-    // Kept for backward compatibility with repos that don't have VFS yet.
-    // Once VFS is universal, this entire function can be removed.
-
-    let current_branch_name = crate::read_current_branch(layout)?;
-    let current_branch = graph
-        .get_branch(&current_branch_name)
-        .map_err(|error| KinError::Graph(error.to_string()))?
-        .ok_or_else(|| {
-            KinError::Graph(format!(
-                "current branch {current_branch_name:?} is absent from graph authority"
-            ))
-        })?;
-    checkout_branch_between_heads_with_pre_mutation_hook(
-        graph,
-        blob_store,
-        layout,
-        &current_branch.head,
-        branch_head,
-        after_read_only_preflight,
-    )
-}
-
-/// Reconcile the projection between two explicit, exact graph heads.
-///
-/// Branch switching uses this to compensate a successfully published target
-/// tree when a later branch-head recheck or HEAD update fails. The current
-/// branch marker cannot supply the `previous_head` in that path because it
-/// intentionally still names the old branch.
-#[doc(hidden)]
-pub fn checkout_branch_between_heads<G: GraphStore>(
-    graph: &G,
-    blob_store: &kin_blobs::BlobStore,
-    layout: &KinLayout,
-    previous_head: &SemanticChangeId,
-    branch_head: &SemanticChangeId,
-) -> Result<usize> {
-    checkout_branch_between_heads_with_pre_mutation_hook(
-        graph,
-        blob_store,
-        layout,
-        previous_head,
-        branch_head,
-        || {},
-    )
-}
-
-fn checkout_branch_between_heads_with_pre_mutation_hook<G: GraphStore>(
-    graph: &G,
-    blob_store: &kin_blobs::BlobStore,
-    layout: &KinLayout,
-    previous_head: &SemanticChangeId,
-    branch_head: &SemanticChangeId,
-    after_read_only_preflight: impl FnOnce(),
-) -> Result<usize> {
-    let previous_tree = resolve_exact_source_tree(graph, previous_head)?;
-    let tree = resolve_exact_source_tree(graph, branch_head)?;
-    let work_dir = layout.working_dir();
-    let previous_prepared = load_source_tree_blobs(blob_store, previous_tree)?;
-    let prepared = load_source_tree_blobs(blob_store, tree)?;
-
-    // A checkout may require destructive file/directory transitions. Resolve
-    // and verify every content object and every path/link shape before any of
-    // those transitions begin, so a late corrupt or missing blob cannot leave
-    // a partially projected working tree.
-    reconcile_source_tree_with_pre_mutation_hook(
-        work_dir,
-        previous_prepared
-            .iter()
-            .map(|(file_id, kind, content)| (file_id, *kind, content.as_slice())),
-        prepared
-            .iter()
-            .map(|(file_id, kind, content)| (file_id, *kind, content.as_slice())),
-        should_preserve_checkout_path,
-        after_read_only_preflight,
-    )?;
-
-    Ok(prepared.len())
-}
-
-/// Publish a branch projection and its `.kin/HEAD` transition as one
-/// crash-recoverable transaction. `before_head_commit` runs after all target
-/// bytes are durable while the repository projection lock and rollback journal
-/// are still retained. It must recheck graph authority; the transaction then
-/// writes the target HEAD through its retained `.kin` capability.
-#[doc(hidden)]
-#[allow(clippy::too_many_arguments)]
-pub fn checkout_branch_between_heads_transactional_with_hooks<G: GraphStore>(
-    graph: &G,
-    blob_store: &kin_blobs::BlobStore,
-    layout: &KinLayout,
-    previous_branch: &str,
-    previous_head: &SemanticChangeId,
-    target_branch: &str,
-    target_head: &SemanticChangeId,
-    after_read_only_preflight: impl FnOnce(),
-    before_head_commit: impl FnOnce() -> Result<()>,
-) -> Result<usize> {
-    let previous_tree = resolve_exact_source_tree(graph, previous_head)?;
-    let target_tree = resolve_exact_source_tree(graph, target_head)?;
-    let previous_prepared = load_source_tree_blobs(blob_store, previous_tree)?;
-    let prepared = load_source_tree_blobs(blob_store, target_tree)?;
-    let previous_entries = validated_source_entries(
-        previous_prepared
-            .iter()
-            .map(|(file_id, kind, content)| (file_id, *kind, content.as_slice())),
-    )?;
-    let entries = validated_source_entries(
-        prepared
-            .iter()
-            .map(|(file_id, kind, content)| (file_id, *kind, content.as_slice())),
-    )?;
-    let transition = BranchProjectionTransition {
-        previous_branch: previous_branch.to_string(),
-        previous_head: *previous_head,
-        target_branch: target_branch.to_string(),
-        target_head: *target_head,
-    };
-    project_reconciled_source_tree(
-        layout.working_dir(),
-        &previous_entries,
-        &entries,
-        &should_preserve_checkout_path,
-        after_read_only_preflight,
-        || {},
-        Some(transition),
-        before_head_commit,
-    )?;
-    Ok(prepared.len())
-}
-
-fn load_source_tree_blobs(
-    blob_store: &kin_blobs::BlobStore,
-    tree: ResolvedTree,
-) -> Result<Vec<(RepoPath, TreeEntry, Vec<u8>)>> {
-    let mut entries: Vec<_> = tree.into_artifacts().collect();
-    entries.sort_by(|left, right| left.path.cmp(&right.path));
-    entries
-        .into_iter()
-        .map(|artifact| {
-            let blob_hash = artifact.entry.blob_identity().ok_or_else(|| {
-                KinError::Other(format!(
-                    "cannot materialize gitlink {:?} at {} as repository-owned bytes",
-                    artifact.entry, artifact.path
-                ))
-            })?;
-            let blob_hash = kin_blobs::Hash256(*blob_hash.as_bytes());
-            let content = blob_store.read(&blob_hash)?;
-            Ok((artifact.path, artifact.entry, content))
-        })
-        .collect()
-}
-
-fn resolve_exact_source_tree<G: GraphStore>(
-    graph: &G,
-    head: &SemanticChangeId,
-) -> Result<ResolvedTree> {
-    graph
-        .resolve_tree_at(head)
+        .resolve_tree_at(change_id)
         .map_err(|error| KinError::Graph(error.to_string()))
 }
 
 /// Preserve control-plane and generated dependency/build directories during
-/// exact tree cleanup. This policy is shared by full checkout and branch
-/// switching so neither path treats generated state as graph-owned source.
+/// exact tree cleanup. This policy is shared by full projection and workspace
+/// transitions so neither path treats generated state as graph-owned source.
 pub fn should_preserve_checkout_path(relative: &Path) -> bool {
     const PRESERVED_COMPONENTS: &[&str] = &[
         ".kin",
@@ -287,6 +89,9 @@ pub fn should_preserve_checkout_path(relative: &Path) -> bool {
 /// writes are anchored to directory capabilities and use no-follow traversal
 /// plus atomic replacement, so neither a pre-existing link nor a concurrent
 /// rename can redirect bytes outside the projection root.
+///
+/// This is a physical export/recovery primitive, not a repository-authority
+/// workspace transition. V2 workspace switching is served through VFS.
 pub fn materialize_source_entry(
     root: &Path,
     file_id: &RepoPath,
@@ -332,7 +137,7 @@ pub fn replace_source_tree<'a>(
 ///
 /// Only paths tracked by `previous_entries` and absent from `entries` are
 /// eligible for deletion. A prior tracked path that would be replaced or
-/// removed must still match its exact current-branch kind and content; local
+/// removed must still match its exact prior-workspace kind and content; local
 /// edits fail the whole read-only preflight. New target paths fail closed when
 /// an unrelated working-copy object occupies the destination or blocks an
 /// ancestor.
@@ -389,8 +194,6 @@ pub fn reconcile_source_tree_with_mutation_hooks<'a, 'b>(
         &should_preserve,
         after_read_only_preflight,
         after_identity_revalidation,
-        None,
-        || Ok(()),
     )
 }
 
@@ -581,7 +384,7 @@ pub fn prepare_source_tree<'a>(
     #[cfg(any(unix, windows))]
     {
         let projection = ProjectionRoot::open(root)?;
-        return projection.prepare(&file_ids);
+        projection.prepare(&file_ids)
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -626,11 +429,10 @@ fn projection_path_comparison_key(path: &str) -> String {
         // Unicode case expansion so those trees fail before any transition is
         // applied. Upper-then-lower also catches folds such as sharp-s and the
         // Greek final sigma that lowercase alone does not collapse.
-        return path
-            .split('/')
+        path.split('/')
             .map(projection_component_comparison_key)
             .collect::<Vec<_>>()
-            .join("/");
+            .join("/")
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     path.to_string()
@@ -672,7 +474,7 @@ fn project_validated_source_tree(
         after_read_only_preflight();
 
         projection.apply_full_replacement(entries, plan)?;
-        return Ok(entries.len());
+        Ok(entries.len())
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -689,8 +491,6 @@ fn project_reconciled_source_tree(
     should_preserve: &dyn Fn(&Path) -> bool,
     after_read_only_preflight: impl FnOnce(),
     after_identity_revalidation: impl FnOnce(),
-    branch_transition: Option<BranchProjectionTransition>,
-    before_head_commit: impl FnOnce() -> Result<()>,
 ) -> Result<usize> {
     #[cfg(any(unix, windows))]
     {
@@ -849,8 +649,7 @@ fn project_reconciled_source_tree(
         // Stage every target object before the first destructive namespace
         // operation. The transaction directory is retained until either all
         // publications succeed or every displaced old object is restored.
-        let mut transaction =
-            projection.create_reconciliation_transaction_with_transition(branch_transition)?;
+        let mut transaction = projection.create_reconciliation_transaction()?;
         let staged = match projection
             .stage_reconciliation_entries(&transaction.directory, &entries_to_materialize)
         {
@@ -938,60 +737,8 @@ fn project_reconciled_source_tree(
             };
         }
 
-        let head_commit = before_head_commit().and_then(|()| {
-            projection.revalidate_projection_lock()?;
-            if let Some(transition) = &transaction.manifest.branch_transition {
-                projection.write_branch_marker_capability(&transition.target_branch)?;
-            }
-            Ok(())
-        });
-        if let Err(error) = head_commit {
-            let rollback = projection.rollback_reconciliation_manifest(&transaction);
-            return match rollback {
-                Ok(()) => match projection.cleanup_reconciliation_transaction(transaction) {
-                    Ok(()) => Err(error),
-                    Err(cleanup_error) => Err(KinError::Other(format!(
-                        "{error}; finalized branch rollback succeeded but transaction cleanup failed: {cleanup_error}"
-                    ))),
-                },
-                Err(rollback_error) => Err(KinError::Other(format!(
-                    "{error}; {rollback_error}; retained recovery transaction at {}",
-                    projection
-                        .reconciliation_control_path()
-                        .join(&transaction.name)
-                        .display()
-                ))),
-            };
-        }
-
-        if transaction.manifest.branch_transition.is_some() {
-            transaction.manifest.state = ReconciliationTransactionState::Committed;
-            if let Err(error) = projection.persist_reconciliation_manifest(&transaction) {
-                // The durable descriptor is still pending. Restore the
-                // in-memory phase before using the same recovery path so HEAD
-                // and projected bytes return to the prior authority.
-                transaction.manifest.state = ReconciliationTransactionState::Pending;
-                let rollback = projection.rollback_reconciliation_manifest(&transaction);
-                return match rollback {
-                    Ok(()) => match projection.cleanup_reconciliation_transaction(transaction) {
-                        Ok(()) => Err(error),
-                        Err(cleanup_error) => Err(KinError::Other(format!(
-                            "{error}; branch commit-marker rollback succeeded but transaction cleanup failed: {cleanup_error}"
-                        ))),
-                    },
-                    Err(rollback_error) => Err(KinError::Other(format!(
-                        "{error}; {rollback_error}; retained recovery transaction at {}",
-                        projection
-                            .reconciliation_control_path()
-                            .join(&transaction.name)
-                            .display()
-                    ))),
-                };
-            }
-        }
-
         projection.cleanup_reconciliation_transaction(transaction)?;
-        return Ok(entries_to_materialize.len());
+        Ok(entries_to_materialize.len())
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -1092,7 +839,6 @@ struct ReconciliationManifest {
     control_identity: TrackedEntryIdentity,
     transaction_identity: TrackedEntryIdentity,
     state: ReconciliationTransactionState,
-    branch_transition: Option<BranchProjectionTransition>,
     actions: Vec<ReconciliationRecoveryAction>,
 }
 
@@ -1102,15 +848,6 @@ struct ReconciliationManifest {
 enum ReconciliationTransactionState {
     Pending,
     Committed,
-}
-
-#[cfg(any(unix, windows))]
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-struct BranchProjectionTransition {
-    previous_branch: String,
-    previous_head: SemanticChangeId,
-    target_branch: String,
-    target_head: SemanticChangeId,
 }
 
 #[cfg(any(unix, windows))]
@@ -1805,13 +1542,6 @@ impl ProjectionRoot {
     }
 
     fn create_reconciliation_transaction(&self) -> Result<ReconciliationTransaction> {
-        self.create_reconciliation_transaction_with_transition(None)
-    }
-
-    fn create_reconciliation_transaction_with_transition(
-        &self,
-        branch_transition: Option<BranchProjectionTransition>,
-    ) -> Result<ReconciliationTransaction> {
         self.revalidate_projection_lock()?;
         for _ in 0..8 {
             let id = uuid::Uuid::new_v4().to_string();
@@ -1849,7 +1579,6 @@ impl ProjectionRoot {
                             control_identity: self.control_identity,
                             transaction_identity: identity,
                             state: ReconciliationTransactionState::Pending,
-                            branch_transition: branch_transition.clone(),
                             actions: Vec::new(),
                         },
                         action_log_bytes: 0,
@@ -1978,142 +1707,6 @@ impl ProjectionRoot {
             )));
         }
         Ok(())
-    }
-
-    fn read_branch_marker_capability(&self) -> Result<String> {
-        let display = self.display_root.join(".kin/HEAD");
-        let file =
-            open_reconciliation_control_file(&self.kin_control, std::ffi::OsStr::new("HEAD"))
-                .map_err(|error| KinError::io(&display, error))?;
-        let metadata = file
-            .metadata()
-            .map_err(|error| KinError::io(&display, error))?;
-        if !metadata.is_file() || metadata.len() > 4096 {
-            return Err(KinError::Other(format!(
-                "branch marker {} is not a bounded regular file",
-                display.display()
-            )));
-        }
-        let mut bytes = Vec::new();
-        file.take(4097)
-            .read_to_end(&mut bytes)
-            .map_err(|error| KinError::io(&display, error))?;
-        if bytes.len() > 4096 {
-            return Err(KinError::Other(format!(
-                "branch marker {} exceeds 4096 bytes",
-                display.display()
-            )));
-        }
-        let marker = std::str::from_utf8(&bytes).map_err(|error| {
-            KinError::Other(format!(
-                "branch marker {} is not UTF-8: {error}",
-                display.display()
-            ))
-        })?;
-        let marker = marker.trim();
-        if marker.is_empty() {
-            return Err(KinError::Other(format!(
-                "branch marker {} is empty",
-                display.display()
-            )));
-        }
-        Ok(marker.to_string())
-    }
-
-    fn write_branch_marker_capability(&self, branch: &str) -> Result<()> {
-        if branch.trim().is_empty()
-            || branch != branch.trim()
-            || branch.len() > 4096
-            || branch.chars().any(char::is_control)
-        {
-            return Err(KinError::Other(
-                "refusing to write an invalid branch marker during recovery".to_string(),
-            ));
-        }
-        let temporary = OsString::from(format!(".HEAD-{}.tmp", uuid::Uuid::new_v4()));
-        let display = self.display_root.join(".kin/HEAD");
-        let mut options = cap_std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(windows)]
-        {
-            use cap_std::fs::OpenOptionsExt;
-            use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
-            use windows_sys::Win32::Storage::FileSystem::{
-                DELETE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            };
-
-            options
-                .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
-        }
-        let mut file = self
-            .kin_control
-            .open_with(&temporary, &options)
-            .map_err(|error| KinError::io(&display, error))?;
-        #[cfg(unix)]
-        rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(0o600))
-            .map_err(|error| KinError::io(&display, error.into()))?;
-        if let Err(error) = file
-            .write_all(branch.as_bytes())
-            .and_then(|()| file.sync_all())
-            .map_err(|error| KinError::io(&display, error))
-        {
-            drop(file);
-            let _ = self.kin_control.remove_file(&temporary);
-            return Err(error);
-        }
-        #[cfg(unix)]
-        let rename_result =
-            self.kin_control
-                .rename(&temporary, &self.kin_control, std::ffi::OsStr::new("HEAD"));
-        #[cfg(windows)]
-        let rename_result = replace_windows_file_handle_exact(
-            &file,
-            &self.kin_control,
-            std::ffi::OsStr::new("HEAD"),
-            true,
-        );
-        if let Err(error) = rename_result {
-            drop(file);
-            let _ = self.kin_control.remove_file(&temporary);
-            return Err(KinError::io(&display, error));
-        }
-        file.sync_all()
-            .map_err(|error| KinError::io(&display, error))?;
-        drop(file);
-        sync_directory_capability(&self.kin_control, &self.display_root.join(".kin"))
-    }
-
-    fn recover_pending_branch_transition(
-        &self,
-        transition: &BranchProjectionTransition,
-    ) -> Result<()> {
-        let current = self.read_branch_marker_capability()?;
-        if current == transition.previous_branch {
-            return Ok(());
-        }
-        if current != transition.target_branch {
-            return Err(KinError::Other(format!(
-                "branch-switch recovery refused to overwrite HEAD '{}': expected '{}' or '{}'",
-                current, transition.previous_branch, transition.target_branch
-            )));
-        }
-        self.write_branch_marker_capability(&transition.previous_branch)
-    }
-
-    fn validate_committed_branch_transition(
-        &self,
-        transition: &BranchProjectionTransition,
-    ) -> Result<()> {
-        let current = self.read_branch_marker_capability()?;
-        if current == transition.target_branch {
-            Ok(())
-        } else {
-            Err(KinError::Other(format!(
-                "committed branch-switch transaction expected HEAD '{}', found '{}'; refusing cleanup",
-                transition.target_branch, current
-            )))
-        }
     }
 
     fn authenticate_reconciliation_manifest(
@@ -2552,7 +2145,6 @@ impl ProjectionRoot {
                             control_identity: self.control_identity,
                             transaction_identity: identity,
                             state: ReconciliationTransactionState::Pending,
-                            branch_transition: None,
                             actions: Vec::new(),
                         },
                         action_log_bytes: 0,
@@ -2582,9 +2174,6 @@ impl ProjectionRoot {
                 )));
             }
             if manifest.state == ReconciliationTransactionState::Committed {
-                if let Some(transition) = &manifest.branch_transition {
-                    self.validate_committed_branch_transition(transition)?;
-                }
                 let transaction = ReconciliationTransaction {
                     name,
                     directory,
@@ -2731,12 +2320,6 @@ impl ProjectionRoot {
             }
         }
 
-        if let Some(transition) = &transaction.manifest.branch_transition {
-            if let Err(error) = self.recover_pending_branch_transition(transition) {
-                failures.push(error.to_string());
-            }
-        }
-
         if failures.is_empty() {
             Ok(())
         } else {
@@ -2816,6 +2399,7 @@ impl ProjectionRoot {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn recover_published_object(
         &self,
         transaction: &ReconciliationTransaction,
@@ -3472,7 +3056,7 @@ impl ProjectionRoot {
                             }
                             Ok(_) => {
                                 return Err(KinError::Other(format!(
-                                    "working-copy path {} changed into an untracked blocker during exact branch reconciliation",
+                                    "working-copy path {} changed into an untracked blocker during exact workspace reconciliation",
                                     self.display_root.join(&relative).display()
                                 )));
                             }
@@ -3491,7 +3075,7 @@ impl ProjectionRoot {
             match parent.symlink_metadata(name) {
                 Ok(metadata) if metadata.is_dir() && !metadata_is_reparse(&metadata) => {
                     return Err(KinError::Other(format!(
-                        "working-copy directory {} conflicts with an exact branch file",
+                        "working-copy directory {} conflicts with an exact workspace file",
                         self.display_path(&components).display()
                     )));
                 }
@@ -3634,7 +3218,7 @@ impl ProjectionRoot {
                     }
                     Ok(_) => {
                         return Err(KinError::Other(format!(
-                            "untracked working-copy path {} blocks exact branch target {}",
+                            "untracked working-copy path {} blocks exact workspace target {}",
                             self.display_root.join(&relative).display(),
                             entry.file_id
                         )));
@@ -3660,7 +3244,7 @@ impl ProjectionRoot {
                         || removed.relation(&relative) != TrackedPathRelation::Ancestor
                     {
                         return Err(KinError::Other(format!(
-                            "untracked working-copy directory {} conflicts with exact branch target {}",
+                            "untracked working-copy directory {} conflicts with exact workspace target {}",
                             self.display_root.join(&relative).display(),
                             entry.file_id
                         )));
@@ -3675,7 +3259,7 @@ impl ProjectionRoot {
                 Ok(_) if previous.relation(&relative) == TrackedPathRelation::Exact => {}
                 Ok(_) => {
                     return Err(KinError::Other(format!(
-                        "untracked working-copy path {} conflicts with exact branch target {}",
+                        "untracked working-copy path {} conflicts with exact workspace target {}",
                         self.display_root.join(&relative).display(),
                         entry.file_id
                     )));
@@ -3709,7 +3293,7 @@ impl ProjectionRoot {
             if metadata.is_dir() && !metadata_is_reparse(&metadata) {
                 if removed.relation(&relative) != TrackedPathRelation::Ancestor {
                     return Err(KinError::Other(format!(
-                        "untracked working-copy directory {} blocks exact branch reconciliation",
+                        "untracked working-copy directory {} blocks exact workspace reconciliation",
                         self.display_root.join(&relative).display()
                     )));
                 }
@@ -3717,7 +3301,7 @@ impl ProjectionRoot {
                 self.validate_removable_directory_contents(&child, &relative, removed)?;
             } else if removed.relation(&relative) != TrackedPathRelation::Exact {
                 return Err(KinError::Other(format!(
-                    "untracked working-copy path {} blocks exact branch reconciliation",
+                    "untracked working-copy path {} blocks exact workspace reconciliation",
                     self.display_root.join(&relative).display()
                 )));
             }
@@ -3742,14 +3326,14 @@ impl ProjectionRoot {
     ) -> Result<()> {
         if entries.len() != expected_identities.len() {
             return Err(KinError::Other(
-                "exact branch reconciliation identity preflight is inconsistent".to_string(),
+                "exact workspace reconciliation identity preflight is inconsistent".to_string(),
             ));
         }
         for (entry, expected_identity) in entries.iter().zip(expected_identities) {
             let actual_identity = self.validate_tracked_entry_unchanged(entry)?;
             if actual_identity != *expected_identity {
                 return Err(KinError::Other(format!(
-                    "tracked working-copy path {} changed object identity after exact branch preflight; reconciliation refused",
+                    "tracked working-copy path {} changed object identity after exact workspace preflight; reconciliation refused",
                     self.display_root
                         .join(projection_path(entry.file_id)?)
                         .display()
@@ -4805,7 +4389,7 @@ impl ProjectionRoot {
         let display = self.display_path(&components);
         let conflict = |reason: &str| {
             KinError::Other(format!(
-                "tracked working-copy path {} differs from current branch source ({reason}); exact branch reconciliation refused",
+                "tracked working-copy path {} differs from prior workspace source ({reason}); exact workspace reconciliation refused",
                 display.display()
             ))
         };
@@ -5389,7 +4973,7 @@ fn replace_windows_handle_exact(
     let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
     unsafe {
         // FileRenameInfo reads this union field as ReplaceIfExists: a nonzero low
-        // byte replaces an existing destination. New branch-only paths pass 0 so a
+        // byte replaces an existing destination. New workspace-only paths pass 0 so a
         // raced untracked destination fails closed rather than being overwritten;
         // previously-tracked paths pass 1 to replace. FileRenameInfo (not the Ex
         // class) is used because FileRenameInfoEx raises ERROR_INVALID_PARAMETER
@@ -6192,7 +5776,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("differs from current branch source"));
+            .contains("differs from prior workspace source"));
         assert_eq!(std::fs::read(&path).unwrap(), b"editor bytes");
     }
 
@@ -6221,7 +5805,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("differs from current branch source"));
+            .contains("differs from prior workspace source"));
         assert_eq!(std::fs::read(&path).unwrap(), b"editor bytes");
     }
 
@@ -6307,7 +5891,8 @@ mod tests {
                 std::fs::rename(root.path().join(".kin"), root.path().join(".kin-detached"))
                     .unwrap();
                 std::fs::create_dir(root.path().join(".kin")).unwrap();
-                std::fs::write(root.path().join(".kin/HEAD"), b"replacement").unwrap();
+                std::fs::write(root.path().join(".kin/replacement-marker"), b"replacement")
+                    .unwrap();
             },
         )
         .unwrap_err();
@@ -6315,7 +5900,7 @@ mod tests {
         assert!(error.to_string().contains("repository control directory"));
         assert_eq!(std::fs::read(&path).unwrap(), b"old graph bytes");
         assert_eq!(
-            std::fs::read(root.path().join(".kin/HEAD")).unwrap(),
+            std::fs::read(root.path().join(".kin/replacement-marker")).unwrap(),
             b"replacement"
         );
     }
@@ -6789,146 +6374,6 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
             0o600
         );
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn pending_branch_transaction_recovers_tree_and_head_together() {
-        let root = tempfile::tempdir().unwrap();
-        let layout = crate::init(root.path()).unwrap().layout;
-        let path = root.path().join("owned.txt");
-        std::fs::write(&path, b"main bytes").unwrap();
-        let file_id = repo_path("owned.txt".to_string());
-        let entry = ValidatedSourceEntry {
-            file_id: &file_id,
-            kind: regular(),
-            content: b"feature bytes",
-        };
-        let transition = BranchProjectionTransition {
-            previous_branch: "main".to_string(),
-            previous_head: SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32])),
-            target_branch: "feature".to_string(),
-            target_head: SemanticChangeId::from_hash(Hash256::from_bytes([0x12; 32])),
-        };
-        let projection = ProjectionRoot::open(root.path()).unwrap();
-        let (identity, state) = projection
-            .inspect_named_existing_object(
-                &projection.root,
-                std::ffi::OsStr::new("owned.txt"),
-                ExistingObjectKind::File,
-                &path,
-            )
-            .unwrap();
-        let mut transaction = projection
-            .create_reconciliation_transaction_with_transition(Some(transition))
-            .unwrap();
-        let staged = projection
-            .stage_reconciliation_entries(&transaction.directory, &[entry])
-            .unwrap();
-        projection
-            .back_up_existing_object(
-                &mut transaction,
-                &PlannedExistingObject {
-                    relative: PathBuf::from("owned.txt"),
-                    kind: ExistingObjectKind::File,
-                    identity,
-                    state,
-                },
-                0,
-            )
-            .unwrap();
-        projection
-            .publish_staged_entry(&mut transaction, &staged[0])
-            .unwrap();
-        projection
-            .write_branch_marker_capability("feature")
-            .unwrap();
-        let transaction_path = projection
-            .reconciliation_control_path()
-            .join(&transaction.name);
-        drop(transaction);
-        drop(projection);
-
-        ProjectionRoot::open(root.path()).unwrap();
-
-        assert_eq!(std::fs::read(&path).unwrap(), b"main bytes");
-        assert_eq!(
-            crate::read_current_branch(&layout).unwrap().to_string(),
-            "main"
-        );
-        assert!(!transaction_path.exists());
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn committed_branch_transaction_keeps_tree_and_head_during_cleanup_recovery() {
-        let root = tempfile::tempdir().unwrap();
-        let layout = crate::init(root.path()).unwrap().layout;
-        let path = root.path().join("owned.txt");
-        std::fs::write(&path, b"main bytes").unwrap();
-        let file_id = repo_path("owned.txt".to_string());
-        let entry = ValidatedSourceEntry {
-            file_id: &file_id,
-            kind: regular(),
-            content: b"feature bytes",
-        };
-        let transition = BranchProjectionTransition {
-            previous_branch: "main".to_string(),
-            previous_head: SemanticChangeId::from_hash(Hash256::from_bytes([0x21; 32])),
-            target_branch: "feature".to_string(),
-            target_head: SemanticChangeId::from_hash(Hash256::from_bytes([0x22; 32])),
-        };
-        let projection = ProjectionRoot::open(root.path()).unwrap();
-        let (identity, state) = projection
-            .inspect_named_existing_object(
-                &projection.root,
-                std::ffi::OsStr::new("owned.txt"),
-                ExistingObjectKind::File,
-                &path,
-            )
-            .unwrap();
-        let mut transaction = projection
-            .create_reconciliation_transaction_with_transition(Some(transition))
-            .unwrap();
-        let staged = projection
-            .stage_reconciliation_entries(&transaction.directory, &[entry])
-            .unwrap();
-        projection
-            .back_up_existing_object(
-                &mut transaction,
-                &PlannedExistingObject {
-                    relative: PathBuf::from("owned.txt"),
-                    kind: ExistingObjectKind::File,
-                    identity,
-                    state,
-                },
-                0,
-            )
-            .unwrap();
-        projection
-            .publish_staged_entry(&mut transaction, &staged[0])
-            .unwrap();
-        projection
-            .write_branch_marker_capability("feature")
-            .unwrap();
-        transaction.manifest.state = ReconciliationTransactionState::Committed;
-        projection
-            .persist_reconciliation_manifest(&transaction)
-            .unwrap();
-        let transaction_path = projection
-            .reconciliation_control_path()
-            .join(&transaction.name);
-        drop(transaction);
-        drop(projection);
-
-        ProjectionRoot::open(root.path()).unwrap();
-
-        assert_eq!(std::fs::read(&path).unwrap(), b"feature bytes");
-        assert_eq!(
-            crate::read_current_branch(&layout).unwrap().to_string(),
-            "feature"
-        );
-        assert!(!transaction_path.exists());
     }
 
     #[cfg(any(unix, windows))]

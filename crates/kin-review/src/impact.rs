@@ -550,10 +550,8 @@ pub fn analyze_impact_at<I: ImpactGraph>(
                         contract_consumers.push(entity);
                     }
                 }
-                RelationKind::Tests => {
-                    if seen_tests.insert(affected_id) {
-                        tests.push(entity);
-                    }
+                RelationKind::Tests if seen_tests.insert(affected_id) => {
+                    tests.push(entity);
                 }
                 _ => {}
             }
@@ -743,6 +741,7 @@ mod tests {
                         TreeEntry::blob(Hash256::from_bytes([0x5a; 32]), false),
                     ),
                 }],
+                admission_policy_delta: None,
             })
             .expect("test artifact admission");
         artifact_id
