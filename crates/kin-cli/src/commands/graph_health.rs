@@ -46,7 +46,7 @@ pub(crate) fn inspect_graph(
     graph: &kin_db::InMemoryGraph,
 ) -> Result<GraphHealthReport> {
     let stats = graph.graph_stats();
-    let supported_inputs = collect_supported_inputs(layout)?;
+    let supported_inputs = collect_supported_inputs(layout, graph)?;
     let contamination = collect_contamination(graph)?;
     Ok(build_graph_health_report(
         &stats,
@@ -55,9 +55,12 @@ pub(crate) fn inspect_graph(
     ))
 }
 
-fn collect_supported_inputs(layout: &kin_core::KinLayout) -> Result<SupportedInputCounts> {
+fn collect_supported_inputs(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+) -> Result<SupportedInputCounts> {
     let source_root = kin_core::source_dir(layout);
-    let admitted_entries = collect_on_disk_tree_entries(&source_root)?;
+    let admitted_entries = collect_on_disk_tree_entries(&source_root, graph)?;
     let mut entity_source = 0usize;
     let mut shallow_source = 0usize;
 

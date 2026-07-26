@@ -105,7 +105,7 @@ pub async fn run(heal: bool, json: bool) -> Result<()> {
     let graph = snap.graph();
 
     let source_root = kin_core::source_dir(&layout);
-    let on_disk = collect_on_disk_tree_entries(&source_root)?;
+    let on_disk = collect_on_disk_tree_entries(&source_root, graph.as_ref())?;
 
     let report = detect_drift(graph.as_ref(), &on_disk);
 
@@ -279,7 +279,7 @@ mod tests {
     use kin_db::InMemoryGraph;
     use kin_model::{
         ArtifactId, AuthorId, ChangeStore, GitObjectId, Hash256, LocatedEntry, SemanticChange,
-        SemanticChangeId, Timestamp, TreeDelta,
+        SemanticChangeId, Timestamp, TransactionDelta, TreeDelta,
     };
 
     fn path(value: &str) -> RepoPath {
@@ -295,6 +295,20 @@ mod tests {
         let genesis = kin_core::build_genesis_change();
         graph.create_change(&genesis).unwrap();
 
+        let tree_deltas = files
+            .iter()
+            .map(|(path, entry)| TreeDelta::Added {
+                artifact_id: ArtifactId::new(),
+                new: LocatedEntry::new(path.clone(), *entry),
+            })
+            .collect::<Vec<_>>();
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: tree_deltas.clone(),
+            })
+            .unwrap();
         let projected_files = files
             .iter()
             .filter_map(|(path, _)| path.as_utf8().map(|value| FilePathId::new(value)))
@@ -307,13 +321,7 @@ mod tests {
             message: "seed exact doctor tree".to_string(),
             entity_deltas: Vec::new(),
             relation_deltas: Vec::new(),
-            tree_deltas: files
-                .into_iter()
-                .map(|(path, entry)| TreeDelta::Added {
-                    artifact_id: ArtifactId::new(),
-                    new: LocatedEntry::new(path, entry),
-                })
-                .collect(),
+            tree_deltas,
             projected_files,
             spec_link: None,
             evidence: Vec::new(),
@@ -349,6 +357,73 @@ mod tests {
         let report = detect_drift(&graph, &disk);
         assert!(report.is_clean(), "expected clean, got {report:?}");
         assert_eq!(report.total(), 0);
+    }
+
+    #[test]
+    fn exact_scan_keeps_graph_tracked_files_visible_after_ignore_rule_changes() {
+        let repo = tempfile::tempdir().unwrap();
+        let tracked_bytes = b"graph-owned bytes";
+        let ignore_bytes = b"tracked.bin\n";
+        std::fs::write(repo.path().join("tracked.bin"), tracked_bytes).unwrap();
+        std::fs::write(repo.path().join(".kinignore"), ignore_bytes).unwrap();
+        let graph = graph_with_entries(vec![
+            (
+                path("tracked.bin"),
+                TreeEntry::blob(
+                    Hash256::from_bytes(kin_blobs::digest_bytes(tracked_bytes)),
+                    false,
+                ),
+            ),
+            (
+                path(".kinignore"),
+                TreeEntry::blob(
+                    Hash256::from_bytes(kin_blobs::digest_bytes(ignore_bytes)),
+                    false,
+                ),
+            ),
+        ]);
+
+        let observed =
+            collect_on_disk_tree_entries(repo.path(), &graph).expect("complete exact scan");
+        let report = detect_drift(&graph, &observed);
+
+        assert!(report.is_clean(), "tracked ignore transition: {report:?}");
+    }
+
+    #[test]
+    fn exact_scan_preserves_gitlink_without_expanding_host_checkout() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("vendor/child/src")).unwrap();
+        std::fs::write(
+            repo.path().join("vendor/child/src/lib.rs"),
+            b"host checkout is not parent repository truth",
+        )
+        .unwrap();
+        let ordinary_bytes = b"ordinary";
+        std::fs::write(repo.path().join("ordinary.txt"), ordinary_bytes).unwrap();
+        let gitlink = TreeEntry::gitlink(GitObjectId::sha1([0x77; 20]));
+        let graph = graph_with_entries(vec![
+            (path("vendor/child"), gitlink),
+            (
+                path("ordinary.txt"),
+                TreeEntry::blob(
+                    Hash256::from_bytes(kin_blobs::digest_bytes(ordinary_bytes)),
+                    false,
+                ),
+            ),
+        ]);
+
+        let observed =
+            collect_on_disk_tree_entries(repo.path(), &graph).expect("complete exact scan");
+        let report = detect_drift(&graph, &observed);
+
+        assert!(report.is_clean(), "graph-only Gitlink drift: {report:?}");
+        assert!(observed
+            .iter()
+            .any(|(repo_path, entry)| repo_path == &path("vendor/child") && entry == &gitlink));
+        assert!(!observed
+            .iter()
+            .any(|(repo_path, _)| repo_path == &path("vendor/child/src/lib.rs")));
     }
 
     #[test]

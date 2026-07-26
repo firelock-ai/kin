@@ -3495,17 +3495,46 @@ fn summarize_shallow_items(items: impl IntoIterator<Item = String>) -> Vec<Strin
 /// admission.
 pub(crate) fn collect_on_disk_tree_entries(
     source_root: &Path,
+    graph: &kin_db::InMemoryGraph,
 ) -> Result<Vec<(RepoPath, TreeEntry)>> {
+    let current_tree = graph.resolved_tree();
+    let tracked_paths = current_tree
+        .artifacts_by_path()
+        .map(|artifact| artifact.path.clone())
+        .collect::<Vec<_>>();
+    let graph_only_paths = current_tree
+        .artifacts_by_path()
+        .filter(|artifact| matches!(artifact.entry, TreeEntry::Gitlink { .. }))
+        .map(|artifact| artifact.path.clone())
+        .collect::<Vec<_>>();
     let ignore = kin_index::RepositoryIgnore::load(source_root)?;
-    let scan = kin_index::scan_repository(source_root, &ignore, std::iter::empty())?;
-    scan.entries()
+    let scan = kin_index::scan_repository_preserving_graph_only(
+        source_root,
+        &ignore,
+        tracked_paths.iter(),
+        graph_only_paths.iter(),
+    )?;
+    let mut observed = scan
+        .entries()
         .map(|entry| {
             let content = kin_index::read_verified_scanned_entry(entry)
                 .with_context(|| format!("read exact working-tree entry {}", entry.repo_path))?;
             let hash = kin_blobs::digest_bytes(&content);
             Ok((entry.repo_path.clone(), exact_tree_entry(hash, entry.kind)))
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    // Gitlinks are graph-only repository members. A host directory cannot
+    // prove their target identity, and host absence cannot prove removal.
+    // Carry their existing exact graph entry into the observation just as the
+    // complete scanner's graph-only token requires.
+    observed.extend(
+        current_tree
+            .artifacts_by_path()
+            .filter(|artifact| matches!(artifact.entry, TreeEntry::Gitlink { .. }))
+            .map(|artifact| (artifact.path.clone(), artifact.entry)),
+    );
+    observed.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(observed)
 }
 
 fn count_supported_source_inputs(indexable_files: &[IndexableFile]) -> (usize, usize) {
