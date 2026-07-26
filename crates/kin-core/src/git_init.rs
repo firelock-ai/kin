@@ -758,6 +758,53 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn private_git_repository_keeps_staged_and_published_authority_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o700)).unwrap();
+        initialize_git(&source);
+        std::fs::write(source.join("README.md"), b"private source\n").unwrap();
+        git(&source, ["add", "--all"]);
+        git(&source, ["commit", "-m", "private history"]);
+
+        let staging_parent = root.path().to_path_buf();
+        let result = init_from_git_with_hook(&source, move || {
+            let staging = std::fs::read_dir(&staging_parent)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with(".kin.init-"))
+                })
+                .expect("complete unpublished staging directory");
+            assert_eq!(
+                std::fs::symlink_metadata(&staging)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert!(staging.join("config.toml").is_file());
+        })
+        .unwrap();
+
+        assert_eq!(
+            std::fs::symlink_metadata(result.layout.root())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_no_staging_directories(root.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn exact_git_init_admits_polyglot_non_code_and_opaque_history_atomically() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
