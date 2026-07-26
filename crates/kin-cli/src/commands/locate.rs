@@ -2790,6 +2790,16 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         );
     }
 
+    rerank_path_affinity(&mut fused, text);
+    if explain {
+        record_debug_stage(
+            &mut score_breakdown,
+            &mut debug_info,
+            &fused,
+            "after_path_affinity",
+        );
+    }
+
     promote_named_source_surfaces(&mut fused, text, &source_files, workspace_root);
     if explain {
         record_debug_stage(
@@ -12776,6 +12786,131 @@ fn rerank_cli_surface_paths(
     }
 }
 
+/// Query words considered too generic to carry path-affinity evidence on
+/// their own; a segment named `error/` or `test/` matches issue prose far
+/// too often to discriminate anything.
+fn is_path_affinity_stopword(token: &str) -> bool {
+    matches!(
+        token,
+        "the"
+            | "and"
+            | "for"
+            | "not"
+            | "when"
+            | "with"
+            | "this"
+            | "that"
+            | "fix"
+            | "fixes"
+            | "bug"
+            | "issue"
+            | "add"
+            | "added"
+            | "new"
+            | "use"
+            | "can"
+            | "now"
+            | "are"
+            | "was"
+            | "get"
+            | "set"
+            | "error"
+            | "errors"
+            | "test"
+            | "tests"
+            | "src"
+            | "lib"
+            | "pkg"
+            | "internal"
+            | "docs"
+            | "main"
+            | "code"
+            | "file"
+            | "files"
+    )
+}
+
+/// Deterministic query-token to path-segment affinity. When the query names
+/// the surface the path encodes (a command family plus verb like
+/// `release list` against `pkg/cmd/release/list/list.go`), lexical path
+/// evidence must be able to discriminate verb siblings that the semantic
+/// channels rank as near-neighbors. Two adjacent query tokens matching two
+/// consecutive path segments is strong evidence; isolated segment matches
+/// are weak. The boost is bounded and multiplicative; no graph or filesystem
+/// reads. `KIN_LOCATE_PATH_AFFINITY=0` disables.
+fn rerank_path_affinity(fused: &mut Vec<(String, f32)>, text: &str) {
+    if fused.is_empty() || !locate_env_bool("KIN_LOCATE_PATH_AFFINITY", true) {
+        return;
+    }
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            current.push(c.to_ascii_lowercase());
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens.retain(|t| {
+        t.len() >= 3
+            && t.len() <= 24
+            && !is_path_affinity_stopword(t)
+            && !is_generic_code_modifier_term(t)
+    });
+    if tokens.is_empty() {
+        return;
+    }
+    let bigrams: Vec<(&str, &str)> = tokens
+        .windows(2)
+        .map(|w| (w[0].as_str(), w[1].as_str()))
+        .collect();
+    let token_set: HashSet<&str> = tokens.iter().map(|t| t.as_str()).collect();
+
+    let bigram_boost = locate_env_f32("KIN_LOCATE_PATH_AFFINITY_BIGRAM_BOOST", 0.35);
+    let token_boost = locate_env_f32("KIN_LOCATE_PATH_AFFINITY_TOKEN_BOOST", 0.06);
+    let factor_cap = locate_env_f32("KIN_LOCATE_PATH_AFFINITY_FACTOR_CAP", 1.6);
+
+    let mut changed = false;
+    for (path, score) in fused.iter_mut() {
+        let lower = path.to_ascii_lowercase();
+        let mut segments: Vec<&str> = lower.split('/').collect();
+        if let Some(last) = segments.last_mut() {
+            if let Some(stem) = last.split('.').next() {
+                *last = stem;
+            }
+        }
+        let strong = bigrams.iter().any(|(a, b)| {
+            segments
+                .windows(2)
+                .any(|pair| pair[0] == *a && pair[1] == *b)
+        });
+        let weak = token_set
+            .iter()
+            .filter(|t| segments.iter().any(|seg| seg == *t))
+            .count()
+            .min(3) as f32;
+        if !strong && weak == 0.0 {
+            continue;
+        }
+        let factor =
+            (1.0 + if strong { bigram_boost } else { 0.0 } + weak * token_boost).min(factor_cap);
+        if factor > 1.0 {
+            *score *= factor;
+            changed = true;
+        }
+    }
+    if changed {
+        fused.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+    }
+}
+
 fn promote_cli_surface_local_headers(
     fused: &mut Vec<(String, f32)>,
     top_score: f32,
@@ -15910,6 +16045,54 @@ mod tests {
         );
         bound_fused_declaration_to_primary(&mut fused, 10, false);
         assert_eq!(fused.files.len(), 3, "larger budget is a no-op");
+    }
+
+    #[test]
+    fn path_affinity_discriminates_verb_siblings() {
+        let mut fused = vec![
+            ("pkg/cmd/release/create/create.go".to_string(), 10.0f32),
+            ("pkg/cmd/release/list/list.go".to_string(), 9.0f32),
+            ("pkg/cmd/release/shared/fetch.go".to_string(), 8.0f32),
+        ];
+        rerank_path_affinity(&mut fused, "added Order flag for release list command");
+        assert_eq!(
+            fused[0].0, "pkg/cmd/release/list/list.go",
+            "the verb bigram must lift the right sibling: {fused:?}"
+        );
+        assert_eq!(
+            fused[1].0, "pkg/cmd/release/create/create.go",
+            "the wrong verb sibling keeps only its family evidence: {fused:?}"
+        );
+    }
+
+    #[test]
+    fn path_affinity_leaves_prose_queries_untouched() {
+        let before = vec![
+            ("models/scanresults.go".to_string(), 5.0f32),
+            ("scanner/scan.go".to_string(), 4.0f32),
+        ];
+        let mut fused = before.clone();
+        rerank_path_affinity(
+            &mut fused,
+            "please repair the broken behavior when scanning",
+        );
+        assert_eq!(
+            fused, before,
+            "prose without exact segment tokens must not move scores"
+        );
+    }
+
+    #[test]
+    fn path_affinity_weak_single_matches_stay_bounded() {
+        let mut fused = vec![
+            ("pkg/cmd/pr/create/create.go".to_string(), 10.0f32),
+            ("pkg/cmd/pr/view/view.go".to_string(), 9.0f32),
+        ];
+        rerank_path_affinity(&mut fused, "the view output should include the number");
+        assert_eq!(
+            fused[0].0, "pkg/cmd/pr/create/create.go",
+            "one isolated token must not overturn a real score gap: {fused:?}"
+        );
     }
 
     #[test]
