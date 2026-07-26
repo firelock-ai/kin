@@ -38,7 +38,7 @@ use crate::engine::InMemoryGraph;
 use crate::error::KinDbError;
 use crate::storage::authority::{
     AuthorityCommitDecision, AuthorityPublication, AuthorityReadLease, DurableAuthorityPersistence,
-    PersistOutcome, VersionedAuthorityState,
+    PersistOutcome, RetainedPersistOutcome, VersionedAuthorityState,
 };
 use crate::storage::backend::{
     load_recovered_snapshot, validate_source_blob_size, verify_source_blob_digest, Generation,
@@ -459,6 +459,36 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
     }
 }
 
+impl RepositorySnapshotPersistence<LocalFileBackend> {
+    fn persist_and_freeze(
+        &self,
+        next: &RepositoryAuthorityState,
+    ) -> RetainedPersistOutcome<LocalAuthorityFreezeLock> {
+        let bytes = match next.snapshot.to_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => return RetainedPersistOutcome::NotCommitted(error),
+        };
+        let mut cursor = self.backend_cursor.lock();
+        match self
+            .backend
+            .save_snapshot_and_freeze(self.repository_id.as_str(), &bytes, *cursor)
+        {
+            Ok((committed_cursor, retained)) if committed_cursor != *cursor => {
+                *cursor = committed_cursor;
+                RetainedPersistOutcome::Committed { retained }
+            }
+            Ok((committed_cursor, _)) => RetainedPersistOutcome::Indeterminate(storage(format!(
+                "snapshot backend acknowledged authority without advancing its CAS cursor from {}",
+                committed_cursor.backend_generation()
+            ))),
+            Err(error @ KinDbError::SnapshotPersistenceIndeterminate(_)) => {
+                RetainedPersistOutcome::Indeterminate(error)
+            }
+            Err(error) => RetainedPersistOutcome::NotCommitted(error),
+        }
+    }
+}
+
 impl<B: StorageBackend + ?Sized + 'static> DurableAuthorityPersistence<RepositoryAuthorityState>
     for RepositorySnapshotPersistence<B>
 {
@@ -849,53 +879,65 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         let backend = Arc::clone(&self.backend);
 
         self.publication.commit(|current| {
-            let metadata = current.metadata();
-            if transaction.repository_id != repository_id {
-                return Err(ModelError::InvalidOperation(format!(
-                    "transaction repository {} does not match authority repository {}",
-                    transaction.repository_id, repository_id
-                ))
-                .into());
-            }
-
-            if let Some(receipt) = metadata
-                .receipts
-                .iter()
-                .find(|receipt| receipt.operation_id == transaction.operation_id)
-            {
-                if receipt.transaction_hash != transaction_hash {
-                    return Err(ModelError::Conflict(format!(
-                        "operation {} was already committed with a different transaction hash",
-                        transaction.operation_id
-                    ))
-                    .into());
-                }
-                let mut replay = receipt.clone();
-                replay.outcome = RepositoryCommitOutcome::IdempotentReplay;
-                return Ok(AuthorityCommitDecision::IdempotentReplay { output: replay });
-            }
-
-            if transaction.expected_generation != current.generation()
-                || transaction.expected_roots != *current.roots()
-            {
-                return Err(ModelError::Conflict(format!(
-                    "repository {} authority moved from expected generation/root bundle",
-                    repository_id
-                ))
-                .into());
-            }
-
-            let (next, receipt) =
-                prepare_successor(current, &transaction, transaction_hash, backend.as_ref())?;
-            Ok(AuthorityCommitDecision::Publish {
-                next,
-                output: receipt,
-            })
+            prepare_repository_commit_decision(
+                current,
+                &transaction,
+                transaction_hash,
+                &repository_id,
+                backend.as_ref(),
+            )
         })
     }
 }
 
 impl RepositoryAuthorityManager<LocalFileBackend> {
+    /// Commit one complete local repository transaction and return a freeze
+    /// that still holds the exact backend lock used for its durable CAS.
+    ///
+    /// A successful new commit has no release/reacquire window: the local
+    /// authority record is installed, the immutable in-memory successor is
+    /// published, and the guard is returned while the same OS lock remains
+    /// held. An idempotent replay acquires the lock and reloads the exact
+    /// current authority before returning its guard.
+    pub fn commit_repository_transaction_and_freeze(
+        &self,
+        transaction: RepositoryTransaction,
+    ) -> Result<(RepositoryCommitReceipt, LocalRepositoryAuthorityFreeze), KinDbError> {
+        transaction.validate()?;
+        let transaction_hash = transaction.transaction_hash()?;
+        let repository_id = self.repository_id.clone();
+        let backend = Arc::clone(&self.backend);
+
+        self.publication.commit_and_retain(
+            |current| {
+                prepare_repository_commit_decision(
+                    current,
+                    &transaction,
+                    transaction_hash,
+                    &repository_id,
+                    backend.as_ref(),
+                )
+            },
+            |_, current| self.freeze_exact_state(current),
+            |persistence, _, next| match persistence.persist_and_freeze(next) {
+                RetainedPersistOutcome::Committed { retained } => {
+                    RetainedPersistOutcome::Committed {
+                        retained: LocalRepositoryAuthorityFreeze {
+                            state: next.clone(),
+                            _lock: retained,
+                        },
+                    }
+                }
+                RetainedPersistOutcome::NotCommitted(error) => {
+                    RetainedPersistOutcome::NotCommitted(error)
+                }
+                RetainedPersistOutcome::Indeterminate(error) => {
+                    RetainedPersistOutcome::Indeterminate(error)
+                }
+            },
+        )
+    }
+
     /// Freeze one expected local authority generation for a namespace
     /// transition.
     ///
@@ -910,15 +952,21 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
         &self,
         expected_roots: &RootBundle,
     ) -> Result<LocalRepositoryAuthorityFreeze, KinDbError> {
-        let published_roots = self.read_authority().roots().clone();
-        if &published_roots != expected_roots {
+        let published = self.read_authority();
+        if published.roots() != expected_roots {
             return Err(ModelError::Conflict(format!(
                 "repository {} published authority moved from the expected root bundle before local freeze",
                 self.repository_id
             ))
             .into());
         }
+        self.freeze_exact_state(&published)
+    }
 
+    fn freeze_exact_state(
+        &self,
+        expected: &RepositoryAuthorityState,
+    ) -> Result<LocalRepositoryAuthorityFreeze, KinDbError> {
         let locked = self
             .backend
             .freeze_existing_authority(self.repository_id.as_str())?;
@@ -945,7 +993,7 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
         validate_all_authority_bodies(&body_backend, &self.repository_id, &snapshot)?;
 
         let state = RepositoryAuthorityState::from_validated_snapshot(snapshot);
-        if state.roots() != expected_roots || state.roots() != &published_roots {
+        if state.roots() != expected.roots() {
             return Err(ModelError::Conflict(format!(
                 "repository {} persisted authority moved from the expected root bundle while local freeze was acquired",
                 self.repository_id
@@ -1055,6 +1103,57 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
             .into())
         }
     }
+}
+
+fn prepare_repository_commit_decision<B: StorageBackend + ?Sized>(
+    current: &RepositoryAuthorityState,
+    transaction: &RepositoryTransaction,
+    transaction_hash: Hash256,
+    repository_id: &RepositoryId,
+    backend: &B,
+) -> Result<AuthorityCommitDecision<RepositoryAuthorityState, RepositoryCommitReceipt>, KinDbError>
+{
+    let metadata = current.metadata();
+    if &transaction.repository_id != repository_id {
+        return Err(ModelError::InvalidOperation(format!(
+            "transaction repository {} does not match authority repository {}",
+            transaction.repository_id, repository_id
+        ))
+        .into());
+    }
+
+    if let Some(receipt) = metadata
+        .receipts
+        .iter()
+        .find(|receipt| receipt.operation_id == transaction.operation_id)
+    {
+        if receipt.transaction_hash != transaction_hash {
+            return Err(ModelError::Conflict(format!(
+                "operation {} was already committed with a different transaction hash",
+                transaction.operation_id
+            ))
+            .into());
+        }
+        let mut replay = receipt.clone();
+        replay.outcome = RepositoryCommitOutcome::IdempotentReplay;
+        return Ok(AuthorityCommitDecision::IdempotentReplay { output: replay });
+    }
+
+    if transaction.expected_generation != current.generation()
+        || transaction.expected_roots != *current.roots()
+    {
+        return Err(ModelError::Conflict(format!(
+            "repository {} authority moved from expected generation/root bundle",
+            repository_id
+        ))
+        .into());
+    }
+
+    let (next, receipt) = prepare_successor(current, transaction, transaction_hash, backend)?;
+    Ok(AuthorityCommitDecision::Publish {
+        next,
+        output: receipt,
+    })
 }
 
 fn prepare_successor<B: StorageBackend + ?Sized>(
@@ -7230,6 +7329,143 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reopened.read_authority().generation(), 2);
+    }
+
+    #[test]
+    fn local_commit_returns_successor_freeze_without_releasing_writer_lock() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .unwrap();
+
+        let competing = RepositoryAuthorityManager::open(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        )
+        .unwrap();
+        let successor = unborn_workspace_transaction(&manager, 0x5410, 0x5411, b"successor");
+        let stale_competitor =
+            unborn_workspace_transaction(&competing, 0x5412, 0x5413, b"competitor");
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let finished_rx = Arc::new(std::sync::Mutex::new(finished_rx));
+        let writer = std::thread::spawn(move || {
+            release_rx.recv().unwrap();
+            started_tx.send(()).unwrap();
+            finished_tx
+                .send(competing.commit_repository_transaction(stale_competitor))
+                .unwrap();
+        });
+        let hook_finished_rx = Arc::clone(&finished_rx);
+        backend.set_snapshot_before_authority_commit_hook(move || {
+            release_tx.send(()).unwrap();
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            assert!(
+                hook_finished_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_millis(200))
+                    .is_err(),
+                "the competing writer must wait behind the commit-point lock"
+            );
+        });
+
+        let (receipt, freeze) = manager
+            .commit_repository_transaction_and_freeze(successor)
+            .expect("local commit must return its still-held successor lock");
+        assert_eq!(receipt.generation, 2);
+        assert_eq!(freeze.roots(), &receipt.roots_after);
+        assert_eq!(freeze.authority().roots(), &receipt.roots_after);
+        assert!(
+            finished_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "the successor freeze must retain the commit-point lock"
+        );
+
+        drop(freeze);
+        let error = finished_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the blocked writer must resume after freeze release")
+            .expect_err("the blocked stale writer must lose successor CAS");
+        assert!(
+            error.to_string().contains("generation mismatch"),
+            "unexpected stale-writer error: {error}"
+        );
+        writer.join().unwrap();
+
+        let reopened = RepositoryAuthorityManager::open(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        )
+        .unwrap();
+        assert_eq!(reopened.read_authority().generation(), receipt.generation);
+        assert_eq!(reopened.read_authority().roots(), &receipt.roots_after);
+    }
+
+    #[test]
+    fn local_idempotent_commit_replay_returns_exact_held_freeze() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        let transaction = arbitrary_repository_transaction(&manager);
+        let (receipt, initial_freeze) = manager
+            .commit_repository_transaction_and_freeze(transaction.clone())
+            .expect("initial local commit must return its successor freeze");
+        drop(initial_freeze);
+
+        let competing = RepositoryAuthorityManager::open(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        )
+        .unwrap();
+        let competing_transaction =
+            unborn_workspace_transaction(&competing, 0x5420, 0x5421, b"after-replay");
+        let (replay, replay_freeze) = manager
+            .commit_repository_transaction_and_freeze(transaction)
+            .expect("idempotent replay must freeze the exact installed successor");
+        assert_eq!(replay.operation_id, receipt.operation_id);
+        assert_eq!(replay.roots_after, receipt.roots_after);
+        assert_eq!(replay.outcome, RepositoryCommitOutcome::IdempotentReplay);
+        assert_eq!(replay_freeze.roots(), &receipt.roots_after);
+        assert_eq!(replay_freeze.authority().roots(), &receipt.roots_after);
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx
+                .send(competing.commit_repository_transaction(competing_transaction))
+                .unwrap();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "an idempotent replay freeze must retain the installed authority lock"
+        );
+
+        drop(replay_freeze);
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the competing writer must resume after replay freeze release")
+            .expect("the competing writer must commit against the unchanged replayed parent");
+        writer.join().unwrap();
     }
 
     #[cfg(unix)]

@@ -2986,6 +2986,151 @@ impl LocalFileBackend {
             .collect()
     }
 
+    /// Persist one complete snapshot while the caller holds this repository's
+    /// exclusive local authority lock.
+    ///
+    /// Keeping lock acquisition outside this helper lets the ordinary storage
+    /// API drop the lock on return while the repository-authority API can
+    /// return the exact same lock as a held successor freeze.
+    fn save_snapshot_unlocked(
+        &self,
+        repo_id: &str,
+        data: &[u8],
+        expected_gen: Generation,
+    ) -> Result<Generation, KinDbError> {
+        let current = self.load_authority_unlocked(repo_id)?;
+        let current_record = self.read_authority_record_raw_unlocked(repo_id)?;
+        match (current.as_ref(), current_record.as_ref()) {
+            (Some(authority), Some(record))
+                if authority.snapshot_generation == record.snapshot_generation
+                    && authority.head_generation == record.head_generation
+                    && Self::snapshot_digest(&authority.snapshot_bytes)
+                        == record.snapshot_sha256 => {}
+            (None, None) => {}
+            _ => {
+                return Err(KinDbError::StorageError(format!(
+                    "repo {repo_id} snapshot authority changed while preparing full promotion"
+                )));
+            }
+        }
+        let current_gen = current
+            .as_ref()
+            .map_or(GENERATION_INIT, |authority| authority.head_generation);
+        let requested_digest = Self::snapshot_digest(data);
+        if let Some(record) = current_record.as_ref() {
+            let retry_generation = expected_gen.checked_add(1);
+            if retry_generation == Some(record.head_generation)
+                && record.snapshot_generation == record.head_generation
+                && record.snapshot_sha256 == requested_digest
+                && current.as_ref().is_some_and(|authority| {
+                    authority.snapshot_generation == record.snapshot_generation
+                        && authority.head_generation == record.head_generation
+                        && Self::snapshot_digest(&authority.snapshot_bytes) == requested_digest
+                })
+            {
+                // Exact serialized-content retries are idempotent after an
+                // authority rename whose directory sync result was uncertain.
+                // Re-sync the authority directory before accepting.
+                mmap::sync_parent_dir(&self.authority_path(repo_id)).map_err(|error| {
+                    KinDbError::SnapshotPersistenceIndeterminate(format!(
+                        "local authority {} is installed but durability remains unconfirmed: {error}",
+                        self.authority_path(repo_id).display()
+                    ))
+                })?;
+                return Ok(record.head_generation);
+            }
+        }
+        self.reject_unbound_staged_deltas_unlocked(repo_id, current_record.as_ref())?;
+        if current_gen != expected_gen {
+            return Err(KinDbError::StorageError(format!(
+                "generation mismatch for repo {repo_id}: expected {expected_gen}, found {current_gen} \
+                 (another writer committed since last load)"
+            )));
+        }
+
+        // Validate the bytes without re-serializing — from_bytes proves the
+        // data round-trips, then we write the *original* bytes to disk.
+        let _snapshot = GraphSnapshot::from_bytes(data)?;
+        let new_gen = checked_next_generation(current_gen, "local snapshot")?;
+        let versioned_path = self.versioned_snapshot_path(repo_id, new_gen);
+        Self::atomic_write(&versioned_path, data)?;
+
+        #[cfg(test)]
+        if self
+            .fail_before_authority_commit
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(KinDbError::StorageError(
+                "injected crash before local snapshot authority commit".to_string(),
+            ));
+        }
+
+        #[cfg(test)]
+        if let Some(hook) = self.snapshot_before_authority_commit_hook.lock().take() {
+            hook();
+        }
+
+        let captured_for_cleanup =
+            self.capture_authority_bound_deltas_unlocked(repo_id, current_record.as_ref())?;
+        self.reject_unbound_staged_deltas_unlocked(repo_id, current_record.as_ref())?;
+        if self.capture_authority_bound_deltas_unlocked(repo_id, current_record.as_ref())?
+            != captured_for_cleanup
+            || self.read_authority_record_raw_unlocked(repo_id)? != current_record
+        {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id} authority or journal changed during full promotion; authority was not committed"
+            )));
+        }
+
+        let record = LocalAuthorityRecord {
+            version: LOCAL_AUTHORITY_VERSION,
+            snapshot_generation: new_gen,
+            head_generation: new_gen,
+            snapshot_file: Self::snapshot_file_name(new_gen),
+            snapshot_sha256: requested_digest,
+            acknowledged_deltas: Vec::new(),
+            retired_deltas: Self::delta_identities(&captured_for_cleanup),
+        };
+        self.write_authority_unlocked(repo_id, &record)?;
+        if let Err(error) = self.clear_superseded_snapshots_unlocked(repo_id, new_gen) {
+            tracing::warn!(repo_id, error = %error, "deferred superseded local snapshot cleanup");
+        }
+        Ok(new_gen)
+    }
+
+    /// Persist a local full-snapshot CAS and return the same still-held
+    /// repository lock that protected its commit point.
+    pub(crate) fn save_snapshot_and_freeze(
+        &self,
+        repo_id: &str,
+        data: &[u8],
+        expected_cursor: SnapshotCursor,
+    ) -> Result<(SnapshotCursor, LocalAuthorityFreezeLock), KinDbError> {
+        let expected_gen = expected_cursor.backend_generation();
+        let lock_file = if expected_gen == GENERATION_INIT
+            && self.existing_repository_path(repo_id)?.is_none()
+        {
+            self.acquire_lock(repo_id)?
+        } else {
+            self.acquire_existing_lock(repo_id)?
+        };
+        let generation = self.save_snapshot_unlocked(repo_id, data, expected_gen)?;
+        let cursor = SnapshotCursor::from_backend_generation(generation);
+        let authority = SnapshotAuthority {
+            snapshot_bytes: data.to_vec(),
+            snapshot_generation: generation,
+            head_generation: generation,
+        };
+        Ok((
+            cursor,
+            LocalAuthorityFreezeLock {
+                repo_id: repo_id.to_string(),
+                authority,
+                _lock_file: lock_file,
+            },
+        ))
+    }
+
     #[cfg(test)]
     pub(crate) fn fail_next_snapshot_before_authority_commit(&self) {
         self.fail_before_authority_commit
@@ -3023,7 +3168,10 @@ impl LocalFileBackend {
     }
 
     #[cfg(test)]
-    fn set_snapshot_before_authority_commit_hook(&self, hook: impl FnOnce() + Send + 'static) {
+    pub(crate) fn set_snapshot_before_authority_commit_hook(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
         *self.snapshot_before_authority_commit_hook.lock() = Some(Box::new(hook));
     }
 
@@ -3434,104 +3582,7 @@ impl StorageBackend for LocalFileBackend {
         } else {
             self.acquire_existing_lock(repo_id)?
         };
-        let current = self.load_authority_unlocked(repo_id)?;
-        let current_record = self.read_authority_record_raw_unlocked(repo_id)?;
-        match (current.as_ref(), current_record.as_ref()) {
-            (Some(authority), Some(record))
-                if authority.snapshot_generation == record.snapshot_generation
-                    && authority.head_generation == record.head_generation
-                    && Self::snapshot_digest(&authority.snapshot_bytes)
-                        == record.snapshot_sha256 => {}
-            (None, None) => {}
-            _ => {
-                return Err(KinDbError::StorageError(format!(
-                    "repo {repo_id} snapshot authority changed while preparing full promotion"
-                )));
-            }
-        }
-        let current_gen = current
-            .as_ref()
-            .map_or(GENERATION_INIT, |authority| authority.head_generation);
-        let requested_digest = Self::snapshot_digest(data);
-        if let Some(record) = current_record.as_ref() {
-            let retry_generation = expected_gen.checked_add(1);
-            if retry_generation == Some(record.head_generation)
-                && record.snapshot_generation == record.head_generation
-                && record.snapshot_sha256 == requested_digest
-                && current.as_ref().is_some_and(|authority| {
-                    authority.snapshot_generation == record.snapshot_generation
-                        && authority.head_generation == record.head_generation
-                        && Self::snapshot_digest(&authority.snapshot_bytes) == requested_digest
-                })
-            {
-                // Exact serialized-content retries are idempotent after an
-                // authority rename whose directory sync result was uncertain.
-                // Re-sync the authority directory before accepting.
-                mmap::sync_parent_dir(&self.authority_path(repo_id)).map_err(|error| {
-                    KinDbError::SnapshotPersistenceIndeterminate(format!(
-                        "local authority {} is installed but durability remains unconfirmed: {error}",
-                        self.authority_path(repo_id).display()
-                    ))
-                })?;
-                return Ok(record.head_generation);
-            }
-        }
-        self.reject_unbound_staged_deltas_unlocked(repo_id, current_record.as_ref())?;
-        if current_gen != expected_gen {
-            return Err(KinDbError::StorageError(format!(
-                "generation mismatch for repo {repo_id}: expected {expected_gen}, found {current_gen} \
-                 (another writer committed since last load)"
-            )));
-        }
-
-        // Validate the bytes without re-serializing — from_bytes proves the
-        // data round-trips, then we write the *original* bytes to disk.
-        let _snapshot = GraphSnapshot::from_bytes(data)?;
-        let new_gen = checked_next_generation(current_gen, "local snapshot")?;
-        let versioned_path = self.versioned_snapshot_path(repo_id, new_gen);
-        Self::atomic_write(&versioned_path, data)?;
-
-        #[cfg(test)]
-        if self
-            .fail_before_authority_commit
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(KinDbError::StorageError(
-                "injected crash before local snapshot authority commit".to_string(),
-            ));
-        }
-
-        #[cfg(test)]
-        if let Some(hook) = self.snapshot_before_authority_commit_hook.lock().take() {
-            hook();
-        }
-
-        let captured_for_cleanup =
-            self.capture_authority_bound_deltas_unlocked(repo_id, current_record.as_ref())?;
-        self.reject_unbound_staged_deltas_unlocked(repo_id, current_record.as_ref())?;
-        if self.capture_authority_bound_deltas_unlocked(repo_id, current_record.as_ref())?
-            != captured_for_cleanup
-            || self.read_authority_record_raw_unlocked(repo_id)? != current_record
-        {
-            return Err(KinDbError::StorageError(format!(
-                "repo {repo_id} authority or journal changed during full promotion; authority was not committed"
-            )));
-        }
-
-        let record = LocalAuthorityRecord {
-            version: LOCAL_AUTHORITY_VERSION,
-            snapshot_generation: new_gen,
-            head_generation: new_gen,
-            snapshot_file: Self::snapshot_file_name(new_gen),
-            snapshot_sha256: requested_digest,
-            acknowledged_deltas: Vec::new(),
-            retired_deltas: Self::delta_identities(&captured_for_cleanup),
-        };
-        self.write_authority_unlocked(repo_id, &record)?;
-        if let Err(error) = self.clear_superseded_snapshots_unlocked(repo_id, new_gen) {
-            tracing::warn!(repo_id, error = %error, "deferred superseded local snapshot cleanup");
-        }
-        Ok(new_gen)
+        self.save_snapshot_unlocked(repo_id, data, expected_gen)
     }
 
     fn save_snapshot_classified(
