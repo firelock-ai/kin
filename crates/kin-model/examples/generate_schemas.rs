@@ -72,13 +72,38 @@ fn main() {
             "TransactionDelta",
             serde_json::to_string_pretty(&schema_for!(kin_model::TransactionDelta)).unwrap(),
         ),
+        // Repository authority
         (
-            "GraphOverlay",
-            serde_json::to_string_pretty(&schema_for!(kin_model::GraphOverlay)).unwrap(),
+            "RefName",
+            serde_json::to_string_pretty(&schema_for!(kin_model::RefName)).unwrap(),
         ),
         (
-            "WorkingCopy",
-            serde_json::to_string_pretty(&schema_for!(kin_model::WorkingCopy)).unwrap(),
+            "RefTarget",
+            serde_json::to_string_pretty(&schema_for!(kin_model::RefTarget)).unwrap(),
+        ),
+        (
+            "RepositoryRefState",
+            serde_json::to_string_pretty(&schema_for!(kin_model::RepositoryRefState)).unwrap(),
+        ),
+        (
+            "WorkspaceState",
+            serde_json::to_string_pretty(&schema_for!(kin_model::WorkspaceState)).unwrap(),
+        ),
+        (
+            "WorkspaceMutation",
+            serde_json::to_string_pretty(&schema_for!(kin_model::WorkspaceMutation)).unwrap(),
+        ),
+        (
+            "RepositoryTransaction",
+            serde_json::to_string_pretty(&schema_for!(kin_model::RepositoryTransaction)).unwrap(),
+        ),
+        (
+            "SharedAdmissionPolicy",
+            serde_json::to_string_pretty(&schema_for!(kin_model::SharedAdmissionPolicy)).unwrap(),
+        ),
+        (
+            "AdmissionScanToken",
+            serde_json::to_string_pretty(&schema_for!(kin_model::AdmissionScanToken)).unwrap(),
         ),
         // Work graph
         (

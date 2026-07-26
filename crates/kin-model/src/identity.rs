@@ -7,32 +7,37 @@
 //! Every store and transport can therefore recompute an incoming
 //! [`SemanticChange`](crate::SemanticChange) before admitting it.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
     Entity, EntityDelta, Hash256, ModelError, Relation, RelationDelta, Result, SemanticChange,
-    SemanticChangeId, TreeDelta,
+    SemanticChangeId, TransactionDelta, TreeDelta,
 };
 
-/// Compute the immutable identity of a complete native semantic change.
+/// Compute the immutable v6 identity of a complete semantic change.
 ///
-/// The existing `id` field is excluded to avoid a self-reference; every other
-/// serialized field participates, including parents, author, timestamp,
-/// message, exact repository-tree transitions, semantic deltas, provenance,
-/// risk, and authored branch.
+/// The existing `id` field is excluded to avoid self-reference. Independent
+/// deltas are sorted by stable target identity, so producer iteration order is
+/// irrelevant. All remaining immutable fields participate, including exact
+/// change origin and admission-policy transitions.
 pub fn compute_semantic_change_id(change: &SemanticChange) -> Result<SemanticChangeId> {
-    // Reuse delta validation so non-finite semantic scores cannot enter a
-    // canonical identity through this higher-level path.
-    let _ = content_identity_from_deltas(
-        &change.entity_deltas,
-        &change.relation_deltas,
-        &change.tree_deltas,
-    )?;
+    let delta = change.transaction_delta();
+    validate_transaction_delta(&delta)?;
 
-    let mut payload = serde_json::to_value(change).map_err(serialization)?;
+    let mut canonical_change = change.clone();
+    canonical_change
+        .entity_deltas
+        .sort_by_key(EntityDelta::target_id);
+    canonical_change
+        .relation_deltas
+        .sort_by_key(RelationDelta::target_id);
+    canonical_change
+        .tree_deltas
+        .sort_by_key(TreeDelta::artifact_id);
+
+    let mut payload = serde_json::to_value(&canonical_change).map_err(serialization)?;
     let fields = payload.as_object_mut().ok_or_else(|| {
         ModelError::InvalidOperation(
             "semantic change identity payload is not an object".to_string(),
@@ -47,10 +52,10 @@ pub fn compute_semantic_change_id(change: &SemanticChange) -> Result<SemanticCha
     append_canonical_json(&mut canonical, &payload)?;
 
     let mut hasher = Sha256::new();
-    hasher.update(b"kin-semantic-change-v5\0");
+    hasher.update(b"kin-semantic-change-v6\0");
     append_len_prefixed_hash_field(&mut hasher, &canonical)?;
     let result = hasher.finalize();
-    let mut bytes = [0u8; 32];
+    let mut bytes = [0_u8; 32];
     bytes.copy_from_slice(&result);
     Ok(SemanticChangeId::from_hash(Hash256::from_bytes(bytes)))
 }
@@ -58,6 +63,12 @@ pub fn compute_semantic_change_id(change: &SemanticChange) -> Result<SemanticCha
 /// Reject an incoming change whose declared identity does not match its
 /// complete immutable payload.
 pub fn validate_semantic_change_id(change: &SemanticChange) -> Result<()> {
+    if change.parents.contains(&change.id) {
+        return Err(ModelError::InvalidOperation(format!(
+            "semantic change {} cannot name itself as a parent",
+            change.id
+        )));
+    }
     let computed = compute_semantic_change_id(change)?;
     if computed == change.id {
         return Ok(());
@@ -68,157 +79,135 @@ pub fn validate_semantic_change_id(change: &SemanticChange) -> Result<()> {
     )))
 }
 
-/// Derive a deterministic content fingerprint from complete delta payloads.
+/// Validate exact, self-inverting deltas before replay or identity derivation.
 ///
-/// Canonical encodings of independent deltas are sorted before hashing so
-/// insertion order does not affect the result. When deltas overlap a replay
-/// target, order remains part of the identity because replay is order-sensitive.
-pub fn content_identity_from_deltas(
-    entity_deltas: &[EntityDelta],
-    relation_deltas: &[RelationDelta],
-    tree_deltas: &[TreeDelta],
-) -> Result<[u8; 32]> {
-    for delta in entity_deltas {
-        match delta {
-            EntityDelta::Added(entity) => validate_entity_numbers(entity)?,
+/// One transaction may target each entity, relation, or artifact at most once.
+/// Modified deltas preserve identity and carry two different complete states.
+pub fn validate_transaction_delta(delta: &TransactionDelta) -> Result<()> {
+    let mut entity_targets = BTreeSet::new();
+    for entity_delta in &delta.entity_deltas {
+        let target = entity_delta.target_id();
+        if !entity_targets.insert(target) {
+            return Err(ModelError::InvalidOperation(format!(
+                "transaction contains more than one delta for entity {target}"
+            )));
+        }
+        match entity_delta {
+            EntityDelta::Added { new } => validate_entity_numbers(new)?,
             EntityDelta::Modified { old, new } => {
                 validate_entity_numbers(old)?;
                 validate_entity_numbers(new)?;
+                if old.id != new.id {
+                    return Err(ModelError::InvalidOperation(format!(
+                        "entity modification changes identity from {} to {}",
+                        old.id, new.id
+                    )));
+                }
+                if old == new {
+                    return Err(ModelError::InvalidOperation(format!(
+                        "entity {} modification is a no-op",
+                        old.id
+                    )));
+                }
             }
-            EntityDelta::Removed(_) => {}
-        }
-    }
-    for delta in relation_deltas {
-        if let RelationDelta::Added(relation) = delta {
-            validate_relation_numbers(relation)?;
+            EntityDelta::Removed { old } => validate_entity_numbers(old)?,
         }
     }
 
-    let entity_payloads = replay_equivalent_payloads(
-        entity_deltas,
-        entity_deltas_have_overlapping_targets(entity_deltas),
-    )?;
-    let relation_payloads = replay_equivalent_payloads(
-        relation_deltas,
-        relation_deltas_have_overlapping_targets(relation_deltas),
-    )?;
-    let tree_payloads = replay_equivalent_payloads(
-        tree_deltas,
-        tree_deltas_have_overlapping_targets(tree_deltas),
-    )?;
+    let mut relation_targets = BTreeSet::new();
+    for relation_delta in &delta.relation_deltas {
+        let target = relation_delta.target_id();
+        if !relation_targets.insert(target) {
+            return Err(ModelError::InvalidOperation(format!(
+                "transaction contains more than one delta for relation {target}"
+            )));
+        }
+        match relation_delta {
+            RelationDelta::Added { new } => validate_relation_numbers(new)?,
+            RelationDelta::Modified { old, new } => {
+                validate_relation_numbers(old)?;
+                validate_relation_numbers(new)?;
+                if old.id != new.id {
+                    return Err(ModelError::InvalidOperation(format!(
+                        "relation modification changes identity from {} to {}",
+                        old.id, new.id
+                    )));
+                }
+                if old == new {
+                    return Err(ModelError::InvalidOperation(format!(
+                        "relation {} modification is a no-op",
+                        old.id
+                    )));
+                }
+            }
+            RelationDelta::Removed { old } => validate_relation_numbers(old)?,
+        }
+    }
+
+    let mut tree_targets = BTreeSet::new();
+    for tree_delta in &delta.tree_deltas {
+        let target = tree_delta.artifact_id();
+        if !tree_targets.insert(target) {
+            return Err(ModelError::InvalidOperation(format!(
+                "transaction contains more than one delta for artifact {target:?}"
+            )));
+        }
+        if let TreeDelta::Updated { old, new, .. } = tree_delta {
+            if old == new {
+                return Err(ModelError::InvalidOperation(format!(
+                    "artifact {target:?} update is a no-op"
+                )));
+            }
+        }
+    }
+
+    if let Some(policy_delta) = &delta.admission_policy_delta {
+        policy_delta.validate()?;
+    }
+    Ok(())
+}
+
+/// Derive a deterministic content fingerprint from a complete transaction.
+pub fn content_identity_from_deltas(delta: &TransactionDelta) -> Result<[u8; 32]> {
+    validate_transaction_delta(delta)?;
+
+    let mut canonical = delta.clone();
+    canonical.entity_deltas.sort_by_key(EntityDelta::target_id);
+    canonical
+        .relation_deltas
+        .sort_by_key(RelationDelta::target_id);
+    canonical.tree_deltas.sort_by_key(TreeDelta::artifact_id);
+
+    let encoded = canonical_json_bytes(&canonical)?;
 
     let mut hasher = Sha256::new();
-    hasher.update(b"kin-content-v4\0");
-    append_payload_slice(&mut hasher, b"entities", &entity_payloads)?;
-    append_payload_slice(&mut hasher, b"relations", &relation_payloads)?;
-    append_payload_slice(&mut hasher, b"tree", &tree_payloads)?;
+    hasher.update(b"kin-content-v5\0");
+    append_len_prefixed_hash_field(&mut hasher, &encoded)?;
     let result = hasher.finalize();
-    let mut bytes = [0u8; 32];
+    let mut bytes = [0_u8; 32];
     bytes.copy_from_slice(&result);
     Ok(bytes)
 }
 
-fn entity_deltas_have_overlapping_targets(entity_deltas: &[EntityDelta]) -> bool {
-    let mut targets = HashSet::with_capacity(entity_deltas.len());
-    for delta in entity_deltas {
-        match delta {
-            EntityDelta::Added(entity) => {
-                if !targets.insert(entity.id) {
-                    return true;
-                }
-            }
-            EntityDelta::Modified { old, new } => {
-                if !targets.insert(old.id) || (new.id != old.id && !targets.insert(new.id)) {
-                    return true;
-                }
-            }
-            EntityDelta::Removed(id) => {
-                if !targets.insert(*id) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-fn relation_deltas_have_overlapping_targets(relation_deltas: &[RelationDelta]) -> bool {
-    let mut targets = HashSet::with_capacity(relation_deltas.len());
-    for delta in relation_deltas {
-        let target = match delta {
-            RelationDelta::Added(relation) => relation.id,
-            RelationDelta::Removed(id) => *id,
-        };
-        if !targets.insert(target) {
-            return true;
-        }
-    }
-    false
-}
-
-fn tree_deltas_have_overlapping_targets(tree_deltas: &[TreeDelta]) -> bool {
-    let mut targets = HashSet::with_capacity(tree_deltas.len());
-    tree_deltas
-        .iter()
-        .any(|delta| !targets.insert(delta.artifact_id()))
-}
-
 fn validate_entity_numbers(entity: &Entity) -> Result<()> {
-    if entity.fingerprint.stability_score.is_finite() {
+    let score = entity.fingerprint.stability_score;
+    if score.is_finite() && (0.0..=1.0).contains(&score) {
         return Ok(());
     }
     Err(ModelError::InvalidOperation(format!(
-        "entity {} has a non-finite fingerprint stability score",
+        "entity {} has invalid fingerprint stability score {score}",
         entity.id
     )))
 }
 
 fn validate_relation_numbers(relation: &Relation) -> Result<()> {
-    if relation.confidence.is_finite() {
+    if relation.confidence.is_finite() && (0.0..=1.0).contains(&relation.confidence) {
         return Ok(());
     }
     Err(ModelError::InvalidOperation(format!(
-        "relation {} has a non-finite confidence score",
-        relation.id
+        "relation {} has invalid confidence score {}",
+        relation.id, relation.confidence
     )))
-}
-
-fn canonical_payloads<T: Serialize>(values: &[T]) -> Result<Vec<Vec<u8>>> {
-    values
-        .iter()
-        .map(|value| {
-            let value = serde_json::to_value(value).map_err(serialization)?;
-            let mut encoded = Vec::new();
-            append_canonical_json(&mut encoded, &value)?;
-            Ok(encoded)
-        })
-        .collect()
-}
-
-fn replay_equivalent_payloads<T: Serialize>(
-    values: &[T],
-    order_matters: bool,
-) -> Result<Vec<Vec<u8>>> {
-    let mut payloads = canonical_payloads(values)?;
-    if !order_matters {
-        payloads.sort_unstable();
-    }
-    Ok(payloads)
-}
-
-fn append_payload_slice(hasher: &mut Sha256, label: &[u8], payloads: &[Vec<u8>]) -> Result<()> {
-    append_len_prefixed_hash_field(hasher, label)?;
-    hasher.update(
-        u64::try_from(payloads.len())
-            .map_err(|_| {
-                ModelError::InvalidOperation("change delta count exceeds u64".to_string())
-            })?
-            .to_le_bytes(),
-    );
-    for payload in payloads {
-        append_len_prefixed_hash_field(hasher, payload)?;
-    }
-    Ok(())
 }
 
 fn append_len_prefixed_hash_field(hasher: &mut Sha256, value: &[u8]) -> Result<()> {
@@ -231,6 +220,13 @@ fn append_len_prefixed_hash_field(hasher: &mut Sha256, value: &[u8]) -> Result<(
     );
     hasher.update(value);
     Ok(())
+}
+
+pub(crate) fn canonical_json_bytes(value: &impl serde::Serialize) -> Result<Vec<u8>> {
+    let value = serde_json::to_value(value).map_err(serialization)?;
+    let mut encoded = Vec::new();
+    append_canonical_json(&mut encoded, &value)?;
+    Ok(encoded)
 }
 
 fn append_canonical_json(output: &mut Vec<u8>, value: &serde_json::Value) -> Result<()> {
@@ -298,12 +294,15 @@ fn serialization(error: serde_json::Error) -> ModelError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AuthorId, BranchName, Timestamp};
+    use crate::{
+        AuthorId, ChangeOrigin, GitObjectId, LocatedEntry, RepoPath, Timestamp, TreeEntry,
+    };
     use chrono::{TimeZone, Utc};
 
     fn empty_change() -> SemanticChange {
         SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
             parents: Vec::new(),
             timestamp: Timestamp::from(
                 Utc.timestamp_millis_opt(1_700_000_000_000)
@@ -315,11 +314,21 @@ mod tests {
             entity_deltas: Vec::new(),
             relation_deltas: Vec::new(),
             tree_deltas: Vec::new(),
+            admission_policy_delta: None,
             projected_files: Vec::new(),
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
-            authored_on: None,
+        }
+    }
+
+    fn tree_delta(id: u128, path: &str, byte: u8) -> TreeDelta {
+        TreeDelta::Added {
+            artifact_id: crate::ArtifactId(uuid::Uuid::from_u128(id)),
+            new: LocatedEntry::new(
+                RepoPath::from_utf8(path).unwrap(),
+                TreeEntry::blob(Hash256::from_bytes([byte; 32]), false),
+            ),
         }
     }
 
@@ -344,6 +353,75 @@ mod tests {
     }
 
     #[test]
+    fn change_origin_participates_in_v6_identity() {
+        let native = empty_change();
+        let mut imported = native.clone();
+        imported.origin = ChangeOrigin::GitCommit {
+            oid: GitObjectId::sha1([0x91; 20]),
+        };
+
+        assert_ne!(
+            compute_semantic_change_id(&native).unwrap(),
+            compute_semantic_change_id(&imported).unwrap()
+        );
+    }
+
+    #[test]
+    fn octopus_and_repeated_git_parents_preserve_exact_order() {
+        let first = SemanticChangeId::from_hash(Hash256::from_bytes([0x31; 32]));
+        let second = SemanticChangeId::from_hash(Hash256::from_bytes([0x32; 32]));
+        let third = SemanticChangeId::from_hash(Hash256::from_bytes([0x33; 32]));
+        let mut change = empty_change();
+        change.parents = vec![first, second, first, third];
+
+        let identity = compute_semantic_change_id(&change).unwrap();
+        change.id = identity;
+        validate_semantic_change_id(&change).unwrap();
+
+        let encoded = serde_json::to_vec(&change).unwrap();
+        let decoded: SemanticChange = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.parents, vec![first, second, first, third]);
+
+        let mut reordered = decoded;
+        reordered.parents.swap(0, 1);
+        assert_ne!(
+            compute_semantic_change_id(&reordered).unwrap(),
+            identity,
+            "parent order participates in identity"
+        );
+    }
+
+    #[test]
+    fn independent_delta_order_is_canonical_but_duplicate_targets_are_rejected() {
+        let first = tree_delta(1, "Dockerfile", 0x11);
+        let second = tree_delta(2, "compose.yaml", 0x22);
+        let left = TransactionDelta {
+            tree_deltas: vec![first.clone(), second.clone()],
+            ..TransactionDelta::default()
+        };
+        let right = TransactionDelta {
+            tree_deltas: vec![second, first.clone()],
+            ..TransactionDelta::default()
+        };
+        assert_eq!(
+            content_identity_from_deltas(&left).unwrap(),
+            content_identity_from_deltas(&right).unwrap()
+        );
+
+        let duplicate = TransactionDelta {
+            tree_deltas: vec![
+                first.clone(),
+                TreeDelta::Removed {
+                    artifact_id: first.artifact_id(),
+                    old: first.new_state().unwrap().clone(),
+                },
+            ],
+            ..TransactionDelta::default()
+        };
+        assert!(validate_transaction_delta(&duplicate).is_err());
+    }
+
+    #[test]
     fn validation_rejects_spoofed_and_accepts_recomputed_identity() {
         let mut change = empty_change();
         let error = validate_semantic_change_id(&change).unwrap_err();
@@ -354,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_change_v5_hash_domain_has_a_pinned_fixture() {
+    fn semantic_change_v6_hash_domain_has_a_pinned_fixture() {
         let mut fixture = empty_change();
         fixture.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x55; 32]));
         fixture.timestamp = Timestamp::from(
@@ -364,12 +442,14 @@ mod tests {
         );
         fixture.author = AuthorId::new("fixture");
         fixture.message = "phase two".to_string();
-        fixture.authored_on = Some(BranchName::new("main"));
+        fixture.origin = ChangeOrigin::GitCommit {
+            oid: GitObjectId::sha1([0x66; 20]),
+        };
 
         assert_eq!(
             compute_semantic_change_id(&fixture).unwrap().to_string(),
-            "4c2bb2dc66a780f9b807e0c08b0ab61d37ae0d861af9dea8347145932bf1f7c5",
-            "changing the kin-semantic-change-v5 domain or canonical fixture is a wire break"
+            "f455b244cffbf4eee002e607b19926cefb575e2549fdc21ecbbb956a2eed9fad",
+            "changing the kin-semantic-change-v6 domain or canonical fixture is a wire break"
         );
     }
 }

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use crate::branch::Branch;
 use crate::change::{ResolvedTree, SemanticChange, TransactionDelta, TreeEntry};
 use crate::entity::{Entity, EntityKind, EntityRole};
 use crate::error::ModelError;
@@ -218,7 +217,7 @@ pub trait EntityStore: Send + Sync {
     }
 }
 
-/// Semantic change DAG and branch operations.
+/// Immutable semantic change DAG operations.
 pub trait ChangeStore: Send + Sync {
     /// Store errors must be able to represent model-level history integrity
     /// failures surfaced by the default replay helpers.
@@ -233,7 +232,7 @@ pub trait ChangeStore: Send + Sync {
         id: &EntityId,
     ) -> std::result::Result<Vec<EntityRevision>, Self::Error> {
         let changes = self.get_entity_history(id)?;
-        Ok(derive_entity_revisions_from_changes(changes)
+        Ok(derive_entity_revisions_from_changes(changes)?
             .remove(id)
             .unwrap_or_default())
     }
@@ -268,7 +267,7 @@ pub trait ChangeStore: Send + Sync {
         head: &SemanticChangeId,
     ) -> std::result::Result<Vec<EntityRevision>, Self::Error> {
         let changes = self.get_entity_history_at(id, head)?;
-        Ok(derive_entity_revisions_from_changes(changes)
+        Ok(derive_entity_revisions_from_changes(changes)?
             .remove(id)
             .unwrap_or_default())
     }
@@ -345,7 +344,7 @@ pub trait ChangeStore: Send + Sync {
         head: &SemanticChangeId,
     ) -> std::result::Result<ResolvedGraphState, Self::Error> {
         let first_parent_history = collect_changes_first_parent(self, head)?;
-        let mut state = replay_graph_state(first_parent_history.clone());
+        let mut state = replay_graph_state(first_parent_history.clone())?;
         state.tree = replay_tree(first_parent_history).map_err(Self::Error::from)?;
         Ok(state)
     }
@@ -368,15 +367,6 @@ pub trait ChangeStore: Send + Sync {
         let (_changes, order) = collect_changes_topologically(self, head)?;
         Ok(order)
     }
-    fn get_branch(&self, name: &BranchName) -> std::result::Result<Option<Branch>, Self::Error>;
-    fn create_branch(&self, branch: &Branch) -> std::result::Result<(), Self::Error>;
-    fn update_branch_head(
-        &self,
-        name: &BranchName,
-        new_head: &SemanticChangeId,
-    ) -> std::result::Result<(), Self::Error>;
-    fn delete_branch(&self, name: &BranchName) -> std::result::Result<(), Self::Error>;
-    fn list_branches(&self) -> std::result::Result<Vec<Branch>, Self::Error>;
 }
 
 /// Work items, annotations, and work graph relationships.
@@ -883,7 +873,7 @@ where
     Ok(tree)
 }
 
-fn replay_graph_state<I>(changes: I) -> ResolvedGraphState
+fn replay_graph_state<I>(changes: I) -> std::result::Result<ResolvedGraphState, ModelError>
 where
     I: IntoIterator<Item = SemanticChange>,
 {
@@ -893,7 +883,13 @@ where
         let change_id = change.id;
         for delta in change.entity_deltas {
             match delta {
-                crate::change::EntityDelta::Added(entity) => {
+                crate::change::EntityDelta::Added { new: entity } => {
+                    if state.entities.contains_key(&entity.id) {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} adds existing entity {}",
+                            entity.id
+                        )));
+                    }
                     let previous_revision = mark_matching_entity_revision_ended(
                         &mut state.entity_revisions,
                         &entity,
@@ -908,9 +904,22 @@ where
                             change_id,
                             previous_revision,
                         ));
+                    state.entity_tombstones.remove(&entity.id);
                     state.entities.insert(entity.id, entity);
                 }
                 crate::change::EntityDelta::Modified { old, new } => {
+                    if old.id != new.id {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} modifies entity {} into different identity {}",
+                            old.id, new.id
+                        )));
+                    }
+                    if state.entities.get(&old.id) != Some(&old) {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} has stale old payload for entity {}",
+                            old.id
+                        )));
+                    }
                     let previous_revision = mark_matching_entity_revision_ended(
                         &mut state.entity_revisions,
                         &old,
@@ -927,59 +936,91 @@ where
                         ));
                     state.entities.insert(new.id, new);
                 }
-                crate::change::EntityDelta::Removed(entity_id) => {
+                crate::change::EntityDelta::Removed { old } => {
+                    let entity_id = old.id;
+                    if state.entities.get(&entity_id) != Some(&old) {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} has stale old payload for removed entity {entity_id}"
+                        )));
+                    }
                     if let Some(entries) = state.entity_revisions.get_mut(&entity_id) {
                         if let Some(previous) = entries.last_mut() {
                             previous.mark_ended(change_id);
                         }
                     }
-                    if let Some(entity) = state.entities.remove(&entity_id) {
-                        state
-                            .entity_tombstones
-                            .insert(entity_id, (entity, change_id));
-                    }
-                    // Prune dangling relations and tombstone them.
-                    let dangling: Vec<RelationId> = state
-                        .relations
-                        .iter()
-                        .filter(|(_, rel)| relation_mentions_entity(rel, entity_id))
-                        .map(|(id, _)| *id)
-                        .collect();
-                    for rel_id in dangling {
-                        if let Some(relation) = state.relations.remove(&rel_id) {
-                            state
-                                .relation_tombstones
-                                .insert(rel_id, (relation, change_id));
-                        }
-                    }
+                    state.entities.remove(&entity_id);
+                    state.entity_tombstones.insert(entity_id, (old, change_id));
                 }
             }
         }
 
         for delta in change.relation_deltas {
             match delta {
-                crate::change::RelationDelta::Added(relation) => {
+                crate::change::RelationDelta::Added { new: relation } => {
+                    if state.relations.contains_key(&relation.id) {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} adds existing relation {}",
+                            relation.id
+                        )));
+                    }
+                    state.relation_tombstones.remove(&relation.id);
                     state.relations.insert(relation.id, relation);
                 }
-                crate::change::RelationDelta::Removed(relation_id) => {
-                    if let Some(relation) = state.relations.remove(&relation_id) {
-                        state
-                            .relation_tombstones
-                            .insert(relation_id, (relation, change_id));
+                crate::change::RelationDelta::Modified { old, new } => {
+                    if old.id != new.id {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} modifies relation {} into different identity {}",
+                            old.id, new.id
+                        )));
+                    }
+                    if state.relations.get(&old.id) != Some(&old) {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} has stale old payload for relation {}",
+                            old.id
+                        )));
+                    }
+                    state.relations.insert(new.id, new);
+                }
+                crate::change::RelationDelta::Removed { old } => {
+                    let relation_id = old.id;
+                    if state.relations.get(&relation_id) != Some(&old) {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} has stale old payload for removed relation {relation_id}"
+                        )));
+                    }
+                    state.relations.remove(&relation_id);
+                    state
+                        .relation_tombstones
+                        .insert(relation_id, (old, change_id));
+                }
+            }
+        }
+
+        for relation in state.relations.values() {
+            for node in [relation.src, relation.dst] {
+                if let GraphNodeId::Entity(entity_id) = node {
+                    if !state.entities.contains_key(&entity_id) {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} leaves relation {} dangling from entity {entity_id}; \
+                             relation removal must be explicit",
+                            relation.id
+                        )));
                     }
                 }
             }
         }
     }
 
-    state
+    Ok(state)
 }
 
-pub fn derive_entity_revisions_from_changes<I>(changes: I) -> HashMap<EntityId, Vec<EntityRevision>>
+pub fn derive_entity_revisions_from_changes<I>(
+    changes: I,
+) -> std::result::Result<HashMap<EntityId, Vec<EntityRevision>>, ModelError>
 where
     I: IntoIterator<Item = SemanticChange>,
 {
-    replay_graph_state(changes).entity_revisions
+    Ok(replay_graph_state(changes)?.entity_revisions)
 }
 
 fn replay_relation_revisions<I>(changes: I, relation_id: &RelationId) -> Vec<RelationRevision>
@@ -993,7 +1034,9 @@ where
         let change_id = change.id;
         for delta in change.relation_deltas {
             match delta {
-                crate::change::RelationDelta::Added(relation) if relation.id == *relation_id => {
+                crate::change::RelationDelta::Added { new: relation }
+                    if relation.id == *relation_id =>
+                {
                     let previous_revision = active_revision
                         .and_then(|index| revisions.get_mut(index))
                         .map(|revision| {
@@ -1007,7 +1050,20 @@ where
                     ));
                     active_revision = Some(revisions.len() - 1);
                 }
-                crate::change::RelationDelta::Removed(removed_id) if removed_id == *relation_id => {
+                crate::change::RelationDelta::Modified { old, new }
+                    if old.id == *relation_id && new.id == *relation_id =>
+                {
+                    let previous_revision = active_revision
+                        .take()
+                        .and_then(|index| revisions.get_mut(index))
+                        .map(|revision| {
+                            revision.mark_ended(change_id);
+                            revision.revision_id
+                        });
+                    revisions.push(RelationRevision::new(new, change_id, previous_revision));
+                    active_revision = Some(revisions.len() - 1);
+                }
+                crate::change::RelationDelta::Removed { old } if old.id == *relation_id => {
                     if let Some(index) = active_revision.take() {
                         if let Some(revision) = revisions.get_mut(index) {
                             revision.mark_ended(change_id);
@@ -1101,11 +1157,11 @@ fn replay_artifact_revisions(
 
 fn entity_is_touched_by_change(change: &SemanticChange, entity_id: &EntityId) -> bool {
     change.entity_deltas.iter().any(|delta| match delta {
-        crate::change::EntityDelta::Added(entity) => entity.id == *entity_id,
+        crate::change::EntityDelta::Added { new } => new.id == *entity_id,
         crate::change::EntityDelta::Modified { old, new } => {
             old.id == *entity_id || new.id == *entity_id
         }
-        crate::change::EntityDelta::Removed(removed_id) => removed_id == entity_id,
+        crate::change::EntityDelta::Removed { old } => old.id == *entity_id,
     })
 }
 
@@ -1148,11 +1204,6 @@ fn entities_match_for_revision(left: &Entity, right: &Entity) -> bool {
         && left.doc_summary == right.doc_summary
         && left.metadata.extra == right.metadata.extra
         && left.lineage_parent == right.lineage_parent
-}
-
-fn relation_mentions_entity(relation: &Relation, entity_id: EntityId) -> bool {
-    matches!(relation.src, GraphNodeId::Entity(id) if id == entity_id)
-        || matches!(relation.dst, GraphNodeId::Entity(id) if id == entity_id)
 }
 
 // ===========================================================================
@@ -1371,25 +1422,6 @@ impl<G: ChangeStore> ChangeStore for &G {
         head: &SemanticChangeId,
     ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
         (**self).get_changes_since(base, head)
-    }
-    fn get_branch(&self, name: &BranchName) -> std::result::Result<Option<Branch>, Self::Error> {
-        (**self).get_branch(name)
-    }
-    fn create_branch(&self, branch: &Branch) -> std::result::Result<(), Self::Error> {
-        (**self).create_branch(branch)
-    }
-    fn update_branch_head(
-        &self,
-        name: &BranchName,
-        new_head: &SemanticChangeId,
-    ) -> std::result::Result<(), Self::Error> {
-        (**self).update_branch_head(name, new_head)
-    }
-    fn delete_branch(&self, name: &BranchName) -> std::result::Result<(), Self::Error> {
-        (**self).delete_branch(name)
-    }
-    fn list_branches(&self) -> std::result::Result<Vec<Branch>, Self::Error> {
-        (**self).list_branches()
     }
 }
 
@@ -1926,6 +1958,7 @@ mod tests {
     ) -> SemanticChange {
         SemanticChange {
             id,
+            origin: crate::ChangeOrigin::Native,
             parents,
             timestamp: Timestamp::now(),
             author: AuthorId("test".into()),
@@ -1933,11 +1966,11 @@ mod tests {
             entity_deltas,
             relation_deltas,
             tree_deltas: vec![],
+            admission_policy_delta: None,
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
         }
     }
 
@@ -1998,33 +2031,6 @@ mod tests {
             _base: &SemanticChangeId,
             _head: &SemanticChangeId,
         ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
-            Ok(Vec::new())
-        }
-
-        fn get_branch(
-            &self,
-            _name: &BranchName,
-        ) -> std::result::Result<Option<Branch>, Self::Error> {
-            Ok(None)
-        }
-
-        fn create_branch(&self, _branch: &Branch) -> std::result::Result<(), Self::Error> {
-            Ok(())
-        }
-
-        fn update_branch_head(
-            &self,
-            _name: &BranchName,
-            _new_head: &SemanticChangeId,
-        ) -> std::result::Result<(), Self::Error> {
-            Ok(())
-        }
-
-        fn delete_branch(&self, _name: &BranchName) -> std::result::Result<(), Self::Error> {
-            Ok(())
-        }
-
-        fn list_branches(&self) -> std::result::Result<Vec<Branch>, Self::Error> {
             Ok(Vec::new())
         }
     }
@@ -2126,7 +2132,9 @@ mod tests {
         let mut right_change = make_semantic_change(
             right_id,
             vec![root_id],
-            vec![EntityDelta::Added(right_only_entity.clone())],
+            vec![EntityDelta::Added {
+                new: right_only_entity.clone(),
+            }],
             vec![],
         );
         right_change.tree_deltas = vec![
@@ -2529,24 +2537,30 @@ mod tests {
             make_semantic_change(
                 c1,
                 vec![],
-                vec![EntityDelta::Added(entity_a.clone())],
+                vec![EntityDelta::Added {
+                    new: entity_a.clone(),
+                }],
                 vec![],
             ),
             make_semantic_change(
                 c2,
                 vec![c1],
-                vec![EntityDelta::Added(entity_b.clone())],
+                vec![EntityDelta::Added {
+                    new: entity_b.clone(),
+                }],
                 vec![],
             ),
             make_semantic_change(
                 c3,
                 vec![c2],
-                vec![EntityDelta::Removed(entity_a_id)],
+                vec![EntityDelta::Removed {
+                    old: entity_a.clone(),
+                }],
                 vec![],
             ),
         ];
 
-        let state = replay_graph_state(changes);
+        let state = replay_graph_state(changes).unwrap();
 
         assert!(
             !state.entities.contains_key(&entity_a_id),
@@ -2582,11 +2596,21 @@ mod tests {
         let entity_b = make_entity(entity_b_id, "b");
 
         let changes = vec![
-            make_semantic_change(c1, vec![], vec![EntityDelta::Added(entity_a)], vec![]),
-            make_semantic_change(c2, vec![c1], vec![EntityDelta::Added(entity_b)], vec![]),
+            make_semantic_change(
+                c1,
+                vec![],
+                vec![EntityDelta::Added { new: entity_a }],
+                vec![],
+            ),
+            make_semantic_change(
+                c2,
+                vec![c1],
+                vec![EntityDelta::Added { new: entity_b }],
+                vec![],
+            ),
         ];
 
-        let state = replay_graph_state(changes);
+        let state = replay_graph_state(changes).unwrap();
 
         assert!(state.entities.contains_key(&entity_a_id));
         assert!(state.entities.contains_key(&entity_b_id));
@@ -2609,17 +2633,29 @@ mod tests {
         let relation = make_relation(rel_id, entity_a_id, entity_b_id);
 
         let changes = vec![
-            make_semantic_change(c1, vec![], vec![EntityDelta::Added(entity_a)], vec![]),
+            make_semantic_change(
+                c1,
+                vec![],
+                vec![EntityDelta::Added { new: entity_a }],
+                vec![],
+            ),
             make_semantic_change(
                 c2,
                 vec![c1],
-                vec![EntityDelta::Added(entity_b)],
-                vec![RelationDelta::Added(relation)],
+                vec![EntityDelta::Added { new: entity_b }],
+                vec![RelationDelta::Added {
+                    new: relation.clone(),
+                }],
             ),
-            make_semantic_change(c3, vec![c2], vec![], vec![RelationDelta::Removed(rel_id)]),
+            make_semantic_change(
+                c3,
+                vec![c2],
+                vec![],
+                vec![RelationDelta::Removed { old: relation }],
+            ),
         ];
 
-        let state = replay_graph_state(changes);
+        let state = replay_graph_state(changes).unwrap();
 
         assert!(
             !state.relations.contains_key(&rel_id),
@@ -2635,7 +2671,7 @@ mod tests {
     }
 
     #[test]
-    fn dangling_relation_tombstoned_on_entity_removal() {
+    fn entity_removal_requires_explicit_relation_removal() {
         let c1 = make_change_id(1);
         let c2 = make_change_id(2);
         let c3 = make_change_id(3);
@@ -2649,35 +2685,144 @@ mod tests {
         let relation = make_relation(rel_id, entity_a_id, entity_b_id);
 
         let changes = vec![
-            make_semantic_change(c1, vec![], vec![EntityDelta::Added(entity_a)], vec![]),
+            make_semantic_change(
+                c1,
+                vec![],
+                vec![EntityDelta::Added {
+                    new: entity_a.clone(),
+                }],
+                vec![],
+            ),
             make_semantic_change(
                 c2,
                 vec![c1],
-                vec![EntityDelta::Added(entity_b)],
-                vec![RelationDelta::Added(relation)],
+                vec![EntityDelta::Added { new: entity_b }],
+                vec![RelationDelta::Added { new: relation }],
             ),
             make_semantic_change(
                 c3,
                 vec![c2],
-                vec![EntityDelta::Removed(entity_a_id)],
+                vec![EntityDelta::Removed { old: entity_a }],
                 vec![],
             ),
         ];
 
-        let state = replay_graph_state(changes);
+        let error = replay_graph_state(changes).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("relation removal must be explicit"));
+    }
 
-        assert!(
-            state.entity_tombstones.contains_key(&entity_a_id),
-            "entity A should be tombstoned"
+    #[test]
+    fn exact_graph_and_tree_deltas_are_self_inverting() {
+        let entity_id = EntityId::new();
+        let mut old_entity = make_entity(entity_id, "old_name");
+        let mut new_entity = old_entity.clone();
+        new_entity.name = "new_name".to_string();
+
+        let other_id = EntityId::new();
+        let relation_id = RelationId::new();
+        let old_relation = make_relation(relation_id, entity_id, other_id);
+        let mut new_relation = old_relation.clone();
+        new_relation.confidence = 0.75;
+
+        let artifact_id = ArtifactId::new();
+        let old_entry = LocatedEntry::new(
+            repo_path("compose.yaml"),
+            TreeEntry::blob(Hash256::from_bytes([0x91; 32]), false),
         );
-        assert!(
-            state.relation_tombstones.contains_key(&rel_id),
-            "relation should be tombstoned because entity A was removed"
+        let new_entry = LocatedEntry::new(
+            RepoPath::from_bytes(b"infra/compose-\xff.yaml".to_vec()).unwrap(),
+            TreeEntry::symlink(Hash256::from_bytes([0x92; 32])),
         );
-        let (_, removal_change) = state.relation_tombstones.get(&rel_id).unwrap();
-        assert_eq!(
-            *removal_change, c3,
-            "dangling relation tombstone should reference the change that removed the entity"
-        );
+        let delta = TransactionDelta {
+            entity_deltas: vec![EntityDelta::Modified {
+                old: old_entity.clone(),
+                new: new_entity,
+            }],
+            relation_deltas: vec![RelationDelta::Modified {
+                old: old_relation,
+                new: new_relation,
+            }],
+            tree_deltas: vec![TreeDelta::Updated {
+                artifact_id,
+                old: old_entry.clone(),
+                new: new_entry,
+            }],
+            admission_policy_delta: None,
+        };
+
+        crate::validate_transaction_delta(&delta).unwrap();
+        assert_eq!(delta.inverse().inverse(), delta);
+
+        let base = ResolvedTree::from_artifacts([crate::ResolvedArtifact::new(
+            artifact_id,
+            old_entry.path.clone(),
+            old_entry.entry,
+        )])
+        .unwrap();
+        let changed = base.apply(&delta.tree_deltas).unwrap();
+        assert_eq!(changed.apply(&delta.inverse().tree_deltas).unwrap(), base);
+
+        old_entity.name = "stale_old_payload".to_string();
+        let mut wrong_identity = old_entity.clone();
+        wrong_identity.id = EntityId::new();
+        let invalid = TransactionDelta {
+            entity_deltas: vec![EntityDelta::Modified {
+                old: old_entity,
+                new: wrong_identity,
+            }],
+            ..TransactionDelta::default()
+        };
+        assert!(crate::validate_transaction_delta(&invalid).is_err());
+    }
+
+    #[test]
+    fn exact_inverse_readdition_clears_entity_and_relation_tombstones() {
+        let c1 = make_change_id(41);
+        let c2 = make_change_id(42);
+        let c3 = make_change_id(43);
+        let entity_a = make_entity(EntityId::new(), "a");
+        let entity_b = make_entity(EntityId::new(), "b");
+        let relation = make_relation(RelationId::new(), entity_a.id, entity_b.id);
+        let removal = TransactionDelta {
+            entity_deltas: vec![EntityDelta::Removed {
+                old: entity_a.clone(),
+            }],
+            relation_deltas: vec![RelationDelta::Removed {
+                old: relation.clone(),
+            }],
+            ..TransactionDelta::default()
+        };
+        let restoration = removal.inverse();
+
+        let changes = vec![
+            make_semantic_change(
+                c1,
+                Vec::new(),
+                vec![
+                    EntityDelta::Added {
+                        new: entity_a.clone(),
+                    },
+                    EntityDelta::Added { new: entity_b },
+                ],
+                vec![RelationDelta::Added {
+                    new: relation.clone(),
+                }],
+            ),
+            make_semantic_change(c2, vec![c1], removal.entity_deltas, removal.relation_deltas),
+            make_semantic_change(
+                c3,
+                vec![c2],
+                restoration.entity_deltas,
+                restoration.relation_deltas,
+            ),
+        ];
+
+        let state = replay_graph_state(changes).unwrap();
+        assert_eq!(state.entities.get(&entity_a.id), Some(&entity_a));
+        assert_eq!(state.relations.get(&relation.id), Some(&relation));
+        assert!(!state.entity_tombstones.contains_key(&entity_a.id));
+        assert!(!state.relation_tombstones.contains_key(&relation.id));
     }
 }

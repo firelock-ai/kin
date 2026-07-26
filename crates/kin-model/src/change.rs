@@ -5,19 +5,25 @@ use schemars::JsonSchema;
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::admission::AdmissionPolicyDelta;
 use crate::entity::Entity;
 use crate::ids::*;
+use crate::relation::Relation;
 use crate::retrieval::ArtifactId;
 use crate::review::RiskSummary;
 use crate::timestamp::Timestamp;
 
 /// Kin's native commit — the unit of semantic history.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticChange {
     /// Content-addressed hash.
     pub id: SemanticChangeId,
-    /// 0 = genesis, 1 = normal, 2 = merge.
+    /// Native provenance or the exact external commit identity imported.
+    pub origin: ChangeOrigin,
+    /// Ordered parent list: empty for genesis, one for an ordinary change, and
+    /// any number for a merge. Order and repeated parent entries are preserved
+    /// exactly for lossless Git commit import.
     pub parents: Vec<SemanticChangeId>,
     pub timestamp: Timestamp,
     /// Human or assistant.
@@ -28,37 +34,150 @@ pub struct SemanticChange {
     /// Exact changes to the repository tree, including code, configuration,
     /// documentation, assets, and files in unsupported languages.
     pub tree_deltas: Vec<TreeDelta>,
+    /// History-versioned admission policy transition, when the policy changes.
+    pub admission_policy_delta: Option<AdmissionPolicyDelta>,
     pub projected_files: Vec<FilePathId>,
     pub spec_link: Option<SpecId>,
     pub evidence: Vec<EvidenceId>,
     pub risk_summary: Option<RiskSummary>,
-    /// Informational: branch name at creation time.
-    pub authored_on: Option<BranchName>,
+}
+
+/// Immutable provenance that participates in semantic-change identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ChangeOrigin {
+    Native,
+    GitCommit { oid: GitObjectId },
+}
+
+impl SemanticChange {
+    pub fn transaction_delta(&self) -> TransactionDelta {
+        TransactionDelta {
+            entity_deltas: self.entity_deltas.clone(),
+            relation_deltas: self.relation_deltas.clone(),
+            tree_deltas: self.tree_deltas.clone(),
+            admission_policy_delta: self.admission_policy_delta.clone(),
+        }
+    }
 }
 
 /// Delta for a single entity within a SemanticChange.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[allow(clippy::large_enum_variant)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EntityDelta {
-    Added(Entity),
+    Added { new: Entity },
     Modified { old: Entity, new: Entity },
-    Removed(EntityId),
+    Removed { old: Entity },
+}
+
+impl EntityDelta {
+    pub const fn target_id(&self) -> EntityId {
+        match self {
+            Self::Added { new } | Self::Modified { new, .. } => new.id,
+            Self::Removed { old } => old.id,
+        }
+    }
+
+    pub const fn old_state(&self) -> Option<&Entity> {
+        match self {
+            Self::Added { .. } => None,
+            Self::Modified { old, .. } | Self::Removed { old } => Some(old),
+        }
+    }
+
+    pub const fn new_state(&self) -> Option<&Entity> {
+        match self {
+            Self::Added { new } | Self::Modified { new, .. } => Some(new),
+            Self::Removed { .. } => None,
+        }
+    }
+
+    pub fn inverse(&self) -> Self {
+        match self {
+            Self::Added { new } => Self::Removed { old: new.clone() },
+            Self::Modified { old, new } => Self::Modified {
+                old: new.clone(),
+                new: old.clone(),
+            },
+            Self::Removed { old } => Self::Added { new: old.clone() },
+        }
+    }
 }
 
 /// Delta for a single relation within a SemanticChange.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RelationDelta {
-    Added(crate::relation::Relation),
-    Removed(RelationId),
+    Added { new: Relation },
+    Modified { old: Relation, new: Relation },
+    Removed { old: Relation },
+}
+
+impl RelationDelta {
+    pub const fn target_id(&self) -> RelationId {
+        match self {
+            Self::Added { new } | Self::Modified { new, .. } => new.id,
+            Self::Removed { old } => old.id,
+        }
+    }
+
+    pub const fn old_state(&self) -> Option<&Relation> {
+        match self {
+            Self::Added { .. } => None,
+            Self::Modified { old, .. } | Self::Removed { old } => Some(old),
+        }
+    }
+
+    pub const fn new_state(&self) -> Option<&Relation> {
+        match self {
+            Self::Added { new } | Self::Modified { new, .. } => Some(new),
+            Self::Removed { .. } => None,
+        }
+    }
+
+    pub fn inverse(&self) -> Self {
+        match self {
+            Self::Added { new } => Self::Removed { old: new.clone() },
+            Self::Modified { old, new } => Self::Modified {
+                old: new.clone(),
+                new: old.clone(),
+            },
+            Self::Removed { old } => Self::Added { new: old.clone() },
+        }
+    }
 }
 
 /// Delta for a batch of transactional graph changes.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TransactionDelta {
     pub entity_deltas: Vec<EntityDelta>,
     pub relation_deltas: Vec<RelationDelta>,
     pub tree_deltas: Vec<TreeDelta>,
+    pub admission_policy_delta: Option<AdmissionPolicyDelta>,
+}
+
+impl TransactionDelta {
+    pub fn inverse(&self) -> Self {
+        Self {
+            entity_deltas: self
+                .entity_deltas
+                .iter()
+                .map(EntityDelta::inverse)
+                .collect(),
+            relation_deltas: self
+                .relation_deltas
+                .iter()
+                .map(RelationDelta::inverse)
+                .collect(),
+            tree_deltas: self.tree_deltas.iter().map(TreeDelta::inverse).collect(),
+            admission_policy_delta: self
+                .admission_policy_delta
+                .as_ref()
+                .map(AdmissionPolicyDelta::inverse),
+        }
+    }
 }
 
 /// Exact materialization of one leaf in the repository tree.
@@ -171,6 +290,28 @@ impl TreeDelta {
 
     pub const fn is_removed(&self) -> bool {
         matches!(self, Self::Removed { .. })
+    }
+
+    pub fn inverse(&self) -> Self {
+        match self {
+            Self::Added { artifact_id, new } => Self::Removed {
+                artifact_id: *artifact_id,
+                old: new.clone(),
+            },
+            Self::Updated {
+                artifact_id,
+                old,
+                new,
+            } => Self::Updated {
+                artifact_id: *artifact_id,
+                old: new.clone(),
+                new: old.clone(),
+            },
+            Self::Removed { artifact_id, old } => Self::Added {
+                artifact_id: *artifact_id,
+                new: old.clone(),
+            },
+        }
     }
 }
 

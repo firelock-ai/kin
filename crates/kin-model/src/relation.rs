@@ -81,7 +81,7 @@ impl From<VerificationRunId> for GraphNodeId {
 }
 
 /// A typed edge in the semantic graph.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Relation {
     pub id: RelationId,
     pub kind: RelationKind,

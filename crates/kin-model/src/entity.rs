@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use crate::ids::*;
 
 /// The atomic semantic unit in Kin's graph.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Entity {
     pub id: EntityId,
     pub kind: EntityKind,
@@ -57,7 +57,7 @@ pub enum EntityKind {
 
 /// Content-based fingerprint of an entity, used to detect what changed
 /// between revisions (structure, signature, and exact contents).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SemanticFingerprint {
     pub algorithm: FingerprintAlgorithm,
     /// Hash of the normalized AST/source structure (insensitive to comments and whitespace).
@@ -104,7 +104,7 @@ pub enum EntityRole {
 }
 
 /// Extensible metadata bag for entities.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct EntityMetadata {
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,

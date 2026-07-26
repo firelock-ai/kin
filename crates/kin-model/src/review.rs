@@ -7,7 +7,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Summary of risk associated with a semantic change.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RiskSummary {
     pub overall_risk: RiskLevel,
     pub breaking_changes: Vec<String>,

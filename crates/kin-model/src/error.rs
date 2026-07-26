@@ -11,8 +11,11 @@ pub enum ModelError {
     #[error("relation not found: {0}")]
     RelationNotFound(String),
 
-    #[error("branch not found: {0}")]
-    BranchNotFound(String),
+    #[error("reference not found: {0}")]
+    RefNotFound(String),
+
+    #[error("workspace not found: {0}")]
+    WorkspaceNotFound(String),
 
     #[error("change not found: {0}")]
     ChangeNotFound(String),

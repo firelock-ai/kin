@@ -48,7 +48,9 @@ impl fmt::Display for EntityId {
 }
 
 /// Unique identifier for a Relation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 pub struct RelationId(pub Uuid);
 
 impl RelationId {
@@ -104,7 +106,9 @@ impl fmt::Display for RelationRevisionId {
 }
 
 /// Content-addressed identifier for a SemanticChange.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 pub struct SemanticChangeId(pub Hash256);
 
 impl SemanticChangeId {
@@ -116,6 +120,141 @@ impl SemanticChangeId {
 impl fmt::Display for SemanticChangeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+/// Stable repository identity used to scope refs, aliases, and transactions.
+///
+/// Repository IDs are presentation-safe opaque strings. Hosted slugs and UUID
+/// text are both valid; empty, control-bearing, or oversized values are not.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RepositoryId(String);
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RepositoryIdError {
+    #[error("repository id must not be empty")]
+    Empty,
+    #[error("repository id must not exceed 255 bytes")]
+    TooLong,
+    #[error("repository id must not contain control characters")]
+    Control,
+}
+
+impl RepositoryId {
+    pub fn new(value: impl Into<String>) -> Result<Self, RepositoryIdError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(RepositoryIdError::Empty);
+        }
+        if value.len() > 255 {
+            return Err(RepositoryIdError::TooLong);
+        }
+        if value.chars().any(char::is_control) {
+            return Err(RepositoryIdError::Control);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for RepositoryId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Serialize for RepositoryId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for RepositoryId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+impl JsonSchema for RepositoryId {
+    fn schema_name() -> String {
+        "RepositoryId".to_string()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        String::json_schema(generator)
+    }
+}
+
+/// Caller-stable identity for one repository authority transaction.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+pub struct OperationId(pub Uuid);
+
+impl OperationId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub const fn from_uuid(value: Uuid) -> Self {
+        Self(value)
+    }
+
+    pub const fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+}
+
+impl Default for OperationId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for OperationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Local identity for one materialized repository workspace.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+pub struct WorkspaceId(pub Uuid);
+
+impl WorkspaceId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub const fn from_uuid(value: Uuid) -> Self {
+        Self(value)
+    }
+}
+
+impl Default for WorkspaceId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for WorkspaceId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
     }
 }
 
@@ -396,44 +535,6 @@ impl Default for EvidenceId {
 }
 
 impl fmt::Display for EvidenceId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Unique identifier for a Branch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-pub struct BranchId(pub Uuid);
-
-impl BranchId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl Default for BranchId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl fmt::Display for BranchId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Branch name.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-pub struct BranchName(pub String);
-
-impl BranchName {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self(name.into())
-    }
-}
-
-impl fmt::Display for BranchName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
