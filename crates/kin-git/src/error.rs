@@ -24,6 +24,24 @@ pub enum GitError {
     #[error("no commits in repository")]
     EmptyRepository,
 
+    #[error("shallow Git repositories cannot be imported losslessly")]
+    ShallowRepository,
+
+    #[error("Git object {oid} is missing while traversing {context}")]
+    MissingObject { oid: String, context: String },
+
+    #[error("Git object {oid} is corrupt: {reason}")]
+    CorruptObject { oid: String, reason: String },
+
+    #[error("lossless Git snapshot is invalid: {0}")]
+    InvalidSnapshot(String),
+
+    #[error("Git object format {0} is not supported for exact rehydration")]
+    UnsupportedObjectFormat(String),
+
+    #[error("Git rehydration destination already exists: {0}")]
+    DestinationExists(String),
+
     #[error("io error: {path}: {source}")]
     Io {
         path: String,

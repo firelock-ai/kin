@@ -7,22 +7,16 @@
 //! boundary imports exact Git repository state and projects Kin history back to
 //! Git for migration and coexistence.
 //!
-//! - **Import**: Read Git history via gitoxide and create SemanticChange objects
-//! - **Export**: Translate SemanticChange DAG into Git commits/trees
-//! - **Co-change enrichment**: Mine non-authoritative historical signals
+//! The public boundary is deliberately lossless: capture raw Git objects and
+//! exact refs into graph-owned descriptors, or rehydrate those same bytes.
+//! Earlier lossy history conversion and commit-synthesizing export APIs are not
+//! part of the clean-slate model-v6 surface.
 
-pub mod cochange;
 pub mod error;
-pub mod export;
-pub mod genesis;
-pub mod import;
+pub mod lossless;
 
-pub use cochange::{mine_from_change_dag, mine_from_git_log, mine_from_git_log_with_limit};
 pub use error::{GitError, Result};
-pub use export::{export_changes, export_to_git, ExportOptions, ExportResult};
-pub use genesis::is_genesis_change;
-#[allow(deprecated)]
-pub use import::{
-    import_git_history, import_git_history_to_commit_with_blobs, import_git_history_with_blobs,
-    semantic_change_id_from_git_oid_hex, GitImportMode, ImportOptions, ImportedChange,
+pub use lossless::{
+    capture_lossless_git_repository, rehydrate_lossless_git_repository, GitObjectFormat,
+    GitRehydrationResult, LosslessGitRepository,
 };

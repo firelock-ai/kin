@@ -12,7 +12,7 @@ repository.workspace = true
 [dependencies]
 kin-model = { workspace = true }
 kin-blobs = { workspace = true }
-gix = { workspace = true, features = ["blob-diff"] }
+gix = { workspace = true, features = ["blob-diff", "sha256"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
@@ -20,9 +20,9 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 rayon = { workspace = true }
 uuid = { workspace = true }
+rustix = { workspace = true }
 
 [dev-dependencies]
-kin-db = { workspace = true }
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
 serde_json = { workspace = true }
