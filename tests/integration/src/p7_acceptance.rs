@@ -217,7 +217,7 @@ fn traffic_aware_context_pack_includes_traffic() {
 }
 
 // -----------------------------------------------------------------------
-// 11. Brownfield: create Git repo -> kin migrate --shallow -> verify entities
+// 11. Brownfield: create Git repo -> exact snapshot migrate -> verify entities
 // -----------------------------------------------------------------------
 
 #[test]
@@ -267,10 +267,7 @@ fn brownfield_snapshot_migration() {
     let scan = kin_migrate::scan_repo(dir.path());
     match scan {
         Ok(scan) => {
-            // commit_count is populated by a deeper scan, not scan_repo itself,
-            // so we only assert on source files here.
-            assert!(!scan.source_files.is_empty(), "should find source files");
-
+            assert_eq!(scan.root, dir.path().canonicalize().unwrap());
             // Plan an exact snapshot migration to a separate target directory.
             let target = tempfile::tempdir().unwrap();
             let plan = kin_migrate::plan_migration(
@@ -385,19 +382,9 @@ fn brownfield_snapshot_migration_preserves_mixed_repo_shape() {
     let scan = kin_migrate::scan_repo(dir.path());
     match scan {
         Ok(scan) => {
-            assert!(
-                scan.source_files
-                    .iter()
-                    .any(|path| path == &PathBuf::from("src/lib.rs")),
-                "migration scan should keep Rust files in a mixed repo"
-            );
-            assert!(
-                scan.source_files
-                    .iter()
-                    .any(|path| path == &PathBuf::from("frontend/app.tsx")),
-                "migration scan should keep TypeScript files in a mixed repo"
-            );
-
+            // Scanning selects the Git repository/ref only. Membership comes
+            // from the imported exact tree, including non-language artifacts.
+            assert_eq!(scan.root, dir.path().canonicalize().unwrap());
             let target = tempfile::tempdir().unwrap();
             let plan = kin_migrate::plan_migration(
                 &scan,
