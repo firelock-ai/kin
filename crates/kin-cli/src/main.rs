@@ -965,8 +965,12 @@ enum ResourcesAction {
 
 #[derive(Subcommand)]
 enum BranchAction {
-    /// [OPEN GATE] List byte-exact repository-v6 refs
-    List,
+    /// List byte-exact repository-v6 branch refs
+    List {
+        /// Output exact ref names and targets as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// [OPEN GATE] Create a ref with compare-and-swap
     Create {
         /// Branch name
@@ -1893,7 +1897,7 @@ fn main() -> Result<()> {
                 Command::Commit { .. } => commands::capabilities::require_ready("commit"),
                 Command::Log { count: _ } => commands::capabilities::require_ready("log"),
                 Command::Branch { action } => match action {
-                    BranchAction::List => commands::capabilities::require_ready("branch list"),
+                    BranchAction::List { json } => commands::branch::list(json),
                     BranchAction::Create { name: _ } => {
                         commands::capabilities::require_ready("branch create")
                     }

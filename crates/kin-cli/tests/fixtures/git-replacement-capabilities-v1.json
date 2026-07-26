@@ -76,15 +76,17 @@
     },
     {
       "command": "branch list",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "repository-v6 byte-exact refs",
       "required_for_bounded_dogfood": true,
       "acceptance_spec": [
         "list full byte-exact refs and identify the workspace symbolic or detached head from one authority generation"
       ],
-      "evidence_tests": [],
-      "note": "The old implementation used removed Branch and BranchName state."
+      "evidence_tests": [
+        "crates/kin-cli/tests/repository_branches.rs"
+      ],
+      "note": "Branch list reads canonical fully-qualified byte refs, targets, default ref, and active workspace head from one repository-v6 authority lease."
     },
     {
       "command": "branch create",
