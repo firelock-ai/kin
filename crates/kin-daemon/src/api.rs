@@ -12963,6 +12963,8 @@ mod tests {
         let branch_name = BranchName::new("main");
         let genesis = kin_core::build_genesis_change();
         state.graph.create_change(&genesis).unwrap();
+        let entries: Vec<_> = entries.into_iter().collect();
+        let projected_files = entries.iter().map(|(file_id, _)| file_id.clone()).collect();
 
         let change = SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([0x77; 32])),
@@ -12976,7 +12978,7 @@ mod tests {
                 .into_iter()
                 .map(|(file_id, new_entry)| TreeDelta::Added { file_id, new_entry })
                 .collect(),
-            projected_files: vec![],
+            projected_files,
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
