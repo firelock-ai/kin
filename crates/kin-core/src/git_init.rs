@@ -17,15 +17,18 @@ use kin_git::{
     GitMigrationPreflightProof, LosslessGitRepository,
 };
 use kin_model::{
-    compute_resolved_tree_hash, AdmissionScanToken, AuthorId, EffectiveAdmissionPolicyStamp,
-    FrozenLocalOverlay, FrozenLocalOverlayDelta, GitExternalAuthorityDelta, Hash256,
-    LocalAdmissionRuleSource, LocalAdmissionRuleSourceKind, LocatedEntry, OperationId,
-    RepositoryId, RepositoryTransaction, ResolvedTree, TreeDelta, WorkspaceExpectation,
-    WorkspaceMutation, ADMISSION_POLICY_SEMANTICS_VERSION,
+    compute_resolved_tree_hash, AdmissionCase, AdmissionScanToken, AuthorId,
+    EffectiveAdmissionPolicyStamp, FrozenLocalOverlay, FrozenLocalOverlayDelta,
+    GitExternalAuthorityDelta, Hash256, LocalAdmissionRuleSource, LocalAdmissionRuleSourceKind,
+    LocatedEntry, OperationId, RepositoryId, RepositoryTransaction, ResolvedTree, TreeDelta,
+    WorkspaceExpectation, WorkspaceMutation, ADMISSION_POLICY_SEMANTICS_VERSION,
 };
 use tracing::info;
 
-use crate::config::KinConfig;
+use crate::config::{
+    GitBranchTrackingConfig, GitCoexistenceConfig, GitPushDefault, GitRemoteTransportConfig,
+    KinConfig,
+};
 use crate::error::{KinError, Result};
 use crate::init::{
     prepare_repository_layout_at, publish_repository_layout_after_check, InitResult,
@@ -38,6 +41,13 @@ use crate::manifest::KinManifest;
 /// source drift, unsupported compatibility state, an existing destination, or
 /// any graph/CAS validation error leaves `.kin` absent.
 pub fn init_from_git(working_dir: &Path) -> Result<InitResult> {
+    init_from_git_with_hook(working_dir, || {})
+}
+
+fn init_from_git_with_hook(
+    working_dir: &Path,
+    before_final_source_proof: impl FnOnce(),
+) -> Result<InitResult> {
     let source = canonical_new_repository_root(working_dir)?;
     require_git_boundary(&source)?;
 
@@ -67,10 +77,9 @@ pub fn init_from_git(working_dir: &Path) -> Result<InitResult> {
         .map_err(|error| git_boundary_error("build exact Git authority", error))?;
     let source_proof = preflight_git_migration(&source, &snapshot, &semantic_plan, &capture_store)
         .map_err(|error| git_boundary_error("prove mutable Git workspace", error))?;
-    reject_unmapped_remotes(&source_proof)?;
 
     let staging_dir = source_parent.join(format!(".kin.init-{}", uuid::Uuid::new_v4()));
-    let config = config_for_source(&snapshot);
+    let config = config_for_source(&snapshot, &source_proof.remote_mapping)?;
     let mut prepared = prepare_repository_layout_at(&staging_dir, config, manifest)?;
     copy_captured_authority(&prepared, &snapshot, &capture_store, &source_proof)?;
 
@@ -100,6 +109,7 @@ pub fn init_from_git(working_dir: &Path) -> Result<InitResult> {
 
     let final_kin_dir = source.join(".kin");
     let result = publish_repository_layout_after_check(prepared, &final_kin_dir, || {
+        before_final_source_proof();
         let final_proof =
             preflight_git_migration(&source, &snapshot, &semantic_plan, &capture_store)
                 .map_err(|error| git_boundary_error("repeat final Git source proof", error))?;
@@ -150,7 +160,10 @@ fn require_git_boundary(source: &Path) -> Result<()> {
     }
 }
 
-fn config_for_source(snapshot: &LosslessGitRepository) -> KinConfig {
+fn config_for_source(
+    snapshot: &LosslessGitRepository,
+    remote_mapping: &kin_git::GitRemoteMappingFacts,
+) -> Result<KinConfig> {
     let mut config = KinConfig::default();
     if let kin_model::WorkspaceHead::Symbolic { target } = &snapshot.head {
         if target.is_branch() {
@@ -160,18 +173,83 @@ fn config_for_source(snapshot: &LosslessGitRepository) -> KinConfig {
             }
         }
     }
-    config
+    config.git = map_git_coexistence_config(remote_mapping)?;
+    config.validate()?;
+    Ok(config)
 }
 
-fn reject_unmapped_remotes(proof: &GitMigrationPreflightProof) -> Result<()> {
-    if !proof.remote_mapping.mapper_required {
-        return Ok(());
-    }
-    Err(KinError::Other(format!(
-        "Git repository has {} remote configuration block(s) and {} branch-tracking block(s); exact Kin remote mapping is required before migration",
-        proof.remote_mapping.remotes.len(),
-        proof.remote_mapping.branch_tracking.len()
-    )))
+fn map_git_coexistence_config(
+    facts: &kin_git::GitRemoteMappingFacts,
+) -> Result<GitCoexistenceConfig> {
+    let remotes = facts
+        .remotes
+        .iter()
+        .map(|remote| {
+            Ok(GitRemoteTransportConfig {
+                name: exact_utf8(&remote.name, "Git remote name")?,
+                fetch_urls: exact_utf8_values(&remote.fetch_urls, "Git fetch URL")?,
+                push_urls: exact_utf8_values(&remote.push_urls, "Git push URL")?,
+                fetch_refspecs: exact_utf8_values(&remote.fetch_refspecs, "Git fetch refspec")?,
+                push_refspecs: exact_utf8_values(&remote.push_refspecs, "Git push refspec")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let branches = facts
+        .branch_tracking
+        .iter()
+        .map(|branch| {
+            Ok(GitBranchTrackingConfig {
+                branch: exact_utf8(&branch.branch, "Git branch name")?,
+                remote: branch
+                    .remote
+                    .as_deref()
+                    .map(|value| exact_utf8(value, "Git branch remote"))
+                    .transpose()?,
+                merge_refs: exact_utf8_values(&branch.merge_refs, "Git branch merge ref")?,
+                push_remote: branch
+                    .push_remote
+                    .as_deref()
+                    .map(|value| exact_utf8(value, "Git branch pushRemote"))
+                    .transpose()?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let remote_push_default = facts
+        .remote_push_default
+        .as_deref()
+        .map(|value| exact_utf8(value, "Git remote.pushDefault"))
+        .transpose()?;
+    let push_default = facts
+        .push_default
+        .as_deref()
+        .map(|value| {
+            let value = exact_utf8(value, "Git push.default")?;
+            GitPushDefault::from_exact_git_value(&value).ok_or_else(|| {
+                KinError::Other(
+                    "Git push.default escaped preflight without an exact typed mapping".to_string(),
+                )
+            })
+        })
+        .transpose()?;
+    Ok(GitCoexistenceConfig {
+        remotes,
+        branches,
+        remote_push_default,
+        push_default,
+    })
+}
+
+fn exact_utf8(value: &[u8], label: &str) -> Result<String> {
+    std::str::from_utf8(value)
+        .map(str::to_owned)
+        .map_err(|_| KinError::Other(format!("{label} escaped preflight with non-UTF-8 bytes")))
+}
+
+fn exact_utf8_values(values: &[Vec<u8>], label: &str) -> Result<Vec<String>> {
+    values
+        .iter()
+        .map(|value| exact_utf8(value, label))
+        .collect()
 }
 
 fn copy_captured_authority(
@@ -223,11 +301,15 @@ fn bind_workspace_authority(
     }
     let tree_hash = compute_resolved_tree_hash(&workspace_seed.base_tree)
         .map_err(|error| KinError::Other(error.to_string()))?;
-    if workspace_seed
-        .base_tree_hash
-        .is_some_and(|hash| hash != tree_hash)
-        || workspace_seed.base_tree_hash.is_none() != workspace_seed.base_tree.is_empty()
-    {
+    let valid_tree_identity = match workspace_seed.base_tree_hash {
+        Some(expected) => expected == tree_hash,
+        None => {
+            workspace_seed.base_target.is_none()
+                && workspace_seed.base_commit_oid.is_none()
+                && workspace_seed.base_tree.is_empty()
+        }
+    };
+    if !valid_tree_identity {
         return Err(KinError::Other(
             "admitted Git workspace tree does not match its canonical base identity".to_string(),
         ));
@@ -308,7 +390,12 @@ fn frozen_local_overlay(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    FrozenLocalOverlay::new(workspace_id, 0, sources)
+    let case = if proof.ignored_local.ignore_case {
+        AdmissionCase::FoldAscii
+    } else {
+        AdmissionCase::Sensitive
+    };
+    FrozenLocalOverlay::new(workspace_id, 0, case, sources)
         .map_err(|error| KinError::Other(error.to_string()))
 }
 
@@ -323,7 +410,119 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unmapped_remote_configuration_fails_before_publication() {
+    fn exact_remote_configuration_is_sealed_in_local_kin_config() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
+        git(&source, ["add", "--all"]);
+        git(&source, ["commit", "-m", "initial"]);
+        git(
+            &source,
+            ["remote", "add", "origin", "https://example.invalid/kin.git"],
+        );
+        git(
+            &source,
+            [
+                "remote",
+                "set-url",
+                "--add",
+                "origin",
+                "https://mirror.example.invalid/kin.git",
+            ],
+        );
+        git(
+            &source,
+            [
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                "ssh://example.invalid/kin.git",
+            ],
+        );
+        git(
+            &source,
+            [
+                "config",
+                "--add",
+                "remote.origin.push",
+                "refs/heads/main:refs/heads/main",
+            ],
+        );
+        git(&source, ["config", "branch.main.remote", "origin"]);
+        git(&source, ["config", "branch.main.merge", "refs/heads/main"]);
+        git(&source, ["config", "remote.pushDefault", "origin"]);
+        git(&source, ["config", "push.default", "simple"]);
+
+        let result = init_from_git(&source).unwrap();
+
+        assert_eq!(result.config.git.remotes.len(), 1);
+        assert_eq!(
+            result.config.git.remotes[0].fetch_urls,
+            vec![
+                "https://example.invalid/kin.git",
+                "https://mirror.example.invalid/kin.git",
+            ]
+        );
+        assert_eq!(
+            result.config.git.remotes[0].push_urls,
+            vec!["ssh://example.invalid/kin.git"]
+        );
+        assert_eq!(
+            result.config.git.remotes[0].fetch_refspecs,
+            vec!["+refs/heads/*:refs/remotes/origin/*"]
+        );
+        assert_eq!(
+            result.config.git.remotes[0].push_refspecs,
+            vec!["refs/heads/main:refs/heads/main"]
+        );
+        assert_eq!(result.config.git.branches.len(), 1);
+        assert_eq!(
+            result.config.git.branches[0].remote.as_deref(),
+            Some("origin")
+        );
+        assert_eq!(
+            result.config.git.remote_push_default.as_deref(),
+            Some("origin")
+        );
+        assert_eq!(result.config.git.push_default, Some(GitPushDefault::Simple));
+        let reopened = KinConfig::load(&result.layout.config_path()).unwrap();
+        assert_eq!(reopened.git, result.config.git);
+        assert!(!format!("{reopened:?}").contains("example.invalid"));
+        assert_no_staging_directories(root.path());
+    }
+
+    #[test]
+    fn unsafe_remote_configuration_fails_before_staging_without_disclosure() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
+        git(&source, ["add", "--all"]);
+        git(&source, ["commit", "-m", "initial"]);
+        git(
+            &source,
+            [
+                "remote",
+                "add",
+                "origin",
+                "https://super-secret@example.invalid/private/repo.git",
+            ],
+        );
+
+        let error = init_from_git(&source).unwrap_err().to_string();
+
+        assert!(error.contains("safe exact subset"), "{error}");
+        assert!(!error.contains("super-secret"), "{error}");
+        assert!(!source.join(".kin").exists());
+        assert_no_staging_directories(root.path());
+    }
+
+    #[test]
+    fn same_count_remote_url_drift_at_final_proof_blocks_publication() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
@@ -336,13 +535,70 @@ mod tests {
             ["remote", "add", "origin", "https://example.invalid/kin.git"],
         );
 
-        let error = init_from_git(&source).unwrap_err().to_string();
+        let source_for_hook = source.clone();
+        let error = init_from_git_with_hook(&source, move || {
+            git(
+                &source_for_hook,
+                [
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "https://changed.example.invalid/kin.git",
+                ],
+            );
+        })
+        .unwrap_err()
+        .to_string();
 
-        assert!(
-            error.contains("exact Kin remote mapping is required"),
-            "{error}"
-        );
+        assert!(error.contains("source proof changed"), "{error}");
+        assert!(!error.contains("changed.example.invalid"), "{error}");
         assert!(!source.join(".kin").exists());
+        assert_no_staging_directories(root.path());
+    }
+
+    #[test]
+    fn pristine_unborn_repository_without_an_index_initializes_atomically() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        assert!(!source.join(".git/index").exists());
+
+        let result = init_from_git(&source).unwrap();
+
+        assert_eq!(result.authority.receipt.generation, 1);
+        assert!(result.authority.workspace.base_target.is_none());
+        assert!(result.authority.workspace.base_tree_hash.is_none());
+        assert!(source.join(".kin").is_dir());
+        assert_no_staging_directories(root.path());
+    }
+
+    #[test]
+    fn born_empty_commit_keeps_a_present_empty_tree_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        git(
+            &source,
+            [
+                "commit",
+                "--allow-empty",
+                "--no-gpg-sign",
+                "-m",
+                "born empty",
+            ],
+        );
+
+        let result = init_from_git(&source).unwrap();
+
+        assert!(result.authority.workspace.base_target.is_some());
+        assert!(result.authority.workspace.base_tree_hash.is_some());
+        assert_eq!(
+            result.authority.workspace.base_tree_hash,
+            Some(result.authority.workspace.workspace_tree_hash)
+        );
+        assert!(!result.authority.workspace.is_dirty());
         assert_no_staging_directories(root.path());
     }
 

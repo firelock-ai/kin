@@ -2,7 +2,11 @@
 // Copyright 2026 Firelock, LLC
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::fmt;
 use std::path::Path;
+
+use gix::bstr::ByteSlice;
 
 use crate::error::{KinError, Result};
 
@@ -189,7 +193,7 @@ impl std::fmt::Display for RemoteTransportKind {
 }
 
 /// A configured Kin remote reference.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteRefConfig {
     /// Remote name such as `origin`.
     pub name: String,
@@ -208,6 +212,21 @@ pub struct RemoteRefConfig {
     pub publish_proofs: bool,
 }
 
+impl fmt::Debug for RemoteRefConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteRefConfig")
+            .field("name", &self.name)
+            .field("host", &self.host)
+            .field("transport", &self.transport)
+            .field("url_present", &self.url.is_some())
+            .field("url", &"<redacted>")
+            .field("publish_review_state", &self.publish_review_state)
+            .field("publish_proofs", &self.publish_proofs)
+            .finish()
+    }
+}
+
 /// Remote configuration stored in repo config.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RemoteConfig {
@@ -217,6 +236,273 @@ pub struct RemoteConfig {
     /// Explicitly configured remotes.
     #[serde(default)]
     pub refs: Vec<RemoteRefConfig>,
+}
+
+/// Canonical repository-local Git push behavior admitted during coexistence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GitPushDefault {
+    Nothing,
+    Current,
+    Upstream,
+    Simple,
+    Matching,
+}
+
+impl GitPushDefault {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Nothing => "nothing",
+            Self::Current => "current",
+            Self::Upstream => "upstream",
+            Self::Simple => "simple",
+            Self::Matching => "matching",
+        }
+    }
+
+    pub fn from_exact_git_value(value: &str) -> Option<Self> {
+        match value {
+            "nothing" => Some(Self::Nothing),
+            "current" => Some(Self::Current),
+            "upstream" => Some(Self::Upstream),
+            "simple" => Some(Self::Simple),
+            "matching" => Some(Self::Matching),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for GitPushDefault {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// One exact, credential-free Git remote admitted from repository-local config.
+///
+/// Empty URL/refspec lists are meaningful and preserve explicit absence. Values
+/// remain ordered exactly as Git presented them at the admission boundary.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitRemoteTransportConfig {
+    pub name: String,
+    #[serde(default)]
+    pub fetch_urls: Vec<String>,
+    #[serde(default)]
+    pub push_urls: Vec<String>,
+    #[serde(default)]
+    pub fetch_refspecs: Vec<String>,
+    #[serde(default)]
+    pub push_refspecs: Vec<String>,
+}
+
+impl fmt::Debug for GitRemoteTransportConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitRemoteTransportConfig")
+            .field("name", &self.name)
+            .field("fetch_url_count", &self.fetch_urls.len())
+            .field("push_url_count", &self.push_urls.len())
+            .field("fetch_refspec_count", &self.fetch_refspecs.len())
+            .field("push_refspec_count", &self.push_refspecs.len())
+            .field("values", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Exact tracking configuration for one local Git branch.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitBranchTrackingConfig {
+    pub branch: String,
+    #[serde(default)]
+    pub remote: Option<String>,
+    #[serde(default)]
+    pub merge_refs: Vec<String>,
+    #[serde(default)]
+    pub push_remote: Option<String>,
+}
+
+impl fmt::Debug for GitBranchTrackingConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitBranchTrackingConfig")
+            .field("branch", &self.branch)
+            .field("remote_present", &self.remote.is_some())
+            .field("merge_ref_count", &self.merge_refs.len())
+            .field("push_remote_present", &self.push_remote.is_some())
+            .field("values", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Sealed local Git coexistence configuration.
+///
+/// This is transport/projection configuration, not graph-owned
+/// `GitExternalAuthority`. It is written into `.kin/config.toml` and sealed by
+/// repository initialization alongside the other local configuration bytes.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitCoexistenceConfig {
+    #[serde(default)]
+    pub remotes: Vec<GitRemoteTransportConfig>,
+    #[serde(default)]
+    pub branches: Vec<GitBranchTrackingConfig>,
+    #[serde(default)]
+    pub remote_push_default: Option<String>,
+    #[serde(default)]
+    pub push_default: Option<GitPushDefault>,
+}
+
+impl fmt::Debug for GitCoexistenceConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitCoexistenceConfig")
+            .field("remote_count", &self.remotes.len())
+            .field("branch_count", &self.branches.len())
+            .field(
+                "remote_push_default_present",
+                &self.remote_push_default.is_some(),
+            )
+            .field("push_default", &self.push_default)
+            .field("transport_values", &"<redacted>")
+            .finish()
+    }
+}
+
+impl GitCoexistenceConfig {
+    /// Validate that manually edited or reopened local config remains inside
+    /// the same credential-free subset admitted from Git.
+    pub fn validate(&self) -> Result<()> {
+        let mut remote_names = BTreeSet::new();
+        for remote in &self.remotes {
+            validate_git_identifier(&remote.name, "Git remote name")?;
+            if !remote_names.insert(remote.name.as_str()) {
+                return Err(git_config_error("duplicate Git remote name"));
+            }
+            for url in remote.fetch_urls.iter().chain(&remote.push_urls) {
+                validate_git_remote_url(url)?;
+            }
+            for refspec in &remote.fetch_refspecs {
+                validate_git_refspec(refspec, gix::refspec::parse::Operation::Fetch)?;
+            }
+            for refspec in &remote.push_refspecs {
+                validate_git_refspec(refspec, gix::refspec::parse::Operation::Push)?;
+            }
+        }
+
+        let known_remote = |candidate: &str| candidate == "." || remote_names.contains(candidate);
+        if self
+            .remote_push_default
+            .as_deref()
+            .is_some_and(|remote| !known_remote(remote))
+        {
+            return Err(git_config_error(
+                "Git remote_push_default names an unknown remote",
+            ));
+        }
+
+        let mut branch_names = BTreeSet::new();
+        for branch in &self.branches {
+            validate_git_branch_name(&branch.branch)?;
+            if !branch_names.insert(branch.branch.as_str()) {
+                return Err(git_config_error("duplicate Git branch tracking entry"));
+            }
+            if branch
+                .remote
+                .as_deref()
+                .is_some_and(|remote| !known_remote(remote))
+                || branch
+                    .push_remote
+                    .as_deref()
+                    .is_some_and(|remote| !known_remote(remote))
+            {
+                return Err(git_config_error(
+                    "Git branch tracking names an unknown remote",
+                ));
+            }
+            if !branch.merge_refs.is_empty() && branch.remote.is_none() {
+                return Err(git_config_error(
+                    "Git branch merge refs require an explicit remote",
+                ));
+            }
+            for merge_ref in &branch.merge_refs {
+                gix::validate::reference::name(merge_ref.as_bytes().as_bstr())
+                    .map_err(|_| git_config_error("invalid Git branch merge ref"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_git_identifier(value: &str, label: &str) -> Result<()> {
+    if value.is_empty()
+        || value.starts_with('-')
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(git_config_error(format!("unsafe {label}")));
+    }
+    Ok(())
+}
+
+fn validate_git_branch_name(value: &str) -> Result<()> {
+    validate_git_identifier(value, "Git branch name")?;
+    let full = format!("refs/heads/{value}");
+    gix::validate::reference::name(full.as_bytes().as_bstr())
+        .map_err(|_| git_config_error("invalid Git branch name"))?;
+    Ok(())
+}
+
+fn validate_git_remote_url(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.starts_with('-')
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || matches!(byte, b'?' | b'#'))
+    {
+        return Err(git_config_error("unsafe Git remote URL"));
+    }
+    let parsed =
+        gix::Url::try_from(value).map_err(|_| git_config_error("unparseable Git remote URL"))?;
+    if parsed.user.is_some() || parsed.password.is_some() {
+        return Err(git_config_error("credential or userinfo in Git remote URL"));
+    }
+    match parsed.scheme {
+        gix::url::Scheme::File => {}
+        gix::url::Scheme::Git
+        | gix::url::Scheme::Ssh
+        | gix::url::Scheme::Http
+        | gix::url::Scheme::Https => {
+            if parsed.host.as_deref().is_none_or(str::is_empty) {
+                return Err(git_config_error("network Git remote URL has no host"));
+            }
+        }
+        gix::url::Scheme::Ext(_) => {
+            return Err(git_config_error("unsupported custom Git remote scheme"));
+        }
+    }
+    if parsed.path_argument_safe().is_none() {
+        return Err(git_config_error("unsafe Git remote path"));
+    }
+    Ok(())
+}
+
+fn validate_git_refspec(value: &str, operation: gix::refspec::parse::Operation) -> Result<()> {
+    if value
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(git_config_error("unsafe Git refspec"));
+    }
+    gix::refspec::parse(value.as_bytes().as_bstr(), operation)
+        .map_err(|_| git_config_error("invalid Git refspec"))?;
+    Ok(())
+}
+
+fn git_config_error(reason: impl Into<String>) -> KinError {
+    KinError::Config(format!(
+        "sealed Git coexistence config is outside Kin's safe exact subset ({})",
+        reason.into()
+    ))
 }
 
 /// Proof posture for LSP enrichment. Mirrors `kin_lsp::ProofMode`.
@@ -370,6 +656,10 @@ pub struct KinConfig {
     #[serde(default)]
     pub remote: RemoteConfig,
 
+    /// Exact repository-local Git coexistence configuration admitted at init.
+    #[serde(default)]
+    pub git: GitCoexistenceConfig,
+
     /// LSP enrichment configuration: provider selection, required/disabled
     /// languages, and proof posture.
     #[serde(default)]
@@ -428,6 +718,7 @@ impl Default for KinConfig {
             world: WorldConfig::default(),
             execution: ExecutionPolicyConfig::default(),
             remote: RemoteConfig::default(),
+            git: GitCoexistenceConfig::default(),
             lsp: LspConfig::default(),
         }
     }
@@ -445,6 +736,7 @@ impl KinConfig {
     /// silently and degrade behavior at runtime.
     pub fn validate(&self) -> Result<()> {
         self.lsp.validate()?;
+        self.git.validate()?;
         Ok(())
     }
 
@@ -499,6 +791,8 @@ mod tests {
             ExternalToolExecutionPolicy::Workspace
         );
         assert!(parsed.remote.refs.is_empty());
+        assert!(parsed.git.remotes.is_empty());
+        assert!(parsed.git.branches.is_empty());
     }
 
     #[test]
@@ -581,6 +875,70 @@ transport = "native-kin"
         let parsed: KinConfig = toml::from_str(legacy).unwrap();
         assert_eq!(parsed.remote.refs.len(), 1);
         assert_eq!(parsed.remote.refs[0].host, RemoteHostKind::KinLab);
+    }
+
+    #[test]
+    fn exact_git_coexistence_config_round_trips_and_redacts_debug() {
+        let config = KinConfig {
+            git: GitCoexistenceConfig {
+                remotes: vec![GitRemoteTransportConfig {
+                    name: "origin".to_string(),
+                    fetch_urls: vec![
+                        "https://example.invalid/org/repo.git".to_string(),
+                        "https://mirror.example.invalid/org/repo.git".to_string(),
+                    ],
+                    push_urls: Vec::new(),
+                    fetch_refspecs: vec![
+                        "+refs/heads/*:refs/remotes/origin/*".to_string(),
+                        "+refs/tags/*:refs/tags/*".to_string(),
+                    ],
+                    push_refspecs: vec!["refs/heads/main:refs/heads/main".to_string()],
+                }],
+                branches: vec![GitBranchTrackingConfig {
+                    branch: "main".to_string(),
+                    remote: Some("origin".to_string()),
+                    merge_refs: vec!["refs/heads/main".to_string()],
+                    push_remote: None,
+                }],
+                remote_push_default: Some("origin".to_string()),
+                push_default: Some(GitPushDefault::Simple),
+            },
+            ..KinConfig::default()
+        };
+        config.validate().unwrap();
+
+        let encoded = toml::to_string_pretty(&config).unwrap();
+        let decoded: KinConfig = toml::from_str(&encoded).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded.git, config.git);
+        assert!(decoded.git.remotes[0].push_urls.is_empty());
+        let debug = format!("{decoded:?}");
+        assert!(!debug.contains("example.invalid"));
+        assert!(!debug.contains("refs/heads/main"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn exact_git_coexistence_config_rejects_unsafe_urls_without_disclosure() {
+        let config = KinConfig {
+            git: GitCoexistenceConfig {
+                remotes: vec![GitRemoteTransportConfig {
+                    name: "origin".to_string(),
+                    fetch_urls: vec![
+                        "https://super-secret@example.invalid/private/repo.git".to_string()
+                    ],
+                    push_urls: Vec::new(),
+                    fetch_refspecs: Vec::new(),
+                    push_refspecs: Vec::new(),
+                }],
+                ..GitCoexistenceConfig::default()
+            },
+            ..KinConfig::default()
+        };
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("safe exact subset"));
+        assert!(!error.contains("super-secret"));
     }
 
     #[test]

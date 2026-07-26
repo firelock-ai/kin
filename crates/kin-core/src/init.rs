@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager, StorageBackend};
 use kin_model::{
-    compute_resolved_tree_hash, AdmissionPolicyDelta, AdmissionScanToken, AuthorId,
+    compute_resolved_tree_hash, AdmissionCase, AdmissionPolicyDelta, AdmissionScanToken, AuthorId,
     DefaultRefExpectation, DefaultRefMutation, EffectiveAdmissionPolicyStamp, FrozenLocalOverlay,
     FrozenLocalOverlayDelta, GitRawTarget, Hash256, OperationId, RefExpectation, RefMutation,
     RefName, RefTarget, RefUpdatePolicy, RepositoryAuthorityStore, RepositoryCommitReceipt,
@@ -576,8 +576,9 @@ fn build_repository_bootstrap_transaction(
     let workspace_head = WorkspaceHead::Symbolic {
         target: default_ref.clone(),
     };
-    let local_overlay = FrozenLocalOverlay::new(workspace_id, 0, Vec::new())
-        .map_err(|error| KinError::Other(error.to_string()))?;
+    let local_overlay =
+        FrozenLocalOverlay::new(workspace_id, 0, AdmissionCase::Sensitive, Vec::new())
+            .map_err(|error| KinError::Other(error.to_string()))?;
     let admission_policy = EffectiveAdmissionPolicyStamp {
         shared: shared_policy.stamp(),
         local: local_overlay.stamp(),

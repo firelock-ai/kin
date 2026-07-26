@@ -35,8 +35,9 @@ pub use assistant_sync::{
     SyncMode, SyncResult,
 };
 pub use config::{
-    ExecutionPolicyConfig, ExternalToolExecutionPolicy, KinConfig, RemoteConfig, RemoteHostKind,
-    RemoteRefConfig, RemoteTransportKind, WorldConfig, WorldPreset,
+    ExecutionPolicyConfig, ExternalToolExecutionPolicy, GitBranchTrackingConfig,
+    GitCoexistenceConfig, GitPushDefault, GitRemoteTransportConfig, KinConfig, RemoteConfig,
+    RemoteHostKind, RemoteRefConfig, RemoteTransportKind, WorldConfig, WorldPreset,
 };
 pub use error::{KinError, Result};
 pub use exact_tree::{
