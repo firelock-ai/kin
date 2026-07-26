@@ -3,6 +3,8 @@
 
 use thiserror::Error;
 
+use kin_model::{GitObjectId, Hash256, RepoPath};
+
 /// Errors from the projection engine.
 #[derive(Debug, Error)]
 pub enum ProjectionError {
@@ -47,6 +49,60 @@ pub enum ProjectionError {
 
     #[error("body unavailable for entity {entity_id}: {reason}")]
     BodyUnavailable { entity_id: String, reason: String },
+
+    #[error("file layout {file_id} resolves to non-blob entry {entry_kind}")]
+    LayoutEntryUnsupported {
+        file_id: String,
+        entry_kind: &'static str,
+    },
+
+    #[error("repository tree contains conflicting paths {ancestor} and {descendant}")]
+    PathConflict {
+        ancestor: RepoPath,
+        descendant: RepoPath,
+    },
+
+    #[error(
+        "gitlink {path} at {target} cannot be materialized without submodule repository state"
+    )]
+    UnsupportedGitlink { path: RepoPath, target: GitObjectId },
+
+    #[error("repository path {path} cannot be represented exactly on {platform}")]
+    PathUnsupported {
+        path: RepoPath,
+        platform: &'static str,
+    },
+
+    #[error("symbolic link {path} cannot be represented exactly on {platform}")]
+    SymlinkUnsupported {
+        path: RepoPath,
+        platform: &'static str,
+    },
+
+    #[error("invalid symbolic-link target stored for {path}: {reason}")]
+    InvalidSymlinkTarget { path: RepoPath, reason: String },
+
+    #[error("graph tree references unavailable blob {hash} for {path}: {reason}")]
+    TreeBlobUnavailable {
+        path: RepoPath,
+        hash: Hash256,
+        reason: String,
+    },
+
+    #[error("projection root is not a directory: {0}")]
+    RootNotDirectory(String),
+
+    #[error("initial projection root is not empty: {0}")]
+    RootNotEmpty(String),
+
+    #[error("working-copy object at {path} differs from graph-owned source: {reason}")]
+    LocalModification { path: RepoPath, reason: String },
+
+    #[error("untracked working-copy object blocks projection at {path}: {reason}")]
+    UntrackedCollision { path: RepoPath, reason: String },
+
+    #[error("projection transaction failed: {cause}; rollback: {rollback}")]
+    TransactionFailed { cause: String, rollback: String },
 
     #[error("{0}")]
     Other(String),
