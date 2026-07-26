@@ -1006,6 +1006,7 @@ mod tests {
             actor: AuthorId::new("gcs-authority-test"),
             reason: "publish an exact unborn GCS workspace".to_string(),
             external_objects: Vec::new(),
+            git_authority_delta: None,
             changes: Vec::new(),
             aliases: Vec::new(),
             ref_mutations: Vec::new(),

@@ -19,12 +19,14 @@ use parking_lot::Mutex;
 use kin_model::{
     AuthorId, AuthorityRoot, ChangeStore, DefaultRefExpectation, DefaultRefMutation,
     ExternalChangeAlias, ExternalObjectId, ExternalObjectKind, ExternalObjectRecord,
-    FrozenLocalOverlay, GitObjectId, Hash256, ModelError, OperationId, RefExpectation, RefMutation,
-    RefName, RefTarget, RefUpdatePolicy, RepositoryAuthorityStore, RepositoryCommitOutcome,
-    RepositoryCommitReceipt, RepositoryId, RepositoryOperationRecord, RepositoryRef,
-    RepositoryRefState, RepositoryTransaction, RootBundle, SemanticChangeId, SharedAdmissionPolicy,
-    Timestamp, TreeEntry, WorkspaceHead, WorkspaceId, WorkspaceSnapshotBinding, WorkspaceState,
-    WorkspaceTreeArtifact, WorkspaceTreeSnapshot, REPOSITORY_ROOT_SCHEMA_VERSION,
+    FrozenLocalOverlay, GitExternalAuthority, GitObjectBodyLoader, GitObjectDependencyKind,
+    GitObjectId, GitTreeEntryMode, Hash256, ModelError, OperationId, RefExpectation, RefMutation,
+    RefName, RefTarget, RefUpdatePolicy, RepoPath, RepositoryAuthorityStore,
+    RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId, RepositoryOperationRecord,
+    RepositoryRef, RepositoryRefState, RepositoryTransaction, RootBundle, SemanticChangeId,
+    SharedAdmissionPolicy, Timestamp, TreeEntry, WorkspaceHead, WorkspaceId,
+    WorkspaceSnapshotBinding, WorkspaceState, WorkspaceTreeArtifact, WorkspaceTreeSnapshot,
+    REPOSITORY_ROOT_SCHEMA_VERSION,
 };
 
 use crate::engine::InMemoryGraph;
@@ -40,7 +42,7 @@ use crate::storage::backend::{
 use crate::storage::format::GraphSnapshot;
 
 /// Persisted repository-envelope schema.
-pub const REPOSITORY_AUTHORITY_SCHEMA_VERSION: u32 = 1;
+pub const REPOSITORY_AUTHORITY_SCHEMA_VERSION: u32 = 2;
 
 /// Shared admission policy resolved at one exact semantic change.
 ///
@@ -65,6 +67,7 @@ pub struct PersistedRepositoryAuthority {
     pub repository_id: RepositoryId,
     pub roots: RootBundle,
     pub external_objects: Vec<ExternalObjectRecord>,
+    pub git_external_authority: Option<GitExternalAuthority>,
     pub aliases: Vec<ExternalChangeAlias>,
     pub ref_state: RepositoryRefState,
     pub operation_log: Vec<RepositoryOperationRecord>,
@@ -81,6 +84,7 @@ impl PersistedRepositoryAuthority {
             repository_id,
             roots: placeholder_roots(0),
             external_objects: Vec::new(),
+            git_external_authority: None,
             aliases: Vec::new(),
             ref_state: RepositoryRefState::default(),
             operation_log: Vec::new(),
@@ -152,6 +156,7 @@ impl PersistedRepositoryAuthority {
                 )));
             }
         }
+        validate_git_authority_shape_and_projection(snapshot, self)?;
         for workspace in &self.workspaces {
             workspace.validate()?;
             if workspace.repository_id != self.repository_id {
@@ -767,6 +772,7 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     )?;
     admit_changes(&mut snapshot, &transaction.changes)?;
     admit_aliases(&snapshot, &mut metadata, &transaction.aliases)?;
+    apply_git_authority(backend, &snapshot, &mut metadata, transaction)?;
     metadata.admission_policies = derive_admission_policies(&snapshot.changes)?;
 
     apply_ref_mutations(&snapshot, &mut metadata, transaction)?;
@@ -796,6 +802,7 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
         transaction_hash,
         actor: transaction.actor.clone(),
         committed_at: Timestamp::now(),
+        git_authority_delta: transaction.git_authority_delta.clone(),
         ref_mutations: transaction.ref_mutations.clone(),
         default_ref_mutation: transaction.default_ref_mutation.clone(),
         workspace_mutation: transaction.workspace_mutation.clone(),
@@ -967,6 +974,441 @@ fn admit_aliases(
     }
     metadata.aliases = aliases.into_values().collect();
     Ok(())
+}
+
+fn apply_git_authority<B: StorageBackend + ?Sized>(
+    backend: &B,
+    snapshot: &GraphSnapshot,
+    metadata: &mut PersistedRepositoryAuthority,
+    transaction: &RepositoryTransaction,
+) -> Result<(), KinDbError> {
+    if let Some(delta) = &transaction.git_authority_delta {
+        if metadata.git_external_authority.as_ref() != delta.old.as_ref() {
+            return Err(ModelError::Conflict(format!(
+                "Git external authority for repository {} no longer matches its exact old-state lease",
+                transaction.repository_id
+            ))
+            .into());
+        }
+        metadata.git_external_authority = delta.new.clone();
+    }
+
+    validate_transaction_git_projection_membership(
+        transaction,
+        metadata.git_external_authority.as_ref(),
+    )?;
+    validate_git_authority_shape_and_projection(snapshot, metadata)?;
+    if transaction.git_authority_delta.is_some() {
+        validate_git_authority_bodies(
+            backend,
+            &transaction.repository_id,
+            metadata.git_external_authority.as_ref(),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_transaction_git_projection_membership(
+    transaction: &RepositoryTransaction,
+    authority: Option<&GitExternalAuthority>,
+) -> Result<(), KinDbError> {
+    let projected_oids = authority
+        .into_iter()
+        .flat_map(|authority| {
+            authority
+                .commit_projections
+                .iter()
+                .map(|projection| projection.commit_oid)
+        })
+        .collect::<BTreeSet<_>>();
+
+    for alias in &transaction.aliases {
+        if !projected_oids.contains(&alias.oid) {
+            return Err(ModelError::InvalidOperation(format!(
+                "transaction alias {} has no commit projection in the resulting Git external authority",
+                alias.oid
+            ))
+            .into());
+        }
+    }
+    for change in &transaction.changes {
+        if let kin_model::ChangeOrigin::GitCommit { oid } = change.origin {
+            if !projected_oids.contains(&oid) {
+                return Err(ModelError::InvalidOperation(format!(
+                    "Git-origin change {} for {} has no commit projection in the resulting Git external authority",
+                    change.id, oid
+                ))
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_git_authority_shape_and_projection(
+    snapshot: &GraphSnapshot,
+    metadata: &PersistedRepositoryAuthority,
+) -> Result<(), KinDbError> {
+    let Some(authority) = &metadata.git_external_authority else {
+        return validate_persisted_git_alias_coverage(snapshot, metadata);
+    };
+    if authority.repository_id != metadata.repository_id {
+        return Err(ModelError::InvalidOperation(format!(
+            "Git external authority belongs to repository {}, not {}",
+            authority.repository_id, metadata.repository_id
+        ))
+        .into());
+    }
+    authority.validate_shape().map_err(|error| {
+        ModelError::InvalidOperation(format!("invalid Git external authority shape: {error}"))
+    })?;
+
+    let records = metadata
+        .external_objects
+        .iter()
+        .map(|record| (record.object, record))
+        .collect::<BTreeMap<_, _>>();
+    for entry in &authority.closure.objects {
+        match records.get(&entry.record.object) {
+            Some(record) if **record == entry.record => {}
+            Some(_) => {
+                return Err(ModelError::Conflict(format!(
+                    "Git authority closure object {} does not match its persisted external-object descriptor",
+                    entry.record.object.oid
+                ))
+                .into())
+            }
+            None => {
+                return Err(ModelError::InvalidOperation(format!(
+                    "Git authority closure object {} is absent from persisted external objects",
+                    entry.record.object.oid
+                ))
+                .into())
+            }
+        }
+    }
+
+    let aliases = metadata
+        .aliases
+        .iter()
+        .map(|alias| (alias.oid, alias))
+        .collect::<BTreeMap<_, _>>();
+    let mut replay = snapshot.clone();
+    replay.repository_authority = None;
+    let graph = InMemoryGraph::from_snapshot(replay)?;
+    for projection in &authority.commit_projections {
+        let alias = aliases.get(&projection.commit_oid).ok_or_else(|| {
+            ModelError::InvalidOperation(format!(
+                "Git commit projection {} has no repository-scoped semantic alias",
+                projection.commit_oid
+            ))
+        })?;
+        let change = snapshot
+            .changes
+            .get(&alias.change_id)
+            .ok_or_else(|| ModelError::ChangeNotFound(alias.change_id.to_string()))?;
+        match change.origin {
+            kin_model::ChangeOrigin::GitCommit { oid } if oid == projection.commit_oid => {}
+            kin_model::ChangeOrigin::GitCommit { oid } => {
+                return Err(ModelError::Conflict(format!(
+                    "Git commit projection {} aliases change {} whose origin names {}",
+                    projection.commit_oid, change.id, oid
+                ))
+                .into())
+            }
+            kin_model::ChangeOrigin::Native => {
+                return Err(ModelError::InvalidOperation(format!(
+                    "Git commit projection {} aliases native change {}",
+                    projection.commit_oid, change.id
+                ))
+                .into())
+            }
+        }
+
+        let expected_parents = projection
+            .parent_oids
+            .iter()
+            .map(|parent_oid| {
+                aliases
+                    .get(parent_oid)
+                    .map(|alias| alias.change_id)
+                    .ok_or_else(|| {
+                        ModelError::InvalidOperation(format!(
+                            "Git commit projection {} parent {} has no repository-scoped semantic alias",
+                            projection.commit_oid, parent_oid
+                        ))
+                    })
+            })
+            .collect::<kin_model::Result<Vec<_>>>()?;
+        if change.parents != expected_parents {
+            return Err(ModelError::Conflict(format!(
+                "Git commit projection {} ordered parent aliases do not match semantic change {}",
+                projection.commit_oid, change.id
+            ))
+            .into());
+        }
+
+        let raw_tree = materialize_git_tree(authority, projection.raw_tree_oid)?;
+        let semantic_tree = graph
+            .resolve_tree_at(&change.id)?
+            .artifacts()
+            .map(|artifact| (artifact.path.clone(), artifact.entry))
+            .collect::<BTreeMap<_, _>>();
+        if semantic_tree != raw_tree {
+            return Err(ModelError::Conflict(format!(
+                "Git commit projection {} raw tree {} does not match the deterministic semantic tree for change {}",
+                projection.commit_oid, projection.raw_tree_oid, change.id
+            ))
+            .into());
+        }
+    }
+    validate_persisted_git_alias_coverage(snapshot, metadata)
+}
+
+fn validate_persisted_git_alias_coverage(
+    snapshot: &GraphSnapshot,
+    metadata: &PersistedRepositoryAuthority,
+) -> Result<(), KinDbError> {
+    let mut projected_oids = BTreeSet::new();
+    let mut collect = |authority: &GitExternalAuthority| {
+        projected_oids.extend(
+            authority
+                .commit_projections
+                .iter()
+                .map(|projection| projection.commit_oid),
+        );
+    };
+    if let Some(authority) = &metadata.git_external_authority {
+        collect(authority);
+    }
+    for operation in &metadata.operation_log {
+        let Some(delta) = &operation.git_authority_delta else {
+            continue;
+        };
+        if let Some(authority) = &delta.old {
+            collect(authority);
+        }
+        if let Some(authority) = &delta.new {
+            collect(authority);
+        }
+    }
+
+    let aliases = metadata
+        .aliases
+        .iter()
+        .map(|alias| (alias.oid, alias))
+        .collect::<BTreeMap<_, _>>();
+    for alias in &metadata.aliases {
+        if !projected_oids.contains(&alias.oid) {
+            return Err(ModelError::InvalidOperation(format!(
+                "persisted alias {} has no current or recorded Git authority commit projection",
+                alias.oid
+            ))
+            .into());
+        }
+        let change = snapshot
+            .changes
+            .get(&alias.change_id)
+            .ok_or_else(|| ModelError::ChangeNotFound(alias.change_id.to_string()))?;
+        alias.validate_change(change)?;
+    }
+    for change in snapshot.changes.values() {
+        let kin_model::ChangeOrigin::GitCommit { oid } = change.origin else {
+            continue;
+        };
+        if !projected_oids.contains(&oid) {
+            return Err(ModelError::InvalidOperation(format!(
+                "persisted Git-origin change {} for {} has no current or recorded authority commit projection",
+                change.id, oid
+            ))
+            .into());
+        }
+        if aliases.get(&oid).map(|alias| alias.change_id) != Some(change.id) {
+            return Err(ModelError::InvalidOperation(format!(
+                "persisted Git-origin change {} for {} lacks its exact repository-scoped alias",
+                change.id, oid
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn materialize_git_tree(
+    authority: &GitExternalAuthority,
+    root_oid: GitObjectId,
+) -> Result<BTreeMap<RepoPath, TreeEntry>, KinDbError> {
+    let entries = authority
+        .closure
+        .objects
+        .iter()
+        .map(|entry| (entry.record.object, entry))
+        .collect::<BTreeMap<_, _>>();
+    let root = ExternalObjectId::new(ExternalObjectKind::Tree, root_oid);
+    if !entries.contains_key(&root) {
+        return Err(ModelError::InvalidOperation(format!(
+            "Git commit tree {} is absent from the authority closure",
+            root_oid
+        ))
+        .into());
+    }
+
+    let mut material = BTreeMap::new();
+    let mut pending = vec![(root, Vec::<u8>::new(), Vec::<ExternalObjectId>::new())];
+    while let Some((tree_id, prefix, mut ancestry)) = pending.pop() {
+        if ancestry.contains(&tree_id) {
+            return Err(ModelError::InvalidOperation(format!(
+                "Git tree closure contains a cycle through {}",
+                tree_id.oid
+            ))
+            .into());
+        }
+        ancestry.push(tree_id);
+        let tree = entries.get(&tree_id).ok_or_else(|| {
+            ModelError::InvalidOperation(format!(
+                "Git tree {} is absent from the authority closure",
+                tree_id.oid
+            ))
+        })?;
+        for dependency in tree.dependencies.iter().rev() {
+            let GitObjectDependencyKind::TreeEntry { mode, name, .. } = &dependency.kind else {
+                return Err(ModelError::InvalidOperation(format!(
+                    "Git tree {} contains a non-tree-entry dependency",
+                    tree_id.oid
+                ))
+                .into());
+            };
+            let mut path = prefix.clone();
+            if !path.is_empty() {
+                path.push(b'/');
+            }
+            path.extend_from_slice(name.as_bytes());
+            match mode {
+                GitTreeEntryMode::Tree => {
+                    pending.push((dependency.target, path, ancestry.clone()));
+                }
+                GitTreeEntryMode::Blob
+                | GitTreeEntryMode::BlobExecutable
+                | GitTreeEntryMode::Symlink => {
+                    let record = entries.get(&dependency.target).ok_or_else(|| {
+                        ModelError::InvalidOperation(format!(
+                            "Git tree entry {} targets object {} absent from the authority closure",
+                            RepoPath::from_bytes(path.clone())
+                                .map_or_else(|_| hex::encode(&path), |path| path.to_string()),
+                            dependency.target.oid
+                        ))
+                    })?;
+                    let entry = match mode {
+                        GitTreeEntryMode::Blob => TreeEntry::blob(record.record.body_hash, false),
+                        GitTreeEntryMode::BlobExecutable => {
+                            TreeEntry::blob(record.record.body_hash, true)
+                        }
+                        GitTreeEntryMode::Symlink => TreeEntry::symlink(record.record.body_hash),
+                        GitTreeEntryMode::Tree | GitTreeEntryMode::Gitlink => unreachable!(),
+                    };
+                    insert_git_tree_entry(&mut material, path, entry)?;
+                }
+                GitTreeEntryMode::Gitlink => {
+                    insert_git_tree_entry(
+                        &mut material,
+                        path,
+                        TreeEntry::gitlink(dependency.target.oid),
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(material)
+}
+
+fn insert_git_tree_entry(
+    material: &mut BTreeMap<RepoPath, TreeEntry>,
+    path: Vec<u8>,
+    entry: TreeEntry,
+) -> Result<(), KinDbError> {
+    let path = RepoPath::from_bytes(path).map_err(|error| {
+        ModelError::InvalidOperation(format!(
+            "Git tree projects an invalid repository path: {error}"
+        ))
+    })?;
+    if material.insert(path.clone(), entry).is_some() {
+        return Err(ModelError::InvalidOperation(format!(
+            "Git tree projects repository path {path} more than once"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+struct RepositoryGitObjectBodyLoader<'a, B: StorageBackend + ?Sized> {
+    backend: &'a B,
+    repository_id: &'a RepositoryId,
+    body_lengths: BTreeMap<Hash256, u64>,
+}
+
+impl<'a, B: StorageBackend + ?Sized> RepositoryGitObjectBodyLoader<'a, B> {
+    fn new(
+        backend: &'a B,
+        repository_id: &'a RepositoryId,
+        authority: &GitExternalAuthority,
+    ) -> Result<Self, KinDbError> {
+        let mut body_lengths = BTreeMap::new();
+        for entry in &authority.closure.objects {
+            if let Some(previous) =
+                body_lengths.insert(entry.record.body_hash, entry.record.body_len)
+            {
+                if previous != entry.record.body_len {
+                    return Err(ModelError::InvalidOperation(format!(
+                        "Git authority body {} is declared with both length {} and {}",
+                        entry.record.body_hash, previous, entry.record.body_len
+                    ))
+                    .into());
+                }
+            }
+        }
+        Ok(Self {
+            backend,
+            repository_id,
+            body_lengths,
+        })
+    }
+}
+
+impl<B: StorageBackend + ?Sized> GitObjectBodyLoader for RepositoryGitObjectBodyLoader<'_, B> {
+    type Error = KinDbError;
+
+    fn load_body(
+        &mut self,
+        body_hash: &Hash256,
+    ) -> std::result::Result<Option<Vec<u8>>, Self::Error> {
+        let Some(body_len) = self.body_lengths.get(body_hash).copied() else {
+            return Ok(None);
+        };
+        self.backend.load_source_blob_bounded(
+            self.repository_id.as_str(),
+            *body_hash.as_bytes(),
+            body_len,
+        )
+    }
+}
+
+fn validate_git_authority_bodies<B: StorageBackend + ?Sized>(
+    backend: &B,
+    repository_id: &RepositoryId,
+    authority: Option<&GitExternalAuthority>,
+) -> Result<(), KinDbError> {
+    let Some(authority) = authority else {
+        return Ok(());
+    };
+    let mut loader = RepositoryGitObjectBodyLoader::new(backend, repository_id, authority)?;
+    authority
+        .validate_with_body_loader(&mut loader)
+        .map_err(|error| {
+            ModelError::InvalidOperation(format!(
+                "Git external authority body validation failed: {error}"
+            ))
+            .into()
+        })
 }
 
 fn apply_ref_mutations(
@@ -1683,6 +2125,11 @@ fn validate_all_authority_bodies<B: StorageBackend + ?Sized>(
         )?;
         record.validate_raw(&body)?;
     }
+    validate_git_authority_bodies(
+        backend,
+        repository_id,
+        metadata.git_external_authority.as_ref(),
+    )?;
     validate_change_tree_bodies(backend, repository_id, snapshot.changes.values())?;
     for workspace in &metadata.workspaces {
         validate_tree_bodies(
@@ -2001,8 +2448,12 @@ fn collaboration_root(snapshot: &GraphSnapshot) -> Result<Hash256, KinDbError> {
 }
 
 fn replication_root(authority: &PersistedRepositoryAuthority) -> Result<Hash256, KinDbError> {
-    let mut root = DomainRoot::new(b"kin-repository-replication-root-v1\0");
+    let mut root = DomainRoot::new(b"kin-repository-replication-root-v2\0");
     root.ordered("external_objects", &authority.external_objects)?;
+    root.ordered(
+        "git_external_authority",
+        &authority.git_external_authority.iter().collect::<Vec<_>>(),
+    )?;
     root.ordered("aliases", &authority.aliases)?;
     Ok(root.finish())
 }
@@ -2131,8 +2582,9 @@ mod tests {
         compute_resolved_tree_hash, compute_semantic_change_id, AdmissionPolicyDelta,
         AdmissionRuleSource, AdmissionRuleSourceKind, AdmissionScanToken, ArtifactId, AuthorId,
         ChangeOrigin, DefaultRefMutation, EffectiveAdmissionPolicyStamp, FrozenLocalOverlayDelta,
-        LocatedEntry, RefMutation, RepoPath, ResolvedTree, SemanticChange, TreeDelta,
-        WorkspaceExpectation, WorkspaceMutation, ADMISSION_POLICY_SEMANTICS_VERSION,
+        GitExternalAuthorityDelta, GitObjectFormat, GitRawRef, GitRawTarget, LocatedEntry,
+        RefMutation, RepoPath, ResolvedTree, SemanticChange, TreeDelta, WorkspaceExpectation,
+        WorkspaceMutation, ADMISSION_POLICY_SEMANTICS_VERSION,
         REPOSITORY_TRANSACTION_SCHEMA_VERSION,
     };
     use parking_lot::Mutex;
@@ -2300,6 +2752,56 @@ mod tests {
         Hash256::from_bytes(Sha256::digest(body).into())
     }
 
+    #[derive(Clone, Default)]
+    struct TestGitBodies(BTreeMap<Hash256, Vec<u8>>);
+
+    impl GitObjectBodyLoader for TestGitBodies {
+        type Error = std::convert::Infallible;
+
+        fn load_body(
+            &mut self,
+            body_hash: &Hash256,
+        ) -> std::result::Result<Option<Vec<u8>>, Self::Error> {
+            Ok(self.0.get(body_hash).cloned())
+        }
+    }
+
+    fn git_record(
+        kind: ExternalObjectKind,
+        oid: &str,
+        body: impl Into<Vec<u8>>,
+    ) -> (ExternalObjectRecord, Vec<u8>) {
+        let body = body.into();
+        let oid = GitObjectId::sha1(hex::decode(oid).unwrap().try_into().unwrap());
+        let record = ExternalObjectRecord::from_raw(kind, oid, &body).unwrap();
+        (record, body)
+    }
+
+    fn git_tree_body(entries: &[(&[u8], &[u8], GitObjectId)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (name, mode, oid) in entries {
+            body.extend_from_slice(mode);
+            body.push(b' ');
+            body.extend_from_slice(name);
+            body.push(0);
+            body.extend_from_slice(oid.as_bytes());
+        }
+        body
+    }
+
+    fn git_commit_body(tree: GitObjectId, parents: &[GitObjectId], message: &[u8]) -> Vec<u8> {
+        let mut body = format!("tree {tree}\n").into_bytes();
+        for parent in parents {
+            body.extend_from_slice(format!("parent {parent}\n").as_bytes());
+        }
+        body.extend_from_slice(
+            b"author Kin <kin@example.com> 1700000000 +0000\n\
+              committer Kin <kin@example.com> 1700000000 +0000\n\n",
+        );
+        body.extend_from_slice(message);
+        body
+    }
+
     fn initial_manager(backend: Arc<MemoryBackend>) -> RepositoryAuthorityManager<MemoryBackend> {
         RepositoryAuthorityManager::open(repository_id(), backend).unwrap()
     }
@@ -2318,6 +2820,7 @@ mod tests {
             actor: AuthorId::new("authority-test"),
             reason: "atomic repository authority fixture".to_string(),
             external_objects: Vec::new(),
+            git_authority_delta: None,
             changes: Vec::new(),
             aliases: Vec::new(),
             ref_mutations: Vec::new(),
@@ -2529,35 +3032,271 @@ mod tests {
         )
     }
 
+    #[derive(Clone)]
+    struct GitAuthorityTransactionFixture {
+        transaction: RepositoryTransaction,
+        authority: GitExternalAuthority,
+        direct_authority: GitExternalAuthority,
+        head: ExternalObjectRecord,
+        compose: ExternalObjectRecord,
+    }
+
+    fn git_authority_transaction_fixture(
+        manager: &RepositoryAuthorityManager<MemoryBackend>,
+        operation: u128,
+    ) -> GitAuthorityTransactionFixture {
+        let mut bodies = TestGitBodies::default();
+        let mut admit = |kind, oid, body| {
+            let (record, body) = git_record(kind, oid, body);
+            bodies.0.insert(record.body_hash, body);
+            record
+        };
+        let compose = admit(
+            ExternalObjectKind::Blob,
+            "97fdbc5b507fdfce49b8b073bc6df3a73ea78c8e",
+            b"services:\n  api:\n    build: .\n".to_vec(),
+        );
+        let binary = admit(
+            ExternalObjectKind::Blob,
+            "dd729764d359d78852d453b4508d1f127eb9c61a",
+            vec![0_u8, 0xff, 0x80, b'\n'],
+        );
+        let symlink = admit(
+            ExternalObjectKind::Blob,
+            "577ffa642a989094abc1349fefc893cf2491da59",
+            b"compose.yaml".to_vec(),
+        );
+        let empty_tree = admit(
+            ExternalObjectKind::Tree,
+            "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+            Vec::<u8>::new(),
+        );
+        let root_tree = admit(
+            ExternalObjectKind::Tree,
+            "f8ca0030cfaa2d892be162947852de7804729814",
+            git_tree_body(&[
+                (b"compose.yaml", b"100644", compose.object.oid),
+                (b"payload.bin", b"100755", binary.object.oid),
+                (&[0xff], b"120000", symlink.object.oid),
+            ]),
+        );
+        let parent = admit(
+            ExternalObjectKind::Commit,
+            "a5663401dd8ebb94c317008e6a8cd2f01183a940",
+            git_commit_body(empty_tree.object.oid, &[], b"parent"),
+        );
+        let head = admit(
+            ExternalObjectKind::Commit,
+            "72d6709f04432f9711c9c0f9100caf54ba2d9927",
+            git_commit_body(root_tree.object.oid, &[parent.object.oid], b"head"),
+        );
+        let records = vec![
+            compose.clone(),
+            binary.clone(),
+            symlink.clone(),
+            empty_tree,
+            root_tree,
+            parent.clone(),
+            head.clone(),
+        ];
+        for record in &records {
+            manager
+                .save_source_blob(
+                    record.body_hash,
+                    bodies
+                        .0
+                        .get(&record.body_hash)
+                        .expect("fixture retains every exact Git body"),
+                )
+                .unwrap();
+        }
+
+        let main = RefName::branch(b"main").unwrap();
+        let raw_refs = vec![GitRawRef {
+            name: main.clone(),
+            target: GitRawTarget::Direct {
+                object: head.object,
+            },
+        }];
+        let mut loader = bodies.clone();
+        let authority = GitExternalAuthority::from_raw_parts(
+            repository_id(),
+            GitObjectFormat::Sha1,
+            raw_refs.clone(),
+            GitRawTarget::Symbolic {
+                target: main.clone(),
+            },
+            records.clone(),
+            &mut loader,
+        )
+        .unwrap();
+        let direct_authority = GitExternalAuthority::from_raw_parts(
+            repository_id(),
+            GitObjectFormat::Sha1,
+            raw_refs,
+            GitRawTarget::Direct {
+                object: head.object,
+            },
+            records.clone(),
+            &mut loader,
+        )
+        .unwrap();
+
+        let timestamp = Timestamp(
+            chrono::DateTime::parse_from_rfc3339("2026-07-26T14:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        let mut parent_change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::GitCommit {
+                oid: parent.object.oid,
+            },
+            parents: Vec::new(),
+            timestamp: timestamp.clone(),
+            author: AuthorId::new("authority-test"),
+            message: "import exact Git parent".to_string(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        parent_change.id = compute_semantic_change_id(&parent_change).unwrap();
+        let mut head_change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::GitCommit {
+                oid: head.object.oid,
+            },
+            parents: vec![parent_change.id],
+            timestamp,
+            author: AuthorId::new("authority-test"),
+            message: "import Compose, binary, symlink, and byte path".to_string(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: vec![
+                TreeDelta::Added {
+                    artifact_id: ArtifactId(Uuid::from_u128(0xa1)),
+                    new: LocatedEntry::new(
+                        RepoPath::from_utf8("compose.yaml").unwrap(),
+                        TreeEntry::blob(compose.body_hash, false),
+                    ),
+                },
+                TreeDelta::Added {
+                    artifact_id: ArtifactId(Uuid::from_u128(0xa2)),
+                    new: LocatedEntry::new(
+                        RepoPath::from_utf8("payload.bin").unwrap(),
+                        TreeEntry::blob(binary.body_hash, true),
+                    ),
+                },
+                TreeDelta::Added {
+                    artifact_id: ArtifactId(Uuid::from_u128(0xa3)),
+                    new: LocatedEntry::new(
+                        RepoPath::from_bytes(vec![0xff]).unwrap(),
+                        TreeEntry::symlink(symlink.body_hash),
+                    ),
+                },
+            ],
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        head_change.id = compute_semantic_change_id(&head_change).unwrap();
+
+        let mut transaction = transaction_shell(manager, operation);
+        transaction.external_objects = records.clone();
+        transaction.git_authority_delta =
+            Some(GitExternalAuthorityDelta::initialize(authority.clone()));
+        transaction.aliases = vec![
+            ExternalChangeAlias::new(repository_id(), parent.object.oid, parent_change.id),
+            ExternalChangeAlias::new(repository_id(), head.object.oid, head_change.id),
+        ];
+        transaction.changes = vec![parent_change, head_change];
+
+        GitAuthorityTransactionFixture {
+            transaction,
+            authority,
+            direct_authority,
+            head,
+            compose,
+        }
+    }
+
     fn imported_repository_transaction(
         manager: &RepositoryAuthorityManager<MemoryBackend>,
     ) -> (RepositoryTransaction, SemanticChangeId, RefTarget) {
-        let body = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor Kin <kin@example.com> 0 +0000\ncommitter Kin <kin@example.com> 0 +0000\n\npolicy anchor\n".to_vec();
-        let oid = GitObjectId::sha1(
-            hex::decode("059a81a7b095d1e0af020b133ae9ee6e88105072")
-                .unwrap()
-                .try_into()
-                .unwrap(),
-        );
-        let record =
-            ExternalObjectRecord::from_raw(ExternalObjectKind::Commit, oid, &body).unwrap();
-        manager.save_source_blob(record.body_hash, &body).unwrap();
+        let fixture = git_authority_transaction_fixture(manager, 21);
+        let mut transaction = fixture.transaction;
+        let parent = transaction.changes.remove(0);
+        let mut head = transaction.changes.remove(0);
+        let shared = SharedAdmissionPolicy::empty(0);
+        head.admission_policy_delta = Some(AdmissionPolicyDelta::initialize(shared.clone()));
+        head.id = compute_semantic_change_id(&head).unwrap();
+        let change_id = head.id;
+        let tree = ResolvedTree::default().apply(&head.tree_deltas).unwrap();
+        let tree_hash = compute_resolved_tree_hash(&tree).unwrap();
 
-        let mut transaction = arbitrary_repository_transaction(manager);
-        transaction.changes[0].origin = ChangeOrigin::GitCommit { oid };
-        transaction.changes[0].id = compute_semantic_change_id(&transaction.changes[0]).unwrap();
-        let change_id = transaction.changes[0].id;
-        transaction.external_objects.push(record.clone());
-        transaction
-            .aliases
-            .push(ExternalChangeAlias::new(repository_id(), oid, change_id));
-        let target = RefTarget::external_object(record.object);
-        transaction.ref_mutations[0].new_target = Some(target.clone());
-        transaction
-            .workspace_mutation
-            .as_mut()
-            .unwrap()
-            .new_base_target = Some(target.clone());
+        transaction.changes = vec![head.clone(), parent.clone()];
+        transaction.aliases = vec![
+            ExternalChangeAlias::new(repository_id(), fixture.head.object.oid, head.id),
+            ExternalChangeAlias::new(
+                repository_id(),
+                match parent.origin {
+                    ChangeOrigin::GitCommit { oid } => oid,
+                    ChangeOrigin::Native => unreachable!(),
+                },
+                parent.id,
+            ),
+        ];
+        let target = RefTarget::external_object(fixture.head.object);
+        let main = RefName::branch(b"main").unwrap();
+        transaction.ref_mutations.push(RefMutation {
+            name: main.clone(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(target.clone()),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        });
+        transaction.default_ref_mutation = Some(DefaultRefMutation {
+            expected: DefaultRefExpectation::MustBeUnset,
+            new_default: Some(main.clone()),
+        });
+
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(20));
+        let overlay = FrozenLocalOverlay::new(workspace_id, 0, Vec::new()).unwrap();
+        let policy = EffectiveAdmissionPolicyStamp {
+            shared: shared.stamp(),
+            local: overlay.stamp(),
+        };
+        let head_state = WorkspaceHead::Symbolic { target: main };
+        transaction.workspace_mutation = Some(WorkspaceMutation {
+            workspace_id,
+            expected: WorkspaceExpectation::MustNotExist,
+            new_generation: 0,
+            new_head: head_state.clone(),
+            new_base_target: Some(target.clone()),
+            new_base_tree_hash: Some(tree_hash),
+            tree_deltas: head.tree_deltas,
+            new_tree_hash: tree_hash,
+            new_shared_admission_policy: shared,
+            new_admission_policy: policy,
+        });
+        transaction.local_overlay_delta = Some(FrozenLocalOverlayDelta::initialize(overlay));
+        transaction.admission_scan_token = Some(AdmissionScanToken {
+            repository_id: repository_id(),
+            workspace_id,
+            workspace_generation: 0,
+            workspace_head: head_state,
+            baseline_tree_hash: compute_resolved_tree_hash(&ResolvedTree::default()).unwrap(),
+            observed_tree_hash: tree_hash,
+            matcher_semantics_version: ADMISSION_POLICY_SEMANTICS_VERSION,
+            shared_policy: policy.shared,
+            local_overlay: policy.local,
+        });
         (transaction, change_id, target)
     }
 
@@ -2609,6 +3348,346 @@ mod tests {
             policy: RefUpdatePolicy::FastForwardOnly,
         });
         (transaction, old_body)
+    }
+
+    #[test]
+    fn git_authority_commits_atomically_reopens_and_binds_replication_identity() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        let before = manager.read_authority().roots().clone();
+        let fixture = git_authority_transaction_fixture(&manager, 0xa001);
+        let expected_delta = fixture.transaction.git_authority_delta.clone();
+
+        let receipt = manager
+            .commit_repository_transaction(fixture.transaction)
+            .unwrap();
+        let committed = manager.read_authority();
+        assert_eq!(
+            committed.metadata().schema_version,
+            REPOSITORY_AUTHORITY_SCHEMA_VERSION
+        );
+        assert_eq!(
+            committed.metadata().git_external_authority.as_ref(),
+            Some(&fixture.authority)
+        );
+        assert_eq!(receipt.operation.git_authority_delta, expected_delta);
+        assert_ne!(before.replication, committed.roots().replication);
+        let initial_roots = committed.roots().clone();
+        drop(committed);
+
+        let reopened =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        assert_eq!(
+            reopened
+                .read_authority()
+                .metadata()
+                .git_external_authority
+                .as_ref(),
+            Some(&fixture.authority)
+        );
+        assert_eq!(reopened.read_authority().roots(), &initial_roots);
+
+        let mut update = transaction_shell(&reopened, 0xa002);
+        update.git_authority_delta = Some(GitExternalAuthorityDelta::update(
+            fixture.authority.clone(),
+            fixture.direct_authority.clone(),
+        ));
+        let before_update = reopened.read_authority().roots().clone();
+        let receipt = reopened.commit_repository_transaction(update).unwrap();
+        let after_update = reopened.read_authority();
+        assert_eq!(
+            after_update.metadata().git_external_authority.as_ref(),
+            Some(&fixture.direct_authority)
+        );
+        assert_eq!(before_update.history, after_update.roots().history);
+        assert_ne!(before_update.replication, after_update.roots().replication);
+        assert!(receipt.operation.git_authority_delta.is_some());
+        let final_roots = after_update.roots().clone();
+        drop(after_update);
+
+        let reopened =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        assert_eq!(
+            reopened
+                .read_authority()
+                .metadata()
+                .git_external_authority
+                .as_ref(),
+            Some(&fixture.direct_authority)
+        );
+        assert_eq!(reopened.read_authority().roots(), &final_roots);
+
+        let mut removal = transaction_shell(&reopened, 0xa003);
+        removal.git_authority_delta =
+            Some(GitExternalAuthorityDelta::remove(fixture.direct_authority));
+        let before_removal = reopened.read_authority().roots().clone();
+        let receipt = reopened.commit_repository_transaction(removal).unwrap();
+        let removed = reopened.read_authority();
+        assert!(removed.metadata().git_external_authority.is_none());
+        assert!(!removed.metadata().aliases.is_empty());
+        assert!(!removed.snapshot().changes.is_empty());
+        assert_eq!(before_removal.history, removed.roots().history);
+        assert_ne!(before_removal.replication, removed.roots().replication);
+        assert!(receipt.operation.git_authority_delta.is_some());
+        let removed_roots = removed.roots().clone();
+        drop(removed);
+
+        let reopened =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        assert!(reopened
+            .read_authority()
+            .metadata()
+            .git_external_authority
+            .is_none());
+        assert_eq!(reopened.read_authority().roots(), &removed_roots);
+    }
+
+    #[test]
+    fn git_authority_publication_failure_leaves_no_partial_semantic_or_external_truth() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        let fixture = git_authority_transaction_fixture(&manager, 0xa010);
+        backend.fail_next_snapshot.store(true, Ordering::SeqCst);
+
+        manager
+            .commit_repository_transaction(fixture.transaction)
+            .expect_err("failed durable publication must not expose Git authority");
+
+        let lease = manager.read_authority();
+        assert_eq!(lease.generation(), 0);
+        assert!(lease.metadata().git_external_authority.is_none());
+        assert!(lease.metadata().external_objects.is_empty());
+        assert!(lease.metadata().aliases.is_empty());
+        assert!(lease.snapshot().changes.is_empty());
+    }
+
+    #[test]
+    fn git_authority_exact_old_state_cas_rejects_stale_authority() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(backend);
+        let fixture = git_authority_transaction_fixture(&manager, 0xa020);
+        manager
+            .commit_repository_transaction(fixture.transaction)
+            .unwrap();
+        let stable_generation = manager.read_authority().generation();
+
+        let mut stale = transaction_shell(&manager, 0xa021);
+        stale.git_authority_delta = Some(GitExternalAuthorityDelta::update(
+            fixture.direct_authority,
+            fixture.authority,
+        ));
+        let error = manager
+            .commit_repository_transaction(stale)
+            .expect_err("wrong old authority must lose the exact compare-and-swap");
+        assert!(
+            error.to_string().contains("exact old-state lease"),
+            "unexpected exact-old error: {error}"
+        );
+        assert_eq!(manager.read_authority().generation(), stable_generation);
+    }
+
+    #[test]
+    fn git_authority_closure_requires_exact_persisted_descriptors() {
+        let missing_backend = Arc::new(MemoryBackend::default());
+        let missing_manager = initial_manager(missing_backend);
+        let mut missing = git_authority_transaction_fixture(&missing_manager, 0xa030);
+        missing
+            .transaction
+            .external_objects
+            .retain(|record| record.object != missing.compose.object);
+        let error = missing_manager
+            .commit_repository_transaction(missing.transaction)
+            .expect_err("closure records absent from the external-object union must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("absent from persisted external objects"),
+            "unexpected missing closure error: {error}"
+        );
+        assert_eq!(missing_manager.read_authority().generation(), 0);
+
+        let wrong_backend = Arc::new(MemoryBackend::default());
+        let wrong_manager = initial_manager(wrong_backend);
+        let mut wrong = git_authority_transaction_fixture(&wrong_manager, 0xa031);
+        let mut authority = wrong.authority.clone();
+        authority
+            .closure
+            .objects
+            .iter_mut()
+            .find(|entry| entry.record.object == wrong.compose.object)
+            .unwrap()
+            .record
+            .body_hash = Hash256::from_bytes([0xee; 32]);
+        authority.validate_shape().unwrap();
+        wrong.transaction.git_authority_delta =
+            Some(GitExternalAuthorityDelta::initialize(authority));
+        let error = wrong_manager
+            .commit_repository_transaction(wrong.transaction)
+            .expect_err("closure descriptors must match the external-object union exactly");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its persisted external-object descriptor"),
+            "unexpected wrong descriptor error: {error}"
+        );
+        assert_eq!(wrong_manager.read_authority().generation(), 0);
+    }
+
+    #[test]
+    fn git_authority_update_reloads_every_body_and_rejects_missing_or_tampered_cas() {
+        let missing_backend = Arc::new(MemoryBackend::default());
+        let missing_manager = initial_manager(Arc::clone(&missing_backend));
+        let missing = git_authority_transaction_fixture(&missing_manager, 0xa040);
+        missing_manager
+            .commit_repository_transaction(missing.transaction)
+            .unwrap();
+        missing_backend
+            .blobs
+            .lock()
+            .remove(missing.head.body_hash.as_bytes());
+        let mut update = transaction_shell(&missing_manager, 0xa041);
+        update.git_authority_delta = Some(GitExternalAuthorityDelta::update(
+            missing.authority,
+            missing.direct_authority,
+        ));
+        let error = missing_manager
+            .commit_repository_transaction(update)
+            .expect_err("authority update must reload inherited closure bodies");
+        assert!(
+            error.to_string().contains("body for"),
+            "unexpected missing body error: {error}"
+        );
+        assert_eq!(missing_manager.read_authority().generation(), 1);
+
+        let tampered_backend = Arc::new(MemoryBackend::default());
+        let tampered_manager = initial_manager(Arc::clone(&tampered_backend));
+        let tampered = git_authority_transaction_fixture(&tampered_manager, 0xa042);
+        tampered_manager
+            .commit_repository_transaction(tampered.transaction)
+            .unwrap();
+        tampered_backend.blobs.lock().insert(
+            *tampered.compose.body_hash.as_bytes(),
+            b"descriptor-tamper".to_vec(),
+        );
+        let mut update = transaction_shell(&tampered_manager, 0xa043);
+        update.git_authority_delta = Some(GitExternalAuthorityDelta::update(
+            tampered.authority,
+            tampered.direct_authority,
+        ));
+        let error = tampered_manager
+            .commit_repository_transaction(update)
+            .expect_err("authority update must reject tampered inherited bodies");
+        assert!(
+            error.to_string().contains("body validation failed"),
+            "unexpected tampered body error: {error}"
+        );
+        assert_eq!(tampered_manager.read_authority().generation(), 1);
+        assert!(
+            RepositoryAuthorityManager::open(repository_id(), tampered_backend).is_err(),
+            "reopen must independently reject tampered authority bodies"
+        );
+    }
+
+    #[test]
+    fn git_authority_requires_projection_alias_ordered_parents_and_exact_tree_plan() {
+        let alias_backend = Arc::new(MemoryBackend::default());
+        let alias_manager = initial_manager(alias_backend);
+        let mut missing_alias = git_authority_transaction_fixture(&alias_manager, 0xa050);
+        missing_alias.transaction.changes.retain(|change| {
+            !matches!(
+                change.origin,
+                ChangeOrigin::GitCommit { oid } if oid == missing_alias.head.object.oid
+            )
+        });
+        missing_alias
+            .transaction
+            .aliases
+            .retain(|alias| alias.oid != missing_alias.head.object.oid);
+        let error = alias_manager
+            .commit_repository_transaction(missing_alias.transaction)
+            .expect_err("every commit projection requires an exact semantic alias");
+        assert!(
+            error
+                .to_string()
+                .contains("has no repository-scoped semantic alias"),
+            "unexpected alias error: {error}"
+        );
+
+        let parent_backend = Arc::new(MemoryBackend::default());
+        let parent_manager = initial_manager(parent_backend);
+        let mut wrong_parent = git_authority_transaction_fixture(&parent_manager, 0xa051);
+        let head_change = wrong_parent
+            .transaction
+            .changes
+            .iter_mut()
+            .find(|change| {
+                matches!(
+                    change.origin,
+                    ChangeOrigin::GitCommit { oid } if oid == wrong_parent.head.object.oid
+                )
+            })
+            .unwrap();
+        head_change.parents.clear();
+        head_change.id = compute_semantic_change_id(head_change).unwrap();
+        wrong_parent
+            .transaction
+            .aliases
+            .iter_mut()
+            .find(|alias| alias.oid == wrong_parent.head.object.oid)
+            .unwrap()
+            .change_id = head_change.id;
+        let error = parent_manager
+            .commit_repository_transaction(wrong_parent.transaction)
+            .expect_err("raw ordered parents must map exactly through aliases");
+        assert!(
+            error.to_string().contains("ordered parent aliases"),
+            "unexpected parent projection error: {error}"
+        );
+
+        let tree_backend = Arc::new(MemoryBackend::default());
+        let tree_manager = initial_manager(tree_backend);
+        let mut wrong_tree = git_authority_transaction_fixture(&tree_manager, 0xa052);
+        let head_change = wrong_tree
+            .transaction
+            .changes
+            .iter_mut()
+            .find(|change| {
+                matches!(
+                    change.origin,
+                    ChangeOrigin::GitCommit { oid } if oid == wrong_tree.head.object.oid
+                )
+            })
+            .unwrap();
+        let TreeDelta::Added { new, .. } = head_change
+            .tree_deltas
+            .iter_mut()
+            .find(|delta| {
+                delta
+                    .new_state()
+                    .is_some_and(|entry| entry.path.as_bytes() == b"compose.yaml")
+            })
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        new.entry = TreeEntry::blob(wrong_tree.compose.body_hash, true);
+        head_change.id = compute_semantic_change_id(head_change).unwrap();
+        wrong_tree
+            .transaction
+            .aliases
+            .iter_mut()
+            .find(|alias| alias.oid == wrong_tree.head.object.oid)
+            .unwrap()
+            .change_id = head_change.id;
+        let error = tree_manager
+            .commit_repository_transaction(wrong_tree.transaction)
+            .expect_err("raw Git tree identity must match semantic replay exactly");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the deterministic semantic tree"),
+            "unexpected tree projection error: {error}"
+        );
     }
 
     #[test]
@@ -3172,7 +4251,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_fast_forward_crosses_imported_commit_aliases_but_not_arbitrary_objects() {
+    fn semantic_fast_forward_crosses_imported_aliases_but_not_unauthorized_objects() {
         let backend = Arc::new(MemoryBackend::default());
         let manager = initial_manager(backend);
         let (import, imported_id, imported_target) = imported_repository_transaction(&manager);
@@ -3208,58 +4287,6 @@ mod tests {
             policy: RefUpdatePolicy::FastForwardOnly,
         });
         manager.commit_repository_transaction(to_native).unwrap();
-
-        let exported_body = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor Kin <kin@example.com> 0 +0000\ncommitter Kin <kin@example.com> 0 +0000\n\nnative child export\n".to_vec();
-        let exported_oid = GitObjectId::sha1(
-            hex::decode("78e7f8f027e4fff47da2ad66e510713f35a363d9")
-                .unwrap()
-                .try_into()
-                .unwrap(),
-        );
-        let exported_record = ExternalObjectRecord::from_raw(
-            ExternalObjectKind::Commit,
-            exported_oid,
-            &exported_body,
-        )
-        .unwrap();
-        manager
-            .save_source_blob(exported_record.body_hash, &exported_body)
-            .unwrap();
-        let mut exported = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
-            origin: ChangeOrigin::GitCommit { oid: exported_oid },
-            parents: vec![native_id],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("authority-test"),
-            message: "exported descendant".to_string(),
-            entity_deltas: Vec::new(),
-            relation_deltas: Vec::new(),
-            tree_deltas: Vec::new(),
-            admission_policy_delta: None,
-            projected_files: Vec::new(),
-            spec_link: None,
-            evidence: Vec::new(),
-            risk_summary: None,
-        };
-        exported.id = compute_semantic_change_id(&exported).unwrap();
-        let exported_target = RefTarget::external_object(exported_record.object);
-        let mut to_external = transaction_shell(&manager, 0xf002);
-        to_external.external_objects.push(exported_record);
-        to_external.aliases.push(ExternalChangeAlias::new(
-            repository_id(),
-            exported_oid,
-            exported.id,
-        ));
-        to_external.changes.push(exported);
-        to_external.ref_mutations.push(RefMutation {
-            name: RefName::branch(b"main").unwrap(),
-            expected: RefExpectation::MustEqual {
-                target: native_target,
-            },
-            new_target: Some(exported_target.clone()),
-            policy: RefUpdatePolicy::FastForwardOnly,
-        });
-        manager.commit_repository_transaction(to_external).unwrap();
         let stable_generation = manager.read_authority().generation();
 
         let unaliased_body = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor Kin <kin@example.com> 0 +0000\ncommitter Kin <kin@example.com> 0 +0000\n\nunaliased\n".to_vec();
@@ -3283,7 +4310,7 @@ mod tests {
         unaliased.ref_mutations.push(RefMutation {
             name: RefName::branch(b"main").unwrap(),
             expected: RefExpectation::MustEqual {
-                target: exported_target.clone(),
+                target: native_target.clone(),
             },
             new_target: Some(RefTarget::external_object(unaliased_record.object)),
             policy: RefUpdatePolicy::FastForwardOnly,
@@ -3302,7 +4329,7 @@ mod tests {
         non_commit.ref_mutations.push(RefMutation {
             name: RefName::branch(b"main").unwrap(),
             expected: RefExpectation::MustEqual {
-                target: exported_target,
+                target: native_target,
             },
             new_target: Some(RefTarget::external_object(blob_record.object)),
             policy: RefUpdatePolicy::FastForwardOnly,
