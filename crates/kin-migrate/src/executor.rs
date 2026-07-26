@@ -10,9 +10,9 @@ use chrono::{DateTime, Utc};
 use kin_blobs::BlobStore;
 use kin_core::{init, KinConfig, KinLayout};
 use kin_model::{
-    Branch, BranchName, ChangeStore, Entity, EntityStore, FileLayout, FilePathId, GraphStore,
-    OpaqueArtifact, ParseCompleteness, Relation, RepoPath, ResolvedTree, SemanticChangeId,
-    ShallowTrackedFile, StructuredArtifact, TreeEntry,
+    Branch, BranchName, ChangeStore, Entity, EntityStore, FileLayout, FilePathId, OpaqueArtifact,
+    Relation, ResolvedTree, SemanticChangeId, ShallowTrackedFile, StructuredArtifact,
+    TransactionDelta, TreeDelta, TreeEntry,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -165,6 +165,7 @@ pub fn execute_migration_persisted(plan: &MigrationPlan) -> Result<MigrationResu
                 .collect(),
         )
         .map_err(|error| MigrateError::Graph(error.to_string()))?;
+    admit_resolved_head(graph.as_ref(), &imported_head.tree)?;
     persist_enrichment(graph.as_ref(), &enrichment)?;
     graph
         .update_branch_head(&BranchName::new(&branch_name), &imported_head.change_id)
@@ -594,6 +595,28 @@ fn prepare_head_enrichment(
     Ok(prepared)
 }
 
+fn admit_resolved_head(graph: &kin_db::InMemoryGraph, tree: &ResolvedTree) -> Result<()> {
+    if !graph.resolved_tree().is_empty() {
+        return Err(MigrateError::Graph(
+            "new migration staging graph unexpectedly contains repository tree state".to_string(),
+        ));
+    }
+    let tree_deltas = tree
+        .artifacts_by_path()
+        .map(|artifact| TreeDelta::Added {
+            artifact_id: artifact.artifact_id,
+            new: artifact.located_entry(),
+        })
+        .collect();
+    graph
+        .apply_transaction_delta(&TransactionDelta {
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas,
+        })
+        .map_err(|error| MigrateError::Graph(error.to_string()))
+}
+
 fn shallow_tracked_file(shallow: kin_parser::ShallowFile) -> ShallowTrackedFile {
     ShallowTrackedFile {
         file_id: shallow.file_id,
@@ -674,6 +697,12 @@ fn verify_graph_state(
     if &tree != expected_tree {
         return Err(MigrateError::Graph(
             "migration verification failed: persisted head tree differs from imported tree"
+                .to_string(),
+        ));
+    }
+    if &graph.resolved_tree() != expected_tree {
+        return Err(MigrateError::Graph(
+            "migration verification failed: active repository tree differs from imported head"
                 .to_string(),
         ));
     }
@@ -818,6 +847,47 @@ mod tests {
         git(root, &["add", "-A"]) && git(root, &["commit", "-m", message])
     }
 
+    #[cfg(unix)]
+    fn add_non_utf8_blob_to_index(root: &Path) -> OsString {
+        use std::io::Write;
+        use std::os::unix::ffi::OsStringExt;
+        use std::process::Stdio;
+
+        let mut hash_object = Command::new("git")
+            .args(["hash-object", "-w", "--stdin"])
+            .current_dir(root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        hash_object
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&[0, 0xff, 3])
+            .unwrap();
+        let output = hash_object.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "git hash-object failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let blob_oid = String::from_utf8(output.stdout).unwrap().trim().to_string();
+        let raw_name = OsString::from_vec(b"opaque-\xff.bin".to_vec());
+        let mut cache_info = OsString::from("100644,");
+        cache_info.push(blob_oid);
+        cache_info.push(",");
+        cache_info.push(&raw_name);
+        assert!(Command::new("git")
+            .args(["update-index", "--add", "--cacheinfo"])
+            .arg(cache_info)
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        raw_name
+    }
+
     fn plan(source: &Path, target: Option<PathBuf>, strategy: MigrationStrategy) -> MigrationPlan {
         let scan = crate::scan_repo(source).unwrap();
         crate::plan_migration(&scan, strategy, target)
@@ -864,6 +934,7 @@ mod tests {
         )
         .unwrap();
         assert!(commit_all(&source, "initial"));
+        std::fs::write(source.join("untracked.tmp"), "must not migrate\n").unwrap();
 
         let _registry = RegistryIsolation::new(&workspace.path().join("registry.toml"));
         let result = execute_migration_persisted(&plan(
@@ -894,6 +965,36 @@ mod tests {
             std::fs::read(target.join("asset.bin")).unwrap(),
             [0, 1, 2, 0xff]
         );
+        assert!(
+            !target.join("untracked.tmp").exists(),
+            "distinct projection must contain the imported Git tree, not copied worktree state"
+        );
+    }
+
+    #[test]
+    fn clean_in_place_migration_publishes_only_control_state() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        if !init_git(&source) {
+            return;
+        }
+        std::fs::write(source.join("tracked.txt"), "exact bytes\n").unwrap();
+        assert!(commit_all(&source, "initial"));
+        let before = std::fs::read(source.join("tracked.txt")).unwrap();
+
+        let _registry = RegistryIsolation::new(&workspace.path().join("registry.toml"));
+        let result =
+            execute_migration_persisted(&plan(&source, None, MigrationStrategy::Snapshot)).unwrap();
+
+        assert_eq!(
+            result.kin_root,
+            source.canonicalize().unwrap().display().to_string()
+        );
+        assert!(source.join(".kin").is_dir());
+        assert_eq!(std::fs::read(source.join("tracked.txt")).unwrap(), before);
+        let (_snapshot, graph) = open_published_graph(&source);
+        assert_eq!(graph.resolved_tree().len(), 1);
     }
 
     #[test]
@@ -950,7 +1051,7 @@ mod tests {
         let missing = kin_model::Hash256::from_bytes([0x5a; 32]);
         let tree = ResolvedTree::from_artifacts([kin_model::ResolvedArtifact::new(
             kin_model::ArtifactId::new(),
-            RepoPath::from_utf8("missing.bin").unwrap(),
+            kin_model::RepoPath::from_utf8("missing.bin").unwrap(),
             TreeEntry::blob(missing, false),
         )])
         .unwrap();
@@ -960,8 +1061,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn distinct_target_preserves_non_utf8_path_executable_and_symlink() {
-        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    fn distinct_target_preserves_executable_and_symlink() {
+        use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::{symlink, PermissionsExt};
 
         let workspace = tempfile::tempdir().unwrap();
@@ -977,8 +1078,6 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&script, permissions).unwrap();
         symlink("run.sh", source.join("run-link")).unwrap();
-        let raw_name = OsString::from_vec(b"opaque-\xff.bin".to_vec());
-        std::fs::write(source.join(&raw_name), [0, 0xff, 3]).unwrap();
         assert!(commit_all(&source, "exact entries"));
 
         let _registry = RegistryIsolation::new(&workspace.path().join("registry.toml"));
@@ -989,7 +1088,6 @@ mod tests {
         ))
         .unwrap();
 
-        assert_eq!(std::fs::read(target.join(&raw_name)).unwrap(), [0, 0xff, 3]);
         assert_eq!(
             std::fs::read_link(target.join("run-link"))
                 .unwrap()
@@ -1005,6 +1103,53 @@ mod tests {
                 & 0o111,
             0
         );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn distinct_target_preserves_non_utf8_path() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source");
+        let target = workspace.path().join("target");
+        std::fs::create_dir(&source).unwrap();
+        if !init_git(&source) {
+            return;
+        }
+        let raw_name = add_non_utf8_blob_to_index(&source);
+        assert!(git(&source, &["commit", "-m", "raw path"]));
+
+        let _registry = RegistryIsolation::new(&workspace.path().join("registry.toml"));
+        execute_migration_persisted(&plan(
+            &source,
+            Some(target.clone()),
+            MigrationStrategy::Snapshot,
+        ))
+        .unwrap();
+        assert_eq!(std::fs::read(target.join(raw_name)).unwrap(), [0, 0xff, 3]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn distinct_target_refuses_non_utf8_path_without_lossy_publication() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source");
+        let target = workspace.path().join("target");
+        std::fs::create_dir(&source).unwrap();
+        if !init_git(&source) {
+            return;
+        }
+        add_non_utf8_blob_to_index(&source);
+        assert!(git(&source, &["commit", "-m", "raw path"]));
+
+        let _registry = RegistryIsolation::new(&workspace.path().join("registry.toml"));
+        let error = execute_migration_persisted(&plan(
+            &source,
+            Some(target.clone()),
+            MigrationStrategy::Snapshot,
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot be represented exactly"));
+        assert!(!target.join(".kin").exists());
     }
 
     #[test]
