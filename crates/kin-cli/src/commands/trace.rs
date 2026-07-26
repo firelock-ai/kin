@@ -655,8 +655,7 @@ fn render_entity_source(
             span.file.0
         );
     }
-    let bytes =
-        crate::commands::graph::read_entity_file_bytes_from_graph(layout, graph, file_origin)?;
+    let bytes = crate::commands::graph::read_entity_file_bytes_from_graph(layout, graph, entity)?;
     let start = span.start_byte;
     let end = span.end_byte;
     if start >= end || end > bytes.len() {
