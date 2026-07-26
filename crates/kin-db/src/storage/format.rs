@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use crate::storage::change_validation::validate_semantic_change_entries;
 use crate::types::*;
 
 /// Statistics from a snapshot compaction pass.
@@ -469,7 +470,7 @@ impl GraphSnapshot {
                 Self::CURRENT_VERSION
             )));
         }
-        self.validate_enrichment_admission()?;
+        self.validate_storage_admission()?;
         let body = rmp_serde::to_vec(self).map_err(|e| {
             crate::error::KinDbError::StorageError(format!("serialization failed: {e}"))
         })?;
@@ -527,7 +528,7 @@ impl GraphSnapshot {
             Self::CURRENT_VERSION => Self::decode_current_snapshot(frame.body)?,
             _ => unreachable!("decode_frame validates supported versions"),
         };
-        snapshot.validate_enrichment_admission()?;
+        snapshot.validate_storage_admission()?;
         let persisted_root_hash = if verify_checksum {
             Self::decode_root_hash_trailer(data, &frame)?
         } else {
@@ -617,7 +618,12 @@ impl GraphSnapshot {
         })
     }
 
-    pub(crate) fn validate_enrichment_admission(&self) -> Result<(), crate::error::KinDbError> {
+    pub(crate) fn validate_storage_admission(&self) -> Result<(), crate::error::KinDbError> {
+        validate_semantic_change_entries(self.changes.iter(), "snapshot")?;
+        self.validate_enrichment_admission()
+    }
+
+    fn validate_enrichment_admission(&self) -> Result<(), crate::error::KinDbError> {
         let file_ids = self
             .shallow_files
             .iter()
@@ -800,7 +806,7 @@ impl LocateGraphSnapshot {
             GraphSnapshot::CURRENT_VERSION => Self::decode_current_snapshot(frame.body)?,
             _ => unreachable!("decode_frame validates supported versions"),
         };
-        snapshot.validate_enrichment_admission()?;
+        snapshot.validate_storage_admission()?;
         let persisted_root_hash = if verify_checksum {
             GraphSnapshot::decode_root_hash_trailer(data, &frame)?
         } else {
@@ -814,6 +820,11 @@ impl LocateGraphSnapshot {
         rmp_serde::from_slice(body).map_err(|e| {
             crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
         })
+    }
+
+    fn validate_storage_admission(&self) -> Result<(), crate::error::KinDbError> {
+        validate_semantic_change_entries(self.changes.iter(), "locate snapshot")?;
+        self.validate_enrichment_admission()
     }
 
     fn validate_enrichment_admission(&self) -> Result<(), crate::error::KinDbError> {
@@ -1250,6 +1261,23 @@ mod tests {
         }
     }
 
+    fn seal_change(mut change: SemanticChange) -> SemanticChange {
+        change.id =
+            kin_model::compute_semantic_change_id(&change).expect("valid semantic change fixture");
+        change
+    }
+
+    fn encode_snapshot_without_admission_validation(snapshot: &GraphSnapshot) -> Vec<u8> {
+        let body = rmp_serde::to_vec(snapshot).unwrap();
+        let mut bytes = Vec::with_capacity(16 + body.len() + GraphSnapshot::CHECKSUM_LEN);
+        bytes.extend_from_slice(&GraphSnapshot::MAGIC);
+        bytes.extend_from_slice(&GraphSnapshot::CURRENT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(&Sha256::digest(&body));
+        bytes
+    }
+
     fn test_relation(src: EntityId, dst: EntityId) -> Relation {
         Relation {
             id: RelationId::new(),
@@ -1269,7 +1297,7 @@ mod tests {
         let caller = test_entity("caller");
         let callee = test_entity("callee");
         let relation = test_relation(caller.id, callee.id);
-        let change = SemanticChange {
+        let change = seal_change(SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([9; 32])),
             parents: Vec::new(),
             timestamp: Timestamp::now(),
@@ -1283,7 +1311,7 @@ mod tests {
             evidence: Vec::new(),
             risk_summary: None,
             authored_on: Some(BranchName::new("main")),
-        };
+        });
 
         let mut snapshot = GraphSnapshot::empty();
         snapshot.entities.insert(caller.id, caller.clone());
@@ -1756,6 +1784,42 @@ mod tests {
         // Version in header should match the current format version.
         let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
         assert_eq!(version, GraphSnapshot::CURRENT_VERSION);
+    }
+
+    #[test]
+    fn snapshot_decode_rejects_corrupted_semantic_change_identity() {
+        let mut snapshot = GraphSnapshot::empty();
+        let change = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x91; 32])),
+            parents: Vec::new(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("tester"),
+            message: "valid before corruption".into(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            authored_on: Some(BranchName::new("main")),
+        });
+        snapshot.changes.insert(change.id, change.clone());
+        snapshot
+            .changes
+            .get_mut(&change.id)
+            .unwrap()
+            .message
+            .push_str(" after id was sealed");
+
+        let bytes = encode_snapshot_without_admission_validation(&snapshot);
+        let error = GraphSnapshot::from_bytes(&bytes)
+            .expect_err("checksum-valid snapshot corruption must fail identity validation");
+        assert!(error.to_string().contains("recomputes to"));
+
+        let error = GraphSnapshot::from_bytes_with_persisted_root_hash_unverified(&bytes)
+            .expect_err("the mmap checksum shortcut must still validate change identity");
+        assert!(error.to_string().contains("recomputes to"));
     }
 
     #[test]

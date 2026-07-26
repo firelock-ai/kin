@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 pub mod backend;
+pub(crate) mod change_validation;
 pub mod delta;
 pub mod format;
 #[cfg(feature = "gcs")]

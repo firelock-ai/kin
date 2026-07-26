@@ -2975,6 +2975,12 @@ mod tests {
         }
     }
 
+    fn seal_change(mut change: SemanticChange) -> SemanticChange {
+        change.id =
+            kin_model::compute_semantic_change_id(&change).expect("valid semantic change fixture");
+        change
+    }
+
     fn test_entity_with_language(name: &str, file_origin: &str, language: LanguageId) -> Entity {
         let mut entity = test_entity(name);
         entity.file_origin = Some(FilePathId::new(file_origin));
@@ -3984,7 +3990,7 @@ mod tests {
         let mut callee = test_entity("callee");
         callee.file_origin = Some(FilePathId::new("src/lib.rs"));
 
-        let change = SemanticChange {
+        let change = seal_change(SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([8; 32])),
             parents: Vec::new(),
             timestamp: Timestamp::now(),
@@ -3998,7 +4004,7 @@ mod tests {
             evidence: Vec::new(),
             risk_summary: None,
             authored_on: Some(BranchName::new("main")),
-        };
+        });
         let relation = Relation {
             id: RelationId::new(),
             kind: RelationKind::CoChanges,
@@ -4064,7 +4070,7 @@ mod tests {
         callee.file_origin = Some(FilePathId::new("src/lib.rs"));
         let helper = test_entity("helper");
 
-        let change = SemanticChange {
+        let change = seal_change(SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([8; 32])),
             parents: Vec::new(),
             timestamp: Timestamp::now(),
@@ -4078,7 +4084,7 @@ mod tests {
             evidence: Vec::new(),
             risk_summary: None,
             authored_on: Some(BranchName::new("main")),
-        };
+        });
 
         let calls = Relation {
             id: RelationId::new(),
@@ -4351,7 +4357,7 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
 
         let base_change = SemanticChangeId::from_hash(Hash256::from_bytes([1; 32]));
-        let change = SemanticChange {
+        let change = seal_change(SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([2; 32])),
             parents: vec![base_change],
             timestamp: Timestamp::now(),
@@ -4365,7 +4371,7 @@ mod tests {
             evidence: Vec::new(),
             risk_summary: None,
             authored_on: Some(BranchName::new("main")),
-        };
+        });
         graph.create_change(&change).unwrap();
         graph
             .create_branch(&Branch {

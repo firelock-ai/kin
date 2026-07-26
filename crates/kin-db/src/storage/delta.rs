@@ -20,6 +20,7 @@ use std::hash::Hash;
 
 use crate::error::KinDbError;
 use crate::storage::backend::Generation;
+use crate::storage::change_validation::validate_semantic_change_entries;
 use crate::storage::format::GraphSnapshot;
 use crate::types::*;
 
@@ -263,8 +264,20 @@ impl GraphSnapshotDelta {
             + self.intents.change_count()
     }
 
+    fn validate_semantic_changes(&self) -> Result<(), KinDbError> {
+        validate_semantic_change_entries(
+            self.changes
+                .added
+                .iter()
+                .chain(&self.changes.modified)
+                .map(|(key, change)| (key, change)),
+            "snapshot delta",
+        )
+    }
+
     /// Serialize the delta to bytes with header and SHA-256 checksum.
     pub fn to_bytes(&self) -> Result<Vec<u8>, KinDbError> {
+        self.validate_semantic_changes()?;
         let mut buf = Vec::new();
         buf.extend_from_slice(&Self::MAGIC);
         buf.extend_from_slice(&Self::CURRENT_VERSION.to_le_bytes());
@@ -336,8 +349,10 @@ impl GraphSnapshotDelta {
             ));
         }
 
-        rmp_serde::from_slice(body)
-            .map_err(|e| KinDbError::StorageError(format!("delta deserialization failed: {e}")))
+        let delta: Self = rmp_serde::from_slice(body)
+            .map_err(|e| KinDbError::StorageError(format!("delta deserialization failed: {e}")))?;
+        delta.validate_semantic_changes()?;
+        Ok(delta)
     }
 }
 
@@ -603,6 +618,7 @@ pub fn apply_graph_delta(
     snapshot: &mut GraphSnapshot,
     delta: &GraphSnapshotDelta,
 ) -> Result<(), KinDbError> {
+    delta.validate_semantic_changes()?;
     // Apply into a private candidate so repository identity/path truth and
     // every enrichment that depends on it are validated as one state
     // transition. No snapshot domain becomes visible on any failure.
@@ -665,7 +681,7 @@ pub fn apply_graph_delta(
     apply_vec_delta(&mut staged.downstream_warnings, &delta.downstream_warnings);
     apply_map_delta(&mut staged.entity_revisions, &delta.entity_revisions);
 
-    staged.validate_enrichment_admission()?;
+    staged.validate_storage_admission()?;
     *snapshot = staged;
     Ok(())
 }
@@ -677,6 +693,23 @@ pub fn apply_graph_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seal_change(mut change: SemanticChange) -> SemanticChange {
+        change.id =
+            kin_model::compute_semantic_change_id(&change).expect("valid semantic change fixture");
+        change
+    }
+
+    fn encode_delta_without_admission_validation(delta: &GraphSnapshotDelta) -> Vec<u8> {
+        let body = rmp_serde::to_vec(delta).unwrap();
+        let mut bytes = Vec::with_capacity(16 + body.len() + GraphSnapshotDelta::CHECKSUM_LEN);
+        bytes.extend_from_slice(&GraphSnapshotDelta::MAGIC);
+        bytes.extend_from_slice(&GraphSnapshotDelta::CURRENT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(&Sha256::digest(&body));
+        bytes
+    }
 
     fn path(value: &str) -> RepoPath {
         RepoPath::from_utf8(value).unwrap()
@@ -709,6 +742,40 @@ mod tests {
             result.is_err(),
             "overflowing body_len must error, not panic"
         );
+    }
+
+    #[test]
+    fn delta_decode_and_apply_reject_corrupted_semantic_change_identity_atomically() {
+        let mut change = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x92; 32])),
+            parents: Vec::new(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("tester"),
+            message: "valid before corruption".into(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            authored_on: Some(BranchName::new("main")),
+        });
+        change.message.push_str(" after id was sealed");
+        let mut delta = GraphSnapshotDelta::empty(0);
+        delta.changes.added.push((change.id, change));
+
+        let bytes = encode_delta_without_admission_validation(&delta);
+        let error = GraphSnapshotDelta::from_bytes(&bytes)
+            .expect_err("checksum-valid delta corruption must fail identity validation");
+        assert!(error.to_string().contains("recomputes to"));
+
+        let mut snapshot = GraphSnapshot::empty();
+        let before = snapshot.to_bytes().unwrap();
+        let error = apply_graph_delta(&mut snapshot, &delta)
+            .expect_err("direct delta application must enforce the same identity boundary");
+        assert!(error.to_string().contains("recomputes to"));
+        assert_eq!(snapshot.to_bytes().unwrap(), before);
     }
 
     #[test]

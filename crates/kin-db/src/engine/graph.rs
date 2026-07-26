@@ -15,6 +15,7 @@ use crate::error::KinDbError;
 use crate::search::{
     opaque_artifact_fields, shallow_file_fields, structured_artifact_fields, TextIndex,
 };
+use crate::storage::change_validation::validate_semantic_change;
 use crate::storage::format::LocateGraphSnapshot;
 use crate::storage::merkle::{
     compute_graph_root_hash, compute_root_hash_generic, GraphHashSource, MerkleCache,
@@ -2704,16 +2705,6 @@ impl InMemoryGraph {
         let mut pending = self.pending_delta.lock();
         delta_map_remove(&mut pending.delta.relations, relation.id);
         record_relation_edge_delta(&mut pending, ent, relation);
-    }
-
-    fn record_resolved_tree_delta_upsert(&self, artifact_id: ArtifactId, entry: LocatedEntry) {
-        let mut pending = self.pending_delta.lock();
-        delta_map_upsert(&mut pending.delta.resolved_tree, artifact_id, entry);
-    }
-
-    fn record_resolved_tree_delta_remove(&self, artifact_id: ArtifactId) {
-        let mut pending = self.pending_delta.lock();
-        delta_map_remove(&mut pending.delta.resolved_tree, artifact_id);
     }
 
     fn record_shallow_file_delta_upsert(
@@ -5662,6 +5653,25 @@ fn validate_entity_enrichment_admission(ent: &EntityData) -> Result<(), KinDbErr
     Ok(())
 }
 
+fn tree_delta_invalidates_path_facets(delta: &TreeDelta) -> bool {
+    match (delta.old_state(), delta.new_state()) {
+        (Some(_), None) => true,
+        (Some(old), Some(new)) if old.path != new.path => true,
+        (
+            Some(LocatedEntry {
+                entry: TreeEntry::Blob { hash: old, .. },
+                ..
+            }),
+            Some(LocatedEntry {
+                entry: TreeEntry::Blob { hash: new, .. },
+                ..
+            }),
+        ) => old != new,
+        (Some(old), Some(new)) => old.entry != new.entry,
+        (None, _) => false,
+    }
+}
+
 fn collect_artifact_text_index_docs(
     ent: &EntityData,
 ) -> Result<Vec<(RetrievalKey, Vec<(String, f32)>)>, KinDbError> {
@@ -6652,6 +6662,7 @@ impl EntityStore for InMemoryGraph {
         let mut affected = HashSet::new();
         let mut deleted_entities = Vec::new();
         let mut merkle_seeds = HashSet::new();
+        let mut retired_artifact_indexes = HashSet::new();
 
         {
             let mut ent = self.entities.write();
@@ -6664,19 +6675,80 @@ impl EntityStore for InMemoryGraph {
                 .resolved_tree
                 .apply(&delta.tree_deltas)
                 .map_err(tree_state_error)?;
+            // Keep the whole graph transaction in one persistence batch. The
+            // normal record_* helpers take this lock per mutation; doing that
+            // here would let a persistence detach split tree, facet, entity,
+            // and relation effects across different durable deltas.
+            let mut pending = self.pending_delta.lock();
 
-            // 1. Publish exact repository-tree truth and its persistence delta.
+            // 1. Retire path-keyed enrichment through the identity-bearing old
+            // tree state before publishing the new tree. A later path lookup
+            // cannot authenticate a cleanup after a removal or move, while the
+            // validated TreeDelta still proves the exact ArtifactId, location,
+            // and materialization being replaced. Keeping this under the same
+            // entity lock makes the tree and its derived facets one atomic
+            // graph-truth transition.
+            for tree_delta in &delta.tree_deltas {
+                if !tree_delta_invalidates_path_facets(tree_delta) {
+                    continue;
+                }
+                let Some(old_state) = tree_delta.old_state() else {
+                    continue;
+                };
+                let Some(file_id) = file_path_for_repo_path(&old_state.path) else {
+                    continue;
+                };
+                let artifact_id = tree_delta.artifact_id();
+
+                if let Some(old) = ent.file_layouts.remove(&file_id) {
+                    delta_vec_remove_by_key(
+                        &mut pending.delta.file_layouts,
+                        Some(old),
+                        file_id.clone(),
+                        |layout| layout.file_id.clone(),
+                    );
+                }
+                if let Some(old) = ent.shallow_files.remove(&file_id) {
+                    delta_vec_remove_by_key(
+                        &mut pending.delta.shallow_files,
+                        Some(old),
+                        file_id.clone(),
+                        |file| file.file_id.clone(),
+                    );
+                    retired_artifact_indexes.insert(artifact_id);
+                }
+                if let Some(old) = ent.structured_artifacts.remove(&file_id) {
+                    delta_vec_remove_by_key(
+                        &mut pending.delta.structured_artifacts,
+                        Some(old),
+                        file_id.clone(),
+                        |artifact| artifact.file_id.clone(),
+                    );
+                    retired_artifact_indexes.insert(artifact_id);
+                }
+                if let Some(old) = ent.opaque_artifacts.remove(&file_id) {
+                    delta_vec_remove_by_key(
+                        &mut pending.delta.opaque_artifacts,
+                        Some(old),
+                        file_id,
+                        |artifact| artifact.file_id.clone(),
+                    );
+                    retired_artifact_indexes.insert(artifact_id);
+                }
+            }
+
+            // 2. Publish exact repository-tree truth and its persistence delta.
             for tree_delta in &delta.tree_deltas {
                 let artifact_id = tree_delta.artifact_id();
                 if let Some(new) = tree_delta.new_state() {
-                    self.record_resolved_tree_delta_upsert(artifact_id, new.clone());
+                    delta_map_upsert(&mut pending.delta.resolved_tree, artifact_id, new.clone());
                 } else {
-                    self.record_resolved_tree_delta_remove(artifact_id);
+                    delta_map_remove(&mut pending.delta.resolved_tree, artifact_id);
                 }
             }
             ent.resolved_tree = staged_tree;
 
-            // 2. Process entity deltas.
+            // 3. Process entity deltas.
             for ent_delta in &delta.entity_deltas {
                 match ent_delta {
                     EntityDelta::Added(entity) | EntityDelta::Modified { new: entity, .. } => {
@@ -6709,7 +6781,7 @@ impl EntityStore for InMemoryGraph {
                         }
 
                         ent.entities.insert(entity.id, entity.clone());
-                        self.record_entity_delta_upsert(entity.clone());
+                        delta_map_upsert(&mut pending.delta.entities, entity.id, entity.clone());
                         affected.insert(entity.id);
                         merkle_seeds.insert(entity.id);
                     }
@@ -6754,15 +6826,17 @@ impl EntityStore for InMemoryGraph {
                             }
                         }
                         let removed_relations = remove_relations_for_entity(&mut ent, id);
-                        self.record_entity_delta_remove(*id);
+                        delta_map_remove(&mut pending.delta.entities, *id);
+                        delta_map_remove(&mut pending.delta.entity_revisions, *id);
                         for relation in &removed_relations {
-                            self.record_relation_delta_remove(&ent, relation);
+                            delta_map_remove(&mut pending.delta.relations, relation.id);
+                            record_relation_edge_delta(&mut pending, &ent, relation);
                         }
                     }
                 }
             }
 
-            // 3. Process relation deltas.
+            // 4. Process relation deltas.
             for rel_delta in &delta.relation_deltas {
                 match rel_delta {
                     RelationDelta::Added(relation) => {
@@ -6770,11 +6844,17 @@ impl EntityStore for InMemoryGraph {
                             affected.extend(entity_ids_for_relation(&old));
                             merkle_seeds.extend(entity_ids_for_relation(&old));
                             remove_relation_indexes(&mut ent, &old);
-                            self.record_relation_delta_remove(&ent, &old);
+                            delta_map_remove(&mut pending.delta.relations, old.id);
+                            record_relation_edge_delta(&mut pending, &ent, &old);
                         }
                         insert_relation_indexes(&mut ent, relation);
                         ent.relations.insert(relation.id, relation.clone());
-                        self.record_relation_delta_upsert(&ent, relation.clone());
+                        delta_map_upsert(
+                            &mut pending.delta.relations,
+                            relation.id,
+                            relation.clone(),
+                        );
+                        record_relation_edge_delta(&mut pending, &ent, relation);
                         affected.extend(entity_ids_for_relation(relation));
                         merkle_seeds.extend(entity_ids_for_relation(relation));
                     }
@@ -6783,7 +6863,8 @@ impl EntityStore for InMemoryGraph {
                             affected.extend(entity_ids_for_relation(&rel));
                             merkle_seeds.extend(entity_ids_for_relation(&rel));
                             remove_relation_indexes(&mut ent, &rel);
-                            self.record_relation_delta_remove(&ent, &rel);
+                            delta_map_remove(&mut pending.delta.relations, rel.id);
+                            record_relation_edge_delta(&mut pending, &ent, &rel);
                         }
                     }
                 }
@@ -6791,7 +6872,25 @@ impl EntityStore for InMemoryGraph {
             self.refresh_merkle_for_entities(&ent, merkle_seeds.iter().copied());
         }
 
-        // 4. Clean up deleted entities from the embedding queue / vector index
+        // 5. Retire derived retrieval state for facets removed by the exact
+        // tree transaction. Sort for deterministic vector free-list reuse.
+        let mut retired_artifact_indexes: Vec<ArtifactId> =
+            retired_artifact_indexes.into_iter().collect();
+        retired_artifact_indexes.sort_unstable();
+        for artifact_id in &retired_artifact_indexes {
+            let key = RetrievalKey::Artifact(*artifact_id);
+            self.remove_retrievable_text_index(&key)?;
+            self.remove_retrievable_vector(&key)?;
+        }
+        #[cfg(feature = "vector")]
+        {
+            let mut queue = self.artifact_embedding_queue.lock();
+            for artifact_id in &retired_artifact_indexes {
+                queue.remove(artifact_id);
+            }
+        }
+
+        // 6. Clean up deleted entities from the embedding queue / vector index
         #[cfg(feature = "vector")]
         {
             let mut eq = self.embedding_queue.lock();
@@ -6804,7 +6903,7 @@ impl EntityStore for InMemoryGraph {
             }
         }
 
-        // 5. Invalidate / refresh text index & embeddings for affected entities
+        // 7. Invalidate / refresh text index & embeddings for affected entities
         let affected_list: Vec<EntityId> = affected.into_iter().collect();
         if !affected_list.is_empty() {
             self.refresh_text_index_for_entities(&affected_list);
@@ -7092,6 +7191,7 @@ impl ChangeStore for InMemoryGraph {
     }
 
     fn create_change(&self, change: &SemanticChange) -> Result<(), KinDbError> {
+        validate_semantic_change(change)?;
         let payload = semantic_change_payload(change)?;
         let mut ent = self.entities.write();
         let mut chg = self.changes.write();
@@ -7309,6 +7409,16 @@ impl InMemoryGraph {
             return Ok(());
         }
 
+        // Validate the complete immutable identity and exact payload of every
+        // item before acquiring any graph lock. A spoofed later item therefore
+        // cannot expose a partial batch or append a pending persistence delta.
+        let mut validated = Vec::with_capacity(changes.len());
+        for change in changes {
+            validate_semantic_change(&change)?;
+            let payload = semantic_change_payload(&change)?;
+            validated.push((change, payload));
+        }
+
         // Domain lock order is part of InMemoryGraph's deadlock contract:
         // entities -> changes. Holding both makes a batch appear as one ordered
         // import to readers instead of exposing a partially registered DAG.
@@ -7320,10 +7430,9 @@ impl InMemoryGraph {
         // bit-exact payloads are idempotent; a differing payload under the
         // same content identity is corruption and rejects the whole batch
         // atomically.
-        let mut unique_changes = Vec::with_capacity(changes.len());
+        let mut unique_changes = Vec::with_capacity(validated.len());
         let mut batch_payloads = HashMap::new();
-        for change in changes {
-            let payload = semantic_change_payload(&change)?;
+        for (change, payload) in validated {
             if let Some(existing) = chg.changes.get(&change.id) {
                 if semantic_change_payload(existing)? == payload {
                     continue;
@@ -8995,6 +9104,28 @@ mod tests {
         }
     }
 
+    fn seal_change(mut change: SemanticChange) -> SemanticChange {
+        change.id =
+            kin_model::compute_semantic_change_id(&change).expect("valid semantic change fixture");
+        change
+    }
+
+    fn admit_change(graph: &InMemoryGraph, change: SemanticChange) -> SemanticChangeId {
+        let change = seal_change(change);
+        let id = change.id;
+        graph.create_change(&change).expect("valid change fixture");
+        id
+    }
+
+    fn assert_no_change_admission(graph: &InMemoryGraph) {
+        let snapshot = graph.to_snapshot();
+        assert!(snapshot.changes.is_empty());
+        assert!(snapshot.entity_revisions.is_empty());
+        assert!(snapshot.change_children.is_empty());
+        assert!(snapshot.resolved_tree.is_empty());
+        assert!(!graph.has_pending_delta());
+    }
+
     fn test_repo_path(path: &str) -> RepoPath {
         RepoPath::from_utf8(path).unwrap()
     }
@@ -9060,6 +9191,190 @@ mod tests {
     }
 
     #[test]
+    fn tree_mode_only_update_preserves_content_derived_facets() {
+        let graph = InMemoryGraph::new();
+        let file_id = FilePathId::new("Makefile");
+        let hash = Hash256::from_bytes([0x10; 32]);
+        let regular = TreeEntry::blob(hash, false);
+        let executable = TreeEntry::blob(hash, true);
+        let artifact_id = graph.admit_artifact_for_test(&file_id.0, regular);
+        let artifact = StructuredArtifact {
+            file_id: file_id.clone(),
+            kind: ArtifactKind::Makefile,
+            content_hash: hash,
+            text_preview: Some("build:".into()),
+        };
+        graph.upsert_structured_artifact(&artifact).unwrap();
+        graph.clear_pending_delta();
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&file_id.0, regular),
+                    new: test_located(&file_id.0, executable),
+                }],
+            })
+            .unwrap();
+
+        assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(executable));
+        assert_eq!(
+            graph
+                .get_structured_artifact(&file_id)
+                .unwrap()
+                .expect("content-identical facet must remain")
+                .content_hash,
+            hash
+        );
+        let pending = graph
+            .pending_delta_snapshot(0)
+            .expect("mode transition must be persisted");
+        assert!(pending.structured_artifacts.is_empty());
+    }
+
+    #[test]
+    fn tree_transaction_retires_old_path_facets_by_captured_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = InMemoryGraph::with_text_index(dir.path().join("text-index"));
+        let old_file_id = FilePathId::new("config/old.toml");
+        let new_file_id = FilePathId::new("config/current.toml");
+        let old_entry = TreeEntry::blob(Hash256::from_bytes([0x21; 32]), false);
+        let new_entry = TreeEntry::blob(Hash256::from_bytes([0x22; 32]), false);
+        let artifact_id = graph.admit_artifact_for_test(&old_file_id.0, old_entry);
+        let shallow = ShallowTrackedFile {
+            file_id: old_file_id.clone(),
+            language_hint: "unsupported".into(),
+            declaration_count: 1,
+            import_count: 0,
+            syntax_hash: Hash256::from_bytes([0x23; 32]),
+            signature_hash: None,
+            declaration_names: vec!["obsolete_shallow_marker".into()],
+            import_paths: Vec::new(),
+        };
+        let layout = FileLayout {
+            file_id: old_file_id.clone(),
+            parse_completeness: ParseCompleteness::Full,
+            imports: ImportSection {
+                byte_range: 0..0,
+                items: Vec::new(),
+            },
+            regions: Vec::new(),
+        };
+        let structured = StructuredArtifact {
+            file_id: old_file_id.clone(),
+            kind: ArtifactKind::CiConfig,
+            content_hash: Hash256::from_bytes([0x24; 32]),
+            text_preview: Some("obsolete structured marker".into()),
+        };
+        let opaque = OpaqueArtifact {
+            file_id: old_file_id.clone(),
+            content_hash: Hash256::from_bytes([0x25; 32]),
+            mime_type: Some("application/octet-stream".into()),
+            text_preview: Some("obsolete opaque marker".into()),
+        };
+
+        graph.upsert_shallow_file(&shallow).unwrap();
+        graph.upsert_file_layout(&layout).unwrap();
+        graph.upsert_structured_artifact(&structured).unwrap();
+        graph.upsert_opaque_artifact(&opaque).unwrap();
+        graph.flush_text_index().unwrap();
+        graph.clear_pending_delta();
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&old_file_id.0, old_entry),
+                    new: test_located(&new_file_id.0, new_entry),
+                }],
+            })
+            .unwrap();
+
+        assert!(graph.get_shallow_file(&old_file_id).unwrap().is_none());
+        assert!(graph.get_file_layout(&old_file_id).unwrap().is_none());
+        assert!(graph
+            .get_structured_artifact(&old_file_id)
+            .unwrap()
+            .is_none());
+        assert!(graph.get_opaque_artifact(&old_file_id).unwrap().is_none());
+        assert_eq!(
+            graph.artifact_id_at_path(&test_repo_path(&new_file_id.0)),
+            Some(artifact_id)
+        );
+        assert!(graph
+            .artifact_id_at_path(&test_repo_path(&old_file_id.0))
+            .is_none());
+
+        let pending = graph
+            .pending_delta_snapshot(0)
+            .expect("tree and facet removals must be persisted together");
+        assert_eq!(pending.shallow_files.removed.len(), 1);
+        assert_eq!(pending.shallow_files.removed[0].file_id, old_file_id);
+        assert_eq!(pending.file_layouts.removed.len(), 1);
+        assert_eq!(pending.file_layouts.removed[0].file_id, old_file_id);
+        assert_eq!(pending.structured_artifacts.removed.len(), 1);
+        assert_eq!(pending.structured_artifacts.removed[0].file_id, old_file_id);
+        assert_eq!(pending.opaque_artifacts.removed.len(), 1);
+        assert_eq!(pending.opaque_artifacts.removed[0].file_id, old_file_id);
+        assert_eq!(
+            pending.resolved_tree.modified,
+            vec![(artifact_id, test_located(&new_file_id.0, new_entry))]
+        );
+
+        graph.flush_text_index().unwrap();
+        let artifact_key = RetrievalKey::Artifact(artifact_id);
+        assert!(!graph
+            .text_search("obsolete opaque marker", 10)
+            .unwrap()
+            .iter()
+            .any(|(key, _)| *key == artifact_key));
+        #[cfg(feature = "vector")]
+        assert!(!graph.artifact_embedding_queue.lock().contains(&artifact_id));
+    }
+
+    #[test]
+    fn tree_removal_retires_facets_without_post_removal_path_lookup() {
+        let graph = InMemoryGraph::new();
+        let file_id = FilePathId::new("compose.yaml");
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x31; 32]), false);
+        let artifact_id = graph.admit_artifact_for_test(&file_id.0, entry);
+        let artifact = StructuredArtifact {
+            file_id: file_id.clone(),
+            kind: ArtifactKind::ComposeFile,
+            content_hash: Hash256::from_bytes([0x32; 32]),
+            text_preview: Some("services:".into()),
+        };
+        graph.upsert_structured_artifact(&artifact).unwrap();
+        graph.clear_pending_delta();
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Removed {
+                    artifact_id,
+                    old: test_located(&file_id.0, entry),
+                }],
+            })
+            .unwrap();
+
+        assert!(graph
+            .artifact_id_at_path(&test_repo_path(&file_id.0))
+            .is_none());
+        assert!(graph.get_structured_artifact(&file_id).unwrap().is_none());
+        let pending = graph
+            .pending_delta_snapshot(0)
+            .expect("tree and facet removal must share one persistence delta");
+        assert_eq!(pending.resolved_tree.removed, vec![artifact_id]);
+        assert_eq!(pending.structured_artifacts.removed.len(), 1);
+        assert_eq!(pending.structured_artifacts.removed[0].file_id, file_id);
+    }
+
+    #[test]
     fn stale_tree_transition_rejects_all_graph_mutations_atomically() {
         let graph = InMemoryGraph::new();
         let file_id = FilePathId::new("Dockerfile");
@@ -9086,6 +9401,103 @@ mod tests {
             .contains("repository tree transition rejected"));
         assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(current));
         assert!(graph.get_entity(&entity.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn stale_tree_transition_preserves_every_old_path_facet_atomically() {
+        let graph = InMemoryGraph::new();
+        let file_id = FilePathId::new("config/settings.yaml");
+        let current = TreeEntry::blob(Hash256::from_bytes([0x41; 32]), false);
+        let stale = TreeEntry::blob(Hash256::from_bytes([0x42; 32]), false);
+        let replacement = TreeEntry::blob(Hash256::from_bytes([0x43; 32]), false);
+        let artifact_id = graph.admit_artifact_for_test(&file_id.0, current);
+        let shallow = ShallowTrackedFile {
+            file_id: file_id.clone(),
+            language_hint: "yaml".into(),
+            declaration_count: 0,
+            import_count: 0,
+            syntax_hash: Hash256::from_bytes([0x44; 32]),
+            signature_hash: None,
+            declaration_names: Vec::new(),
+            import_paths: Vec::new(),
+        };
+        let layout = FileLayout {
+            file_id: file_id.clone(),
+            parse_completeness: ParseCompleteness::Full,
+            imports: ImportSection {
+                byte_range: 0..0,
+                items: Vec::new(),
+            },
+            regions: Vec::new(),
+        };
+        let structured = StructuredArtifact {
+            file_id: file_id.clone(),
+            kind: ArtifactKind::CiConfig,
+            content_hash: Hash256::from_bytes([0x45; 32]),
+            text_preview: Some("structured".into()),
+        };
+        let opaque = OpaqueArtifact {
+            file_id: file_id.clone(),
+            content_hash: Hash256::from_bytes([0x46; 32]),
+            mime_type: None,
+            text_preview: Some("opaque".into()),
+        };
+        graph.upsert_shallow_file(&shallow).unwrap();
+        graph.upsert_file_layout(&layout).unwrap();
+        graph.upsert_structured_artifact(&structured).unwrap();
+        graph.upsert_opaque_artifact(&opaque).unwrap();
+        graph.clear_pending_delta();
+
+        let error = graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&file_id.0, stale),
+                    new: test_located(&file_id.0, replacement),
+                }],
+            })
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("repository tree transition rejected"));
+        assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(current));
+        assert_eq!(
+            graph
+                .get_shallow_file(&file_id)
+                .unwrap()
+                .expect("shallow facet must remain")
+                .syntax_hash,
+            shallow.syntax_hash
+        );
+        assert_eq!(
+            graph
+                .get_file_layout(&file_id)
+                .unwrap()
+                .expect("layout facet must remain")
+                .parse_completeness
+                .bucket(),
+            layout.parse_completeness.bucket()
+        );
+        assert_eq!(
+            graph
+                .get_structured_artifact(&file_id)
+                .unwrap()
+                .expect("structured facet must remain")
+                .content_hash,
+            structured.content_hash
+        );
+        assert_eq!(
+            graph
+                .get_opaque_artifact(&file_id)
+                .unwrap()
+                .expect("opaque facet must remain")
+                .content_hash,
+            opaque.content_hash
+        );
+        assert!(!graph.has_pending_delta());
     }
 
     fn test_relation(src: EntityId, dst: EntityId, kind: RelationKind) -> Relation {
@@ -10054,9 +10466,8 @@ mod tests {
     fn change_dag_operations() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([1; 32]));
-        let genesis = SemanticChange {
-            id: genesis_id,
+        let genesis = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([1; 32])),
             parents: vec![],
             timestamp: Timestamp::now(),
             author: AuthorId::new("test"),
@@ -10069,12 +10480,12 @@ mod tests {
             evidence: vec![],
             risk_summary: None,
             authored_on: None,
-        };
+        });
+        let genesis_id = genesis.id;
         graph.create_change(&genesis).unwrap();
 
-        let child_id = SemanticChangeId::from_hash(Hash256::from_bytes([2; 32]));
-        let child = SemanticChange {
-            id: child_id,
+        let child = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([2; 32])),
             parents: vec![genesis_id],
             timestamp: Timestamp::now(),
             author: AuthorId::new("test"),
@@ -10087,7 +10498,8 @@ mod tests {
             evidence: vec![],
             risk_summary: None,
             authored_on: None,
-        };
+        });
+        let child_id = child.id;
         graph.create_change(&child).unwrap();
 
         let fetched = graph.get_change(&child_id).unwrap().unwrap();
@@ -10102,7 +10514,7 @@ mod tests {
     fn create_change_is_idempotent_only_for_identical_payload() {
         let graph = InMemoryGraph::new();
         let parent = SemanticChangeId::from_hash(Hash256::from_bytes([0x31; 32]));
-        let change = SemanticChange {
+        let change = seal_change(SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([0x32; 32])),
             parents: vec![parent],
             timestamp: Timestamp::now(),
@@ -10116,7 +10528,7 @@ mod tests {
             evidence: vec![],
             risk_summary: None,
             authored_on: None,
-        };
+        });
 
         graph.create_change(&change).unwrap();
         graph
@@ -10134,7 +10546,7 @@ mod tests {
         let error = graph
             .create_change(&conflicting)
             .expect_err("same id with different payload must be rejected");
-        assert!(matches!(error, KinDbError::DuplicateChange(_)));
+        assert!(matches!(error, KinDbError::Model(_)));
         assert_eq!(
             graph.get_change(&change.id).unwrap().unwrap().message,
             "immutable payload"
@@ -10150,7 +10562,7 @@ mod tests {
         let graph = InMemoryGraph::new();
         let mut entity = test_entity("float_identity", "src/lib.rs");
         entity.fingerprint.stability_score = 0.0;
-        let change = SemanticChange {
+        let change = seal_change(SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([0x3d; 32])),
             parents: vec![],
             timestamp: Timestamp::now(),
@@ -10164,7 +10576,7 @@ mod tests {
             evidence: vec![],
             risk_summary: None,
             authored_on: None,
-        };
+        });
         graph.create_change(&change).unwrap();
 
         let mut conflicting = change.clone();
@@ -10175,7 +10587,7 @@ mod tests {
         let error = graph
             .create_change(&conflicting)
             .expect_err("different IEEE-754 payload bits must not be idempotent");
-        assert!(matches!(error, KinDbError::DuplicateChange(_)));
+        assert!(matches!(error, KinDbError::Model(_)));
 
         let stored = graph.get_change(&change.id).unwrap().unwrap();
         let EntityDelta::Added(entity) = &stored.entity_deltas[0] else {
@@ -10217,12 +10629,68 @@ mod tests {
     }
 
     #[test]
-    fn create_changes_rejects_conflicting_batch_before_any_mutation() {
+    fn create_change_rejects_spoofed_id_before_any_mutation() {
+        let graph = InMemoryGraph::new();
+        let spoofed = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x40; 32])),
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("agent"),
+            message: "spoofed".to_string(),
+            entity_deltas: vec![EntityDelta::Added(test_entity(
+                "must_not_land",
+                "src/lib.rs",
+            ))],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+
+        let error = graph
+            .create_change(&spoofed)
+            .expect_err("spoofed identity must fail closed");
+        assert!(error.to_string().contains("recomputes to"));
+        assert_no_change_admission(&graph);
+    }
+
+    #[test]
+    fn create_change_rejects_identical_spoofed_reinsertion() {
+        let graph = InMemoryGraph::new();
+        let spoofed = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x40; 32])),
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("agent"),
+            message: "same invalid retry".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+
+        for _ in 0..2 {
+            let error = graph
+                .create_change(&spoofed)
+                .expect_err("an identical spoofed retry is never idempotent");
+            assert!(error.to_string().contains("recomputes to"));
+        }
+        assert_no_change_admission(&graph);
+    }
+
+    #[test]
+    fn create_changes_rejects_later_spoof_before_any_mutation() {
         let graph = InMemoryGraph::new();
         let entity = test_entity("must_not_land", "src/lib.rs");
-        let id = SemanticChangeId::from_hash(Hash256::from_bytes([0x41; 32]));
-        let first = SemanticChange {
-            id,
+        let first = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x41; 32])),
             parents: vec![],
             timestamp: Timestamp::now(),
             author: AuthorId::new("agent"),
@@ -10235,18 +10703,50 @@ mod tests {
             evidence: vec![],
             risk_summary: None,
             authored_on: None,
+        });
+        let mut spoofed = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32])),
+            parents: vec![first.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("agent"),
+            message: "later spoof".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        });
+        spoofed.id = SemanticChangeId::from_hash(Hash256::from_bytes([0xff; 32]));
+        let branch = Branch {
+            name: BranchName::new("sentinel"),
+            head: SemanticChangeId::from_hash(Hash256::from_bytes([0xaa; 32])),
         };
-        let mut conflicting = first.clone();
-        conflicting.message = "conflict".to_string();
+        graph.create_branch(&branch).unwrap();
+        let pending_before = graph.take_pending_delta(0);
+        assert!(
+            pending_before.is_some(),
+            "sentinel branch records one delta"
+        );
 
         let error = graph
-            .create_changes(vec![first, conflicting])
-            .expect_err("conflicting duplicate must reject the whole batch");
-        assert!(matches!(error, KinDbError::DuplicateChange(_)));
+            .create_changes(vec![first, spoofed])
+            .expect_err("a spoofed later item must reject the whole batch");
+        assert!(error.to_string().contains("recomputes to"));
         let snapshot = graph.to_snapshot();
         assert!(snapshot.changes.is_empty());
         assert!(snapshot.entity_revisions.is_empty());
         assert!(snapshot.change_children.is_empty());
+        assert!(snapshot.resolved_tree.is_empty());
+        assert_eq!(
+            snapshot
+                .branches
+                .get(&branch.name)
+                .map(|stored| stored.head),
+            Some(branch.head)
+        );
         assert!(!graph.has_pending_delta());
     }
 
@@ -10255,7 +10755,7 @@ mod tests {
         let graph = InMemoryGraph::new();
         let mut entity = test_entity("batch_float_identity", "src/lib.rs");
         entity.fingerprint.stability_score = 0.0;
-        let first = SemanticChange {
+        let first = seal_change(SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32])),
             parents: vec![],
             timestamp: Timestamp::now(),
@@ -10269,7 +10769,7 @@ mod tests {
             evidence: vec![],
             risk_summary: None,
             authored_on: None,
-        };
+        });
         let mut conflicting = first.clone();
         let EntityDelta::Added(entity) = &mut conflicting.entity_deltas[0] else {
             unreachable!("fixture contains one added entity")
@@ -10279,7 +10779,7 @@ mod tests {
         let error = graph
             .create_changes(vec![first, conflicting])
             .expect_err("bit-distinct floats under one ID must reject the whole batch");
-        assert!(matches!(error, KinDbError::DuplicateChange(_)));
+        assert!(matches!(error, KinDbError::Model(_)));
         let snapshot = graph.to_snapshot();
         assert!(snapshot.changes.is_empty());
         assert!(snapshot.entity_revisions.is_empty());
@@ -10289,7 +10789,7 @@ mod tests {
     #[test]
     fn create_changes_non_finite_payload_rejects_prior_valid_entries_atomically() {
         let graph = InMemoryGraph::new();
-        let valid = SemanticChange {
+        let valid = seal_change(SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([0x43; 32])),
             parents: vec![],
             timestamp: Timestamp::now(),
@@ -10303,7 +10803,7 @@ mod tests {
             evidence: vec![],
             risk_summary: None,
             authored_on: None,
-        };
+        });
         let source = test_entity("source", "src/source.rs");
         let target = test_entity("target", "src/target.rs");
         let mut relation = test_relation(source.id, target.id, RelationKind::Calls);
@@ -10327,7 +10827,7 @@ mod tests {
         let error = graph
             .create_changes(vec![valid, invalid])
             .expect_err("a later non-finite payload must reject the batch before mutation");
-        assert!(error.to_string().contains("non-finite relation confidence"));
+        assert!(error.to_string().contains("non-finite confidence score"));
         let snapshot = graph.to_snapshot();
         assert!(snapshot.changes.is_empty());
         assert!(snapshot.entity_revisions.is_empty());
@@ -10344,60 +10844,59 @@ mod tests {
         modified.signature = "fn target(value: usize)".to_string();
         modified.fingerprint.signature_hash = Hash256::from_bytes([0x44; 32]);
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32]));
-        let first_child_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x22; 32]));
-        let second_child_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x33; 32]));
         let timestamp = Timestamp::now();
-        let changes = vec![
-            SemanticChange {
-                id: genesis_id,
-                parents: vec![],
-                timestamp: timestamp.clone(),
-                author: AuthorId::new("test"),
-                message: "genesis".to_string(),
-                entity_deltas: vec![EntityDelta::Added(original.clone())],
-                relation_deltas: vec![],
-                tree_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            },
-            SemanticChange {
-                id: first_child_id,
-                parents: vec![genesis_id],
-                timestamp: timestamp.clone(),
-                author: AuthorId::new("test"),
-                message: "modify target".to_string(),
-                entity_deltas: vec![EntityDelta::Modified {
-                    old: original.clone(),
-                    new: modified,
-                }],
-                relation_deltas: vec![],
-                tree_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            },
-            SemanticChange {
-                id: second_child_id,
-                parents: vec![genesis_id],
-                timestamp,
-                author: AuthorId::new("test"),
-                message: "sibling".to_string(),
-                entity_deltas: vec![],
-                relation_deltas: vec![],
-                tree_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            },
-        ];
+        let genesis = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32])),
+            parents: vec![],
+            timestamp: timestamp.clone(),
+            author: AuthorId::new("test"),
+            message: "genesis".to_string(),
+            entity_deltas: vec![EntityDelta::Added(original.clone())],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        });
+        let genesis_id = genesis.id;
+        let first_child = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x22; 32])),
+            parents: vec![genesis_id],
+            timestamp: timestamp.clone(),
+            author: AuthorId::new("test"),
+            message: "modify target".to_string(),
+            entity_deltas: vec![EntityDelta::Modified {
+                old: original.clone(),
+                new: modified,
+            }],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        });
+        let first_child_id = first_child.id;
+        let second_child = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x33; 32])),
+            parents: vec![genesis_id],
+            timestamp,
+            author: AuthorId::new("test"),
+            message: "sibling".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        });
+        let second_child_id = second_child.id;
+        let changes = vec![genesis, first_child, second_child];
 
         for change in &changes {
             sequential.create_change(change).unwrap();
@@ -10525,8 +11024,8 @@ mod tests {
         let removed_then_added = test_entity("late", "src/late.rs");
         let other = test_entity("other", "src/other.rs");
         let timestamp = Timestamp::now();
-        let make_change =
-            |id_byte: u8, message: &str, entity_deltas: Vec<EntityDelta>| SemanticChange {
+        let make_change = |id_byte: u8, message: &str, entity_deltas: Vec<EntityDelta>| {
+            seal_change(SemanticChange {
                 id: SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
                 parents: vec![],
                 timestamp: timestamp.clone(),
@@ -10540,7 +11039,8 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            };
+            })
+        };
         let changes = vec![
             make_change(
                 0x41,
@@ -10667,10 +11167,10 @@ mod tests {
     fn resolve_entity_at_replays_entity_deltas_for_target_head() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -10683,14 +11183,14 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let entity_v1 = test_entity("foo", "src/lib.rs");
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x22; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x22; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -10703,17 +11203,17 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let mut entity_v2 = entity_v1.clone();
         entity_v2.signature = "fn foo(value: i32)".to_string();
         entity_v2.fingerprint.signature_hash = Hash256::from_bytes([0x33; 32]);
 
-        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x33; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: modify_id,
+        let modify_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x33; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -10729,8 +11229,8 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let at_add = graph
             .resolve_entity_at(&entity_v1.id, &add_id)
@@ -10749,10 +11249,10 @@ mod tests {
     fn get_entity_revisions_at_tracks_revision_lineage_for_target_head() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x34; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x34; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -10765,14 +11265,14 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let entity_v1 = test_entity("foo", "src/lib.rs");
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x35; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x35; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -10785,17 +11285,17 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let mut entity_v2 = entity_v1.clone();
         entity_v2.signature = "fn foo(value: i32)".to_string();
         entity_v2.fingerprint.signature_hash = Hash256::from_bytes([0x36; 32]);
 
-        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x37; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: modify_id,
+        let modify_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x37; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -10811,8 +11311,8 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let revisions = graph
             .get_entity_revisions_at(&entity_v1.id, &modify_id)
@@ -10832,10 +11332,10 @@ mod tests {
     fn create_change_persists_entity_revision_lineage_in_snapshots() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x71; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x71; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -10848,14 +11348,14 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let entity_v1 = test_entity("foo", "src/lib.rs");
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x72; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x72; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -10868,16 +11368,16 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let mut entity_v2 = entity_v1.clone();
         entity_v2.signature = "fn foo(value: i32)".to_string();
         entity_v2.fingerprint.signature_hash = Hash256::from_bytes([0x73; 32]);
-        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x74; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: modify_id,
+        let modify_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x74; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -10893,8 +11393,8 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let snapshot = graph.to_snapshot();
         let revisions = snapshot
@@ -10914,10 +11414,10 @@ mod tests {
     fn from_snapshot_backfills_entity_revisions_from_change_history() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x75; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x75; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -10930,14 +11430,14 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let entity_v1 = test_entity("foo", "src/lib.rs");
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x76; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x76; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -10950,16 +11450,16 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let mut entity_v2 = entity_v1.clone();
         entity_v2.signature = "fn foo(value: i32)".to_string();
         entity_v2.fingerprint.signature_hash = Hash256::from_bytes([0x77; 32]);
-        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x78; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: modify_id,
+        let modify_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x78; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -10975,8 +11475,8 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let mut snapshot = graph.to_snapshot();
         snapshot.entity_revisions.clear();
@@ -11000,10 +11500,10 @@ mod tests {
     fn get_relation_revisions_at_replays_relation_lifecycle() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x38; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x38; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11016,17 +11516,17 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let caller = test_entity("caller", "src/lib.rs");
         let callee = test_entity("callee", "src/lib.rs");
         let rel = test_relation(caller.id, callee.id, RelationKind::Calls);
 
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x39; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x39; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11042,13 +11542,13 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
-        let remove_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x3a; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: remove_id,
+        let remove_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x3a; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11061,8 +11561,8 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let revisions = graph
             .get_relation_revisions_at(&rel.id, &remove_id)
@@ -11077,10 +11577,10 @@ mod tests {
     fn resolve_graph_at_replays_entities_and_relations() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x41; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x41; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11093,17 +11593,17 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let caller = test_entity("caller", "src/lib.rs");
         let callee = test_entity("callee", "src/lib.rs");
         let rel = test_relation(caller.id, callee.id, RelationKind::Calls);
 
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11119,13 +11619,13 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
-        let remove_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x43; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: remove_id,
+        let remove_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x43; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11138,8 +11638,8 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let added_state = graph.resolve_graph_at(&add_id).unwrap();
         assert_eq!(added_state.entities.len(), 2);
@@ -11158,10 +11658,10 @@ mod tests {
     fn resolve_graph_at_replays_tree_into_resolved_state() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x44; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x44; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11174,16 +11674,16 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let file_id = FilePathId::new("docs/config.json");
         let artifact_id = ArtifactId::new();
         let content_hash = Hash256::from_bytes([0x45; 32]);
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x46; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x46; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11199,8 +11699,8 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let state = graph.resolve_graph_at(&add_id).unwrap();
         assert_eq!(
@@ -11213,10 +11713,10 @@ mod tests {
     fn get_entity_history_at_filters_to_reachable_changes() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x51; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x51; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11229,14 +11729,14 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let entity = test_entity("foo", "src/lib.rs");
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x52; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x52; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11249,15 +11749,15 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let mut main_entity = entity.clone();
         main_entity.signature = "fn foo_main()".to_string();
-        let main_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x53; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: main_id,
+        let main_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x53; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11273,15 +11773,15 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let mut feature_entity = entity.clone();
         feature_entity.signature = "fn foo_feature()".to_string();
-        let feature_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x54; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: feature_id,
+        let _feature_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x54; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11297,8 +11797,8 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let history = graph.get_entity_history_at(&entity.id, &main_id).unwrap();
         let messages: Vec<_> = history.into_iter().map(|change| change.message).collect();
@@ -11312,10 +11812,10 @@ mod tests {
     fn get_entity_revisions_at_tracks_supersession_and_removal() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x55; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x55; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11328,14 +11828,14 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let entity_v1 = test_entity("foo", "src/lib.rs");
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x56; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x56; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11348,17 +11848,17 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let mut entity_v2 = entity_v1.clone();
         entity_v2.signature = "fn foo(value: i32)".to_string();
         entity_v2.fingerprint.signature_hash = Hash256::from_bytes([0x57; 32]);
 
-        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x58; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: modify_id,
+        let modify_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x58; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11374,13 +11874,13 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
-        let remove_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x59; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: remove_id,
+        let remove_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x59; 32])),
                 parents: vec![modify_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11393,8 +11893,8 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let revisions = graph
             .get_entity_revisions_at(&entity_v1.id, &remove_id)
@@ -11418,10 +11918,10 @@ mod tests {
     fn get_relation_revisions_at_tracks_add_remove_cycles() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x5a; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x5a; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11434,16 +11934,16 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let caller = test_entity("caller", "src/lib.rs");
         let callee = test_entity("callee", "src/lib.rs");
         let rel = test_relation(caller.id, callee.id, RelationKind::Calls);
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x5b; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x5b; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11459,13 +11959,13 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
-        let remove_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x5c; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: remove_id,
+        let remove_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x5c; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11478,8 +11978,8 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let revisions = graph
             .get_relation_revisions_at(&rel.id, &remove_id)
@@ -11497,10 +11997,10 @@ mod tests {
     fn get_artifact_revisions_at_tracks_current_and_removed_content() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x66; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x66; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11513,16 +12013,16 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let file_id = FilePathId::new("docs/config.json");
         let artifact_id = ArtifactId::new();
         let v1 = Hash256::from_bytes([0x67; 32]);
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x68; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x68; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11538,14 +12038,14 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let v2 = Hash256::from_bytes([0x69; 32]);
-        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x6a; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: modify_id,
+        let modify_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x6a; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11562,13 +12062,13 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
-        let remove_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x6b; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: remove_id,
+        let remove_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x6b; 32])),
                 parents: vec![modify_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11584,8 +12084,8 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let revisions = graph
             .get_artifact_revisions_at(&artifact_id, &remove_id)
@@ -11603,10 +12103,10 @@ mod tests {
     fn resolve_tree_at_replays_tree_deltas_for_target_head() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x61; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x61; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11619,16 +12119,16 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let file_id = FilePathId::new("docs/config.json");
         let artifact_id = ArtifactId::new();
         let v1 = Hash256::from_bytes([0x62; 32]);
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x63; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x63; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11644,14 +12144,14 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let v2 = Hash256::from_bytes([0x64; 32]);
-        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x65; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: modify_id,
+        let modify_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x65; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11668,8 +12168,8 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let at_add = graph.resolve_tree_at(&add_id).unwrap();
         assert_eq!(
@@ -11688,10 +12188,10 @@ mod tests {
     fn get_artifact_revisions_at_replays_file_history() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x66; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x66; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11704,16 +12204,16 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let file_id = FilePathId::new("docs/config.json");
         let artifact_id = ArtifactId::new();
         let v1 = Hash256::from_bytes([0x67; 32]);
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x68; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x68; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11729,14 +12229,14 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let v2 = Hash256::from_bytes([0x69; 32]);
-        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x6a; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: modify_id,
+        let modify_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x6a; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11753,8 +12253,8 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let revisions = graph
             .get_artifact_revisions_at(&artifact_id, &modify_id)
@@ -12549,10 +13049,13 @@ mod tests {
         change_byte: u8,
         entities: &[Entity],
     ) -> SemanticChange {
-        let change = SemanticChange {
+        let change = seal_change(SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([change_byte; 32])),
             parents: vec![],
-            timestamp: Timestamp::now(),
+            timestamp: Timestamp(
+                chrono::DateTime::from_timestamp(1_700_000_000 + i64::from(change_byte), 0)
+                    .expect("test timestamp is representable"),
+            ),
             author: AuthorId::new("test"),
             message: "init".to_string(),
             entity_deltas: entities
@@ -12566,7 +13069,7 @@ mod tests {
             evidence: vec![],
             risk_summary: None,
             authored_on: None,
-        };
+        });
         graph.create_change(&change).unwrap();
         graph.batch_upsert_entities(entities).unwrap();
         change
@@ -13392,10 +13895,10 @@ mod tests {
     fn resolve_graph_at_handles_deep_linear_history_iteratively() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x5b; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x5b; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -13408,18 +13911,18 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: None,
-            })
-            .unwrap();
+            },
+        );
 
         let mut previous = genesis_id;
         let mut head = genesis_id;
         for idx in 0..3_000u16 {
             let mut bytes = [0u8; 32];
             bytes[..2].copy_from_slice(&(idx + 1).to_be_bytes());
-            let id = SemanticChangeId::from_hash(Hash256::from_bytes(bytes));
-            graph
-                .create_change(&SemanticChange {
-                    id,
+            let id = admit_change(
+                &graph,
+                SemanticChange {
+                    id: SemanticChangeId::from_hash(Hash256::from_bytes(bytes)),
                     parents: vec![previous],
                     timestamp: Timestamp::now(),
                     author: AuthorId::new("test"),
@@ -13432,8 +13935,8 @@ mod tests {
                     evidence: vec![],
                     risk_summary: None,
                     authored_on: None,
-                })
-                .unwrap();
+                },
+            );
             previous = id;
             head = id;
         }

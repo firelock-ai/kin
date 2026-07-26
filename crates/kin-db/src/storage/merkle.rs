@@ -1881,7 +1881,7 @@ mod tests {
     }
 
     fn test_change(id_byte: u8, message: &str, entity_deltas: Vec<EntityDelta>) -> SemanticChange {
-        SemanticChange {
+        let mut change = SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
             parents: Vec::new(),
             timestamp: fixed_timestamp(1_700_000_000),
@@ -1895,7 +1895,15 @@ mod tests {
             evidence: Vec::new(),
             risk_summary: None,
             authored_on: None,
-        }
+        };
+        change.id =
+            kin_model::compute_semantic_change_id(&change).expect("valid semantic change fixture");
+        change
+    }
+
+    fn reseal_change(change: &mut SemanticChange) {
+        change.id =
+            kin_model::compute_semantic_change_id(change).expect("valid semantic change fixture");
     }
 
     fn snapshot_with_changes(changes: Vec<SemanticChange>) -> GraphSnapshot {
@@ -1907,9 +1915,9 @@ mod tests {
     }
 
     /// The regression this primitive was blind to: identical head snapshot,
-    /// identical change ids, identical change count — but the history disagrees
-    /// about what the change actually did. A cardinality-only digest cannot see
-    /// it; a content digest must.
+    /// Identical change count, but the history disagrees about what the change
+    /// actually did. Full-payload change identity and the repo-truth digest must
+    /// both change.
     #[test]
     fn repo_truth_hash_detects_rewritten_entity_delta() {
         let original = test_entity("resolver_target");
@@ -1932,6 +1940,11 @@ mod tests {
             after.changes.len(),
             "the two histories must have equal cardinality for this test to mean anything"
         );
+        assert_ne!(
+            before.changes.keys().next(),
+            after.changes.keys().next(),
+            "rewritten payloads must mint different semantic change ids"
+        );
         assert_eq!(
             compute_graph_root_hash(&before),
             compute_graph_root_hash(&after),
@@ -1950,6 +1963,8 @@ mod tests {
         let mut after_change = before_change.clone();
         before_change.parents = vec![SemanticChangeId::from_hash(Hash256::from_bytes([0xA0; 32]))];
         after_change.parents = vec![SemanticChangeId::from_hash(Hash256::from_bytes([0xB0; 32]))];
+        reseal_change(&mut before_change);
+        reseal_change(&mut after_change);
 
         assert_ne!(
             compute_repo_truth_hash(&snapshot_with_changes(vec![before_change])),
@@ -2242,12 +2257,13 @@ mod tests {
                 EntityDelta::Removed(other.id),
             ],
         );
+        let change_id = change.id;
         snapshot.changes.insert(change.id, change);
         snapshot.branches.insert(
             BranchName("main".to_string()),
             Branch {
                 name: BranchName("main".to_string()),
-                head: SemanticChangeId::from_hash(Hash256::from_bytes([0x91; 32])),
+                head: change_id,
             },
         );
         snapshot.admit_artifact_for_test(
