@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{anyhow, bail, Result};
-use kin_model::{BranchName, ChangeStore, Entity, EntityFilter, GraphStore};
+use kin_model::{BranchName, Entity, EntityFilter, GraphStore};
 use kin_model::{Hash256, SemanticChangeId};
 
 /// A reference did not resolve to a semantic change — unknown ref syntax, a

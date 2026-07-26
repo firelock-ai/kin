@@ -341,7 +341,7 @@ fn build_trace_lines_with_graph(
     }
 
     if let Some(content) =
-        render_entity_source(layout, graph, target, focal_max_lines, snippet_max_chars)
+        render_entity_source(layout, graph, target, focal_max_lines, snippet_max_chars)?
     {
         if !compact {
             lines.push("\n--- Focal ---".to_string());
@@ -419,7 +419,7 @@ fn build_trace_lines_with_graph(
                             &dep,
                             focal_max_lines,
                             snippet_max_chars,
-                        ) {
+                        )? {
                             lines.push(content);
                             expanded_same_file += 1;
                             continue;
@@ -640,42 +640,51 @@ fn render_entity_source(
     entity: &Entity,
     max_lines: usize,
     max_chars: usize,
-) -> Option<String> {
-    let span = entity.span.as_ref()?;
-    let file_origin = entity.file_origin.as_ref()?;
-    let bytes = graph_owned_source_bytes(layout, graph, file_origin)?;
-    let start = span.start_byte.min(bytes.len());
-    let end = span.end_byte.min(bytes.len());
-    if start >= end {
-        return None;
+) -> Result<Option<String>> {
+    let Some(span) = entity.span.as_ref() else {
+        return Ok(None);
+    };
+    let Some(file_origin) = entity.file_origin.as_ref() else {
+        return Ok(None);
+    };
+    if span.file != *file_origin {
+        anyhow::bail!(
+            "entity '{}' has divergent source paths: file_origin '{}' but span file '{}'",
+            entity.name,
+            file_origin.0,
+            span.file.0
+        );
+    }
+    let bytes =
+        crate::commands::graph::read_entity_file_bytes_from_graph(layout, graph, file_origin)?;
+    let start = span.start_byte;
+    let end = span.end_byte;
+    if start >= end || end > bytes.len() {
+        anyhow::bail!(
+            "entity '{}' source span {}..{} is invalid for '{}' ({} bytes)",
+            entity.name,
+            start,
+            end,
+            file_origin.0,
+            bytes.len()
+        );
     }
 
-    let snippet = clip_rendered_text_with_cap(
-        String::from_utf8_lossy(&bytes[start..end]).trim(),
-        max_lines,
-        max_chars,
-    );
+    let source = std::str::from_utf8(&bytes[start..end]).with_context(|| {
+        format!(
+            "entity '{}' source span {}..{} in '{}' is not valid UTF-8",
+            entity.name, start, end, file_origin.0
+        )
+    })?;
+    let snippet = clip_rendered_text_with_cap(source.trim(), max_lines, max_chars);
     if snippet.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    Some(format!(
+    Ok(Some(format!(
         "// {} ({:?}, {})\n{}",
         entity.name, file_origin.0, entity.language, snippet
-    ))
-}
-
-fn graph_owned_source_bytes(
-    layout: &kin_core::KinLayout,
-    graph: &impl GraphStore,
-    file_origin: &kin_model::FilePathId,
-) -> Option<Vec<u8>> {
-    let hash = graph.get_file_hash(file_origin).ok().flatten()?;
-    let bytes = kin_core::read_blob_from_layout(layout, &hash)?;
-    if kin_blobs::digest(&bytes) != hash {
-        return None;
-    }
-    Some(bytes)
+    )))
 }
 
 fn display_read_path(_layout: &kin_core::KinLayout, rel_path: &str) -> String {
@@ -688,9 +697,11 @@ fn render_neighbor_source(
     entity: &Entity,
     max_lines: usize,
     max_chars: usize,
-) -> Option<String> {
-    let content = render_entity_source(layout, graph, entity, max_lines, max_chars)?;
-    Some(format!("// same-file neighbor\n{}", content))
+) -> Result<Option<String>> {
+    let Some(content) = render_entity_source(layout, graph, entity, max_lines, max_chars)? else {
+        return Ok(None);
+    };
+    Ok(Some(format!("// same-file neighbor\n{}", content)))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

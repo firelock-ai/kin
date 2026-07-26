@@ -796,7 +796,7 @@ fn graph_source_record(
     })
 }
 
-fn read_entity_file_bytes_from_graph(
+pub(crate) fn read_entity_file_bytes_from_graph(
     layout: &kin_core::KinLayout,
     graph: &impl GraphStore,
     file_id: &FilePathId,
@@ -825,14 +825,20 @@ fn read_entity_file_bytes_from_graph(
             branch.head
         )
     })?;
-    let blob_identity = artifact.entry.blob_identity().ok_or_else(|| {
-        anyhow::anyhow!(
-            "entity source '{}' resolves to a gitlink at branch '{}' head {}; gitlinks have no repository-local source bytes",
+    let kin_model::TreeEntry::Blob {
+        hash: blob_identity,
+        ..
+    } = artifact.entry
+    else {
+        anyhow::bail!(
+            "entity source '{}' resolves to non-source entry {:?} for artifact {:?} at branch '{}' head {}",
             file_id.0,
+            artifact.entry,
+            artifact.artifact_id,
             branch.name,
             branch.head
-        )
-    })?;
+        );
+    };
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())?;
     let blob_hash = kin_blobs::Hash256(*blob_identity.as_bytes());
     blob_store
