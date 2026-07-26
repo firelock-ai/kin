@@ -622,8 +622,10 @@ pub struct ExactSessionProjection {
     display_root: std::path::PathBuf,
 }
 
-/// Identity-bound proof that one complete [`ResolvedTree`] matched the working
-/// projection while an [`ExactProjectionFreeze`] was held.
+/// Identity-bound proof that one complete [`ResolvedTree`] matched every
+/// host-materializable working-copy entry, while graph-only entries satisfied
+/// their typed host representation policy, under an
+/// [`ExactProjectionFreeze`].
 pub struct ExactProjectionVerification {
     tree_hash: Hash256,
     #[cfg(any(unix, windows))]
@@ -634,7 +636,20 @@ pub struct ExactProjectionVerification {
 struct ExactProjectionVerifiedEntry {
     path: RepoPath,
     kind: TreeEntry,
-    identity: TrackedEntryIdentity,
+    proof: ExactProjectionEntryProof,
+}
+
+#[cfg(any(unix, windows))]
+enum ExactProjectionEntryProof {
+    Materialized {
+        identity: TrackedEntryIdentity,
+    },
+    HostUnrepresentableAbsent,
+    GitlinkAbsent,
+    GitlinkDirectory {
+        directory: cap_std::fs::Dir,
+        identity: TrackedEntryIdentity,
+    },
 }
 
 /// Retained, no-follow capability for an already-created eject archive.
@@ -1319,7 +1334,7 @@ impl ExactProjectionFreeze {
                     .map(|(entry, identity)| ExactProjectionVerifiedEntry {
                         path: entry.file_id.clone(),
                         kind: entry.kind,
-                        identity,
+                        proof: ExactProjectionEntryProof::Materialized { identity },
                     })
                     .collect(),
             })
@@ -1331,8 +1346,10 @@ impl ExactProjectionFreeze {
         }
     }
 
-    /// Bounded-memory variant of [`Self::verify_resolved_tree`] that reads one
-    /// exact body at a time from a content-addressed blob store.
+    /// Bounded-memory variant of [`Self::verify_resolved_tree`] that reads each
+    /// host-materializable exact body from a content-addressed blob store.
+    /// Gitlinks and paths the host cannot represent remain graph-only and are
+    /// proved through their typed representation policy instead.
     pub fn verify_resolved_tree_from_blobs(
         &self,
         tree: &ResolvedTree,
@@ -1346,18 +1363,28 @@ impl ExactProjectionFreeze {
             )?;
             let mut verified = Vec::with_capacity(tree.len());
             for artifact in tree.artifacts_by_path() {
-                validate_projection_proof_entry_path(&artifact.path, artifact.entry)?;
-                let content = load_projection_proof_blob(blobs, &artifact.path, artifact.entry)?;
-                let entry = ValidatedSourceEntry {
-                    file_id: &artifact.path,
-                    kind: artifact.entry,
-                    content: &content,
+                let materializable_path = materializable_projection_proof_path(&artifact.path)?;
+                let proof = match (materializable_path, artifact.entry) {
+                    (None, _) => ExactProjectionEntryProof::HostUnrepresentableAbsent,
+                    (Some(_), TreeEntry::Gitlink { .. }) => {
+                        self.projection.verify_frozen_gitlink(&artifact.path)?
+                    }
+                    (Some(_), TreeEntry::Blob { .. } | TreeEntry::Symlink { .. }) => {
+                        let content =
+                            load_projection_proof_blob(blobs, &artifact.path, artifact.entry)?;
+                        let entry = ValidatedSourceEntry {
+                            file_id: &artifact.path,
+                            kind: artifact.entry,
+                            content: &content,
+                        };
+                        let identity = self.projection.validate_frozen_entry_unchanged(&entry)?;
+                        ExactProjectionEntryProof::Materialized { identity }
+                    }
                 };
-                let identity = self.projection.validate_frozen_entry_unchanged(&entry)?;
                 verified.push(ExactProjectionVerifiedEntry {
                     path: artifact.path.clone(),
                     kind: artifact.entry,
-                    identity,
+                    proof,
                 });
             }
             self.revalidate_namespace()?;
@@ -1412,8 +1439,16 @@ impl ExactProjectionFreeze {
             let expected_identities = verification
                 .entries
                 .iter()
-                .map(|entry| entry.identity)
-                .collect::<Vec<_>>();
+                .map(|entry| match &entry.proof {
+                    ExactProjectionEntryProof::Materialized { identity } => Ok(*identity),
+                    ExactProjectionEntryProof::HostUnrepresentableAbsent
+                    | ExactProjectionEntryProof::GitlinkAbsent
+                    | ExactProjectionEntryProof::GitlinkDirectory { .. } => Err(KinError::Other(
+                        "byte-slice projection revalidation cannot represent graph-only entry state; use the CAS-backed exact proof"
+                            .to_string(),
+                    )),
+                })
+                .collect::<Result<Vec<_>>>()?;
             self.projection
                 .revalidate_frozen_entries_unchanged(&entry_refs, &expected_identities)?;
             self.revalidate_namespace()
@@ -1457,19 +1492,49 @@ impl ExactProjectionFreeze {
                             .to_string(),
                     ));
                 }
-                let path = validate_projection_proof_entry_path(&artifact.path, artifact.entry)?;
-                let content = load_projection_proof_blob(blobs, &artifact.path, artifact.entry)?;
-                let entry = ValidatedSourceEntry {
-                    file_id: &artifact.path,
-                    kind: artifact.entry,
-                    content: &content,
-                };
-                let identity = self.projection.validate_frozen_entry_unchanged(&entry)?;
-                if identity != verified.identity {
-                    return Err(KinError::Other(format!(
-                        "tracked working-copy path {} changed object identity after exact projection verification",
-                        self.projection.display_root.join(path.relative).display()
-                    )));
+                let materializable_path = materializable_projection_proof_path(&artifact.path)?;
+                match (
+                    materializable_path.as_ref(),
+                    &artifact.entry,
+                    &verified.proof,
+                ) {
+                    (None, _, ExactProjectionEntryProof::HostUnrepresentableAbsent) => {}
+                    (
+                        Some(_),
+                        TreeEntry::Gitlink { .. },
+                        ExactProjectionEntryProof::GitlinkAbsent
+                        | ExactProjectionEntryProof::GitlinkDirectory { .. },
+                    ) => self
+                        .projection
+                        .revalidate_frozen_gitlink(&artifact.path, &verified.proof)?,
+                    (
+                        Some(path),
+                        TreeEntry::Blob { .. } | TreeEntry::Symlink { .. },
+                        ExactProjectionEntryProof::Materialized {
+                            identity: expected_identity,
+                        },
+                    ) => {
+                        let content =
+                            load_projection_proof_blob(blobs, &artifact.path, artifact.entry)?;
+                        let entry = ValidatedSourceEntry {
+                            file_id: &artifact.path,
+                            kind: artifact.entry,
+                            content: &content,
+                        };
+                        let identity = self.projection.validate_frozen_entry_unchanged(&entry)?;
+                        if identity != *expected_identity {
+                            return Err(KinError::Other(format!(
+                                "tracked working-copy path {} changed object identity after exact projection verification",
+                                self.projection.display_root.join(&path.relative).display()
+                            )));
+                        }
+                    }
+                    _ => {
+                        return Err(KinError::Other(
+                            "exact projection verification mixed materialized and graph-only entry proofs"
+                                .to_string(),
+                        ));
+                    }
                 }
             }
             self.revalidate_namespace()
@@ -2101,19 +2166,49 @@ impl ExactProjectionFreeze {
                         .to_string(),
                 ));
             }
-            let path = validate_projection_proof_entry_path(&artifact.path, artifact.entry)?;
-            let content = load_projection_proof_blob(blobs, &artifact.path, artifact.entry)?;
-            let entry = ValidatedSourceEntry {
-                file_id: &artifact.path,
-                kind: artifact.entry,
-                content: &content,
-            };
-            let identity = self.projection.validate_frozen_entry_unchanged(&entry)?;
-            if identity != verified.identity {
-                return Err(KinError::Other(format!(
-                    "tracked working-copy path {} changed object identity after exact projection verification",
-                    self.projection.display_root.join(path.relative).display()
-                )));
+            let materializable_path = materializable_projection_proof_path(&artifact.path)?;
+            match (
+                materializable_path.as_ref(),
+                &artifact.entry,
+                &verified.proof,
+            ) {
+                (None, _, ExactProjectionEntryProof::HostUnrepresentableAbsent) => {}
+                (
+                    Some(_),
+                    TreeEntry::Gitlink { .. },
+                    ExactProjectionEntryProof::GitlinkAbsent
+                    | ExactProjectionEntryProof::GitlinkDirectory { .. },
+                ) => self
+                    .projection
+                    .revalidate_frozen_gitlink(&artifact.path, &verified.proof)?,
+                (
+                    Some(path),
+                    TreeEntry::Blob { .. } | TreeEntry::Symlink { .. },
+                    ExactProjectionEntryProof::Materialized {
+                        identity: expected_identity,
+                    },
+                ) => {
+                    let content =
+                        load_projection_proof_blob(blobs, &artifact.path, artifact.entry)?;
+                    let entry = ValidatedSourceEntry {
+                        file_id: &artifact.path,
+                        kind: artifact.entry,
+                        content: &content,
+                    };
+                    let identity = self.projection.validate_frozen_entry_unchanged(&entry)?;
+                    if identity != *expected_identity {
+                        return Err(KinError::Other(format!(
+                            "tracked working-copy path {} changed object identity after exact projection verification",
+                            self.projection.display_root.join(&path.relative).display()
+                        )));
+                    }
+                }
+                _ => {
+                    return Err(KinError::Other(
+                        "exact projection verification mixed materialized and graph-only entry proofs"
+                            .to_string(),
+                    ));
+                }
             }
         }
         Ok(())
@@ -2419,13 +2514,8 @@ fn validated_session_source_entries<'a>(
 
 fn validate_projection_proof_entry_path(
     file_id: &RepoPath,
-    kind: TreeEntry,
+    _kind: TreeEntry,
 ) -> Result<ValidatedProjectionPath> {
-    if matches!(kind, TreeEntry::Gitlink { .. }) {
-        return Err(KinError::Other(format!(
-            "gitlink {file_id} is repository history, not a materialized working-copy object"
-        )));
-    }
     validate_projection_proof_path(file_id)
 }
 
@@ -2435,7 +2525,7 @@ fn validate_projection_proof_paths<'a>(
     let mut paths = paths
         .into_iter()
         .map(|path| {
-            validate_projection_proof_path(path)?;
+            materializable_projection_proof_path(path)?;
             let key = if let Some(path) = path.as_utf8() {
                 projection_path_comparison_key(path).into_bytes()
             } else {
@@ -2462,6 +2552,24 @@ fn validate_projection_proof_paths<'a>(
         }
     }
     Ok(())
+}
+
+/// Return the host path for an entry that this filesystem can represent.
+///
+/// Git trees and Kin's graph preserve repository paths as bytes. Linux can
+/// address arbitrary non-NUL byte components, while macOS rejects invalid
+/// UTF-8 with `EILSEQ` and Windows has no lossless byte-path conversion. Those
+/// entries remain graph-only on hosts that cannot name them: exact export
+/// still binds their path, kind, and object identity, but workspace proof must
+/// neither invent a lossy alias nor infer their absence as a deletion.
+fn materializable_projection_proof_path(
+    file_id: &RepoPath,
+) -> Result<Option<ValidatedProjectionPath>> {
+    if file_id.as_utf8().is_none() {
+        #[cfg(any(windows, target_os = "macos"))]
+        return Ok(None);
+    }
+    validate_projection_proof_path(file_id).map(Some)
 }
 
 fn validate_projection_proof_path(file_id: &RepoPath) -> Result<ValidatedProjectionPath> {
@@ -8514,6 +8622,127 @@ impl ProjectionRoot {
         self.validate_tracked_entry_unchanged_at_path(entry, &path)
     }
 
+    fn verify_frozen_gitlink(&self, file_id: &RepoPath) -> Result<ExactProjectionEntryProof> {
+        let path = validate_projection_proof_path(file_id)?;
+        let display = self.display_root.join(&path.relative);
+        let conflict = |reason: &str| {
+            KinError::Other(format!(
+                "graph-only gitlink path {} is neither absent nor a no-follow real directory ({reason})",
+                display.display()
+            ))
+        };
+        let mut parent = self.clone_root()?;
+        let mut relative = PathBuf::new();
+        for component in &path.components[..path.components.len() - 1] {
+            relative.push(component);
+            let metadata = match parent.symlink_metadata(component) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(ExactProjectionEntryProof::GitlinkAbsent);
+                }
+                Err(error) => {
+                    return Err(KinError::io(self.display_root.join(&relative), error));
+                }
+            };
+            if !metadata.is_dir() || metadata_is_reparse(&metadata) {
+                return Err(conflict("an ancestor is not a no-follow real directory"));
+            }
+            let expected_identity = tracked_entry_identity(&metadata);
+            let child = open_directory_nofollow(&parent, component)
+                .map_err(|error| KinError::io(self.display_root.join(&relative), error))?;
+            if tracked_open_directory_identity(&child)
+                .map_err(|error| KinError::io(self.display_root.join(&relative), error))?
+                != expected_identity
+            {
+                return Err(conflict(
+                    "an ancestor changed identity while being retained",
+                ));
+            }
+            parent = child;
+        }
+
+        let name = path.components[path.components.len() - 1].as_os_str();
+        let metadata = match parent.symlink_metadata(name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ExactProjectionEntryProof::GitlinkAbsent);
+            }
+            Err(error) => return Err(KinError::io(&display, error)),
+        };
+        if !metadata.is_dir() || metadata_is_reparse(&metadata) {
+            return Err(conflict(
+                "the named entry is a file, symbolic link, reparse point, or special object",
+            ));
+        }
+        let identity = tracked_entry_identity(&metadata);
+        let directory = open_directory_nofollow(&parent, name)
+            .map_err(|error| KinError::io(&display, error))?;
+        if tracked_open_directory_identity(&directory)
+            .map_err(|error| KinError::io(&display, error))?
+            != identity
+        {
+            return Err(conflict(
+                "the named directory changed identity while being retained",
+            ));
+        }
+        Ok(ExactProjectionEntryProof::GitlinkDirectory {
+            directory,
+            identity,
+        })
+    }
+
+    fn revalidate_frozen_gitlink(
+        &self,
+        file_id: &RepoPath,
+        expected: &ExactProjectionEntryProof,
+    ) -> Result<()> {
+        let actual = self.verify_frozen_gitlink(file_id)?;
+        let display = self
+            .display_root
+            .join(validate_projection_proof_path(file_id)?.relative);
+        match (expected, actual) {
+            (ExactProjectionEntryProof::GitlinkAbsent, ExactProjectionEntryProof::GitlinkAbsent) => {
+                Ok(())
+            }
+            (
+                ExactProjectionEntryProof::GitlinkDirectory {
+                    directory,
+                    identity,
+                },
+                ExactProjectionEntryProof::GitlinkDirectory {
+                    identity: actual_identity,
+                    ..
+                },
+            ) => {
+                let retained_identity = tracked_open_directory_identity(directory)
+                    .map_err(|error| KinError::io(&display, error))?;
+                if retained_identity != *identity || actual_identity != *identity {
+                    return Err(KinError::Other(format!(
+                        "graph-only gitlink directory {} changed identity after exact projection verification",
+                        display.display()
+                    )));
+                }
+                Ok(())
+            }
+            (ExactProjectionEntryProof::GitlinkAbsent, _) => Err(KinError::Other(format!(
+                "graph-only gitlink path {} materialized after exact projection verification",
+                display.display()
+            ))),
+            (ExactProjectionEntryProof::GitlinkDirectory { .. }, _) => {
+                Err(KinError::Other(format!(
+                    "graph-only gitlink directory {} disappeared or changed kind after exact projection verification",
+                    display.display()
+                )))
+            }
+            (ExactProjectionEntryProof::HostUnrepresentableAbsent, _) => Err(KinError::Other(
+                "host-unrepresentable proof was supplied for a materializable gitlink".to_string(),
+            )),
+            (ExactProjectionEntryProof::Materialized { .. }, _) => Err(KinError::Other(
+                "materialized source proof was supplied for a graph-only gitlink".to_string(),
+            )),
+        }
+    }
+
     fn validate_tracked_entry_unchanged_at_path(
         &self,
         entry: &ValidatedSourceEntry<'_>,
@@ -9556,6 +9785,17 @@ mod tests {
         .unwrap()
     }
 
+    fn exact_tree_entries(
+        entries: impl IntoIterator<Item = (RepoPath, TreeEntry)>,
+    ) -> ResolvedTree {
+        ResolvedTree::from_artifacts(
+            entries
+                .into_iter()
+                .map(|(path, entry)| ResolvedArtifact::new(ArtifactId::new(), path, entry)),
+        )
+        .unwrap()
+    }
+
     #[cfg(unix)]
     enum ExistingGitFixture {
         None,
@@ -9686,6 +9926,49 @@ mod tests {
         freeze
             .revalidate_resolved_tree(&verification, &tree, [(&path, entry, content.as_slice())])
             .unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_projection_host_unrepresentable_path_remains_graph_only_during_detach() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("repository");
+        let archive = outer.path().join("archive");
+        let blobs_directory = outer.path().join("blobs");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&archive).unwrap();
+        drop(ProjectionRoot::open(&root).unwrap());
+
+        let path = RepoPath::from_bytes(b"assets/icon-\xff.bin".to_vec()).unwrap();
+        let content = b"opaque graph bytes";
+        let entry = exact_blob(content, false);
+        let tree = exact_tree(&path, entry);
+        let blobs = kin_blobs::BlobStore::new(blobs_directory).unwrap();
+
+        let freeze = ExactProjectionFreeze::acquire_existing(&root).unwrap();
+        let verification = freeze
+            .verify_resolved_tree_from_blobs(&tree, &blobs)
+            .expect("a host-unrepresentable path must remain graph-only");
+        freeze
+            .revalidate_resolved_tree_from_blobs(&verification, &tree, &blobs)
+            .unwrap();
+        let target = ExactProjectionDetachTarget::open_existing(&archive).unwrap();
+        freeze
+            .detach_verified_to_from_blobs(
+                &verification,
+                &tree,
+                &blobs,
+                &target,
+                std::ffi::OsStr::new("kin"),
+            )
+            .unwrap();
+
+        assert!(!root.join(".kin").exists());
+        assert!(archive.join("kin/reconciliation/projection.lock").is_file());
+        assert!(
+            blobs.read(&kin_blobs::digest(content)).is_err(),
+            "workspace proof must not require a physical CAS body for a host-unrepresentable path"
+        );
     }
 
     #[test]
@@ -10776,6 +11059,213 @@ mod tests {
         freeze
             .revalidate_resolved_tree(&verification, &tree, [(&path, entry, target.as_slice())])
             .unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn exact_projection_gitlink_absent_is_graph_only_and_target_bound() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("repository");
+        let archive = outer.path().join("archive");
+        let blobs_directory = outer.path().join("blobs");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&archive).unwrap();
+
+        let readme_path = repo_path("README.md");
+        let readme_body = b"exact repository\n";
+        let readme_entry = exact_blob(readme_body, false);
+        let readme_id = ArtifactId::new();
+        let gitlink_path = repo_path("vendor/dependency");
+        let gitlink_id = ArtifactId::new();
+        let gitlink_entry = TreeEntry::gitlink(GitObjectId::sha1([0x44; 20]));
+        let tree = ResolvedTree::from_artifacts([
+            ResolvedArtifact::new(readme_id, readme_path.clone(), readme_entry),
+            ResolvedArtifact::new(gitlink_id, gitlink_path.clone(), gitlink_entry),
+        ])
+        .unwrap();
+        materialize_source_tree(
+            &root,
+            [(&readme_path, readme_entry, readme_body.as_slice())],
+        )
+        .unwrap();
+        let blobs = kin_blobs::BlobStore::new(blobs_directory).unwrap();
+        blobs.write(readme_body).unwrap();
+
+        let freeze = ExactProjectionFreeze::acquire_existing(&root).unwrap();
+        let verification = freeze
+            .verify_resolved_tree_from_blobs(&tree, &blobs)
+            .unwrap();
+        freeze
+            .revalidate_resolved_tree_from_blobs(&verification, &tree, &blobs)
+            .unwrap();
+
+        let wrong_target_tree = ResolvedTree::from_artifacts([
+            ResolvedArtifact::new(readme_id, readme_path, readme_entry),
+            ResolvedArtifact::new(
+                gitlink_id,
+                gitlink_path.clone(),
+                TreeEntry::gitlink(GitObjectId::sha1([0x55; 20])),
+            ),
+        ])
+        .unwrap();
+        let error = freeze
+            .revalidate_resolved_tree_from_blobs(&verification, &wrong_target_tree, &blobs)
+            .expect_err("the exact Gitlink target must be part of the proof");
+        assert!(
+            error
+                .to_string()
+                .contains("resolved projection tree changed"),
+            "unexpected Gitlink target error: {error}"
+        );
+
+        let target = ExactProjectionDetachTarget::open_existing(&archive).unwrap();
+        freeze
+            .detach_verified_to_from_blobs(
+                &verification,
+                &tree,
+                &blobs,
+                &target,
+                std::ffi::OsStr::new("kin"),
+            )
+            .unwrap();
+        assert!(!root.join(".kin").exists());
+        assert!(!root.join("vendor/dependency").exists());
+        assert!(archive.join("kin/reconciliation/projection.lock").is_file());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn exact_projection_gitlink_directory_preserves_independently_owned_contents() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("repository");
+        let archive = outer.path().join("archive");
+        let dependency = root.join("vendor/dependency");
+        std::fs::create_dir_all(dependency.join("nested")).unwrap();
+        std::fs::create_dir(&archive).unwrap();
+        std::fs::write(dependency.join("nested/owned.txt"), b"before").unwrap();
+        drop(ProjectionRoot::open(&root).unwrap());
+
+        let gitlink_path = repo_path("vendor/dependency");
+        let gitlink_entry = TreeEntry::gitlink(GitObjectId::sha1([0x66; 20]));
+        let tree = exact_tree_entries([(gitlink_path, gitlink_entry)]);
+        let blobs = kin_blobs::BlobStore::new(outer.path().join("blobs")).unwrap();
+        let freeze = ExactProjectionFreeze::acquire_existing(&root).unwrap();
+        let verification = freeze
+            .verify_resolved_tree_from_blobs(&tree, &blobs)
+            .unwrap();
+
+        std::fs::write(dependency.join("nested/owned.txt"), b"after").unwrap();
+        std::fs::write(dependency.join("new-untracked.txt"), b"independent").unwrap();
+        freeze
+            .revalidate_resolved_tree_from_blobs(&verification, &tree, &blobs)
+            .expect("Gitlink proof must not traverse independently owned contents");
+
+        let target = ExactProjectionDetachTarget::open_existing(&archive).unwrap();
+        freeze
+            .detach_verified_to_from_blobs(
+                &verification,
+                &tree,
+                &blobs,
+                &target,
+                std::ffi::OsStr::new("kin"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(dependency.join("nested/owned.txt")).unwrap(),
+            b"after"
+        );
+        assert_eq!(
+            std::fs::read(dependency.join("new-untracked.txt")).unwrap(),
+            b"independent"
+        );
+        assert!(!root.join(".kin").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_projection_gitlink_directory_replacement_invalidates_the_proof() {
+        let root = tempfile::tempdir().unwrap();
+        let dependency = root.path().join("vendor/dependency");
+        let displaced = root.path().join("vendor/dependency.displaced");
+        std::fs::create_dir_all(&dependency).unwrap();
+        drop(ProjectionRoot::open(root.path()).unwrap());
+
+        let gitlink_path = repo_path("vendor/dependency");
+        let gitlink_entry = TreeEntry::gitlink(GitObjectId::sha1([0x77; 20]));
+        let tree = exact_tree_entries([(gitlink_path, gitlink_entry)]);
+        let blobs = kin_blobs::BlobStore::new(root.path().join("blobs")).unwrap();
+        let freeze = ExactProjectionFreeze::acquire_existing(root.path()).unwrap();
+        let verification = freeze
+            .verify_resolved_tree_from_blobs(&tree, &blobs)
+            .unwrap();
+
+        std::fs::rename(&dependency, &displaced).unwrap();
+        std::fs::create_dir(&dependency).unwrap();
+        let error = freeze
+            .revalidate_resolved_tree_from_blobs(&verification, &tree, &blobs)
+            .expect_err("same-name Gitlink directory replacement must invalidate the proof");
+        assert!(
+            error.to_string().contains("changed identity"),
+            "unexpected Gitlink replacement error: {error}"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn exact_projection_gitlink_absent_cannot_materialize_after_verification() {
+        let root = tempfile::tempdir().unwrap();
+        drop(ProjectionRoot::open(root.path()).unwrap());
+
+        let gitlink_path = repo_path("vendor/dependency");
+        let gitlink_entry = TreeEntry::gitlink(GitObjectId::sha1([0x88; 20]));
+        let tree = exact_tree_entries([(gitlink_path, gitlink_entry)]);
+        let blobs = kin_blobs::BlobStore::new(root.path().join("blobs")).unwrap();
+        let freeze = ExactProjectionFreeze::acquire_existing(root.path()).unwrap();
+        let verification = freeze
+            .verify_resolved_tree_from_blobs(&tree, &blobs)
+            .unwrap();
+
+        std::fs::create_dir_all(root.path().join("vendor/dependency")).unwrap();
+        let error = freeze
+            .revalidate_resolved_tree_from_blobs(&verification, &tree, &blobs)
+            .expect_err("an absent Gitlink may not materialize after verification");
+        assert!(
+            error.to_string().contains("materialized after"),
+            "unexpected Gitlink materialization error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_projection_gitlink_rejects_files_and_symlinks_without_following() {
+        use std::os::unix::fs::symlink;
+
+        for replacement in ["file", "symlink"] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join("vendor")).unwrap();
+            let dependency = root.path().join("vendor/dependency");
+            match replacement {
+                "file" => std::fs::write(&dependency, b"not a directory").unwrap(),
+                "symlink" => symlink(root.path(), &dependency).unwrap(),
+                _ => unreachable!(),
+            }
+            drop(ProjectionRoot::open(root.path()).unwrap());
+
+            let gitlink_path = repo_path("vendor/dependency");
+            let gitlink_entry = TreeEntry::gitlink(GitObjectId::sha1([0x99; 20]));
+            let tree = exact_tree_entries([(gitlink_path, gitlink_entry)]);
+            let blobs = kin_blobs::BlobStore::new(root.path().join("blobs")).unwrap();
+            let freeze = ExactProjectionFreeze::acquire_existing(root.path()).unwrap();
+            let error = freeze
+                .verify_resolved_tree_from_blobs(&tree, &blobs)
+                .expect_err("Gitlink proof must reject a file or no-follow symlink");
+            assert!(
+                error.to_string().contains("neither absent nor")
+                    && error.to_string().contains("real directory"),
+                "unexpected Gitlink {replacement} error: {error}"
+            );
+        }
     }
 
     #[cfg(any(unix, windows))]
