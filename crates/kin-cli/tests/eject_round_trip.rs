@@ -16,10 +16,10 @@
 //! - A corrupt or partial snapshot fails loudly and mutates nothing — Kin never
 //!   silently strands files.
 //!
-//! Honest scope: Kin never reads, rewrites, or restores Git history. It
-//! snapshots the working tree at init (excluding `.git`, `.kin*`, and ignored
-//! paths) and restores those files only. Commit history is owned by Git the
-//! whole time, which is exactly why these tests assert `.git` is untouched
+//! Honest scope: Kin may read Git at an explicit import boundary, but eject
+//! never rewrites or restores the source Git repository. It snapshots the
+//! working tree at init (excluding `.git`, `.kin*`, and ignored paths) and
+//! restores those files only. These tests therefore assert `.git` is untouched
 //! rather than re-imported.
 
 use std::collections::BTreeMap;
