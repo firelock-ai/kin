@@ -444,11 +444,140 @@ export interface NativeRemotePublishRequest {
   approved: boolean;
   publishReviewState: boolean;
   publishProofs: boolean;
-  semanticChanges?: Record<string, unknown>[];
   actor?: string;
   actorKind?: ActorKind;
   leaseSessionId?: string;
   leaseFenceEpoch?: number;
+}
+
+/**
+ * Repository-v6 native transfer is a separate, strict authority protocol.
+ * Embedded semantic-change and Git-object payloads retain the canonical Rust
+ * model JSON shape and are independently decoded and verified by the daemon.
+ */
+export interface RepositoryTransferRefName {
+  bytes_hex: string;
+}
+
+export type RepositoryTransferRefTarget =
+  | { type: "change"; change_id: string }
+  | {
+      type: "external_object";
+      object: {
+        kind: "commit" | "tree" | "blob" | "tag";
+        oid:
+          | { algorithm: "sha1"; bytes: number[] }
+          | { algorithm: "sha256"; bytes: number[] };
+      };
+    }
+  | { type: "symbolic"; target: RepositoryTransferRefName };
+
+export interface RepositoryTransferAuthorityRoot {
+  version: number;
+  hash: string;
+}
+
+export interface RepositoryTransferRootBundle {
+  version: number;
+  generation: number;
+  history: RepositoryTransferAuthorityRoot;
+  ref_state: RepositoryTransferAuthorityRoot;
+  ref_log: RepositoryTransferAuthorityRoot;
+  collaboration: RepositoryTransferAuthorityRoot;
+  replication: RepositoryTransferAuthorityRoot;
+  local_state: RepositoryTransferAuthorityRoot;
+}
+
+export interface RepositoryTransferLimits {
+  max_changes: number;
+  max_trees: number;
+  max_bodies: number;
+  max_external_objects: number;
+  max_aliases: number;
+  max_decoded_body_bytes: number;
+  max_single_body_bytes: number;
+}
+
+export interface RepositoryTransferStatus {
+  schema_version: 1;
+  protocol: "kin-repository-v6-fast-forward";
+  repository_id: string;
+  destination_ref: RepositoryTransferRefName;
+  destination_target: RepositoryTransferRefTarget | null;
+  destination_head: string | null;
+  destination_tree_hash: string | null;
+  roots: RepositoryTransferRootBundle;
+  default_ref: RepositoryTransferRefName | null;
+  git_authority_hash: string | null;
+  supported_features: string[];
+  limits: RepositoryTransferLimits;
+  push_apply_ready: false;
+  bounded_envelope_export_ready: boolean;
+  pull_apply_ready: false;
+}
+
+export interface RepositoryTransferBody {
+  hash: string;
+  byte_len: number;
+  bytes_base64: string;
+}
+
+export interface RepositoryTransferPack {
+  schema_version: 1;
+  protocol: "kin-repository-v6-fast-forward";
+  transfer_id: string;
+  operation_id: string;
+  repository_id: string;
+  source_ref: RepositoryTransferRefName;
+  destination_ref: RepositoryTransferRefName;
+  source_head: string;
+  source_tree_hash: string;
+  expected_destination_target: RepositoryTransferRefTarget | null;
+  expected_destination_head: string | null;
+  expected_destination_roots: RepositoryTransferRootBundle;
+  expected_destination_default_ref: RepositoryTransferRefName | null;
+  source_git_authority_hash: string | null;
+  expected_destination_git_authority_hash: string | null;
+  required_features: string[];
+  changes: Record<string, unknown>[];
+  trees: Array<{ change_id: string; tree_hash: string }>;
+  external_objects: Record<string, unknown>[];
+  aliases: Record<string, unknown>[];
+  bodies: RepositoryTransferBody[];
+}
+
+export interface RepositoryTransferReceipt {
+  schema_version: 1;
+  protocol: "kin-repository-v6-fast-forward";
+  transfer_id: string;
+  repository_id: string;
+  destination_ref: RepositoryTransferRefName;
+  destination_head: string;
+  outcome: "committed" | "idempotent_replay";
+  authority_receipt: Record<string, unknown> & {
+    operation_id: string;
+    repository_id: string;
+    transaction_hash: string;
+    outcome: "committed" | "idempotent_replay";
+    generation: number;
+    roots_before: RepositoryTransferRootBundle;
+    roots_after: RepositoryTransferRootBundle;
+  };
+}
+
+export interface RepositoryTransferPublishRequest {
+  pack: RepositoryTransferPack;
+  publishReviewState: boolean;
+  publishProofs: boolean;
+  actor?: string;
+  actorKind?: ActorKind;
+  leaseSessionId?: string;
+  leaseFenceEpoch?: number;
+}
+
+export interface RepositoryTransferPublishResponse {
+  remote: NativeRemoteStatus;
+  receipt: RepositoryTransferReceipt;
 }
 
 export interface NativeRemotePublishApprovalRequiredConflict {

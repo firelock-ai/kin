@@ -41,6 +41,7 @@ kin-cli = { workspace = true }
 kin-buildinfo = { workspace = true }
 kin-mcp = { workspace = true }
 kin-review = { workspace = true }
+kin-remote = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

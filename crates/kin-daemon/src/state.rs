@@ -830,7 +830,7 @@ pub struct DaemonState {
     /// Pluggable storage backend for snapshot persistence.
     /// `None` = local repository-v6 authority.
     /// `Some` = hosted StorageBackend (GCS or an isolated backend fixture).
-    pub storage_backend: Option<Box<dyn StorageBackend>>,
+    pub storage_backend: Option<Arc<dyn StorageBackend>>,
     /// Frozen startup policy for deployments whose graph backend is the only
     /// write authority. When true, no filesystem/session/VFS compatibility
     /// surface may reconcile bytes back into graph truth.
@@ -1577,7 +1577,7 @@ impl DaemonState {
             started_at: Instant::now(),
             is_initialized: AtomicBool::new(loaded_snapshot),
             reconciliation_status: AtomicU8::new(RECON_IDLE),
-            storage_backend: Some(backend),
+            storage_backend: Some(Arc::from(backend)),
             filesystem_reconcile_disabled: AtomicBool::new(
                 crate::loop_runner::filesystem_reconcile_disabled_at_startup(true),
             ),

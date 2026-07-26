@@ -25,8 +25,13 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 kin-model = { workspace = true }
+kin-db = { workspace = true }
+sha2 = { workspace = true }
+base64 = "0.22"
 ureq = { version = "3", optional = true, features = ["json"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+sha1 = "0.10"

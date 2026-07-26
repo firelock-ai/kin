@@ -9,6 +9,7 @@ pub mod federated;
 pub mod http_transport;
 pub mod invalidation;
 pub mod mutation_push;
+pub mod repository_transfer;
 pub mod sync_types;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
