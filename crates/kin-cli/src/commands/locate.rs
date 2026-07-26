@@ -3544,12 +3544,12 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // Project bounded inline snippets from graph-owned content (no extra IO on
     // the working tree). No-op unless requested; the early budget-exhausted
     // return above carries no symbols, so it needs no snippets.
-    attach_snippets(&mut result, graph, &snippet_opts);
+    attach_snippets(&mut result, graph, &snippet_opts)?;
     // Re-project the ranked symbols into the graph-native PRIMARY surface: a
     // single globally-ranked entity list (file demoted to provenance). Reuses the
     // snippet projection's bounds; the daemon caches the full ranking and windows
     // one page. No-op unless the agent/JSON surface requested snippets.
-    build_entity_view(&mut result, graph, &snippet_opts);
+    build_entity_view(&mut result, graph, &snippet_opts)?;
     Ok(result)
 }
 
@@ -14984,7 +14984,9 @@ fn collect_explain_for_file(
 /// shared [`kin_mcp::handlers::common::read_entity_source_excerpt_detailed`]
 /// projection (content-addressed, hash-verified — the same bytes
 /// `get_entity_source` and `semantic_locate` serve), so there is no working-tree
-/// read: a graph/blob miss simply leaves the symbol as coordinates-only.
+/// read. A graph/tree/blob authority gap fails the locate request loudly rather
+/// than returning a coordinates-only result that could be mistaken for a
+/// complete graph answer.
 ///
 /// Additive: symbol set, ordering, and scores are untouched (the ContextBench
 /// scorer derives its predicted symbol set from `symbols[].name`, which is
@@ -14994,9 +14996,9 @@ pub fn attach_snippets(
     result: &mut LocateResult,
     graph: &kin_db::InMemoryGraph,
     opts: &SnippetOptions,
-) {
+) -> Result<()> {
     if !opts.enabled {
-        return;
+        return Ok(());
     }
     for file in result.files.iter_mut() {
         if file.symbols.is_empty() {
@@ -15006,9 +15008,7 @@ pub fn attach_snippets(
             file_path: Some(kin_model::FilePathId::new(&file.path)),
             ..Default::default()
         };
-        let Ok(entities) = graph.query_entities(&filter) else {
-            continue;
-        };
+        let entities = graph.query_entities(&filter)?;
         if entities.is_empty() {
             continue;
         }
@@ -15024,17 +15024,18 @@ pub fn attach_snippets(
             let Some(entity) = match_symbol_entity(&entities, sym) else {
                 continue;
             };
-            if let Some(snippet) = kin_mcp::handlers::common::read_entity_source_excerpt_detailed(
+            if let Some(source) = kin_mcp::handlers::common::read_entity_source_excerpt_detailed(
                 graph,
                 entity,
                 opts.max_lines,
                 opts.max_chars,
-            ) {
-                sym.snippet = Some(snippet);
+            )? {
+                sym.snippet = Some(source.body);
                 filled += 1;
             }
         }
     }
+    Ok(())
 }
 
 /// Resolve a located symbol to its graph entity by name, disambiguating by start
@@ -15061,31 +15062,35 @@ fn match_symbol_entity<'a>(
 /// the entity spans more source lines than the cap surfaced. Same
 /// content-addressed, hash-verified projection
 /// ([`kin_mcp::handlers::common::read_entity_source_excerpt_detailed`]) every
-/// agent surface uses — never a working-tree read; a graph/blob miss yields
-/// `None` (coordinates only).
+/// agent surface uses — never a working-tree read. `None` means the entity has
+/// no source coordinates; graph/tree/blob gaps are errors.
 fn bounded_entity_body_with_note(
     graph: &kin_db::InMemoryGraph,
     entity: &kin_model::Entity,
     max_lines: usize,
     max_chars: usize,
-) -> Option<String> {
-    let body = kin_mcp::handlers::common::read_entity_source_excerpt_detailed(
+) -> Result<Option<String>> {
+    let Some(source) = kin_mcp::handlers::common::read_entity_source_excerpt_detailed(
         graph, entity, max_lines, max_chars,
-    )?;
+    )?
+    else {
+        return Ok(None);
+    };
+    let body = source.body;
     if let Some(span) = entity.span.as_ref() {
         let total_lines =
             (span.end_line.saturating_sub(span.start_line) as usize).saturating_add(1);
         let shown = body.lines().count();
         if total_lines > shown {
             let remaining = total_lines - shown;
-            return Some(format!(
+            return Ok(Some(format!(
                 "{body}\n… (+{remaining} more line{} — get_entity_source {} for the full body)",
                 if remaining == 1 { "" } else { "s" },
                 entity.id
-            ));
+            )));
         }
     }
-    Some(body)
+    Ok(Some(body))
 }
 
 /// Re-project the file-attributed ranked symbols already built into `result`
@@ -15106,9 +15111,9 @@ pub fn build_entity_view(
     result: &mut LocateResult,
     graph: &kin_db::InMemoryGraph,
     opts: &SnippetOptions,
-) {
+) -> Result<()> {
     if !opts.enabled {
-        return;
+        return Ok(());
     }
     // (file_rank, LocateEntity) so global ranking can tie-break on file order.
     let mut ranked: Vec<(usize, LocateEntity)> = Vec::new();
@@ -15121,9 +15126,7 @@ pub fn build_entity_view(
             file_path: Some(kin_model::FilePathId::new(&file.path)),
             ..Default::default()
         };
-        let Ok(entities) = graph.query_entities(&filter) else {
-            continue;
-        };
+        let entities = graph.query_entities(&filter)?;
         if entities.is_empty() {
             continue;
         }
@@ -15138,7 +15141,7 @@ pub fn build_entity_view(
             // Bodies belong to definitions; references/re-exports stay
             // coordinates-only (the symbol already reused its snippet, if any).
             let body = if sym.definition {
-                bounded_entity_body_with_note(graph, entity, opts.max_lines, opts.max_chars)
+                bounded_entity_body_with_note(graph, entity, opts.max_lines, opts.max_chars)?
                     .or_else(|| sym.snippet.clone())
             } else {
                 None
@@ -15187,6 +15190,7 @@ pub fn build_entity_view(
 
     result.entities = ranked.into_iter().map(|(_, entity)| entity).collect();
     result.total_ranked = result.entities.len();
+    Ok(())
 }
 
 /// Stable, opaque key for a locate ranking, scoped to the query, the ref/scope it
@@ -15983,7 +15987,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        build_entity_view(&mut result, &graph, &SnippetOptions::default());
+        build_entity_view(&mut result, &graph, &SnippetOptions::default()).unwrap();
         assert!(
             result.entities.is_empty(),
             "disabled snippet opts must leave the entity surface untouched"
