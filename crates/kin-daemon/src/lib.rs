@@ -100,11 +100,14 @@
 //!   `DELETE /graph/branches/{name}` remains a ref-management operation outside
 //!   the entity write-veto policy.
 //! - `POST /mcp/tools/call` (`kin_transaction_commit`): **write-veto** before
-//!   `apply_transaction_delta`, plus `can_write`/`can_commit` capability checks.
-//!   Enforce mode fails closed for an unknown/non-rich session. Exact entity,
-//!   entity-file artifact, and relation-endpoint scopes are covered; contract
-//!   scopes and non-transaction graph-mutating MCP tools are explicitly not
-//!   claim-eligible yet. Each terminal outcome is submitted to
+//!   exact repository-v6 publication, plus `can_write`/`can_commit` capability
+//!   checks. Existing source entity bodies are spliced and reparsed from
+//!   repository CAS before one journaled tree/change/ref transaction; the
+//!   working filesystem is never semantic answer authority. Enforce mode fails
+//!   closed for an unknown/non-rich session. Exact entity, entity-file artifact,
+//!   and relation-endpoint scopes are covered; contract scopes and
+//!   non-transaction graph-mutating MCP tools are explicitly not claim-eligible
+//!   yet. Each terminal outcome is submitted to
 //!   `.kin/coordination_events.jsonl` with sequence, repo/session/intent,
 //!   effective mode, and release attribution. A write-ahead reservation is
 //!   fsynced before mutation, the terminal event is fsynced before live
@@ -117,7 +120,7 @@ pub mod daemon;
 pub mod error;
 pub mod lifecycle;
 pub mod loop_runner;
-pub mod projection_wiring;
+mod mcp_commit;
 pub mod repository_commit;
 pub mod session_registry;
 pub mod state;
