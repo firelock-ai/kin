@@ -263,9 +263,10 @@ mod tests {
     }
 
     #[test]
-    fn entity_role_serde_default_on_missing() {
-        // Build a valid Entity, serialize it, strip the role field, then deserialize.
-        // This proves that old snapshots (without role) default to Source.
+    fn entity_rejects_missing_role() {
+        // Clean-slate model payloads carry role explicitly. Silently treating an
+        // absent role as source would change semantic meaning at an ingestion
+        // boundary.
         let entity = Entity {
             id: EntityId(uuid::Uuid::nil()),
             kind: EntityKind::Function,
@@ -283,7 +284,7 @@ mod tests {
             span: None,
             signature: "fn f()".into(),
             visibility: Visibility::Public,
-            role: EntityRole::Test, // set non-default to prove the strip works
+            role: EntityRole::Test,
             doc_summary: None,
             metadata: EntityMetadata::default(),
             lineage_parent: None,
@@ -292,7 +293,7 @@ mod tests {
         };
         let mut json_val: serde_json::Value = serde_json::to_value(&entity).unwrap();
         json_val.as_object_mut().unwrap().remove("role");
-        let deserialized: Entity = serde_json::from_value(json_val).unwrap();
-        assert_eq!(deserialized.role, EntityRole::Source);
+        let error = serde_json::from_value::<Entity>(json_val).unwrap_err();
+        assert!(error.to_string().contains("role"));
     }
 }

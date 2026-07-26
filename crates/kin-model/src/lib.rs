@@ -17,6 +17,7 @@ pub mod error;
 pub mod evidence;
 pub mod federation;
 pub mod graph;
+pub mod identity;
 pub mod ids;
 pub mod layout;
 pub mod preset;
@@ -59,6 +60,9 @@ pub use federation::{
 pub use graph::{
     ChangeStore, EntityFilter, EntityStore, GraphStore, ProvenanceStore, ReviewStore, SessionStore,
     SubGraph, VerificationStore, WorkStore,
+};
+pub use identity::{
+    compute_semantic_change_id, content_identity_from_deltas, validate_semantic_change_id,
 };
 pub use ids::{
     ArtifactRevisionId, AuthorId, BranchId, BranchName, ConflictId, ContractId, EntityId,

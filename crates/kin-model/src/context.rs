@@ -154,7 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn context_pack_defaults_supporting_artifacts_when_absent() {
+    fn context_pack_rejects_missing_supporting_artifacts() {
         let json = r#"{
             "focal_entities": [],
             "dependency_signatures": [],
@@ -168,20 +168,18 @@ mod tests {
             "actual_tokens": 0
         }"#;
 
-        let pack: ContextPack = serde_json::from_str(json).unwrap();
-        assert!(pack.supporting_artifacts.is_empty());
+        let error = serde_json::from_str::<ContextPack>(json).unwrap_err();
+        assert!(error.to_string().contains("supporting_artifacts"));
     }
 
     #[test]
-    fn context_plan_seed_defaults_optional_fields() {
+    fn context_plan_seed_requires_explicit_retrieval_evidence() {
         let json = r#"{
             "retrieval_key": { "Entity": "00000000-0000-0000-0000-000000000000" },
             "score": 1.5
         }"#;
 
-        let seed: ContextPlanSeed = serde_json::from_str(json).unwrap();
-        assert!(seed.file_path.is_none());
-        assert!(!seed.lexical);
-        assert!(!seed.semantic);
+        let error = serde_json::from_str::<ContextPlanSeed>(json).unwrap_err();
+        assert!(error.to_string().contains("lexical"));
     }
 }
