@@ -7,13 +7,13 @@ use std::sync::Arc;
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager, StorageBackend};
 use kin_model::{
     compute_resolved_tree_hash, AdmissionCase, AdmissionPolicyDelta, AdmissionScanToken, AuthorId,
-    DefaultRefExpectation, DefaultRefMutation, EffectiveAdmissionPolicyStamp, FrozenLocalOverlay,
-    FrozenLocalOverlayDelta, GitRawTarget, Hash256, OperationId, RefExpectation, RefMutation,
-    RefName, RefTarget, RefUpdatePolicy, RepositoryAuthorityStore, RepositoryCommitReceipt,
-    RepositoryId, RepositoryTransaction, RootBundle, SemanticChange, SemanticChangeId,
-    SharedAdmissionPolicy, WorkspaceExpectation, WorkspaceHead, WorkspaceId, WorkspaceMutation,
-    WorkspaceSnapshotBinding, ADMISSION_POLICY_SEMANTICS_VERSION,
-    REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    DefaultRefExpectation, DefaultRefMutation, EffectiveAdmissionPolicyStamp, ExternalObjectId,
+    ExternalObjectKind, FrozenLocalOverlay, FrozenLocalOverlayDelta, GitMaterialHead, GitRawTarget,
+    Hash256, OperationId, RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy,
+    RepositoryAuthorityStore, RepositoryCommitReceipt, RepositoryId, RepositoryTransaction,
+    RootBundle, SemanticChange, SemanticChangeId, SharedAdmissionPolicy, WorkspaceExpectation,
+    WorkspaceHead, WorkspaceId, WorkspaceMutation, WorkspaceSnapshotBinding,
+    ADMISSION_POLICY_SEMANTICS_VERSION, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
 };
 use sha2::{Digest, Sha256};
 use tracing::info;
@@ -747,17 +747,37 @@ fn validate_bootstrap_transaction(
         let git_authority = delta.new.as_ref().ok_or_else(|| {
             KinError::Other("repository bootstrap cannot remove absent Git authority".to_string())
         })?;
-        let expected_head = match &git_authority.raw_head {
-            GitRawTarget::Symbolic { target } => WorkspaceHead::Symbolic {
+        let expected_head = match (&git_authority.raw_head, &git_authority.material_head) {
+            (
+                GitRawTarget::Symbolic { target },
+                GitMaterialHead::Unborn { .. } | GitMaterialHead::Commit { .. },
+            ) => WorkspaceHead::Symbolic {
                 target: target.clone(),
             },
-            GitRawTarget::Direct { object } => WorkspaceHead::Detached {
-                target: RefTarget::ExternalObject { object: *object },
-            },
+            (GitRawTarget::Direct { .. }, GitMaterialHead::Commit { commit_oid, .. }) => {
+                WorkspaceHead::Detached {
+                    target: RefTarget::external_object(ExternalObjectId::new(
+                        ExternalObjectKind::Commit,
+                        *commit_oid,
+                    )),
+                }
+            }
+            (GitRawTarget::Direct { .. }, GitMaterialHead::Unborn { .. }) => {
+                return Err(KinError::Other(
+                    "direct raw Git HEAD cannot be verified as unborn".to_string(),
+                ));
+            }
+            (_, GitMaterialHead::NonMaterializable { .. }) => {
+                return Err(KinError::Other(
+                    "repository bootstrap cannot materialize raw Git HEAD as a workspace"
+                        .to_string(),
+                ));
+            }
         };
         if workspace.new_head != expected_head {
             return Err(KinError::Other(
-                "repository bootstrap workspace head must exactly match raw Git HEAD".to_string(),
+                "repository bootstrap workspace head must exactly match material Git HEAD"
+                    .to_string(),
             ));
         }
     }

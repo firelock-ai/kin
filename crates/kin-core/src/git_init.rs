@@ -18,10 +18,11 @@ use kin_git::{
 };
 use kin_model::{
     compute_resolved_tree_hash, AdmissionCase, AdmissionScanToken, AuthorId,
-    EffectiveAdmissionPolicyStamp, FrozenLocalOverlay, FrozenLocalOverlayDelta,
-    GitExternalAuthorityDelta, Hash256, LocalAdmissionRuleSource, LocalAdmissionRuleSourceKind,
-    LocatedEntry, OperationId, RepositoryId, RepositoryTransaction, ResolvedTree, TreeDelta,
-    WorkspaceExpectation, WorkspaceMutation, ADMISSION_POLICY_SEMANTICS_VERSION,
+    EffectiveAdmissionPolicyStamp, ExternalObjectId, ExternalObjectKind, FrozenLocalOverlay,
+    FrozenLocalOverlayDelta, GitExternalAuthorityDelta, GitMaterialHead, Hash256,
+    LocalAdmissionRuleSource, LocalAdmissionRuleSourceKind, LocatedEntry, OperationId,
+    RepositoryId, RepositoryTransaction, ResolvedTree, TreeDelta, WorkspaceExpectation,
+    WorkspaceMutation, ADMISSION_POLICY_SEMANTICS_VERSION,
 };
 use tracing::info;
 
@@ -69,12 +70,13 @@ fn init_from_git_with_hook(
 
     let snapshot = capture_lossless_git_repository(&source, repository_id, &capture_store)
         .map_err(|error| git_boundary_error("capture exact Git repository", error))?;
-    let semantic_plan = plan_semantic_git_import(&snapshot, &capture_store)
-        .map_err(|error| git_boundary_error("derive exact semantic Git history", error))?;
-    let admitted = admit_semantic_git_import(&semantic_plan, &capture_store)
-        .map_err(|error| git_boundary_error("derive branch-versioned admission policy", error))?;
     let git_authority = build_git_external_authority(&snapshot, &capture_store)
         .map_err(|error| git_boundary_error("build exact Git authority", error))?;
+    let semantic_plan = plan_semantic_git_import(&snapshot, &capture_store)
+        .map_err(|error| git_boundary_error("derive exact semantic Git history", error))?;
+    verify_material_workspace_seed(&semantic_plan.workspace_seed, &git_authority.material_head)?;
+    let admitted = admit_semantic_git_import(&semantic_plan, &capture_store)
+        .map_err(|error| git_boundary_error("derive branch-versioned admission policy", error))?;
     let source_proof = preflight_git_migration(&source, &snapshot, &semantic_plan, &capture_store)
         .map_err(|error| git_boundary_error("prove mutable Git workspace", error))?;
 
@@ -130,6 +132,51 @@ fn init_from_git_with_hook(
         "admitted exact Git repository as graph-owned Kin authority"
     );
     Ok(result)
+}
+
+fn verify_material_workspace_seed(
+    seed: &kin_git::GitWorkspaceSeed,
+    material_head: &GitMaterialHead,
+) -> Result<()> {
+    match material_head {
+        GitMaterialHead::Unborn { .. } => {
+            let exact_unborn = matches!(&seed.head, kin_model::WorkspaceHead::Symbolic { .. })
+                && seed.base_target.is_none()
+                && seed.base_commit_oid.is_none()
+                && seed.base_tree_hash.is_none()
+                && seed.base_tree.is_empty();
+            if !exact_unborn {
+                return Err(KinError::Other(
+                    "semantic workspace seed disagrees with verified unborn Git HEAD".to_string(),
+                ));
+            }
+        }
+        GitMaterialHead::Commit { commit_oid, .. } => {
+            let material_target = kin_model::RefTarget::external_object(ExternalObjectId::new(
+                ExternalObjectKind::Commit,
+                *commit_oid,
+            ));
+            let exact_head = match &seed.head {
+                kin_model::WorkspaceHead::Symbolic { .. } => true,
+                kin_model::WorkspaceHead::Detached { target } => target == &material_target,
+            };
+            if !exact_head
+                || seed.base_target.as_ref() != Some(&material_target)
+                || seed.base_commit_oid != Some(*commit_oid)
+                || seed.base_tree_hash.is_none()
+            {
+                return Err(KinError::Other(
+                    "semantic workspace seed disagrees with verified material Git HEAD".to_string(),
+                ));
+            }
+        }
+        GitMaterialHead::NonMaterializable { .. } => {
+            return Err(KinError::Other(
+                "verified Git HEAD cannot seed a material Kin workspace".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn canonical_new_repository_root(working_dir: &Path) -> Result<std::path::PathBuf> {
@@ -602,6 +649,113 @@ mod tests {
         assert_no_staging_directories(root.path());
     }
 
+    #[test]
+    fn detached_annotated_tag_keeps_raw_tag_authority_and_seeds_the_peeled_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_annotated_tag_source(&source);
+        let tag_oid = git_stdout(&source, ["rev-parse", "refs/tags/release"]);
+        std::fs::write(source.join(".git/HEAD"), format!("{}\n", tag_oid.trim())).unwrap();
+
+        let result = init_from_git(&source).unwrap();
+        let backend = std::sync::Arc::new(kin_db::LocalFileBackend::new(result.layout.kindb_dir()));
+        let authority =
+            kin_db::RepositoryAuthorityManager::open(result.repository_id.clone(), backend)
+                .unwrap();
+        let lease = authority.read_authority();
+        let git_authority = lease.metadata().git_external_authority.as_ref().unwrap();
+        let (direct_target, commit_oid) = match &git_authority.material_head {
+            GitMaterialHead::Commit {
+                direct_target,
+                tag_chain,
+                commit_oid,
+                ..
+            } => {
+                assert_eq!(direct_target.kind, ExternalObjectKind::Tag);
+                assert_eq!(tag_chain.as_slice(), [*direct_target]);
+                (*direct_target, *commit_oid)
+            }
+            other => panic!("expected material annotated-tag commit, got {other:?}"),
+        };
+        assert!(matches!(
+            git_authority.raw_head,
+            kin_model::GitRawTarget::Direct { object } if object == direct_target
+        ));
+        let material_target = kin_model::RefTarget::external_object(ExternalObjectId::new(
+            ExternalObjectKind::Commit,
+            commit_oid,
+        ));
+        assert_eq!(
+            result.authority.workspace.workspace_head,
+            kin_model::WorkspaceHead::Detached {
+                target: material_target.clone()
+            }
+        );
+        assert_eq!(
+            result.authority.workspace.base_target,
+            Some(material_target)
+        );
+        assert_no_staging_directories(root.path());
+    }
+
+    #[test]
+    fn symbolic_annotated_tag_keeps_raw_ref_authority_and_seeds_the_peeled_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_annotated_tag_source(&source);
+        git(&source, ["symbolic-ref", "HEAD", "refs/tags/release"]);
+
+        let result = init_from_git(&source).unwrap();
+        let backend = std::sync::Arc::new(kin_db::LocalFileBackend::new(result.layout.kindb_dir()));
+        let authority =
+            kin_db::RepositoryAuthorityManager::open(result.repository_id.clone(), backend)
+                .unwrap();
+        let lease = authority.read_authority();
+        let git_authority = lease.metadata().git_external_authority.as_ref().unwrap();
+        let (direct_target, commit_oid) = match &git_authority.material_head {
+            GitMaterialHead::Commit {
+                direct_target,
+                tag_chain,
+                commit_oid,
+                ..
+            } => {
+                assert_eq!(direct_target.kind, ExternalObjectKind::Tag);
+                assert_eq!(tag_chain.as_slice(), [*direct_target]);
+                (*direct_target, *commit_oid)
+            }
+            other => panic!("expected material annotated-tag commit, got {other:?}"),
+        };
+        let tag_ref = kin_model::RefName::tag(b"release").unwrap();
+        assert_eq!(
+            git_authority.raw_head,
+            kin_model::GitRawTarget::Symbolic {
+                target: tag_ref.clone()
+            }
+        );
+        assert!(git_authority.raw_refs.iter().any(|raw_ref| {
+            raw_ref.name == tag_ref
+                && matches!(
+                    raw_ref.target,
+                    kin_model::GitRawTarget::Direct { object } if object == direct_target
+                )
+        }));
+        assert_eq!(
+            result.authority.workspace.workspace_head,
+            kin_model::WorkspaceHead::Symbolic {
+                target: tag_ref.clone()
+            }
+        );
+        assert_eq!(
+            result.authority.workspace.base_target,
+            Some(kin_model::RefTarget::external_object(
+                ExternalObjectId::new(ExternalObjectKind::Commit, commit_oid)
+            ))
+        );
+        assert_no_staging_directories(root.path());
+    }
+
     #[cfg(unix)]
     #[test]
     fn exact_git_init_admits_polyglot_non_code_and_opaque_history_atomically() {
@@ -745,6 +899,14 @@ mod tests {
         git(source, ["config", "user.name", "Kin Test"]);
     }
 
+    fn initialize_annotated_tag_source(source: &Path) {
+        initialize_git(source);
+        std::fs::write(source.join("README.md"), b"annotated tag source\n").unwrap();
+        git(source, ["add", "--all"]);
+        git(source, ["commit", "-m", "tagged commit"]);
+        git(source, ["tag", "--annotate", "release", "-m", "release"]);
+    }
+
     fn assert_no_staging_directories(parent: &Path) {
         let leftovers = std::fs::read_dir(parent)
             .unwrap()
@@ -771,5 +933,22 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn git_stdout<const N: usize>(repository: &Path, args: [&str; N]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repository)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed\nstdout: {}\nstderr: {}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
     }
 }
