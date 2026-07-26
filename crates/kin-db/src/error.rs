@@ -61,14 +61,14 @@ pub enum KinDbError {
 }
 
 impl KinDbError {
-    /// Error for a snapshot whose format predates exact universal-tree truth.
+    /// Error for a snapshot whose format predates complete workspace authority.
     pub fn snapshot_schema_too_old(found: u32, min: u32, max: u32) -> Self {
         KinDbError::IncompatibleSnapshotVersion {
             found,
             min,
             max,
             direction: "is older than",
-            remediation: "reinitialize this pre-release repository with the current Kin; exact file modes cannot be recovered from this snapshot",
+            remediation: "reinitialize this pre-release repository with the current Kin; exact workspace semantics and file modes cannot be recovered from this snapshot",
         }
     }
 
