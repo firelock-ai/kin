@@ -634,7 +634,8 @@ fn session_runtime_check_for(layout: Option<&kin_core::KinLayout>) -> HealthChec
             ),
         )
         .with_manual_fix(
-            "reconcile a finished session with `kin reconcile <session-id> --cleanup`, or remove it with `rm -rf <workspace>`",
+            "reconcile a finished session with `kin reconcile <session-id>`; capability-safe \
+             session cleanup is not exposed yet",
         )
     }
 }

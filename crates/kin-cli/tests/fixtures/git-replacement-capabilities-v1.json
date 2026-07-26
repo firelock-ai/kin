@@ -271,16 +271,19 @@
     },
     {
       "command": "reconcile",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "repository-v6 explicit ingestion boundary",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
         "admit an explicitly observed projection delta into exact workspace authority with complete artifact identities and source CAS",
         "never answer semantic queries or silently repair authority from raw files"
       ],
-      "evidence_tests": [],
-      "note": "The old reconcile executor uses removed GraphOverlay and legacy blob storage."
+      "evidence_tests": [
+        "api::tests::reconcile_endpoint_admits_complete_exact_session_tree_and_replays",
+        "api::tests::reconcile_rejects_control_aliases_special_members_and_stale_bases"
+      ],
+      "note": "Full disposable-session membership is admitted through a caller-stable repository-v6 workspace transaction and projection WAL; scoped sessions stay fail-closed pending an external capability seal, and optional parser enrichment is reported separately."
     },
     {
       "command": "conflicts",

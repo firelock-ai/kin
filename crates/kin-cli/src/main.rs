@@ -771,13 +771,13 @@ enum Command {
         #[arg(last = true)]
         task: Vec<String>,
     },
-    /// [OPEN GATE] Admit explicit session deltas into repository-v6 authority
+    /// Admit one exact disposable-session observation into repository-v6 authority
     Reconcile {
         /// Session ID (defaults to most recent session)
         session: Option<String>,
-        /// Remove the session workspace after successful reconciliation
+        /// Confirm an observation that removes more than 75% of a non-trivial tree
         #[arg(long)]
-        cleanup: bool,
+        confirm_mass_deletion: bool,
     },
     /// [OPEN GATE] Open a shell in an exact graph-derived session workspace
     Shell {
@@ -2635,7 +2635,10 @@ fn main() -> Result<()> {
                     TodoAction::Import { path } => commands::note::todo_import(path).await,
                 },
                 Command::Open { .. } => commands::capabilities::require_ready("open"),
-                Command::Reconcile { .. } => commands::capabilities::require_ready("reconcile"),
+                Command::Reconcile {
+                    session,
+                    confirm_mass_deletion,
+                } => commands::reconcile::run(session, confirm_mass_deletion).await,
                 Command::With { .. } => commands::capabilities::require_ready("with"),
                 Command::Shell { .. } => commands::capabilities::require_ready("shell"),
                 Command::Overview { compact, json } => {

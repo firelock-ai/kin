@@ -23,8 +23,8 @@ use kin_db::{LocalFileBackend, RepositoryAuthorityManager, StorageBackend};
 use kin_model::session::{Intent, IntentScope, IntentSummary, LockType};
 use kin_model::{
     ChangeStore, ContractId, EntityId, EntityStore, FilePathId, GraphNodeId, IntentId, RepoPath,
-    RepositoryId, SessionCapabilities, SessionId, SessionStore, SessionTransport, TreeEntry,
-    WorkStore, WorkspaceId, WorkspaceTreeSnapshot,
+    RepositoryId, SessionCapabilities, SessionId, SessionStore, SessionTransport, TransactionDelta,
+    TreeEntry, WorkStore, WorkspaceId, WorkspaceTreeSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -866,6 +866,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
             "/commands/session-workspace",
             post(command_session_workspace),
         )
+        .route("/reconcile", post(reconcile_session_workspace))
         .route("/commands/commit", post(command_commit))
         .route("/mcp/tools/call", post(mcp_tools_call))
         // Multi-repo endpoints — list and query lazily-loaded repo graphs
@@ -2570,8 +2571,190 @@ async fn command_session_workspace(
         &state.layout,
         &request,
     )
-    .map_err(internal_error)?;
+    .map_err(session_reconcile_error)?;
     Ok(Json(response))
+}
+
+/// POST /reconcile — admit one twice-verified disposable-session observation.
+///
+/// Filesystem reads occur only in `observe_session_workspace`. Repository
+/// authority and the primary graph-derived projection then move together
+/// through the repository-v6 projection WAL. Semantic parsing is derived,
+/// optional follow-up work and never controls exact membership.
+async fn reconcile_session_workspace(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::reconcile::ReconcileRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+    if state.storage_backend.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "exact local session reconciliation is unavailable for hosted snapshot authority"
+                .to_string(),
+        ));
+    }
+
+    let _coordination = state.coordination_gate.lock().await;
+    let graph_mutation = state.begin_graph_authority_mutation();
+    let observation = kin_cli::commands::reconcile::observe_session_workspace(
+        &state.layout,
+        &request.session_dir,
+        state.blobs.as_ref(),
+        request.confirm_mass_deletion,
+    )
+    .map_err(session_reconcile_error)?;
+
+    let previous_tree_hash = observation.base.source_workspace.tree_hash;
+    let desired_tree_hash = kin_model::compute_resolved_tree_hash(&observation.desired_tree)
+        .map_err(repository_authority_error)?;
+    let changes = observation.changes();
+    let added = changes
+        .iter()
+        .filter(|change| change.kind == kin_cli::commands::reconcile::ReconcileChangeKind::Added)
+        .count();
+    let modified = changes
+        .iter()
+        .filter(|change| change.kind == kin_cli::commands::reconcile::ReconcileChangeKind::Modified)
+        .count();
+    let removed = changes
+        .iter()
+        .filter(|change| change.kind == kin_cli::commands::reconcile::ReconcileChangeKind::Removed)
+        .count();
+
+    if state.graph.resolved_tree() != observation.base.source_workspace.tree
+        && state.graph.resolved_tree() != observation.desired_tree
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "daemon query tree is not bound to the session base or its exact recovered target; \
+             reopen the daemon from repository authority"
+                .to_string(),
+        ));
+    }
+
+    let (authority_generation, workspace_generation, idempotent_replay) =
+        if observation.deltas.is_empty() {
+            (
+                observation.base.authority_roots.generation,
+                observation.base.source_workspace.generation,
+                false,
+            )
+        } else {
+            let plan = crate::repository_commit::plan_session_workspace_admission(
+                &state.layout,
+                state.blobs.as_ref(),
+                &observation.base,
+                &observation.desired_tree,
+            )
+            .map_err(repository_commit_error)?;
+            let committed = crate::repository_commit::commit_session_workspace_admission(
+                &state.layout,
+                state.blobs.as_ref(),
+                plan,
+            )
+            .map_err(repository_commit_error)?;
+
+            let live_generation = state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if committed.receipt.generation > live_generation {
+                state
+                    .record_repository_authority_commit(committed.receipt.generation)
+                    .map_err(repository_commit_error)?;
+            } else if committed.receipt.generation < live_generation {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!(
+                        "daemon generation {live_generation} is newer than recovered session \
+                         receipt {}",
+                        committed.receipt.generation
+                    ),
+                ));
+            }
+
+            let graph_tree = state.graph.resolved_tree();
+            if graph_tree == observation.base.source_workspace.tree {
+                state
+                    .graph
+                    .apply_transaction_delta(&TransactionDelta {
+                        tree_deltas: observation.deltas.clone(),
+                        ..TransactionDelta::default()
+                    })
+                    .map_err(internal_error)?;
+            } else if graph_tree != observation.desired_tree {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "repository receipt is durable but the daemon query tree cannot be advanced \
+                     from the retained session base; restart to reload exact authority"
+                        .to_string(),
+                ));
+            }
+
+            state.mark_dirty();
+            state.bump_version();
+            state.emit_event(DaemonEvent::GraphRootChanged {
+                old_root_hash: Some(previous_tree_hash.to_string()),
+                new_root_hash: desired_tree_hash.to_string(),
+            });
+            (
+                committed.receipt.generation,
+                observation
+                    .base
+                    .source_workspace
+                    .generation
+                    .saturating_add(1),
+                committed.idempotent_replay,
+            )
+        };
+
+    drop(graph_mutation);
+    Ok(Json(kin_cli::commands::reconcile::ReconcileSummary {
+        schema: kin_cli::commands::reconcile::RECONCILE_SUMMARY_SCHEMA.to_string(),
+        operation_id: observation.base.reconcile_operation_id,
+        repository_id: observation.base.repository_id,
+        authority_generation,
+        workspace_generation,
+        previous_tree_hash,
+        desired_tree_hash,
+        idempotent_replay,
+        changed: !observation.deltas.is_empty(),
+        added,
+        modified,
+        removed,
+        observed_materialized_artifacts: observation.observed_materialized_artifacts,
+        preserved_graph_only_artifacts: observation.preserved_graph_only_artifacts,
+        observed_body_bytes: observation.observed_body_bytes,
+        semantic_files_enriched: 0,
+        semantic_enrichment_failures: 0,
+        changes,
+    }))
+}
+
+fn session_reconcile_error(error: impl std::fmt::Display) -> (StatusCode, String) {
+    let message = error.to_string();
+    let status = if [
+        "stale",
+        "tampered",
+        "changed",
+        "mass-deletion",
+        "no longer match",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+    {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (status, message)
 }
 
 // ── Thin-Client Commands ─────────────────────────────────────────────────
@@ -9229,6 +9412,72 @@ mod tests {
         Arc::new(DaemonState::open(layout).unwrap())
     }
 
+    #[cfg(unix)]
+    fn test_state_with_verified_gitlink() -> Arc<DaemonState> {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+        use std::process::Command;
+
+        fn git<const N: usize>(repository: &FsPath, args: [&str; N]) {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repository)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed\nstdout: {}\nstderr: {}",
+                args,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        install_test_registry_override();
+        let dir = std::env::temp_dir().join(format!("kin-daemon-gitlink-state-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("compose.yaml"),
+            b"services:\n  api:\n    image: kin:base\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("bin/verify"), b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut executable_permissions = std::fs::metadata(dir.join("bin/verify"))
+            .unwrap()
+            .permissions();
+        executable_permissions.set_mode(0o755);
+        std::fs::set_permissions(dir.join("bin/verify"), executable_permissions).unwrap();
+        std::fs::write(
+            dir.join("assets/policy.unknown"),
+            b"\x00\xffopaque base bytes\x00",
+        )
+        .unwrap();
+        std::fs::write(dir.join("delete.me"), b"delete this exact member\n").unwrap();
+        std::fs::write(dir.join("src/lib.py"), b"def retained():\n    return 1\n").unwrap();
+        symlink("compose.yaml", dir.join("current-compose")).unwrap();
+
+        git(&dir, ["init", "--initial-branch=main"]);
+        git(&dir, ["config", "user.email", "kin@example.invalid"]);
+        git(&dir, ["config", "user.name", "Kin Test"]);
+        git(&dir, ["add", "--all"]);
+        git(
+            &dir,
+            [
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000,4444444444444444444444444444444444444444,vendor/subrepo",
+            ],
+        );
+        git(&dir, ["commit", "-m", "exact session fixture"]);
+        std::fs::create_dir_all(dir.join("vendor/subrepo")).unwrap();
+
+        let layout = kin_core::init_from_git(&dir).unwrap().layout;
+        Arc::new(DaemonState::open(layout).unwrap())
+    }
+
     #[tokio::test]
     async fn repository_transfer_status_preserves_non_utf8_ref_bytes_and_gates_push() {
         let state = test_state();
@@ -10930,6 +11179,29 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let app = router(state.clone());
         let session_dir = state.layout.root().join("runs/session-api");
+        let scoped_session_dir = state.layout.root().join("runs/session-api-scoped");
+        let scoped = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/session-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "session_dir": scoped_session_dir.display().to_string(),
+                            "strategy": null,
+                            "scope": "artifact:compose.yaml"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(scoped.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            !scoped_session_dir.exists(),
+            "unauthenticated scoped session selection must fail before publication"
+        );
 
         let response = app
             .oneshot(
@@ -10993,7 +11265,8 @@ mod tests {
         base.validate().unwrap();
         assert_eq!(
             base.materialized_artifact_ids.len(),
-            base.source_workspace.tree.len()
+            base.source_workspace.tree.len(),
+            "the complete materializable tree is represented in the session"
         );
         #[cfg(unix)]
         assert_eq!(base.source_workspace.tree.len(), 5);
@@ -11002,6 +11275,434 @@ mod tests {
         assert!(
             !session_dir.join(".kin").exists(),
             "session projection must not shadow owning-repository discovery"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_endpoint_admits_complete_exact_session_tree_and_replays() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let state = test_state_with_verified_gitlink();
+        let deleted_path = RepoPath::from_utf8("delete.me").unwrap();
+        let gitlink_path = RepoPath::from_utf8("vendor/subrepo").unwrap();
+        #[cfg(target_os = "macos")]
+        let raw_path = RepoPath::from_bytes(b"assets/raw-\xff.bin".to_vec()).unwrap();
+
+        #[cfg(target_os = "macos")]
+        {
+            let raw_body = b"\x00raw graph-only bytes\xff";
+            let raw_hash = state.blobs.write(raw_body).unwrap();
+            state
+                .graph
+                .apply_transaction_delta(&TransactionDelta {
+                    tree_deltas: vec![kin_model::TreeDelta::Added {
+                        artifact_id: kin_model::ArtifactId::new(),
+                        new: kin_model::LocatedEntry::new(
+                            raw_path.clone(),
+                            TreeEntry::blob(Hash256::from_bytes(raw_hash.0), false),
+                        ),
+                    }],
+                    ..TransactionDelta::default()
+                })
+                .unwrap();
+            let install_plan = crate::repository_commit::plan_native_commit(
+                &state.layout,
+                &state.graph,
+                &state.blobs,
+                kin_model::OperationId::new(),
+                Timestamp::now(),
+                AuthorId::new("reconcile-api-test"),
+                "install host-unrepresentable exact fixture".to_string(),
+            )
+            .unwrap();
+            let installed = crate::repository_commit::commit_native_plan(
+                &state.layout,
+                &state.blobs,
+                install_plan,
+            )
+            .unwrap();
+            state
+                .record_repository_authority_commit(installed.receipt.generation)
+                .unwrap();
+            state.blobs.delete(&raw_hash).unwrap();
+            assert!(
+                state.blobs.read(&raw_hash).is_err(),
+                "the test must prove graph-only preservation from repository CAS, not an \
+                 accidentally warm ingestion CAS"
+            );
+        }
+
+        std::fs::create_dir_all(state.layout.working_dir().join("vendor/subrepo")).unwrap();
+        std::fs::write(
+            state
+                .layout
+                .working_dir()
+                .join("vendor/subrepo/arbitrary-descendant"),
+            b"nested checkout identity must be retained\n",
+        )
+        .unwrap();
+
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(Arc::clone(&state));
+        let session_dir = state.layout.root().join("runs/session-reconcile-api");
+        let materialize = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/session-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "session_dir": session_dir.display().to_string(),
+                            "strategy": null,
+                            "scope": null
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(materialize.status(), StatusCode::OK);
+        assert!(
+            !session_dir.join("vendor/subrepo").exists(),
+            "a Gitlink is exact graph membership, not a fake session file"
+        );
+        let base: kin_cli::commands::session_workspace::SessionWorkspaceBase =
+            serde_json::from_slice(
+                &std::fs::read(session_dir.join(".kin-session/base.json")).unwrap(),
+            )
+            .unwrap();
+        base.validate().unwrap();
+        let base_gitlink_id = base
+            .source_workspace
+            .tree
+            .artifact_at_path(&gitlink_path)
+            .unwrap()
+            .artifact_id;
+        assert!(!base.materialized_artifact_ids.contains(&base_gitlink_id));
+        #[cfg(target_os = "macos")]
+        let base_raw_id = base
+            .source_workspace
+            .tree
+            .artifact_at_path(&raw_path)
+            .unwrap()
+            .artifact_id;
+        #[cfg(target_os = "macos")]
+        assert!(!base.materialized_artifact_ids.contains(&base_raw_id));
+
+        std::fs::write(
+            session_dir.join("compose.yaml"),
+            b"services:\n  api:\n    image: kin:desired\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session_dir.join("assets/policy.unknown"),
+            b"\x00\xfeopaque desired bytes\x00",
+        )
+        .unwrap();
+        let mut executable_permissions = std::fs::metadata(session_dir.join("bin/verify"))
+            .unwrap()
+            .permissions();
+        executable_permissions.set_mode(0o644);
+        std::fs::set_permissions(session_dir.join("bin/verify"), executable_permissions).unwrap();
+        std::fs::remove_file(session_dir.join("current-compose")).unwrap();
+        symlink("assets/policy.unknown", session_dir.join("current-compose")).unwrap();
+        std::fs::remove_file(session_dir.join("delete.me")).unwrap();
+        std::fs::create_dir_all(session_dir.join("notes")).unwrap();
+        std::fs::write(
+            session_dir.join("notes/new.odd"),
+            b"new arbitrary repository member\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(session_dir.join("vendor/subrepo")).unwrap();
+        std::fs::write(
+            session_dir.join("vendor/subrepo/untrusted-descendant"),
+            b"this must not become parent-repository membership\n",
+        )
+        .unwrap();
+
+        let request_body = json!({
+            "session_dir": session_dir,
+            "confirm_mass_deletion": false
+        })
+        .to_string();
+        let reconcile = app
+            .clone()
+            .oneshot(
+                Request::post("/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = reconcile.status();
+        let body = axum::body::to_bytes(reconcile.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let summary: kin_cli::commands::reconcile::ReconcileSummary =
+            serde_json::from_slice(&body).unwrap();
+        assert!(summary.changed);
+        assert!(!summary.idempotent_replay);
+        assert_eq!(summary.added, 1);
+        assert_eq!(summary.modified, 4);
+        assert_eq!(summary.removed, 1);
+        assert_eq!(summary.observed_materialized_artifacts, 6);
+        #[cfg(target_os = "macos")]
+        assert_eq!(summary.preserved_graph_only_artifacts, 2);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(summary.preserved_graph_only_artifacts, 1);
+        assert_eq!(summary.semantic_files_enriched, 0);
+        assert_eq!(summary.semantic_enrichment_failures, 0);
+
+        let authority = ActiveApiRepositoryAuthority::open(&state.layout).unwrap();
+        let lease = authority.manager.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .unwrap()
+            .clone();
+        drop(lease);
+        assert_eq!(workspace.tree_hash, summary.desired_tree_hash);
+        assert_eq!(workspace.tree, state.graph.resolved_tree());
+        assert_eq!(
+            workspace
+                .tree
+                .artifact_at_path(&gitlink_path)
+                .unwrap()
+                .artifact_id,
+            base_gitlink_id,
+            "graph-only Gitlink identity must remain stable"
+        );
+        assert_eq!(
+            workspace
+                .tree
+                .artifact_at_path(&gitlink_path)
+                .unwrap()
+                .entry,
+            TreeEntry::gitlink(kin_model::GitObjectId::sha1([0x44; 20]))
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            workspace
+                .tree
+                .artifact_at_path(&raw_path)
+                .unwrap()
+                .artifact_id,
+            base_raw_id,
+            "host-unrepresentable exact membership and identity must survive reconciliation"
+        );
+        assert!(
+            workspace.tree.artifact_at_path(&deleted_path).is_none(),
+            "a missing materialized session member is an exact deletion"
+        );
+        assert!(workspace
+            .tree
+            .artifact_at_path(&RepoPath::from_utf8("notes/new.odd").unwrap())
+            .is_some());
+
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("compose.yaml")).unwrap(),
+            b"services:\n  api:\n    image: kin:desired\n"
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("assets/policy.unknown")).unwrap(),
+            b"\x00\xfeopaque desired bytes\x00"
+        );
+        assert_eq!(
+            std::fs::metadata(state.layout.working_dir().join("bin/verify"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        assert_eq!(
+            std::fs::read_link(state.layout.working_dir().join("current-compose")).unwrap(),
+            PathBuf::from("assets/policy.unknown")
+        );
+        assert!(!state.layout.working_dir().join("delete.me").exists());
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("notes/new.odd")).unwrap(),
+            b"new arbitrary repository member\n"
+        );
+        assert_eq!(
+            std::fs::read(
+                state
+                    .layout
+                    .working_dir()
+                    .join("vendor/subrepo/arbitrary-descendant")
+            )
+            .unwrap(),
+            b"nested checkout identity must be retained\n",
+            "Gitlink descendants are outside parent-repository traversal and mutation"
+        );
+
+        let replay = app
+            .oneshot(
+                Request::post("/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = replay.status();
+        let body = axum::body::to_bytes(replay.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let replay: kin_cli::commands::reconcile::ReconcileSummary =
+            serde_json::from_slice(&body).unwrap();
+        assert!(replay.idempotent_replay);
+        assert_eq!(replay.operation_id, summary.operation_id);
+        assert_eq!(replay.desired_tree_hash, summary.desired_tree_hash);
+        assert_eq!(replay.authority_generation, summary.authority_generation);
+
+        let restarted = Arc::new(DaemonState::open(state.layout.clone()).unwrap());
+        assert_eq!(
+            restarted.graph.resolved_tree(),
+            workspace.tree,
+            "repository-v6 restart must retain the complete exact reconciled tree"
+        );
+        restarted
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let restarted_replay = router(restarted)
+            .oneshot(
+                Request::post("/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = restarted_replay.status();
+        let body = axum::body::to_bytes(restarted_replay.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let restarted_replay: kin_cli::commands::reconcile::ReconcileSummary =
+            serde_json::from_slice(&body).unwrap();
+        assert!(restarted_replay.idempotent_replay);
+        assert_eq!(
+            restarted_replay.desired_tree_hash,
+            summary.desired_tree_hash
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_rejects_control_aliases_special_members_and_stale_bases() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+        use std::os::unix::net::UnixListener;
+
+        async fn materialize(state: &Arc<DaemonState>, session_dir: &FsPath) {
+            let response = router(Arc::clone(state))
+                .oneshot(
+                    Request::post("/commands/session-workspace")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "session_dir": session_dir.display().to_string(),
+                                "strategy": null,
+                                "scope": null
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        async fn reconcile_status(state: &Arc<DaemonState>, session_dir: &FsPath) -> StatusCode {
+            router(Arc::clone(state))
+                .oneshot(
+                    Request::post("/reconcile")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "session_dir": session_dir.display().to_string(),
+                                "confirm_mass_deletion": false
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        }
+
+        let state = test_state();
+        install_repository_file(&state, "README.md", b"exact base\n");
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let symlink_session = state.layout.root().join("runs/session-control-symlink");
+        materialize(&state, &symlink_session).await;
+        let base_path = symlink_session.join(".kin-session/base.json");
+        let aliased_base = symlink_session.join("aliased-base.json");
+        std::fs::write(&aliased_base, std::fs::read(&base_path).unwrap()).unwrap();
+        std::fs::remove_file(&base_path).unwrap();
+        symlink("../aliased-base.json", &base_path).unwrap();
+        assert_eq!(
+            reconcile_status(&state, &symlink_session).await,
+            StatusCode::BAD_REQUEST,
+            "control metadata must never be read through a symlink"
+        );
+
+        let hardlink_session = state.layout.root().join("runs/session-control-hardlink");
+        materialize(&state, &hardlink_session).await;
+        let base_path = hardlink_session.join(".kin-session/base.json");
+        let aliased_base = hardlink_session.join("aliased-base.json");
+        std::fs::write(&aliased_base, std::fs::read(&base_path).unwrap()).unwrap();
+        let mut aliased_permissions = std::fs::metadata(&aliased_base).unwrap().permissions();
+        aliased_permissions.set_mode(0o600);
+        std::fs::set_permissions(&aliased_base, aliased_permissions).unwrap();
+        std::fs::remove_file(&base_path).unwrap();
+        std::fs::hard_link(&aliased_base, &base_path).unwrap();
+        assert_eq!(
+            reconcile_status(&state, &hardlink_session).await,
+            StatusCode::BAD_REQUEST,
+            "control metadata must be one unaliased regular file"
+        );
+
+        let special_session = state.layout.root().join("runs/session-special-member");
+        materialize(&state, &special_session).await;
+        let short_socket =
+            PathBuf::from("/tmp").join(format!("kin-reconcile-{}.sock", Uuid::new_v4().simple()));
+        let _listener = UnixListener::bind(&short_socket).unwrap();
+        std::fs::rename(&short_socket, special_session.join("member.sock")).unwrap();
+        assert_eq!(
+            reconcile_status(&state, &special_session).await,
+            StatusCode::BAD_REQUEST,
+            "special filesystem members cannot enter exact repository authority"
+        );
+
+        let stale_session = state.layout.root().join("runs/session-stale-base");
+        materialize(&state, &stale_session).await;
+        install_repository_file(&state, "new-authority.txt", b"authority moved\n");
+        let authority = ActiveApiRepositoryAuthority::open(&state.layout).unwrap();
+        let generation = authority.manager.read_authority().roots().generation;
+        assert_eq!(
+            reconcile_status(&state, &stale_session).await,
+            StatusCode::CONFLICT,
+            "a stale session must never silently rebase"
+        );
+        assert_eq!(
+            authority.manager.read_authority().roots().generation,
+            generation,
+            "rejected stale reconciliation must not mutate authority"
         );
     }
 
