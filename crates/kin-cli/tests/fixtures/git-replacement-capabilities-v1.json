@@ -92,27 +92,31 @@
     },
     {
       "command": "branch create",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "repository-v6 ref transaction",
       "required_for_bounded_dogfood": true,
       "acceptance_spec": [
         "create a fully qualified ref with MustNotExist compare-and-swap against the active workspace base target"
       ],
-      "evidence_tests": [],
-      "note": "Repository-v6 ref creation has not replaced legacy graph branch mutation."
+      "evidence_tests": [
+        "crates/kin-cli/tests/repository_branches.rs"
+      ],
+      "note": "Branch creation commits MustNotExist against the exact active workspace base target and repository root bundle."
     },
     {
       "command": "branch delete",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "repository-v6 ref transaction",
       "required_for_bounded_dogfood": true,
       "acceptance_spec": [
         "delete an exact ref only with force-with-lease and reject deletion of the active symbolic head"
       ],
-      "evidence_tests": [],
-      "note": "Repository-v6 ref deletion has not replaced legacy graph branch mutation."
+      "evidence_tests": [
+        "crates/kin-cli/tests/repository_branches.rs"
+      ],
+      "note": "Branch deletion commits force-with-lease against the exact target and rejects default or checked-out refs."
     },
     {
       "command": "branch switch",

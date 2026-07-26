@@ -974,15 +974,23 @@ enum BranchAction {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// [OPEN GATE] Create a ref with compare-and-swap
+    /// Create a ref with compare-and-swap
     Create {
-        /// Branch name
-        name: String,
+        /// UTF-8 short branch name or fully-qualified refs/heads/... name
+        #[arg(required_unless_present = "ref_hex", conflicts_with = "ref_hex")]
+        name: Option<String>,
+        /// Canonical lowercase hex for a fully-qualified byte-exact branch ref
+        #[arg(long, value_name = "LOWER_HEX")]
+        ref_hex: Option<String>,
     },
-    /// [OPEN GATE] Delete a ref with force-with-lease
+    /// Delete a ref with force-with-lease
     Delete {
-        /// Branch name
-        name: String,
+        /// UTF-8 short branch name or fully-qualified refs/heads/... name
+        #[arg(required_unless_present = "ref_hex", conflicts_with = "ref_hex")]
+        name: Option<String>,
+        /// Canonical lowercase hex for a fully-qualified byte-exact branch ref
+        #[arg(long, value_name = "LOWER_HEX")]
+        ref_hex: Option<String>,
     },
     /// [OPEN GATE] Switch workspace authority and projection atomically
     Switch {
@@ -1901,12 +1909,12 @@ fn main() -> Result<()> {
                 Command::Log { count, json } => commands::log::run(count, json),
                 Command::Branch { action } => match action {
                     BranchAction::List { json } => commands::branch::list(json),
-                    BranchAction::Create { name: _ } => {
-                        commands::capabilities::require_ready("branch create")
-                    }
-                    BranchAction::Delete { name: _ } => {
-                        commands::capabilities::require_ready("branch delete")
-                    }
+                    BranchAction::Create { name, ref_hex } => commands::branch::create(
+                        commands::branch::parse_branch_ref(name.as_deref(), ref_hex.as_deref())?,
+                    ),
+                    BranchAction::Delete { name, ref_hex } => commands::branch::delete(
+                        commands::branch::parse_branch_ref(name.as_deref(), ref_hex.as_deref())?,
+                    ),
                     BranchAction::Switch { name: _ } => {
                         commands::capabilities::require_ready("branch switch")
                     }
