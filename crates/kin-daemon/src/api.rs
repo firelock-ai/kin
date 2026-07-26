@@ -276,17 +276,6 @@ pub struct ReadinessResponse {
     pub ready: bool,
 }
 
-/// Working copy status response.
-#[derive(Debug, Serialize, serde::Deserialize)]
-pub struct StatusResponse {
-    pub base_change: String,
-    pub entity_adds: usize,
-    pub entity_mods: usize,
-    pub entity_removes: usize,
-    pub relation_adds: usize,
-    pub relation_removes: usize,
-}
-
 /// JSON-friendly intent payload for CLI and adapter consumers.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IntentResponse {
@@ -834,7 +823,6 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/health", get(health))
         .route("/readiness", get(readiness))
         .route("/ready", get(readiness))
-        .route("/status", get(status))
         .route("/session", post(start_session).get(list_sessions))
         .route(
             "/session/{session_id}",
@@ -1678,21 +1666,6 @@ async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     }
 }
 
-/// GET /status — current working copy status.
-async fn status(State(state): State<Arc<DaemonState>>) -> Result<impl IntoResponse, StatusCode> {
-    let wc = state.working_copy.read().await;
-    let overlay = &wc.uncommitted_mutations;
-
-    Ok(Json(StatusResponse {
-        base_change: wc.base_change.to_string(),
-        entity_adds: overlay.entity_adds.len(),
-        entity_mods: overlay.entity_mods.len(),
-        entity_removes: overlay.entity_removes.len(),
-        relation_adds: overlay.relation_adds.len(),
-        relation_removes: overlay.relation_removes.len(),
-    }))
-}
-
 /// GET /session — list all active sessions.
 async fn list_sessions(
     State(state): State<Arc<DaemonState>>,
@@ -1983,6 +1956,7 @@ async fn graph_mutations(
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     }
 
+    state.mark_dirty();
     state.bump_version();
     state.emit_event(DaemonEvent::GraphRootChanged {
         old_root_hash: None,
@@ -11676,28 +11650,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    // -----------------------------------------------------------------------
-    // Status endpoint
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn status_returns_working_copy_state() {
-        let state = test_state();
-        let app = router(state);
-        let response = app
-            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let json: StatusResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json.entity_adds, 0);
-        assert_eq!(json.entity_mods, 0);
-        assert_eq!(json.entity_removes, 0);
     }
 
     // -----------------------------------------------------------------------

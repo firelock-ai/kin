@@ -356,14 +356,35 @@ mod tests {
         }
     }
 
-    /// Record a SemanticChange in the graph and advance the branch head.
+    fn genesis_change() -> kin_model::SemanticChange {
+        let mut change = kin_model::SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: kin_model::ChangeOrigin::Native,
+            parents: vec![],
+            author: AuthorId::new("test"),
+            message: "test genesis".to_string(),
+            timestamp: Timestamp::now(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            admission_policy_delta: None,
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+        };
+        change.id = kin_core::compute_semantic_change_id(&change).unwrap();
+        change
+    }
+
+    /// Record a SemanticChange in the graph.
     fn record_commit(
         graph: &InMemoryGraph,
         entity_deltas: Vec<EntityDelta>,
         relation_deltas: Vec<RelationDelta>,
         tree_deltas: Vec<TreeDelta>,
         parent: &SemanticChangeId,
-        branch: &str,
+        _branch: &str,
     ) -> SemanticChangeId {
         let mut change = kin_model::SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
@@ -384,9 +405,6 @@ mod tests {
         change.id = kin_core::compute_semantic_change_id(&change).unwrap();
         let change_id = change.id;
         graph.create_change(&change).expect("create_change");
-        graph
-            .update_branch_head(&kin_model::BranchName::new(branch), &change_id)
-            .expect("update_branch_head");
         let desired = graph
             .resolve_tree_at(&change_id)
             .expect("resolve committed tree");
@@ -420,7 +438,7 @@ mod tests {
             .filter(|artifact| matches!(artifact.entry, TreeEntry::Gitlink { .. }))
             .map(|artifact| artifact.path.clone())
             .collect::<Vec<_>>();
-        let source = kin_core::source_dir(layout);
+        let source = layout.working_dir();
         let ignore =
             kin_index::RepositoryIgnore::load(&source).map_err(kin_index::IndexError::from)?;
         let scan = kin_index::scan_repository_preserving_graph_only(
@@ -450,15 +468,8 @@ mod tests {
     fn entity_added_since_genesis_appears_in_deltas() {
         let graph = Arc::new(kin_db::InMemoryGraph::new());
 
-        // Bootstrap genesis + branch so get_changes_since works.
-        let genesis = kin_core::build_genesis_change();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
 
         // Simulate reconcile: entity upserted into primary graph (overlay cleared).
         let entity = make_entity("my_fn", "src/lib.rs", [1; 32]);
@@ -488,14 +499,8 @@ mod tests {
     fn no_deltas_after_commit_records_current_entity() {
         let graph = Arc::new(kin_db::InMemoryGraph::new());
 
-        let genesis = kin_core::build_genesis_change();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
 
         let entity = make_entity("stable_fn", "src/lib.rs", [42; 32]);
         graph.upsert_entity(&entity).unwrap();
@@ -528,14 +533,8 @@ mod tests {
     fn modified_entity_fingerprint_produces_modified_delta() {
         let graph = Arc::new(kin_db::InMemoryGraph::new());
 
-        let genesis = kin_core::build_genesis_change();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
 
         // Commit the entity with hash [1;32].
         let old_entity = make_entity("changing_fn", "src/lib.rs", [1; 32]);
@@ -573,14 +572,8 @@ mod tests {
     fn removed_entity_produces_removed_delta() {
         let graph = Arc::new(kin_db::InMemoryGraph::new());
 
-        let genesis = kin_core::build_genesis_change();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
 
         let entity = make_entity("doomed_fn", "src/lib.rs", [7; 32]);
         graph.upsert_entity(&entity).unwrap();
@@ -621,17 +614,11 @@ mod tests {
         let graph = Arc::new(kin_db::InMemoryGraph::new());
         let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
 
-        let genesis = kin_core::build_genesis_change();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
 
         // Write a file to the working directory.
-        let src_dir = kin_core::source_dir(&layout);
+        let src_dir = layout.working_dir();
         std::fs::create_dir_all(src_dir.join("src")).unwrap();
         std::fs::write(src_dir.join("src/new.rs"), b"pub fn new_fn() {}\n").unwrap();
 
@@ -693,17 +680,11 @@ mod tests {
         let graph = Arc::new(kin_db::InMemoryGraph::new());
         let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
 
-        let genesis = kin_core::build_genesis_change();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
 
         // Simulate a prior commit that recorded the file with old content.
-        let src_dir = kin_core::source_dir(&layout);
+        let src_dir = layout.working_dir();
         std::fs::create_dir_all(src_dir.join("src")).unwrap();
         let old_content = b"pub fn old() {}\n";
         std::fs::write(src_dir.join("src/lib.rs"), old_content).unwrap();
@@ -762,16 +743,10 @@ mod tests {
         let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
         let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
-        let genesis = kin_core::build_genesis_change();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
 
-        let source = kin_core::source_dir(&layout);
+        let source = layout.working_dir();
         std::fs::create_dir_all(source.join("src")).unwrap();
         let old_path = RepoPath::from_utf8("src/old.rs").unwrap();
         let new_path = RepoPath::from_utf8("src/new.rs").unwrap();
@@ -836,14 +811,8 @@ mod tests {
         let graph = Arc::new(kin_db::InMemoryGraph::new());
         let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
 
-        let genesis = kin_core::build_genesis_change();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
 
         let content = b"pub fn gone() {}\n";
         let digest = blobs.write(content).unwrap();
@@ -891,16 +860,10 @@ mod tests {
         let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
         let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
-        let genesis = kin_core::build_genesis_change();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
 
-        let source = kin_core::source_dir(&layout);
+        let source = layout.working_dir();
         std::fs::create_dir_all(source.join("bin")).unwrap();
         let regular = source.join("plain.txt");
         let executable = source.join("bin/run");
@@ -1003,16 +966,10 @@ mod tests {
         let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
         let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
-        let genesis = kin_core::build_genesis_change();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
 
-        let source = kin_core::source_dir(&layout);
+        let source = layout.working_dir();
         let files: &[(&str, &[u8])] = &[
             ("Dockerfile", b"FROM scratch"),
             ("compose.yaml", b"services: {}"),
@@ -1058,14 +1015,8 @@ mod tests {
         let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
         let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
-        let genesis = kin_core::build_genesis_change();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
         let gitlink = TreeEntry::gitlink(kin_model::GitObjectId::sha1([0x61; 20]));
         let head = record_commit(
             &graph,
@@ -1078,7 +1029,7 @@ mod tests {
             &genesis.id,
             "main",
         );
-        let checkout_file = kin_core::source_dir(&layout).join("submodule/src/lib.rs");
+        let checkout_file = layout.working_dir().join("submodule/src/lib.rs");
         std::fs::create_dir_all(checkout_file.parent().unwrap()).unwrap();
         std::fs::write(checkout_file, b"materialized checkout").unwrap();
 
@@ -1097,16 +1048,10 @@ mod tests {
         let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
         let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
-        let genesis = kin_core::build_genesis_change();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
 
-        let source = kin_core::source_dir(&layout);
+        let source = layout.working_dir();
         std::fs::create_dir_all(source.join("target")).unwrap();
         std::fs::create_dir_all(source.join("node_modules/pkg")).unwrap();
         std::fs::write(source.join(".kinignore"), b"target/\nnode_modules/\n.env\n").unwrap();
@@ -1164,14 +1109,8 @@ mod tests {
         let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
         let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
-        let genesis = kin_core::build_genesis_change();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
 
         let missing = RepoPath::from_utf8("missing.txt").unwrap();
         let special = RepoPath::from_utf8("tracked.sock").unwrap();
@@ -1193,8 +1132,7 @@ mod tests {
             &genesis.id,
             "main",
         );
-        let _listener =
-            UnixListener::bind(kin_core::source_dir(&layout).join("tracked.sock")).unwrap();
+        let _listener = UnixListener::bind(layout.working_dir().join("tracked.sock")).unwrap();
 
         let error = admit_working_tree(&graph, &blobs, &layout)
             .expect_err("an incomplete exact scan cannot authorize any inferred removal");
@@ -1215,17 +1153,11 @@ mod tests {
         let graph = Arc::new(kin_db::InMemoryGraph::new());
         let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
 
-        let genesis = kin_core::build_genesis_change();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
 
         // Write a file and add an entity.
-        let src_dir = kin_core::source_dir(&layout);
+        let src_dir = layout.working_dir();
         std::fs::create_dir_all(src_dir.join("src")).unwrap();
         let content = b"pub fn stable() {}\n";
         std::fs::write(src_dir.join("src/lib.rs"), content).unwrap();
