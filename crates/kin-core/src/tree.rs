@@ -5705,6 +5705,7 @@ fn validate_source_symlink_target_with_windows_rules(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_model::Hash256;
 
     fn regular() -> TreeEntryKind {
         TreeEntryKind::Regular { executable: false }

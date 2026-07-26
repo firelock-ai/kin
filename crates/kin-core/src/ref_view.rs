@@ -4,7 +4,6 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
-use std::process::Command;
 
 use kin_blobs::BlobStore;
 use kin_db::{GraphSnapshot, InMemoryGraph};
@@ -32,57 +31,11 @@ use crate::{KinError, Result};
 /// - non-entity tracked files rebuilt from historical blob content
 /// - a fresh in-memory text index aligned with the historical view
 ///
-/// When `repo_path` is provided and a blob is missing from the blob store,
-/// the function repairs the gap by reading from the Git object database and
-/// back-filling the blob store. This is a one-time migration path for repos
-/// initialized before the import.rs fix (commit 244de43) that persists old
-/// blob hashes. Once all repos have been re-initialized or repaired, this
-/// code path becomes dead and can be removed.
-///
 /// Embedding/vector state is intentionally not reconstructed yet.
 pub fn build_graph_at_ref(
     graph: &InMemoryGraph,
     blob_store: &BlobStore,
     head: &SemanticChangeId,
-) -> Result<InMemoryGraph> {
-    build_graph_at_ref_with_repo(graph, blob_store, head, None, None)
-}
-
-pub fn build_graph_at_ref_with_repo(
-    graph: &InMemoryGraph,
-    blob_store: &BlobStore,
-    head: &SemanticChangeId,
-    repo_path: Option<&Path>,
-    oid_cache: Option<&ChangeOidCache>,
-) -> Result<InMemoryGraph> {
-    build_graph_at_ref_with_repo_inner(graph, blob_store, head, repo_path, oid_cache, None)
-}
-
-pub fn build_graph_at_git_ref_with_repo(
-    graph: &InMemoryGraph,
-    blob_store: &BlobStore,
-    head: &SemanticChangeId,
-    repo_path: &Path,
-    git_oid_hint: &str,
-    oid_cache: Option<&ChangeOidCache>,
-) -> Result<InMemoryGraph> {
-    build_graph_at_ref_with_repo_inner(
-        graph,
-        blob_store,
-        head,
-        Some(repo_path),
-        oid_cache,
-        Some(git_oid_hint),
-    )
-}
-
-fn build_graph_at_ref_with_repo_inner(
-    graph: &InMemoryGraph,
-    blob_store: &BlobStore,
-    head: &SemanticChangeId,
-    repo_path: Option<&Path>,
-    oid_cache: Option<&ChangeOidCache>,
-    git_oid_hint: Option<&str>,
 ) -> Result<InMemoryGraph> {
     let build_start = std::time::Instant::now();
     let timing = std::env::var("KIN_SCOPE_TIMING").is_ok();
@@ -102,43 +55,8 @@ fn build_graph_at_ref_with_repo_inner(
         );
     }
 
-    let git_repair = repo_path.and_then(|path| {
-        match GitBlobRepair::new(path, head, &changes, oid_cache, git_oid_hint) {
-            Ok(repair) => Some(repair),
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "failed to initialize git-backed historical ref repair"
-                );
-                None
-            }
-        }
-    });
-    let reader = BlobReader::new(blob_store, git_repair.as_ref(), repo_path);
-    let ref_file_tree = match git_repair
-        .as_ref()
-        .map(|repair| repair.materialize_file_tree(blob_store))
-    {
-        Some(Ok(git_tree)) if !git_tree.is_empty() => {
-            if git_tree != resolved.tree {
-                tracing::warn!(
-                    graph_files = resolved.tree.len(),
-                    git_files = git_tree.len(),
-                    "historical ref graph tree differed from git tree; using Git object tree for scoped source truth"
-                );
-            }
-            git_tree
-        }
-        Some(Ok(_)) => resolved.tree.clone(),
-        Some(Err(err)) => {
-            tracing::warn!(
-                error = %err,
-                "failed to materialize Git tree for historical ref; falling back to exact graph tree"
-            );
-            resolved.tree.clone()
-        }
-        None => resolved.tree.clone(),
-    };
+    let reader = BlobReader::new(blob_store);
+    let ref_file_tree = resolved.tree.clone();
     if timing {
         eprintln!(
             "[scope-timing] after materialize_file_tree: {}ms",
@@ -150,8 +68,6 @@ fn build_graph_at_ref_with_repo_inner(
     snapshot.entities = resolved.entities;
     snapshot.relations = resolved.relations;
     snapshot.entity_revisions = resolved.entity_revisions;
-    snapshot.entity_tombstones = resolved.entity_tombstones;
-    snapshot.relation_tombstones = resolved.relation_tombstones;
     snapshot.changes = changes
         .iter()
         .map(|change| (change.id, change.clone()))
@@ -260,372 +176,26 @@ pub fn filter_vector_results_to_scope(
         .collect()
 }
 
-/// Reads blob content, repairing from Git objects when the blob store misses.
+/// Reads graph-owned blob content from Kin's content-addressed store.
 ///
-/// Layered fallback for missing blobs (Kin's SHA-256 store -> Git tree by path
-/// via gix -> `git cat-file blob`). All tiers verify the content hash matches
-/// the requested Kin SHA-256 before back-filling the store.
-///
-/// Migration debt: the Git repair tiers exist for repos initialized before
-/// import.rs persisted old blob hashes (commit 244de43), and for shallow
-/// clones / integration branches where Kin's blob store hasn't been seeded
-/// for every blob the change DAG references.
+/// Historical query paths never repair or replace graph truth from Git or the
+/// working tree. A missing blob is a graph-integrity error.
 struct BlobReader<'a> {
     blob_store: &'a BlobStore,
-    git_repair: Option<&'a GitBlobRepair>,
-    repo_path: Option<&'a Path>,
 }
 
 impl<'a> BlobReader<'a> {
-    fn new(
-        blob_store: &'a BlobStore,
-        git_repair: Option<&'a GitBlobRepair>,
-        repo_path: Option<&'a Path>,
-    ) -> Self {
-        Self {
-            blob_store,
-            git_repair,
-            repo_path,
-        }
+    fn new(blob_store: &'a BlobStore) -> Self {
+        Self { blob_store }
     }
 
-    fn read(&self, hash: &kin_blobs::Hash256, file_path: &str) -> Option<Vec<u8>> {
-        if let Ok(content) = self.blob_store.read(hash) {
-            return Some(content);
-        }
-        if let Some(content) = self.repair_from_git_tree(hash, file_path) {
-            return Some(content);
-        }
-        if let Some(content) = self.repair_from_git_object(hash, file_path) {
-            return Some(content);
-        }
-        None
-    }
-
-    fn repair_from_git_tree(&self, hash: &kin_blobs::Hash256, file_path: &str) -> Option<Vec<u8>> {
-        let repair = self.git_repair?;
-        let content = repair.read_blob(file_path)?;
-        self.accept_repaired_blob(hash, file_path, content, "git tree")
-    }
-
-    fn repair_from_git_object(
-        &self,
-        hash: &kin_blobs::Hash256,
-        file_path: &str,
-    ) -> Option<Vec<u8>> {
-        let repo_path = self.repo_path?;
-        let content = git_cat_file_blob(repo_path, &hash.to_string())?;
-        self.accept_repaired_blob(hash, file_path, content, "git cat-file")
-    }
-
-    fn accept_repaired_blob(
-        &self,
-        expected: &kin_blobs::Hash256,
-        file_path: &str,
-        content: Vec<u8>,
-        source: &str,
-    ) -> Option<Vec<u8>> {
-        let actual_hash = kin_blobs::digest(&content);
-        if actual_hash != *expected {
-            // Surface as warn (not debug) so silent-pass mode is observable:
-            // caller sees `None` either way, but logs distinguish
-            // "blob missing everywhere" from "blob retrieved but corrupted".
-            tracing::warn!(
-                file = %file_path,
-                expected = %expected,
-                actual = %actual_hash,
-                source = source,
-                "git blob hash mismatch during repair: retrieved blob content does not match expected hash, skipping repair"
-            );
-            return None;
-        }
-        tracing::warn!(
-            file = %file_path,
-            source = source,
-            "repaired missing blob from git — re-init repo to eliminate migration debt"
-        );
-        if let Err(err) = self.blob_store.write(&content) {
-            tracing::debug!(
-                file = %file_path,
-                error = %err,
-                "failed to back-fill blob store during repair"
-            );
-        }
-        Some(content)
-    }
-}
-
-/// Final-tier blob repair: ask Git to dump the blob content for a hash.
-///
-/// Works when the repository is using SHA-256 object format (Git's optional
-/// modern OID format). For SHA-1 repos this returns `None` because Kin's hash
-/// won't address any Git object; that failure is expected and silent.
-fn git_cat_file_blob(repo_path: &Path, hash_hex: &str) -> Option<Vec<u8>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_path)
-        .arg("cat-file")
-        .arg("blob")
-        .arg(hash_hex)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(output.stdout)
-}
-
-/// One-time blob repair from Git for repos with unpersisted old blob hashes.
-///
-/// Constructed once per `build_graph_at_ref` call when `repo_path` is provided
-/// and the head change maps to an imported git commit. Reads blob content
-/// from Git's object database and back-fills the blob store so subsequent
-/// reads are served from the blob store directly.
-///
-/// Migration debt: remove once all active repos have been re-initialized
-/// with the import.rs fix that persists old blob hashes (commit 244de43).
-struct GitBlobRepair {
-    repo: gix::Repository,
-    repo_path: std::path::PathBuf,
-    git_oid: gix::ObjectId,
-    tree_id: gix::ObjectId,
-}
-
-fn open_repo(path: &Path) -> std::result::Result<gix::Repository, gix::open::Error> {
-    let dot_git = path.join(".git");
-    if dot_git.is_dir() {
-        gix::open(dot_git)
-    } else {
-        gix::open(path)
-    }
-}
-
-impl GitBlobRepair {
-    fn new(
-        repo_path: &Path,
-        head: &SemanticChangeId,
-        _changes: &[SemanticChange],
-        oid_cache: Option<&ChangeOidCache>,
-        git_oid_hint: Option<&str>,
-    ) -> std::result::Result<Self, String> {
-        let repo = open_repo(repo_path).map_err(|e| e.to_string())?;
-        let git_oid = if let Some(git_oid) = git_oid_hint {
-            let oid = gix::ObjectId::from_hex(git_oid.as_bytes())
-                .map_err(|err| format!("invalid git oid hint '{git_oid}': {err}"))?;
-            let hinted_change = change_id_from_git_oid_for_ref_view(&oid);
-            if hinted_change != *head {
-                return Err(format!(
-                    "git oid hint {git_oid} maps to {hinted_change}, not requested change {head}"
-                ));
-            }
-            oid
-        } else {
-            find_git_oid_for_change(&repo, head, oid_cache)?
-        };
-        let tree_id = {
-            let commit = repo.find_commit(git_oid).map_err(|e| e.to_string())?;
-            let tree = commit.tree().map_err(|e| e.to_string())?;
-            tree.id
-        };
-        Ok(Self {
-            repo,
-            repo_path: repo_path.to_path_buf(),
-            git_oid,
-            tree_id,
+    fn read(&self, hash: &kin_blobs::Hash256, file_path: &str) -> Result<Vec<u8>> {
+        self.blob_store.read(hash).map_err(|error| {
+            KinError::Graph(format!(
+                "graph tree references missing or corrupt blob {hash} for {file_path}: {error}"
+            ))
         })
     }
-
-    fn read_blob(&self, file_path: &str) -> Option<Vec<u8>> {
-        let tree = self.repo.find_tree(self.tree_id).ok()?;
-        let entry = tree.lookup_entry_by_path(file_path).ok()??;
-        let object = entry.object().ok()?;
-        Some(object.data.to_vec())
-    }
-
-    fn materialize_file_tree(
-        &self,
-        blob_store: &BlobStore,
-    ) -> std::result::Result<HashMap<FilePathId, TreeEntry>, String> {
-        let timing = std::env::var("KIN_SCOPE_TIMING").is_ok();
-        let t_lstree = std::time::Instant::now();
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&self.repo_path)
-            .arg("ls-tree")
-            .arg("-rz")
-            .arg(self.git_oid.to_string())
-            .output()
-            .map_err(|err| format!("git ls-tree failed to start: {err}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "git ls-tree exited with status {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-        let lstree_ms = t_lstree.elapsed().as_millis();
-
-        let t_loop = std::time::Instant::now();
-        let mut blob_count = 0usize;
-        let mut file_tree = HashMap::new();
-        for raw in output.stdout.split(|byte| *byte == 0) {
-            if raw.is_empty() {
-                continue;
-            }
-            let record =
-                std::str::from_utf8(raw).map_err(|err| format!("non-utf8 git path: {err}"))?;
-            let Some((meta, path)) = record.split_once('\t') else {
-                continue;
-            };
-            let mut meta_parts = meta.split_whitespace();
-            let Some(mode) = meta_parts.next() else {
-                continue;
-            };
-            let Some(kind) = meta_parts.next() else {
-                continue;
-            };
-            let Some(oid) = meta_parts.next() else {
-                continue;
-            };
-            if kind == "commit" {
-                return Err(format!(
-                    "historical Git tree contains unsupported gitlink {path}; exact TreeEntryKind has no gitlink variant"
-                ));
-            }
-            if kind != "blob" {
-                continue;
-            }
-            let entry_kind = match mode {
-                "100644" => TreeEntryKind::Regular { executable: false },
-                "100755" => TreeEntryKind::Regular { executable: true },
-                "120000" => TreeEntryKind::Symlink,
-                other => {
-                    return Err(format!(
-                        "historical Git tree contains unsupported mode {other} for {path}"
-                    ));
-                }
-            };
-            blob_count += 1;
-
-            let content = Command::new("git")
-                .arg("-C")
-                .arg(&self.repo_path)
-                .arg("cat-file")
-                .arg("blob")
-                .arg(oid)
-                .output()
-                .map_err(|err| format!("git cat-file failed to start for {path}: {err}"))?;
-            if !content.status.success() {
-                return Err(format!(
-                    "git cat-file failed for {path} ({oid}) with status {}: {}",
-                    content.status,
-                    String::from_utf8_lossy(&content.stderr)
-                ));
-            }
-            let hash = blob_store
-                .write(&content.stdout)
-                .map_err(|err| format!("failed to write git blob for {path}: {err}"))?;
-            file_tree.insert(
-                FilePathId::new(path),
-                TreeEntry {
-                    blob_hash: Hash256::from_bytes(hash.0),
-                    kind: entry_kind,
-                },
-            );
-        }
-        if timing {
-            eprintln!(
-                "[scope-timing] materialize_file_tree: {blob_count} blobs, ls-tree {lstree_ms}ms, cat-file loop {}ms",
-                t_loop.elapsed().as_millis()
-            );
-        }
-
-        Ok(file_tree)
-    }
-}
-
-fn change_id_from_git_oid_for_ref_view(oid: &gix::ObjectId) -> SemanticChangeId {
-    use sha2::{Digest, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(b"kin-git-import-v1:");
-    hasher.update(oid.as_bytes());
-    let result = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&result);
-    SemanticChangeId::from_hash(Hash256::from_bytes(bytes))
-}
-
-/// Pre-computed mapping from SemanticChangeId to Git OID.
-/// Build once, reuse across multiple `build_graph_at_ref` calls for
-/// fast scope switching without re-walking the commit DAG.
-pub type ChangeOidCache = HashMap<SemanticChangeId, gix::ObjectId>;
-
-/// Build a complete SemanticChangeId → Git OID mapping by walking all
-/// reachable commits from HEAD. O(N) in commit count but only needs
-/// to be done once per repo session.
-pub fn build_change_oid_cache(
-    repo: &gix::Repository,
-) -> std::result::Result<ChangeOidCache, String> {
-    use sha2::{Digest, Sha256};
-
-    let tip = repo.head_id().map_err(|e| e.to_string())?.detach();
-    let walk = repo.rev_walk([tip]).all().map_err(|e| e.to_string())?;
-
-    let mut cache = HashMap::new();
-    for info_result in walk {
-        let info = info_result.map_err(|e| e.to_string())?;
-        let oid = info.id;
-        let mut hasher = Sha256::new();
-        hasher.update(b"kin-git-import-v1:");
-        hasher.update(oid.as_bytes());
-        let result = hasher.finalize();
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&result);
-        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes(bytes));
-        cache.insert(change_id, oid);
-    }
-
-    Ok(cache)
-}
-
-/// Find the git OID that corresponds to a SemanticChangeId.
-/// When a pre-built cache is provided, this is an O(1) lookup.
-/// Otherwise falls back to walking all reachable commits (O(N)).
-fn find_git_oid_for_change(
-    repo: &gix::Repository,
-    head: &SemanticChangeId,
-    cache: Option<&ChangeOidCache>,
-) -> std::result::Result<gix::ObjectId, String> {
-    if let Some(cache) = cache {
-        return cache
-            .get(head)
-            .copied()
-            .ok_or_else(|| format!("no git commit found for change {head} (cached)"));
-    }
-
-    use sha2::{Digest, Sha256};
-
-    let tip = repo.head_id().map_err(|e| e.to_string())?.detach();
-
-    let walk = repo.rev_walk([tip]).all().map_err(|e| e.to_string())?;
-
-    for info_result in walk {
-        let info = info_result.map_err(|e| e.to_string())?;
-        let oid = info.id;
-        let mut hasher = Sha256::new();
-        hasher.update(b"kin-git-import-v1:");
-        hasher.update(oid.as_bytes());
-        let result = hasher.finalize();
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&result);
-        let candidate = SemanticChangeId::from_hash(Hash256::from_bytes(bytes));
-        if candidate == *head {
-            return Ok(oid);
-        }
-    }
-
-    Err(format!("no git commit found for change {head}"))
 }
 
 /// Snapshot of which changes and entities are alive at the target ref.
@@ -1005,23 +575,15 @@ fn rebuild_non_entity_tracked_files(
 
     for (file_id, entry) in file_tree {
         if build_start.elapsed().as_secs_f64() > build_timeout_secs {
-            tracing::warn!(
-                "rebuild_non_entity_tracked_files: timeout after {:.1}s, returning partial results",
-                build_start.elapsed().as_secs_f64()
-            );
-            break;
+            return Err(KinError::Other(format!(
+                "historical graph reconstruction exceeded its {build_timeout_secs:.1}s deadline while rebuilding non-entity entries"
+            )));
         }
         if entity_paths.contains(&file_id.0) {
             continue;
         }
 
-        let content = match reader.read(&entry.blob_hash, &file_id.0) {
-            Some(content) => content,
-            None => {
-                tracing::warn!(file = %file_id, hash = %entry.blob_hash, "skipping historical tracked file with missing blob");
-                continue;
-            }
-        };
+        let content = reader.read(&entry.blob_hash, &file_id.0)?;
 
         match FileClassifier::classify_with_content(Path::new(&file_id.0), &content) {
             FileClassification::EntitySource => {}
@@ -1094,23 +656,11 @@ fn rebuild_entity_source_file_layouts(
 
     for (file_id, entry) in file_tree {
         if build_start.elapsed().as_secs_f64() > build_timeout_secs {
-            tracing::warn!(
-                "rebuild_entity_source_file_layouts: timeout after {:.1}s, returning partial results",
-                build_start.elapsed().as_secs_f64()
-            );
-            break;
+            return Err(KinError::Other(format!(
+                "historical graph reconstruction exceeded its {build_timeout_secs:.1}s deadline while rebuilding entity-source entries"
+            )));
         }
-        let content = match reader.read(&entry.blob_hash, &file_id.0) {
-            Some(content) => content,
-            None => {
-                tracing::warn!(
-                    file = %file_id,
-                    hash = %entry.blob_hash,
-                    "skipping historical source layout with missing blob"
-                );
-                continue;
-            }
-        };
+        let content = reader.read(&entry.blob_hash, &file_id.0)?;
         if entry.kind == TreeEntryKind::Symlink
             || !matches!(
                 FileClassifier::classify_with_content(Path::new(&file_id.0), &content),
@@ -1260,11 +810,20 @@ fn rebuild_entity_source_file_layouts(
 
     if !parsed_files.is_empty() {
         let universe_entities = snapshot.entities.values().cloned().collect::<Vec<_>>();
-        parsed_relations.extend(link_cross_file_against_entities_with_completeness(
-            &parsed_files,
-            &universe_entities,
-            &parse_completeness,
-        ));
+        let artifact_ids = snapshot
+            .artifact_index
+            .iter()
+            .map(|(file_id, artifact_id)| (file_id.0.clone(), *artifact_id))
+            .collect::<HashMap<_, _>>();
+        parsed_relations.extend(
+            link_cross_file_against_entities_with_completeness(
+                &parsed_files,
+                &universe_entities,
+                &artifact_ids,
+                &parse_completeness,
+            )
+            .map_err(|error| KinError::Other(format!("cross-file linking failed: {error}")))?,
+        );
     }
 
     parsed_relations.extend(projection_relations);
@@ -1660,15 +1219,14 @@ mod tests {
 
     use kin_blobs::BlobStore;
     use kin_model::{
-        ArtifactDelta, ArtifactDeltaKind, AuthorId, Entity, EntityDelta, EntityKind, EntityRole,
-        EntityStore, FingerprintAlgorithm, LanguageId, SemanticChange, SemanticFingerprint,
-        SourceSpan, Timestamp, Visibility,
+        AuthorId, Entity, EntityDelta, EntityKind, EntityRole, EntityStore, FingerprintAlgorithm,
+        LanguageId, SemanticChange, SemanticFingerprint, SourceSpan, Timestamp, Visibility,
     };
 
     fn change(
         id: SemanticChangeId,
         parents: Vec<SemanticChangeId>,
-        artifact_deltas: Vec<ArtifactDelta>,
+        tree_deltas: Vec<TreeDelta>,
     ) -> SemanticChange {
         SemanticChange {
             id,
@@ -1678,7 +1236,7 @@ mod tests {
             message: format!("change {}", id),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas,
+            tree_deltas,
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -1687,40 +1245,26 @@ mod tests {
         }
     }
 
-    fn git_change_id_for_test(git_oid_hex: &str) -> SemanticChangeId {
-        use sha2::{Digest, Sha256};
-
-        let oid = gix::ObjectId::from_hex(git_oid_hex.as_bytes()).unwrap();
-        let mut hasher = Sha256::new();
-        hasher.update(b"kin-git-import-v1:");
-        hasher.update(oid.as_bytes());
-        let result = hasher.finalize();
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&result);
-        SemanticChangeId::from_hash(Hash256::from_bytes(bytes))
+    fn added(path: &str, hash: Hash256) -> TreeDelta {
+        TreeDelta::Added {
+            file_id: FilePathId::new(path),
+            new_entry: TreeEntry::regular(hash, false),
+        }
     }
 
-    fn run_git(repo: &Path, args: &[&str]) -> String {
-        let mut cmd = Command::new("git");
-        cmd.arg("-C").arg(repo).args(args);
-        // Explicit increasing commit timestamps: order-sensitive fixtures must
-        // not depend on wall-clock second granularity.
-        if args.first() == Some(&"commit") {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static COMMIT_EPOCH: AtomicU64 = AtomicU64::new(1_000_000_000);
-            let date = format!("{} +0000", COMMIT_EPOCH.fetch_add(100, Ordering::Relaxed));
-            cmd.env("GIT_AUTHOR_DATE", &date)
-                .env("GIT_COMMITTER_DATE", &date);
+    fn modified(path: &str, old_hash: Hash256, new_hash: Hash256) -> TreeDelta {
+        TreeDelta::Modified {
+            file_id: FilePathId::new(path),
+            old_entry: TreeEntry::regular(old_hash, false),
+            new_entry: TreeEntry::regular(new_hash, false),
         }
-        let output = cmd
-            .output()
-            .unwrap_or_else(|err| panic!("failed to run git {args:?}: {err}"));
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn removed(path: &str, hash: Hash256) -> TreeDelta {
+        TreeDelta::Removed {
+            file_id: FilePathId::new(path),
+            old_entry: TreeEntry::regular(hash, false),
+        }
     }
 
     #[test]
@@ -1741,20 +1285,7 @@ mod tests {
             .create_change(&change(
                 add_id,
                 vec![genesis_id],
-                vec![
-                    ArtifactDelta {
-                        file_id: FilePathId::new("README.md"),
-                        kind: ArtifactDeltaKind::Added,
-                        old_hash: None,
-                        new_hash: Some(readme_v1),
-                    },
-                    ArtifactDelta {
-                        file_id: FilePathId::new("Cargo.toml"),
-                        kind: ArtifactDeltaKind::Added,
-                        old_hash: None,
-                        new_hash: Some(cargo_v1),
-                    },
-                ],
+                vec![added("README.md", readme_v1), added("Cargo.toml", cargo_v1)],
             ))
             .unwrap();
 
@@ -1764,12 +1295,7 @@ mod tests {
             .create_change(&change(
                 head_id,
                 vec![add_id],
-                vec![ArtifactDelta {
-                    file_id: FilePathId::new("README.md"),
-                    kind: ArtifactDeltaKind::Modified,
-                    old_hash: Some(readme_v1),
-                    new_hash: Some(readme_v2),
-                }],
+                vec![modified("README.md", readme_v1, readme_v2)],
             ))
             .unwrap();
 
@@ -1793,77 +1319,6 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(historical.text_search("Deployment", 10).unwrap().is_empty());
-    }
-
-    #[test]
-    fn build_graph_at_ref_with_repo_uses_git_tree_over_stale_artifact_delta() {
-        let repo = tempfile::tempdir().unwrap();
-        run_git(repo.path(), &["init"]);
-        run_git(repo.path(), &["config", "user.email", "kin@example.test"]);
-        run_git(repo.path(), &["config", "user.name", "Kin Test"]);
-
-        let source_path = repo.path().join("src/lib.cpp");
-        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &source_path,
-            "int main() {\n  return 0;\n}\n// OLD_BASE_ONLY\n",
-        )
-        .unwrap();
-        run_git(repo.path(), &["add", "src/lib.cpp"]);
-        run_git(repo.path(), &["commit", "-m", "base"]);
-        let base_oid = run_git(repo.path(), &["rev-parse", "HEAD"]);
-
-        std::fs::write(
-            &source_path,
-            "int main() {\n  return 0;\n}\n// JSON_PRIVATE_UNLESS_TESTED\n",
-        )
-        .unwrap();
-        run_git(repo.path(), &["add", "src/lib.cpp"]);
-        run_git(repo.path(), &["commit", "-m", "future"]);
-
-        let graph = InMemoryGraph::new();
-        let blob_temp = tempfile::tempdir().unwrap();
-        let blob_store = BlobStore::new(blob_temp.path().join("objects")).unwrap();
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x91; 32]));
-        graph
-            .create_change(&change(genesis_id, vec![], vec![]))
-            .unwrap();
-
-        let stale_future_hash = blob_store
-            .write(b"int main() {\n  return 0;\n}\n// JSON_PRIVATE_UNLESS_TESTED\n")
-            .unwrap();
-        let base_id = git_change_id_for_test(&base_oid);
-        graph
-            .create_change(&change(
-                base_id,
-                vec![genesis_id],
-                vec![ArtifactDelta {
-                    file_id: FilePathId::new("src/lib.cpp"),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(stale_future_hash),
-                }],
-            ))
-            .unwrap();
-
-        let historical = build_graph_at_git_ref_with_repo(
-            &graph,
-            &blob_store,
-            &base_id,
-            repo.path(),
-            &base_oid,
-            None,
-        )
-        .unwrap();
-
-        assert!(!historical
-            .text_search("OLD_BASE_ONLY", 10)
-            .unwrap()
-            .is_empty());
-        assert!(historical
-            .text_search("JSON_PRIVATE_UNLESS_TESTED", 10)
-            .unwrap()
-            .is_empty());
     }
 
     #[test]
@@ -1893,12 +1348,7 @@ mod tests {
                 message: "add main".to_string(),
                 entity_deltas: vec![EntityDelta::Added(main_entity)],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
-                    file_id: FilePathId::new("src/main.c"),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(source_hash),
-                }],
+                tree_deltas: vec![added("src/main.c", source_hash)],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -1950,12 +1400,7 @@ mod tests {
                 message: "auto-parse".to_string(),
                 entity_deltas: vec![EntityDelta::Added(processor.clone())],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
-                    file_id: FilePathId::new("src/lib.py"),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(current_hash),
-                }],
+                tree_deltas: vec![added("src/lib.py", current_hash)],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -1972,12 +1417,7 @@ mod tests {
             .create_change(&change(
                 historical_id,
                 vec![auto_parse_id],
-                vec![ArtifactDelta {
-                    file_id: FilePathId::new("src/lib.py"),
-                    kind: ArtifactDeltaKind::Modified,
-                    old_hash: Some(current_hash),
-                    new_hash: Some(historical_hash),
-                }],
+                vec![modified("src/lib.py", current_hash, historical_hash)],
             ))
             .unwrap();
 
@@ -2027,12 +1467,7 @@ mod tests {
             .create_change(&change(
                 historical_id,
                 vec![genesis_id],
-                vec![ArtifactDelta {
-                    file_id: FilePathId::new("src/lib.py"),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(historical_hash),
-                }],
+                vec![added("src/lib.py", historical_hash)],
             ))
             .unwrap();
 
@@ -2091,12 +1526,7 @@ mod tests {
                 message: "aliased historical file".to_string(),
                 entity_deltas: vec![EntityDelta::Added(aliased.clone())],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
-                    file_id: FilePathId::new("src/lib.py"),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(source_hash),
-                }],
+                tree_deltas: vec![added("src/lib.py", source_hash)],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -2159,12 +1589,7 @@ mod tests {
                 message: "suffix-aliased historical file".to_string(),
                 entity_deltas: vec![EntityDelta::Added(aliased.clone())],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
-                    file_id: FilePathId::new("project/src/lib.py"),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(source_hash),
-                }],
+                tree_deltas: vec![added("project/src/lib.py", source_hash)],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -2217,12 +1642,7 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
                 message: "sparse imported history".to_string(),
                 entity_deltas: vec![EntityDelta::Added(processor.clone())],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
-                    file_id: FilePathId::new("src/lib.py"),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(historical_hash),
-                }],
+                tree_deltas: vec![added("src/lib.py", historical_hash)],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -2416,11 +1836,11 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
         let file_tree: HashMap<FilePathId, TreeEntry> = [
             (
                 FilePathId::new("single_include/catch.hpp"),
-                Hash256::from_bytes([0x11; 32]),
+                TreeEntry::regular(Hash256::from_bytes([0x11; 32]), false),
             ),
             (
                 FilePathId::new("include/reporters/catch_reporter_multi.hpp"),
-                Hash256::from_bytes([0x22; 32]),
+                TreeEntry::regular(Hash256::from_bytes([0x22; 32]), false),
             ),
         ]
         .into_iter()
@@ -2611,12 +2031,7 @@ def uri_encoder(value):\n    return value\n",
                 message: "create victim".to_string(),
                 entity_deltas: vec![EntityDelta::Added(victim.clone())],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
-                    file_id: FilePathId::new("src/lib.py"),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(stale_hash),
-                }],
+                tree_deltas: vec![added("src/lib.py", stale_hash)],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -2646,12 +2061,7 @@ def uri_encoder(value):\n    return value\n",
                 message: "remove victim, update source".to_string(),
                 entity_deltas: vec![EntityDelta::Removed(victim.id)],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
-                    file_id: FilePathId::new("src/lib.py"),
-                    kind: ArtifactDeltaKind::Modified,
-                    old_hash: Some(stale_hash),
-                    new_hash: Some(new_hash),
-                }],
+                tree_deltas: vec![modified("src/lib.py", stale_hash, new_hash)],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -2715,19 +2125,9 @@ def uri_encoder(value):\n    return value\n",
                 message: "collision".to_string(),
                 entity_deltas: vec![EntityDelta::Added(entity_a.clone())],
                 relation_deltas: vec![],
-                artifact_deltas: vec![
-                    ArtifactDelta {
-                        file_id: FilePathId::new("crates/a/src/mod.rs"),
-                        kind: ArtifactDeltaKind::Added,
-                        old_hash: None,
-                        new_hash: Some(mod_a),
-                    },
-                    ArtifactDelta {
-                        file_id: FilePathId::new("crates/b/src/mod.rs"),
-                        kind: ArtifactDeltaKind::Added,
-                        old_hash: None,
-                        new_hash: Some(mod_b),
-                    },
+                tree_deltas: vec![
+                    added("crates/a/src/mod.rs", mod_a),
+                    added("crates/b/src/mod.rs", mod_b),
                 ],
                 projected_files: vec![],
                 spec_link: None,
@@ -2768,12 +2168,7 @@ def uri_encoder(value):\n    return value\n",
             message: "create".into(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
-                file_id: FilePathId::new("old/path/file.rs"),
-                kind: ArtifactDeltaKind::Added,
-                old_hash: None,
-                new_hash: Some(resolver_blob),
-            }],
+            tree_deltas: vec![added("old/path/file.rs", resolver_blob)],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -2788,19 +2183,9 @@ def uri_encoder(value):\n    return value\n",
             message: "rename".into(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![
-                ArtifactDelta {
-                    file_id: FilePathId::new("old/path/file.rs"),
-                    kind: ArtifactDeltaKind::Removed,
-                    old_hash: Some(resolver_blob),
-                    new_hash: None,
-                },
-                ArtifactDelta {
-                    file_id: FilePathId::new("new/path/file.rs"),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(resolver_blob),
-                },
+            tree_deltas: vec![
+                removed("old/path/file.rs", resolver_blob),
+                added("new/path/file.rs", resolver_blob),
             ],
             projected_files: vec![],
             spec_link: None,
@@ -2810,7 +2195,10 @@ def uri_encoder(value):\n    return value\n",
         };
 
         let mut file_tree = HashMap::new();
-        file_tree.insert(FilePathId::new("new/path/file.rs"), resolver_blob);
+        file_tree.insert(
+            FilePathId::new("new/path/file.rs"),
+            TreeEntry::regular(resolver_blob, false),
+        );
 
         let resolver =
             HistoricalPathResolver::from_changes(&[create_change, rename_change], &file_tree);
@@ -2820,60 +2208,17 @@ def uri_encoder(value):\n    return value\n",
         assert_eq!(resolved, FilePathId::new("new/path/file.rs"));
     }
 
-    /// Gap 4: when the blob store doesn't have a hash and no git repair is
-    /// available, reads return None — no panic, no silent garbage.
     #[test]
-    fn blob_reader_returns_none_when_all_tiers_miss() {
+    fn blob_reader_fails_loud_when_graph_blob_is_missing() {
         let temp = tempfile::tempdir().unwrap();
         let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
-        let reader = BlobReader::new(&blob_store, None, None);
-        // Hash that was never written.
+        let reader = BlobReader::new(&blob_store);
         let missing = kin_blobs::Hash256::from_bytes([0xfe; 32]);
-        assert!(reader.read(&missing, "any/path").is_none());
-    }
-
-    /// Gap 4 (audit follow-up): when a fallback tier returns content whose
-    /// hash does not match the expected hash, accept_repaired_blob refuses
-    /// the repair (returns None) and emits a warn-level log so the
-    /// silent-pass mode is observable to operators.
-    ///
-    /// Note: log emission itself is not asserted here — the kin-core test
-    /// suite has no log-capture helper. The log promotion to warn is
-    /// covered by inspecting the source: accept_repaired_blob uses
-    /// `tracing::warn!` on the mismatch path.
-    #[test]
-    fn blob_reader_warns_on_hash_mismatch_during_repair() {
-        let temp = tempfile::tempdir().unwrap();
-        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
-        let reader = BlobReader::new(&blob_store, None, None);
-
-        // Expected hash addresses some imaginary blob; the content we hand
-        // in corresponds to a different payload and therefore hashes to a
-        // different value. accept_repaired_blob must refuse it.
-        let real_content = b"actual blob content from git fallback";
-        let actual_hash = kin_blobs::digest(real_content);
-        let expected_hash = kin_blobs::Hash256::from_bytes([0xab; 32]);
-        assert_ne!(actual_hash, expected_hash);
-
-        let result = reader.accept_repaired_blob(
-            &expected_hash,
-            "src/lib.rs",
-            real_content.to_vec(),
-            "git tree",
-        );
+        let error = reader.read(&missing, "any/path").unwrap_err().to_string();
         assert!(
-            result.is_none(),
-            "hash-mismatched repaired blob must be rejected"
-        );
-
-        // The blob store must NOT have been polluted by the rejected content.
-        assert!(
-            blob_store.read(&expected_hash).is_err(),
-            "rejected blob must not be back-filled under the expected hash"
-        );
-        assert!(
-            blob_store.read(&actual_hash).is_err(),
-            "rejected blob must not be back-filled under its own hash either"
+            error.contains("graph tree references missing or corrupt blob")
+                && error.contains("any/path"),
+            "unexpected error: {error}"
         );
     }
 
@@ -2898,12 +2243,7 @@ def uri_encoder(value):\n    return value\n",
             message: "create".into(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
-                file_id: FilePathId::new("path-a"),
-                kind: ArtifactDeltaKind::Added,
-                old_hash: None,
-                new_hash: Some(blob_ab),
-            }],
+            tree_deltas: vec![added("path-a", blob_ab)],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -2919,20 +2259,7 @@ def uri_encoder(value):\n    return value\n",
             message: "a->b".into(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![
-                ArtifactDelta {
-                    file_id: FilePathId::new("path-a"),
-                    kind: ArtifactDeltaKind::Removed,
-                    old_hash: Some(blob_ab),
-                    new_hash: None,
-                },
-                ArtifactDelta {
-                    file_id: FilePathId::new("path-b"),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(blob_ab),
-                },
-            ],
+            tree_deltas: vec![removed("path-a", blob_ab), added("path-b", blob_ab)],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -2950,20 +2277,7 @@ def uri_encoder(value):\n    return value\n",
             message: "b->c".into(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![
-                ArtifactDelta {
-                    file_id: FilePathId::new("path-b"),
-                    kind: ArtifactDeltaKind::Removed,
-                    old_hash: Some(blob_bc),
-                    new_hash: None,
-                },
-                ArtifactDelta {
-                    file_id: FilePathId::new("path-c"),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(blob_bc),
-                },
-            ],
+            tree_deltas: vec![removed("path-b", blob_bc), added("path-c", blob_bc)],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -2972,7 +2286,10 @@ def uri_encoder(value):\n    return value\n",
         };
 
         let mut file_tree = HashMap::new();
-        file_tree.insert(FilePathId::new("path-c"), blob_bc);
+        file_tree.insert(
+            FilePathId::new("path-c"),
+            TreeEntry::regular(blob_bc, false),
+        );
 
         let resolver =
             HistoricalPathResolver::from_changes(&[create_change, rename1, rename2], &file_tree);
@@ -3001,7 +2318,10 @@ def uri_encoder(value):\n    return value\n",
         let resolver_blob = Hash256::from_bytes([0xaa; 32]);
         let mut file_tree = HashMap::new();
         // The tree has the inner path (like in old commit)
-        file_tree.insert(FilePathId::new("src/compiler/phases/css.js"), resolver_blob);
+        file_tree.insert(
+            FilePathId::new("src/compiler/phases/css.js"),
+            TreeEntry::regular(resolver_blob, false),
+        );
 
         let resolver = HistoricalPathResolver::from_changes(&[], &file_tree);
 
@@ -3018,7 +2338,7 @@ def uri_encoder(value):\n    return value\n",
         let mut file_tree_nested = HashMap::new();
         file_tree_nested.insert(
             FilePathId::new("packages/svelte/src/compiler/phases/css.js"),
-            resolver_blob,
+            TreeEntry::regular(resolver_blob, false),
         );
 
         let resolver_nested = HistoricalPathResolver::from_changes(&[], &file_tree_nested);
@@ -3041,11 +2361,11 @@ def uri_encoder(value):\n    return value\n",
         // The tree has the historical path: packages/material-ui/src/useAutocomplete/index.js
         file_tree.insert(
             FilePathId::new("packages/material-ui/src/useAutocomplete/index.js"),
-            resolver_blob,
+            TreeEntry::regular(resolver_blob, false),
         );
         file_tree.insert(
             FilePathId::new("packages/material-ui/src/index.js"),
-            resolver_blob,
+            TreeEntry::regular(resolver_blob, false),
         );
 
         let resolver = HistoricalPathResolver::from_changes(&[], &file_tree);

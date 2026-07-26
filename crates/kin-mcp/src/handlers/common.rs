@@ -1031,7 +1031,11 @@ pub fn read_entity_source_excerpt_detailed<G: GraphStore>(
 
     // Retrieve graph hash
     let graph_hash = if let Some(ref file_origin) = entity.file_origin {
-        store.get_file_hash(file_origin).ok().flatten()
+        store
+            .get_tree_entry(file_origin)
+            .ok()
+            .flatten()
+            .map(|entry| entry.blob_hash)
     } else {
         None
     };

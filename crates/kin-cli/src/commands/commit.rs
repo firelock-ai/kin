@@ -17,8 +17,8 @@ use anyhow::Result;
 use kin_index::{FileClassification, FileClassifier};
 #[cfg(test)]
 use kin_model::{
-    relation::GraphNodeId, ArtifactDelta, ArtifactDeltaKind, ArtifactId, AuthorId, EntityDelta,
-    FilePathId, Hash256, RelationDelta, SemanticChange, ShallowTrackedFile, Timestamp,
+    relation::GraphNodeId, AuthorId, EntityDelta, FilePathId, Hash256, RelationDelta,
+    SemanticChange, ShallowTrackedFile, Timestamp, TreeDelta, TreeEntryKind,
 };
 
 pub async fn run(message: String, quiet: bool) -> Result<()> {
@@ -86,7 +86,7 @@ async fn run_local_commit_pipeline_for_tests(
     // Parse files and extract entities
     let registry = kin_parser::AdapterRegistry::new();
     let mut entity_deltas = Vec::new();
-    let mut artifact_deltas = Vec::new();
+    let mut tree_deltas = Vec::new();
 
     // Accumulate shallow changes for the daemon.
     let mut shallow_upserts = Vec::new();
@@ -125,40 +125,41 @@ async fn run_local_commit_pipeline_for_tests(
             .to_string_lossy()
             .to_string();
 
-        let source = match std::fs::read(file_path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("warning: failed to read {}: {}", rel_path, e);
-                continue;
-            }
+        let Some((tree_entry, source)) =
+            super::session_base::read_disk_entry(file_path).map_err(|error| {
+                anyhow::anyhow!("failed to read exact tree entry {}: {}", rel_path, error)
+            })?
+        else {
+            continue;
         };
-
-        // Check if this blob already exists (file was previously indexed)
-        let content_hash_preview = kin_blobs::digest(&source);
-        let previously_stored = blob_store.exists(&content_hash_preview).unwrap_or(false);
 
         // Store file content in blob store
         let blob_hash = blob_store
             .write(&source)
             .map_err(|e| anyhow::anyhow!("blob write failed: {}", e))?;
         let content_hash = Hash256::from_bytes(blob_hash.0);
+        if content_hash != tree_entry.blob_hash {
+            anyhow::bail!("tree entry changed while committing {}", rel_path);
+        }
 
         let file_id = FilePathId::new(&rel_path);
 
-        // Determine artifact delta kind: check both entity history and blob existence
+        // Exact repository deltas are independent of parser/enrichment state.
         let existing_file_entities = existing_by_file.get(&rel_path);
-        let artifact_kind = if existing_file_entities.is_some() || previously_stored {
-            ArtifactDeltaKind::Modified
-        } else {
-            ArtifactDeltaKind::Added
-        };
-
-        artifact_deltas.push(ArtifactDelta {
-            file_id: file_id.clone(),
-            kind: artifact_kind,
-            old_hash: None,
-            new_hash: Some(content_hash),
-        });
+        match previous_tree.get(&file_id) {
+            None => tree_deltas.push(TreeDelta::Added {
+                file_id: file_id.clone(),
+                new_entry: tree_entry,
+            }),
+            Some(old_entry) if *old_entry != tree_entry => {
+                tree_deltas.push(TreeDelta::Modified {
+                    file_id: file_id.clone(),
+                    old_entry: *old_entry,
+                    new_entry: tree_entry,
+                });
+            }
+            Some(_) => {}
+        }
 
         total_files += 1;
 
@@ -170,6 +171,14 @@ async fn run_local_commit_pipeline_for_tests(
                 "[{}/{}] {}% | {} entities | {:.1}s",
                 total_files, file_count, pct, total_entity_count, elapsed
             ));
+        }
+
+        if tree_entry.kind == TreeEntryKind::Symlink {
+            shallow_clears.push(file_id.clone());
+            clear_shallow_tracking(&layout, graph, &file_id)?;
+            graph.delete_file_layout(&file_id)?;
+            parsed_file_entity_names.insert(rel_path, HashSet::new());
+            continue;
         }
 
         // Classify the file and route to the appropriate handler
@@ -328,13 +337,13 @@ async fn run_local_commit_pipeline_for_tests(
             FileClassification::StructuredArtifact(_kind) => {
                 shallow_clears.push(file_id.clone());
                 clear_shallow_tracking(&layout, graph, &file_id)?;
-                // Structured artifacts are tracked via artifact deltas (already added above).
+                // Structured artifacts remain exact tree entries without entities.
                 // No entity extraction needed.
             }
             FileClassification::OpaqueArtifact { .. } => {
                 shallow_clears.push(file_id.clone());
                 clear_shallow_tracking(&layout, graph, &file_id)?;
-                // Opaque artifacts are tracked via artifact deltas (already added above).
+                // Opaque artifacts remain exact tree entries without entities.
                 // No entity extraction needed.
             }
         }
@@ -385,13 +394,11 @@ async fn run_local_commit_pipeline_for_tests(
         }
     }
 
-    for (file_id, old_hash) in &previous_tree {
+    for (file_id, old_entry) in &previous_tree {
         if !current_files.contains(&file_id.0) {
-            artifact_deltas.push(ArtifactDelta {
+            tree_deltas.push(TreeDelta::Removed {
                 file_id: file_id.clone(),
-                kind: ArtifactDeltaKind::Removed,
-                old_hash: Some(*old_hash),
-                new_hash: None,
+                old_entry: *old_entry,
             });
         }
     }
@@ -438,7 +445,7 @@ async fn run_local_commit_pipeline_for_tests(
         let file_id = FilePathId::new(&file_data.file_path);
         let artifact_id = graph
             .artifact_id_for_path(&file_id)
-            .unwrap_or_else(|| ArtifactId::seed_from_path(&file_data.file_path));
+            .unwrap_or_else(|| graph.ensure_artifact_id(&file_id));
         let artifact_node = GraphNodeId::Artifact(artifact_id);
         for rel in graph.get_all_relations_for_node(&artifact_node)? {
             if rel.src == artifact_node {
@@ -487,7 +494,7 @@ async fn run_local_commit_pipeline_for_tests(
         message,
         entity_deltas: entity_deltas.clone(),
         relation_deltas,
-        artifact_deltas,
+        tree_deltas,
         projected_files: vec![],
         spec_link: None,
         evidence: vec![],
@@ -713,7 +720,7 @@ fn shallow_sidecar_path(layout: &kin_core::KinLayout, file_id: &FilePathId) -> s
     layout.shallow_dir().join(format!("{}.json", safe_name))
 }
 
-/// Collect all files from the working directory, skipping .kin/ and hidden dirs.
+/// Collect every exact repository entry, excluding only reserved control paths.
 #[cfg(test)]
 fn collect_all_files(root: &Path) -> Result<Vec<std::path::PathBuf>> {
     let mut files = Vec::new();
@@ -737,15 +744,23 @@ fn collect_files_recursive(
         let entry = entry?;
         let path = entry.path();
         let name = entry.file_name();
-        let name_str = name.to_string_lossy();
+        let name = name.to_str().ok_or_else(|| {
+            anyhow::anyhow!("repository path is not valid UTF-8: {}", path.display())
+        })?;
+        let file_type = entry.file_type()?;
 
-        if path.is_dir() {
-            if kin_index::should_skip_dir(name_str.as_ref()) {
+        if file_type.is_dir() {
+            if matches!(name, ".kin" | ".git" | ".git-export" | ".kin-session") {
                 continue;
             }
             collect_files_recursive(root, &path, files)?;
-        } else if path.is_file() {
+        } else if file_type.is_file() || file_type.is_symlink() {
             files.push(path);
+        } else {
+            anyhow::bail!(
+                "repository tree contains an unsupported filesystem object at {}",
+                path.display()
+            );
         }
     }
 
@@ -819,8 +834,6 @@ fn fetch_remote_catalog_filtered(names: &[&str]) -> Vec<String> {
     }
 }
 
-// should_skip_dir moved to kin_index::should_skip_dir (canonical skip list).
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -831,8 +844,7 @@ mod tests {
     #[test]
     fn pending_embedding_work_counts_artifact_only_queue() {
         let graph = kin_db::InMemoryGraph::new();
-        // Synthetic test ID: empty in-test graph has no artifact_index entry.
-        let makefile_id = ArtifactId::seed_from_path("Makefile");
+        let makefile_id = ArtifactId::new();
         graph.queue_artifacts_for_embedding(&[makefile_id]);
 
         assert_eq!(graph.pending_embeddings(), 0);
@@ -877,7 +889,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_all_files_skips_kin_temporary_dirs() {
+    fn collect_all_files_tracks_arbitrary_kin_like_names() {
         let tempdir = tempfile::tempdir().unwrap();
         let root = tempdir.path();
 
@@ -899,7 +911,7 @@ mod tests {
             .collect();
 
         assert!(collected.contains("README.md"));
-        assert!(!collected.contains(".kin-snapshot-tmp/nested/manifest.json"));
-        assert!(!collected.contains(".kin-export/cache/state.json"));
+        assert!(collected.contains(".kin-snapshot-tmp/nested/manifest.json"));
+        assert!(collected.contains(".kin-export/cache/state.json"));
     }
 }

@@ -1430,32 +1430,33 @@ fn collect_evidence_gaps<G: GraphStore>(
     let mut gaps = Vec::new();
     let mut toolchain_findings: Vec<InlineComment> = Vec::new();
 
-    // Files whose changes were recorded only as raw artifacts: the graph has
-    // no entities for them, so they are invisible to blast radius and policy.
-    // Retain each file's net old->new blob hashes across the range — first old,
-    // last new, folded in stable slice order — so an inert source edit can be
-    // inspected for toolchain-directive churn. Ordered by file (BTreeMap) so
-    // both the gaps and any findings emit deterministically.
+    // Files whose exact tree changes have no corresponding entity delta are
+    // invisible to blast radius and policy. Retain each file's net old->new
+    // blob hashes across the range — first old, last new, folded in stable
+    // slice order — so an inert source edit can be inspected for
+    // toolchain-directive churn. A mode-only delta is retained even when its
+    // two blob hashes match. Ordered by file (BTreeMap) so both the gaps and
+    // any findings emit deterministically.
     let entity_files: BTreeSet<String> = changed_entities
         .iter()
         .filter_map(|entity| entity.file.clone())
         .collect();
-    let mut artifact_hashes: BTreeMap<String, (Option<Hash256>, Option<Hash256>)> = BTreeMap::new();
+    let mut tree_hashes: BTreeMap<String, (Option<Hash256>, Option<Hash256>)> = BTreeMap::new();
     for change in changes {
-        for delta in &change.artifact_deltas {
-            let file = delta.file_id.to_string();
+        for delta in &change.tree_deltas {
+            let file = delta.file_id().to_string();
             if entity_files.contains(&file)
                 || semantic_removed_entity_accounts_for_artifact_file(&file, changed_entities)
             {
                 continue;
             }
-            let entry = artifact_hashes
-                .entry(file)
-                .or_insert((delta.old_hash, delta.new_hash));
-            entry.1 = delta.new_hash;
+            let old_hash = delta.old_entry().map(|entry| entry.blob_hash);
+            let new_hash = delta.new_entry().map(|entry| entry.blob_hash);
+            let entry = tree_hashes.entry(file).or_insert((old_hash, new_hash));
+            entry.1 = new_hash;
         }
     }
-    for (file, (old_hash, new_hash)) in &artifact_hashes {
+    for (file, (old_hash, new_hash)) in &tree_hashes {
         // A source-class file whose raw bytes changed but whose entities the
         // graph DID capture at head is an inert edit — a comment, formatting,
         // or preprocessor-only change that altered no entity — not an
@@ -1813,9 +1814,7 @@ pub fn format_shadow_report(report: &ShadowGateReport) -> String {
 mod tests {
     use super::*;
     use kin_db::InMemoryGraph;
-    use kin_model::change::{
-        ArtifactDelta, ArtifactDeltaKind, EntityDelta, RelationDelta, SemanticChange,
-    };
+    use kin_model::change::{EntityDelta, RelationDelta, SemanticChange, TreeDelta, TreeEntry};
     use kin_model::entity::{
         Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint,
         SourceSpan, Visibility,
@@ -1870,7 +1869,7 @@ mod tests {
         parents: Vec<SemanticChangeId>,
         entity_deltas: Vec<EntityDelta>,
         relation_deltas: Vec<RelationDelta>,
-        artifact_deltas: Vec<ArtifactDelta>,
+        tree_deltas: Vec<TreeDelta>,
     ) -> SemanticChange {
         SemanticChange {
             id,
@@ -1880,7 +1879,7 @@ mod tests {
             message: "test change".into(),
             entity_deltas,
             relation_deltas,
-            artifact_deltas,
+            tree_deltas,
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -2171,11 +2170,10 @@ mod tests {
                 new: entity,
             }],
             vec![],
-            vec![ArtifactDelta {
+            vec![TreeDelta::Modified {
                 file_id: FilePathId::new("config/policy.yaml"),
-                kind: ArtifactDeltaKind::Modified,
-                old_hash: Some(Hash256::from_bytes([7; 32])),
-                new_hash: Some(Hash256::from_bytes([8; 32])),
+                old_entry: TreeEntry::regular(Hash256::from_bytes([7; 32]), false),
+                new_entry: TreeEntry::regular(Hash256::from_bytes([8; 32]), false),
             }],
         );
         graph.create_change(&base).unwrap();
@@ -2207,6 +2205,32 @@ mod tests {
     }
 
     #[test]
+    fn mode_only_tree_delta_is_not_dropped_from_evidence_gaps() {
+        let hash = Hash256::from_bytes([0x44; 32]);
+        let change = change_with_deltas(
+            change_id(5),
+            vec![],
+            vec![],
+            vec![],
+            vec![TreeDelta::Modified {
+                file_id: FilePathId::new("bin/run"),
+                old_entry: TreeEntry::regular(hash, false),
+                new_entry: TreeEntry::regular(hash, true),
+            }],
+        );
+
+        let (gaps, findings) =
+            collect_evidence_gaps::<InMemoryGraph>(&empty_review(), &[change], &[], None, None);
+
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.kind == "artifact_only_change" && gap.subject == "bin/run"),
+            "an executable-bit-only tree transition must remain review-visible"
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
     fn source_class_artifact_gap_still_demotes() {
         // Counter-case: the same artifact-only gap on a file the ingest
         // classifier calls source means real code changed that the graph
@@ -2232,11 +2256,10 @@ mod tests {
                 new: entity,
             }],
             vec![],
-            vec![ArtifactDelta {
+            vec![TreeDelta::Modified {
                 file_id: FilePathId::new("src/legacy.c"),
-                kind: ArtifactDeltaKind::Modified,
-                old_hash: Some(Hash256::from_bytes([9; 32])),
-                new_hash: Some(Hash256::from_bytes([10; 32])),
+                old_entry: TreeEntry::regular(Hash256::from_bytes([9; 32]), false),
+                new_entry: TreeEntry::regular(Hash256::from_bytes([10; 32]), false),
             }],
         );
         graph.create_change(&base).unwrap();
@@ -3861,11 +3884,10 @@ mod tests {
                 new: app,
             }],
             vec![],
-            vec![ArtifactDelta {
+            vec![TreeDelta::Modified {
                 file_id: FilePathId::new("src/sensor.c"),
-                kind: ArtifactDeltaKind::Modified,
-                old_hash: Some(Hash256::from_bytes([11; 32])),
-                new_hash: Some(Hash256::from_bytes([12; 32])),
+                old_entry: TreeEntry::regular(Hash256::from_bytes([11; 32]), false),
+                new_entry: TreeEntry::regular(Hash256::from_bytes([12; 32]), false),
             }],
         );
         graph.create_change(&base).unwrap();
@@ -3919,11 +3941,10 @@ mod tests {
             vec![base_id],
             vec![EntityDelta::Removed(legacy.id)],
             vec![],
-            vec![ArtifactDelta {
+            vec![TreeDelta::Modified {
                 file_id: FilePathId::new("src/internal/keyed-each.js"),
-                kind: ArtifactDeltaKind::Modified,
-                old_hash: Some(Hash256::from_bytes([21; 32])),
-                new_hash: Some(Hash256::from_bytes([22; 32])),
+                old_entry: TreeEntry::regular(Hash256::from_bytes([21; 32]), false),
+                new_entry: TreeEntry::regular(Hash256::from_bytes([22; 32]), false),
             }],
         );
         graph.create_change(&base).unwrap();
@@ -4229,11 +4250,10 @@ mod tests {
             vec![base_id],
             vec![],
             vec![],
-            vec![ArtifactDelta {
+            vec![TreeDelta::Modified {
                 file_id: FilePathId::new("src/sensor.c"),
-                kind: ArtifactDeltaKind::Modified,
-                old_hash: Some(old_hash),
-                new_hash: Some(new_hash),
+                old_entry: TreeEntry::regular(old_hash, false),
+                new_entry: TreeEntry::regular(new_hash, false),
             }],
         )];
 

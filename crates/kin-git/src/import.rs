@@ -134,7 +134,7 @@ pub fn semantic_change_id_from_git_oid_hex(oid_hex: &str) -> Result<SemanticChan
 /// 3. Inserting changes into the graph via GraphStore
 ///
 /// This function does NOT perform entity extraction (that requires kin-parser
-/// and kin-index). It creates SemanticChange objects with artifact deltas only.
+/// and kin-index). It creates SemanticChange objects with exact tree deltas only.
 /// Entity deltas will be populated by the indexing pipeline when it processes
 /// the imported changes.
 pub fn import_git_history(
@@ -1178,7 +1178,7 @@ fn bounded_full_tree_blob_entries(
 /// `import_git_history_*` diffs every commit against its first parent, so a
 /// truncated window (`--git-history recent`, default 50 commits) records only
 /// the files each windowed commit *touched*. The oldest kept commit's own
-/// artifact deltas therefore cover just its changed files, never the whole tree
+/// tree deltas therefore cover just its changed files, never the whole tree
 /// it was built on. Semantic enrichment then links each commit against that
 /// touched-files-only universe, so a cross-file inbound edge whose *consumer*
 /// lives in a file untouched anywhere inside the window is never committed into
@@ -1209,7 +1209,7 @@ fn bounded_full_tree_blob_entries(
 /// # Determinism
 ///
 /// Base ids are hashes of omitted parent OIDs. Anchors are emitted in OID order,
-/// artifact deltas in path order, and author/timestamp come from Git commit
+/// tree deltas in path order, and author/timestamp come from Git commit
 /// content, never wall-clock. Parent order continues to match Git. The output
 /// is therefore byte-identical across runs for identical history + window.
 pub fn anchor_imported_history_at_base_link(
@@ -1306,7 +1306,7 @@ pub fn anchor_imported_history_at_base_link(
             .tree()
             .map_err(|e| GitError::Git(e.to_string()))?;
 
-        // Full parent universe as Added artifact deltas, in stable path order.
+        // Full parent universe as Added tree deltas, in stable path order.
         // Materialize every blob so exact checkout/archive consumers have the
         // bytes corresponding to the graph-owned content identities.
         let remaining_entries = MAX_BASE_LINK_TREE_ENTRIES
@@ -1645,7 +1645,7 @@ mod tests {
     }
 
     #[test]
-    fn import_with_blobs_materializes_artifact_content() {
+    fn import_with_blobs_materializes_tree_content() {
         let dir = tempfile::tempdir().unwrap();
         if !init_git_repo(dir.path()) {
             eprintln!("git not available, skipping blob materialization test");
@@ -1678,9 +1678,10 @@ mod tests {
 
         let imported_blob = imported
             .iter()
-            .flat_map(|change| change.change.artifact_deltas.iter())
-            .find_map(|delta| delta.new_hash)
-            .expect("import should record a blob-backed artifact hash");
+            .flat_map(|change| change.change.tree_deltas.iter())
+            .find_map(TreeDelta::new_entry)
+            .map(|entry| entry.blob_hash)
+            .expect("import should record a blob-backed tree entry");
 
         let stored = blob_store
             .read(&kin_blobs::Hash256(imported_blob.0))
@@ -1749,42 +1750,64 @@ mod tests {
 
         let initial_kinds: std::collections::BTreeMap<_, _> = imported[0]
             .change
-            .artifact_deltas
+            .tree_deltas
             .iter()
-            .map(|delta| (delta.file_id.0.as_str(), delta.kind))
+            .map(|delta| {
+                (
+                    delta.file_id().0.as_str(),
+                    delta
+                        .new_entry()
+                        .expect("initial tree deltas must add entries")
+                        .kind,
+                )
+            })
             .collect();
         assert_eq!(
             initial_kinds.get("plain.txt"),
-            Some(&ArtifactDeltaKind::AddedRegularFile)
+            Some(&TreeEntryKind::Regular { executable: false })
         );
         assert_eq!(
             initial_kinds.get("run.sh"),
-            Some(&ArtifactDeltaKind::AddedExecutableFile)
+            Some(&TreeEntryKind::Regular { executable: true })
         );
         assert_eq!(
             initial_kinds.get("plain-link"),
-            Some(&ArtifactDeltaKind::AddedSymlink)
+            Some(&TreeEntryKind::Symlink)
         );
         let link_delta = imported[0]
             .change
-            .artifact_deltas
+            .tree_deltas
             .iter()
-            .find(|delta| delta.file_id.0 == "plain-link")
+            .find(|delta| delta.file_id().0 == "plain-link")
             .unwrap();
         let link_target = blob_store
-            .read(&kin_blobs::Hash256(link_delta.new_hash.unwrap().0))
+            .read(&kin_blobs::Hash256(
+                link_delta
+                    .new_entry()
+                    .expect("symlink addition must carry its link-target blob")
+                    .blob_hash
+                    .0,
+            ))
             .unwrap();
         assert_eq!(link_target, b"plain.txt");
 
-        assert_eq!(imported[1].change.artifact_deltas.len(), 1);
-        let mode_delta = &imported[1].change.artifact_deltas[0];
-        assert_eq!(mode_delta.file_id.0, "plain.txt");
-        assert_eq!(mode_delta.kind, ArtifactDeltaKind::ModifiedExecutableFile);
-        assert_eq!(mode_delta.old_hash, mode_delta.new_hash);
+        assert_eq!(imported[1].change.tree_deltas.len(), 1);
+        let TreeDelta::Modified {
+            file_id,
+            old_entry,
+            new_entry,
+        } = &imported[1].change.tree_deltas[0]
+        else {
+            panic!("mode-only transition must be an exact modification")
+        };
+        assert_eq!(file_id.0, "plain.txt");
+        assert_eq!(old_entry.kind, TreeEntryKind::Regular { executable: false });
+        assert_eq!(new_entry.kind, TreeEntryKind::Regular { executable: true });
+        assert_eq!(old_entry.blob_hash, new_entry.blob_hash);
     }
 
     #[test]
-    fn exact_import_records_gitlinks_as_tracked_pointer_changes() {
+    fn exact_import_rejects_gitlinks_without_fabricating_tree_entries() {
         let dir = tempfile::tempdir().unwrap();
         if !init_git_repo(dir.path()) {
             eprintln!("git not available, skipping gitlink import test");
@@ -1825,26 +1848,15 @@ mod tests {
             .unwrap()
             .success());
 
-        // A submodule in history must not block import (regression: it used to
-        // be refused). The pointer is recorded as a tracked, mode-unknown
-        // artifact delta carrying the pinned commit as content — not refused,
-        // not silently omitted, and not mislabeled as a file.
+        // Gitlinks are neither regular files nor symlinks. Until the canonical
+        // tree schema has an exact gitlink kind, importing one must fail loudly
+        // instead of fabricating a file entry or silently dropping the path.
         let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x13; 32]));
-        let imported = import_git_history(dir.path(), genesis_id, &ImportOptions::default())
-            .expect("a submodule pointer is recorded as a tracked change, not refused");
-
-        let gitlink = imported
-            .iter()
-            .flat_map(|change| &change.change.artifact_deltas)
-            .find(|delta| delta.file_id.0 == "vendor/sub")
-            .expect("the gitlink pointer is recorded as an artifact delta");
-        assert_eq!(gitlink.kind, ArtifactDeltaKind::Added);
-        // Mode-unknown on purpose: a submodule is not an exact-source file kind,
-        // so it resolves to a source-tree gap rather than a fabricated file.
-        assert_eq!(gitlink.kind.source_entry_kind(), None);
-        // The pinned commit is captured as the delta's content identity.
-        assert!(gitlink.new_hash.is_some());
-        assert!(gitlink.old_hash.is_none());
+        let error = import_git_history(dir.path(), genesis_id, &ImportOptions::default())
+            .expect_err("an exact import must reject an unrepresentable gitlink");
+        assert!(error
+            .to_string()
+            .contains("exact Git import cannot represent gitlink"));
     }
 
     #[test]
@@ -1926,20 +1938,19 @@ mod tests {
         let imported = import_git_history(dir.path(), genesis_id, &ImportOptions::default())
             .expect("git import should succeed");
         let latest = imported.last().expect("expected imported commits");
-        let paths = latest
-            .change
-            .artifact_deltas
-            .iter()
-            .map(|delta| (delta.file_id.0.clone(), delta.kind))
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            paths,
-            vec![(
-                "alpha.txt".to_string(),
-                ArtifactDeltaKind::ModifiedRegularFile,
-            )]
-        );
+        assert_eq!(latest.change.tree_deltas.len(), 1);
+        let TreeDelta::Modified {
+            file_id,
+            old_entry,
+            new_entry,
+        } = &latest.change.tree_deltas[0]
+        else {
+            panic!("the changed file must be represented as a modification")
+        };
+        assert_eq!(file_id.0, "alpha.txt");
+        assert_eq!(old_entry.kind, TreeEntryKind::Regular { executable: false });
+        assert_eq!(new_entry.kind, TreeEntryKind::Regular { executable: false });
+        assert_ne!(old_entry.blob_hash, new_entry.blob_hash);
     }
 
     #[test]
@@ -1990,13 +2001,13 @@ mod tests {
         .expect("git import should succeed");
 
         // Truncated to the newest 3 commits (c2, c3, c4); c2's real parent (c1)
-        // is out of window, so beta.txt appears in NO windowed artifact delta.
+        // is out of window, so beta.txt appears in NO windowed tree delta.
         assert_eq!(imported.len(), 3, "window should hold exactly 3 commits");
         assert!(
             imported
                 .iter()
-                .flat_map(|ic| ic.change.artifact_deltas.iter())
-                .all(|d| d.file_id.0 != "beta.txt"),
+                .flat_map(|ic| ic.change.tree_deltas.iter())
+                .all(|d| d.file_id().0 != "beta.txt"),
             "pre-anchor: the untouched consumer file must not appear in any windowed commit"
         );
         let window_base_id = imported[0].change.id;
@@ -2020,17 +2031,31 @@ mod tests {
         assert_eq!(imported.len(), 4, "base-link prepended to the window");
         assert_eq!(imported[0].change.id, base_id);
         assert_eq!(imported[0].change.parents, vec![genesis_id]);
-        let base_paths: Vec<(String, ArtifactDeltaKind)> = imported[0]
+        let base_paths: Vec<(String, TreeEntryKind)> = imported[0]
             .change
-            .artifact_deltas
+            .tree_deltas
             .iter()
-            .map(|d| (d.file_id.0.clone(), d.kind))
+            .map(|delta| {
+                (
+                    delta.file_id().0.clone(),
+                    delta
+                        .new_entry()
+                        .expect("base-link deltas must add exact tree entries")
+                        .kind,
+                )
+            })
             .collect();
         assert_eq!(
             base_paths,
             vec![
-                ("alpha.txt".to_string(), ArtifactDeltaKind::AddedRegularFile,),
-                ("beta.txt".to_string(), ArtifactDeltaKind::AddedRegularFile,),
+                (
+                    "alpha.txt".to_string(),
+                    TreeEntryKind::Regular { executable: false },
+                ),
+                (
+                    "beta.txt".to_string(),
+                    TreeEntryKind::Regular { executable: false },
+                ),
             ],
             "base-link must carry the full base universe as sorted Additions"
         );
@@ -2560,7 +2585,7 @@ mod tests {
 
     #[test]
     fn truncated_merge_anchors_every_boundary_parent_and_replays_exact_archive() {
-        use kin_model::{ChangeStore, SourceTreeResolution};
+        use kin_model::ChangeStore;
 
         let Some(dir) = build_equal_timestamp_merge_repo() else {
             eprintln!("git not available, skipping merge-boundary anchor test");
@@ -2633,13 +2658,26 @@ mod tests {
             let expected_paths: Vec<_> = full_tree_blob_entries(&repo, &parent_tree)
                 .unwrap()
                 .into_iter()
-                .map(|(path, _, class)| (path, added_delta_kind(class)))
+                .map(|(path, _, class)| {
+                    let GitEntryClass::Tree(kind) = class else {
+                        panic!("merge fixture contains no submodules")
+                    };
+                    (path, kind)
+                })
                 .collect();
             let anchor_paths: Vec<_> = anchor
                 .change
-                .artifact_deltas
+                .tree_deltas
                 .iter()
-                .map(|delta| (delta.file_id.0.clone(), delta.kind))
+                .map(|delta| {
+                    (
+                        delta.file_id().0.clone(),
+                        delta
+                            .new_entry()
+                            .expect("boundary anchors must add exact tree entries")
+                            .kind,
+                    )
+                })
                 .collect();
             assert_eq!(anchor_paths, expected_paths);
         }
@@ -2650,11 +2688,7 @@ mod tests {
         for change in &imported {
             graph.create_change(&change.change).unwrap();
         }
-        let SourceTreeResolution::Exact { entries } =
-            graph.resolve_source_tree_at(&merge.change.id).unwrap()
-        else {
-            panic!("anchored truncated merge must resolve to an exact source tree")
-        };
+        let entries = graph.resolve_tree_at(&merge.change.id).unwrap();
 
         // Compare an archive-shaped manifest (path, mode, bytes) against the
         // authoritative Git merge tree. This proves both graph identities and
@@ -2663,7 +2697,7 @@ mod tests {
         let expected_entries = full_tree_blob_entries(&repo, &head_tree).unwrap();
         let mut expected_archive = Vec::new();
         for (path, blob_oid, class) in expected_entries {
-            let GitEntryClass::Source(kind) = class else {
+            let GitEntryClass::Tree(kind) = class else {
                 unreachable!("merge fixture contains no submodules");
             };
             let bytes = repo.find_blob(blob_oid).unwrap().take_data();
@@ -2674,7 +2708,7 @@ mod tests {
         resolved.sort_by(|left, right| left.0 .0.cmp(&right.0 .0));
         for (path, entry) in resolved {
             let bytes = blob_store
-                .read(&kin_blobs::Hash256(*entry.hash.as_bytes()))
+                .read(&kin_blobs::Hash256(entry.blob_hash.0))
                 .unwrap();
             replay_archive.push((path.0, entry.kind, bytes));
         }
@@ -2683,7 +2717,7 @@ mod tests {
 
     #[test]
     fn truncated_merge_correction_preserves_deletion_content_and_mode_choices() {
-        use kin_model::{ChangeStore, SourceTreeResolution};
+        use kin_model::ChangeStore;
 
         let Some(dir) = build_truncated_merge_correction_repo() else {
             eprintln!("git not available, skipping merge-correction test");
@@ -2713,19 +2747,48 @@ mod tests {
         let merge = imported.last().expect("merge remains imported head");
         let by_path: HashMap<_, _> = merge
             .change
-            .artifact_deltas
+            .tree_deltas
             .iter()
-            .map(|delta| (delta.file_id.0.as_str(), delta.kind))
+            .map(|delta| (delta.file_id().0.as_str(), delta))
             .collect();
-        assert_eq!(by_path["gone.txt"], ArtifactDeltaKind::Removed);
-        assert_eq!(
+        assert!(matches!(
+            by_path["gone.txt"],
+            TreeDelta::Removed {
+                old_entry: TreeEntry {
+                    kind: TreeEntryKind::Regular { executable: false },
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
             by_path["conflict.txt"],
-            ArtifactDeltaKind::ModifiedRegularFile
-        );
-        assert_eq!(
+            TreeDelta::Modified {
+                old_entry: TreeEntry {
+                    kind: TreeEntryKind::Regular { executable: false },
+                    ..
+                },
+                new_entry: TreeEntry {
+                    kind: TreeEntryKind::Regular { executable: false },
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
             by_path["mode.sh"],
-            ArtifactDeltaKind::ModifiedExecutableFile
-        );
+            TreeDelta::Modified {
+                old_entry: TreeEntry {
+                    kind: TreeEntryKind::Regular { executable: true },
+                    ..
+                },
+                new_entry: TreeEntry {
+                    kind: TreeEntryKind::Regular { executable: true },
+                    ..
+                },
+                ..
+            }
+        ));
 
         let graph = kin_db::InMemoryGraph::new();
         graph
@@ -2734,17 +2797,13 @@ mod tests {
         for change in &imported {
             graph.create_change(&change.change).unwrap();
         }
-        let SourceTreeResolution::Exact { entries } =
-            graph.resolve_source_tree_at(&merge.change.id).unwrap()
-        else {
-            panic!("truncated merge correction must resolve exactly")
-        };
+        let entries = graph.resolve_tree_at(&merge.change.id).unwrap();
 
         let git_merge = repo.find_commit(head_id).unwrap();
         let expected_entries = full_tree_blob_entries(&repo, &git_merge.tree().unwrap()).unwrap();
         let mut expected_archive = Vec::new();
         for (path, blob_oid, class) in expected_entries {
-            let GitEntryClass::Source(kind) = class else {
+            let GitEntryClass::Tree(kind) = class else {
                 unreachable!("merge fixture contains no submodules");
             };
             expected_archive.push((path, kind, repo.find_blob(blob_oid).unwrap().take_data()));
@@ -2757,7 +2816,7 @@ mod tests {
                 path.0,
                 entry.kind,
                 blob_store
-                    .read(&kin_blobs::Hash256(*entry.hash.as_bytes()))
+                    .read(&kin_blobs::Hash256(entry.blob_hash.0))
                     .unwrap(),
             ));
         }
@@ -2885,7 +2944,7 @@ mod tests {
 
     /// Determinism gate: the parallel commit-mapping path must produce a
     /// byte-identical `Vec<ImportedChange>` to the serial reference — same order,
-    /// same change_id / parents / artifact_deltas / message / timestamp per
+    /// same change_id / parents / tree_deltas / message / timestamp per
     /// element — and re-running the parallel path must be byte-stable. This is
     /// the proof that parallelizing the import preserves the citable graph.
     #[test]
@@ -2921,7 +2980,7 @@ mod tests {
             "parallel and serial must import the same number of commits"
         );
         // Debug formatting captures every field (id, parents, timestamp, author,
-        // message, artifact_deltas, git_oid); equal Debug strings ⇒ byte-identical
+        // message, tree_deltas, git_oid); equal Debug strings ⇒ byte-identical
         // ImportedChange vectors in identical order.
         assert_eq!(
             format!("{parallel:?}"),
@@ -3068,7 +3127,7 @@ mod tests {
         assert_eq!(recent.len(), 1);
         assert_eq!(format!("{recent:?}"), format!("{full:?}"));
         assert_eq!(recent[0].change.parents, vec![genesis]);
-        assert_eq!(recent[0].change.artifact_deltas.len(), 2);
+        assert_eq!(recent[0].change.tree_deltas.len(), 2);
         assert_eq!(
             anchor_imported_history_at_base_link(
                 &shallow,

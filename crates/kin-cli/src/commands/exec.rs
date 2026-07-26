@@ -810,7 +810,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn npm_smoke_reconciles_lockfile_and_ignores_node_modules() {
+    async fn npm_smoke_reconciles_lockfile_and_unrelated_tree_entries() {
         let repo = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo.path()).unwrap();
         let layout = init.layout;
@@ -821,7 +821,11 @@ mod tests {
         std::fs::write(repo.path().join("package.json"), "{\"name\":\"app\"}\n").unwrap();
         std::fs::create_dir_all(&session_dir).unwrap();
         std::fs::write(session_dir.join("package.json"), "{\"name\":\"app\"}\n").unwrap();
-        crate::commands::session_base::record_materialized_base(&session_dir, None).unwrap();
+        crate::commands::session_base::record_materialized_base(
+            &session_dir,
+            kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0x42; 32])),
+        )
+        .unwrap();
 
         // Fake npm: emits a lockfile plus a node_modules tree, like a real install.
         let env = stub_tool(
@@ -853,8 +857,8 @@ mod tests {
             "lockfile should reconcile back into the source tree"
         );
         assert!(
-            !repo.path().join("node_modules").exists(),
-            "generated node_modules must be excluded by the reconcile skip policy"
+            repo.path().join("node_modules/left-pad/index.js").exists(),
+            "without an explicit ignore rule, every repository entry participates in exact tree truth"
         );
         assert!(
             !session_dir.exists(),
@@ -921,7 +925,11 @@ mod tests {
             "services:\n  app:\n    image: alpine\n",
         )
         .unwrap();
-        crate::commands::session_base::record_materialized_base(&session_dir, None).unwrap();
+        crate::commands::session_base::record_materialized_base(
+            &session_dir,
+            kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0x42; 32])),
+        )
+        .unwrap();
 
         // Fake docker: validates that the compose file is visible from the
         // workspace cwd, like `docker compose config` would.

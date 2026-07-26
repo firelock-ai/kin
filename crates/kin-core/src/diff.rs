@@ -292,9 +292,9 @@ pub fn whoami() -> String {
 mod tests {
     use super::*;
     use kin_model::{
-        relation::GraphNodeId, ArtifactDeltaKind, AuthorId, BranchName, EntityId, EntityKind,
-        EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm, LanguageId, RelationId,
-        RelationKind, RelationOrigin, SemanticFingerprint, Visibility,
+        relation::GraphNodeId, AuthorId, BranchName, EntityId, EntityKind, EntityMetadata,
+        EntityRole, FilePathId, FingerprintAlgorithm, LanguageId, RelationId, RelationKind,
+        RelationOrigin, SemanticFingerprint, TreeEntry, Visibility,
     };
 
     fn test_entity(id: EntityId, name: &str) -> Entity {
@@ -321,6 +321,19 @@ mod tests {
             lineage_parent: None,
             created_in: None,
             superseded_by: None,
+        }
+    }
+
+    fn modified_tree(
+        path: &str,
+        old_hash: Hash256,
+        new_hash: Hash256,
+        executable: bool,
+    ) -> TreeDelta {
+        TreeDelta::Modified {
+            file_id: FilePathId::new(path),
+            old_entry: TreeEntry::regular(old_hash, false),
+            new_entry: TreeEntry::regular(new_hash, executable),
         }
     }
 
@@ -357,21 +370,13 @@ mod tests {
     }
 
     #[test]
-    fn content_identity_binds_complete_artifact_delta_and_ignores_slice_order() {
-        let regular = ArtifactDelta {
-            file_id: FilePathId::new("bin/kin"),
-            kind: ArtifactDeltaKind::ModifiedRegularFile,
-            old_hash: Some(Hash256::from_bytes([1; 32])),
-            new_hash: Some(Hash256::from_bytes([2; 32])),
-        };
-        let executable = ArtifactDelta {
-            kind: ArtifactDeltaKind::ModifiedExecutableFile,
-            ..regular.clone()
-        };
-        let different_old = ArtifactDelta {
-            old_hash: Some(Hash256::from_bytes([3; 32])),
-            ..regular.clone()
-        };
+    fn content_identity_binds_complete_tree_delta_and_ignores_slice_order() {
+        let old_hash = Hash256::from_bytes([1; 32]);
+        let new_hash = Hash256::from_bytes([2; 32]);
+        let different_old_hash = Hash256::from_bytes([3; 32]);
+        let regular = modified_tree("bin/kin", old_hash, new_hash, false);
+        let executable = modified_tree("bin/kin", old_hash, new_hash, true);
+        let different_old = modified_tree("bin/kin", different_old_hash, new_hash, false);
 
         let regular_id =
             content_identity_from_deltas(&[], &[], std::slice::from_ref(&regular)).unwrap();
@@ -382,14 +387,9 @@ mod tests {
         assert_ne!(regular_id, executable_id);
         assert_ne!(regular_id, different_old_id);
 
-        let ordered_executable = ArtifactDelta {
-            file_id: FilePathId::new("bin/kin-exec"),
-            ..executable
-        };
-        let ordered_different_old = ArtifactDelta {
-            file_id: FilePathId::new("bin/kin-old"),
-            ..different_old
-        };
+        let ordered_executable = modified_tree("bin/kin-exec", old_hash, new_hash, true);
+        let ordered_different_old =
+            modified_tree("bin/kin-old", different_old_hash, new_hash, false);
         let first = content_identity_from_deltas(
             &[],
             &[],
@@ -410,17 +410,12 @@ mod tests {
     }
 
     #[test]
-    fn content_identity_binds_order_for_duplicate_artifact_targets() {
-        let first = ArtifactDelta {
-            file_id: FilePathId::new("src/lib.rs"),
-            kind: ArtifactDeltaKind::ModifiedRegularFile,
-            old_hash: Some(Hash256::from_bytes([1; 32])),
-            new_hash: Some(Hash256::from_bytes([2; 32])),
-        };
-        let second = ArtifactDelta {
-            new_hash: Some(Hash256::from_bytes([3; 32])),
-            ..first.clone()
-        };
+    fn content_identity_binds_order_for_duplicate_tree_targets() {
+        let first_hash = Hash256::from_bytes([1; 32]);
+        let second_hash = Hash256::from_bytes([2; 32]);
+        let third_hash = Hash256::from_bytes([3; 32]);
+        let first = modified_tree("src/lib.rs", first_hash, second_hash, false);
+        let second = modified_tree("src/lib.rs", second_hash, third_hash, false);
 
         let forward =
             content_identity_from_deltas(&[], &[], &[first.clone(), second.clone()]).unwrap();
