@@ -2885,6 +2885,38 @@ impl SnapshotManager {
         Self::save_vector_index_bundle(&path, graph, retrieval_authority_hash, embedder_identity)
     }
 
+    /// Checkpoint a derived vector sidecar without writing graph authority.
+    ///
+    /// This is the repository-authority counterpart to
+    /// [`flush_embed_progress`](Self::flush_embed_progress): the repository and
+    /// workspace transaction has already made graph truth durable elsewhere, so
+    /// this method only manages the O(index) vector checkpoint. While embedding
+    /// is still draining, the first batch lands immediately and subsequent
+    /// batches honor the graph's interval/batch throttle. A drained queue always
+    /// lands the completion checkpoint and resets the next run.
+    ///
+    /// Returns `true` when this call wrote the sidecar and `false` when the
+    /// in-flight checkpoint was throttled.
+    #[cfg(feature = "vector")]
+    pub fn checkpoint_vector_index_for_graph(
+        path: impl Into<PathBuf>,
+        graph: &InMemoryGraph,
+        embedder_identity: Option<&str>,
+    ) -> Result<bool, KinDbError> {
+        let embedding_in_flight =
+            graph.pending_embeddings() > 0 || graph.pending_artifact_embeddings() > 0;
+        let write_sidecar = if embedding_in_flight {
+            graph.should_flush_vector_sidecar_now()
+        } else {
+            graph.reset_vector_sidecar_flush_throttle();
+            true
+        };
+        if write_sidecar {
+            Self::save_vector_index_for_graph(path, graph, embedder_identity)?;
+        }
+        Ok(write_sidecar)
+    }
+
     /// Durably persist one batch of embed progress incrementally, so a long
     /// embed that is interrupted resumes from the last flushed batch instead of
     /// restarting from zero.
@@ -2945,17 +2977,7 @@ impl SnapshotManager {
             // A checkpoint written mid-run is stamped with the graph root hash, so
             // a reopen loads the covered vectors and re-derives only the remainder
             // from the graph-vs-index diff (resume), instead of re-embedding all.
-            let embedding_in_flight =
-                graph.pending_embeddings() > 0 || graph.pending_artifact_embeddings() > 0;
-            let write_sidecar = if embedding_in_flight {
-                graph.should_flush_vector_sidecar_now()
-            } else {
-                graph.reset_vector_sidecar_flush_throttle();
-                true
-            };
-            if write_sidecar {
-                Self::save_vector_index_for_graph(&path, graph, embedder_identity)?;
-            }
+            Self::checkpoint_vector_index_for_graph(&path, graph, embedder_identity)?;
         }
         Ok(EmbedFlushOutcome {
             generation,
@@ -5462,6 +5484,57 @@ mod tests {
             !vector_path.exists(),
             "an immediate follow-up flush must be throttled, not re-serialize the index"
         );
+    }
+
+    /// Repository-v6 owns graph/workspace durability outside the legacy local
+    /// snapshot bundle. Its derived-only checkpoint must retain the same
+    /// first-batch and in-flight throttle without creating graph.kndb.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn derived_vector_checkpoint_throttles_without_writing_graph_authority() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+        let graph = InMemoryGraph::new();
+        let embedded = test_entity("already_embedded");
+        let pending = test_entity("still_pending");
+        graph.upsert_entity(&embedded).unwrap();
+        graph.upsert_entity(&pending).unwrap();
+
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(embedded.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        install_current_test_vector_index(&graph, &vectors, &vector_path);
+        graph.queue_missing_for_embedding();
+        assert!(graph.pending_embeddings() > 0);
+
+        std::fs::remove_file(&vector_path).unwrap();
+        assert!(
+            SnapshotManager::checkpoint_vector_index_for_graph(
+                &snapshot_path,
+                &graph,
+                Some("fixture-embedder@1"),
+            )
+            .unwrap(),
+            "the first derived-only batch must checkpoint"
+        );
+        assert!(vector_path.exists());
+        assert!(
+            !snapshot_path.exists(),
+            "a derived checkpoint must never create graph authority"
+        );
+
+        std::fs::remove_file(&vector_path).unwrap();
+        assert!(
+            !SnapshotManager::checkpoint_vector_index_for_graph(
+                &snapshot_path,
+                &graph,
+                Some("fixture-embedder@1"),
+            )
+            .unwrap(),
+            "an immediate in-flight checkpoint must be throttled"
+        );
+        assert!(!vector_path.exists());
+        assert!(!snapshot_path.exists());
     }
 
     /// Deferring WHEN the index is canonicalized preserves the retrieval RESULT
