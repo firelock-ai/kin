@@ -1752,6 +1752,44 @@ impl DaemonState {
         self.initialize_spine_lazy_with_publication_hook(|| {});
     }
 
+    fn load_registered_workspace_graph(
+        repository_path: &std::path::Path,
+        expected_repository_id: &str,
+    ) -> std::result::Result<Arc<kin_db::InMemoryGraph>, String> {
+        let layout = KinLayout::new(repository_path.join(".kin"));
+        layout
+            .check_version()
+            .map_err(|error| format!("validate sibling Kin layout: {error}"))?;
+        let manifest = kin_core::manifest::KinManifest::load(&layout.manifest_path())
+            .map_err(|error| format!("load sibling manifest: {error}"))?;
+        if manifest.repo_id != expected_repository_id {
+            return Err(format!(
+                "registry repository id {expected_repository_id} does not match manifest authority {}",
+                manifest.repo_id
+            ));
+        }
+        let repository_id = RepositoryId::new(manifest.repo_id)
+            .map_err(|error| format!("parse sibling repository identity: {error}"))?;
+        let workspace_uuid = uuid::Uuid::parse_str(&manifest.workspace_id)
+            .map_err(|error| format!("parse sibling workspace identity: {error}"))?;
+        let workspace_id = WorkspaceId::from_uuid(workspace_uuid);
+        let authority = RepositoryAuthorityManager::open(
+            repository_id,
+            Arc::new(LocalFileBackend::new(layout.kindb_dir())),
+        )
+        .map_err(|error| format!("open sibling repository authority: {error}"))?;
+        let lease = authority.read_authority();
+        let snapshot = lease
+            .workspace_graph_snapshot(&workspace_id)
+            .map_err(|error| format!("materialize sibling workspace authority: {error}"))?
+            .ok_or_else(|| {
+                format!("sibling repository authority has no manifest workspace {workspace_id}")
+            })?;
+        kin_db::InMemoryGraph::from_snapshot(snapshot)
+            .map(Arc::new)
+            .map_err(|error| format!("open sibling workspace graph: {error}"))
+    }
+
     /// Prepare and publish the lazy spine behind the graph-authority visibility
     /// handshake. The hook is a deterministic seam for the final-validation to
     /// publication race regression; production callers use the no-op wrapper.
@@ -1782,11 +1820,11 @@ impl DaemonState {
         let mut captures = vec![primary];
         let mut authority_incomplete = false;
 
-        // Capture sibling repos from the global registry. Persisted sibling
-        // graphs are immutable cache inputs, but they still go through one
-        // detached snapshot and exact live-root validation. A bad sibling is
-        // omitted as advisory data and prevents this initialization from ever
-        // claiming complete authority.
+        // Capture sibling repos from the global registry. Each sibling is
+        // materialized from one repository-v6 workspace lease; no raw snapshot
+        // compatibility file participates. The detached graph still goes
+        // through exact live-root validation. A bad sibling is omitted as
+        // advisory data and prevents a completeness claim.
         match kin_core::registry::KinRegistry::load() {
             Ok(registry) => {
                 let cwd_canonical = self
@@ -1805,38 +1843,40 @@ impl DaemonState {
                         continue;
                     }
 
-                    let kndb_path = repo.path.join(".kin").join("kindb").join("graph.kndb");
-                    if !kndb_path.exists() {
-                        continue;
-                    }
-
-                    let kndb_clone = kndb_path.clone();
+                    let sibling_path = repo.path.clone();
                     let sibling_id = repo.id.clone();
                     let loaded = std::thread::Builder::new()
                         .name(format!("spine-load-{}", repo.id))
-                        .spawn(move || -> Option<Arc<kin_db::InMemoryGraph>> {
-                            let snapshot = kin_db::SnapshotManager::open(&kndb_clone).ok()?;
-                            Some(snapshot.graph())
+                        .spawn(move || {
+                            Self::load_registered_workspace_graph(&sibling_path, &sibling_id)
                         })
-                        .ok()
-                        .and_then(|handle| handle.join().ok())
-                        .flatten();
+                        .map_err(|error| format!("spawn sibling authority load: {error}"))
+                        .and_then(|handle| {
+                            handle
+                                .join()
+                                .map_err(|_| "sibling authority loader panicked".to_string())
+                        })
+                        .and_then(|result| result);
 
-                    let Some(sibling_graph) = loaded else {
-                        authority_incomplete = true;
-                        warn!(
-                            repo_id = %sibling_id,
-                            path = %kndb_path.display(),
-                            "sibling graph could not be loaded; spine authority will remain incomplete"
-                        );
-                        continue;
+                    let sibling_graph = match loaded {
+                        Ok(graph) => graph,
+                        Err(load_error) => {
+                            authority_incomplete = true;
+                            warn!(
+                                repo_id = %repo.id,
+                                path = %repo.path.display(),
+                                error = %load_error,
+                                "sibling workspace authority could not be loaded; spine authority will remain incomplete"
+                            );
+                            continue;
+                        }
                     };
-                    match self.capture_spine_repo(&sibling_id, sibling_graph) {
+                    match self.capture_spine_repo(&repo.id, sibling_graph) {
                         Ok(capture) => captures.push(capture),
                         Err(capture_error) => {
                             authority_incomplete = true;
                             warn!(
-                                repo_id = %sibling_id,
+                                repo_id = %repo.id,
                                 error = %capture_error,
                                 "sibling graph capture failed; spine authority will remain incomplete"
                             );
@@ -4684,7 +4724,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn spine_init_materializes_cross_repo_edges() {
-        use kin_db::{InMemoryGraph, SnapshotManager};
+        use kin_db::InMemoryGraph;
         use kin_model::{
             GraphNodeId, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin,
         };
@@ -4694,19 +4734,35 @@ mod tests {
         // cross-repo reference by matching the imported-symbol evidence on the
         // primary's relation against an indexed entity name, so the sibling
         // entity is named with the real symbol the reference imports.
-        let sibling_id = "sibling-lib";
         let external_id = kin_model::EntityId::new();
         let imported_symbol = "remote_call";
 
         let sibling_dir = tempfile::tempdir().unwrap();
         let sibling_init = kin_core::init(sibling_dir.path()).unwrap();
+        let sibling_id = sibling_init.repository_id.as_str().to_string();
         let sibling_graph = InMemoryGraph::new();
         sibling_graph
             .batch_upsert_entities(&[test_entity(imported_symbol, "src/lib.rs")])
             .unwrap();
-        let expected_sibling_root = hex::encode(sibling_graph.compute_root_hash());
-        SnapshotManager::save_graph(sibling_init.layout.kindb_snapshot_path(), &sibling_graph)
+        let sibling_blobs =
+            kin_blobs::BlobStore::new(sibling_init.layout.ingest_cas_dir()).unwrap();
+        let plan = crate::repository_commit::plan_native_commit(
+            &sibling_init.layout,
+            &sibling_graph,
+            &sibling_blobs,
+            kin_model::OperationId::new(),
+            kin_model::Timestamp::now(),
+            kin_model::AuthorId::new("spine-fixture"),
+            "publish sibling semantic authority".to_string(),
+        )
+        .unwrap();
+        crate::repository_commit::commit_native_plan(&sibling_init.layout, &sibling_blobs, plan)
             .unwrap();
+        let expected_sibling_root = hex::encode(
+            DaemonState::load_registered_workspace_graph(sibling_dir.path(), &sibling_id)
+                .unwrap()
+                .compute_root_hash(),
+        );
 
         // The primary repo: a caller entity plus an unresolved cross-repo call
         // tagged with the sibling repo as its import source.
@@ -4728,7 +4784,7 @@ mod tests {
                 confidence: 1.0,
                 origin: RelationOrigin::Parsed,
                 created_in: None,
-                import_source: Some(sibling_id.to_string()),
+                import_source: Some(sibling_id.clone()),
                 evidence: vec![RelationEvidence {
                     token: Some(imported_symbol.to_string()),
                     ..RelationEvidence::default()
@@ -4742,7 +4798,7 @@ mod tests {
         let registry_path = registry_dir.path().join("registry.toml");
         kin_core::registry::KinRegistry {
             repos: vec![kin_core::registry::RegisteredRepo {
-                id: sibling_id.to_string(),
+                id: sibling_id.clone(),
                 path: sibling_dir.path().to_path_buf(),
                 entities: 1,
                 last_commit: String::new(),
@@ -4762,7 +4818,7 @@ mod tests {
             (
                 spine.repo_count(),
                 spine.edge_count(),
-                spine.root_hash(sibling_id),
+                spine.root_hash(&sibling_id),
             )
         };
 
@@ -4798,9 +4854,9 @@ mod tests {
         // write path. A hosted pod runs one repo and owns no local sibling
         // checkouts and no `registry.toml`: the cross-repo index must be built
         // by loading sibling graphs from the durable StorageBackend (GCS in
-        // cloud, a `LocalFileBackend` rooted at `v2/` here — the same
-        // `v2/<repo>/graph.kndb` layout) via `ingest_repo_into_spine`, NOT from
-        // on-disk `.kndb` siblings the way `initialize_spine_lazy` does.
+        // cloud, a `LocalFileBackend` rooted at `v2/` here) via
+        // `ingest_repo_into_spine`, not from local registry workspace
+        // authorities.
         //
         // Two repos land in storage the way cloud ingestion sees them: the
         // sibling `kin-db` (which exports `InMemoryGraph`) and the primary
