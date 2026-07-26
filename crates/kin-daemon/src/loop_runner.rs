@@ -2,12 +2,15 @@
 // Copyright 2026 Firelock, LLC
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kin_index::{FileEvent, FileWatcher};
+use kin_index::{
+    FileClassification, FileClassifier, FileEvent, FileWatcher, IndexPipeline, IndexedAny,
+};
+use kin_model::{EntityFilter, EntityId, EntityStore, FilePathId, ShallowTrackedFile, TreeEntry};
 use kin_reconcile::apply_overlay_to_graph;
 use tracing::{debug, error, info, warn};
 
@@ -86,6 +89,249 @@ fn is_bare_repository(dir: &std::path::Path) -> bool {
         && !dir.join(".git").exists()
 }
 
+#[derive(Debug)]
+enum AdmittedFileEvent {
+    Regular {
+        file_id: FilePathId,
+        content: Vec<u8>,
+        entry: TreeEntry,
+        tree_changed: bool,
+    },
+    Symlink {
+        file_id: FilePathId,
+        entry: TreeEntry,
+        tree_changed: bool,
+    },
+    Removed {
+        file_id: FilePathId,
+        tree_changed: bool,
+    },
+    Ignored,
+}
+
+impl AdmittedFileEvent {
+    fn tree_changed(&self) -> bool {
+        match self {
+            Self::Regular { tree_changed, .. }
+            | Self::Symlink { tree_changed, .. }
+            | Self::Removed { tree_changed, .. } => *tree_changed,
+            Self::Ignored => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnrichmentFacet {
+    EntitySource,
+    ShallowSyntax,
+    StructuredArtifact,
+    OpaqueArtifact,
+    None,
+}
+
+#[derive(Debug, Default)]
+struct FacetCleanup {
+    removed_entities: Vec<EntityId>,
+    changed: bool,
+}
+
+fn repo_file_id(path: &Path, working_dir: &Path) -> Option<FilePathId> {
+    let relative = path.strip_prefix(working_dir).ok()?;
+    if !kin_index::should_index_repo_relative_path(relative) {
+        return None;
+    }
+    Some(kin_index::normalize_file_path_id(path, working_dir))
+}
+
+#[cfg(unix)]
+fn symlink_target_bytes(target: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    target.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn symlink_target_bytes(target: &Path) -> Vec<u8> {
+    target.to_string_lossy().as_bytes().to_vec()
+}
+
+#[cfg(unix)]
+fn regular_file_is_executable(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn regular_file_is_executable(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// Admit exact repository-tree truth before attempting any enrichment.
+///
+/// A removal notification is reclassified as a change when the directory
+/// entry exists again (including a dangling symlink); a change notification is
+/// reclassified as a removal when the entry disappeared before processing.
+fn admit_file_event(state: &DaemonState, event: &FileEvent) -> Result<AdmittedFileEvent> {
+    let path = match event {
+        FileEvent::Changed(path) | FileEvent::Removed(path) => path,
+    };
+    let working_dir = state.layout.working_dir();
+    let Some(file_id) = repo_file_id(path, working_dir) else {
+        return Ok(AdmittedFileEvent::Ignored);
+    };
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let tree_changed = state.graph.remove_working_tree_entry(&file_id.0).is_some();
+            return Ok(AdmittedFileEvent::Removed {
+                file_id,
+                tree_changed,
+            });
+        }
+        Err(error) => return Err(DaemonError::Io(error)),
+    };
+
+    let file_type = metadata.file_type();
+    let (content, entry, is_symlink) = if file_type.is_symlink() {
+        let target = std::fs::read_link(path).map_err(DaemonError::Io)?;
+        let content = symlink_target_bytes(&target);
+        let blob_hash = state.blobs.write(&content)?;
+        let content = state.blobs.read(&blob_hash)?;
+        (content, TreeEntry::symlink(blob_hash), true)
+    } else if file_type.is_file() {
+        let content = std::fs::read(path).map_err(DaemonError::Io)?;
+        let blob_hash = state.blobs.write(&content)?;
+        let content = state.blobs.read(&blob_hash)?;
+        (
+            content,
+            TreeEntry::regular(blob_hash, regular_file_is_executable(&metadata)),
+            false,
+        )
+    } else {
+        return Ok(AdmittedFileEvent::Ignored);
+    };
+
+    let tree_changed = state.graph.get_working_tree_entry(&file_id.0) != Some(entry);
+    if tree_changed {
+        state.graph.set_working_tree_entry(&file_id.0, entry);
+    }
+
+    if is_symlink {
+        Ok(AdmittedFileEvent::Symlink {
+            file_id,
+            entry,
+            tree_changed,
+        })
+    } else {
+        Ok(AdmittedFileEvent::Regular {
+            file_id,
+            content,
+            entry,
+            tree_changed,
+        })
+    }
+}
+
+fn clear_incompatible_facets(
+    state: &DaemonState,
+    file_id: &FilePathId,
+    keep: EnrichmentFacet,
+) -> Result<FacetCleanup> {
+    let mut cleanup = FacetCleanup::default();
+
+    if keep != EnrichmentFacet::EntitySource {
+        let entities = state.graph.query_entities(&EntityFilter {
+            file_path: Some(file_id.clone()),
+            ..Default::default()
+        })?;
+        cleanup.removed_entities = entities.into_iter().map(|entity| entity.id).collect();
+        state
+            .graph
+            .remove_entities_batch(&cleanup.removed_entities)?;
+        cleanup.changed |= !cleanup.removed_entities.is_empty();
+        if state.graph.get_file_layout(file_id)?.is_some() {
+            state.graph.delete_file_layout(file_id)?;
+            cleanup.changed = true;
+        }
+    }
+
+    if keep != EnrichmentFacet::ShallowSyntax && state.graph.get_shallow_file(file_id)?.is_some() {
+        state.graph.delete_shallow_file(file_id)?;
+        cleanup.changed = true;
+    }
+    if keep != EnrichmentFacet::StructuredArtifact
+        && state.graph.get_structured_artifact(file_id)?.is_some()
+    {
+        state.graph.delete_structured_artifact(file_id)?;
+        cleanup.changed = true;
+    }
+    if keep != EnrichmentFacet::OpaqueArtifact
+        && state.graph.get_opaque_artifact(file_id)?.is_some()
+    {
+        state.graph.delete_opaque_artifact(file_id)?;
+        cleanup.changed = true;
+    }
+
+    Ok(cleanup)
+}
+
+fn shallow_tracked_file(shallow: kin_parser::ShallowFile) -> ShallowTrackedFile {
+    ShallowTrackedFile {
+        file_id: shallow.file_id,
+        language_hint: shallow.language_hint.unwrap_or_default(),
+        declaration_count: shallow.declarations.len(),
+        import_count: shallow.imports.len(),
+        syntax_hash: shallow.fingerprint.syntax_hash,
+        signature_hash: shallow.fingerprint.signature_hash,
+        declaration_names: shallow
+            .declarations
+            .into_iter()
+            .map(|declaration| declaration.name)
+            .collect(),
+        import_paths: shallow
+            .imports
+            .into_iter()
+            .map(|import| import.raw_path)
+            .collect(),
+    }
+}
+
+fn persist_non_entity_enrichment(
+    state: &DaemonState,
+    indexed: IndexedAny,
+) -> Result<(FilePathId, FacetCleanup)> {
+    match indexed {
+        IndexedAny::EntitySource(_) => Err(DaemonError::Io(std::io::Error::other(
+            "entity source reached non-entity enrichment path",
+        ))),
+        IndexedAny::ShallowSyntax(shallow) => {
+            let shallow = shallow_tracked_file(shallow);
+            let cleanup =
+                clear_incompatible_facets(state, &shallow.file_id, EnrichmentFacet::ShallowSyntax)?;
+            state.graph.upsert_shallow_file(&shallow)?;
+            Ok((shallow.file_id, cleanup))
+        }
+        IndexedAny::StructuredArtifact(artifact) => {
+            let cleanup = clear_incompatible_facets(
+                state,
+                &artifact.file_id,
+                EnrichmentFacet::StructuredArtifact,
+            )?;
+            state.graph.upsert_structured_artifact(&artifact)?;
+            Ok((artifact.file_id, cleanup))
+        }
+        IndexedAny::OpaqueArtifact(artifact) => {
+            let cleanup = clear_incompatible_facets(
+                state,
+                &artifact.file_id,
+                EnrichmentFacet::OpaqueArtifact,
+            )?;
+            state.graph.upsert_opaque_artifact(&artifact)?;
+            Ok((artifact.file_id, cleanup))
+        }
+    }
+}
+
 /// Run the reconciliation loop until the cancellation token fires.
 ///
 /// This is the main loop of the daemon. It:
@@ -124,8 +370,8 @@ pub async fn run_loop(
         return Ok(());
     }
 
-    let extensions = kin_index::watcher::supported_extensions();
-    let watcher = FileWatcher::new(working_dir, extensions).map_err(DaemonError::from)?;
+    let watcher = FileWatcher::new(working_dir).map_err(DaemonError::from)?;
+    let enrichment_pipeline = IndexPipeline::new();
 
     info!(
         poll_ms = config.poll_interval_ms,
@@ -285,8 +531,135 @@ pub async fn run_loop(
         let graph_mutation = state.begin_graph_authority_mutation();
 
         for event in &batch {
+            let admitted = match admit_file_event(&state, event) {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    warn!(error = %error, "failed to admit exact repository-tree entry");
+                    continue;
+                }
+            };
+            if matches!(admitted, AdmittedFileEvent::Ignored) {
+                continue;
+            }
+
+            let tree_changed = admitted.tree_changed();
+            graph_changed |= tree_changed;
+            let path = match event {
+                FileEvent::Changed(path) | FileEvent::Removed(path) => path,
+            };
+
+            let semantic_event = match admitted {
+                AdmittedFileEvent::Regular {
+                    file_id,
+                    content,
+                    entry,
+                    ..
+                } => {
+                    let classification = FileClassifier::classify_with_content(path, &content);
+                    if classification != FileClassification::EntitySource {
+                        match enrichment_pipeline.index_any_content(
+                            &file_id,
+                            &content,
+                            entry.blob_hash,
+                        ) {
+                            Ok(indexed) => match persist_non_entity_enrichment(&state, indexed) {
+                                Ok((file_id, cleanup)) => {
+                                    projection_changed.remove(file_id.clone());
+                                    for id in cleanup.removed_entities {
+                                        state.emit_event(DaemonEvent::EntityChanged {
+                                            entity_id: id,
+                                            change_type: ChangeType::Deleted,
+                                            file_path: Some(file_id.0.clone()),
+                                            session_id: None,
+                                        });
+                                    }
+                                    graph_changed = true;
+                                    state.bump_version();
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        file = %file_id,
+                                        error = %error,
+                                        "tree entry admitted but enrichment facet persistence failed"
+                                    );
+                                    if tree_changed {
+                                        state.bump_version();
+                                    }
+                                }
+                            },
+                            Err(error) => {
+                                warn!(
+                                    file = %file_id,
+                                    error = %error,
+                                    "tree entry admitted but optional enrichment failed"
+                                );
+                                if tree_changed {
+                                    state.bump_version();
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    match clear_incompatible_facets(&state, &file_id, EnrichmentFacet::EntitySource)
+                    {
+                        Ok(cleanup) => {
+                            graph_changed |= cleanup.changed;
+                        }
+                        Err(error) => {
+                            warn!(
+                                file = %file_id,
+                                error = %error,
+                                "tree entry admitted but incompatible facet cleanup failed"
+                            );
+                        }
+                    }
+                    FileEvent::Changed(path.clone())
+                }
+                AdmittedFileEvent::Symlink { file_id, entry, .. } => {
+                    match clear_incompatible_facets(&state, &file_id, EnrichmentFacet::None) {
+                        Ok(cleanup) => {
+                            for id in cleanup.removed_entities {
+                                state.emit_event(DaemonEvent::EntityChanged {
+                                    entity_id: id,
+                                    change_type: ChangeType::Deleted,
+                                    file_path: Some(file_id.0.clone()),
+                                    session_id: None,
+                                });
+                            }
+                            projection_changed.remove(file_id.clone());
+                            graph_changed |= cleanup.changed;
+                            if tree_changed || cleanup.changed {
+                                state.bump_version();
+                            }
+                            debug!(
+                                file = %file_id,
+                                hash = %entry.blob_hash,
+                                "admitted symlink tree entry without source enrichment"
+                            );
+                        }
+                        Err(error) => {
+                            warn!(
+                                file = %file_id,
+                                error = %error,
+                                "symlink tree entry admitted but facet cleanup failed"
+                            );
+                            if tree_changed {
+                                state.bump_version();
+                            }
+                        }
+                    }
+                    continue;
+                }
+                AdmittedFileEvent::Removed { file_id, .. } => {
+                    debug!(file = %file_id, "removed exact repository-tree entry before facet cleanup");
+                    FileEvent::Removed(path.clone())
+                }
+                AdmittedFileEvent::Ignored => unreachable!(),
+            };
+
             match reconciler.reconcile_file_change(
-                event,
+                &semantic_event,
                 &state.blobs,
                 state.graph.as_ref(),
                 &mut working_copy.uncommitted_mutations,
@@ -305,6 +678,9 @@ pub async fn run_loop(
                             &mut working_copy.uncommitted_mutations,
                         ) {
                             warn!(error = %e, "failed to apply reconciled mutations into primary graph");
+                            if tree_changed {
+                                state.bump_version();
+                            }
                             continue;
                         }
                         if let Err(e) =
@@ -323,11 +699,7 @@ pub async fn run_loop(
                         ..
                     } = &outcome
                     {
-                        let file_path = match event {
-                            FileEvent::Changed(p) | FileEvent::Removed(p) => {
-                                p.to_string_lossy().to_string()
-                            }
-                        };
+                        let file_path = path.to_string_lossy().to_string();
                         for id in added {
                             state.emit_event(DaemonEvent::EntityChanged {
                                 entity_id: *id,
@@ -358,7 +730,9 @@ pub async fn run_loop(
                                 session_id: None,
                             });
                         }
-                        state.bump_version();
+                        if should_apply || tree_changed {
+                            state.bump_version();
+                        }
 
                         // Collect entity IDs for LSP enrichment.
                         let mut changed_ids: Vec<kin_model::EntityId> = Vec::new();
@@ -372,20 +746,13 @@ pub async fn run_loop(
                             "reconcile entity counts for LSP enrichment"
                         );
                         if !changed_ids.is_empty() {
-                            let path = match event {
-                                FileEvent::Changed(p) | FileEvent::Removed(p) => p.clone(),
-                            };
-                            lsp_changed.push((path, changed_ids));
+                            lsp_changed.push((path.clone(), changed_ids));
                         }
                     } else if let ReconcileOutcome::FileRemoved {
                         removed, file_id, ..
                     } = &outcome
                     {
-                        let file_path = match event {
-                            FileEvent::Changed(p) | FileEvent::Removed(p) => {
-                                p.to_string_lossy().to_string()
-                            }
-                        };
+                        let file_path = path.to_string_lossy().to_string();
                         for id in removed {
                             state.emit_event(DaemonEvent::EntityChanged {
                                 entity_id: *id,
@@ -396,13 +763,26 @@ pub async fn run_loop(
                                 session_id: None,
                             });
                         }
+                        match clear_incompatible_facets(&state, file_id, EnrichmentFacet::None) {
+                            Ok(cleanup) => {
+                                projection_changed.remove(file_id.clone());
+                                graph_changed |= cleanup.changed;
+                            }
+                            Err(error) => {
+                                warn!(
+                                    file = %file_id,
+                                    error = %error,
+                                    "removed tree entry but failed to clear every enrichment facet"
+                                );
+                            }
+                        }
 
-                        use kin_model::EntityStore;
-                        let _ = state.graph.delete_file_layout(file_id);
-                        state.graph.remove_entities_for_file(&file_id.0);
-                        let _ = state.graph.delete_structured_artifact(file_id);
-                        let _ = state.graph.delete_opaque_artifact(file_id);
-
+                        if should_apply || tree_changed {
+                            state.bump_version();
+                        }
+                    } else if tree_changed {
+                        // Broken-AST/LKG outcomes still publish the exact bytes
+                        // and mode admitted before parser enrichment.
                         state.bump_version();
                     }
                 }
@@ -416,12 +796,28 @@ pub async fn run_loop(
                         kin_reconcile::ReconcileError::FileModifiedDuringReconcile { .. }
                     ) {
                         debug!(error = %e, "file changed during reconcile, queued for retry");
-                        let retry_path = match &event {
-                            FileEvent::Changed(path) | FileEvent::Removed(path) => path.clone(),
-                        };
-                        retry_queue.push(retry_path);
+                        retry_queue.push(path.clone());
                     } else {
                         warn!(error = %e, "reconciliation error for event, skipping");
+                    }
+                    if matches!(semantic_event, FileEvent::Removed(_)) {
+                        let file_id =
+                            kin_index::normalize_file_path_id(path, state.layout.working_dir());
+                        match clear_incompatible_facets(&state, &file_id, EnrichmentFacet::None) {
+                            Ok(cleanup) => {
+                                projection_changed.remove(file_id);
+                                graph_changed |= cleanup.changed;
+                            }
+                            Err(error) => {
+                                warn!(
+                                    error = %error,
+                                    "removed tree entry but fallback facet cleanup failed"
+                                );
+                            }
+                        }
+                    }
+                    if tree_changed {
+                        state.bump_version();
                     }
                 }
             }
@@ -531,7 +927,13 @@ fn take_file_event_batch(pending: &mut VecDeque<FileEvent>, batch_size: usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_model::TreeEntryKind;
     use std::path::PathBuf;
+
+    fn open_test_state(repo: &tempfile::TempDir) -> Arc<DaemonState> {
+        let init = kin_core::init(repo.path()).unwrap();
+        Arc::new(DaemonState::open(init.layout).unwrap())
+    }
 
     #[test]
     fn graph_only_flag_accepts_only_explicit_truthy_values() {
@@ -579,6 +981,187 @@ mod tests {
             mass_delete_before,
             "graph-only mode must not set or clear the mass-deletion escape hatch"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admission_preserves_unsupported_bytes_and_executable_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let path = repo.path().join("tool.custom");
+        let content = b"#!/opt/custom/runtime\nrun something\n";
+        std::fs::write(&path, content).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let admitted = admit_file_event(&state, &FileEvent::Changed(path.clone())).unwrap();
+        let AdmittedFileEvent::Regular {
+            file_id,
+            entry,
+            tree_changed,
+            ..
+        } = admitted
+        else {
+            panic!("unsupported regular file must be admitted");
+        };
+        assert!(tree_changed);
+        assert_eq!(file_id, FilePathId::new("tool.custom"));
+        assert_eq!(entry.kind, TreeEntryKind::Regular { executable: true });
+        assert_eq!(state.blobs.read(&entry.blob_hash).unwrap(), content);
+        assert_eq!(
+            state.graph.get_working_tree_entry("tool.custom"),
+            Some(entry)
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let admitted = admit_file_event(&state, &FileEvent::Changed(path)).unwrap();
+        let AdmittedFileEvent::Regular { entry, .. } = admitted else {
+            panic!("mode-only edit must remain a regular tree entry");
+        };
+        assert_eq!(entry.kind, TreeEntryKind::Regular { executable: false });
+        assert_eq!(state.blobs.read(&entry.blob_hash).unwrap(), content);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admission_preserves_dangling_symlink_target_bytes() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let path = repo.path().join("current");
+        symlink("../releases/not-present", &path).unwrap();
+
+        let admitted = admit_file_event(&state, &FileEvent::Changed(path)).unwrap();
+        let AdmittedFileEvent::Symlink {
+            file_id,
+            entry,
+            tree_changed,
+        } = admitted
+        else {
+            panic!("dangling symlink must be admitted without dereferencing");
+        };
+        assert!(tree_changed);
+        assert_eq!(file_id, FilePathId::new("current"));
+        assert_eq!(entry.kind, TreeEntryKind::Symlink);
+        assert_eq!(
+            state.blobs.read(&entry.blob_hash).unwrap(),
+            b"../releases/not-present"
+        );
+        assert_eq!(state.graph.get_working_tree_entry("current"), Some(entry));
+    }
+
+    #[tokio::test]
+    async fn binary_reclassification_clears_source_facets_but_keeps_tree_truth() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        let path = repo.path().join("src/change.rs");
+        std::fs::write(&path, "pub fn semantic_source() -> u8 { 1 }\n").unwrap();
+
+        sync_filesystem_with_graph(&state).await.unwrap();
+        assert!(state
+            .graph
+            .entity_bearing_file_paths()
+            .contains(&"src/change.rs".to_string()));
+        assert!(state
+            .graph
+            .get_opaque_artifact(&FilePathId::new("src/change.rs"))
+            .unwrap()
+            .is_none());
+
+        let binary = b"\0\xff\x10not-source";
+        std::fs::write(&path, binary).unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+
+        let entry = state
+            .graph
+            .get_working_tree_entry("src/change.rs")
+            .expect("binary file remains exact tree truth");
+        assert_eq!(entry.kind, TreeEntryKind::Regular { executable: false });
+        assert_eq!(state.blobs.read(&entry.blob_hash).unwrap(), binary);
+        assert!(!state
+            .graph
+            .entity_bearing_file_paths()
+            .contains(&"src/change.rs".to_string()));
+        assert!(state
+            .graph
+            .get_file_layout(&FilePathId::new("src/change.rs"))
+            .unwrap()
+            .is_none());
+        assert!(state
+            .graph
+            .get_opaque_artifact(&FilePathId::new("src/change.rs"))
+            .unwrap()
+            .is_some());
+
+        std::fs::write(&path, "pub fn semantic_source() -> u8 { 2 }\n").unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+        assert!(state
+            .graph
+            .entity_bearing_file_paths()
+            .contains(&"src/change.rs".to_string()));
+        assert!(state
+            .graph
+            .get_opaque_artifact(&FilePathId::new("src/change.rs"))
+            .unwrap()
+            .is_none());
+        assert!(state
+            .graph
+            .get_working_tree_entry("src/change.rs")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn startup_sync_keeps_universal_entries_and_delete_clears_tree_and_facets() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let compose_path = repo.path().join("compose.yaml");
+        let notes_path = repo.path().join("release.notes");
+        std::fs::write(
+            &compose_path,
+            "services:\n  api:\n    image: example/api:latest\n",
+        )
+        .unwrap();
+        std::fs::write(&notes_path, "operator notes\n").unwrap();
+
+        sync_filesystem_with_graph(&state).await.unwrap();
+        let before = state.graph.working_tree_entries();
+        assert_eq!(before.len(), 2);
+        assert!(state
+            .graph
+            .get_structured_artifact(&FilePathId::new("compose.yaml"))
+            .unwrap()
+            .is_some());
+        assert!(state
+            .graph
+            .get_opaque_artifact(&FilePathId::new("release.notes"))
+            .unwrap()
+            .is_some());
+
+        // A startup/tick scan over an unchanged universal tree must not purge
+        // entries merely because they have no language parser.
+        sync_filesystem_with_graph(&state).await.unwrap();
+        assert_eq!(state.graph.working_tree_entries(), before);
+        assert!(state
+            .graph
+            .get_opaque_artifact(&FilePathId::new("release.notes"))
+            .unwrap()
+            .is_some());
+
+        std::fs::remove_file(&notes_path).unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+        assert!(state
+            .graph
+            .get_working_tree_entry("release.notes")
+            .is_none());
+        assert!(state
+            .graph
+            .get_opaque_artifact(&FilePathId::new("release.notes"))
+            .unwrap()
+            .is_none());
+        assert!(state.graph.get_working_tree_entry("compose.yaml").is_some());
     }
 
     #[test]
@@ -788,9 +1371,9 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
         return Ok(());
     }
 
-    let extensions = kin_index::watcher::supported_extensions();
-
-    // 1. Scan filesystem for all files recursively
+    // 1. Scan the exact filesystem tree. Parsing support is deliberately not
+    // consulted here: config, lockfiles, binaries, unsupported languages, and
+    // symlinks are all repository truth.
     let mut files_on_disk = std::collections::HashMap::new();
     let mut stack = vec![working_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -807,36 +1390,42 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
 
-            if path.is_dir() {
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
                 if kin_index::should_skip_dir(&name_str) {
                     continue;
                 }
                 stack.push(path);
-            } else if path.is_file() {
-                let is_relevant = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(|ext| extensions.iter().any(|e| e == ext))
-                    .unwrap_or(false);
-                if is_relevant {
-                    // Read file to compute content hash
-                    if let Ok(content) = std::fs::read(&path) {
-                        let hash = kin_blobs::digest_bytes(&content);
-                        files_on_disk.insert(path, hash);
-                    }
+            } else if file_type.is_file() {
+                if let (Ok(content), Ok(metadata)) =
+                    (std::fs::read(&path), std::fs::symlink_metadata(&path))
+                {
+                    let entry = TreeEntry::regular(
+                        kin_blobs::digest(&content),
+                        regular_file_is_executable(&metadata),
+                    );
+                    files_on_disk.insert(path, entry);
+                }
+            } else if file_type.is_symlink() {
+                if let Ok(target) = std::fs::read_link(&path) {
+                    let target = symlink_target_bytes(&target);
+                    files_on_disk.insert(path, TreeEntry::symlink(kin_blobs::digest(&target)));
                 }
             }
         }
     }
 
-    // 2. Scan the graph for all indexed files
-    let files_in_graph = state.graph.indexed_file_paths();
+    // 2. Snapshot graph-owned exact working-tree truth.
+    let files_in_graph = state.graph.working_tree_entries();
 
     let mut events = Vec::new();
 
     // 3. Find deleted files: files in graph that are NOT on disk.
     let mut removed_events = Vec::new();
-    for file_path_str in &files_in_graph {
+    for file_path_str in files_in_graph.keys() {
         let abs_path = working_dir.join(file_path_str);
         if !files_on_disk.contains_key(&abs_path) {
             removed_events.push(FileEvent::Removed(abs_path));
@@ -872,26 +1461,16 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
         events.extend(removed_events);
     }
 
-    // 4. Find added/modified files: files on disk that are NOT in graph or have different hash
-    for (path, disk_hash) in &files_on_disk {
+    // 4. Find added/modified files: paths absent from graph truth or whose
+    // exact content/kind/mode entry differs.
+    for (path, disk_entry) in &files_on_disk {
         let rel_path = path
             .strip_prefix(working_dir)
             .unwrap_or(path)
             .to_string_lossy()
             .to_string();
 
-        let in_graph = files_in_graph.iter().any(|p| p == &rel_path);
-        let hash_matches = if in_graph {
-            if let Some(graph_hash) = state.graph.get_file_hash(&rel_path) {
-                graph_hash == *disk_hash
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        if !in_graph || !hash_matches {
+        if files_in_graph.get(&rel_path) != Some(disk_entry) {
             events.push(FileEvent::Changed(path.clone()));
         }
     }
@@ -911,10 +1490,109 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
     let mut graph_changed = false;
     let mut projection_changed = ProjectionChangedSet::default();
     let graph_mutation = state.begin_graph_authority_mutation();
+    let enrichment_pipeline = IndexPipeline::new();
 
     for event in events {
+        let admitted = match admit_file_event(state, &event) {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                warn!(error = %error, "failed to admit exact repository-tree entry during sync");
+                continue;
+            }
+        };
+        if matches!(admitted, AdmittedFileEvent::Ignored) {
+            continue;
+        }
+        graph_changed |= admitted.tree_changed();
+        let path = match &event {
+            FileEvent::Changed(path) | FileEvent::Removed(path) => path,
+        };
+
+        let semantic_event = match admitted {
+            AdmittedFileEvent::Regular {
+                file_id,
+                content,
+                entry,
+                ..
+            } => {
+                let classification = FileClassifier::classify_with_content(path, &content);
+                if classification != FileClassification::EntitySource {
+                    match enrichment_pipeline.index_any_content(&file_id, &content, entry.blob_hash)
+                    {
+                        Ok(indexed) => match persist_non_entity_enrichment(state, indexed) {
+                            Ok((file_id, cleanup)) => {
+                                projection_changed.remove(file_id.clone());
+                                for id in cleanup.removed_entities {
+                                    state.emit_event(DaemonEvent::EntityChanged {
+                                        entity_id: id,
+                                        change_type: ChangeType::Deleted,
+                                        file_path: Some(file_id.0.clone()),
+                                        session_id: None,
+                                    });
+                                }
+                                graph_changed = true;
+                            }
+                            Err(error) => warn!(
+                                file = %file_id,
+                                error = %error,
+                                "tree entry admitted during sync but facet persistence failed"
+                            ),
+                        },
+                        Err(error) => warn!(
+                            file = %file_id,
+                            error = %error,
+                            "tree entry admitted during sync but optional enrichment failed"
+                        ),
+                    }
+                    continue;
+                }
+
+                match clear_incompatible_facets(state, &file_id, EnrichmentFacet::EntitySource) {
+                    Ok(cleanup) => graph_changed |= cleanup.changed,
+                    Err(error) => warn!(
+                        file = %file_id,
+                        error = %error,
+                        "tree entry admitted during sync but incompatible facet cleanup failed"
+                    ),
+                }
+                FileEvent::Changed(path.clone())
+            }
+            AdmittedFileEvent::Symlink { file_id, entry, .. } => {
+                match clear_incompatible_facets(state, &file_id, EnrichmentFacet::None) {
+                    Ok(cleanup) => {
+                        for id in cleanup.removed_entities {
+                            state.emit_event(DaemonEvent::EntityChanged {
+                                entity_id: id,
+                                change_type: ChangeType::Deleted,
+                                file_path: Some(file_id.0.clone()),
+                                session_id: None,
+                            });
+                        }
+                        projection_changed.remove(file_id.clone());
+                        graph_changed |= cleanup.changed;
+                        debug!(
+                            file = %file_id,
+                            hash = %entry.blob_hash,
+                            "admitted symlink during exact-tree sync"
+                        );
+                    }
+                    Err(error) => warn!(
+                        file = %file_id,
+                        error = %error,
+                        "symlink admitted during sync but facet cleanup failed"
+                    ),
+                }
+                continue;
+            }
+            AdmittedFileEvent::Removed { file_id, .. } => {
+                debug!(file = %file_id, "removed exact tree entry during sync");
+                FileEvent::Removed(path.clone())
+            }
+            AdmittedFileEvent::Ignored => unreachable!(),
+        };
+
         match reconciler.reconcile_file_change(
-            &event,
+            &semantic_event,
             &state.blobs,
             state.graph.as_ref(),
             &mut working_copy.uncommitted_mutations,
@@ -940,16 +1618,21 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
                     }
                     projection_changed.record_reconcile_outcome(&outcome);
 
-                    // Call the cleanup if it's a FileRemoved outcome!
                     if let ReconcileOutcome::FileRemoved {
                         removed, file_id, ..
                     } = &outcome
                     {
-                        use kin_model::EntityStore;
-                        let _ = state.graph.delete_file_layout(file_id);
-                        state.graph.remove_entities_for_file(&file_id.0);
-                        let _ = state.graph.delete_structured_artifact(file_id);
-                        let _ = state.graph.delete_opaque_artifact(file_id);
+                        match clear_incompatible_facets(state, file_id, EnrichmentFacet::None) {
+                            Ok(cleanup) => {
+                                projection_changed.remove(file_id.clone());
+                                graph_changed |= cleanup.changed;
+                            }
+                            Err(error) => warn!(
+                                file = %file_id,
+                                error = %error,
+                                "removed exact tree entry but failed to clear every facet"
+                            ),
+                        }
 
                         for id in removed {
                             state.emit_event(DaemonEvent::EntityChanged {
@@ -967,6 +1650,19 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
             }
             Err(e) => {
                 warn!(error = %e, "sync reconciliation error for event, skipping");
+                if matches!(semantic_event, FileEvent::Removed(_)) {
+                    let file_id = kin_index::normalize_file_path_id(path, working_dir);
+                    match clear_incompatible_facets(state, &file_id, EnrichmentFacet::None) {
+                        Ok(cleanup) => {
+                            projection_changed.remove(file_id);
+                            graph_changed |= cleanup.changed;
+                        }
+                        Err(error) => warn!(
+                            error = %error,
+                            "removed exact tree entry but fallback facet cleanup failed"
+                        ),
+                    }
+                }
             }
         }
     }

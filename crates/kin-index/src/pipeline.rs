@@ -429,7 +429,83 @@ impl IndexPipeline {
         self.index_file_content_with_tests(&file_id, &source, blob_hash)
     }
 
-    /// Index any file by classifying it first, then routing to the right handler.
+    /// Enrich exact bytes that have already been admitted into repository tree
+    /// truth.
+    ///
+    /// The caller supplies the blob hash for those exact bytes. Parser and
+    /// artifact support only select an enrichment facet; they never decide
+    /// whether the file exists in the repository.
+    pub fn index_any_content(
+        &self,
+        file_id: &FilePathId,
+        content: &[u8],
+        blob_hash: kin_blobs::Hash256,
+    ) -> Result<IndexedAny> {
+        let path = Path::new(&file_id.0);
+        let classification = FileClassifier::classify_with_content(path, content);
+
+        match classification {
+            FileClassification::EntitySource => Ok(IndexedAny::EntitySource(
+                self.index_file_content_with_tests(file_id, content, blob_hash)?
+                    .indexed_file,
+            )),
+            FileClassification::StructuredArtifact(kind) => {
+                let artifact = artifacts::extract_artifact(kind, content, file_id)
+                    .map_err(|e| IndexError::Graph(e.to_string()))?;
+
+                debug!(
+                    path = %file_id,
+                    kind = ?kind,
+                    hash = %blob_hash,
+                    "enriched structured artifact"
+                );
+
+                Ok(IndexedAny::StructuredArtifact(artifact))
+            }
+            FileClassification::ShallowSyntax { language_hint } => {
+                if let Some(shallow) = parse_shallow_file(content, file_id, &language_hint) {
+                    debug!(
+                        path = %file_id,
+                        lang = %language_hint,
+                        decls = shallow.declarations.len(),
+                        imports = shallow.imports.len(),
+                        "enriched shallow syntax file (C2)"
+                    );
+                    return Ok(IndexedAny::ShallowSyntax(shallow));
+                }
+
+                debug!(
+                    path = %file_id,
+                    lang = %language_hint,
+                    "C2 grammar unavailable; retaining opaque enrichment"
+                );
+                Ok(IndexedAny::OpaqueArtifact(OpaqueArtifact {
+                    file_id: file_id.clone(),
+                    content_hash: Hash256::from_bytes(blob_hash.0),
+                    mime_type: None,
+                    text_preview: None,
+                }))
+            }
+            FileClassification::OpaqueArtifact { mime_hint } => {
+                debug!(
+                    path = %file_id,
+                    mime = ?mime_hint,
+                    hash = %blob_hash,
+                    "enriched opaque artifact"
+                );
+
+                Ok(IndexedAny::OpaqueArtifact(OpaqueArtifact {
+                    file_id: file_id.clone(),
+                    content_hash: Hash256::from_bytes(blob_hash.0),
+                    mime_type: mime_hint,
+                    text_preview: None,
+                }))
+            }
+        }
+    }
+
+    /// Index any file by storing its exact bytes once, then routing those same
+    /// bytes through optional semantic enrichment.
     ///
     /// - EntitySource files go through the tree-sitter parser pipeline.
     /// - StructuredArtifact files go through the artifact extractor.
@@ -440,86 +516,11 @@ impl IndexPipeline {
             path = %path.display()
         )
         .entered();
-        let classification = FileClassifier::classify(path);
-
-        match classification {
-            FileClassification::EntitySource => {
-                let indexed = self.index_file(path, blob_store)?;
-                Ok(IndexedAny::EntitySource(indexed))
-            }
-            FileClassification::StructuredArtifact(kind) => {
-                let content = std::fs::read(path)
-                    .map_err(|e| IndexError::io(path.display().to_string(), e))?;
-                let blob_hash = blob_store.write(&content)?;
-
-                let file_id = FilePathId::new(path.display().to_string());
-                let artifact = artifacts::extract_artifact(kind, &content, &file_id)
-                    .map_err(|e| IndexError::Graph(e.to_string()))?;
-
-                debug!(
-                    path = %path.display(),
-                    kind = ?kind,
-                    hash = %blob_hash,
-                    "indexed structured artifact"
-                );
-
-                Ok(IndexedAny::StructuredArtifact(artifact))
-            }
-            FileClassification::ShallowSyntax { language_hint } => {
-                let content = std::fs::read(path)
-                    .map_err(|e| IndexError::io(path.display().to_string(), e))?;
-                let blob_hash = blob_store.write(&content)?;
-                let file_id = FilePathId::new(path.display().to_string());
-
-                // Try to parse at C2 shallow tier
-                if let Some(shallow) = parse_shallow_file(&content, &file_id, &language_hint) {
-                    debug!(
-                        path = %path.display(),
-                        lang = %language_hint,
-                        decls = shallow.declarations.len(),
-                        imports = shallow.imports.len(),
-                        "indexed shallow syntax file (C2)"
-                    );
-                    return Ok(IndexedAny::ShallowSyntax(shallow));
-                }
-
-                // Fallback: no grammar available or parse failed -> opaque
-                debug!(
-                    path = %path.display(),
-                    lang = %language_hint,
-                    "C2 grammar not available, falling back to opaque"
-                );
-                let content_hash = Hash256::from_bytes(blob_hash.0);
-                Ok(IndexedAny::OpaqueArtifact(OpaqueArtifact {
-                    file_id,
-                    content_hash,
-                    mime_type: None,
-                    text_preview: None,
-                }))
-            }
-            FileClassification::OpaqueArtifact { mime_hint } => {
-                let content = std::fs::read(path)
-                    .map_err(|e| IndexError::io(path.display().to_string(), e))?;
-                let blob_hash = blob_store.write(&content)?;
-
-                let file_id = FilePathId::new(path.display().to_string());
-                let content_hash = Hash256::from_bytes(blob_hash.0);
-
-                debug!(
-                    path = %path.display(),
-                    mime = ?mime_hint,
-                    hash = %blob_hash,
-                    "indexed opaque artifact"
-                );
-
-                Ok(IndexedAny::OpaqueArtifact(OpaqueArtifact {
-                    file_id,
-                    content_hash,
-                    mime_type: mime_hint,
-                    text_preview: None,
-                }))
-            }
-        }
+        let content =
+            std::fs::read(path).map_err(|e| IndexError::io(path.display().to_string(), e))?;
+        let blob_hash = blob_store.write(&content)?;
+        let file_id = FilePathId::new(path.display().to_string());
+        self.index_any_content(&file_id, &content, blob_hash)
     }
 
     /// Index a file and upsert results into the graph store.
@@ -1391,6 +1392,45 @@ pub fn add(a: i32, b: i32) -> i32 { a + b }\n";
             entity_id_set(&full),
             entity_id_set(&hinted),
             "incremental and full relative indexing must agree on entity IDs"
+        );
+    }
+
+    #[test]
+    fn admitted_binary_with_source_extension_gets_only_opaque_enrichment() {
+        let bytes = b"\0\xff\x10not-rust";
+        let hash = kin_blobs::digest(bytes);
+        let indexed = IndexPipeline::new()
+            .index_any_content(&FilePathId::new("src/payload.rs"), bytes, hash)
+            .unwrap();
+
+        let IndexedAny::OpaqueArtifact(artifact) = indexed else {
+            panic!("binary bytes must not be forced through the Rust parser");
+        };
+        assert_eq!(artifact.file_id, FilePathId::new("src/payload.rs"));
+        assert_eq!(artifact.content_hash, Hash256::from_bytes(hash.0));
+        assert_eq!(
+            artifact.mime_type.as_deref(),
+            Some("application/octet-stream")
+        );
+    }
+
+    #[test]
+    fn admitted_compose_bytes_get_structured_enrichment_without_changing_blob_identity() {
+        let bytes = b"services:\n  api:\n    image: example/api\n";
+        let hash = kin_blobs::digest(bytes);
+        let indexed = IndexPipeline::new()
+            .index_any_content(&FilePathId::new("compose.yaml"), bytes, hash)
+            .unwrap();
+
+        let IndexedAny::StructuredArtifact(artifact) = indexed else {
+            panic!("Compose content must receive its structured facet");
+        };
+        assert_eq!(artifact.file_id, FilePathId::new("compose.yaml"));
+        assert_eq!(artifact.kind, kin_model::ArtifactKind::ComposeFile);
+        assert_ne!(
+            artifact.content_hash,
+            Hash256::from_bytes(hash.0),
+            "structured hash is an enrichment fingerprint, not exact tree identity"
         );
     }
 }
