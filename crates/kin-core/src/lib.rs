@@ -45,7 +45,10 @@ pub use exact_tree::{
 pub use hooks::{
     generate_claude_hooks, render_hooks_instructions, render_hooks_json, HookTemplate,
 };
-pub use init::{init, initialize_repository_authority, InitResult, RepositoryBootstrap};
+pub use init::{
+    init, initialize_repository_authority, prepare_repository_layout_at, publish_repository_layout,
+    InitResult, PreparedRepositoryInit, RepositoryBootstrap,
+};
 pub use layout::KinLayout;
 pub use manifest::KinManifest;
 pub use resolver::{ImportResolver, PythonResolver, SymbolTable, TypeScriptResolver};
