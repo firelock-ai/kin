@@ -10,6 +10,7 @@ pub mod diff;
 pub mod disambiguation;
 pub mod env_registry;
 pub mod error;
+pub mod exact_tree;
 pub mod hooks;
 pub mod init;
 pub mod layout;
@@ -37,6 +38,7 @@ pub use config::{
     RemoteRefConfig, RemoteTransportKind, WorldConfig, WorldPreset,
 };
 pub use error::{KinError, Result};
+pub use exact_tree::{exact_tree_correction, plan_observed_tree_deltas};
 pub use hooks::{
     generate_claude_hooks, render_hooks_instructions, render_hooks_json, HookTemplate,
 };
