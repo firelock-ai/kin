@@ -150,7 +150,6 @@ fn commit_exact_transaction_inner(
 
     let base = load_native_commit_base(&state.layout)
         .map_err(|error| format!("load exact MCP commit base: {error}"))?;
-    reject_unmaterializable_tree(&base)?;
     require_live_graph_matches_authority(state.graph.as_ref(), &base.graph)?;
     let plan = plan_exact_transaction(state, &transaction, operation_id, &base)?;
 
@@ -283,20 +282,6 @@ fn persist_registry_checked(
     }
     crate::state::write_persisted_mcp_transactions_checked(&state.layout, &store)
         .map_err(|error| error.to_string())
-}
-
-fn reject_unmaterializable_tree(base: &NativeCommitBase) -> Result<(), String> {
-    if let Some(gitlink) = base
-        .tree
-        .artifacts_by_path()
-        .find(|artifact| matches!(artifact.entry, TreeEntry::Gitlink { .. }))
-    {
-        return Err(format!(
-            "exact MCP repository commit cannot project gitlink {}; commit aborted before mutation",
-            gitlink.path
-        ));
-    }
-    Ok(())
 }
 
 fn require_live_graph_matches_authority(
@@ -973,11 +958,11 @@ fn stabilize_layout_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use std::process::Command;
     use std::sync::OnceLock;
 
-    use kin_model::{
-        AuthorId, EntityFilter, GitObjectId, LocatedEntry, SemanticChangeId, Timestamp, TreeDelta,
-    };
+    use kin_model::{AuthorId, EntityFilter, LocatedEntry, SemanticChangeId, Timestamp, TreeDelta};
 
     fn install_test_registry_override() {
         static REGISTRY_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -1003,6 +988,21 @@ mod tests {
         let layout = kin_core::init(dir.path()).unwrap().layout;
         let state = Arc::new(DaemonState::open(layout).unwrap());
         (dir, state)
+    }
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("run git {args:?}: {error}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
     fn install_exact_source(
@@ -1495,30 +1495,134 @@ mod tests {
     }
 
     #[test]
-    fn gitlink_tree_is_rejected_by_exact_materialization_gate() {
-        let (_dir, state) = test_state();
-        install_exact_source(
-            &state,
-            "src/lib.rs",
-            b"pub fn value() -> u8 { 1 }\n",
-            "value",
+    fn untouched_gitlink_does_not_block_an_unrelated_exact_source_commit() {
+        install_test_registry_override();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git(repo, &["init", "--initial-branch=subtarget"]);
+        git(repo, &["config", "user.email", "kin@example.invalid"]);
+        git(repo, &["config", "user.name", "Kin"]);
+        git(repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join(".subtarget"), b"subrepository target\n").unwrap();
+        git(repo, &["add", ".subtarget"]);
+        git(repo, &["commit", "-m", "subrepository target"]);
+        let gitlink_target = git(repo, &["rev-parse", "HEAD"]);
+        git(repo, &["switch", "--orphan", "main"]);
+        if repo.join(".subtarget").exists() {
+            std::fs::remove_file(repo.join(".subtarget")).unwrap();
+        }
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::create_dir_all(repo.join("modules/dependency")).unwrap();
+        let initial = b"pub fn value() -> u8 { 1 }\n";
+        std::fs::write(repo.join("src/lib.rs"), initial).unwrap();
+        git(repo, &["add", "src/lib.rs"]);
+        git(
+            repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{gitlink_target},modules/dependency"),
+            ],
         );
-        let mut base = load_native_commit_base(&state.layout).unwrap();
-        base.graph
-            .apply_transaction_delta(&TransactionDelta {
-                tree_deltas: vec![TreeDelta::Added {
-                    artifact_id: kin_model::ArtifactId::new(),
-                    new: LocatedEntry::new(
-                        RepoPath::from_utf8("vendor/dependency").unwrap(),
-                        TreeEntry::gitlink(GitObjectId::sha1([0x44; 20])),
-                    ),
-                }],
-                ..TransactionDelta::default()
+        git(repo, &["commit", "-m", "source with exact gitlink"]);
+
+        let layout = kin_core::init_from_git(repo).unwrap().layout;
+        let state = Arc::new(DaemonState::open(layout).unwrap());
+        let file_id = FilePathId::new("src/lib.rs");
+        let mut entities = state
+            .graph
+            .query_entities(&EntityFilter {
+                name_pattern: Some("value".to_string()),
+                file_path: Some(file_id.clone()),
+                ..EntityFilter::default()
             })
             .unwrap();
-        base.tree = base.graph.resolved_tree();
-        let error = reject_unmaterializable_tree(&base).unwrap_err();
-        assert!(error.contains("cannot project gitlink"), "{error}");
+        if entities.iter().all(|entity| entity.name != "value") {
+            let blob_hash = state.blobs.write(initial).unwrap();
+            let indexed = kin_index::IndexPipeline::new()
+                .index_any_content(&file_id, initial, blob_hash)
+                .unwrap();
+            let kin_index::IndexedAny::EntitySource(indexed) = indexed else {
+                panic!("Rust source fixture must produce semantic entities");
+            };
+            assert!(
+                state
+                    .graph
+                    .resolved_tree()
+                    .artifact_at_path(&RepoPath::from_utf8("src/lib.rs").unwrap())
+                    .is_some(),
+                "daemon query graph must begin from the imported exact workspace tree"
+            );
+            let layout = indexed.file_layout.clone();
+            state
+                .graph
+                .apply_transaction_delta(&TransactionDelta {
+                    entity_deltas: indexed
+                        .entities
+                        .into_iter()
+                        .map(|new| EntityDelta::Added { new })
+                        .collect(),
+                    relation_deltas: indexed
+                        .relations
+                        .into_iter()
+                        .map(|new| RelationDelta::Added { new })
+                        .collect(),
+                    ..TransactionDelta::default()
+                })
+                .unwrap();
+            state.graph.upsert_file_layout(&layout).unwrap();
+            commit_live_graph(&state, "install source semantics", false);
+            entities = state
+                .graph
+                .query_entities(&EntityFilter {
+                    name_pattern: Some("value".to_string()),
+                    file_path: Some(file_id),
+                    ..EntityFilter::default()
+                })
+                .unwrap();
+        }
+        let entity = entities
+            .into_iter()
+            .find(|entity| entity.name == "value")
+            .expect("source fixture must contain value");
+
+        let before = load_native_commit_base(&state.layout).unwrap();
+        let gitlink_path = RepoPath::from_utf8("modules/dependency").unwrap();
+        let gitlink = before
+            .tree
+            .artifact_at_path(&gitlink_path)
+            .cloned()
+            .expect("Git import must retain the exact Gitlink");
+        assert!(matches!(gitlink.entry, TreeEntry::Gitlink { .. }));
+        let retained = state
+            .layout
+            .working_dir()
+            .join("modules/dependency/local-only.txt");
+        std::fs::write(&retained, b"independently managed bytes\n").unwrap();
+
+        let sessions = kin_mcp::SessionRegistry::new();
+        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "unrelated exact source commit failed: {}",
+            result_text(&result)
+        );
+
+        let after = load_native_commit_base(&state.layout).unwrap();
+        assert!(after.roots.generation > before.roots.generation);
+        assert_eq!(
+            after.tree.get(&gitlink.artifact_id).unwrap().entry,
+            gitlink.entry,
+            "MCP commit must preserve the exact Gitlink target"
+        );
+        assert_eq!(
+            std::fs::read(&retained).unwrap(),
+            b"independently managed bytes\n",
+            "unrelated MCP edits must not traverse or rewrite retained Gitlink content"
+        );
     }
 
     #[test]
