@@ -1,22 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+//! Reconcile an isolated session workspace into graph-owned repository truth.
+//!
+//! The filesystem is consulted only as an explicit, complete session-ingress
+//! observation. The recorded graph head supplies the base, the live graph
+//! supplies the current state, and one identity-bearing transaction publishes
+//! exact tree plus semantic changes. The working directory is only a projection.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
-use kin_index::{FileClassification, FileClassifier, FileEvent, IndexPipeline, IndexedAny};
+use anyhow::{Context, Result};
+use kin_index::{FileClassification, FileClassifier, FileEvent};
 use kin_model::{
-    EntityFilter, EntityStore, FilePathId, GraphOverlay, ShallowTrackedFile, TreeEntry,
-    TreeEntryKind,
+    ChangeStore, Entity, EntityDelta, EntityFilter, EntityId, EntityStore, FilePathId, GraphNodeId,
+    GraphOverlay, Relation, RelationDelta, RelationId, RepoPath, ResolvedArtifact, ResolvedTree,
+    TransactionDelta, TreeDelta, TreeEntry,
 };
-use kin_reconcile::{apply_overlay_to_graph, ReconcileOutcome, Reconciler};
+use kin_reconcile::{ReconcileOutcome, Reconciler};
 use serde::{Deserialize, Serialize};
 
-/// `kin reconcile [session-id] [--cleanup]` — Detect changes in a session workspace and update the graph.
+/// `kin reconcile [session-id] [--cleanup]` — admit a session workspace into the graph.
 pub async fn run(session_id: Option<String>, cleanup: bool) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-
     let session_dir = resolve_session_dir(&layout, session_id)?;
     let summary = reconcile_session_dir(&layout, &session_dir).await?;
 
@@ -29,23 +37,21 @@ pub async fn run(session_id: Option<String>, cleanup: bool) -> Result<()> {
     for change in &summary.changes {
         println!("  {} {}", change.0, change.1);
     }
-
     println!(
-        "\nReconciliation complete: {} files indexed, {} entities upserted, {} entities removed.",
+        "\nReconciliation complete: {} files semantically indexed, {} entities upserted, {} entities removed.",
         summary.files_indexed, summary.total_upserted, summary.total_removed
     );
 
     if cleanup {
-        std::fs::remove_dir_all(&session_dir).map_err(|e| {
+        std::fs::remove_dir_all(&session_dir).map_err(|error| {
             anyhow::anyhow!(
                 "reconciled successfully, but failed to clean up {}: {}",
                 session_dir.display(),
-                e
+                error
             )
         })?;
         println!("Cleaned up session workspace: {}", session_dir.display());
     }
-
     Ok(())
 }
 
@@ -69,9 +75,9 @@ pub async fn reconcile_session_dir(
 ) -> Result<ReconcileSummary> {
     #[cfg(test)]
     {
-        let snap = crate::backend::open_kindb_snapshot(layout)
-            .map_err(|e| anyhow::anyhow!("failed to open graph store: {}", e))?;
-        reconcile_session_dir_with_snapshot(layout, session_dir, snap)
+        let snapshot = crate::backend::open_kindb_snapshot(layout)
+            .map_err(|error| anyhow::anyhow!("failed to open graph store: {error}"))?;
+        reconcile_session_dir_with_snapshot(layout, session_dir, snapshot)
     }
 
     #[cfg(not(test))]
@@ -86,22 +92,21 @@ pub async fn reconcile_session_dir(
                 session_dir: session_dir.to_path_buf(),
             })
             .await
-            .map_err(|e| anyhow::anyhow!("daemon reconcile failed: {}", e))
+            .map_err(|error| anyhow::anyhow!("daemon reconcile failed: {error}"))
     }
 }
 
-/// Reconcile through the endpoint and bearer token already verified for the
-/// session's repository. This path deliberately carries no ambient
-/// `KIN_DAEMON_URL` or `KIN_SESSION_ID` authority.
+/// Reconcile through an endpoint and bearer token already verified for the
+/// session repository. No ambient daemon/session authority is consulted.
 pub(crate) async fn reconcile_session_dir_with_binding(
     binding: &super::session_process::VerifiedRepoBinding,
     session_dir: &Path,
 ) -> Result<ReconcileSummary> {
     #[cfg(test)]
     {
-        let snap = crate::backend::open_kindb_snapshot(binding.layout())
-            .map_err(|e| anyhow::anyhow!("failed to open graph store: {}", e))?;
-        reconcile_session_dir_with_snapshot(binding.layout(), session_dir, snap)
+        let snapshot = crate::backend::open_kindb_snapshot(binding.layout())
+            .map_err(|error| anyhow::anyhow!("failed to open graph store: {error}"))?;
+        reconcile_session_dir_with_snapshot(binding.layout(), session_dir, snapshot)
     }
 
     #[cfg(not(test))]
@@ -112,31 +117,33 @@ pub(crate) async fn reconcile_session_dir_with_binding(
                 session_dir: session_dir.to_path_buf(),
             })
             .await
-            .map_err(|e| anyhow::anyhow!("daemon reconcile failed: {}", e))
+            .map_err(|error| anyhow::anyhow!("daemon reconcile failed: {error}"))
     }
 }
 
-/// Test-only sync variant that opens the snapshot directly (no daemon).
 #[cfg(test)]
 fn reconcile_session_dir_sync(
     layout: &kin_core::KinLayout,
     session_dir: &Path,
 ) -> Result<ReconcileSummary> {
-    let snap = crate::backend::open_kindb_snapshot(layout)
-        .map_err(|e| anyhow::anyhow!("failed to open graph store: {}", e))?;
-    reconcile_session_dir_with_snapshot(layout, session_dir, snap)
+    let snapshot = crate::backend::open_kindb_snapshot(layout)
+        .map_err(|error| anyhow::anyhow!("failed to open graph store: {error}"))?;
+    reconcile_session_dir_with_snapshot(layout, session_dir, snapshot)
 }
 
 #[cfg(test)]
 fn reconcile_session_dir_with_snapshot(
     layout: &kin_core::KinLayout,
     session_dir: &Path,
-    snap: kin_db::SnapshotManager,
+    snapshot: kin_db::SnapshotManager,
 ) -> Result<ReconcileSummary> {
-    let graph = snap.graph();
+    let graph = snapshot.graph();
     execute_reconcile_session_dir_with_persist(layout, graph.as_ref(), session_dir, || {
-        snap.save()
-            .map_err(|e| anyhow::anyhow!("failed to persist reconciled graph snapshot: {}", e))
+        snapshot
+            .save()
+            .map_err(|error| {
+                anyhow::anyhow!("failed to persist reconciled graph snapshot: {error}")
+            })
             .map(|_| ())
     })
 }
@@ -179,352 +186,602 @@ fn execute_reconcile_session_dir_inner<F>(
 where
     F: FnOnce() -> Result<()>,
 {
-    let source = kin_core::source_dir(layout);
     ensure_session_dir_exists(session_dir)?;
+    let base = super::session_base::load_base(session_dir)?;
+    let base_tree = graph
+        .resolve_tree_at(&base.base_head)
+        .with_context(|| format!("resolve session base graph head {}", base.base_head))?;
+    let mut observation = super::session_base::snapshot_dir(session_dir)?;
 
-    println!("Reconciling session workspace: {}", session_dir.display());
-    if project_source {
-        println!("Projecting graph authority to: {}", source.display());
-    }
-
-    let changes = plan_reconcile_changes(session_dir, &source)?;
-    if changes.is_empty() {
-        return Ok(ReconcileSummary {
-            changes: Vec::new(),
-            change_count: 0,
-            files_indexed: 0,
-            total_upserted: 0,
-            total_removed: 0,
-        });
-    }
-
-    let prepared = changes
-        .iter()
-        .map(|change| prepare_change(session_dir, &source, change))
-        .collect::<Result<Vec<_>>>()?;
-    let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
-        .map_err(|error| anyhow::anyhow!("failed to open blob store: {}", error))?;
-    let pipeline = IndexPipeline::new();
-    let mut reconciler = Reconciler::new(session_dir.to_path_buf());
-    reconciler.seed_lkg_from_graph(graph);
-    let mut overlay = GraphOverlay::default();
-    let mut total_upserted = 0usize;
-    let mut total_removed = 0usize;
-    let mut files_indexed = 0usize;
-
-    for change in &prepared {
-        match &change.after {
-            Some(after) => {
-                let written_hash = blob_store.write(&after.content).map_err(|error| {
-                    anyhow::anyhow!(
-                        "failed to persist graph blob for {}: {}",
-                        change.file_id,
-                        error
-                    )
-                })?;
-                if written_hash.0 != *after.entry.blob_hash.as_bytes() {
-                    anyhow::bail!(
-                        "session entry hash changed during admission for {}",
-                        change.file_id
-                    );
-                }
-                if after.entry.kind == TreeEntryKind::Symlink {
-                    total_removed += clear_all_enrichment(graph, &change.file_id)?;
-                } else {
-                    match FileClassifier::classify_with_content(
-                        Path::new(&change.file_id.0),
-                        &after.content,
-                    ) {
-                        FileClassification::EntitySource => {
-                            clear_non_entity_enrichment(graph, &change.file_id)?;
-                            let event = FileEvent::Changed(session_dir.join(&change.relative_path));
-                            match reconciler.reconcile_file_change(
-                                &event,
-                                &blob_store,
-                                graph,
-                                &mut overlay,
-                            ) {
-                                Ok(ReconcileOutcome::Updated {
-                                    added,
-                                    modified,
-                                    removed,
-                                    file_id,
-                                    ..
-                                }) => {
-                                    total_upserted += added.len() + modified.len();
-                                    total_removed += removed.len();
-                                    files_indexed += 1;
-                                    if let Some(layout) =
-                                        reconciler.projection().get_layout(&file_id)
-                                    {
-                                        graph.upsert_file_layout(layout)?;
-                                    }
-                                }
-                                Ok(ReconcileOutcome::BrokenAst { file_id, .. }) => {
-                                    eprintln!(
-                                        "  Note: {} has incomplete syntax; exact bytes were admitted and semantic LKG was retained",
-                                        file_id
-                                    );
-                                }
-                                Ok(ReconcileOutcome::Conflict(conflict)) => {
-                                    eprintln!(
-                                        "  Note: {} has a semantic conflict ({:?}); exact bytes were admitted and semantic LKG was retained",
-                                        change.file_id, conflict.kind
-                                    );
-                                }
-                                Ok(ReconcileOutcome::FileRemoved { .. }) => {
-                                    eprintln!(
-                                        "  Note: {} disappeared from semantic enrichment; exact admission will revalidate it",
-                                        change.file_id
-                                    );
-                                }
-                                Err(error) => {
-                                    eprintln!(
-                                        "  Note: {} could not be semantically enriched ({}); exact repository truth was still admitted",
-                                        change.file_id, error
-                                    );
-                                }
-                            }
-                        }
-                        _ => {
-                            let indexed = pipeline
-                                .index_any_content(&change.file_id, &after.content, written_hash)
-                                .map_err(|error| {
-                                    anyhow::anyhow!(
-                                        "failed to enrich exact repository entry {}: {}",
-                                        change.file_id,
-                                        error
-                                    )
-                                })?;
-                            total_removed += clear_all_enrichment(graph, &change.file_id)?;
-                            persist_non_entity_enrichment(graph, indexed)?;
-                            files_indexed += 1;
-                        }
-                    }
-                }
-
-                let current =
-                    super::session_base::read_disk_entry(&session_dir.join(&change.relative_path))?
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "session entry disappeared during reconcile: {}",
-                                change.relative_path.display()
-                            )
-                        })?;
-                if current.0 != after.entry {
-                    anyhow::bail!(
-                        "session entry changed during reconcile: {}",
-                        change.relative_path.display()
-                    );
-                }
-                // Enrichment deletion may remove the last facet-backed artifact
-                // index entry. Exact tree authority always retains identity.
-                graph.ensure_artifact_id(&change.file_id);
-                graph.set_working_tree_entry(&change.file_id.0, after.entry);
-            }
-            None => {
-                total_removed += clear_all_enrichment(graph, &change.file_id)?;
-                graph.remove_working_tree_entry(&change.file_id.0);
-            }
+    // A Gitlink has no ordinary host-file materialization. Preserve it unless a
+    // future explicit identity-bearing session command says otherwise.
+    for artifact in base_tree.artifacts() {
+        if matches!(artifact.entry, TreeEntry::Gitlink { .. })
+            && !observation.contains_key(&artifact.path)
+        {
+            observation.insert(artifact.path.clone(), artifact.entry);
         }
     }
 
-    apply_overlay_to_graph(graph, &mut overlay)
-        .map_err(|error| anyhow::anyhow!("failed to apply reconciled overlay: {}", error))?;
-    persist()?;
-
-    if project_source {
-        let previous_entries: Vec<_> = prepared
-            .iter()
-            .filter_map(|change| {
-                change
-                    .before
-                    .as_ref()
-                    .map(|entry| (&change.file_id, entry.entry.kind, entry.content.as_slice()))
-            })
-            .collect();
-        let target_entries: Vec<_> = prepared
-            .iter()
-            .filter_map(|change| {
-                change
-                    .after
-                    .as_ref()
-                    .map(|entry| (&change.file_id, entry.entry.kind, entry.content.as_slice()))
-            })
-            .collect();
-        kin_core::reconcile_source_tree(
-            &source,
-            previous_entries,
-            target_entries,
-            kin_core::should_preserve_checkout_path,
-        )
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "graph authority was persisted, but its filesystem projection failed: {}",
-                error
-            )
-        })?;
+    let session_deltas = kin_core::plan_observed_tree_deltas(&base_tree, observation)
+        .context("plan exact session observation")?;
+    if session_deltas.is_empty() {
+        return Ok(empty_summary());
     }
 
-    let change_summaries = changes
-        .iter()
-        .map(|change| {
-            (
-                match change.kind {
-                    ChangeKind::Modified => "modified",
-                    ChangeKind::Added => "added",
-                    ChangeKind::Deleted => "deleted",
-                }
-                .to_string(),
-                change.relative_path.display().to_string(),
+    let current_tree = graph.resolved_tree();
+    let rebased = rebase_session_deltas(&current_tree, &session_deltas).with_context(|| {
+        format!(
+            "session reconcile conflict for {} (base graph head {}); graph truth was not changed",
+            session_dir.display(),
+            base.base_head
+        )
+    })?;
+    if rebased.deltas.is_empty() {
+        return Ok(empty_summary());
+    }
+
+    let blob_store =
+        kin_blobs::BlobStore::new(layout.objects_dir()).context("open Kin object store")?;
+    let prepared = prepare_target_entries(session_dir, &rebased.deltas, &blob_store)?;
+    let semantic = prepare_semantic_transaction(
+        graph,
+        session_dir,
+        &current_tree,
+        &rebased.target,
+        &rebased.deltas,
+        &prepared,
+        &blob_store,
+    )?;
+    let transaction = TransactionDelta {
+        entity_deltas: semantic.entity_deltas,
+        relation_deltas: semantic.relation_deltas,
+        tree_deltas: rebased.deltas.clone(),
+    };
+    let inverse = inverse_transaction(graph, &transaction)?;
+    let projection = projection_trees(&current_tree, &rebased.target, &rebased.deltas)?;
+    let source = kin_core::source_dir(layout);
+
+    if project_source {
+        kin_projection::transition_resolved_tree(
+            &source,
+            &projection.previous,
+            &projection.target,
+            &blob_store,
+        )
+        .context("stage and publish reconciled working-copy projection")?;
+    }
+
+    if let Err(graph_error) = graph.apply_transaction_delta(&transaction) {
+        let rollback = project_source.then(|| {
+            kin_projection::transition_resolved_tree(
+                &source,
+                &projection.target,
+                &projection.previous,
+                &blob_store,
             )
-        })
-        .collect();
+        });
+        return Err(command_failure(
+            "exact reconcile graph transaction failed after projection",
+            graph_error,
+            rollback,
+        ));
+    }
+
+    if let Err(persist_error) = persist() {
+        let graph_rollback = graph.apply_transaction_delta(&inverse);
+        let projection_rollback = project_source.then(|| {
+            kin_projection::transition_resolved_tree(
+                &source,
+                &projection.target,
+                &projection.previous,
+                &blob_store,
+            )
+        });
+        let graph_status = graph_rollback
+            .map(|_| "graph rollback succeeded".to_string())
+            .unwrap_or_else(|error| format!("graph rollback failed: {error}"));
+        let projection_status = projection_rollback
+            .map(|result| {
+                result
+                    .map(|_| "projection rollback succeeded".to_string())
+                    .unwrap_or_else(|error| format!("projection rollback failed: {error}"))
+            })
+            .unwrap_or_else(|| "projection was not requested".to_string());
+        anyhow::bail!("{persist_error}; {graph_status}; {projection_status}");
+    }
+
+    let changes = summarize_tree_deltas(&rebased.deltas);
     Ok(ReconcileSummary {
-        changes: change_summaries,
         change_count: changes.len(),
+        changes,
+        files_indexed: semantic.files_indexed,
+        total_upserted: semantic.total_upserted,
+        total_removed: semantic.total_removed,
+    })
+}
+
+fn empty_summary() -> ReconcileSummary {
+    ReconcileSummary {
+        changes: Vec::new(),
+        change_count: 0,
+        files_indexed: 0,
+        total_upserted: 0,
+        total_removed: 0,
+    }
+}
+
+struct RebasedTree {
+    deltas: Vec<TreeDelta>,
+    target: ResolvedTree,
+}
+
+/// Rebase the workspace's identity-bearing base transition onto current graph
+/// truth. Identity preconditions detect concurrent edits; `ResolvedTree::apply`
+/// validates all path swaps, cycles, and path reuse against one parent.
+fn rebase_session_deltas(current: &ResolvedTree, session: &[TreeDelta]) -> Result<RebasedTree> {
+    let mut rebased = Vec::new();
+    let mut conflicts = Vec::new();
+
+    for delta in session {
+        match delta {
+            TreeDelta::Added { artifact_id, new } => match current.get(artifact_id) {
+                Some(existing) if existing.located_entry() == *new => {}
+                Some(existing) => conflicts.push(format!(
+                    "new session artifact {artifact_id:?} conflicts with current {}",
+                    existing.path
+                )),
+                None => {
+                    if current
+                        .artifact_at_path(&new.path)
+                        .is_some_and(|existing| existing.entry == new.entry)
+                    {
+                        // Both sides independently added the same exact bytes at
+                        // the same path. Keep the already-published identity.
+                        continue;
+                    }
+                    rebased.push(delta.clone());
+                }
+            },
+            TreeDelta::Updated {
+                artifact_id,
+                old,
+                new,
+            } => match current.get(artifact_id) {
+                Some(existing) if existing.located_entry() == *old => rebased.push(delta.clone()),
+                Some(existing) if existing.located_entry() == *new => {}
+                Some(existing) => conflicts.push(format!(
+                    "artifact {artifact_id:?} changed concurrently (base {}, session {}, current {})",
+                    old.path, new.path, existing.path
+                )),
+                None => conflicts.push(format!(
+                    "artifact {artifact_id:?} at {} was removed while the session changed it",
+                    old.path
+                )),
+            },
+            TreeDelta::Removed { artifact_id, old } => match current.get(artifact_id) {
+                Some(existing) if existing.located_entry() == *old => rebased.push(delta.clone()),
+                None => {}
+                Some(existing) => conflicts.push(format!(
+                    "artifact {artifact_id:?} changed concurrently from {} to {} while the session removed it",
+                    old.path, existing.path
+                )),
+            },
+        }
+    }
+
+    if !conflicts.is_empty() {
+        anyhow::bail!(conflicts.join("\n  "));
+    }
+    let target = current.apply(&rebased).map_err(|error| {
+        anyhow::anyhow!(
+            "session changes collide with current graph paths; no state was changed: {error}"
+        )
+    })?;
+    Ok(RebasedTree {
+        deltas: rebased,
+        target,
+    })
+}
+
+#[derive(Default)]
+struct PreparedEntries {
+    by_path: BTreeMap<RepoPath, Vec<u8>>,
+}
+
+fn prepare_target_entries(
+    session_dir: &Path,
+    deltas: &[TreeDelta],
+    blobs: &kin_blobs::BlobStore,
+) -> Result<PreparedEntries> {
+    let mut prepared = PreparedEntries::default();
+    for located in deltas.iter().filter_map(TreeDelta::new_state) {
+        let Some(expected_hash) = located.entry.blob_identity() else {
+            anyhow::bail!(
+                "session reconcile cannot materialize Gitlink at {}; use an explicit graph-native Gitlink command",
+                located.path
+            );
+        };
+        let relative = repo_path_to_relative(&located.path)?;
+        let host = session_dir.join(&relative);
+        let (actual_entry, content) =
+            super::session_base::read_disk_entry(&host)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "session entry disappeared during reconcile: {}",
+                    located.path
+                )
+            })?;
+        anyhow::ensure!(
+            actual_entry == located.entry,
+            "session entry changed after complete observation: {}",
+            located.path
+        );
+        let stored = blobs
+            .write(&content)
+            .with_context(|| format!("store exact session blob for {}", located.path))?;
+        anyhow::ensure!(
+            stored.0 == expected_hash.0,
+            "object-store identity mismatch while admitting {}",
+            located.path
+        );
+        prepared.by_path.insert(located.path.clone(), content);
+    }
+    Ok(prepared)
+}
+
+struct SemanticPreparation {
+    entity_deltas: Vec<EntityDelta>,
+    relation_deltas: Vec<RelationDelta>,
+    files_indexed: usize,
+    total_upserted: usize,
+    total_removed: usize,
+}
+
+fn prepare_semantic_transaction(
+    graph: &kin_db::InMemoryGraph,
+    session_dir: &Path,
+    current: &ResolvedTree,
+    target: &ResolvedTree,
+    tree_deltas: &[TreeDelta],
+    prepared: &PreparedEntries,
+    blobs: &kin_blobs::BlobStore,
+) -> Result<SemanticPreparation> {
+    let before = semantic_snapshot(graph)?;
+    let mut overlay = GraphOverlay::default();
+    let mut reconciler = Reconciler::new(session_dir.to_path_buf());
+    reconciler.seed_lkg_from_graph(graph);
+    let mut affected_paths = BTreeSet::new();
+    for delta in tree_deltas {
+        affected_paths.extend(delta.old_state().map(|entry| entry.path.clone()));
+        affected_paths.extend(delta.new_state().map(|entry| entry.path.clone()));
+    }
+
+    let mut files_indexed = 0usize;
+    let mut total_upserted = 0usize;
+    let mut total_removed = 0usize;
+    for path in affected_paths {
+        let utf8 = path.as_utf8();
+        let target_artifact = target.artifact_at_path(&path);
+        let target_content = prepared.by_path.get(&path);
+        let entity_source = match (utf8, target_artifact, target_content) {
+            (Some(path), Some(artifact), Some(content))
+                if !matches!(artifact.entry, TreeEntry::Symlink { .. }) =>
+            {
+                matches!(
+                    FileClassifier::classify_with_content(Path::new(path), content),
+                    FileClassification::EntitySource
+                )
+            }
+            _ => false,
+        };
+
+        if entity_source {
+            let path_text = utf8.expect("entity source path was UTF-8");
+            let event = FileEvent::Changed(session_dir.join(path_text));
+            match reconciler.reconcile_file_change(&event, blobs, graph, &mut overlay) {
+                Ok(ReconcileOutcome::Updated {
+                    added,
+                    modified,
+                    removed,
+                    ..
+                }) => {
+                    files_indexed += 1;
+                    total_upserted += added.len() + modified.len();
+                    total_removed += removed.len();
+                }
+                Ok(ReconcileOutcome::BrokenAst { file_id, .. }) => {
+                    eprintln!(
+                        "  Note: {file_id} has incomplete syntax; exact bytes were admitted and semantic LKG was retained"
+                    );
+                }
+                Ok(ReconcileOutcome::Conflict(conflict)) => {
+                    eprintln!(
+                        "  Note: {} has a semantic conflict ({:?}); exact bytes remain authoritative",
+                        path, conflict.kind
+                    );
+                }
+                Ok(ReconcileOutcome::FileRemoved { .. }) => {
+                    eprintln!(
+                        "  Note: semantic enrichment observed {} as removed; exact admission remains authoritative",
+                        path
+                    );
+                }
+                Err(error) => {
+                    eprintln!(
+                        "  Note: {} could not be semantically enriched ({}); exact repository truth remains authoritative",
+                        path, error
+                    );
+                }
+            }
+        } else if let Some(path_text) = utf8 {
+            let file_id = FilePathId::new(path_text.to_string());
+            let entities = graph.query_entities(&EntityFilter {
+                file_path: Some(file_id),
+                ..Default::default()
+            })?;
+            total_removed += entities.len();
+            overlay
+                .entity_removes
+                .extend(entities.into_iter().map(|entity| entity.id));
+        }
+    }
+
+    // If an artifact moved away from a UTF-8 path that is not otherwise in the
+    // target affected set, the loop above already removes its semantic facets.
+    // `current` is intentionally retained in this signature as an assertion
+    // that semantic preparation was based on the same exact parent.
+    debug_assert!(tree_deltas
+        .iter()
+        .all(|delta| delta.old_state().is_none_or(|old| current
+            .get(&delta.artifact_id())
+            .is_some_and(|artifact| artifact.located_entry() == *old))));
+
+    let (entity_deltas, relation_deltas) = overlay_transaction(&before, overlay);
+    Ok(SemanticPreparation {
+        entity_deltas,
+        relation_deltas,
         files_indexed,
         total_upserted,
         total_removed,
     })
 }
 
-#[derive(Debug)]
-struct PreparedTreeEntry {
-    entry: TreeEntry,
-    content: Vec<u8>,
+struct SemanticSnapshot {
+    entities: HashMap<EntityId, Entity>,
+    relations: HashMap<RelationId, Relation>,
 }
 
-#[derive(Debug)]
-struct PreparedChange {
-    relative_path: PathBuf,
-    file_id: FilePathId,
-    before: Option<PreparedTreeEntry>,
-    after: Option<PreparedTreeEntry>,
-}
-
-fn prepare_change(
-    session_dir: &Path,
-    source: &Path,
-    change: &FileChange,
-) -> Result<PreparedChange> {
-    let session_path = session_dir.join(&change.relative_path);
-    let source_path = source.join(&change.relative_path);
-    let after = super::session_base::read_disk_entry(&session_path)?
-        .map(|(entry, content)| PreparedTreeEntry { entry, content });
-    let before = super::session_base::read_disk_entry(&source_path)?
-        .map(|(entry, content)| PreparedTreeEntry { entry, content });
-
-    if after.as_ref().map(|entry| entry.entry) != change.workspace_entry {
-        anyhow::bail!(
-            "session entry changed after reconcile planning: {}",
-            change.relative_path.display()
-        );
+fn semantic_snapshot(graph: &kin_db::InMemoryGraph) -> Result<SemanticSnapshot> {
+    let entities = graph
+        .list_all_entities()?
+        .into_iter()
+        .map(|entity| (entity.id, entity))
+        .collect::<HashMap<_, _>>();
+    let mut relations = HashMap::new();
+    for entity_id in entities.keys() {
+        for relation in graph.get_all_relations_for_entity(entity_id)? {
+            relations.insert(relation.id, relation);
+        }
     }
-    if before.as_ref().map(|entry| entry.entry) != change.source_entry {
-        anyhow::bail!(
-            "source entry changed after reconcile planning: {}",
-            change.relative_path.display()
-        );
-    }
-    let file_id = FilePathId::new(
-        change
-            .relative_path
-            .to_str()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "session path is not valid UTF-8: {}",
-                    change.relative_path.display()
-                )
-            })?
-            .replace(std::path::MAIN_SEPARATOR, "/"),
-    );
-    if let Some(after) = &after {
-        kin_core::validate_source_entry(&file_id, after.entry.kind, &after.content)?;
-    }
-    Ok(PreparedChange {
-        relative_path: change.relative_path.clone(),
-        file_id,
-        before,
-        after,
+    Ok(SemanticSnapshot {
+        entities,
+        relations,
     })
 }
 
-fn clear_non_entity_enrichment(graph: &kin_db::InMemoryGraph, file_id: &FilePathId) -> Result<()> {
-    graph.delete_shallow_file(file_id)?;
-    graph.delete_structured_artifact(file_id)?;
-    graph.delete_opaque_artifact(file_id)?;
-    Ok(())
+fn overlay_transaction(
+    before: &SemanticSnapshot,
+    overlay: GraphOverlay,
+) -> (Vec<EntityDelta>, Vec<RelationDelta>) {
+    let removed_entities = overlay.entity_removes.into_iter().collect::<HashSet<_>>();
+    let mut updates = overlay.entity_adds;
+    updates.extend(overlay.entity_mods);
+    let mut entity_deltas = updates
+        .into_iter()
+        .filter(|(id, _)| !removed_entities.contains(id))
+        .map(|(id, new)| match before.entities.get(&id) {
+            Some(old) => EntityDelta::Modified {
+                old: old.clone(),
+                new,
+            },
+            None => EntityDelta::Added(new),
+        })
+        .collect::<Vec<_>>();
+    entity_deltas.extend(
+        removed_entities
+            .into_iter()
+            .filter(|id| before.entities.contains_key(id))
+            .map(EntityDelta::Removed),
+    );
+
+    let removed_relations = overlay.relation_removes.into_iter().collect::<HashSet<_>>();
+    let mut relation_deltas = overlay
+        .relation_adds
+        .into_iter()
+        .filter(|(id, _)| !removed_relations.contains(id))
+        .map(|(_, relation)| RelationDelta::Added(relation))
+        .collect::<Vec<_>>();
+    relation_deltas.extend(
+        removed_relations
+            .into_iter()
+            .filter(|id| before.relations.contains_key(id))
+            .map(RelationDelta::Removed),
+    );
+    (entity_deltas, relation_deltas)
 }
 
-fn clear_all_enrichment(graph: &kin_db::InMemoryGraph, file_id: &FilePathId) -> Result<usize> {
-    let entities = graph.query_entities(&EntityFilter {
-        file_path: Some(file_id.clone()),
-        ..Default::default()
-    })?;
-    let entity_ids: Vec<_> = entities.into_iter().map(|entity| entity.id).collect();
-    graph.remove_entities_batch(&entity_ids)?;
-    graph.delete_file_layout(file_id)?;
-    clear_non_entity_enrichment(graph, file_id)?;
-    Ok(entity_ids.len())
-}
+fn inverse_transaction(
+    graph: &kin_db::InMemoryGraph,
+    transaction: &TransactionDelta,
+) -> Result<TransactionDelta> {
+    let before = semantic_snapshot(graph)?;
+    let mut entity_deltas = Vec::new();
+    let mut relation_restore = HashMap::new();
+    let mut relation_remove = HashSet::new();
 
-fn persist_non_entity_enrichment(graph: &kin_db::InMemoryGraph, indexed: IndexedAny) -> Result<()> {
-    match indexed {
-        IndexedAny::EntitySource(_) => {
-            anyhow::bail!("entity source reached non-entity session enrichment path")
-        }
-        IndexedAny::StructuredArtifact(artifact) => graph.upsert_structured_artifact(&artifact)?,
-        IndexedAny::OpaqueArtifact(artifact) => graph.upsert_opaque_artifact(&artifact)?,
-        IndexedAny::ShallowSyntax(shallow) => {
-            let shallow = ShallowTrackedFile {
-                file_id: shallow.file_id,
-                language_hint: shallow.language_hint.unwrap_or_default(),
-                declaration_count: shallow.declarations.len(),
-                import_count: shallow.imports.len(),
-                syntax_hash: shallow.fingerprint.syntax_hash,
-                signature_hash: shallow.fingerprint.signature_hash,
-                declaration_names: shallow
-                    .declarations
-                    .into_iter()
-                    .map(|declaration| declaration.name)
-                    .collect(),
-                import_paths: shallow
-                    .imports
-                    .into_iter()
-                    .map(|import| import.raw_path)
-                    .collect(),
-            };
-            graph.upsert_shallow_file(&shallow)?;
+    for delta in transaction.entity_deltas.iter().rev() {
+        match delta {
+            EntityDelta::Added(entity) => entity_deltas.push(EntityDelta::Removed(entity.id)),
+            EntityDelta::Modified { old, new } => entity_deltas.push(EntityDelta::Modified {
+                old: new.clone(),
+                new: old.clone(),
+            }),
+            EntityDelta::Removed(id) => {
+                if let Some(entity) = before.entities.get(id) {
+                    entity_deltas.push(EntityDelta::Added(entity.clone()));
+                }
+                for relation in before
+                    .relations
+                    .values()
+                    .filter(|relation| relation_mentions_entity(relation, *id))
+                {
+                    relation_restore.insert(relation.id, relation.clone());
+                }
+            }
         }
     }
-    Ok(())
+    for delta in transaction.relation_deltas.iter().rev() {
+        match delta {
+            RelationDelta::Added(relation) => {
+                if let Some(old) = before.relations.get(&relation.id) {
+                    relation_restore.insert(old.id, old.clone());
+                } else {
+                    relation_remove.insert(relation.id);
+                }
+            }
+            RelationDelta::Removed(id) => {
+                if let Some(old) = before.relations.get(id) {
+                    relation_restore.insert(*id, old.clone());
+                }
+            }
+        }
+    }
+    for id in relation_restore.keys() {
+        relation_remove.remove(id);
+    }
+    let mut relation_deltas = relation_remove
+        .into_iter()
+        .map(RelationDelta::Removed)
+        .collect::<Vec<_>>();
+    relation_deltas.extend(relation_restore.into_values().map(RelationDelta::Added));
+    let tree_deltas = transaction
+        .tree_deltas
+        .iter()
+        .rev()
+        .map(|delta| match delta {
+            TreeDelta::Added { artifact_id, new } => TreeDelta::Removed {
+                artifact_id: *artifact_id,
+                old: new.clone(),
+            },
+            TreeDelta::Updated {
+                artifact_id,
+                old,
+                new,
+            } => TreeDelta::Updated {
+                artifact_id: *artifact_id,
+                old: new.clone(),
+                new: old.clone(),
+            },
+            TreeDelta::Removed { artifact_id, old } => TreeDelta::Added {
+                artifact_id: *artifact_id,
+                new: old.clone(),
+            },
+        })
+        .collect();
+    Ok(TransactionDelta {
+        entity_deltas,
+        relation_deltas,
+        tree_deltas,
+    })
+}
+
+fn relation_mentions_entity(relation: &Relation, id: EntityId) -> bool {
+    relation.src == GraphNodeId::Entity(id) || relation.dst == GraphNodeId::Entity(id)
+}
+
+struct ProjectionTrees {
+    previous: ResolvedTree,
+    target: ResolvedTree,
+}
+
+fn projection_trees(
+    current: &ResolvedTree,
+    target: &ResolvedTree,
+    deltas: &[TreeDelta],
+) -> Result<ProjectionTrees> {
+    let ids = deltas
+        .iter()
+        .map(TreeDelta::artifact_id)
+        .collect::<BTreeSet<_>>();
+    let previous = ResolvedTree::from_artifacts(
+        ids.iter()
+            .filter_map(|id| current.get(id).cloned())
+            .collect::<Vec<ResolvedArtifact>>(),
+    )
+    .context("build reconcile projection parent")?;
+    let target = ResolvedTree::from_artifacts(
+        ids.iter()
+            .filter_map(|id| target.get(id).cloned())
+            .collect::<Vec<ResolvedArtifact>>(),
+    )
+    .context("build reconcile projection target")?;
+    Ok(ProjectionTrees { previous, target })
+}
+
+fn command_failure<E: std::fmt::Display>(
+    context: &str,
+    error: E,
+    rollback: Option<Result<kin_projection::TreeProjectionReport, kin_projection::ProjectionError>>,
+) -> anyhow::Error {
+    let rollback = rollback
+        .map(|result| {
+            result
+                .map(|_| "projection rollback succeeded".to_string())
+                .unwrap_or_else(|error| format!("projection rollback failed: {error}"))
+        })
+        .unwrap_or_else(|| "projection was not requested".to_string());
+    anyhow::anyhow!("{context}: {error}; {rollback}")
+}
+
+fn summarize_tree_deltas(deltas: &[TreeDelta]) -> Vec<(String, String)> {
+    deltas
+        .iter()
+        .map(|delta| match delta {
+            TreeDelta::Added { new, .. } => ("added".to_string(), new.path.to_string()),
+            TreeDelta::Updated { old, new, .. } if old.path == new.path => {
+                ("modified".to_string(), new.path.to_string())
+            }
+            TreeDelta::Updated { old, new, .. } => {
+                ("moved".to_string(), format!("{} -> {}", old.path, new.path))
+            }
+            TreeDelta::Removed { old, .. } => ("deleted".to_string(), old.path.to_string()),
+        })
+        .collect()
+}
+
+fn repo_path_to_relative(path: &RepoPath) -> Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        Ok(PathBuf::from(OsStr::from_bytes(path.as_bytes())))
+    }
+    #[cfg(not(unix))]
+    {
+        path.as_utf8().map(PathBuf::from).ok_or_else(|| {
+            anyhow::anyhow!("repository path is not representable on this host: {path}")
+        })
+    }
 }
 
 fn ensure_session_dir_exists(session_dir: &Path) -> Result<()> {
     if session_dir.exists() {
         return Ok(());
     }
-
     Err(anyhow::anyhow!(
         "session workspace not found: {}",
         session_dir.display()
     ))
-}
-
-#[derive(Debug)]
-struct FileChange {
-    relative_path: PathBuf,
-    kind: ChangeKind,
-    workspace_entry: Option<TreeEntry>,
-    source_entry: Option<TreeEntry>,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ChangeKind {
-    Modified,
-    Added,
-    Deleted,
 }
 
 /// Find the session directory, either by explicit ID or the most recent.
@@ -533,10 +790,8 @@ fn resolve_session_dir(
     session_id: Option<String>,
 ) -> Result<PathBuf> {
     let runs_dir = layout.root().join("runs");
-
     if let Some(id) = session_id {
-        // Try both with and without "session-" prefix
-        let with_prefix = runs_dir.join(format!("session-{}", id));
+        let with_prefix = runs_dir.join(format!("session-{id}"));
         if with_prefix.exists() {
             return Ok(with_prefix);
         }
@@ -544,491 +799,202 @@ fn resolve_session_dir(
         if bare.exists() {
             return Ok(bare);
         }
-        return Err(anyhow::anyhow!(
-            "session '{}' not found in {}",
-            id,
-            runs_dir.display()
-        ));
+        anyhow::bail!("session '{id}' not found in {}", runs_dir.display());
     }
-
-    // Find most recent session directory
     if !runs_dir.exists() {
-        return Err(anyhow::anyhow!("no session workspaces found"));
+        anyhow::bail!("no session workspaces found");
     }
-
-    let mut sessions: Vec<_> = std::fs::read_dir(&runs_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with("session-"))
-        .collect();
-
+    let mut sessions = std::fs::read_dir(&runs_dir)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("session-"))
+        .collect::<Vec<_>>();
     if sessions.is_empty() {
-        return Err(anyhow::anyhow!("no session workspaces found"));
+        anyhow::bail!("no session workspaces found");
     }
-
-    // Sort by modification time (most recent last)
-    sessions.sort_by_key(|e| {
-        e.metadata()
-            .and_then(|m| m.modified())
+    sessions.sort_by_key(|entry| {
+        entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
     });
-
-    Ok(sessions.last().unwrap().path())
-}
-
-/// Compute the change-set to apply when reconciling a session workspace.
-///
-/// Reconcile replays only the workspace's own edits — the delta between the
-/// base state captured when the workspace was materialized and the workspace's
-/// current contents — instead of force-syncing the entire tree. Files the
-/// workspace never touched are left untouched even when the source has advanced
-/// past the base, so a workspace reconciled late never reverts intervening
-/// source truth. When the workspace and the source both changed the same file,
-/// the edits are merged when they agree and reported as a conflict when they do
-/// not; the source is never silently overwritten with older content.
-fn plan_reconcile_changes(session_dir: &Path, source: &Path) -> Result<Vec<FileChange>> {
-    let base = super::session_base::load_base(session_dir)?;
-    plan_from_base(session_dir, source, &base)
-}
-
-/// Change-set plan for a workspace with a recorded base: a file-level three-way
-/// merge of base -> workspace against base -> source.
-fn plan_from_base(
-    session_dir: &Path,
-    source: &Path,
-    base: &super::session_base::SessionBase,
-) -> Result<Vec<FileChange>> {
-    let workspace_state = super::session_base::snapshot_dir(session_dir)?;
-    let source_state = super::session_base::snapshot_dir(source)?;
-    let base_state = &base.tree;
-
-    let mut candidate_paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    candidate_paths.extend(base_state.keys().cloned());
-    candidate_paths.extend(workspace_state.keys().cloned());
-
-    let mut changes = Vec::new();
-    let mut conflicts = Vec::new();
-
-    for path in candidate_paths {
-        let base_entry = base_state.get(&path);
-        let workspace_entry = workspace_state.get(&path);
-        if base_entry == workspace_entry {
-            // The workspace never changed this path; leave it untouched even if
-            // the source advanced it. This is the change-set guarantee.
-            continue;
-        }
-
-        let source_entry = source_state.get(&path);
-        if source_entry != base_entry {
-            // Both the workspace and the source moved this path off the base.
-            if workspace_entry == source_entry {
-                // They converged to identical content — nothing to apply.
-                continue;
-            }
-            conflicts.push(describe_reconcile_conflict(
-                &path,
-                base_entry,
-                workspace_entry,
-                source_entry,
-            ));
-            continue;
-        }
-
-        // Disjoint edit: the source is still at the base here, so the
-        // workspace's own change applies cleanly.
-        let kind = match (base_entry.is_some(), workspace_entry.is_some()) {
-            (false, true) => ChangeKind::Added,
-            (true, true) => ChangeKind::Modified,
-            (true, false) => ChangeKind::Deleted,
-            // Unreachable: base_hash != workspace_hash is guaranteed above.
-            (false, false) => continue,
-        };
-        changes.push(FileChange {
-            relative_path: PathBuf::from(path),
-            kind,
-            workspace_entry: workspace_entry.copied(),
-            source_entry: source_entry.copied(),
-        });
-    }
-
-    if !conflicts.is_empty() {
-        let base_head = &base.base_head;
-        anyhow::bail!(
-            "session reconcile conflict for {}: {} file(s) changed both in the session workspace \
-             and in the source since it was materialized (base graph head {base_head}). Kin will \
-             not overwrite newer source truth. Resolve the workspace by hand or discard it. \
-             Conflicting files:\n  {}",
-            session_dir.display(),
-            conflicts.len(),
-            conflicts.join("\n  "),
-        );
-    }
-
-    Ok(changes)
-}
-
-/// Human-readable description of how a file diverged in both the workspace and
-/// the source, for conflict reporting.
-fn describe_reconcile_conflict(
-    path: &str,
-    base: Option<&TreeEntry>,
-    workspace: Option<&TreeEntry>,
-    source: Option<&TreeEntry>,
-) -> String {
-    let workspace_action = match (base.is_some(), workspace.is_some()) {
-        (false, true) => "added in session",
-        (true, true) => "modified in session",
-        (true, false) => "deleted in session",
-        (false, false) => "unchanged in session",
-    };
-    let source_action = match (base.is_some(), source.is_some()) {
-        (false, true) => "added in source",
-        (true, true) => "modified in source",
-        (true, false) => "deleted in source",
-        (false, false) => "unchanged in source",
-    };
-    format!("{path} ({workspace_action}; {source_action})")
+    Ok(sessions.last().expect("sessions is non-empty").path())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use kin_model::{ArtifactId, Hash256, LocatedEntry, ResolvedArtifact};
     use tempfile::tempdir;
 
-    /// Record a base manifest for a hand-built session workspace, modeling the
-    /// base a real materialization captures: a snapshot of the source tree at
-    /// the moment the workspace was materialized. With the source unchanged
-    /// afterward, the change-set plan reduces to the workspace's own edits.
-    fn record_base_from_source(layout: &kin_core::KinLayout, session_dir: &Path) {
-        let tree =
-            crate::commands::session_base::snapshot_dir(&kin_core::source_dir(layout)).unwrap();
-        crate::commands::session_base::write_base(
-            session_dir,
-            &crate::commands::session_base::SessionBase {
-                base_head: kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes(
-                    [0x42; 32],
-                )),
-                tree,
+    fn path(value: &str) -> RepoPath {
+        RepoPath::from_utf8(value).unwrap()
+    }
+
+    fn entry(byte: u8, executable: bool) -> TreeEntry {
+        TreeEntry::blob(Hash256::from_bytes([byte; 32]), executable)
+    }
+
+    fn tree(entries: Vec<(ArtifactId, &str, TreeEntry)>) -> ResolvedTree {
+        ResolvedTree::from_artifacts(
+            entries
+                .into_iter()
+                .map(|(id, path_value, entry)| ResolvedArtifact::new(id, path(path_value), entry)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rebase_preserves_disjoint_current_graph_changes() {
+        let edited_id = ArtifactId::new();
+        let concurrent_id = ArtifactId::new();
+        let old = entry(1, false);
+        let updated = entry(2, false);
+        let concurrent = entry(3, false);
+        let base = tree(vec![(edited_id, "src/lib.rs", old)]);
+        let session = base
+            .apply(&[TreeDelta::Updated {
+                artifact_id: edited_id,
+                old: LocatedEntry::new(path("src/lib.rs"), old),
+                new: LocatedEntry::new(path("src/lib.rs"), updated),
+            }])
+            .unwrap();
+        let session_deltas = kin_core::exact_tree_correction(&base, &session).unwrap();
+        let current = tree(vec![
+            (edited_id, "src/lib.rs", old),
+            (concurrent_id, "compose.yaml", concurrent),
+        ]);
+
+        let rebased = rebase_session_deltas(&current, &session_deltas).unwrap();
+        assert_eq!(
+            rebased.target.get(&concurrent_id).unwrap().entry,
+            concurrent
+        );
+        assert_eq!(rebased.target.get(&edited_id).unwrap().entry, updated);
+    }
+
+    #[test]
+    fn rebase_fails_before_mutation_on_same_identity_conflict() {
+        let id = ArtifactId::new();
+        let old = entry(1, false);
+        let session_new = entry(2, false);
+        let current_new = entry(3, false);
+        let current = tree(vec![(id, "src/lib.rs", current_new)]);
+        let error = rebase_session_deltas(
+            &current,
+            &[TreeDelta::Updated {
+                artifact_id: id,
+                old: LocatedEntry::new(path("src/lib.rs"), old),
+                new: LocatedEntry::new(path("src/lib.rs"), session_new),
+            }],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("changed concurrently"));
+        assert_eq!(current.get(&id).unwrap().entry, current_new);
+    }
+
+    #[test]
+    fn rebase_applies_identity_move_and_path_reuse_atomically() {
+        let moved_id = ArtifactId::new();
+        let replacement_id = ArtifactId::new();
+        let moved = entry(1, false);
+        let replacement = entry(2, true);
+        let current = tree(vec![(moved_id, "compose.yaml", moved)]);
+        let deltas = vec![
+            TreeDelta::Updated {
+                artifact_id: moved_id,
+                old: LocatedEntry::new(path("compose.yaml"), moved),
+                new: LocatedEntry::new(path("deploy/compose.yaml"), moved),
             },
+            TreeDelta::Added {
+                artifact_id: replacement_id,
+                new: LocatedEntry::new(path("compose.yaml"), replacement),
+            },
+        ];
+        let rebased = rebase_session_deltas(&current, &deltas).unwrap();
+        assert_eq!(
+            rebased
+                .target
+                .artifact_at_path(&path("deploy/compose.yaml"))
+                .unwrap()
+                .artifact_id,
+            moved_id
+        );
+        assert_eq!(
+            rebased
+                .target
+                .artifact_at_path(&path("compose.yaml"))
+                .unwrap()
+                .artifact_id,
+            replacement_id
+        );
+    }
+
+    fn genesis_head(
+        layout: &kin_core::KinLayout,
+        graph: &kin_db::InMemoryGraph,
+    ) -> kin_model::SemanticChangeId {
+        let branch = kin_core::read_current_branch(layout).unwrap();
+        graph.get_branch(&branch).unwrap().unwrap().head
+    }
+
+    #[test]
+    fn reconcile_admits_compose_binary_and_unsupported_extension_exactly() {
+        let repository = tempdir().unwrap();
+        let layout = kin_core::init(repository.path()).unwrap().layout;
+        let snapshot = crate::backend::open_kindb_snapshot(&layout).unwrap();
+        let graph = snapshot.graph();
+        let session = layout.root().join("runs/session-heterogeneous");
+        std::fs::create_dir_all(session.join("assets")).unwrap();
+        std::fs::write(session.join("compose.yaml"), b"services:\n  app: {}\n").unwrap();
+        std::fs::write(session.join("assets/model.bin"), [0, 1, 2, 255]).unwrap();
+        std::fs::write(
+            session.join("README.unsupported"),
+            b"still repository truth\n",
         )
         .unwrap();
-    }
-
-    #[test]
-    fn reconcile_session_dir_persists_snapshot_backed_changes() {
-        let repo = tempdir().unwrap();
-        let init = kin_core::init(repo.path()).unwrap();
-        let layout = init.layout;
-        let session_dir = layout.root().join("runs/session-persist");
-
-        fs::create_dir_all(session_dir.join("src")).unwrap();
-        fs::write(
-            session_dir.join("src/lib.rs"),
-            "pub fn persisted_reconcile() -> &'static str { \"ok\" }\n",
+        super::super::session_base::record_materialized_base(
+            &session,
+            genesis_head(&layout, graph.as_ref()),
         )
         .unwrap();
-        record_base_from_source(&layout, &session_dir);
 
-        let summary = reconcile_session_dir_sync(&layout, &session_dir).unwrap();
-        assert_eq!(summary.files_indexed, 1);
-        assert!(summary.total_upserted > 0);
-
+        let summary = reconcile_session_dir_sync(&layout, &session).unwrap();
+        assert_eq!(summary.change_count, 3);
         let reopened = crate::backend::open_kindb_snapshot(&layout).unwrap();
-        let graph = reopened.graph();
-        assert!(graph.entity_count() > 0);
+        let exact = reopened.graph().resolved_tree();
+        for expected in ["compose.yaml", "assets/model.bin", "README.unsupported"] {
+            assert!(
+                exact.artifact_at_path(&path(expected)).is_some(),
+                "{expected} missing from exact graph tree"
+            );
+            assert!(repository.path().join(expected).exists());
+        }
     }
 
     #[test]
-    fn reconcile_session_dir_admits_broken_source_and_retains_semantic_lkg() {
-        let repo = tempdir().unwrap();
-        let init = kin_core::init(repo.path()).unwrap();
-        let layout = init.layout;
-        let session_dir = layout.root().join("runs/session-broken-source");
-        let source_file = repo.path().join("src/lib.rs");
-        let original = "pub fn stable_source() -> &'static str { \"ok\" }\n";
+    fn persist_failure_reverses_exact_graph_and_projection() {
+        let repository = tempdir().unwrap();
+        let layout = kin_core::init(repository.path()).unwrap().layout;
+        let snapshot = crate::backend::open_kindb_snapshot(&layout).unwrap();
+        let graph = snapshot.graph();
+        let session = layout.root().join("runs/session-rollback");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(session.join("compose.yaml"), b"services: {}\n").unwrap();
+        super::super::session_base::record_materialized_base(
+            &session,
+            genesis_head(&layout, graph.as_ref()),
+        )
+        .unwrap();
 
-        fs::create_dir_all(source_file.parent().unwrap()).unwrap();
-        fs::write(&source_file, original).unwrap();
-        fs::create_dir_all(session_dir.join("src")).unwrap();
-        fs::write(session_dir.join("src/lib.rs"), "pub fn stable_source( {\n").unwrap();
-        record_base_from_source(&layout, &session_dir);
-
-        let summary = reconcile_session_dir_sync(&layout, &session_dir).unwrap();
-        assert_eq!(summary.change_count, 1);
-        assert_eq!(
-            fs::read_to_string(&source_file).unwrap(),
-            "pub fn stable_source( {\n"
-        );
-
-        let reopened = crate::backend::open_kindb_snapshot(&layout).unwrap();
-        let entry = reopened
-            .graph()
-            .get_working_tree_entry("src/lib.rs")
-            .expect("broken source remains exact repository truth");
-        assert_eq!(
-            entry.blob_hash,
-            kin_blobs::digest(b"pub fn stable_source( {\n")
-        );
-    }
-
-    #[test]
-    fn reconcile_session_dir_restores_source_tree_when_snapshot_persist_fails() {
-        let repo = tempdir().unwrap();
-        let init = kin_core::init(repo.path()).unwrap();
-        let layout = init.layout;
-        let session_dir = layout.root().join("runs/session-save-fail");
-        let source_file = repo.path().join("src/lib.rs");
-        let original = "pub fn persisted_before_failure() -> &'static str { \"before\" }\n";
-        let updated = "pub fn persisted_before_failure() -> &'static str { \"after\" }\n";
-
-        fs::create_dir_all(source_file.parent().unwrap()).unwrap();
-        fs::write(&source_file, original).unwrap();
-        fs::create_dir_all(session_dir.join("src")).unwrap();
-        fs::write(session_dir.join("src/lib.rs"), updated).unwrap();
-        record_base_from_source(&layout, &session_dir);
-
-        // Block the next immutable snapshot base's atomic-write tmp path. The
-        // canonical graph.kndb file is now only a compatibility projection, so
-        // blocking its tmp would happen after committed authority and would no
-        // longer make persistence fail.
-        let snapshot_path = crate::backend::kindb_snapshot_path(&layout);
-        let generation = kin_db::SnapshotManager::open_read_only(&snapshot_path)
-            .unwrap()
-            .generation();
-        let mut versions_name = snapshot_path.into_os_string();
-        versions_name.push(".snapshots");
-        let versioned_path =
-            std::path::PathBuf::from(versions_name).join(format!("{:020}.kndb", generation + 1));
-        let mut blocked_tmp_name = versioned_path.into_os_string();
-        blocked_tmp_name.push(".tmp");
-        let blocked_tmp_path = std::path::PathBuf::from(blocked_tmp_name);
-        fs::create_dir_all(&blocked_tmp_path).unwrap();
-
-        let err = reconcile_session_dir_sync(&layout, &session_dir)
+        let error =
+            execute_reconcile_session_dir_with_persist(&layout, graph.as_ref(), &session, || {
+                anyhow::bail!("injected snapshot failure")
+            })
             .unwrap_err()
             .to_string();
-        assert!(err.contains("failed to persist reconciled graph snapshot"));
-        assert_eq!(fs::read_to_string(&source_file).unwrap(), original);
-    }
-
-    // --- change-set reconcile tests ---
-
-    const A_V1: &str = "pub fn a() -> u8 { 1 }\n";
-    const A_V2: &str = "pub fn a() -> u8 { 2 }\n";
-    const A_V3: &str = "pub fn a() -> u8 { 3 }\n";
-
-    /// Fast path: with the source still at the base, the workspace's own edit
-    /// applies exactly as before — behavior is unchanged for the common case.
-    #[test]
-    fn change_set_fast_path_applies_workspace_edit() {
-        let repo = tempdir().unwrap();
-        let layout = kin_core::init(repo.path()).unwrap().layout;
-        let source = kin_core::source_dir(&layout);
-
-        fs::create_dir_all(source.join("src")).unwrap();
-        fs::write(source.join("src/a.rs"), A_V1).unwrap();
-
-        let session_dir = layout.root().join("runs/session-fast-path");
-        fs::create_dir_all(session_dir.join("src")).unwrap();
-        fs::write(session_dir.join("src/a.rs"), A_V2).unwrap();
-        record_base_from_source(&layout, &session_dir);
-
-        let summary = reconcile_session_dir_sync(&layout, &session_dir).unwrap();
-
-        assert_eq!(summary.change_count, 1);
-        assert!(summary
-            .changes
-            .contains(&("modified".into(), "src/a.rs".into())));
-        assert_eq!(fs::read_to_string(source.join("src/a.rs")).unwrap(), A_V2);
-    }
-
-    /// Regression for the session-workspace data-loss edge: a file created in
-    /// the source after the workspace was materialized must survive a late
-    /// reconcile, never be deleted as "absent from the workspace".
-    #[test]
-    fn change_set_preserves_source_file_added_after_materialization() {
-        let repo = tempdir().unwrap();
-        let layout = kin_core::init(repo.path()).unwrap().layout;
-        let source = kin_core::source_dir(&layout);
-
-        // Base state: the source has only a.rs.
-        fs::create_dir_all(source.join("src")).unwrap();
-        fs::write(source.join("src/a.rs"), A_V1).unwrap();
-
-        // Materialize + edit a.rs in the workspace.
-        let session_dir = layout.root().join("runs/session-late-add");
-        fs::create_dir_all(session_dir.join("src")).unwrap();
-        fs::write(session_dir.join("src/a.rs"), A_V2).unwrap();
-        record_base_from_source(&layout, &session_dir);
-
-        // The source advances after materialization: a new file appears.
-        let new_source_file = "pub fn b() -> u8 { 9 }\n";
-        fs::write(source.join("src/b.rs"), new_source_file).unwrap();
-
-        let summary = reconcile_session_dir_sync(&layout, &session_dir).unwrap();
-
-        // The workspace's own edit is applied...
-        assert_eq!(fs::read_to_string(source.join("src/a.rs")).unwrap(), A_V2);
-        // ...and the intervening source file is preserved, not reverted.
-        assert!(
-            source.join("src/b.rs").exists(),
-            "reconcile must not delete source files created after materialization"
-        );
-        assert_eq!(
-            fs::read_to_string(source.join("src/b.rs")).unwrap(),
-            new_source_file
-        );
-        assert_eq!(summary.change_count, 1);
-        assert!(!summary.changes.iter().any(|(_, path)| path == "src/b.rs"));
-    }
-
-    /// A source file modified after materialization but never touched by the
-    /// workspace must keep the newer source content, not be reverted to base.
-    #[test]
-    fn change_set_preserves_unrelated_source_edit() {
-        let repo = tempdir().unwrap();
-        let layout = kin_core::init(repo.path()).unwrap().layout;
-        let source = kin_core::source_dir(&layout);
-
-        fs::create_dir_all(source.join("src")).unwrap();
-        fs::write(source.join("src/a.rs"), A_V1).unwrap();
-        fs::write(source.join("src/c.rs"), "pub fn c() -> u8 { 1 }\n").unwrap();
-
-        // Workspace edits a.rs, leaves c.rs at the base content.
-        let session_dir = layout.root().join("runs/session-unrelated");
-        fs::create_dir_all(session_dir.join("src")).unwrap();
-        fs::write(session_dir.join("src/a.rs"), A_V2).unwrap();
-        fs::write(session_dir.join("src/c.rs"), "pub fn c() -> u8 { 1 }\n").unwrap();
-        record_base_from_source(&layout, &session_dir);
-
-        // The source advances c.rs after materialization.
-        let advanced_c = "pub fn c() -> u8 { 2 }\n";
-        fs::write(source.join("src/c.rs"), advanced_c).unwrap();
-
-        let summary = reconcile_session_dir_sync(&layout, &session_dir).unwrap();
-
-        assert_eq!(fs::read_to_string(source.join("src/a.rs")).unwrap(), A_V2);
-        assert_eq!(
-            fs::read_to_string(source.join("src/c.rs")).unwrap(),
-            advanced_c,
-            "reconcile must not revert a source edit the workspace never touched"
-        );
-        assert_eq!(summary.change_count, 1);
-    }
-
-    /// When the workspace and the source both change the same file to different
-    /// content, reconcile fails loud and leaves the newer source truth intact.
-    #[test]
-    fn change_set_conflicting_edit_fails_loud() {
-        let repo = tempdir().unwrap();
-        let layout = kin_core::init(repo.path()).unwrap().layout;
-        let source = kin_core::source_dir(&layout);
-
-        fs::create_dir_all(source.join("src")).unwrap();
-        fs::write(source.join("src/a.rs"), A_V1).unwrap();
-
-        let session_dir = layout.root().join("runs/session-conflict");
-        fs::create_dir_all(session_dir.join("src")).unwrap();
-        fs::write(session_dir.join("src/a.rs"), A_V2).unwrap();
-        record_base_from_source(&layout, &session_dir);
-
-        // The source moves the same file to a third state.
-        fs::write(source.join("src/a.rs"), A_V3).unwrap();
-
-        let err = reconcile_session_dir_sync(&layout, &session_dir)
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("conflict"), "unexpected error: {err}");
-        assert!(err.contains("src/a.rs"), "unexpected error: {err}");
-        // Newer source truth is untouched, and the workspace is preserved.
-        assert_eq!(fs::read_to_string(source.join("src/a.rs")).unwrap(), A_V3);
-        assert_eq!(
-            fs::read_to_string(session_dir.join("src/a.rs")).unwrap(),
-            A_V2
-        );
-    }
-
-    /// If the workspace and source converged to identical content, there is no
-    /// conflict and nothing to apply.
-    #[test]
-    fn change_set_converged_edit_is_noop() {
-        let repo = tempdir().unwrap();
-        let layout = kin_core::init(repo.path()).unwrap().layout;
-        let source = kin_core::source_dir(&layout);
-
-        fs::create_dir_all(source.join("src")).unwrap();
-        fs::write(source.join("src/a.rs"), A_V1).unwrap();
-
-        let session_dir = layout.root().join("runs/session-converged");
-        fs::create_dir_all(session_dir.join("src")).unwrap();
-        fs::write(session_dir.join("src/a.rs"), A_V2).unwrap();
-        record_base_from_source(&layout, &session_dir);
-
-        // The source independently reaches the same content as the workspace.
-        fs::write(source.join("src/a.rs"), A_V2).unwrap();
-
-        let summary = reconcile_session_dir_sync(&layout, &session_dir).unwrap();
-        assert_eq!(summary.change_count, 0);
-        assert_eq!(fs::read_to_string(source.join("src/a.rs")).unwrap(), A_V2);
-    }
-
-    // --- resolve_session_dir tests ---
-    // layout.root() = .kin, so runs dir = .kin/runs/
-
-    #[test]
-    fn resolve_session_dir_finds_with_prefix() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        let kin_dir = root.join(".kin");
-        fs::create_dir_all(&kin_dir).unwrap();
-        fs::create_dir_all(kin_dir.join("runs").join("session-abc123")).unwrap();
-
-        let layout = kin_core::KinLayout::discover(root).unwrap();
-        let result = resolve_session_dir(&layout, Some("abc123".into())).unwrap();
-        assert!(result.ends_with("session-abc123"));
-    }
-
-    #[test]
-    fn resolve_session_dir_finds_bare_name() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        let kin_dir = root.join(".kin");
-        fs::create_dir_all(&kin_dir).unwrap();
-        fs::create_dir_all(kin_dir.join("runs").join("my-session")).unwrap();
-
-        let layout = kin_core::KinLayout::discover(root).unwrap();
-        let result = resolve_session_dir(&layout, Some("my-session".into())).unwrap();
-        assert!(result.ends_with("my-session"));
-    }
-
-    #[test]
-    fn resolve_session_dir_errors_on_missing() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        let kin_dir = root.join(".kin");
-        fs::create_dir_all(&kin_dir).unwrap();
-        fs::create_dir_all(kin_dir.join("runs")).unwrap();
-
-        let layout = kin_core::KinLayout::discover(root).unwrap();
-        let result = resolve_session_dir(&layout, Some("nonexistent".into()));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn resolve_session_dir_picks_most_recent() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        let kin_dir = root.join(".kin");
-        fs::create_dir_all(&kin_dir).unwrap();
-        fs::create_dir_all(kin_dir.join("runs").join("session-old")).unwrap();
-
-        // Small delay so modification times differ
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        fs::create_dir_all(kin_dir.join("runs").join("session-new")).unwrap();
-
-        let layout = kin_core::KinLayout::discover(root).unwrap();
-        let result = resolve_session_dir(&layout, None).unwrap();
-        assert!(result.ends_with("session-new"));
+        assert!(error.contains("injected snapshot failure"));
+        assert!(graph.resolved_tree().is_empty());
+        assert!(!repository.path().join("compose.yaml").exists());
     }
 }
