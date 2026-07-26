@@ -9471,6 +9471,7 @@ mod tests {
     #[tokio::test]
     async fn health_returns_ok_with_extended_fields() {
         let state = test_state();
+        let expected_generation = DaemonState::read_generation_marker(&state.layout);
         let app = router(state);
         let response = app
             .oneshot(Request::get("/health").body(Body::empty()).unwrap())
@@ -9495,8 +9496,7 @@ mod tests {
             !json.filesystem_reconcile_disabled,
             "local authority remains file-compatible unless explicitly disabled"
         );
-        // Additive freshness marker present; 0 before any snapshot is committed.
-        assert_eq!(json.graph_generation, 0);
+        assert_eq!(json.graph_generation, expected_generation);
         let coordination = json
             .coordination
             .expect("new daemon must attest coordination");
@@ -9597,7 +9597,7 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"], "filesystem_reconcile_disabled");
+        assert_eq!(json["error"], "filesystem_admission_disabled");
         assert_eq!(json["endpoint"], "/commands/commit");
         assert_eq!(json["mutation_applied"], false);
         assert_eq!(state.graph.compute_root_hash(), root_before);
@@ -9630,7 +9630,7 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"], "filesystem_reconcile_disabled");
+        assert_eq!(json["error"], "filesystem_admission_disabled");
         assert_eq!(json["endpoint"], "/lsp/sweep");
         assert_eq!(json["mutation_applied"], false);
         assert_eq!(state.graph.compute_root_hash(), root_before);
@@ -9691,15 +9691,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_returns_503_when_empty() {
+    async fn readiness_returns_200_for_initialized_empty_repository() {
         let state = test_state();
         let app = router(state);
         let response = app
             .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        // Empty graph → not ready
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // Repository-v6 initialization itself is a valid empty repository.
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -11177,13 +11177,17 @@ mod tests {
 
         let vector_path = kin_cli::backend::vector_index_path(&state.layout);
         let vectors = kin_db::VectorIndex::new(4).unwrap();
-        let descriptor = vectors.descriptor();
+        let descriptor = kin_db::vector::IndexDescriptor {
+            model_id: Some("fixture-embedder@1".to_string()),
+            graph_root: Some("fixture-graph-root".to_string()),
+        };
+        vectors.set_descriptor(descriptor.clone());
         vectors.save(&vector_path).unwrap();
         assert!(matches!(
             state
                 .graph
                 .load_vector_index_compatible(&vector_path, &descriptor),
-            kin_db::VectorIndexLoad::Loaded(0)
+            kin_db::vector::VectorIndexLoad::Loaded(0)
         ));
         state.graph.queue_missing_for_embedding();
         assert!(state.graph.pending_embeddings() > 0);
@@ -11216,28 +11220,26 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
         let entity = test_entity("handler", "src/lib.py");
-        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32]));
-        state
-            .graph
-            .create_change(&SemanticChange {
-                id: change_id,
-                origin: kin_model::ChangeOrigin::Native,
-                parents: vec![],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "add handler".to_string(),
-                entity_deltas: vec![EntityDelta::Added {
-                    new: entity.clone(),
-                }],
-                relation_deltas: vec![],
-                tree_deltas: vec![],
-                admission_policy_delta: None,
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-            })
-            .unwrap();
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: kin_model::ChangeOrigin::Native,
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "add handler".to_string(),
+            entity_deltas: vec![EntityDelta::Added {
+                new: entity.clone(),
+            }],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            admission_policy_delta: None,
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+        };
+        change.id = kin_core::compute_semantic_change_id(&change).unwrap();
+        state.graph.create_change(&change).unwrap();
         state.graph.upsert_entity(&entity).unwrap();
 
         let app = router(state);
@@ -11305,28 +11307,26 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
         let entity = test_entity("handler", "src/lib.py");
-        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x43; 32]));
-        state
-            .graph
-            .create_change(&SemanticChange {
-                id: change_id,
-                origin: kin_model::ChangeOrigin::Native,
-                parents: vec![],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "add handler".to_string(),
-                entity_deltas: vec![EntityDelta::Added {
-                    new: entity.clone(),
-                }],
-                relation_deltas: vec![],
-                tree_deltas: vec![],
-                admission_policy_delta: None,
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-            })
-            .unwrap();
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: kin_model::ChangeOrigin::Native,
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "add handler".to_string(),
+            entity_deltas: vec![EntityDelta::Added {
+                new: entity.clone(),
+            }],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            admission_policy_delta: None,
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+        };
+        change.id = kin_core::compute_semantic_change_id(&change).unwrap();
+        state.graph.create_change(&change).unwrap();
         state.graph.upsert_entity(&entity).unwrap();
 
         // Subscribe before issuing any request so every broadcast is observable.
@@ -13879,7 +13879,7 @@ mod tests {
 
         let rejected = app
             .clone()
-            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+            .oneshot(Request::get("/session").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
@@ -13895,7 +13895,7 @@ mod tests {
 
         let accepted = app
             .oneshot(
-                Request::get("/status")
+                Request::get("/session")
                     .header("authorization", "Bearer secret-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -14062,7 +14062,7 @@ mod tests {
         // Daemon API route: rejected without a bearer token.
         let rejected = app
             .clone()
-            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+            .oneshot(Request::get("/session").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
@@ -14071,7 +14071,7 @@ mod tests {
         let accepted = app
             .clone()
             .oneshot(
-                Request::get("/status")
+                Request::get("/session")
                     .header("authorization", "Bearer secret-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -14507,7 +14507,7 @@ mod tests {
         // A bracketed IPv6 loopback Host with a port is accepted (not 403/400).
         let allowed = app
             .oneshot(
-                Request::get("/status")
+                Request::get("/session")
                     .header(header::HOST, "[::1]:4219")
                     .body(Body::empty())
                     .unwrap(),
@@ -14652,7 +14652,7 @@ mod tests {
         let accepted = app
             .clone()
             .oneshot(
-                Request::get("/status")
+                Request::get("/session")
                     .header("authorization", format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
@@ -14662,7 +14662,7 @@ mod tests {
         assert_eq!(accepted.status(), StatusCode::OK);
 
         let rejected = app
-            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+            .oneshot(Request::get("/session").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
@@ -14743,7 +14743,7 @@ mod tests {
 
         let http = reqwest::Client::new();
 
-        let no_token = http.get(format!("{base}/status")).send().await.unwrap();
+        let no_token = http.get(format!("{base}/session")).send().await.unwrap();
         assert_eq!(
             no_token.status(),
             StatusCode::UNAUTHORIZED,
@@ -14751,7 +14751,7 @@ mod tests {
         );
 
         let wrong_token = http
-            .get(format!("{base}/status"))
+            .get(format!("{base}/session"))
             .header("authorization", "Bearer not-the-real-token")
             .send()
             .await
@@ -14763,7 +14763,7 @@ mod tests {
         );
 
         let accepted = http
-            .get(format!("{base}/status"))
+            .get(format!("{base}/session"))
             .header("authorization", format!("Bearer {token}"))
             .send()
             .await
