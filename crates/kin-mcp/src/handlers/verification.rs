@@ -387,27 +387,19 @@ pub fn handle_contract_check<G: GraphStore>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::{release_check_result, EmptyStore};
     use super::*;
-    use kin_model::{Branch, BranchName, ChangeStore, Hash256, SemanticChangeId};
 
     #[test]
-    fn release_check_fails_closed_for_dangling_branch_head() {
-        let store = kin_db::InMemoryGraph::new();
-        let missing = SemanticChangeId::from_hash(Hash256::from_bytes([0xd9; 32]));
-        store
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head: missing,
-            })
-            .unwrap();
+    fn release_check_fails_closed_for_unborn_repository_authority() {
+        let store = EmptyStore::default();
         let args = HashMap::from([("require_approval".to_string(), serde_json::json!(true))]);
 
-        let error = handle_release_check(&args, &store)
-            .expect_err("MCP release gate must not pass a missing graph head");
+        let error = release_check_result(&store, &args)
+            .expect_err("MCP release gate must not pass an unborn repository authority");
 
-        assert!(matches!(error, McpError::Review(_)));
-        assert!(error.to_string().contains(&missing.to_string()));
-        assert!(error.to_string().contains("not materialized"));
+        assert!(matches!(error, McpError::InvalidParams(_)));
+        assert!(error.to_string().contains("requires branch"));
     }
 
     #[test]

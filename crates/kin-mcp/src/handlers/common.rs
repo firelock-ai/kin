@@ -1016,10 +1016,17 @@ pub struct ExactEntitySource {
     pub entry: TreeEntry,
 }
 
-fn graph_source_gap(message: impl Into<String>) -> McpError {
+fn record_graph_source_gap(error: McpError) -> McpError {
     GRAPH_MISS_COUNT.fetch_add(1, Ordering::SeqCst);
     LAST_READ_SOURCE.with(|source| source.set("graph-miss"));
-    McpError::Context(format!("graph authority gap: {}", message.into()))
+    error
+}
+
+fn graph_source_gap(message: impl Into<String>) -> McpError {
+    record_graph_source_gap(McpError::Context(format!(
+        "graph authority gap: {}",
+        message.into()
+    )))
 }
 
 fn resolve_entity_source_authority<G: GraphStore>(
@@ -1042,8 +1049,9 @@ fn resolve_entity_source_authority<G: GraphStore>(
         )));
     }
 
-    let layout = super::artifacts::active_layout()?;
-    let authority = super::repository_authority::ActiveRepositoryAuthority::open(&layout)?;
+    let layout = super::artifacts::active_layout().map_err(record_graph_source_gap)?;
+    let authority = super::repository_authority::ActiveRepositoryAuthority::open(&layout)
+        .map_err(record_graph_source_gap)?;
     let source_change_id = authority.current_source_change_id()?;
     let revision = store
         .resolve_entity_revision_at(&entity.id, &source_change_id)

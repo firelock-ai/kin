@@ -1117,6 +1117,7 @@ mod tests {
                     artifact_id,
                     new: LocatedEntry::new(path, TreeEntry::blob(hash, false)),
                 }],
+                admission_policy_delta: None,
             })
             .expect("test fixture admission must use the repository tree transaction");
         artifact_id
@@ -1737,6 +1738,7 @@ mod tests {
                         TreeEntry::blob(hash, false),
                     ),
                 }],
+                admission_policy_delta: None,
             })
             .unwrap();
 

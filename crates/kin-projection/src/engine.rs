@@ -649,6 +649,7 @@ mod tests {
                         kin_model::TreeEntry::blob(hash, false),
                     ),
                 }],
+                admission_policy_delta: None,
             })
             .unwrap();
         graph
@@ -693,6 +694,7 @@ mod tests {
                         kin_model::TreeEntry::blob(hash, false),
                     ),
                 }],
+                admission_policy_delta: None,
             })
             .unwrap();
         graph

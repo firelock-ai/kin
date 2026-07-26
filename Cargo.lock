@@ -141,7 +141,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -152,7 +152,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -433,7 +433,7 @@ dependencies = [
  "cap-primitives",
  "cap-std",
  "io-lifetimes 3.0.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -450,7 +450,7 @@ dependencies = [
  "maybe-owned",
  "rustix",
  "rustix-linux-procfs",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
  "winx",
 ]
 
@@ -1115,7 +1115,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1224,7 +1224,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1859,6 +1859,7 @@ dependencies = [
  "faster-hex",
  "gix-features",
  "sha1-checked",
+ "sha2 0.11.0",
  "thiserror 2.0.18",
 ]
 
@@ -2828,7 +2829,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20fd6de4ccfcc187e38bc21cfa543cb5a302cb86a8b114eb7f0bf0dc9f8ac00f"
 dependencies = [
  "io-lifetimes 3.0.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3151,6 +3152,7 @@ dependencies = [
  "gix",
  "kin-blobs",
  "kin-db",
+ "kin-git",
  "kin-index",
  "kin-model",
  "kin-parser",
@@ -3222,15 +3224,19 @@ dependencies = [
 
 [[package]]
 name = "kin-db"
-version = "0.4.0"
+version = "0.5.0"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "ee9c3698de4a37b34577a1fa0b88ca4829af4858d17b6b4f6304d900eaae8b9a"
+checksum = "35a30ab06c0b2c26706c2c82192fd13ee4dc63bcbb26befe513d24f32f0054f6"
 dependencies = [
  "bincode",
+ "bstr",
  "bytes",
+ "cap-fs-ext",
+ "cap-std",
  "chrono",
  "directories 6.0.0",
  "fs2",
+ "gix-ignore",
  "half",
  "hashbrown 0.15.5",
  "hex",
@@ -3259,6 +3265,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3298,6 +3305,7 @@ dependencies = [
  "notify",
  "pretty_assertions",
  "rayon",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3362,9 +3370,9 @@ dependencies = [
 
 [[package]]
 name = "kin-lsp"
-version = "0.4.0"
+version = "0.5.0"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "eac57c8501983212e1923efdf64c76ad5e61dce24dd62d714cb1b15f71b2ce54"
+checksum = "52769ad5dc035fe2968ae3524ec0962169dd9468d656da00b4fe69ca9e712e54"
 dependencies = [
  "kin-model",
  "serde",
@@ -3379,6 +3387,8 @@ dependencies = [
 name = "kin-mcp"
 version = "0.3.6"
 dependencies = [
+ "base64 0.22.1",
+ "hex",
  "kin-blobs",
  "kin-context",
  "kin-core",
@@ -3415,8 +3425,8 @@ dependencies = [
  "kin-infer",
  "kin-model",
  "kin-parser",
+ "kin-projection",
  "pretty_assertions",
- "rayon",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -3428,17 +3438,20 @@ dependencies = [
 
 [[package]]
 name = "kin-model"
-version = "0.4.0"
+version = "0.5.0"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "56123029e2cc463a2acc85d00bb4ae2146db7c5088097cadcc92a60d6d1a1b03"
+checksum = "416099f3dbf0a55962fefebcd90deaedd3c1bedc72950c4f9502711a6dc00227"
 dependencies = [
  "chrono",
+ "gix-hash",
+ "gix-object",
  "hex",
  "kin-blobs",
  "kin-vector",
  "schemars",
  "serde",
  "serde_json",
+ "sha1 0.10.6",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "uuid",
@@ -3589,6 +3602,7 @@ version = "0.3.6"
 dependencies = [
  "chrono",
  "kin-blobs",
+ "kin-core",
  "kin-model",
  "pretty_assertions",
  "serde",
@@ -4036,7 +4050,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4500,9 +4514,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.14"
+version = "0.11.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
+checksum = "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -4531,7 +4545,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4935,7 +4949,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5004,7 +5018,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5448,7 +5462,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5581,7 +5595,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6514,7 +6528,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

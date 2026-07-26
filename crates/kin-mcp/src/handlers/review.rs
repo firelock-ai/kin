@@ -938,6 +938,7 @@ fn parse_identity_arg(
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::with_empty_test_repository;
     use super::*;
 
     #[test]
@@ -995,7 +996,8 @@ mod tests {
         args.insert("base".into(), serde_json::json!("branch:missing"));
         args.insert("head".into(), serde_json::json!("branch:missing"));
 
-        let err = handle_shadow_gate_report(&args, &store).unwrap_err();
+        let err =
+            with_empty_test_repository(|| handle_shadow_gate_report(&args, &store)).unwrap_err();
         assert!(
             err.to_string().contains("not found"),
             "unknown branch must error, got: {err}"
@@ -1015,9 +1017,10 @@ mod tests {
             serde_json::json!("2222222222222222222222222222222222222222"),
         );
 
-        let err = handle_shadow_gate_report(&args, &store).unwrap_err();
+        let err =
+            with_empty_test_repository(|| handle_shadow_gate_report(&args, &store)).unwrap_err();
         assert!(
-            err.to_string().contains("not in the graph"),
+            err.to_string().contains("no imported repository alias"),
             "unimported git sha must error, got: {err}"
         );
     }
