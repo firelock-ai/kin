@@ -36,6 +36,8 @@ pub struct NativeCommitPlan {
     pub entity_count: usize,
     pub relation_count: usize,
     pub file_count: usize,
+    previous_tree: kin_model::ResolvedTree,
+    target_tree: kin_model::ResolvedTree,
     source_hashes: Vec<Hash256>,
 }
 
@@ -376,6 +378,8 @@ pub fn plan_native_commit(
         entity_count,
         relation_count,
         file_count,
+        previous_tree: workspace.tree,
+        target_tree: deltas.expected_tree,
         source_hashes: source_hashes.into_iter().collect(),
     })
 }
@@ -409,6 +413,87 @@ pub fn commit_native_plan(
         relation_count: plan.relation_count,
         file_count: plan.file_count,
     })
+}
+
+/// Atomically project and publish one native repository transaction.
+///
+/// Source bodies are copied into repository CAS first, then the exact prior
+/// and target trees are loaded back through that immutable authority. The
+/// projection recovery journal linearizes the working-tree transition with
+/// the repository transaction: a pre-commit failure restores the prior tree,
+/// while recovery after a durable authority commit finalizes the target tree.
+/// No graph-commit-then-best-effort-projection state is observable.
+pub fn commit_native_plan_with_projection(
+    layout: &kin_core::KinLayout,
+    blobs: &kin_blobs::BlobStore,
+    plan: NativeCommitPlan,
+) -> Result<NativeCommitResult> {
+    let (repository_id, _) = repository_identity(layout)?;
+    if plan.transaction.repository_id != repository_id {
+        return Err(invalid(format!(
+            "native plan belongs to {}, not {}",
+            plan.transaction.repository_id, repository_id
+        )));
+    }
+    let authority = open_authority(layout, repository_id)?;
+    for hash in &plan.source_hashes {
+        let body = blobs.read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes()))?;
+        authority.save_source_blob(*hash, &body)?;
+    }
+
+    let previous_entries = load_projection_entries(&authority, &plan.previous_tree)?;
+    let target_entries = load_projection_entries(&authority, &plan.target_tree)?;
+    let (projected, receipt) = kin_core::reconcile_source_tree_and_commit_repository_transaction(
+        layout.working_dir(),
+        &plan.previous_tree,
+        &plan.target_tree,
+        previous_entries
+            .iter()
+            .map(|(path, entry, body)| (path, *entry, body.as_slice())),
+        target_entries
+            .iter()
+            .map(|(path, entry, body)| (path, *entry, body.as_slice())),
+        &authority,
+        plan.transaction,
+    )?;
+    if projected != plan.target_tree.len() {
+        return Err(invalid(format!(
+            "exact projection installed {projected} artifacts but target authority contains {}",
+            plan.target_tree.len()
+        )));
+    }
+    receipt.validate()?;
+    Ok(NativeCommitResult {
+        change: plan.change,
+        receipt,
+        branch: plan.branch,
+        entity_count: plan.entity_count,
+        relation_count: plan.relation_count,
+        file_count: plan.file_count,
+    })
+}
+
+fn load_projection_entries(
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    tree: &kin_model::ResolvedTree,
+) -> Result<Vec<(kin_model::RepoPath, kin_model::TreeEntry, Vec<u8>)>> {
+    let mut entries = Vec::with_capacity(tree.len());
+    for artifact in tree.artifacts_by_path() {
+        let hash = artifact.entry.blob_identity().ok_or_else(|| {
+            invalid(format!(
+                "exact native projection cannot materialize gitlink {}",
+                artifact.path
+            ))
+        })?;
+        let body = authority.load_source_blob(hash)?.ok_or_else(|| {
+            invalid(format!(
+                "repository source CAS is missing {} for {}",
+                hash, artifact.path
+            ))
+        })?;
+        entries.push((artifact.path.clone(), artifact.entry, body));
+    }
+    Ok(entries)
 }
 
 fn repository_identity(layout: &kin_core::KinLayout) -> Result<(RepositoryId, WorkspaceId)> {
@@ -707,7 +792,7 @@ mod tests {
     }
 
     #[test]
-    fn native_commit_atomically_publishes_exact_non_code_tree_and_ref() {
+    fn native_commit_atomically_projects_exact_non_code_tree_and_ref() {
         let root = tempfile::tempdir().unwrap();
         let init = kin_core::init(root.path()).unwrap();
         let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
@@ -748,8 +833,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.file_count, 4);
-        let result = commit_native_plan(&init.layout, &blobs, plan).unwrap();
+        let result = commit_native_plan_with_projection(&init.layout, &blobs, plan).unwrap();
         assert_eq!(result.receipt.generation, 2);
+        assert_eq!(
+            std::fs::read(root.path().join("compose.yaml")).unwrap(),
+            b"services:\n  app:\n    image: kin:test\n"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("Dockerfile")).unwrap(),
+            b"FROM scratch\n"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("assets/model.bin")).unwrap(),
+            [0, 0xff, 0x41, 0x00]
+        );
+        assert_eq!(
+            std::fs::read_link(root.path().join("current-compose")).unwrap(),
+            std::path::PathBuf::from("compose.yaml")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_ne!(
+                std::fs::metadata(root.path().join("Dockerfile"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0
+            );
+        }
 
         let authority = reopen(&init);
         let lease = authority.read_authority();

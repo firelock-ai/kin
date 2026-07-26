@@ -59,8 +59,9 @@ pub use resolver::{ImportResolver, PythonResolver, SymbolTable, TypeScriptResolv
 pub use sync_state::SyncStateStore;
 pub use tree::{
     materialize_session_source_tree, materialize_source_entry, materialize_source_tree,
-    prepare_source_tree, reconcile_source_tree, replace_source_tree, resolve_change_tree,
-    should_preserve_checkout_path, validate_portable_source_paths,
+    prepare_source_tree, reconcile_source_tree,
+    reconcile_source_tree_and_commit_repository_transaction, replace_source_tree,
+    resolve_change_tree, should_preserve_checkout_path, validate_portable_source_paths,
     validate_portable_source_symlink, validate_source_entry, validate_source_paths,
     validate_source_tree, ExactProjectionDetachTarget, ExactProjectionEjectOutcome,
     ExactProjectionFreeze, ExactProjectionGitStage, ExactProjectionVerification,
