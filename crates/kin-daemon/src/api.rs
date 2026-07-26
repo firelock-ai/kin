@@ -2975,7 +2975,17 @@ async fn command_checkout(
 
     let _coordination = state.coordination_gate.lock().await;
     let session_id = extract_session_id_from_headers(&headers)?;
-    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let (graph, authority) = state
+        .graph_for_request_with_authority(session_id.as_ref())
+        .await;
+    if authority == RequestGraphAuthority::SessionScope {
+        return Err((
+            StatusCode::CONFLICT,
+            "checkout cannot project a session-scoped graph into the primary working tree; \
+             materialize and mutate the session workspace instead"
+                .to_string(),
+        ));
+    }
 
     let response = kin_cli::commands::checkout::execute_checkout_request(
         &state.layout,
@@ -3081,15 +3091,13 @@ async fn command_commit(
         ));
     }
 
-    // Force a filesystem sync to guarantee the daemon has reconciled all offline changes
-    // before building the commit deltas.
-    crate::loop_runner::sync_filesystem_with_graph(&state)
+    // Hold one uninterrupted graph-authority gate across forced filesystem
+    // admission, change construction, and branch publication. The sync helper
+    // deliberately does not re-lock this non-reentrant mutex.
+    let _coordination = state.coordination_gate.lock().await;
+    crate::loop_runner::sync_filesystem_with_graph_under_coordination(&state)
         .await
         .map_err(internal_error)?;
-
-    // Serialize the branch read, change construction, and head publication
-    // with `/graph/commit` release CAS operations.
-    let _coordination = state.coordination_gate.lock().await;
 
     let graph = &*state.graph;
 
@@ -3119,22 +3127,18 @@ async fn command_commit(
     // would always produce empty deltas.  Instead we walk the change DAG
     // from genesis to branch.head to reconstruct the committed baseline,
     // then diff it against the live graph — robust regardless of overlay drain timing.
-    let commit_deltas = crate::commit_deltas::compute_deltas_vs_last_commit(
-        graph,
-        state.blobs.as_ref(),
-        &state.layout,
-        &branch.head,
-    )
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to compute commit deltas: {e}"),
-        )
-    })?;
+    let commit_deltas = crate::commit_deltas::compute_deltas_vs_last_commit(graph, &branch.head)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to compute commit deltas: {e}"),
+            )
+        })?;
 
     let entity_deltas = commit_deltas.entity_deltas;
     let relation_deltas = commit_deltas.relation_deltas;
     let tree_deltas = commit_deltas.tree_deltas;
+    let expected_tree = commit_deltas.expected_tree;
 
     let entity_count = entity_deltas.len();
     let relation_count = relation_deltas.len();
@@ -3233,7 +3237,21 @@ async fn command_commit(
         .preflight_exact_source_change(graph, &change)
         .map_err(internal_error)?;
 
+    if graph.resolved_tree() != expected_tree {
+        return Err((
+            StatusCode::CONFLICT,
+            "live graph tree changed during serialized commit construction; retry commit"
+                .to_string(),
+        ));
+    }
     graph.create_change(&change).map_err(internal_error)?;
+    let change_tree = graph.resolve_tree_at(&change_id).map_err(internal_error)?;
+    if change_tree != expected_tree {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "constructed commit does not resolve to the exact live graph tree".to_string(),
+        ));
+    }
     graph
         .update_branch_head(&branch_name, &change_id)
         .map_err(internal_error)?;
@@ -4902,6 +4920,9 @@ async fn reconcile(
         ));
     }
 
+    // Session reconcile and HEAD reconcile both mutate graph authority. Keep
+    // them mutually exclusive with watcher admission, checkout, and commit.
+    let _coordination = state.coordination_gate.lock().await;
     let session_id = extract_session_id_from_headers(&headers)?;
     let state_for_reconcile = Arc::clone(&state);
 
@@ -15639,6 +15660,56 @@ mod tests {
             std::fs::read(state.layout.working_dir().join("src/shared.rs")).unwrap(),
             b"main checkout bytes\n",
             "FIFO checkout A/B must leave the second target fully materialized"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_scoped_checkout_cannot_mutate_primary_working_tree() {
+        let state = test_state();
+        let (main, feature) = install_exact_checkout_branches(&state);
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let session_id = SessionId::new();
+        state
+            .set_session_scope(
+                &session_id,
+                feature.id.to_string(),
+                feature.id,
+                Arc::new(kin_db::InMemoryGraph::new()),
+            )
+            .await;
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .header("X-Kin-Session", session_id.to_string())
+                    .body(Body::from(
+                        json!({
+                            "path": "src/shared.rs",
+                            "change_id": feature.id.to_string(),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/shared.rs")).unwrap(),
+            b"main checkout bytes\n"
+        );
+        assert_eq!(
+            state
+                .graph
+                .get_branch(&BranchName::new("main"))
+                .unwrap()
+                .unwrap()
+                .head,
+            main.id
         );
     }
 

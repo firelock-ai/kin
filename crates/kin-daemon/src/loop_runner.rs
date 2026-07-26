@@ -202,6 +202,52 @@ fn semantic_file_id(path: &RepoPath) -> Option<FilePathId> {
     path.as_utf8().map(FilePathId::new)
 }
 
+/// Re-read one host entry without mutating blob storage and compare its exact
+/// kind, mode, and content identity to graph authority.
+///
+/// Admission and parser enrichment are intentionally separate phases. This
+/// CAS-style check prevents bytes observed after admission from publishing
+/// semantic facets against an older tree entry.
+fn host_entry_matches_graph(
+    state: &DaemonState,
+    host_path: &Path,
+    repo_path: &RepoPath,
+) -> Result<bool> {
+    let observed = match std::fs::symlink_metadata(host_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let target = std::fs::read_link(host_path).map_err(DaemonError::Io)?;
+            let bytes = symlink_target_bytes(&target).map_err(DaemonError::Io)?;
+            Some(TreeEntry::symlink(Hash256::from_bytes(
+                kin_blobs::digest_bytes(&bytes),
+            )))
+        }
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let bytes = std::fs::read(host_path).map_err(DaemonError::Io)?;
+            Some(TreeEntry::blob(
+                Hash256::from_bytes(kin_blobs::digest_bytes(&bytes)),
+                regular_file_is_executable(&metadata),
+            ))
+        }
+        Ok(_) => {
+            return Err(DaemonError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "repository path changed to an unsupported special entry: {}",
+                    host_path.display()
+                ),
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(DaemonError::Io(error)),
+    };
+    let expected = state
+        .graph
+        .artifact_id_at_path(repo_path)
+        .and_then(|artifact_id| state.graph.resolved_artifact(&artifact_id))
+        .map(|artifact| artifact.entry);
+    Ok(observed == expected)
+}
+
 fn is_within_graph_only_member(state: &DaemonState, path: &RepoPath) -> bool {
     state
         .graph
@@ -781,6 +827,12 @@ pub async fn run_loop(
             "processing file events (after dedup)"
         );
 
+        // Serialize exact-tree admission and semantic enrichment with every
+        // other graph-authority mutation, including commit and checkout. The
+        // clock guard below records mutation epochs; this mutex is the actual
+        // exclusion boundary.
+        let coordination = state.coordination_gate.lock().await;
+
         // Acquire write locks for reconciliation.
         let mut reconciler = state.reconciler.write().await;
         let mut working_copy = state.working_copy.write().await;
@@ -806,6 +858,7 @@ pub async fn run_loop(
                 drop(graph_mutation);
                 drop(working_copy);
                 drop(reconciler);
+                drop(coordination);
                 state
                     .reconciliation_status
                     .store(RECON_IDLE, Ordering::Relaxed);
@@ -846,8 +899,40 @@ pub async fn run_loop(
             let path = match event {
                 FileEvent::Changed(path) | FileEvent::Removed(path) => path,
             };
+            let admitted_repo_path = match &admitted {
+                AdmittedFileEvent::Regular { repo_path, .. }
+                | AdmittedFileEvent::Symlink { repo_path, .. }
+                | AdmittedFileEvent::Removed { repo_path, .. } => repo_path,
+                AdmittedFileEvent::Ignored => unreachable!(),
+            };
+            match host_entry_matches_graph(&state, path, admitted_repo_path) {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(
+                        file = %admitted_repo_path,
+                        "host entry changed after exact-tree admission; deferring semantic enrichment"
+                    );
+                    retry_queue.push(path.clone());
+                    if tree_changed {
+                        state.bump_version();
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    warn!(
+                        file = %admitted_repo_path,
+                        error = %error,
+                        "could not revalidate exact host entry; deferring semantic enrichment"
+                    );
+                    retry_queue.push(path.clone());
+                    if tree_changed {
+                        state.bump_version();
+                    }
+                    continue;
+                }
+            }
 
-            let semantic_event = match admitted {
+            let (semantic_event, semantic_repo_path) = match admitted {
                 AdmittedFileEvent::Regular {
                     repo_path,
                     file_id,
@@ -920,7 +1005,7 @@ pub async fn run_loop(
                             );
                         }
                     }
-                    FileEvent::Changed(path.clone())
+                    (FileEvent::Changed(path.clone()), repo_path)
                 }
                 AdmittedFileEvent::Symlink {
                     repo_path,
@@ -1026,6 +1111,36 @@ pub async fn run_loop(
                         ReconcileOutcome::Updated { .. } | ReconcileOutcome::FileRemoved { .. }
                     );
                     if should_apply {
+                        match host_entry_matches_graph(&state, path, &semantic_repo_path) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                working_copy.uncommitted_mutations =
+                                    kin_model::GraphOverlay::default();
+                                warn!(
+                                    file = %semantic_repo_path,
+                                    "host entry changed during semantic reconciliation; discarded overlay and queued retry"
+                                );
+                                retry_queue.push(path.clone());
+                                if tree_changed {
+                                    state.bump_version();
+                                }
+                                continue;
+                            }
+                            Err(error) => {
+                                working_copy.uncommitted_mutations =
+                                    kin_model::GraphOverlay::default();
+                                warn!(
+                                    file = %semantic_repo_path,
+                                    error = %error,
+                                    "could not revalidate reconciled host entry; discarded overlay and queued retry"
+                                );
+                                retry_queue.push(path.clone());
+                                if tree_changed {
+                                    state.bump_version();
+                                }
+                                continue;
+                            }
+                        }
                         if let Err(e) = apply_overlay_to_graph(
                             state.graph.as_ref(),
                             &mut working_copy.uncommitted_mutations,
@@ -1164,6 +1279,7 @@ pub async fn run_loop(
         // Drop write locks before rebuilding projection (it takes its own locks).
         drop(working_copy);
         drop(reconciler);
+        drop(coordination);
 
         // Queue only changed entities for LSP enrichment.
         for (path, entity_ids) in lsp_changed {
@@ -1385,6 +1501,23 @@ mod tests {
             }
         ));
         assert_eq!(read_tree_entry_bytes(&state, entry), content);
+    }
+
+    #[test]
+    fn semantic_revalidation_detects_bytes_changed_after_tree_admission() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let path = repo.path().join("src.rs");
+        let repo_path = test_repo_path("src.rs");
+        std::fs::write(&path, b"fn admitted() {}\n").unwrap();
+
+        admit_file_event(&state, &FileEvent::Changed(path.clone())).unwrap();
+        assert!(host_entry_matches_graph(&state, &path, &repo_path).unwrap());
+
+        std::fs::write(&path, b"fn changed_after_admission() {}\n").unwrap();
+        assert!(!host_entry_matches_graph(&state, &path, &repo_path).unwrap());
+        let entry = tree_entry(&state, "src.rs").unwrap();
+        assert_eq!(read_tree_entry_bytes(&state, entry), b"fn admitted() {}\n");
     }
 
     #[cfg(unix)]
@@ -1857,6 +1990,18 @@ fn should_block_mass_deletion(removed: u64, total_graph_files: u64, allow_overri
 
 #[tracing::instrument(skip(state))]
 pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
+    let _coordination = state.coordination_gate.lock().await;
+    sync_filesystem_with_graph_under_coordination(state).await
+}
+
+/// Synchronize the host checkout while the caller holds `coordination_gate`.
+///
+/// This split lets `/commands/commit` hold one uninterrupted authority gate
+/// across forced admission, delta construction, and branch publication
+/// without recursively acquiring the non-reentrant mutex.
+pub(crate) async fn sync_filesystem_with_graph_under_coordination(
+    state: &DaemonState,
+) -> Result<()> {
     if state.filesystem_reconcile_disabled() {
         debug!(
             env = DISABLE_FILESYSTEM_RECONCILE_ENV,
@@ -1917,8 +2062,19 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
         let path = match &event {
             FileEvent::Changed(path) | FileEvent::Removed(path) => path,
         };
+        let admitted_repo_path = match &admitted {
+            AdmittedFileEvent::Regular { repo_path, .. }
+            | AdmittedFileEvent::Symlink { repo_path, .. }
+            | AdmittedFileEvent::Removed { repo_path, .. } => repo_path,
+            AdmittedFileEvent::Ignored => unreachable!(),
+        };
+        if !host_entry_matches_graph(state, path, admitted_repo_path)? {
+            return Err(DaemonError::Io(std::io::Error::other(format!(
+                "host entry changed after exact-tree admission: {admitted_repo_path}"
+            ))));
+        }
 
-        let semantic_event = match admitted {
+        let (semantic_event, semantic_repo_path) = match admitted {
             AdmittedFileEvent::Regular {
                 repo_path,
                 file_id,
@@ -1972,7 +2128,7 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
                         "tree entry admitted during sync but incompatible facet cleanup failed"
                     ),
                 }
-                FileEvent::Changed(path.clone())
+                (FileEvent::Changed(path.clone()), repo_path)
             }
             AdmittedFileEvent::Symlink {
                 repo_path,
@@ -2063,6 +2219,13 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
                     ReconcileOutcome::Updated { .. } | ReconcileOutcome::FileRemoved { .. }
                 );
                 if should_apply {
+                    if !host_entry_matches_graph(state, path, &semantic_repo_path)? {
+                        working_copy.uncommitted_mutations = kin_model::GraphOverlay::default();
+                        return Err(DaemonError::Io(std::io::Error::other(format!(
+                            "host entry changed during semantic reconciliation: \
+                             {semantic_repo_path}"
+                        ))));
+                    }
                     if let Err(e) = apply_overlay_to_graph(
                         state.graph.as_ref(),
                         &mut working_copy.uncommitted_mutations,

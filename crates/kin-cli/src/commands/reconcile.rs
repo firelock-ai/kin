@@ -233,6 +233,7 @@ where
         &prepared,
         &blob_store,
     )?;
+    revalidate_prepared_entries(session_dir, &rebased.target, &rebased.deltas, &prepared)?;
     let transaction = TransactionDelta {
         entity_deltas: semantic.entity_deltas,
         relation_deltas: semantic.relation_deltas,
@@ -427,6 +428,55 @@ fn prepare_target_entries(
         prepared.by_path.insert(located.path.clone(), content);
     }
     Ok(prepared)
+}
+
+/// Revalidate the complete affected session surface immediately before any
+/// projection or graph mutation. Semantic parsers currently read the session
+/// workspace, so this CAS boundary prevents their observation from being
+/// published against different exact bytes than `prepare_target_entries`.
+fn revalidate_prepared_entries(
+    session_dir: &Path,
+    target: &ResolvedTree,
+    deltas: &[TreeDelta],
+    prepared: &PreparedEntries,
+) -> Result<()> {
+    let affected = deltas
+        .iter()
+        .flat_map(|delta| [delta.old_state(), delta.new_state()])
+        .flatten()
+        .map(|entry| entry.path.clone())
+        .collect::<BTreeSet<_>>();
+
+    for path in affected {
+        let Some(expected) = target.artifact_at_path(&path) else {
+            let host = session_dir.join(repo_path_to_relative(&path)?);
+            anyhow::ensure!(
+                super::session_base::read_disk_entry(&host)?.is_none(),
+                "session entry reappeared after semantic preparation: {path}"
+            );
+            continue;
+        };
+        if matches!(expected.entry, TreeEntry::Gitlink { .. }) {
+            continue;
+        }
+        let host = session_dir.join(repo_path_to_relative(&path)?);
+        let (actual_entry, actual_content) = super::session_base::read_disk_entry(&host)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("session entry disappeared after semantic preparation: {path}")
+            })?;
+        anyhow::ensure!(
+            actual_entry == expected.entry,
+            "session entry changed after semantic preparation: {path}"
+        );
+        let prepared_content = prepared.by_path.get(&path).ok_or_else(|| {
+            anyhow::anyhow!("missing prepared exact bytes for affected session entry: {path}")
+        })?;
+        anyhow::ensure!(
+            &actual_content == prepared_content,
+            "session bytes changed after semantic preparation: {path}"
+        );
+    }
+    Ok(())
 }
 
 struct SemanticPreparation {
@@ -927,6 +977,41 @@ mod tests {
                 .unwrap()
                 .artifact_id,
             replacement_id
+        );
+    }
+
+    #[test]
+    fn prepared_session_bytes_are_revalidated_before_graph_mutation() {
+        let session = tempdir().unwrap();
+        let content = b"services: {}\n".to_vec();
+        let repo_path = path("compose.yaml");
+        let artifact_id = ArtifactId::new();
+        let exact_entry = TreeEntry::blob(
+            Hash256::from_bytes(kin_blobs::digest_bytes(&content)),
+            false,
+        );
+        let target = tree(vec![(artifact_id, "compose.yaml", exact_entry)]);
+        let deltas = vec![TreeDelta::Added {
+            artifact_id,
+            new: LocatedEntry::new(repo_path.clone(), exact_entry),
+        }];
+        let prepared = PreparedEntries {
+            by_path: BTreeMap::from([(repo_path, content)]),
+        };
+        std::fs::write(
+            session.path().join("compose.yaml"),
+            b"services:\n  changed: {}\n",
+        )
+        .unwrap();
+
+        let error =
+            revalidate_prepared_entries(session.path(), &target, &deltas, &prepared).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("changed after semantic preparation"),
+            "{error}"
         );
     }
 
