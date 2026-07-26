@@ -262,6 +262,39 @@ fn is_within_graph_only_member(state: &DaemonState, path: &RepoPath) -> bool {
         })
 }
 
+fn publish_exact_workspace_tree(
+    state: &DaemonState,
+    desired_tree: &kin_model::ResolvedTree,
+) -> Result<()> {
+    let Some(admission) = crate::repository_commit::publish_workspace_tree(
+        &state.layout,
+        state.blobs.as_ref(),
+        desired_tree,
+        kin_model::OperationId::new(),
+        kin_model::AuthorId::new(kin_core::whoami()),
+    )?
+    else {
+        return Ok(());
+    };
+    state.record_repository_authority_commit(admission.receipt.generation)?;
+    info!(
+        workspace = %admission.workspace_id,
+        generation = admission.receipt.generation,
+        tree_hash = %admission.tree_hash,
+        file_deltas = admission.file_count,
+        "admitted exact workspace tree into repository authority"
+    );
+    Ok(())
+}
+
+fn invalid_tree_transition(error: impl std::fmt::Display) -> DaemonError {
+    DaemonError::Graph(kin_db::KinDbError::Model(
+        kin_model::ModelError::InvalidOperation(format!(
+            "invalid admitted exact-tree transition: {error}"
+        )),
+    ))
+}
+
 fn exact_tree_admission(state: &DaemonState) -> Result<ExactTreeAdmission> {
     let working_dir = state.layout.working_dir();
     let previous = state.graph.resolved_tree();
@@ -332,6 +365,11 @@ fn exact_tree_admission(state: &DaemonState) -> Result<ExactTreeAdmission> {
     }
 
     if !deltas.is_empty() {
+        let desired_tree = previous.apply(&deltas).map_err(invalid_tree_transition)?;
+        // Repository authority moves first. The in-memory graph is a derived
+        // staging/query view and must never acknowledge dirty file truth that
+        // has not crossed the repository-v6 compare-and-swap.
+        publish_exact_workspace_tree(state, &desired_tree)?;
         state.graph.apply_transaction_delta(&TransactionDelta {
             entity_deltas: Vec::new(),
             relation_deltas: Vec::new(),
@@ -379,6 +417,12 @@ fn apply_tree_delta(state: &DaemonState, delta: Option<TreeDelta>) -> Result<boo
     let Some(delta) = delta else {
         return Ok(false);
     };
+    let desired_tree = state
+        .graph
+        .resolved_tree()
+        .apply(std::slice::from_ref(&delta))
+        .map_err(invalid_tree_transition)?;
+    publish_exact_workspace_tree(state, &desired_tree)?;
     state.graph.apply_transaction_delta(&TransactionDelta {
         entity_deltas: Vec::new(),
         relation_deltas: Vec::new(),
@@ -1398,6 +1442,29 @@ mod tests {
         state.blobs.read(&kin_blobs::Hash256(hash.0)).unwrap()
     }
 
+    fn authority_tree(state: &DaemonState) -> kin_model::ResolvedTree {
+        let manifest =
+            kin_core::manifest::KinManifest::load(&state.layout.manifest_path()).unwrap();
+        let repository_id = kin_model::RepositoryId::new(manifest.repo_id).unwrap();
+        let workspace_id = kin_model::WorkspaceId::from_uuid(
+            uuid::Uuid::parse_str(&manifest.workspace_id).unwrap(),
+        );
+        let authority = kin_db::RepositoryAuthorityManager::open(
+            repository_id,
+            Arc::new(kin_db::LocalFileBackend::new(state.layout.kindb_dir())),
+        )
+        .unwrap();
+        authority
+            .read_authority()
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .unwrap()
+            .tree
+            .clone()
+    }
+
     #[test]
     fn graph_only_flag_accepts_only_explicit_truthy_values() {
         for value in ["1", "true", " TRUE ", "yes", "on", "ON"] {
@@ -1479,6 +1546,14 @@ mod tests {
         ));
         assert_eq!(read_tree_entry_bytes(&state, entry), content);
         assert_eq!(tree_entry(&state, "tool.custom"), Some(entry));
+        assert_eq!(
+            authority_tree(&state)
+                .artifact_at_path(&test_repo_path("tool.custom"))
+                .unwrap()
+                .entry,
+            entry,
+            "unsupported executable must cross repository authority before graph admission"
+        );
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let admitted = admit_file_event(&state, &FileEvent::Changed(path)).unwrap();
@@ -1493,6 +1568,14 @@ mod tests {
             }
         ));
         assert_eq!(read_tree_entry_bytes(&state, entry), content);
+        assert_eq!(
+            authority_tree(&state)
+                .artifact_at_path(&test_repo_path("tool.custom"))
+                .unwrap()
+                .entry,
+            entry,
+            "mode-only edits must remain exact repository authority"
+        );
     }
 
     #[test]
