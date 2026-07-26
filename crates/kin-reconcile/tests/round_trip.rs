@@ -4,16 +4,18 @@
 //! Round-trip integration tests for kin-reconcile.
 //!
 //! These tests exercise the public Reconciler API end-to-end:
-//! register a file layout + content, build a GraphOverlay with entity
+//! register a file layout + content, build an exact transaction with entity
 //! mutations, project to disk, and verify the resulting bytes.
+
+use std::collections::HashMap;
 
 use kin_blobs::BlobStore;
 use kin_db::{EntityStore, InMemoryGraph};
 use kin_index::FileEvent;
 use kin_model::{
-    Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FileLayout, FilePathId,
-    FingerprintAlgorithm, GraphOverlay, Hash256, ImportSection, LanguageId, ParseCompleteness,
-    SemanticFingerprint, SourceRegion, SourceSpan, Visibility,
+    Entity, EntityDelta, EntityId, EntityKind, EntityMetadata, EntityRole, FileLayout, FilePathId,
+    FingerprintAlgorithm, Hash256, ImportSection, LanguageId, ParseCompleteness,
+    SemanticFingerprint, SourceRegion, SourceSpan, TransactionDelta, Visibility,
 };
 use kin_reconcile::Reconciler;
 
@@ -49,6 +51,49 @@ fn make_entity(
         created_in: None,
         superseded_by: None,
     }
+}
+
+fn projection_transaction(new: Entity) -> TransactionDelta {
+    let mut old = new.clone();
+    old.fingerprint.ast_hash = Hash256::from_bytes([0; 32]);
+    assert_ne!(old, new);
+    TransactionDelta {
+        entity_deltas: vec![EntityDelta::Modified { old, new }],
+        ..TransactionDelta::default()
+    }
+}
+
+fn added_entities(delta: &TransactionDelta) -> Vec<&Entity> {
+    delta
+        .entity_deltas
+        .iter()
+        .filter_map(|entity_delta| match entity_delta {
+            EntityDelta::Added { new } => Some(new),
+            EntityDelta::Modified { .. } | EntityDelta::Removed { .. } => None,
+        })
+        .collect()
+}
+
+fn modified_entities(delta: &TransactionDelta) -> Vec<(&Entity, &Entity)> {
+    delta
+        .entity_deltas
+        .iter()
+        .filter_map(|entity_delta| match entity_delta {
+            EntityDelta::Modified { old, new } => Some((old, new)),
+            EntityDelta::Added { .. } | EntityDelta::Removed { .. } => None,
+        })
+        .collect()
+}
+
+fn removed_entities(delta: &TransactionDelta) -> Vec<&Entity> {
+    delta
+        .entity_deltas
+        .iter()
+        .filter_map(|entity_delta| match entity_delta {
+            EntityDelta::Removed { old } => Some(old),
+            EntityDelta::Added { .. } | EntityDelta::Modified { .. } => None,
+        })
+        .collect()
 }
 
 /// Prove that `extract_entity_body` uses the entity's span to extract the
@@ -93,7 +138,7 @@ fn body_extracted_from_span_not_signature() {
         .projection_mut()
         .register_file(layout, file_content.to_vec());
 
-    // Build overlay: entity's span covers bytes 0..23, but signature is
+    // Build a transaction: the entity's span covers bytes 0..23, but signature is
     // deliberately shorter ("fn foo()") to prove the span wins.
     let entity = make_entity(
         entity_id,
@@ -111,10 +156,11 @@ fn body_extracted_from_span_not_signature() {
         "fn foo()", // intentionally NOT the full body
     );
 
-    let mut overlay = GraphOverlay::default();
-    overlay.entity_mods.insert(entity_id, entity);
+    let transaction = projection_transaction(entity);
 
-    let (modified, _warnings) = reconciler.project_overlay_to_files(&overlay).unwrap();
+    let (modified, _warnings) = reconciler
+        .project_transaction_to_files(&transaction, &HashMap::new())
+        .unwrap();
 
     assert_eq!(modified.len(), 1, "expected exactly 1 modified file");
 
@@ -203,10 +249,11 @@ fn trivia_preserved_between_entities() {
         "fn foo()",
     );
 
-    let mut overlay = GraphOverlay::default();
-    overlay.entity_mods.insert(foo_id, foo_entity);
+    let transaction = projection_transaction(foo_entity);
 
-    let (modified, _) = reconciler.project_overlay_to_files(&overlay).unwrap();
+    let (modified, _) = reconciler
+        .project_transaction_to_files(&transaction, &HashMap::new())
+        .unwrap();
 
     assert_eq!(modified.len(), 1);
 
@@ -295,13 +342,20 @@ fn multi_entity_file_isolation() {
     );
 
     // Give entity a a different fingerprint so it is treated as changed.
-    let mut a_mod = a_entity;
+    let mut a_mod = a_entity.clone();
     a_mod.fingerprint.ast_hash = Hash256::from_bytes([0x11; 32]);
 
-    let mut overlay = GraphOverlay::default();
-    overlay.entity_mods.insert(a_id, a_mod);
+    let transaction = TransactionDelta {
+        entity_deltas: vec![EntityDelta::Modified {
+            old: a_entity,
+            new: a_mod,
+        }],
+        ..TransactionDelta::default()
+    };
 
-    let (modified, _) = reconciler.project_overlay_to_files(&overlay).unwrap();
+    let (modified, _) = reconciler
+        .project_transaction_to_files(&transaction, &HashMap::new())
+        .unwrap();
 
     assert_eq!(modified.len(), 1);
 
@@ -342,8 +396,8 @@ fn multi_entity_file_isolation() {
 /// 1. Write a source file and reconcile it (entities enter the graph).
 /// 2. Commit entities to the graph.
 /// 3. Externally edit the file (change function body).
-/// 4. Reconcile the edit (graph overlay gets entity_mods).
-/// 5. Verify the overlay entity has the new fingerprint and body content.
+/// 4. Reconcile the edit (an exact modification delta is returned).
+/// 5. Verify the new entity state has the new fingerprint and body content.
 ///
 /// This is the single most important test for Kin — it proves that
 /// graph and files stay in sync across the full edit cycle.
@@ -360,20 +414,20 @@ fn full_round_trip_edit_reconcile_verify() {
 
     let mut reconciler = Reconciler::new(dir.path().to_path_buf());
 
-    // Step 2: First reconcile — entity enters the graph as entity_adds.
-    let mut overlay1 = GraphOverlay::default();
+    // Step 2: First reconcile — transaction adds one entity.
     let event = FileEvent::Changed(file_path.clone());
-    reconciler
-        .reconcile_file_change(&event, &blob_store, &graph, &mut overlay1)
+    let reconcile1 = reconciler
+        .reconcile_file_change(&event, &blob_store, &graph)
         .expect("first reconcile should succeed");
+    let added1 = added_entities(&reconcile1.delta);
 
     assert_eq!(
-        overlay1.entity_adds.len(),
+        added1.len(),
         1,
         "expected exactly 1 new entity from first reconcile"
     );
-    let stable_id = *overlay1.entity_adds.keys().next().unwrap();
-    let original_entity = overlay1.entity_adds.values().next().unwrap().clone();
+    let stable_id = added1[0].id;
+    let original_entity = added1[0].clone();
     let original_fingerprint = original_entity.fingerprint.clone();
 
     // Commit entity to graph so it is "existing" for subsequent reconciles.
@@ -387,30 +441,21 @@ fn full_round_trip_edit_reconcile_verify() {
     std::fs::write(&file_path, edited_content).unwrap();
 
     // Step 4: Reconcile the external edit.
-    let mut overlay2 = GraphOverlay::default();
-    reconciler
-        .reconcile_file_change(&event, &blob_store, &graph, &mut overlay2)
+    let reconcile2 = reconciler
+        .reconcile_file_change(&event, &blob_store, &graph)
         .expect("second reconcile after edit should succeed");
 
-    // Step 5: Verify the graph overlay reflects the change.
-    //
-    // The entity should appear in entity_mods (not entity_adds, since it
-    // already existed in the graph).
-    assert!(
-        overlay2.entity_adds.is_empty(),
-        "no new entities should be added on edit"
-    );
+    // Step 5: Verify the exact transaction reflects the change.
+    let added2 = added_entities(&reconcile2.delta);
+    let modified2 = modified_entities(&reconcile2.delta);
+    assert!(added2.is_empty(), "no new entities should be added on edit");
+    assert_eq!(modified2.len(), 1, "exactly 1 entity should be modified");
     assert_eq!(
-        overlay2.entity_mods.len(),
-        1,
-        "exactly 1 entity should be modified"
-    );
-    assert!(
-        overlay2.entity_mods.contains_key(&stable_id),
+        modified2[0].0.id, stable_id,
         "modified entity must use the stable graph ID"
     );
 
-    let modified_entity = &overlay2.entity_mods[&stable_id];
+    let modified_entity = modified2[0].1;
 
     // The fingerprint must have changed (different source content).
     assert_ne!(
@@ -438,11 +483,11 @@ fn full_round_trip_edit_reconcile_verify() {
 /// Comprehensive round-trip test: the single most important test for Kin.
 ///
 /// Exercises the full lifecycle:
-/// 1. Write a source file and reconcile it (entities + relations enter the overlay)
+/// 1. Write a source file and reconcile it (entities + relations enter a transaction)
 /// 2. Commit entities to the graph
 /// 3. Externally edit the file (change function body AND signature)
-/// 4. Reconcile the edit — verify entity_mods has correct new fingerprint
-/// 5. Project the overlay back to files — verify file on disk matches expected content
+/// 4. Reconcile the edit — verify the exact modification has the new fingerprint
+/// 5. Project the transaction back to files — verify file on disk matches expected content
 /// 6. Re-reconcile — verify idempotence (no further modifications detected)
 ///
 /// This proves that graph and files stay in sync across the full edit cycle,
@@ -461,15 +506,14 @@ fn comprehensive_round_trip_with_projection_and_verify() {
 
     let mut reconciler = Reconciler::new(dir.path().to_path_buf());
 
-    // --- Step 2: First reconcile — entities enter as entity_adds ---
-    let mut overlay1 = GraphOverlay::default();
+    // --- Step 2: First reconcile — entities enter as exact additions ---
     let event = FileEvent::Changed(file_path.clone());
-    let outcome1 = reconciler
-        .reconcile_file_change(&event, &blob_store, &graph, &mut overlay1)
+    let reconcile1 = reconciler
+        .reconcile_file_change(&event, &blob_store, &graph)
         .expect("first reconcile should succeed");
 
     // Verify we got an Updated outcome with 2 added entities.
-    match &outcome1 {
+    match &reconcile1.outcome {
         kin_reconcile::ReconcileOutcome::Updated {
             added,
             modified,
@@ -484,7 +528,8 @@ fn comprehensive_round_trip_with_projection_and_verify() {
     }
 
     // All added entities must have blob_hash in metadata.
-    for entity in overlay1.entity_adds.values() {
+    let added1 = added_entities(&reconcile1.delta);
+    for entity in &added1 {
         assert!(
             entity.metadata.extra.contains_key("blob_hash"),
             "entity {} must have blob_hash metadata",
@@ -493,23 +538,29 @@ fn comprehensive_round_trip_with_projection_and_verify() {
     }
 
     // Find entities by name for later comparison.
-    let alpha_id = overlay1
-        .entity_adds
-        .values()
+    let alpha_entity = added1
+        .iter()
+        .copied()
         .find(|e| e.name == "alpha")
-        .expect("alpha must exist")
-        .id;
-    let beta_id = overlay1
-        .entity_adds
-        .values()
+        .expect("alpha must exist");
+    let alpha_id = alpha_entity.id;
+    let beta_id = added1
+        .iter()
+        .copied()
         .find(|e| e.name == "beta")
         .expect("beta must exist")
         .id;
-    let original_alpha_fp = overlay1.entity_adds[&alpha_id].fingerprint.clone();
-    let _original_beta_fp = overlay1.entity_adds[&beta_id].fingerprint.clone();
+    let original_alpha_fp = alpha_entity.fingerprint.clone();
+    let original_beta_fp = added1
+        .iter()
+        .copied()
+        .find(|entity| entity.id == beta_id)
+        .expect("beta must exist")
+        .fingerprint
+        .clone();
 
     // Commit entities to the graph.
-    for entity in overlay1.entity_adds.values() {
+    for entity in &added1 {
         graph.upsert_entity(entity).expect("upsert must succeed");
     }
 
@@ -518,26 +569,32 @@ fn comprehensive_round_trip_with_projection_and_verify() {
     std::fs::write(&file_path, edited_content).unwrap();
 
     // --- Step 4: Reconcile the external edit ---
-    let mut overlay2 = GraphOverlay::default();
-    reconciler
-        .reconcile_file_change(&event, &blob_store, &graph, &mut overlay2)
+    let reconcile2 = reconciler
+        .reconcile_file_change(&event, &blob_store, &graph)
         .expect("second reconcile after edit should succeed");
 
-    // alpha was modified (signature + body changed), beta was not.
+    // alpha changed semantically. Beta's semantic fingerprint is unchanged, but
+    // its source span and containing blob provenance move because alpha grew.
+    let added2 = added_entities(&reconcile2.delta);
+    let modified2 = modified_entities(&reconcile2.delta);
+    let removed2 = removed_entities(&reconcile2.delta);
     assert!(
-        overlay2.entity_adds.is_empty(),
+        added2.is_empty(),
         "no new entities on edit of existing file"
     );
     assert!(
-        overlay2.entity_mods.contains_key(&alpha_id),
-        "alpha must be in entity_mods (it was modified)"
+        modified2.iter().any(|(_, new)| new.id == alpha_id),
+        "alpha must have an exact modification"
     );
     assert!(
-        overlay2.entity_removes.is_empty(),
+        removed2.is_empty(),
         "no entities were removed (both still present)"
     );
 
-    let modified_alpha = &overlay2.entity_mods[&alpha_id];
+    let modified_alpha = modified2
+        .iter()
+        .find_map(|(_, new)| (new.id == alpha_id).then_some(*new))
+        .expect("alpha modification must exist");
 
     // Fingerprint must have changed.
     assert_ne!(
@@ -555,22 +612,25 @@ fn comprehensive_round_trip_with_projection_and_verify() {
         "modified alpha must have blob_hash"
     );
 
-    // beta should NOT be in entity_mods (unchanged).
-    assert!(
-        !overlay2.entity_mods.contains_key(&beta_id),
-        "beta was not modified, should not be in entity_mods"
+    let modified_beta = modified2
+        .iter()
+        .find_map(|(_, new)| (new.id == beta_id).then_some(*new))
+        .expect("beta span/blob enrichment must advance");
+    assert_eq!(
+        modified_beta.fingerprint, original_beta_fp,
+        "beta remains semantically unchanged"
     );
 
-    // --- Step 5: Project overlay back to files and verify disk content ---
+    // --- Step 5: The transaction's file-derived body is already on disk ---
     // We need the modified entity to have a span pointing to the file
-    // for project_overlay_to_files to extract the body.
+    // for project_transaction_to_files to extract the body.
     // The reconciler already registered the layout from the second reconcile,
     // so we can project directly.
 
-    // Commit the modified entity to graph first so it's the "current" state.
-    graph
-        .upsert_entity(modified_alpha)
-        .expect("upsert modified alpha");
+    // Commit every exact entity modification so graph enrichment matches disk.
+    for (_, new) in &modified2 {
+        graph.upsert_entity(new).expect("upsert modified entity");
+    }
 
     // --- Step 6: Re-reconcile — should be idempotent (no further changes) ---
     // Read the file again after edit — it should still match edited_content.
@@ -581,29 +641,24 @@ fn comprehensive_round_trip_with_projection_and_verify() {
         "file on disk must match edited content"
     );
 
-    let mut overlay3 = GraphOverlay::default();
-    reconciler
-        .reconcile_file_change(&event, &blob_store, &graph, &mut overlay3)
+    let reconcile3 = reconciler
+        .reconcile_file_change(&event, &blob_store, &graph)
         .expect("third reconcile (idempotency) should succeed");
 
     // No modifications should be detected — the graph matches the file.
     assert!(
-        overlay3.entity_mods.is_empty(),
-        "re-reconcile must be idempotent: no entity_mods expected, got {}",
-        overlay3.entity_mods.len()
+        reconcile3.delta.entity_deltas.is_empty(),
+        "re-reconcile must be idempotent: no entity deltas expected, got {}",
+        reconcile3.delta.entity_deltas.len()
     );
     assert!(
-        overlay3.entity_adds.is_empty(),
-        "re-reconcile must be idempotent: no entity_adds expected"
-    );
-    assert!(
-        overlay3.entity_removes.is_empty(),
-        "re-reconcile must be idempotent: no entity_removes expected"
+        reconcile3.delta.relation_deltas.is_empty(),
+        "re-reconcile must be idempotent: no relation deltas expected"
     );
 }
 
 /// Test that reconcile transactionality works: if an error occurs during
-/// reconcile, the overlay is restored to its pre-reconcile state.
+/// reconcile, no partial transaction escapes and internal LKG state is restored.
 #[test]
 fn reconcile_transaction_rollback_on_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -615,53 +670,36 @@ fn reconcile_transaction_rollback_on_error() {
     std::fs::write(&file_path, b"pub fn txn_fn() -> i32 { 1 }\n").unwrap();
 
     let mut reconciler = Reconciler::new(dir.path().to_path_buf());
-    let mut overlay = GraphOverlay::default();
     let event = FileEvent::Changed(file_path.clone());
 
-    reconciler
-        .reconcile_file_change(&event, &blob_store, &graph, &mut overlay)
+    let first = reconciler
+        .reconcile_file_change(&event, &blob_store, &graph)
         .expect("first reconcile should succeed");
 
-    // Overlay should have 1 entity added.
-    assert_eq!(overlay.entity_adds.len(), 1);
+    assert_eq!(added_entities(&first.delta).len(), 1);
+    let first_delta = first.delta.clone();
+    let lkg_len = reconciler.lkg().len();
 
     // Now try to reconcile a file that doesn't exist (should error).
     let bad_path = dir.path().join("nonexistent.rs");
     let bad_event = FileEvent::Changed(bad_path);
 
-    // Snapshot the overlay state before the bad reconcile.
-    let overlay_before = overlay.clone();
-
-    let result = reconciler.reconcile_file_change(&bad_event, &blob_store, &graph, &mut overlay);
+    let result = reconciler.reconcile_file_change(&bad_event, &blob_store, &graph);
 
     // The reconcile should have failed.
     assert!(result.is_err(), "reconcile of nonexistent file should fail");
 
-    // The overlay must be unchanged — transactional rollback.
-    assert_eq!(
-        overlay.entity_adds.len(),
-        overlay_before.entity_adds.len(),
-        "overlay entity_adds must be unchanged after failed reconcile"
-    );
-    assert_eq!(
-        overlay.entity_mods.len(),
-        overlay_before.entity_mods.len(),
-        "overlay entity_mods must be unchanged after failed reconcile"
-    );
-    assert_eq!(
-        overlay.entity_removes.len(),
-        overlay_before.entity_removes.len(),
-        "overlay entity_removes must be unchanged after failed reconcile"
-    );
+    assert_eq!(first.delta, first_delta, "prior transaction is immutable");
+    assert_eq!(reconciler.lkg().len(), lkg_len, "LKG must be restored");
 }
 
 /// Prove that the real runtime path — reconcile_file_change followed by
-/// project_overlay_to_files — works correctly when an entity already exists
+/// project_transaction_to_files — works correctly when an entity already exists
 /// in the graph (the "modified" branch).
 ///
 /// This exercises the P1 entity-ID remap: when reconcile_file_change sees
 /// an existing entity, it remaps the parser-assigned UUID to old.id in both
-/// overlay.entity_mods AND the layout regions.  project_entity_mutations must
+/// the exact modification AND the layout regions. project_entity_mutations must
 /// be able to find old.id in the layout to apply the splice.
 ///
 /// Without the fix, the layout has the parser's new UUID, not old.id, so the
@@ -678,44 +716,51 @@ fn reconcile_then_project_uses_stable_ids() {
 
     let mut reconciler = Reconciler::new(dir.path().to_path_buf());
 
-    // --- Reconcile 1: graph is empty, entity is treated as new (entity_adds) ---
-    let mut overlay1 = GraphOverlay::default();
+    // --- Reconcile 1: graph is empty, entity is treated as a new addition ---
     let event = FileEvent::Changed(file_path.clone());
-    reconciler
-        .reconcile_file_change(&event, &blob_store, &graph, &mut overlay1)
+    let reconcile1 = reconciler
+        .reconcile_file_change(&event, &blob_store, &graph)
         .expect("first reconcile should succeed");
 
     // One entity (fn foo) should have been added.
-    assert_eq!(overlay1.entity_adds.len(), 1, "expected 1 new entity");
-    let stable_id = *overlay1.entity_adds.keys().next().unwrap();
+    let added1 = added_entities(&reconcile1.delta);
+    assert_eq!(added1.len(), 1, "expected 1 new entity");
+    let stable_id = added1[0].id;
 
     // Commit the entity to the graph so it is "existing" for the next reconcile.
-    for entity in overlay1.entity_adds.values() {
+    for entity in added1 {
         graph.upsert_entity(entity).expect("upsert must succeed");
     }
 
     // --- Reconcile 2: graph has the entity; same file, so fingerprint unchanged ---
     // The reconciler sees it as an existing entity and remaps the new parser UUID
-    // back to stable_id in both overlay.entity_mods AND the layout regions.
-    let mut overlay2 = GraphOverlay::default();
-    reconciler
-        .reconcile_file_change(&event, &blob_store, &graph, &mut overlay2)
+    // back to stable_id in both the transaction and the layout regions.
+    let reconcile2 = reconciler
+        .reconcile_file_change(&event, &blob_store, &graph)
         .expect("second reconcile should succeed");
 
-    // No semantic change was detected, so entity_mods is empty — but the
+    // No entity change was detected, but the
     // projection state must now have stable_id in its layout regions.
-    // Manually inject a modification under stable_id to verify the layout matches.
-    let mut entity_mod = graph
+    assert!(reconcile2.delta.entity_deltas.is_empty());
+    // Build a modification under stable_id to verify the layout matches.
+    let old = graph
         .get_entity(&stable_id)
         .expect("graph lookup")
         .expect("entity must exist");
-    // Change the fingerprint to mark it as "agent-modified" in the overlay.
+    let mut entity_mod = old.clone();
+    // Change the fingerprint to mark it as agent-modified.
     entity_mod.fingerprint.ast_hash = Hash256::from_bytes([0xde; 32]);
-    overlay2.entity_mods.insert(stable_id, entity_mod);
+    let transaction = TransactionDelta {
+        entity_deltas: vec![EntityDelta::Modified {
+            old,
+            new: entity_mod,
+        }],
+        ..TransactionDelta::default()
+    };
 
     // --- Project: layout must contain stable_id so the splice is applied ---
     let (modified, _warnings) = reconciler
-        .project_overlay_to_files(&overlay2)
+        .project_transaction_to_files(&transaction, &HashMap::new())
         .expect("projection must succeed");
 
     assert_eq!(

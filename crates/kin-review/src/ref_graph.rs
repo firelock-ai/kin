@@ -408,7 +408,10 @@ impl<G: GraphStore> ImpactGraph for GraphAtRef<'_, G> {
 mod tests {
     use super::*;
     use kin_db::InMemoryGraph;
-    use kin_model::change::{EntityDelta, RelationDelta, SemanticChange};
+    use kin_model::change::{
+        EntityDelta, LocatedEntry, RelationDelta, SemanticChange, TransactionDelta, TreeDelta,
+        TreeEntry,
+    };
     use kin_model::entity::{
         Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint,
         Visibility,
@@ -417,6 +420,30 @@ mod tests {
     use kin_model::ids::*;
     use kin_model::relation::{GraphNodeId, RelationOrigin};
     use kin_model::timestamp::Timestamp;
+    use kin_model::ArtifactId;
+
+    fn admit_test_artifact(graph: &InMemoryGraph, path: &str) -> ArtifactId {
+        let path = RepoPath::from_utf8(path).expect("valid test repository path");
+        if let Some(artifact_id) = graph.artifact_id_at_path(&path) {
+            return artifact_id;
+        }
+        let artifact_id = ArtifactId::new();
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: LocatedEntry::new(
+                        path,
+                        TreeEntry::blob(Hash256::from_bytes([0x4d; 32]), false),
+                    ),
+                }],
+                admission_policy_delta: None,
+            })
+            .expect("test artifact admission");
+        artifact_id
+    }
 
     fn test_entity(name: &str) -> Entity {
         Entity {
@@ -459,6 +486,21 @@ mod tests {
         }
     }
 
+    fn graph_artifact_identities(
+        graph: &InMemoryGraph,
+        files: &[kin_index::FileParseData],
+    ) -> kin_index::linker::ArtifactIdentityMap {
+        files
+            .iter()
+            .map(|file| {
+                (
+                    file.file_path.clone(),
+                    admit_test_artifact(graph, &file.file_path),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn ref_scoped_parse_coverage_requires_positive_full_file_markers() {
         let live = InMemoryGraph::new();
@@ -471,16 +513,19 @@ mod tests {
             relations: Vec::new(),
             imports: Vec::new(),
         }];
+        let artifact_ids = graph_artifact_identities(&live, &files);
 
         let materialize = |parse_completeness| {
             let completeness = kin_index::FileParseCompletenessMap::from([(
                 "src/lib.py".to_string(),
                 parse_completeness,
             )]);
-            let relations = kin_index::link_cross_file_with_completeness(&files, &completeness)
-                .into_iter()
-                .map(|relation| (relation.id, relation))
-                .collect();
+            let relations =
+                kin_index::link_cross_file_with_completeness(&files, &artifact_ids, &completeness)
+                    .expect("graph-owned artifact identities must satisfy coverage linking")
+                    .into_iter()
+                    .map(|relation| (relation.id, relation))
+                    .collect();
             GraphAtRef::from_state(
                 &live,
                 at,
@@ -517,7 +562,8 @@ mod tests {
             kin_model::ParseCompleteness::Full,
         )]);
         let mut dual_relations =
-            kin_index::link_cross_file_with_completeness(&files, &full_completeness)
+            kin_index::link_cross_file_with_completeness(&files, &artifact_ids, &full_completeness)
+                .expect("graph-owned artifact identities must satisfy coverage linking")
                 .into_iter()
                 .map(|relation| (relation.id, relation))
                 .collect::<HashMap<_, _>>();
@@ -585,11 +631,16 @@ mod tests {
                 kin_model::ParseCompleteness::Partial("omitted keyword call".to_string()),
             ),
         ]);
-        let mut relations =
-            kin_index::link_cross_file_with_completeness(&coverage_files, &completeness)
-                .into_iter()
-                .map(|relation| (relation.id, relation))
-                .collect::<HashMap<_, _>>();
+        let coverage_artifact_ids = graph_artifact_identities(&live, &coverage_files);
+        let mut relations = kin_index::link_cross_file_with_completeness(
+            &coverage_files,
+            &coverage_artifact_ids,
+            &completeness,
+        )
+        .expect("graph-owned artifact identities must satisfy coverage linking")
+        .into_iter()
+        .map(|relation| (relation.id, relation))
+        .collect::<HashMap<_, _>>();
         let mut positional_call = test_relation(0x7b, caller.id, target.id, RelationKind::Calls);
         positional_call.evidence = vec![kin_model::RelationEvidence {
             parser_rule: Some(kin_index::CALL_SHAPE_EVIDENCE_AGGREGATION_V1.to_string()),
@@ -638,32 +689,35 @@ mod tests {
     }
 
     fn change(
-        id: SemanticChangeId,
+        fixture_id: SemanticChangeId,
         parents: Vec<SemanticChangeId>,
         entity_deltas: Vec<EntityDelta>,
         relation_deltas: Vec<RelationDelta>,
     ) -> SemanticChange {
-        SemanticChange {
-            id,
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
             parents,
             timestamp: Timestamp::now(),
             author: AuthorId::new("test"),
-            message: "test change".into(),
+            message: format!("test change {fixture_id}"),
             entity_deltas,
             relation_deltas,
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
-        }
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        };
+        change.id = kin_model::compute_semantic_change_id(&change).unwrap();
+        change
     }
 
     /// Committed DAG: change 1 adds target/caller/test wired by committed
     /// relations; change 2 removes the caller->target relation; change 3
     /// removes the target entity itself (pruning its remaining edges).
-    fn committed_graph() -> (InMemoryGraph, Entity, Entity, Entity) {
+    fn committed_graph() -> (InMemoryGraph, Entity, Entity, Entity, [SemanticChangeId; 3]) {
         let graph = InMemoryGraph::new();
         let target = test_entity("target");
         let caller = test_entity("caller");
@@ -672,44 +726,48 @@ mod tests {
         let calls = test_relation(1, caller.id, target.id, RelationKind::Calls);
         let tests = test_relation(2, test.id, target.id, RelationKind::Tests);
 
-        graph
-            .create_change(&change(
-                change_id(1),
-                vec![],
-                vec![
-                    EntityDelta::Added(target.clone()),
-                    EntityDelta::Added(caller.clone()),
-                    EntityDelta::Added(test.clone()),
-                ],
-                vec![
-                    RelationDelta::Added(calls.clone()),
-                    RelationDelta::Added(tests),
-                ],
-            ))
-            .unwrap();
-        graph
-            .create_change(&change(
-                change_id(2),
-                vec![change_id(1)],
-                vec![],
-                vec![RelationDelta::Removed(calls.id)],
-            ))
-            .unwrap();
-        graph
-            .create_change(&change(
-                change_id(3),
-                vec![change_id(2)],
-                vec![EntityDelta::Removed(target.id)],
-                vec![],
-            ))
-            .unwrap();
+        let first = change(
+            change_id(1),
+            vec![],
+            vec![
+                EntityDelta::Added {
+                    new: target.clone(),
+                },
+                EntityDelta::Added {
+                    new: caller.clone(),
+                },
+                EntityDelta::Added { new: test.clone() },
+            ],
+            vec![
+                RelationDelta::Added { new: calls.clone() },
+                RelationDelta::Added { new: tests.clone() },
+            ],
+        );
+        let second = change(
+            change_id(2),
+            vec![first.id],
+            vec![],
+            vec![RelationDelta::Removed { old: calls.clone() }],
+        );
+        let third = change(
+            change_id(3),
+            vec![second.id],
+            vec![EntityDelta::Removed {
+                old: target.clone(),
+            }],
+            vec![RelationDelta::Removed { old: tests }],
+        );
+        graph.create_change(&first).unwrap();
+        graph.create_change(&second).unwrap();
+        graph.create_change(&third).unwrap();
+        let ids = [first.id, second.id, third.id];
 
-        (graph, target, caller, test)
+        (graph, target, caller, test, ids)
     }
 
     #[test]
     fn adjacency_is_replayed_from_committed_changes() {
-        let (graph, target, caller, test) = committed_graph();
+        let (graph, target, caller, test, ids) = committed_graph();
 
         // The live adjacency has none of the committed relations: the store
         // records change rows without applying relation deltas.
@@ -719,7 +777,7 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        let at_one = GraphAtRef::materialize(&graph, &change_id(1)).unwrap();
+        let at_one = GraphAtRef::materialize(&graph, &ids[0]).unwrap();
 
         let outgoing = at_one.get_relations(&caller.id, &[]).unwrap();
         assert_eq!(outgoing.len(), 1);
@@ -756,9 +814,9 @@ mod tests {
 
     #[test]
     fn adjacency_respects_relation_removal_at_later_ref() {
-        let (graph, target, caller, _test) = committed_graph();
+        let (graph, target, caller, _test, ids) = committed_graph();
 
-        let at_two = GraphAtRef::materialize(&graph, &change_id(2)).unwrap();
+        let at_two = GraphAtRef::materialize(&graph, &ids[1]).unwrap();
 
         let downstream = at_two.get_downstream_impact(&target.id, 2).unwrap();
         let names: Vec<&str> = downstream.iter().map(|e| e.name.as_str()).collect();
@@ -774,7 +832,7 @@ mod tests {
 
     #[test]
     fn live_only_relations_are_invisible_at_ref() {
-        let (graph, target, _caller, _test) = committed_graph();
+        let (graph, target, _caller, _test, ids) = committed_graph();
 
         // A relation upserted into the live adjacency but never committed to
         // the change DAG must not leak into ref-scoped reads.
@@ -788,20 +846,20 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        let at_two = GraphAtRef::materialize(&graph, &change_id(2)).unwrap();
+        let at_two = GraphAtRef::materialize(&graph, &ids[1]).unwrap();
         let downstream = at_two.get_downstream_impact(&target.id, 2).unwrap();
         assert!(downstream.iter().all(|e| e.name != "ghost_consumer"));
     }
 
     #[test]
     fn removed_entity_serves_edges_severed_by_its_own_removal() {
-        let (graph, target, _caller, test) = committed_graph();
+        let (graph, target, _caller, test, ids) = committed_graph();
 
         // Change 3 removed `target`; the replay pruned its edges there. The
         // full-edge read serves exactly what that removal severed: the Tests
         // edge. The Calls edge was removed by change 2 — that consumer had
         // already let go before the removal, and must not resurrect.
-        let at_three = GraphAtRef::materialize(&graph, &change_id(3)).unwrap();
+        let at_three = GraphAtRef::materialize(&graph, &ids[2]).unwrap();
         assert!(at_three.get_entity(&target.id).unwrap().is_none());
 
         let severed = at_three.get_all_relations_for_entity(&target.id).unwrap();
@@ -820,14 +878,13 @@ mod tests {
     fn missing_ancestry_fails_loud() {
         let graph = InMemoryGraph::new();
         let ghost_parent = change_id(7);
-        graph
-            .create_change(&change(change_id(8), vec![ghost_parent], vec![], vec![]))
-            .unwrap();
+        let head = change(change_id(8), vec![ghost_parent], vec![], vec![]);
+        graph.create_change(&head).unwrap();
 
-        let err = GraphAtRef::materialize(&graph, &change_id(8)).unwrap_err();
+        let err = GraphAtRef::materialize(&graph, &head.id).unwrap_err();
         match err {
             ReviewError::RefStateUnavailable { at, missing } => {
-                assert_eq!(at, change_id(8));
+                assert_eq!(at, head.id);
                 assert_eq!(missing, ghost_parent);
             }
             other => panic!("expected RefStateUnavailable, got {other:?}"),
@@ -842,9 +899,9 @@ mod tests {
 
     #[test]
     fn downstream_impact_order_is_deterministic() {
-        let (graph, target, _caller, _test) = committed_graph();
+        let (graph, target, _caller, _test, ids) = committed_graph();
 
-        let baseline: Vec<EntityId> = GraphAtRef::materialize(&graph, &change_id(1))
+        let baseline: Vec<EntityId> = GraphAtRef::materialize(&graph, &ids[0])
             .unwrap()
             .get_downstream_impact(&target.id, 2)
             .unwrap()
@@ -852,7 +909,7 @@ mod tests {
             .map(|e| e.id)
             .collect();
         for _ in 0..5 {
-            let pass: Vec<EntityId> = GraphAtRef::materialize(&graph, &change_id(1))
+            let pass: Vec<EntityId> = GraphAtRef::materialize(&graph, &ids[0])
                 .unwrap()
                 .get_downstream_impact(&target.id, 2)
                 .unwrap()

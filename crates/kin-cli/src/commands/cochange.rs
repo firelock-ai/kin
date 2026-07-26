@@ -50,9 +50,9 @@ fn replace_relations(graph: &kin_db::InMemoryGraph, relations: Vec<Relation>) ->
 mod tests {
     use super::*;
     use kin_model::{
-        ArtifactDelta, ArtifactDeltaKind, Entity, EntityId, EntityKind, EntityMetadata, EntityRole,
-        FilePathId, FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, RelationId,
-        RelationOrigin, SemanticChange, SemanticFingerprint, SourceSpan, Visibility,
+        Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm,
+        GraphNodeId, Hash256, LanguageId, RelationId, RelationOrigin, SemanticChange,
+        SemanticFingerprint, SourceSpan, TreeDelta, TreeEntry, Visibility,
     };
     use std::process::Command;
 
@@ -100,13 +100,17 @@ mod tests {
             message: format!("change-{id_byte}"),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: files
+            tree_deltas: files
                 .iter()
-                .map(|file| ArtifactDelta {
-                    file_id: FilePathId::new(*file),
-                    kind: ArtifactDeltaKind::Modified,
-                    old_hash: None,
-                    new_hash: None,
+                .enumerate()
+                .map(|(i, file)| {
+                    let old = 0x10 + (i as u8) * 2;
+                    let new = old + 1;
+                    TreeDelta::Modified {
+                        file_id: FilePathId::new(*file),
+                        old_entry: TreeEntry::regular(Hash256::from_bytes([old; 32]), false),
+                        new_entry: TreeEntry::regular(Hash256::from_bytes([new; 32]), false),
+                    }
                 })
                 .collect(),
             projected_files: vec![],

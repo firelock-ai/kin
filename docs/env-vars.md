@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (413 total, 309 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (412 total, 310 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -64,6 +64,8 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_STORAGE` | string | local | operational | daemon storage backend selector (e.g. local, gcs) |
 | `KIN_STRICT_BEHAVIOR_ENV` | bool | false | operational | escalate a CLI/daemon behavior-env divergence from a warning to a hard error |
 | `KIN_STRICT_BUILD_MATCH` | bool | false | correctness | require a strict historical build match when resolving a ref view |
+| `KIN_VFS_DISABLE` | bool | false | correctness | kin-vfs interception kill switch: the literal 1 disables every projected read and write, default off |
+| `KIN_VFS_STRICT` | bool | false | correctness | require graph-authoritative projection misses to fail loud when the daemon is unreachable instead of passing through to raw files |
 | `KIN_WORKSPACE_DIR` | path | *(unset)* | operational | docker-entrypoint workspace override for both storage modes; unset uses /tmp/kin-workspace (backed by an emptyDir in k8s); set to /workspace to opt into a legacy mounted volume |
 | `KIN_WORKSPACE_ROOT` | path | *(unset)* | operational | workspace root override for orchestration commands |
 | `KIN_WRITE_VETO` | enum | warn | correctness | write-veto mode: 'warn' (default) annotates would-be vetoes into foreign-held scopes, 'enforce' rejects them with a 409, 'off' disables |
@@ -72,7 +74,6 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
-| `KIN_DAEMON_ALLOW_EXEC` | bool | false | operational | permit the daemon to run exec commands |
 | `KIN_DAEMON_AUTH_TOKEN` | secret | *(unset)* | secret | bearer token for authenticated daemon requests |
 | `KIN_DAEMON_BIN` | path | *(unset)* | operational | override path to the kin-daemon binary |
 | `KIN_DAEMON_BIND_HOST` | string | *(unset)* | operational | host/interface the daemon binds its HTTP endpoint to |
@@ -156,9 +157,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
-| `KIN_INIT_CACHE_DIR` | path | *(unset)* | operational | directory used for the init warm cache |
 | `KIN_INIT_MAX_FILES` | usize | *(unset)* | operational | cap on files ingested during init |
-| `KIN_INIT_WARM_CACHE` | bool | true | correctness | reuse a warm init cache; a cross-store warm cache can depress F1, so an override is loud |
 
 ## Storage
 

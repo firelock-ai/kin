@@ -237,12 +237,12 @@ fn parse_change_id(s: &str) -> Result<SemanticChangeId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kin_model::{ArtifactDelta, ArtifactDeltaKind, AuthorId, SemanticChange, Timestamp};
+    use kin_model::{AuthorId, SemanticChange, Timestamp, TreeDelta, TreeEntry};
 
     fn source_change(
         id_byte: u8,
         parent: SemanticChangeId,
-        artifact_deltas: Vec<ArtifactDelta>,
+        tree_deltas: Vec<TreeDelta>,
     ) -> SemanticChange {
         SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
@@ -252,7 +252,7 @@ mod tests {
             message: format!("branch switch fixture {id_byte}"),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas,
+            tree_deltas,
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -276,11 +276,9 @@ mod tests {
         let main_change = source_change(
             0x61,
             genesis.id,
-            vec![ArtifactDelta {
+            vec![TreeDelta::Added {
                 file_id: kin_model::FilePathId::new("src/shared.rs"),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(shared_hash),
+                new_entry: TreeEntry::regular(shared_hash, false),
             }],
         );
         graph.create_change(&main_change).unwrap();
@@ -290,11 +288,9 @@ mod tests {
         let feature_change = source_change(
             0x62,
             main_change.id,
-            vec![ArtifactDelta {
+            vec![TreeDelta::Added {
                 file_id: kin_model::FilePathId::new("src/feature_only.rs"),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(stale_hash),
+                new_entry: TreeEntry::regular(stale_hash, false),
             }],
         );
         graph.create_change(&feature_change).unwrap();
@@ -364,11 +360,9 @@ mod tests {
         let main_change = source_change(
             0x63,
             genesis.id,
-            vec![ArtifactDelta {
+            vec![TreeDelta::Added {
                 file_id: kin_model::FilePathId::new("src/shared.rs"),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(main_hash),
+                new_entry: TreeEntry::regular(main_hash, false),
             }],
         );
         graph.create_change(&main_change).unwrap();
@@ -381,17 +375,14 @@ mod tests {
             0x64,
             main_change.id,
             vec![
-                ArtifactDelta {
+                TreeDelta::Modified {
                     file_id: kin_model::FilePathId::new("src/shared.rs"),
-                    kind: ArtifactDeltaKind::ModifiedRegularFile,
-                    old_hash: Some(main_hash),
-                    new_hash: Some(feature_hash),
+                    old_entry: TreeEntry::regular(main_hash, false),
+                    new_entry: TreeEntry::regular(feature_hash, false),
                 },
-                ArtifactDelta {
+                TreeDelta::Added {
                     file_id: kin_model::FilePathId::new("src/feature_only.rs"),
-                    kind: ArtifactDeltaKind::AddedRegularFile,
-                    old_hash: None,
-                    new_hash: Some(stale_hash),
+                    new_entry: TreeEntry::regular(stale_hash, false),
                 },
             ],
         );
@@ -448,11 +439,9 @@ mod tests {
         let main_change = source_change(
             0x65,
             genesis.id,
-            vec![ArtifactDelta {
+            vec![TreeDelta::Added {
                 file_id: kin_model::FilePathId::new("src/shared.rs"),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(main_hash),
+                new_entry: TreeEntry::regular(main_hash, false),
             }],
         );
         graph.create_change(&main_change).unwrap();
@@ -465,17 +454,14 @@ mod tests {
             0x66,
             main_change.id,
             vec![
-                ArtifactDelta {
+                TreeDelta::Modified {
                     file_id: kin_model::FilePathId::new("src/shared.rs"),
-                    kind: ArtifactDeltaKind::ModifiedRegularFile,
-                    old_hash: Some(main_hash),
-                    new_hash: Some(feature_shared_hash),
+                    old_entry: TreeEntry::regular(main_hash, false),
+                    new_entry: TreeEntry::regular(feature_shared_hash, false),
                 },
-                ArtifactDelta {
+                TreeDelta::Added {
                     file_id: kin_model::FilePathId::new("src/remove_on_main.rs"),
-                    kind: ArtifactDeltaKind::AddedRegularFile,
-                    old_hash: None,
-                    new_hash: Some(removed_hash),
+                    new_entry: TreeEntry::regular(removed_hash, false),
                 },
             ],
         );
@@ -535,11 +521,9 @@ mod tests {
         let main = source_change(
             0x67,
             genesis.id,
-            vec![ArtifactDelta {
+            vec![TreeDelta::Added {
                 file_id: kin_model::FilePathId::new("src/shared.rs"),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(main_hash),
+                new_entry: TreeEntry::regular(main_hash, false),
             }],
         );
         graph.create_change(&main).unwrap();
@@ -547,11 +531,10 @@ mod tests {
         let feature = source_change(
             0x68,
             main.id,
-            vec![ArtifactDelta {
+            vec![TreeDelta::Modified {
                 file_id: kin_model::FilePathId::new("src/shared.rs"),
-                kind: ArtifactDeltaKind::ModifiedRegularFile,
-                old_hash: Some(main_hash),
-                new_hash: Some(feature_hash),
+                old_entry: TreeEntry::regular(main_hash, false),
+                new_entry: TreeEntry::regular(feature_hash, false),
             }],
         );
         graph.create_change(&feature).unwrap();
@@ -604,11 +587,9 @@ mod tests {
         let main = source_change(
             0x69,
             genesis.id,
-            vec![ArtifactDelta {
+            vec![TreeDelta::Added {
                 file_id: kin_model::FilePathId::new("src/shared.rs"),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(main_hash),
+                new_entry: TreeEntry::regular(main_hash, false),
             }],
         );
         graph.create_change(&main).unwrap();
@@ -616,11 +597,10 @@ mod tests {
         let feature = source_change(
             0x6a,
             main.id,
-            vec![ArtifactDelta {
+            vec![TreeDelta::Modified {
                 file_id: kin_model::FilePathId::new("src/shared.rs"),
-                kind: ArtifactDeltaKind::ModifiedRegularFile,
-                old_hash: Some(main_hash),
-                new_hash: Some(feature_hash),
+                old_entry: TreeEntry::regular(main_hash, false),
+                new_entry: TreeEntry::regular(feature_hash, false),
             }],
         );
         graph.create_change(&feature).unwrap();
@@ -628,11 +608,10 @@ mod tests {
         let advanced = source_change(
             0x6b,
             feature.id,
-            vec![ArtifactDelta {
+            vec![TreeDelta::Modified {
                 file_id: kin_model::FilePathId::new("src/shared.rs"),
-                kind: ArtifactDeltaKind::ModifiedRegularFile,
-                old_hash: Some(feature_hash),
-                new_hash: Some(advanced_hash),
+                old_entry: TreeEntry::regular(feature_hash, false),
+                new_entry: TreeEntry::regular(advanced_hash, false),
             }],
         );
         graph.create_change(&advanced).unwrap();
@@ -700,11 +679,9 @@ mod tests {
         let main = source_change(
             0x6c,
             genesis.id,
-            vec![ArtifactDelta {
+            vec![TreeDelta::Added {
                 file_id: kin_model::FilePathId::new("src/shared.rs"),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(main_hash),
+                new_entry: TreeEntry::regular(main_hash, false),
             }],
         );
         graph.create_change(&main).unwrap();
@@ -712,11 +689,10 @@ mod tests {
         let feature = source_change(
             0x6d,
             main.id,
-            vec![ArtifactDelta {
+            vec![TreeDelta::Modified {
                 file_id: kin_model::FilePathId::new("src/shared.rs"),
-                kind: ArtifactDeltaKind::ModifiedRegularFile,
-                old_hash: Some(main_hash),
-                new_hash: Some(feature_hash),
+                old_entry: TreeEntry::regular(main_hash, false),
+                new_entry: TreeEntry::regular(feature_hash, false),
             }],
         );
         graph.create_change(&feature).unwrap();

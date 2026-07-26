@@ -14,6 +14,9 @@ pub enum ReconcileError {
     #[error("Graph error: {0}")]
     Graph(String),
 
+    #[error("Invalid exact transaction delta: {0}")]
+    InvalidTransaction(String),
+
     #[error("Projection error: {0}")]
     Projection(String),
 

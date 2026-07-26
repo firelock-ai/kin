@@ -883,6 +883,7 @@ pub async fn handle_transaction_commit<G: GraphStore>(
     let delta = kin_model::change::TransactionDelta {
         entity_deltas,
         relation_deltas,
+        tree_deltas: Vec::new(),
     };
 
     if let Err(err) = store.apply_transaction_delta(&delta) {

@@ -25,10 +25,10 @@ pub fn semantic_deltas_from_change(change: &SemanticChange) -> Vec<SemanticDelta
         .entity_deltas
         .iter()
         .map(|delta| match delta {
-            EntityDelta::Added(entity) => SemanticDelta {
+            EntityDelta::Added { new: entity } => SemanticDelta {
                 entity_id: entity.id.to_string(),
                 before_hash: None,
-                after_hash: format!("{:?}", entity.fingerprint.ast_hash),
+                after_hash: Some(entity.fingerprint.ast_hash.to_string()),
                 change_set: vec![
                     FieldDiff {
                         field: "name".to_string(),
@@ -89,20 +89,20 @@ pub fn semantic_deltas_from_change(change: &SemanticChange) -> Vec<SemanticDelta
 
                 SemanticDelta {
                     entity_id: new.id.to_string(),
-                    before_hash: Some(format!("{:?}", old.fingerprint.ast_hash)),
-                    after_hash: format!("{:?}", new.fingerprint.ast_hash),
+                    before_hash: Some(old.fingerprint.ast_hash.to_string()),
+                    after_hash: Some(new.fingerprint.ast_hash.to_string()),
                     change_set,
                     timestamp,
                     actor_id: actor_id.clone(),
                 }
             }
-            EntityDelta::Removed(entity_id) => SemanticDelta {
-                entity_id: entity_id.to_string(),
-                before_hash: None,
-                after_hash: String::new(),
+            EntityDelta::Removed { old } => SemanticDelta {
+                entity_id: old.id.to_string(),
+                before_hash: Some(old.fingerprint.ast_hash.to_string()),
+                after_hash: None,
                 change_set: vec![FieldDiff {
                     field: "_removed".to_string(),
-                    old_value: None,
+                    old_value: Some("false".to_string()),
                     new_value: Some("true".to_string()),
                 }],
                 timestamp,
@@ -175,33 +175,39 @@ mod tests {
     }
 
     fn test_change(deltas: Vec<EntityDelta>) -> SemanticChange {
-        SemanticChange {
+        let mut change = SemanticChange {
             id: SemanticChangeId(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
             parents: vec![],
             timestamp: Timestamp::now(),
             author: AuthorId("test-author".to_string()),
             message: "test change".to_string(),
             entity_deltas: deltas,
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
+            admission_policy_delta: None,
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
-        }
+        };
+        change.id =
+            compute_semantic_change_id(&change).expect("test change must be identity-exact");
+        change
     }
 
     #[test]
     fn added_entity_produces_delta() {
         let entity = test_entity("fn_new");
-        let change = test_change(vec![EntityDelta::Added(entity.clone())]);
+        let change = test_change(vec![EntityDelta::Added {
+            new: entity.clone(),
+        }]);
 
         let deltas = semantic_deltas_from_change(&change);
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].entity_id, entity.id.to_string());
         assert!(deltas[0].before_hash.is_none());
-        assert!(!deltas[0].after_hash.is_empty());
+        assert!(deltas[0].after_hash.is_some());
 
         let name_diff = deltas[0]
             .change_set
@@ -235,12 +241,19 @@ mod tests {
 
     #[test]
     fn removed_entity_produces_delta() {
-        let entity_id = EntityId::new();
-        let change = test_change(vec![EntityDelta::Removed(entity_id)]);
+        let entity = test_entity("fn_removed");
+        let entity_id = entity.id;
+        let expected_before = entity.fingerprint.ast_hash.to_string();
+        let change = test_change(vec![EntityDelta::Removed { old: entity }]);
 
         let deltas = semantic_deltas_from_change(&change);
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].entity_id, entity_id.to_string());
+        assert_eq!(
+            deltas[0].before_hash.as_deref(),
+            Some(expected_before.as_str())
+        );
+        assert!(deltas[0].after_hash.is_none());
         assert!(deltas[0].change_set.iter().any(|d| d.field == "_removed"));
     }
 
@@ -249,8 +262,8 @@ mod tests {
         let e1 = test_entity("fn_a");
         let e2 = test_entity("fn_b");
 
-        let change1 = test_change(vec![EntityDelta::Added(e1)]);
-        let change2 = test_change(vec![EntityDelta::Added(e2)]);
+        let change1 = test_change(vec![EntityDelta::Added { new: e1 }]);
+        let change2 = test_change(vec![EntityDelta::Added { new: e2 }]);
 
         let mutations = mutations_from_changes(&[change1, change2]);
         assert_eq!(mutations.len(), 2);
@@ -261,7 +274,7 @@ mod tests {
     #[test]
     fn mutation_from_delta_preserves_hashes() {
         let entity = test_entity("fn_test");
-        let change = test_change(vec![EntityDelta::Added(entity)]);
+        let change = test_change(vec![EntityDelta::Added { new: entity }]);
         let deltas = semantic_deltas_from_change(&change);
         let mutation = mutation_from_delta(&deltas[0]);
 

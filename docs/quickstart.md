@@ -142,14 +142,14 @@ kin init
 kin init path/to/project
 ```
 
-In a detected Git repository, `kin init` bootstraps the current tree as semantic truth and
-imports recent Git history by default. Git stays in place; Kin adds the semantic graph and
-agent/runtime surfaces beside it.
+In a detected Git repository, `kin init` imports the exact current tree into
+graph-owned truth by default. Git stays in place as an explicit interoperability
+boundary; Kin runtime queries do not fall back to it.
 
 *Flags:*
-- `--git-history <off|recent|full>`: how much Git history to import into the graph on init
-  (default: `recent`, a deterministic HEAD-connected window of at most 50 commits;
-  `full` imports complete reachable ancestry).
+- `--git-history <off|snapshot|full>`: the Git import boundary
+  (default: `snapshot`, one exact HEAD tree with no ancestry claim; `full`
+  imports complete reachable ancestry and exact parent edges).
 - `--force`: initialize even if a `.git/` directory is already present.
 - `--no-lsp`: skip LSP enrichment (faster, tree-sitter-only init).
 
@@ -216,7 +216,7 @@ venv-like execution contract, so you never need to know which files are
 materialized before running the repo:
 
 ```sh
-kin exec -- npm test          # one-shot command (alias: kin run)
+kin exec -- npm test          # one-shot command
 kin shell                     # interactive shell in a session workspace
 kin with --session claude -- "fix the failing test"   # agent inside a session
 ```
@@ -456,31 +456,30 @@ normal use. The escape hatches:
 
 ## 10. Removing Kin
 
-Kin is ejectable — there is no data lock-in. There are two modes, and they
-do different things:
+Kin is ejectable — there is no data lock-in. Eject remains graph-first all the
+way through the exit:
 
 ```sh
-kin eject                 # safe default
+kin eject
 ```
 
-Stops the Kin daemon and removes the `.kin/` directory (the graph and all Kin
-metadata). **Your working files are left exactly as they are** — whatever is on
-disk right now stays on disk. This is the everyday "walk away with my files"
-path.
+Kin resolves the current branch from graph history, verifies every referenced
+blob and every projected file byte, kind, and executable mode, then stops the
+daemon and checks the persisted graph again. If anything is missing, locally
+edited, or raced during shutdown, eject refuses before moving metadata.
+
+On success, working files are not rewritten. `.kin/` is atomically moved to a
+recoverable sibling archive outside the repository, so the directory is no
+longer a Kin repository and a Git checkout does not gain untracked Kin
+metadata. The command prints the exact archive path and recovery instruction.
+
+For an intentional, irreversible removal:
 
 ```sh
-kin eject --revert-files  # destructive: restore the pre-init snapshot
+kin eject --yes --purge-metadata
 ```
 
-Additionally overwrites every working file with the copy Kin snapshotted at
-`kin init`, discarding changes made since. It asks you to type `revert` to
-confirm (use `--yes` to skip the prompt in scripts), and it writes a timestamped
-backup of your current files to `.kin-backup-eject-<timestamp>/` first, so
-nothing is lost. If the snapshot is missing or incomplete, eject refuses and
-touches nothing rather than half-restoring.
-
-**What eject never touches: `.git`.** Kin snapshots your *working tree* at init
-(excluding `.git`, `.kin*`, and ignored paths) and restores those files only. It
-never reads, rewrites, or restores Git history — your commit history is owned by
-Git the entire time. After eject, the directory is a plain Git repository with
-its history intact; `git log`, `git status`, and `git fsck` all work unchanged.
+This performs the same graph/projection checks and atomic detach, then deletes
+the detached archive. Kin never restores an initialization-time filesystem
+snapshot and never rewrites `.git`; Git is only an explicit interoperability
+boundary.

@@ -1,549 +1,404 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::{bail, Result};
-use kin_core::KinLayout;
+//! Leave a Kin repository without restoring file-first state.
+//!
+//! The graph remains authoritative until the last moment. Ejection succeeds
+//! only when the checked-out branch resolves completely, every referenced blob
+//! verifies, and the working directory is an exact projection of that graph
+//! tree. The `.kin/` store is then atomically detached into a recoverable
+//! sibling archive. There is no initialization-time filesystem snapshot and no
+//! path that silently prefers old raw files over graph truth.
+
 use std::fs;
-use std::io::BufRead;
-use std::path::Path;
-use std::time::{Duration, Instant};
+use std::io::BufRead as _;
+use std::path::{Path, PathBuf};
 
-/// Remove Kin metadata (and optionally revert working files).
-///
-/// DEFAULT (safe): stops the daemon and removes .kin/ graph + metadata.
-/// Working files are left exactly as they are.
-///
-/// WITH --revert-files (DESTRUCTIVE): additionally overwrites every working
-/// file with the pre-init snapshot copy.  Requires typing "revert" to confirm
-/// (or --yes for non-interactive use).  A backup of current files is written
-/// to `.kin-backup-eject-<timestamp>/` in the project root before any mutation.
-///
-/// Scope guarantee — what eject does NOT touch:
-/// - `.git/` and Git history are never read, rewritten, or restored by Kin.
-///   Kin snapshots the *working tree* at init (excluding `.git`, `.kin*`, and
-///   ignored paths); eject restores those files only.  Commit history is and
-///   always was owned by Git, so after eject the repository is a plain Git repo
-///   with its history intact.
-/// - --revert-files refuses to run against a truncated/partial snapshot: it
-///   verifies the snapshot file count against the manifest first and bails
-///   before any mutation, so a corrupt snapshot never silently strands files.
-pub async fn run(revert_files: bool, yes: bool) -> Result<()> {
+use anyhow::{bail, Context as _, Result};
+use kin_model::{ChangeStore as _, ResolvedTree, SemanticChangeId};
+
+/// Verify the graph-derived working tree and detach Kin metadata.
+pub async fn run(yes: bool, purge_metadata: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let layout =
-        KinLayout::discover(&cwd).ok_or_else(|| anyhow::anyhow!("not a Kin repository"))?;
-    run_with_layout(&layout, revert_files, yes)
-}
+    let layout = kin_core::KinLayout::discover(&cwd)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository"))?;
+    ensure_real_metadata_directory(&layout)?;
 
-fn run_with_layout(layout: &KinLayout, revert_files: bool, yes: bool) -> Result<()> {
-    if !revert_files {
-        // Safe default: leave working files untouched.
-        stop_daemons(layout.root());
-        let kin_dir = layout.root().to_path_buf();
-        fs::remove_dir_all(&kin_dir)?;
-        println!("Kin removed. Working files are unchanged.");
-        println!(
-            "To restore Kin tracking run: kin init (in {})",
-            layout.working_dir().display()
-        );
+    // Capture daemon-owned truth first. This is the same authority boundary as
+    // other read-only product commands, not an opportunistic local file open.
+    let live = crate::backend::open_snapshot_explicit_admin_read_only(&layout, "kin eject")
+        .await
+        .context("open live graph truth before eject")?;
+    let branch_name = kin_core::read_current_branch(&layout)?;
+    let branch = live.graph().get_branch(&branch_name)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "current branch '{}' is missing from graph truth",
+            branch_name
+        )
+    })?;
+    let head = branch.head;
+    let tree = live
+        .graph()
+        .resolve_tree_at(&head)
+        .context("resolve exact current branch tree")?;
+    let blobs = kin_blobs::BlobStore::new(layout.objects_dir())
+        .context("open graph blob store before eject")?;
+    verify_graph_projection(&layout, &tree, &blobs)?;
+    drop(live);
+
+    if !yes && !confirm_eject(&branch_name.to_string(), &head, tree.len(), purge_metadata)? {
+        println!("Aborted.");
         return Ok(());
     }
 
-    // ── DESTRUCTIVE path: --revert-files ──────────────────────────────────────
+    // Gracefully stop the canonical worker so it flushes its final graph state.
+    // A live VFS projection must be stopped explicitly; trusting and killing an
+    // arbitrary PID from repository-controlled metadata would be unsafe.
+    refuse_live_vfs(&layout)?;
+    crate::commands::daemon::stop(false, false)
+        .await
+        .context("stop the repository daemon before eject")?;
 
-    let snapshot_dir = layout.root().join("snapshot");
-    if !snapshot_dir.exists() {
-        bail!("No snapshot found. Cannot revert files (run without --revert-files to just remove Kin).");
-    }
-
-    let manifest_path = snapshot_dir.join("manifest.json");
-    let manifest: serde_json::Value = if manifest_path.exists() {
-        serde_json::from_str(&fs::read_to_string(&manifest_path)?)?
-    } else {
-        bail!("Snapshot manifest missing. Cannot verify restore.");
-    };
-
-    let file_count = manifest["file_count"].as_u64().unwrap_or(0);
-
-    // Verify the snapshot is complete BEFORE touching any working file. A
-    // truncated or partially-deleted snapshot must fail loudly here — never
-    // half-restore and then delete .kin/, which would silently strand files at
-    // their post-init content with no path back to pre-init state.
-    let snapshot_file_count = count_snapshot_files(&snapshot_dir, &snapshot_dir)?;
-    if snapshot_file_count != file_count {
+    // Close the race between the initial read and daemon shutdown. Eject is an
+    // explicit administrative boundary, so a direct read-only persisted-state
+    // comparison is appropriate here after the daemon has exited.
+    let persisted = crate::backend::open_kindb_snapshot_read_only(&layout)
+        .context("reopen the daemon's persisted graph after shutdown")?;
+    let persisted_branch_name = kin_core::read_current_branch(&layout)?;
+    if persisted_branch_name != branch_name {
         bail!(
-            "Snapshot is incomplete: manifest records {file_count} file(s) but the snapshot \
-             directory contains {snapshot_file_count}. Refusing to revert from a partial \
-             snapshot — your working files have NOT been touched. Run without --revert-files \
-             to remove Kin while leaving every working file exactly as it is."
+            "current branch changed from '{}' to '{}' while eject was preparing; \
+             metadata and working files are unchanged",
+            branch_name,
+            persisted_branch_name
         );
     }
+    let persisted_branch = persisted
+        .graph()
+        .get_branch(&branch_name)?
+        .ok_or_else(|| anyhow::anyhow!("current branch '{}' was not persisted", branch_name))?;
+    if persisted_branch.head != head {
+        bail!(
+            "branch '{}' advanced from {} to {} while eject was preparing; \
+             metadata and working files are unchanged",
+            branch_name,
+            head,
+            persisted_branch.head
+        );
+    }
+    let persisted_tree = persisted
+        .graph()
+        .resolve_tree_at(&head)
+        .context("resolve persisted current branch tree")?;
+    if persisted_tree != tree {
+        bail!(
+            "persisted graph tree differs from the live graph tree captured before shutdown; \
+             metadata and working files are unchanged"
+        );
+    }
+    verify_graph_projection(&layout, &persisted_tree, &blobs)?;
+    drop(persisted);
+    drop(blobs);
 
-    // Require typed confirmation unless --yes.
-    if !yes {
-        eprintln!();
-        eprintln!("⚠  WARNING — DESTRUCTIVE OPERATION ⚠");
-        eprintln!("  --revert-files will:");
+    let archive = detach_metadata(&layout)?;
+    if purge_metadata {
+        fs::remove_dir_all(&archive).with_context(|| {
+            format!(
+                "Kin was detached, but the recoverable metadata archive could not be purged at {}",
+                archive.display()
+            )
+        })?;
+        sync_parent_directory(&archive)?;
+        println!(
+            "Kin ejected from branch '{}' at {}. Working files remain the exact graph projection; \
+             Kin metadata was permanently removed.",
+            branch_name, head
+        );
+    } else {
+        println!(
+            "Kin ejected from branch '{}' at {}. Working files remain the exact graph projection.",
+            branch_name, head
+        );
+        println!("Recoverable Kin metadata archive: {}", archive.display());
+        println!(
+            "To undo before re-initializing, rename that directory back to {}.",
+            layout.root().display()
+        );
+    }
+    Ok(())
+}
+
+fn ensure_real_metadata_directory(layout: &kin_core::KinLayout) -> Result<()> {
+    let metadata = fs::symlink_metadata(layout.root())
+        .with_context(|| format!("inspect {}", layout.root().display()))?;
+    if !metadata.file_type().is_dir() {
+        bail!(
+            "refusing to eject through non-directory Kin metadata at {}",
+            layout.root().display()
+        );
+    }
+    Ok(())
+}
+
+fn verify_graph_projection(
+    layout: &kin_core::KinLayout,
+    tree: &ResolvedTree,
+    blobs: &kin_blobs::BlobStore,
+) -> Result<()> {
+    kin_projection::verify_resolved_tree_materialization(layout.working_dir(), tree, blobs).map_err(
+        |error| {
+            anyhow::anyhow!(
+                "working files are not an exact projection of current graph truth: {error}. \
+                 Reconcile or commit the working tree and retry; Kin metadata was not removed"
+            )
+        },
+    )
+}
+
+fn confirm_eject(
+    branch: &str,
+    head: &SemanticChangeId,
+    artifact_count: usize,
+    purge_metadata: bool,
+) -> Result<bool> {
+    eprintln!();
+    eprintln!("Eject Kin repository");
+    eprintln!("  Branch: {branch}");
+    eprintln!("  Head: {head}");
+    eprintln!("  Graph-owned artifacts verified: {artifact_count}");
+    eprintln!("  Working files will not be rewritten.");
+    if purge_metadata {
         eprintln!(
-            "  • Overwrite {} working file(s) with the pre-init snapshot",
-            file_count
+            "  Kin graph, history, reviews, proofs, and metadata will be permanently deleted."
         );
-        eprintln!("  • Stop kin-daemon and kin-vfs-daemon");
-        eprintln!("  • Delete the .kin/ directory (graph + all Kin metadata)");
-        eprintln!();
-        eprintln!("  Any uncommitted changes to those files will be LOST unless backed up.");
-        eprintln!();
-        eprintln!("  A backup of the current files will be created before mutation.");
-        eprintln!();
-        eprint!("Type \"revert\" to continue, or press Enter to abort: ");
-
-        let stdin = std::io::stdin();
-        let mut line = String::new();
-        stdin.lock().read_line(&mut line)?;
-        if line.trim() != "revert" {
-            println!("Aborted.");
-            return Ok(());
-        }
+    } else {
+        eprintln!("  Kin metadata will move to a recoverable sibling archive.");
     }
+    eprintln!();
+    eprint!("Type \"eject\" to continue, or press Enter to abort: ");
 
-    // Mandatory backup of current files BEFORE any mutation.
-    let working_dir = layout.working_dir().to_path_buf();
-    let backup_dir = make_eject_backup(&snapshot_dir, &working_dir)?;
-    println!("Backup created: {}", backup_dir.display());
-    println!(
-        "  To restore manually: cp -r {}/* {}/",
-        backup_dir.display(),
-        working_dir.display()
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(line.trim() == "eject")
+}
+
+fn refuse_live_vfs(layout: &kin_core::KinLayout) -> Result<()> {
+    let pid_path = layout.root().join("vfs.pid");
+    let Ok(raw_pid) = fs::read_to_string(&pid_path) else {
+        return Ok(());
+    };
+    let pid = raw_pid.trim().parse::<u32>().with_context(|| {
+        format!(
+            "invalid VFS PID metadata at {}; stop Kin VFS manually before eject",
+            pid_path.display()
+        )
+    })?;
+    if crate::daemon_client::is_process_alive(pid) {
+        bail!(
+            "Kin VFS process {pid} is still active. Stop it before eject so no process retains \
+             the graph store or recreates projection metadata"
+        );
+    }
+    Ok(())
+}
+
+/// Atomically make this directory cease being a Kin repository while keeping
+/// the complete graph store recoverable outside the discovery path.
+fn detach_metadata(layout: &kin_core::KinLayout) -> Result<PathBuf> {
+    ensure_real_metadata_directory(layout)?;
+    let archive_parent = layout
+        .working_dir()
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("repository root has no parent directory"))?;
+    let name = format!(
+        ".kin-ejected-{}-{}",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S"),
+        uuid::Uuid::new_v4().simple()
     );
+    // Keep the recovery archive outside the ejected working directory. A plain
+    // Git checkout must not gain a large untracked metadata directory, and a
+    // native repository should likewise be left with only its projected files.
+    let archive = archive_parent.join(name);
+    fs::rename(layout.root(), &archive).with_context(|| {
+        format!(
+            "atomically detach {} to {}",
+            layout.root().display(),
+            archive.display()
+        )
+    })?;
+    if let Err(error) = sync_parent_directory(&archive) {
+        let rollback = fs::rename(&archive, layout.root());
+        return match rollback {
+            Ok(()) => Err(error.context("metadata detach was rolled back")),
+            Err(rollback_error) => Err(anyhow::anyhow!(
+                "{error}; rollback to {} also failed: {rollback_error}; recoverable metadata remains at {}",
+                layout.root().display(),
+                archive.display()
+            )),
+        };
+    }
+    Ok(archive)
+}
 
-    // Stop daemons (best effort).
-    stop_daemons(layout.root());
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
+    fs::File::open(parent)
+        .with_context(|| format!("open parent directory {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("sync parent directory {}", parent.display()))
+}
 
-    // Restore files from snapshot to the project root.
-    let mut restored: u64 = 0;
-    restore_files(&snapshot_dir, &snapshot_dir, &working_dir, &mut restored)?;
-
-    // Remove .kin/ entirely (backup is OUTSIDE .kin/, so it is safe).
-    let kin_dir = layout.root().to_path_buf();
-    fs::remove_dir_all(&kin_dir)?;
-
-    println!(
-        "Kin removed. {} file(s) restored to pre-init state.",
-        restored
-    );
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<()> {
     Ok(())
-}
-
-// ── Backup helpers ────────────────────────────────────────────────────────────
-
-/// Create a timestamped backup directory in `working_dir` containing the
-/// current version of every file that the snapshot restore would overwrite.
-/// The backup lives OUTSIDE `.kin/` so it survives `remove_dir_all(.kin/)`.
-fn make_eject_backup(snapshot_dir: &Path, working_dir: &Path) -> Result<std::path::PathBuf> {
-    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
-    let backup_dir = working_dir.join(format!(".kin-backup-eject-{}", ts));
-    fs::create_dir_all(&backup_dir)?;
-    backup_current_files(snapshot_dir, snapshot_dir, working_dir, &backup_dir)?;
-    Ok(backup_dir)
-}
-
-/// Recursively walk `snapshot_dir` and copy the **current** working-tree
-/// version of each file (if it exists) into `backup_dir`, mirroring the
-/// relative path.  Only files listed in the snapshot are backed up so we
-/// don't copy unrelated working-tree files.
-fn backup_current_files(
-    snapshot_root: &Path,
-    current_snapshot_dir: &Path,
-    working_dir: &Path,
-    backup_dir: &Path,
-) -> Result<()> {
-    for entry in fs::read_dir(current_snapshot_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        // Skip manifest.json — it's metadata, not a user file.
-        if path
-            .file_name()
-            .map(|f| f == "manifest.json")
-            .unwrap_or(false)
-            && path.parent() == Some(snapshot_root)
-        {
-            continue;
-        }
-
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            backup_current_files(snapshot_root, &path, working_dir, backup_dir)?;
-        } else if ft.is_file() {
-            let rel = path.strip_prefix(snapshot_root)?;
-            let source = working_dir.join(rel);
-            if source.exists() {
-                let dest = backup_dir.join(rel);
-                if let Some(parent) = dest.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::copy(&source, &dest)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-// ── Restore helpers ───────────────────────────────────────────────────────────
-
-/// Walk the snapshot directory and copy each file back to the project root.
-fn restore_files(
-    snapshot_root: &Path,
-    current: &Path,
-    working_dir: &Path,
-    restored: &mut u64,
-) -> Result<()> {
-    for entry in fs::read_dir(current)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        // Skip the manifest itself — it's metadata, not a user file.
-        if path
-            .file_name()
-            .map(|f| f == "manifest.json")
-            .unwrap_or(false)
-            && path.parent() == Some(snapshot_root)
-        {
-            continue;
-        }
-
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            restore_files(snapshot_root, &path, working_dir, restored)?;
-        } else if ft.is_file() {
-            let rel = path.strip_prefix(snapshot_root)?;
-            let dest = working_dir.join(rel);
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(&path, &dest)?;
-            *restored += 1;
-        }
-    }
-    Ok(())
-}
-
-/// Count the user files present in the snapshot, mirroring `restore_files`'
-/// walk (the top-level `manifest.json` is metadata and is not counted). Used to
-/// detect a truncated or partially-deleted snapshot before any destructive
-/// restore begins.
-fn count_snapshot_files(snapshot_root: &Path, current: &Path) -> Result<u64> {
-    let mut count = 0u64;
-    for entry in fs::read_dir(current)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path
-            .file_name()
-            .map(|f| f == "manifest.json")
-            .unwrap_or(false)
-            && path.parent() == Some(snapshot_root)
-        {
-            continue;
-        }
-
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            count += count_snapshot_files(snapshot_root, &path)?;
-        } else if ft.is_file() {
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
-// ── Daemon helpers ────────────────────────────────────────────────────────────
-
-/// Best-effort attempt to stop running Kin daemons.
-///
-/// Sends SIGTERM to each daemon and then polls until the PID file disappears
-/// (or a 5-second timeout expires). This prevents a race where a daemon still
-/// mid-shutdown recreates `.kin/` endpoint files after `remove_dir_all` runs.
-fn stop_daemons(kin_root: &Path) {
-    kill_pid_file_and_wait(&kin_root.join("daemon.pid"));
-    kill_pid_file_and_wait(&kin_root.join("vfs.pid"));
-}
-
-fn kill_pid_file_and_wait(path: &Path) {
-    if let Ok(content) = fs::read_to_string(path) {
-        if let Ok(pid) = content.trim().parse::<u32>() {
-            let _ = std::process::Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
-                .output();
-            // Poll until the PID file disappears — the daemon removes it as
-            // part of shutdown — bounded to 5 seconds.
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while path.exists() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use kin_model::{ArtifactId, GitObjectId, RepoPath, ResolvedArtifact, TreeEntry};
 
-    /// Helper: set up a fake Kin repo with a snapshot.
-    fn setup_fake_repo(dir: &Path) {
-        let kin = dir.join(".kin");
-        let snapshot = kin.join("snapshot");
-        fs::create_dir_all(&snapshot).unwrap();
-        fs::create_dir_all(snapshot.join("src")).unwrap();
+    fn layout(root: &Path) -> kin_core::KinLayout {
+        let working_dir = root.join("repo");
+        let layout = kin_core::KinLayout::new(working_dir.join(".kin"));
+        fs::create_dir_all(layout.objects_dir()).unwrap();
+        fs::write(layout.root().join("manifest.json"), b"{}").unwrap();
+        layout
+    }
 
-        // Snapshot files.
-        fs::write(snapshot.join("README.md"), "hello").unwrap();
-        fs::write(snapshot.join("src/main.rs"), "fn main() {}").unwrap();
+    fn artifact(path: RepoPath, entry: TreeEntry) -> ResolvedArtifact {
+        ResolvedArtifact::new(ArtifactId::new(), path, entry)
+    }
 
-        // Manifest.
-        let manifest = serde_json::json!({
-            "timestamp": "2026-03-23T00:00:00Z",
-            "file_count": 2,
-            "total_bytes": 17,
-            "git_head": null,
-        });
+    fn tree(artifacts: impl IntoIterator<Item = ResolvedArtifact>) -> ResolvedTree {
+        ResolvedTree::from_artifacts(artifacts).unwrap()
+    }
+
+    #[test]
+    fn exact_binary_config_and_executable_projection_can_eject() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = layout(root.path());
+        let blobs = kin_blobs::BlobStore::new(layout.objects_dir()).unwrap();
+        let binary = blobs.write(&[0, 0xff, 1, 0x80]).unwrap();
+        let compose = blobs
+            .write(b"services:\n  app:\n    image: example\n")
+            .unwrap();
+        let script = blobs.write(b"#!/bin/sh\nexit 0\n").unwrap();
+
+        fs::write(layout.working_dir().join("asset.bin"), [0, 0xff, 1, 0x80]).unwrap();
         fs::write(
-            snapshot.join("manifest.json"),
-            serde_json::to_string_pretty(&manifest).unwrap(),
+            layout.working_dir().join("compose.yaml"),
+            b"services:\n  app:\n    image: example\n",
         )
         .unwrap();
+        fs::write(layout.working_dir().join("run"), b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(
+                layout.working_dir().join("run"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
 
-        // Some Kin-internal files that should be removed on eject.
-        fs::write(kin.join("config.toml"), "[core]").unwrap();
+        let tree = tree([
+            artifact(
+                RepoPath::from_utf8("asset.bin").unwrap(),
+                TreeEntry::blob(binary, false),
+            ),
+            artifact(
+                RepoPath::from_utf8("compose.yaml").unwrap(),
+                TreeEntry::blob(compose, false),
+            ),
+            artifact(
+                RepoPath::from_utf8("run").unwrap(),
+                TreeEntry::blob(script, true),
+            ),
+        ]);
+        verify_graph_projection(&layout, &tree, &blobs).unwrap();
+
+        let archive = detach_metadata(&layout).unwrap();
+        assert!(!layout.root().exists());
+        assert!(archive.join("manifest.json").exists());
+        assert_eq!(
+            fs::read(layout.working_dir().join("asset.bin")).unwrap(),
+            [0, 0xff, 1, 0x80]
+        );
+        assert!(layout.working_dir().join("compose.yaml").exists());
     }
 
     #[test]
-    fn eject_restores_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        setup_fake_repo(root);
+    fn dirty_projection_refuses_before_metadata_moves() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = layout(root.path());
+        let blobs = kin_blobs::BlobStore::new(layout.objects_dir()).unwrap();
+        let expected = blobs.write(b"graph truth\n").unwrap();
+        fs::write(layout.working_dir().join("tracked.txt"), b"local edit\n").unwrap();
+        let tree = tree([artifact(
+            RepoPath::from_utf8("tracked.txt").unwrap(),
+            TreeEntry::blob(expected, false),
+        )]);
 
-        let snapshot_dir = root.join(".kin/snapshot");
-        let working_dir = root.to_path_buf();
-        let mut restored = 0u64;
-        restore_files(&snapshot_dir, &snapshot_dir, &working_dir, &mut restored).unwrap();
-
-        assert_eq!(restored, 2);
-        assert_eq!(fs::read_to_string(root.join("README.md")).unwrap(), "hello");
+        let error = verify_graph_projection(&layout, &tree, &blobs).unwrap_err();
+        assert!(error.to_string().contains("exact projection"));
+        assert!(layout.root().exists());
         assert_eq!(
-            fs::read_to_string(root.join("src/main.rs")).unwrap(),
-            "fn main() {}"
+            fs::read(layout.working_dir().join("tracked.txt")).unwrap(),
+            b"local edit\n"
         );
     }
 
     #[test]
-    fn eject_removes_kin_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        setup_fake_repo(root);
+    fn detached_metadata_can_be_purged_after_atomic_move() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = layout(root.path());
+        let archive = detach_metadata(&layout).unwrap();
+        fs::remove_dir_all(&archive).unwrap();
+        sync_parent_directory(&archive).unwrap();
 
-        // Restore files first.
-        let snapshot_dir = root.join(".kin/snapshot");
-        let working_dir = root.to_path_buf();
-        let mut restored = 0u64;
-        restore_files(&snapshot_dir, &snapshot_dir, &working_dir, &mut restored).unwrap();
-
-        // Then remove .kin/.
-        fs::remove_dir_all(root.join(".kin")).unwrap();
-
-        assert!(!root.join(".kin").exists());
-        // But restored files should still be there.
-        assert!(root.join("README.md").exists());
-        assert!(root.join("src/main.rs").exists());
+        assert!(!layout.root().exists());
+        assert!(!archive.exists());
     }
 
     #[test]
-    fn eject_manifest_skip() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        setup_fake_repo(root);
+    fn gitlink_without_a_materialized_submodule_fails_loudly() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = layout(root.path());
+        let blobs = kin_blobs::BlobStore::new(layout.objects_dir()).unwrap();
+        let tree = tree([artifact(
+            RepoPath::from_utf8("vendor/dependency").unwrap(),
+            TreeEntry::gitlink(GitObjectId::Sha1([0x42; 20])),
+        )]);
 
-        let snapshot_dir = root.join(".kin/snapshot");
-        let working_dir = root.to_path_buf();
-        let mut restored = 0u64;
-        restore_files(&snapshot_dir, &snapshot_dir, &working_dir, &mut restored).unwrap();
-
-        // manifest.json should NOT be restored to the project root.
-        assert!(!root.join("manifest.json").exists());
+        let error = verify_graph_projection(&layout, &tree, &blobs).unwrap_err();
+        assert!(error.to_string().contains("gitlink"));
+        assert!(layout.root().exists());
     }
 
-    /// Default eject (no --revert-files): working files are untouched and .kin/ is gone.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
-    fn default_eject_keeps_working_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        setup_fake_repo(root);
+    fn non_utf8_paths_are_verified_without_lossy_conversion() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
 
-        // Place some "current" working files (different from snapshot content).
-        fs::write(root.join("README.md"), "current content").unwrap();
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(root.join("src/main.rs"), "fn current() {}").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let layout = layout(root.path());
+        let blobs = kin_blobs::BlobStore::new(layout.objects_dir()).unwrap();
+        let content = blobs.write(&[0xde, 0xad, 0, 0xff]).unwrap();
+        let path = RepoPath::from_bytes(b"asset-\xff.bin".to_vec()).unwrap();
+        fs::write(
+            layout
+                .working_dir()
+                .join(OsString::from_vec(path.as_bytes().to_vec())),
+            [0xde, 0xad, 0, 0xff],
+        )
+        .unwrap();
+        let tree = tree([artifact(path, TreeEntry::blob(content, false))]);
 
-        let layout = KinLayout::discover(root).unwrap();
-        run_with_layout(&layout, false, false).unwrap();
-
-        // .kin/ must be gone.
-        assert!(!root.join(".kin").exists(), ".kin/ should be removed");
-        // Working files must be unchanged.
-        assert_eq!(
-            fs::read_to_string(root.join("README.md")).unwrap(),
-            "current content",
-            "README.md must not be reverted"
-        );
-        assert_eq!(
-            fs::read_to_string(root.join("src/main.rs")).unwrap(),
-            "fn current() {}",
-            "src/main.rs must not be reverted"
-        );
-    }
-
-    /// --revert-files --yes: backup is created before mutation; files are restored.
-    #[test]
-    fn revert_files_with_yes_creates_backup_and_restores() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        setup_fake_repo(root);
-
-        // Current working files have different content from the snapshot.
-        fs::write(root.join("README.md"), "current content").unwrap();
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(root.join("src/main.rs"), "fn current() {}").unwrap();
-
-        let layout = KinLayout::discover(root).unwrap();
-        run_with_layout(&layout, true, true).unwrap();
-
-        // .kin/ must be gone.
-        assert!(!root.join(".kin").exists(), ".kin/ should be removed");
-
-        // Working files must be restored from snapshot.
-        assert_eq!(
-            fs::read_to_string(root.join("README.md")).unwrap(),
-            "hello",
-            "README.md should be reverted to snapshot content"
-        );
-        assert_eq!(
-            fs::read_to_string(root.join("src/main.rs")).unwrap(),
-            "fn main() {}",
-            "src/main.rs should be reverted to snapshot content"
-        );
-
-        // Backup must exist and contain the PRE-mutation files.
-        let backups: Vec<_> = fs::read_dir(root)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with(".kin-backup-eject-")
-            })
-            .collect();
-        assert_eq!(backups.len(), 1, "exactly one backup directory must exist");
-        let backup_dir = backups[0].path();
-
-        assert_eq!(
-            fs::read_to_string(backup_dir.join("README.md")).unwrap(),
-            "current content",
-            "backup must contain the pre-mutation README.md"
-        );
-        assert_eq!(
-            fs::read_to_string(backup_dir.join("src/main.rs")).unwrap(),
-            "fn current() {}",
-            "backup must contain the pre-mutation src/main.rs"
-        );
-    }
-
-    /// A truncated snapshot (manifest count > files present) must fail loudly
-    /// BEFORE any mutation: .kin/ stays, working files are untouched, and no
-    /// backup is created.
-    #[test]
-    fn revert_files_fails_loud_on_partial_snapshot() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        setup_fake_repo(root);
-
-        // Post-init working content the user would lose if we half-reverted.
-        fs::write(root.join("README.md"), "current content").unwrap();
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(root.join("src/main.rs"), "fn current() {}").unwrap();
-
-        // Truncate the snapshot: manifest still claims 2 files but one is gone.
-        fs::remove_file(root.join(".kin/snapshot/src/main.rs")).unwrap();
-
-        let layout = KinLayout::discover(root).unwrap();
-        let result = run_with_layout(&layout, true, true);
-
-        assert!(result.is_err(), "partial snapshot must fail loudly");
-        assert!(
-            root.join(".kin").exists(),
-            ".kin/ must remain after a refused revert"
-        );
-        assert_eq!(
-            fs::read_to_string(root.join("README.md")).unwrap(),
-            "current content",
-            "working files must be untouched after a refused revert"
-        );
-        assert_eq!(
-            fs::read_to_string(root.join("src/main.rs")).unwrap(),
-            "fn current() {}"
-        );
-        let backups = fs::read_dir(root)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with(".kin-backup-eject-")
-            })
-            .count();
-        assert_eq!(
-            backups, 0,
-            "no backup should be created when revert is refused pre-mutation"
-        );
-    }
-
-    /// Verify that the confirmation guard is the only thing blocking deletion:
-    /// with yes=true the files ARE reverted; without it (yes=false + stdin EOF)
-    /// the interactive path blocks on read — tested by integration / manual tests.
-    /// Here we just assert the yes=true path completes correctly (covered above).
-    #[test]
-    fn revert_requires_yes_for_non_interactive() {
-        // This is a structural check: run_with_layout(revert_files=true, yes=false)
-        // will call read_line() — we can't feed stdin in unit tests, so we confirm
-        // the guard exists by reading the function source comment only.
-        // The full interactive path is covered by manual/integration tests.
-        // The yes=true path is fully tested in revert_files_with_yes_creates_backup_and_restores.
-        let _ = "guard verified structurally";
-    }
-
-    /// backup_current_files only copies files that exist in the working tree.
-    #[test]
-    fn backup_skips_files_not_in_working_tree() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        setup_fake_repo(root);
-
-        // Only README.md exists in working tree; src/main.rs does NOT.
-        fs::write(root.join("README.md"), "current").unwrap();
-        // src/main.rs intentionally absent from working tree.
-
-        let snapshot_dir = root.join(".kin/snapshot");
-        let backup_dir = root.join("backup");
-        fs::create_dir_all(&backup_dir).unwrap();
-
-        backup_current_files(&snapshot_dir, &snapshot_dir, root, &backup_dir).unwrap();
-
-        assert!(
-            backup_dir.join("README.md").exists(),
-            "README.md should be backed up"
-        );
-        assert!(
-            !backup_dir.join("src/main.rs").exists(),
-            "src/main.rs absent from working tree must not appear in backup"
-        );
+        verify_graph_projection(&layout, &tree, &blobs).unwrap();
     }
 }

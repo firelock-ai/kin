@@ -51,24 +51,6 @@ against the repository where the affected code lives.
 
 ## High-Risk Features
 
-### POST /commands/exec
-
-`POST /commands/exec` lets the daemon materialize a graph workspace and
-execute an arbitrary shell command (`sh -c`) inside it. This is a
-high-risk capability.
-
-**Decision: disabled by default, explicit opt-in required.**
-
-The endpoint returns `403 Forbidden` unless the operator sets
-`KIN_DAEMON_ALLOW_EXEC=1` in the daemon environment. The daemon only
-listens on loopback (`127.0.0.1`) and validates the `Host` header and an
-auth token for non-loopback callers; even so, shell execution is off
-unless you consciously enable it.
-
-Enable only in controlled, local development environments where you trust
-all processes on the machine. Do not expose the daemon to untrusted
-networks with this flag set.
-
 ### kin-vfs LD_PRELOAD / DYLD_INSERT_LIBRARIES shim
 
 `kin-vfs` intercepts libc calls at runtime. Only install and use it from

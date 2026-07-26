@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -9,9 +8,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use fs2::FileExt;
 use kin_model::{
-    ArtifactDelta, ArtifactDeltaKind, AuthorId, ChangeStore, EntityDelta, EntityStore, FilePathId,
-    GraphStore, Hash256, RelationDelta, ResolvedSourceEntry, SemanticChange, SemanticChangeId,
-    SourceEntryKind, SourceTreeResolution, Timestamp, Visibility, WorkId, WorkStore,
+    AuthorId, ChangeStore, EntityDelta, EntityStore, GraphStore, Hash256, RelationDelta,
+    ResolvedTree, SemanticChange, SemanticChangeId, Timestamp, TreeDelta, Visibility, WorkId,
+    WorkStore,
 };
 
 const PENDING_RELEASE_SCHEMA: u32 = 1;
@@ -916,112 +915,46 @@ async fn send_pending_release(
     }
 }
 
-fn added_artifact_kind(kind: SourceEntryKind) -> ArtifactDeltaKind {
-    match kind {
-        SourceEntryKind::File { executable: false } => ArtifactDeltaKind::AddedRegularFile,
-        SourceEntryKind::File { executable: true } => ArtifactDeltaKind::AddedExecutableFile,
-        SourceEntryKind::Symlink => ArtifactDeltaKind::AddedSymlink,
-    }
-}
-
-fn modified_artifact_kind(kind: SourceEntryKind) -> ArtifactDeltaKind {
-    match kind {
-        SourceEntryKind::File { executable: false } => ArtifactDeltaKind::ModifiedRegularFile,
-        SourceEntryKind::File { executable: true } => ArtifactDeltaKind::ModifiedExecutableFile,
-        SourceEntryKind::Symlink => ArtifactDeltaKind::ModifiedSymlink,
-    }
-}
-
 fn require_exact_source_tree<G: GraphStore>(
     graph: &G,
     head: &SemanticChangeId,
-) -> Result<HashMap<FilePathId, ResolvedSourceEntry>> {
-    match graph.resolve_source_tree_at(head)? {
-        SourceTreeResolution::Exact { entries } => Ok(entries),
-        SourceTreeResolution::Incomplete { gaps } => {
-            let gaps = gaps
-                .iter()
-                .map(|gap| format!("{}@{}:{:?}", gap.file_id, gap.change_id, gap.reason))
-                .collect::<Vec<_>>()
-                .join(", ");
-            anyhow::bail!(
-                "rollback requires exact source history at {head}, but found unresolved gaps: {gaps}"
-            )
-        }
-    }
+) -> Result<ResolvedTree> {
+    graph
+        .resolve_tree_at(head)
+        .map_err(|error| anyhow::anyhow!("resolve exact repository tree at {head}: {error}"))
 }
 
 fn exact_source_tree_correction(
-    current: &HashMap<FilePathId, ResolvedSourceEntry>,
-    desired: &HashMap<FilePathId, ResolvedSourceEntry>,
-) -> Vec<ArtifactDelta> {
-    let mut deltas = Vec::new();
-    for (path, old) in current {
-        if !desired.contains_key(path) {
-            deltas.push(ArtifactDelta {
-                file_id: path.clone(),
-                kind: ArtifactDeltaKind::Removed,
-                old_hash: Some(old.hash),
-                new_hash: None,
-            });
-        }
-    }
-    for (path, new) in desired {
-        match current.get(path) {
-            Some(old) if old == new => {}
-            Some(old) => deltas.push(ArtifactDelta {
-                file_id: path.clone(),
-                kind: modified_artifact_kind(new.kind),
-                old_hash: Some(old.hash),
-                new_hash: Some(new.hash),
-            }),
-            None => deltas.push(ArtifactDelta {
-                file_id: path.clone(),
-                kind: added_artifact_kind(new.kind),
-                old_hash: None,
-                new_hash: Some(new.hash),
-            }),
-        }
-    }
-    deltas.sort_by(|left, right| left.file_id.0.cmp(&right.file_id.0));
-    deltas
+    current: &ResolvedTree,
+    desired: &ResolvedTree,
+) -> Result<Vec<TreeDelta>> {
+    kin_core::exact_tree_correction(current, desired)
+        .map_err(|error| anyhow::anyhow!("plan exact rollback tree: {error}"))
 }
 
-fn prior_exact_source_entry<G: GraphStore>(
-    graph: &G,
-    change: &SemanticChange,
-    delta: &ArtifactDelta,
-) -> Result<ResolvedSourceEntry> {
-    let old_hash = delta.old_hash.ok_or_else(|| {
-        anyhow::anyhow!(
-            "cannot exactly reverse source delta for {} in {}: old content hash is missing",
-            delta.file_id,
-            change.id
-        )
-    })?;
-    let mut candidates = Vec::new();
-    for parent in &change.parents {
-        if let Some(entry) = require_exact_source_tree(graph, parent)?.get(&delta.file_id) {
-            if entry.hash == old_hash && !candidates.contains(entry) {
-                candidates.push(*entry);
-            }
-        }
-    }
-    match candidates.as_slice() {
-        [entry] => Ok(*entry),
-        [] => anyhow::bail!(
-            "cannot exactly reverse source delta for {} in {}: no parent carries old hash {}",
-            delta.file_id,
-            change.id,
-            old_hash
-        ),
-        _ => anyhow::bail!(
-            "cannot exactly reverse source delta for {} in {}: parent history gives ambiguous entry kinds for old hash {}",
-            delta.file_id,
-            change.id,
-            old_hash
-        ),
-    }
+fn reverse_tree_deltas(deltas: &[TreeDelta]) -> Vec<TreeDelta> {
+    deltas
+        .iter()
+        .map(|delta| match delta {
+            TreeDelta::Added { artifact_id, new } => TreeDelta::Removed {
+                artifact_id: *artifact_id,
+                old: new.clone(),
+            },
+            TreeDelta::Updated {
+                artifact_id,
+                old,
+                new,
+            } => TreeDelta::Updated {
+                artifact_id: *artifact_id,
+                old: new.clone(),
+                new: old.clone(),
+            },
+            TreeDelta::Removed { artifact_id, old } => TreeDelta::Added {
+                artifact_id: *artifact_id,
+                new: old.clone(),
+            },
+        })
+        .collect()
 }
 
 /// Semver bump level.
@@ -1269,7 +1202,7 @@ pub async fn release_with_options(tag: String, opts: ReleaseOptions) -> Result<(
         ),
         entity_deltas: Vec::new(),
         relation_deltas: Vec::new(),
-        artifact_deltas: Vec::new(),
+        tree_deltas: Vec::new(),
         projected_files: Vec::new(),
         spec_link: None,
         evidence: Vec::new(),
@@ -1402,26 +1335,16 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
                 };
                 reversed_relation_deltas.push(reversed);
             }
-            for delta in &change.artifact_deltas {
-                if delta.kind.is_added() {
-                    desired_source_tree.remove(&delta.file_id);
-                } else if delta.kind.is_removed() || delta.kind.is_modified() {
-                    desired_source_tree.insert(
-                        delta.file_id.clone(),
-                        prior_exact_source_entry(graph, change, delta)?,
-                    );
-                } else {
-                    anyhow::bail!(
-                        "cannot reverse unsupported source delta {:?} for {} in {}",
-                        delta.kind,
-                        delta.file_id,
-                        change.id
-                    );
-                }
-            }
+            let reversed = reverse_tree_deltas(&change.tree_deltas);
+            desired_source_tree = desired_source_tree.apply(&reversed).with_context(|| {
+                format!(
+                    "cannot reverse exact tree transition from feature change {} against current identity state",
+                    change.id
+                )
+            })?;
         }
-        let reversed_artifact_deltas =
-            exact_source_tree_correction(&current_source_tree, &desired_source_tree);
+        let reversed_tree_deltas =
+            exact_source_tree_correction(&current_source_tree, &desired_source_tree)?;
 
         let rollback_message = format!(
             "rollback: revert feature '{}' ({} change(s))",
@@ -1436,7 +1359,7 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
             message: rollback_message,
             entity_deltas: reversed_entity_deltas,
             relation_deltas: reversed_relation_deltas,
-            artifact_deltas: reversed_artifact_deltas,
+            tree_deltas: reversed_tree_deltas,
             projected_files: Vec::new(),
             spec_link: None,
             evidence: Vec::new(),
@@ -1445,30 +1368,6 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
         };
         rollback_change.id = kin_core::compute_semantic_change_id(&rollback_change)?;
         let rollback_change_id = rollback_change.id;
-
-        for delta in &rollback_change.entity_deltas {
-            match delta {
-                EntityDelta::Added(entity) => {
-                    graph.upsert_entity(entity)?;
-                }
-                EntityDelta::Removed(id) => {
-                    graph.remove_entity(id)?;
-                }
-                EntityDelta::Modified { new, .. } => {
-                    graph.upsert_entity(new)?;
-                }
-            }
-        }
-        for delta in &rollback_change.relation_deltas {
-            match delta {
-                RelationDelta::Added(rel) => {
-                    graph.upsert_relation(rel)?;
-                }
-                RelationDelta::Removed(id) => {
-                    graph.remove_relation(id)?;
-                }
-            }
-        }
 
         crate::backend::require_daemon_commit(&layout, &rollback_change, &branch_name.to_string())
             .await?;
@@ -1509,8 +1408,8 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
     let mut reversed_relation_deltas = Vec::new();
     let current_source_tree = require_exact_source_tree(graph, &branch.head)?;
     let target_source_tree = require_exact_source_tree(graph, &target_id)?;
-    let reversed_artifact_deltas =
-        exact_source_tree_correction(&current_source_tree, &target_source_tree);
+    let reversed_tree_deltas =
+        exact_source_tree_correction(&current_source_tree, &target_source_tree)?;
 
     for change in changes_to_reverse.iter().rev() {
         for delta in &change.entity_deltas {
@@ -1561,7 +1460,7 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
         message: rollback_message,
         entity_deltas: reversed_entity_deltas,
         relation_deltas: reversed_relation_deltas,
-        artifact_deltas: reversed_artifact_deltas,
+        tree_deltas: reversed_tree_deltas,
         projected_files: target_change.projected_files.clone(),
         spec_link: None,
         evidence: Vec::new(),
@@ -1570,32 +1469,6 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
     };
     rollback_change.id = kin_core::compute_semantic_change_id(&rollback_change)?;
     let rollback_change_id = rollback_change.id;
-
-    // Apply reversed entity deltas to the graph
-    for delta in &rollback_change.entity_deltas {
-        match delta {
-            EntityDelta::Added(entity) => {
-                graph.upsert_entity(entity)?;
-            }
-            EntityDelta::Removed(id) => {
-                graph.remove_entity(id)?;
-            }
-            EntityDelta::Modified { new, .. } => {
-                graph.upsert_entity(new)?;
-            }
-        }
-    }
-
-    for delta in &rollback_change.relation_deltas {
-        match delta {
-            RelationDelta::Added(rel) => {
-                graph.upsert_relation(rel)?;
-            }
-            RelationDelta::Removed(id) => {
-                graph.remove_relation(id)?;
-            }
-        }
-    }
 
     crate::backend::require_daemon_commit(&layout, &rollback_change, &branch_name.to_string())
         .await?;
@@ -1650,6 +1523,7 @@ fn collect_changes_from_head<G: GraphStore>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_model::TreeEntry;
 
     fn pending_release_fixture() -> (SemanticChange, Vec<u8>) {
         let parent = SemanticChangeId::from_hash(Hash256::from_bytes([0x31; 32]));
@@ -1661,7 +1535,7 @@ mod tests {
             message: "release: v0.3.0 (1 entities snapshot)".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -1902,53 +1776,68 @@ mod tests {
     }
 
     #[test]
-    fn exact_source_tree_correction_preserves_modes_additions_and_removals() {
+    fn exact_source_tree_correction_preserves_identity_moves_modes_and_path_reuse() {
+        use kin_model::{ArtifactId, RepoPath, ResolvedArtifact};
+
         let first_hash = Hash256::from_bytes([1; 32]);
         let removed_hash = Hash256::from_bytes([2; 32]);
         let added_hash = Hash256::from_bytes([3; 32]);
-        let current = HashMap::from([
-            (
-                FilePathId::new("bin/kin"),
-                ResolvedSourceEntry {
-                    hash: first_hash,
-                    kind: SourceEntryKind::File { executable: false },
-                },
+        let binary_id = ArtifactId::new();
+        let removed_id = ArtifactId::new();
+        let replacement_id = ArtifactId::new();
+        let current = ResolvedTree::from_artifacts([
+            ResolvedArtifact::new(
+                binary_id,
+                RepoPath::from_utf8("bin/kin").unwrap(),
+                TreeEntry::blob(first_hash, false),
             ),
-            (
-                FilePathId::new("old-link"),
-                ResolvedSourceEntry {
-                    hash: removed_hash,
-                    kind: SourceEntryKind::Symlink,
-                },
+            ResolvedArtifact::new(
+                removed_id,
+                RepoPath::from_utf8("old-link").unwrap(),
+                TreeEntry::symlink(removed_hash),
             ),
-        ]);
-        let desired = HashMap::from([
-            (
-                FilePathId::new("bin/kin"),
-                ResolvedSourceEntry {
-                    hash: first_hash,
-                    kind: SourceEntryKind::File { executable: true },
-                },
+        ])
+        .unwrap();
+        let desired = ResolvedTree::from_artifacts([
+            ResolvedArtifact::new(
+                binary_id,
+                RepoPath::from_utf8("dist/kin").unwrap(),
+                TreeEntry::blob(first_hash, true),
             ),
-            (
-                FilePathId::new("current"),
-                ResolvedSourceEntry {
-                    hash: added_hash,
-                    kind: SourceEntryKind::Symlink,
-                },
+            ResolvedArtifact::new(
+                replacement_id,
+                RepoPath::from_utf8("bin/kin").unwrap(),
+                TreeEntry::symlink(added_hash),
             ),
-        ]);
+        ])
+        .unwrap();
 
-        let deltas = exact_source_tree_correction(&current, &desired);
-        assert_eq!(deltas.len(), 3);
-        assert_eq!(deltas[0].file_id, FilePathId::new("bin/kin"));
-        assert_eq!(deltas[0].kind, ArtifactDeltaKind::ModifiedExecutableFile);
-        assert_eq!(deltas[0].old_hash, Some(first_hash));
-        assert_eq!(deltas[0].new_hash, Some(first_hash));
-        assert_eq!(deltas[1].file_id, FilePathId::new("current"));
-        assert_eq!(deltas[1].kind, ArtifactDeltaKind::AddedSymlink);
-        assert_eq!(deltas[2].file_id, FilePathId::new("old-link"));
-        assert_eq!(deltas[2].kind, ArtifactDeltaKind::Removed);
-        assert_eq!(deltas[2].old_hash, Some(removed_hash));
+        let deltas = exact_source_tree_correction(&current, &desired).unwrap();
+        assert_eq!(current.apply(&deltas).unwrap(), desired);
+        assert!(deltas.iter().any(|delta| matches!(
+            delta,
+            TreeDelta::Updated {
+                artifact_id,
+                old,
+                new,
+            } if *artifact_id == binary_id
+                && old.path.as_utf8() == Some("bin/kin")
+                && new.path.as_utf8() == Some("dist/kin")
+                && matches!(new.entry, TreeEntry::Blob { executable: true, .. })
+        )));
+        assert!(deltas.iter().any(|delta| {
+            matches!(
+                delta,
+                TreeDelta::Added { artifact_id, new }
+                    if *artifact_id == replacement_id
+                        && new.path.as_utf8() == Some("bin/kin")
+            )
+        }));
+        assert!(deltas.iter().any(|delta| {
+            matches!(
+                delta,
+                TreeDelta::Removed { artifact_id, .. } if *artifact_id == removed_id
+            )
+        }));
     }
 }

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `kin exec` executes exact argv locally in the materialized session workspace; shell parsing requires one explicitly quoted `--shell` script, the `kin run` compatibility alias is removed, and the redundant daemon remote-exec endpoint no longer exists.
+- Session launchers now require graph-backed materialization from a repository-verified daemon, register one heartbeating session identity for the child lifetime, scrub inherited Git/Compose/Kin path authority, and preserve failed workspaces. `kin open` now supports only the proven blocking lifecycles of VS Code and Cursor.
+
 ## [0.3.6] - 2026-07-26
 
 ### Added
@@ -610,7 +615,7 @@ Determinism hardened end to end — real-inference byte-identity, deterministic 
 
 ### Fixed
 
-- The stale-kept-workspace data-loss edge on `kin exec` / `kin run` / `kin shell` / `kin with --session` closeout (see the reconcile change above).
+- The stale-kept-workspace data-loss edge on `kin exec` / `kin shell` / `kin with --session` closeout (see the reconcile change above).
 - Object lookups during parallel history import retry once before failing loud, closing a transient loose-object miss window under concurrency.
 - Multi-commit test fixtures across the workspace carry explicit increasing timestamps, removing wall-clock dependence from order-sensitive suites.
 
@@ -622,7 +627,7 @@ Session-aware runtime, a shadow-mode merge gate, a hardened first-run installer,
 
 - Retrieval quality profiles (`KIN_PROFILE`): `compat-v0` (default, the pre-profile serving behavior) and `accuracy-v1` (opt-in candidate: fused `semantic_locate` serving, entity-granularity fusion, lexical parity floor, promotion-only cross-encoder blend). Both ship structured `degradations[]` reporting and a per-stage prune ledger for miss forensics; the candidate graduates to default only on measured wins.
 - Go interface methods are extracted as first-class graph entities, closing a symbol-recall gap on Go codebases.
-- Session runtime for ordinary tools: `kin exec -- <cmd>` (new alias `kin run`) runs commands in a graph-backed session workspace, reconciles on success, and preserves the workspace with recovery commands on failure; `--keep` defers reconcile and `--discard` skips it.
+- Session runtime for ordinary tools: `kin exec -- <cmd>` runs commands in a graph-backed session workspace, reconciles on success, and preserves the workspace with recovery commands on failure; `--keep` defers reconcile and `--discard` skips it.
 - Agent session launches: `kin with --session <assistant> -- <task>` starts the assistant inside a session workspace with its cwd, file shims, session identity (`KIN_SESSION`, `KIN_SESSION_ID`, `KIN_SESSION_DIR`), and daemon binding (`KIN_DAEMON_URL`, `KIN_REPO_ID`) pointed at the same repository — MCP tools spawned by the assistant bind to the same daemon and session.
 - External-tool detection now covers package managers (`npm`, `npx`, `pnpm`, `pnpx`, `yarn`, `bun`, `bunx`, `corepack`), which widen scoped execution to a full workspace under the default policy.
 - `kin doctor` gains a session-runtime check that teaches the `kin exec` / `kin shell` / `kin with --session` path and reports leftover session workspaces with recovery commands.
@@ -634,7 +639,7 @@ Session-aware runtime, a shadow-mode merge gate, a hardened first-run installer,
 
 ### Changed
 
-- `kin exec` executes commands locally in the materialized session workspace instead of requiring the daemon's gated remote-exec capability; the daemon endpoint remains opt-in via `KIN_DAEMON_ALLOW_EXEC`.
+- `kin exec` executes commands locally in the materialized session workspace.
 
 ### Fixed
 
