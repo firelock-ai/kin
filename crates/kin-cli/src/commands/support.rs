@@ -192,6 +192,58 @@ fn render_support_json(report: &SupportJson) -> Vec<String> {
     lines.push(String::new());
     lines.push("Health".to_string());
     lines.push(format!(
+        "  repository artifacts: {} authority / {} query graph",
+        report
+            .health
+            .repository_artifact_coverage
+            .authority_artifact_count,
+        report
+            .health
+            .repository_artifact_coverage
+            .graph_tree_artifact_count
+    ));
+    lines.push(format!(
+        "  query-facing artifact enrichment: {} / {} eligible",
+        report
+            .health
+            .repository_artifact_coverage
+            .enriched_artifact_count,
+        report
+            .health
+            .repository_artifact_coverage
+            .enrichable_artifact_count
+    ));
+    lines.push(format!(
+        "  exact-only artifacts: {}",
+        report
+            .health
+            .repository_artifact_coverage
+            .exact_only_artifact_count
+    ));
+    lines.push(format!(
+        "  repository artifact coverage: {}",
+        if report.health.repository_artifact_coverage.complete {
+            "complete"
+        } else {
+            "incomplete"
+        }
+    ));
+    if !report
+        .health
+        .repository_artifact_coverage
+        .issue_paths_sample
+        .is_empty()
+    {
+        lines.push(format!(
+            "  artifact issue sample: {}",
+            report
+                .health
+                .repository_artifact_coverage
+                .issue_paths_sample
+                .join(", ")
+        ));
+    }
+    lines.push(format!(
         "  supported entity-source files: {}",
         report.health.supported_entity_source_file_count
     ));
@@ -239,9 +291,33 @@ fn render_counts(counts: &BTreeMap<String, usize>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{render_support_report, SupportJson};
-    use crate::commands::graph_health::GraphHealthReport;
+    use crate::commands::graph_health::{GraphHealthReport, RepositoryArtifactCoverage};
     use kin_model::GraphStats;
     use std::collections::HashMap;
+
+    fn artifact_coverage(
+        authority: usize,
+        graph: usize,
+        enrichable: usize,
+        enriched: usize,
+        exact_only: usize,
+    ) -> RepositoryArtifactCoverage {
+        RepositoryArtifactCoverage {
+            authority_artifact_count: authority,
+            graph_tree_artifact_count: graph,
+            repository_tree_in_sync: authority == graph,
+            enrichable_artifact_count: enrichable,
+            enriched_artifact_count: enriched,
+            exact_only_artifact_count: exact_only,
+            missing_enrichment_path_count: enrichable.saturating_sub(enriched),
+            conflicting_enrichment_path_count: 0,
+            stale_enrichment_path_count: 0,
+            content_mismatch_path_count: 0,
+            orphan_entity_count: 0,
+            complete: authority == graph && enrichable == enriched,
+            issue_paths_sample: Vec::new(),
+        }
+    }
 
     #[test]
     fn human_report_renders_sorted_counts() {
@@ -272,6 +348,7 @@ mod tests {
         };
 
         let health = GraphHealthReport {
+            repository_artifact_coverage: artifact_coverage(7, 7, 6, 6, 1),
             supported_entity_source_file_count: 2,
             supported_shallow_source_file_count: 1,
             graph_empty_for_supported_inputs: false,
@@ -325,6 +402,10 @@ mod tests {
                 "  partial: 1".to_string(),
                 String::new(),
                 "Health".to_string(),
+                "  repository artifacts: 7 authority / 7 query graph".to_string(),
+                "  query-facing artifact enrichment: 6 / 6 eligible".to_string(),
+                "  exact-only artifacts: 1".to_string(),
+                "  repository artifact coverage: complete".to_string(),
                 "  supported entity-source files: 2".to_string(),
                 "  supported shallow-syntax files: 1".to_string(),
                 "  contaminated paths: 0".to_string(),
@@ -361,6 +442,7 @@ mod tests {
         let payload = SupportJson::from_parts(
             &stats,
             GraphHealthReport {
+                repository_artifact_coverage: artifact_coverage(4, 4, 4, 4, 0),
                 supported_entity_source_file_count: 1,
                 supported_shallow_source_file_count: 0,
                 graph_empty_for_supported_inputs: false,
