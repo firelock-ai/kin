@@ -72,4 +72,10 @@ impl From<kin_core::KinError> for DaemonError {
     }
 }
 
+impl From<kin_model::ModelError> for DaemonError {
+    fn from(error: kin_model::ModelError) -> Self {
+        Self::Core(kin_core::KinError::Model(error))
+    }
+}
+
 pub type Result<T> = std::result::Result<T, DaemonError>;

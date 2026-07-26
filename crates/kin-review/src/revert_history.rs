@@ -135,14 +135,14 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
     for change in range_changes {
         for delta in &change.entity_deltas {
             match delta {
-                EntityDelta::Added(entity) => {
+                EntityDelta::Added { new: entity } => {
                     head_added
                         .entry((kind_key(entity.kind), entity.name.clone()))
                         .or_insert_with(|| entity.clone());
                 }
-                EntityDelta::Removed(id) => {
-                    if seen_removed.insert(*id) {
-                        head_removed.push(*id);
+                EntityDelta::Removed { old } => {
+                    if seen_removed.insert(old.id) {
+                        head_removed.push(old.id);
                     }
                 }
                 EntityDelta::Modified { old, new } => {
@@ -388,11 +388,11 @@ fn walk_base_window<G: GraphStore>(
         scanned += 1;
         for delta in &change.entity_deltas {
             match delta {
-                EntityDelta::Removed(entity_id) => removals.push(WindowRemoval {
-                    entity_id: *entity_id,
+                EntityDelta::Removed { old } => removals.push(WindowRemoval {
+                    entity_id: old.id,
                     distance,
                 }),
-                EntityDelta::Added(entity) => {
+                EntityDelta::Added { new: entity } => {
                     added_ids.entry(entity.id).or_insert(distance);
                     values.entry(entity.id).or_insert_with(|| entity.clone());
                 }

@@ -20,11 +20,11 @@
 //! `name`), so these behaviors hold for every language once the adapter hands it
 //! a simple name.
 
-use kin_index::{link_cross_file, FileParseData};
+use kin_index::{link_cross_file as link_cross_file_with_identities, FileParseData};
 use kin_model::{
-    Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm,
-    GraphNodeId, Hash256, LanguageId, Relation, RelationKind, SemanticFingerprint, SourceSpan,
-    Visibility,
+    ArtifactId, Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId,
+    FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, Relation, RelationKind,
+    SemanticFingerprint, SourceSpan, Visibility,
 };
 use kin_parser::{
     CSharpAdapter, ExtractedRelation, JavaAdapter, LanguageAdapter, TypeScriptAdapter,
@@ -103,6 +103,15 @@ fn has_call(rels: &[Relation], src: EntityId, dst: EntityId) -> bool {
             && r.src == GraphNodeId::Entity(src)
             && r.dst == GraphNodeId::Entity(dst)
     })
+}
+
+fn link_cross_file(files: &[FileParseData]) -> Vec<Relation> {
+    let artifact_ids = files
+        .iter()
+        .map(|file| (file.file_path.clone(), ArtifactId::new()))
+        .collect();
+    link_cross_file_with_identities(files, &artifact_ids)
+        .expect("every fixture file has an explicitly assigned artifact identity")
 }
 
 /// The fan-out cap mirrors `linker::AMBIGUOUS_CALL_FANOUT_CAP` (private). If the

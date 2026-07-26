@@ -1,38 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Eject conviction suite: "you can always leave".
+//! End-to-end acceptance for leaving a graph-authoritative Kin repository.
 //!
-//! These tests drive the real `kin` binary end-to-end over a real Git repo to
-//! prove the load-bearing adoption promise — a team can remove Kin any day and
-//! be left with a plain, intact Git repository.
-//!
-//! What is proven here:
-//! - `kin eject` (default) removes Kin and leaves every working file and the
-//!   entire `.git` directory byte-for-byte intact.
-//! - `kin eject --revert-files` restores the working tree to its exact pre-init
-//!   bytes (a faithful round-trip), backs up the pre-eject files first, and
-//!   leaves `.git` intact.
-//! - A corrupt or partial snapshot fails loudly and mutates nothing — Kin never
-//!   silently strands files.
-//!
-//! Honest scope: Kin never reads, rewrites, or restores Git history. It
-//! snapshots the working tree at init (excluding `.git`, `.kin*`, and ignored
-//! paths) and restores those files only. Commit history is owned by Git the
-//! whole time, which is exactly why these tests assert `.git` is untouched
-//! rather than re-imported.
+//! Eject is an export boundary, not a return to pre-init file authority. These
+//! tests prove that the real binary:
+//! - leaves exact graph-projected code, config, lockfile, binary, executable,
+//!   and symlink state in place;
+//! - preserves an interoperability `.git/` store byte-for-byte;
+//! - refuses a working tree that diverges from the current graph ref;
+//! - keeps metadata recoverable outside the repository by default; and
+//! - has no legacy initialization-snapshot restore surface.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Output;
+
 use tempfile::tempdir;
 
 mod common;
 
 use common::Command;
 
-/// Run a git command in `dir` and assert it succeeds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EntryState {
+    kind: &'static str,
+    bytes: Vec<u8>,
+    executable: bool,
+}
+
 fn git(dir: &Path, args: &[&str]) -> Output {
     let output = Command::new("git")
         .args(args)
@@ -48,27 +46,13 @@ fn git(dir: &Path, args: &[&str]) -> Output {
     output
 }
 
-/// Run a git command in `dir` and return its exit status without asserting.
-fn git_status_code(dir: &Path, args: &[&str]) -> i32 {
-    Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .expect("run git command")
-        .status
-        .code()
-        .unwrap_or(-1)
-}
-
-/// Run the real `kin` binary in `dir` with a fully hermetic environment:
-/// an isolated registry file and the warm-init cache disabled, so the test
-/// never touches `~/.kin` or any other global state.
+/// Run the real `kin` binary in `dir` with an isolated registry so the test
+/// never touches shared repository state.
 fn run_kin(dir: &Path, registry: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_kin"))
         .args(args)
         .current_dir(dir)
         .env("KIN_REGISTRY_PATH", registry)
-        .env("KIN_INIT_WARM_CACHE", "0")
         .output()
         .expect("run kin binary")
 }
@@ -84,29 +68,7 @@ fn run_kin_ok(dir: &Path, registry: &Path, args: &[&str]) -> Output {
     output
 }
 
-/// `git rev-parse HEAD`.
-fn head_sha(repo: &Path) -> String {
-    String::from_utf8_lossy(&git(repo, &["rev-parse", "HEAD"]).stdout)
-        .trim()
-        .to_string()
-}
-
-/// The set of Git-tracked files mapped to their exact on-disk bytes. This is
-/// the "original git checkout" baseline we round-trip against.
-fn tracked_file_bytes(repo: &Path) -> BTreeMap<String, Vec<u8>> {
-    let listing = git(repo, &["ls-files"]).stdout;
-    let listing = String::from_utf8(listing).expect("git ls-files is utf-8 paths");
-    let mut map = BTreeMap::new();
-    for rel in listing.lines().filter(|line| !line.trim().is_empty()) {
-        let bytes = fs::read(repo.join(rel)).unwrap_or_else(|e| panic!("read tracked {rel}: {e}"));
-        map.insert(rel.to_string(), bytes);
-    }
-    assert!(!map.is_empty(), "seed repo should have tracked files");
-    map
-}
-
-/// Build a small, real Git repo with text and binary content, all committed.
-fn seed_repo(repo: &Path) {
+fn seed_git_repo(repo: &Path) {
     fs::create_dir_all(repo).expect("create repo dir");
     git(repo, &["init", "-q"]);
     git(repo, &["config", "user.email", "kin@example.com"]);
@@ -121,247 +83,264 @@ fn seed_repo(repo: &Path) {
     )
     .unwrap();
     fs::write(
-        repo.join("src/main.rs"),
-        "fn main() {\n    println!(\"{}\", demo::greet(\"world\"));\n}\n",
+        repo.join("compose.yaml"),
+        "services:\n  app:\n    image: example/demo:1\n",
     )
     .unwrap();
-    fs::create_dir_all(repo.join("docs")).unwrap();
-    fs::write(repo.join("docs/guide.md"), "Guide.\n\n- one\n- two\n").unwrap();
-
-    // A binary file with non-UTF-8 bytes proves byte-fidelity beyond text.
+    fs::write(
+        repo.join("Cargo.lock"),
+        "# generated lockfile\nversion = 4\n",
+    )
+    .unwrap();
     fs::create_dir_all(repo.join("assets")).unwrap();
-    let mut blob: Vec<u8> = (0u8..=255).collect();
-    blob.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x10]);
-    fs::write(repo.join("assets/blob.bin"), &blob).unwrap();
+    let mut binary: Vec<u8> = (0u8..=255).collect();
+    binary.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0, 0x80]);
+    fs::write(repo.join("assets/blob.bin"), binary).unwrap();
+    fs::write(repo.join("run-demo"), "#!/bin/sh\nexec echo demo\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+        fs::set_permissions(repo.join("run-demo"), fs::Permissions::from_mode(0o755)).unwrap();
+        symlink("compose.yaml", repo.join("current-compose")).unwrap();
+    }
 
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "-q", "-m", "seed repo"]);
     git(repo, &["branch", "-M", "main"]);
 }
 
-/// Assert `.git` is structurally intact and on the same commit as `before`.
-fn assert_git_intact(repo: &Path, before_head: &str) {
-    assert_eq!(
-        head_sha(repo),
-        before_head,
-        "HEAD must be unchanged — Kin never rewrites Git history"
-    );
-    assert_eq!(
-        git_status_code(repo, &["fsck", "--full", "--strict"]),
-        0,
-        "git fsck must pass — .git must be untouched and intact"
-    );
-    // The commit and its log are still readable as a plain Git repo.
-    let log = git(repo, &["log", "--oneline"]).stdout;
-    assert!(
-        String::from_utf8_lossy(&log).contains("seed repo"),
-        "commit history must survive eject"
-    );
+fn git_head(repo: &Path) -> String {
+    String::from_utf8_lossy(&git(repo, &["rev-parse", "HEAD"]).stdout)
+        .trim()
+        .to_string()
 }
 
-/// Default `kin eject` removes Kin and leaves the working tree and `.git`
-/// byte-for-byte intact.
-#[test]
-fn default_eject_preserves_git_history_and_working_tree() {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
-    let registry = root.path().join("registry.toml");
-    seed_repo(&repo);
-
-    let head_before = head_sha(&repo);
-    let bytes_before = tracked_file_bytes(&repo);
-
-    run_kin_ok(&repo, &registry, &["init", "--no-lsp", "."]);
-    assert!(repo.join(".kin").is_dir(), "init must create .kin/");
-    assert!(
-        repo.join(".kin/snapshot/manifest.json").is_file(),
-        "init must write the pre-init snapshot manifest"
-    );
-
-    run_kin_ok(&repo, &registry, &["eject"]);
-
-    assert!(
-        !repo.join(".kin").exists(),
-        ".kin/ must be removed by eject"
-    );
-    assert!(
-        no_kin_residue(&repo),
-        "no .kin* residue may remain after eject"
-    );
-    assert_eq!(
-        tracked_file_bytes(&repo),
-        bytes_before,
-        "every working file must be byte-identical after default eject"
-    );
-    assert_git_intact(&repo, &head_before);
-    // A clean working tree: default eject creates no backup and no stray files.
-    assert!(
-        git(&repo, &["status", "--porcelain"]).stdout.is_empty(),
-        "working tree must be clean after default eject"
-    );
+fn tracked_state(repo: &Path) -> BTreeMap<PathBuf, EntryState> {
+    let listing = git(repo, &["ls-files", "-z"]).stdout;
+    listing
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|relative| {
+            let relative = PathBuf::from(String::from_utf8(relative.to_vec()).unwrap());
+            let state = entry_state(&repo.join(&relative));
+            (relative, state)
+        })
+        .collect()
 }
 
-/// `kin eject --revert-files` restores the working tree to its exact pre-init
-/// bytes even after edits, backs up the pre-eject files, and leaves `.git`
-/// intact.
-#[test]
-fn revert_files_round_trips_to_pre_init_bytes() {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
-    let registry = root.path().join("registry.toml");
-    seed_repo(&repo);
-
-    let head_before = head_sha(&repo);
-    let bytes_before = tracked_file_bytes(&repo);
-
-    run_kin_ok(&repo, &registry, &["init", "--no-lsp", "."]);
-
-    // Simulate real work done while living in Kin: edit tracked files on disk.
-    let edited_lib = "pub fn greet(name: &str) -> String {\n    format!(\"HELLO {name}!!!\")\n}\n";
-    fs::write(repo.join("src/lib.rs"), edited_lib).unwrap();
-    fs::write(repo.join("README.md"), "# Demo (edited under Kin)\n").unwrap();
-    assert_ne!(
-        fs::read(repo.join("src/lib.rs")).unwrap(),
-        bytes_before["src/lib.rs"],
-        "precondition: file was actually edited"
-    );
-
-    run_kin_ok(&repo, &registry, &["eject", "--revert-files", "--yes"]);
-
-    assert!(
-        !repo.join(".kin").exists(),
-        ".kin/ must be removed by eject"
-    );
-    assert_eq!(
-        tracked_file_bytes(&repo),
-        bytes_before,
-        "every working file must round-trip to its exact pre-init bytes"
-    );
-    assert_git_intact(&repo, &head_before);
-
-    // The pre-eject (edited) content is preserved in a backup, never lost.
-    let backup = find_backup_dir(&repo).expect("a backup dir must be created");
-    assert_eq!(
-        fs::read_to_string(backup.join("src/lib.rs")).unwrap(),
-        edited_lib,
-        "backup must hold the pre-eject edited content"
-    );
+fn entry_state(path: &Path) -> EntryState {
+    let metadata = fs::symlink_metadata(path).unwrap();
+    if metadata.file_type().is_symlink() {
+        return EntryState {
+            kind: "symlink",
+            bytes: os_string_bytes(fs::read_link(path).unwrap().into_os_string()),
+            executable: false,
+        };
+    }
+    #[cfg(unix)]
+    let executable = {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata.permissions().mode() & 0o111 != 0
+    };
+    #[cfg(not(unix))]
+    let executable = false;
+    EntryState {
+        kind: "blob",
+        bytes: fs::read(path).unwrap(),
+        executable,
+    }
 }
 
-/// A missing snapshot directory fails loudly and mutates nothing.
-#[test]
-fn revert_files_fails_loud_on_missing_snapshot() {
-    let (root, repo, registry) = init_repo();
-    fs::remove_dir_all(repo.join(".kin/snapshot")).unwrap();
-    let head_before = head_sha(&repo);
-    let bytes_before = tracked_file_bytes(&repo);
-
-    let out = run_kin(&repo, &registry, &["eject", "--revert-files", "--yes"]);
-    assert_refused(&out, "No snapshot found");
-    assert!(
-        repo.join(".kin").exists(),
-        ".kin/ must remain after refusal"
-    );
-    assert_eq!(tracked_file_bytes(&repo), bytes_before, "files untouched");
-    assert_git_intact(&repo, &head_before);
-    drop(root);
+#[cfg(unix)]
+fn os_string_bytes(value: OsString) -> Vec<u8> {
+    use std::os::unix::ffi::OsStringExt as _;
+    value.into_vec()
 }
 
-/// A missing manifest fails loudly and mutates nothing.
-#[test]
-fn revert_files_fails_loud_on_missing_manifest() {
-    let (root, repo, registry) = init_repo();
-    fs::remove_file(repo.join(".kin/snapshot/manifest.json")).unwrap();
-    let head_before = head_sha(&repo);
-    let bytes_before = tracked_file_bytes(&repo);
-
-    let out = run_kin(&repo, &registry, &["eject", "--revert-files", "--yes"]);
-    assert_refused(&out, "manifest missing");
-    assert!(
-        repo.join(".kin").exists(),
-        ".kin/ must remain after refusal"
-    );
-    assert_eq!(tracked_file_bytes(&repo), bytes_before, "files untouched");
-    assert_git_intact(&repo, &head_before);
-    drop(root);
+#[cfg(not(unix))]
+fn os_string_bytes(value: OsString) -> Vec<u8> {
+    value.to_string_lossy().into_owned().into_bytes()
 }
 
-/// A truncated/partial snapshot (fewer files than the manifest records) fails
-/// loudly before any mutation: nothing restored, nothing deleted, no backup.
-#[test]
-fn revert_files_fails_loud_on_partial_snapshot() {
-    let (root, repo, registry) = init_repo();
-    // Delete one file's snapshot copy so the manifest count no longer matches.
-    fs::remove_file(repo.join(".kin/snapshot/src/lib.rs")).unwrap();
-    let head_before = head_sha(&repo);
-    let bytes_before = tracked_file_bytes(&repo);
+fn directory_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn collect(root: &Path, current: &Path, output: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        let mut entries: Vec<_> = fs::read_dir(current)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            if metadata.file_type().is_dir() {
+                collect(root, &path, output);
+            } else if metadata.file_type().is_symlink() {
+                output.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    os_string_bytes(fs::read_link(path).unwrap().into_os_string()),
+                );
+            } else {
+                output.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
 
-    let out = run_kin(&repo, &registry, &["eject", "--revert-files", "--yes"]);
-    assert_refused(&out, "incomplete");
-    assert!(
-        repo.join(".kin").exists(),
-        ".kin/ must remain after refusal"
-    );
-    assert_eq!(tracked_file_bytes(&repo), bytes_before, "files untouched");
-    assert!(
-        find_backup_dir(&repo).is_none(),
-        "no backup may be created when revert is refused pre-mutation"
-    );
-    assert_git_intact(&repo, &head_before);
-    drop(root);
+    let mut output = BTreeMap::new();
+    collect(root, root, &mut output);
+    output
 }
 
-// ── shared helpers ──────────────────────────────────────────────────────────
-
-/// Seed a repo and run `kin init`, returning (tempdir, repo, registry).
-/// The tempdir is returned so it outlives the test body.
-fn init_repo() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
-    let registry = root.path().join("registry.toml");
-    seed_repo(&repo);
-    run_kin_ok(&repo, &registry, &["init", "--no-lsp", "."]);
-    (root, repo, registry)
+fn metadata_archives(repo: &Path) -> Vec<PathBuf> {
+    let parent = repo.parent().expect("repo has parent");
+    let mut archives: Vec<_> = fs::read_dir(parent)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".kin-ejected-")
+        })
+        .map(|entry| entry.path())
+        .collect();
+    archives.sort();
+    archives
 }
 
-/// Assert an eject invocation was refused (non-zero exit) with a clear message.
-fn assert_refused(out: &Output, expect_substr: &str) {
+fn assert_refused(output: &Output, expected: &str) {
     assert!(
-        !out.status.success(),
-        "eject should have failed but succeeded: stdout={} stderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+        !output.status.success(),
+        "command unexpectedly succeeded: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
     let combined = format!(
         "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        combined
-            .to_lowercase()
-            .contains(&expect_substr.to_lowercase()),
-        "error message should mention {expect_substr:?}; got: {combined}"
+        combined.to_lowercase().contains(&expected.to_lowercase()),
+        "expected {expected:?} in refusal, got: {combined}"
     );
 }
 
-/// True when no `.kin*` entry remains in the repo root.
-fn no_kin_residue(repo: &Path) -> bool {
-    fs::read_dir(repo)
-        .expect("read repo dir")
-        .filter_map(|e| e.ok())
-        .all(|e| !e.file_name().to_string_lossy().starts_with(".kin"))
+#[test]
+fn brownfield_eject_preserves_exact_files_and_git_with_recoverable_metadata() {
+    let root = tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let registry = root.path().join("registry.toml");
+    seed_git_repo(&repo);
+
+    let head_before = git_head(&repo);
+    let tracked_before = tracked_state(&repo);
+    let git_before = directory_bytes(&repo.join(".git"));
+
+    run_kin_ok(&repo, &registry, &["init", "."]);
+    assert!(repo.join(".kin").is_dir());
+    assert!(
+        !repo.join(".kin/snapshot").exists(),
+        "graph-first init must not retain a raw filesystem snapshot"
+    );
+
+    run_kin_ok(&repo, &registry, &["eject", "--yes"]);
+
+    assert!(!repo.join(".kin").exists());
+    assert_eq!(tracked_state(&repo), tracked_before);
+    assert_eq!(
+        directory_bytes(&repo.join(".git")),
+        git_before,
+        "eject must not mutate the Git interoperability store"
+    );
+    assert_eq!(git_head(&repo), head_before);
+    assert!(
+        git(&repo, &["status", "--porcelain"]).stdout.is_empty(),
+        "recovery metadata must live outside the plain Git working tree"
+    );
+
+    let archives = metadata_archives(&repo);
+    assert_eq!(archives.len(), 1);
+    fs::rename(&archives[0], repo.join(".kin")).unwrap();
+    run_kin_ok(&repo, &registry, &["status", "--json"]);
+    run_kin_ok(&repo, &registry, &["eject", "--yes", "--purge-metadata"]);
+    assert!(metadata_archives(&repo).is_empty());
 }
 
-/// Find the single `.kin-backup-eject-*` directory, if any.
-fn find_backup_dir(repo: &Path) -> Option<std::path::PathBuf> {
-    fs::read_dir(repo)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| {
-            p.file_name()
-                .map(|n| n.to_string_lossy().starts_with(".kin-backup-eject-"))
-                .unwrap_or(false)
-        })
+#[test]
+fn eject_refuses_a_projection_that_differs_from_current_graph_ref() {
+    let root = tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let registry = root.path().join("registry.toml");
+    seed_git_repo(&repo);
+    let original = fs::read(repo.join("compose.yaml")).unwrap();
+    run_kin_ok(&repo, &registry, &["init", "."]);
+
+    fs::write(
+        repo.join("compose.yaml"),
+        b"services:\n  unexpected:\n    image: local-only\n",
+    )
+    .unwrap();
+    let output = run_kin(&repo, &registry, &["eject", "--yes"]);
+    assert_refused(&output, "exact projection");
+    assert!(repo.join(".kin").exists());
+    assert_eq!(
+        fs::read(repo.join("compose.yaml")).unwrap(),
+        b"services:\n  unexpected:\n    image: local-only\n"
+    );
+    assert!(metadata_archives(&repo).is_empty());
+
+    fs::write(repo.join("compose.yaml"), original).unwrap();
+    run_kin_ok(&repo, &registry, &["eject", "--yes", "--purge-metadata"]);
+}
+
+#[test]
+fn exact_git_repo_ejects_without_language_support() {
+    let root = tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let registry = root.path().join("registry.toml");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(
+        repo.join("compose.yaml"),
+        b"services:\n  db:\n    image: postgres:17\n",
+    )
+    .unwrap();
+    fs::write(repo.join("vendor.lock"), b"opaque lock syntax\n").unwrap();
+    fs::write(repo.join("firmware.bin"), [0, 0xff, 0x42, 0x80]).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "kin@example.invalid"]);
+    git(&repo, &["config", "user.name", "Kin Test"]);
+    git(&repo, &["add", "--all"]);
+    git(&repo, &["commit", "-q", "-m", "exact non-code tree"]);
+    let before = ["compose.yaml", "vendor.lock", "firmware.bin"]
+        .into_iter()
+        .map(|path| (path, entry_state(&repo.join(path))))
+        .collect::<BTreeMap<_, _>>();
+
+    run_kin_ok(&repo, &registry, &["init", "."]);
+    run_kin_ok(&repo, &registry, &["eject", "--yes", "--purge-metadata"]);
+
+    assert!(!repo.join(".kin").exists());
+    assert!(repo.join(".git").exists());
+    assert!(metadata_archives(&repo).is_empty());
+    for (path, expected) in before {
+        assert_eq!(entry_state(&repo.join(path)), expected);
+    }
+}
+
+#[test]
+fn legacy_snapshot_restore_flag_is_not_a_product_surface() {
+    let root = tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let registry = root.path().join("registry.toml");
+    seed_git_repo(&repo);
+    run_kin_ok(&repo, &registry, &["init", "."]);
+
+    let output = run_kin(&repo, &registry, &["eject", "--revert-files", "--yes"]);
+    assert_refused(&output, "unexpected argument");
+    assert!(repo.join(".kin").exists());
+
+    run_kin_ok(&repo, &registry, &["eject", "--yes", "--purge-metadata"]);
 }

@@ -8,7 +8,7 @@ use kin_model::*;
 
 use crate::helpers::*;
 
-/// Convert a kin_blobs::Hash256 to a kin_model::Hash256 for use in ArtifactDelta.
+/// Convert a kin_blobs::Hash256 to a kin_model::Hash256 for use in a TreeEntry.
 fn blob_to_model_hash(h: &kin_blobs::Hash256) -> Hash256 {
     Hash256::from_bytes(h.0)
 }
@@ -32,15 +32,14 @@ fn checkout_restores_file_from_branch_head() {
     let content = b"fn main() { println!(\"hello\"); }";
     let blob_hash = blob_store.write(content).unwrap();
 
-    // Create a SemanticChange with an artifact delta for this file
+    // Create a SemanticChange with a tree delta for this file
     let file_id = FilePathId::new("src/main.rs");
+    let entry = TreeEntry::regular(blob_to_model_hash(&blob_hash), false);
     let change = {
         let mut c = make_change(genesis_id, vec![], "add main.rs");
-        c.artifact_deltas.push(ArtifactDelta {
+        c.tree_deltas.push(TreeDelta::Added {
             file_id: file_id.clone(),
-            kind: ArtifactDeltaKind::Added,
-            old_hash: None,
-            new_hash: Some(blob_to_model_hash(&blob_hash)),
+            new_entry: entry,
         });
         c
     };
@@ -54,9 +53,14 @@ fn checkout_restores_file_from_branch_head() {
     let tree = kin_core::build_file_tree(graph.as_ref(), &genesis_id, &change.id).unwrap();
     assert!(tree.contains_key(&file_id), "file should be in tree");
 
-    // Read back the blob content using the hash from the tree
-    let stored_hash = tree.get(&file_id).unwrap();
-    let restored = blob_store.read(&model_to_blob_hash(stored_hash)).unwrap();
+    // Read back the blob content using the entry from the tree
+    let stored = tree.get(&file_id).unwrap();
+    assert_eq!(
+        *stored, entry,
+        "tree entry should match the exact entry the change recorded"
+    );
+    let stored_blob = model_to_blob_hash(&stored.blob_hash);
+    let restored = blob_store.read(&stored_blob).unwrap();
     assert_eq!(restored, content, "blob content should match original");
 
     // Write a different version to disk (simulating a dirty working copy)
@@ -66,8 +70,9 @@ fn checkout_restores_file_from_branch_head() {
 
     // Now simulate what `kin checkout` does: restore from the graph
     let tree = kin_core::build_file_tree(graph.as_ref(), &genesis_id, &change.id).unwrap();
-    let file_hash = tree.get(&file_id).unwrap();
-    let original_content = blob_store.read(&model_to_blob_hash(file_hash)).unwrap();
+    let head_entry = tree.get(&file_id).unwrap();
+    let head_blob = model_to_blob_hash(&head_entry.blob_hash);
+    let original_content = blob_store.read(&head_blob).unwrap();
     std::fs::write(&dest, &original_content).unwrap();
 
     // Verify the file was restored
@@ -90,13 +95,12 @@ fn checkout_restores_from_specific_change() {
     // Version 1
     let content_v1 = b"pub fn version() -> u32 { 1 }";
     let hash_v1 = blob_store.write(content_v1).unwrap();
+    let entry_v1 = TreeEntry::regular(blob_to_model_hash(&hash_v1), false);
     let change_v1 = {
         let mut c = make_change(genesis_id, vec![], "v1");
-        c.artifact_deltas.push(ArtifactDelta {
+        c.tree_deltas.push(TreeDelta::Added {
             file_id: file_id.clone(),
-            kind: ArtifactDeltaKind::Added,
-            old_hash: None,
-            new_hash: Some(blob_to_model_hash(&hash_v1)),
+            new_entry: entry_v1,
         });
         c
     };
@@ -105,13 +109,13 @@ fn checkout_restores_from_specific_change() {
     // Version 2
     let content_v2 = b"pub fn version() -> u32 { 2 }";
     let hash_v2 = blob_store.write(content_v2).unwrap();
+    let entry_v2 = TreeEntry::regular(blob_to_model_hash(&hash_v2), false);
     let change_v2 = {
         let mut c = make_change(change_v1.id, vec![], "v2");
-        c.artifact_deltas.push(ArtifactDelta {
+        c.tree_deltas.push(TreeDelta::Modified {
             file_id: file_id.clone(),
-            kind: ArtifactDeltaKind::Modified,
-            old_hash: Some(blob_to_model_hash(&hash_v1)),
-            new_hash: Some(blob_to_model_hash(&hash_v2)),
+            old_entry: entry_v1,
+            new_entry: entry_v2,
         });
         c
     };
@@ -122,8 +126,10 @@ fn checkout_restores_from_specific_change() {
 
     // HEAD points to v2, but checkout from change_v1 should give v1
     let tree_v1 = kin_core::build_file_tree(graph.as_ref(), &genesis_id, &change_v1.id).unwrap();
-    let file_hash = tree_v1.get(&file_id).unwrap();
-    let restored = blob_store.read(&model_to_blob_hash(file_hash)).unwrap();
+    let entry = tree_v1.get(&file_id).unwrap();
+    assert_eq!(*entry, entry_v1, "tree at v1 should hold the v1 entry");
+    let blob = model_to_blob_hash(&entry.blob_hash);
+    let restored = blob_store.read(&blob).unwrap();
     assert_eq!(
         restored, content_v1,
         "checkout at v1 should return v1 content"
@@ -131,8 +137,10 @@ fn checkout_restores_from_specific_change() {
 
     // And checkout at HEAD (v2) gives v2
     let tree_v2 = kin_core::build_file_tree(graph.as_ref(), &genesis_id, &change_v2.id).unwrap();
-    let file_hash = tree_v2.get(&file_id).unwrap();
-    let restored = blob_store.read(&model_to_blob_hash(file_hash)).unwrap();
+    let entry = tree_v2.get(&file_id).unwrap();
+    assert_eq!(*entry, entry_v2, "tree at v2 should hold the v2 entry");
+    let blob = model_to_blob_hash(&entry.blob_hash);
+    let restored = blob_store.read(&blob).unwrap();
     assert_eq!(
         restored, content_v2,
         "checkout at v2 should return v2 content"
@@ -154,13 +162,12 @@ fn checkout_removed_file_not_in_tree() {
     // Add file
     let content = b"// temporary file";
     let hash = blob_store.write(content).unwrap();
+    let entry = TreeEntry::regular(blob_to_model_hash(&hash), false);
     let change_add = {
         let mut c = make_change(genesis_id, vec![], "add temp");
-        c.artifact_deltas.push(ArtifactDelta {
+        c.tree_deltas.push(TreeDelta::Added {
             file_id: file_id.clone(),
-            kind: ArtifactDeltaKind::Added,
-            old_hash: None,
-            new_hash: Some(blob_to_model_hash(&hash)),
+            new_entry: entry,
         });
         c
     };
@@ -169,11 +176,9 @@ fn checkout_removed_file_not_in_tree() {
     // Remove file
     let change_rm = {
         let mut c = make_change(change_add.id, vec![], "remove temp");
-        c.artifact_deltas.push(ArtifactDelta {
+        c.tree_deltas.push(TreeDelta::Removed {
             file_id: file_id.clone(),
-            kind: ArtifactDeltaKind::Removed,
-            old_hash: Some(blob_to_model_hash(&hash)),
-            new_hash: None,
+            old_entry: entry,
         });
         c
     };
@@ -192,8 +197,9 @@ fn checkout_removed_file_not_in_tree() {
     // But at the add-change, it should be
     let tree_before =
         kin_core::build_file_tree(graph.as_ref(), &genesis_id, &change_add.id).unwrap();
-    assert!(
-        tree_before.contains_key(&file_id),
+    assert_eq!(
+        tree_before.get(&file_id),
+        Some(&entry),
         "file should be in tree at the change that added it"
     );
 }
@@ -217,17 +223,15 @@ fn checkout_multiple_files_in_tree() {
     let mut deltas = vec![];
     for (path, content) in &files {
         let hash = blob_store.write(content).unwrap();
-        deltas.push(ArtifactDelta {
+        deltas.push(TreeDelta::Added {
             file_id: FilePathId::new(*path),
-            kind: ArtifactDeltaKind::Added,
-            old_hash: None,
-            new_hash: Some(blob_to_model_hash(&hash)),
+            new_entry: TreeEntry::regular(blob_to_model_hash(&hash), false),
         });
     }
 
     let change = {
         let mut c = make_change(genesis_id, vec![], "add three files");
-        c.artifact_deltas = deltas;
+        c.tree_deltas = deltas;
         c
     };
     graph.create_change(&change).unwrap();
@@ -241,10 +245,16 @@ fn checkout_multiple_files_in_tree() {
     assert!(tree.contains_key(&FilePathId::new("src/b.rs")));
     assert!(tree.contains_key(&FilePathId::new("src/nested/c.rs")));
 
-    // Verify content roundtrips
+    // Verify content and exact mode roundtrip
     for (path, expected_content) in &files {
-        let file_hash = tree.get(&FilePathId::new(*path)).unwrap();
-        let actual = blob_store.read(&model_to_blob_hash(file_hash)).unwrap();
+        let entry = tree.get(&FilePathId::new(*path)).unwrap();
+        assert_eq!(
+            entry.kind,
+            TreeEntryKind::Regular { executable: false },
+            "mode mismatch for {path}"
+        );
+        let blob = model_to_blob_hash(&entry.blob_hash);
+        let actual = blob_store.read(&blob).unwrap();
         assert_eq!(actual, *expected_content, "content mismatch for {}", path);
     }
 }

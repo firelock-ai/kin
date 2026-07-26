@@ -12,7 +12,7 @@ use std::process::Command;
 pub(crate) struct BenchMeta {
     schema: &'static str,
     kin_version: &'static str,
-    init_pipeline_epoch: &'static str,
+    graph_build_pipeline_epoch: &'static str,
     parser_schema_epoch: &'static str,
     layout_schema_version: u32,
     graph_snapshot_version: u32,
@@ -90,7 +90,7 @@ pub(crate) struct PreparedManifest {
     repo_identity: String,
     git_head: String,
     git_tree: String,
-    init_pipeline_epoch: &'static str,
+    graph_build_pipeline_epoch: &'static str,
     parser_schema_epoch: &'static str,
     layout_schema_version: u32,
     graph_snapshot_version: u32,
@@ -113,7 +113,7 @@ pub(crate) struct RepoBaseManifest {
     schema: &'static str,
     repo_base_key: String,
     repo_identity: String,
-    init_pipeline_epoch: &'static str,
+    graph_build_pipeline_epoch: &'static str,
     parser_schema_epoch: &'static str,
     layout_schema_version: u32,
     graph_snapshot_version: u32,
@@ -165,7 +165,10 @@ pub async fn run(json: bool, prepared_state: bool) -> Result<()> {
     } else {
         println!("schema: {}", meta.schema);
         println!("kin_version: {}", meta.kin_version);
-        println!("init_pipeline_epoch: {}", meta.init_pipeline_epoch);
+        println!(
+            "graph_build_pipeline_epoch: {}",
+            meta.graph_build_pipeline_epoch
+        );
         println!("parser_schema_epoch: {}", meta.parser_schema_epoch);
         println!("layout_schema_version: {}", meta.layout_schema_version);
         println!("graph_snapshot_version: {}", meta.graph_snapshot_version);
@@ -208,9 +211,9 @@ pub async fn run(json: bool, prepared_state: bool) -> Result<()> {
 pub(crate) fn build_meta() -> Result<BenchMeta> {
     let build = kin_buildinfo::get();
     Ok(BenchMeta {
-        schema: "kin.bench-meta.v1",
+        schema: "kin.bench-meta.v2",
         kin_version: env!("CARGO_PKG_VERSION"),
-        init_pipeline_epoch: crate::commands::init::INIT_WARM_CACHE_PIPELINE_EPOCH,
+        graph_build_pipeline_epoch: crate::commands::init::GRAPH_BUILD_PIPELINE_EPOCH,
         parser_schema_epoch: kin_parser::PARSER_SCHEMA_EPOCH,
         layout_schema_version: KIN_LAYOUT_VERSION,
         graph_snapshot_version: kin_db::GraphSnapshot::CURRENT_VERSION,
@@ -369,7 +372,7 @@ pub(crate) fn build_prepared_manifests(
         "repo_identity": &repo_identity,
         "git_head": &git_head,
         "git_tree": &git_tree,
-        "init_pipeline_epoch": meta.init_pipeline_epoch,
+        "graph_build_pipeline_epoch": meta.graph_build_pipeline_epoch,
         "parser_schema_epoch": meta.parser_schema_epoch,
         "layout_schema_version": meta.layout_schema_version,
         "graph_snapshot_version": meta.graph_snapshot_version,
@@ -387,7 +390,7 @@ pub(crate) fn build_prepared_manifests(
     }));
     let repo_base_key = hash_json(&serde_json::json!({
         "repo_identity": &repo_identity,
-        "init_pipeline_epoch": meta.init_pipeline_epoch,
+        "graph_build_pipeline_epoch": meta.graph_build_pipeline_epoch,
         "parser_schema_epoch": meta.parser_schema_epoch,
         "layout_schema_version": meta.layout_schema_version,
         "graph_snapshot_version": meta.graph_snapshot_version,
@@ -405,12 +408,12 @@ pub(crate) fn build_prepared_manifests(
     }));
 
     let prepared = PreparedManifest {
-        schema: "kin.prepared-state.v1",
+        schema: "kin.prepared-state.v2",
         cache_key,
         repo_identity,
         git_head,
         git_tree,
-        init_pipeline_epoch: meta.init_pipeline_epoch,
+        graph_build_pipeline_epoch: meta.graph_build_pipeline_epoch,
         parser_schema_epoch: meta.parser_schema_epoch,
         layout_schema_version: meta.layout_schema_version,
         graph_snapshot_version: meta.graph_snapshot_version,
@@ -429,10 +432,10 @@ pub(crate) fn build_prepared_manifests(
         repo_base_key: repo_base_key.clone(),
     };
     let repo_base = RepoBaseManifest {
-        schema: "kin.prepared-base.v1",
+        schema: "kin.prepared-base.v2",
         repo_base_key,
         repo_identity: prepared.repo_identity.clone(),
-        init_pipeline_epoch: meta.init_pipeline_epoch,
+        graph_build_pipeline_epoch: meta.graph_build_pipeline_epoch,
         parser_schema_epoch: meta.parser_schema_epoch,
         layout_schema_version: meta.layout_schema_version,
         graph_snapshot_version: meta.graph_snapshot_version,
@@ -591,13 +594,16 @@ mod tests {
         let meta = build_meta().unwrap();
         let (prepared, repo_base) = build_prepared_manifests(&meta, repo.path()).unwrap();
 
-        assert_eq!(prepared.schema, "kin.prepared-state.v1");
+        assert_eq!(prepared.schema, "kin.prepared-state.v2");
         assert!(!prepared.cache_key.is_empty());
         assert!(!prepared.repo_base_key.is_empty());
         assert!(prepared.repo_identity.starts_with("path:"));
-        assert_eq!(prepared.init_pipeline_epoch, meta.init_pipeline_epoch);
+        assert_eq!(
+            prepared.graph_build_pipeline_epoch,
+            meta.graph_build_pipeline_epoch
+        );
         assert_eq!(prepared.parser_schema_epoch, meta.parser_schema_epoch);
-        assert_eq!(repo_base.schema, "kin.prepared-base.v1");
+        assert_eq!(repo_base.schema, "kin.prepared-base.v2");
         assert_eq!(repo_base.repo_base_key, prepared.repo_base_key);
         assert_eq!(repo_base.source_git_head, prepared.git_head);
     }
@@ -644,7 +650,7 @@ mod tests {
         );
         assert_eq!(
             repo_base_a.repo_base_key, repo_base_a2.repo_base_key,
-            "warm init cache key must be STABLE across rebuilds of the same commit"
+            "repo-base cache key must be STABLE across rebuilds of the same commit"
         );
 
         let mut meta_commit = meta.clone();
@@ -657,7 +663,7 @@ mod tests {
         );
         assert_ne!(
             repo_base_a.repo_base_key, repo_base_b.repo_base_key,
-            "warm init cache must miss when the Kin commit changes"
+            "repo-base cache must miss when the Kin commit changes"
         );
 
         let mut meta_dirty = meta.clone();
@@ -669,7 +675,7 @@ mod tests {
         );
         assert_ne!(
             repo_base_a.repo_base_key, repo_base_c.repo_base_key,
-            "warm init cache must miss when the dirty flag changes"
+            "repo-base cache must miss when the dirty flag changes"
         );
     }
 }

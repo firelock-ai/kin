@@ -165,7 +165,9 @@ fn xref_not_found_guidance(entity: &str) -> Vec<String> {
         format!(
             "      If '{entity}' is defined only in a sibling/dependency repo, run xref from the repo"
         ),
-        "      that defines it, or import that repo so it joins the spine (`kin import`, `kin deps`)."
+        "      that defines it. Use `kin clone URL` for a remote or `kin init PATH` for a clean"
+            .to_string(),
+        "      existing checkout, then run `kin deps` to refresh dependency discovery."
             .to_string(),
     ]
 }
@@ -242,7 +244,9 @@ mod tests {
             "should explain the anchor model: {joined}"
         );
         assert!(
-            joined.contains("kin import") || joined.contains("kin deps"),
+            joined.contains("kin clone")
+                && joined.contains("kin init PATH")
+                && joined.contains("kin deps"),
             "should give an actionable next step: {joined}"
         );
     }
