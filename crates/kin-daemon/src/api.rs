@@ -3202,6 +3202,9 @@ async fn command_commit(
     let committed =
         crate::repository_commit::commit_native_plan(&state.layout, state.blobs.as_ref(), plan)
             .map_err(repository_commit_error)?;
+    state
+        .record_repository_authority_commit(committed.receipt.generation)
+        .map_err(repository_commit_error)?;
     // The repository transaction is durable authority. The in-process graph is
     // a derived query view; install the exact immutable change only after the
     // authority CAS succeeds.
@@ -4665,11 +4668,10 @@ async fn embed(
             // this handler does its own pre/per-batch/post persistence, and a
             // full-graph flush per feed gap amplifies FS churn on large repos.
 
-            // Pin graph.kndb on disk at the current root hash H before embedding so
-            // the per-batch kvec flushes (which tag metadata with H) match on reopen.
-            // The vector index is a pure sidecar (not in the merkle root), so
-            // embedding never changes H; this only closes the mutated-but-unsaved
-            // window. Cost: one snapshot write up front.
+            // Finalize repository-v6 generation/read-index state before tagging
+            // vector metadata with the live graph root H. The vector index is a
+            // pure derived sidecar (not in the Merkle root), so embedding never
+            // changes H and can never create an alternate graph authority.
             // save_snapshot() acquires persist_lock internally; the non-reentrant std
             // Mutex self-deadlocks if we hold persist_lock across this call (this was
             // the daemon embed hang — the worker wedged here before embedding started).
@@ -12690,7 +12692,7 @@ mod tests {
         assert!(!json.build.built_at.is_empty());
         assert!(
             !json.embed_persistence_unavailable,
-            "local SnapshotManager authority must retain embedding persistence"
+            "local repository authority must allow derived vector persistence"
         );
         assert!(
             !json.filesystem_reconcile_disabled,
