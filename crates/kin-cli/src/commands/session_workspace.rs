@@ -1558,6 +1558,10 @@ mod tests {
         let graph = snap.graph();
         let branch_name = BranchName::new("main");
         let branch = graph.get_branch(&branch_name)?.expect("main branch");
+        let projected_path = repo_path
+            .as_utf8()
+            .expect("test repository paths are UTF-8")
+            .to_owned();
         let change = SemanticChange {
             id: commit_id(id_byte),
             parents: vec![branch.head],
@@ -1570,7 +1574,7 @@ mod tests {
                 artifact_id: ArtifactId::new(),
                 new: LocatedEntry::new(repo_path, entry),
             }],
-            projected_files: vec![FilePathId::new(rel_path)],
+            projected_files: vec![FilePathId::new(projected_path)],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
