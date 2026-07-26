@@ -4873,6 +4873,8 @@ mod tests {
         // siblings, no registry).
         let storage = tempfile::tempdir().unwrap();
         let v2_root = storage.path().join("v2");
+        std::fs::create_dir(&v2_root)
+            .expect("storage fixture must create its existing-only backend root");
 
         // ── Ingestion source: seed the sibling graph into storage ─────────
         // Only the sibling's serialized graph reaches storage — never a local

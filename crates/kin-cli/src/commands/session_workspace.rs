@@ -35,16 +35,19 @@ pub struct SessionWorkspaceResponse {
     pub source_kind: String,
 }
 
-/// Immutable three-way-reconcile base installed inside a session projection.
+/// Durable three-way-reconcile base record installed inside a session projection.
 ///
 /// The source workspace carries the complete exact tree, admission policy,
 /// branch/base binding, and generation from one repository-authority lease.
 /// `materialized_artifact_ids` records the subset exposed by a scoped
-/// projection without discarding the rest of the source workspace.
+/// projection without discarding the rest of the source workspace. Consumers
+/// must rebind this editable session-local record to repository authority before
+/// using it to authorize reconciliation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionWorkspaceBase {
     pub schema: u32,
+    pub repository_id: kin_model::RepositoryId,
     pub authority_roots: RootBundle,
     pub source_workspace: WorkspaceState,
     pub materialized_artifact_ids: Vec<ArtifactId>,
@@ -63,6 +66,13 @@ impl SessionWorkspaceBase {
         self.source_workspace
             .validate()
             .context("validate exact source workspace")?;
+        if self.source_workspace.repository_id != self.repository_id {
+            bail!(
+                "session base repository identity {} does not match source workspace {}",
+                self.repository_id,
+                self.source_workspace.repository_id
+            );
+        }
         if self
             .materialized_artifact_ids
             .windows(2)
@@ -110,9 +120,8 @@ impl SessionWorkspaceBase {
     }
 }
 
-pub fn create_session_workspace_from_graph(
+pub fn create_session_workspace_from_authority(
     layout: &kin_core::KinLayout,
-    graph: &kin_db::InMemoryGraph,
     session_dir: &Path,
     strategy: Option<MaterializeStrategy>,
     scope: Option<&str>,
@@ -125,7 +134,7 @@ pub fn create_session_workspace_from_graph(
 
     let authority = ActiveRepositoryAuthority::open(layout)?;
     let (source_workspace, authority_roots) = authority.workspace_with_roots()?;
-    let selected_tree = select_materialized_tree(graph, &source_workspace.tree, scope)?;
+    let selected_tree = select_materialized_tree(&source_workspace.tree, scope)?;
 
     let mut source_bodies = Vec::with_capacity(selected_tree.len());
     for artifact in selected_tree.artifacts_by_path() {
@@ -157,6 +166,7 @@ pub fn create_session_workspace_from_graph(
         .collect();
     let base = SessionWorkspaceBase {
         schema: SESSION_WORKSPACE_BASE_SCHEMA,
+        repository_id: source_workspace.repository_id.clone(),
         authority_roots,
         source_workspace,
         materialized_artifact_ids,
@@ -198,7 +208,6 @@ pub fn create_session_workspace_from_graph(
 
 pub fn materialize_session_workspace(
     layout: &kin_core::KinLayout,
-    graph: &kin_db::InMemoryGraph,
     request: &SessionWorkspaceRequest,
 ) -> Result<SessionWorkspaceResponse> {
     let strategy = request
@@ -208,19 +217,13 @@ pub fn materialize_session_workspace(
         .transpose()
         .map_err(anyhow::Error::msg)?;
     let root = PathBuf::from(&request.session_dir);
-    let workspace = create_session_workspace_from_graph(
-        layout,
-        graph,
-        &root,
-        strategy,
-        request.scope.as_deref(),
-    )?;
+    let workspace =
+        create_session_workspace_from_authority(layout, &root, strategy, request.scope.as_deref())?;
     Ok(SessionWorkspaceResponse {
         root: workspace.root.display().to_string(),
         strategy: workspace.strategy.to_string(),
         source_kind: match workspace.source_kind() {
             MaterializationSourceKind::ExactTree => "exact-tree",
-            MaterializationSourceKind::Filesystem => "filesystem",
         }
         .to_string(),
     })
@@ -279,11 +282,7 @@ fn validate_session_directory(layout: &kin_core::KinLayout, session_dir: &Path) 
     Ok(())
 }
 
-fn select_materialized_tree(
-    graph: &kin_db::InMemoryGraph,
-    source: &ResolvedTree,
-    scope: Option<&str>,
-) -> Result<ResolvedTree> {
+fn select_materialized_tree(source: &ResolvedTree, scope: Option<&str>) -> Result<ResolvedTree> {
     let Some(scope) = scope else {
         return Ok(source.clone());
     };
@@ -291,34 +290,12 @@ fn select_materialized_tree(
         bail!("session scope must not be empty");
     }
 
-    let path = if let Some(query) = scope.strip_prefix("entity:") {
-        if query.is_empty() {
-            bail!("entity session scope must name an entity");
-        }
-        let entity = super::ref_lookup::resolve_entity_query(graph, query)
-            .with_context(|| format!("resolve session entity scope '{query}'"))?;
-        let file_origin = entity.file_origin.ok_or_else(|| {
-            anyhow!(
-                "entity '{}' has no exact artifact placement and cannot define a session scope",
-                entity.name
-            )
-        })?;
-        if entity
-            .span
-            .as_ref()
-            .is_some_and(|span| span.file != file_origin)
-        {
-            bail!(
-                "entity '{}' has conflicting artifact origins in the query graph",
-                entity.name
-            );
-        }
-        RepoPath::from_utf8(file_origin.0).with_context(|| {
-            format!(
-                "entity '{}' has an invalid exact artifact path",
-                entity.name
-            )
-        })?
+    let path = if scope.starts_with("entity:") {
+        bail!(
+            "entity-scoped session materialization is fail-closed until entity lookup and exact \
+             workspace selection share one repository-authority snapshot; use artifact:<path> or \
+             artifact-hex:<raw-path-hex>"
+        );
     } else if let Some(encoded) = scope.strip_prefix("artifact-hex:") {
         let bytes = hex::decode(encoded).context("decode artifact-hex session scope")?;
         if hex::encode(&bytes) != encoded {
@@ -374,26 +351,30 @@ mod tests {
 
     #[test]
     fn artifact_scopes_resolve_against_exact_tree_membership() {
-        let graph = kin_db::InMemoryGraph::new();
         let (source, compose_id, raw_id) = source_tree();
 
-        let compose =
-            select_materialized_tree(&graph, &source, Some("artifact:compose.yaml")).unwrap();
+        let compose = select_materialized_tree(&source, Some("artifact:compose.yaml")).unwrap();
         assert_eq!(compose.len(), 1);
         assert!(compose.get(&compose_id).is_some());
 
         let encoded = hex::encode(b"assets/policy-\xff.unknown");
         let raw =
-            select_materialized_tree(&graph, &source, Some(&format!("artifact-hex:{encoded}")))
-                .unwrap();
+            select_materialized_tree(&source, Some(&format!("artifact-hex:{encoded}"))).unwrap();
         assert_eq!(raw.len(), 1);
         assert!(raw.get(&raw_id).is_some());
 
-        let missing =
-            select_materialized_tree(&graph, &source, Some("artifact:missing.file")).unwrap_err();
+        let missing = select_materialized_tree(&source, Some("artifact:missing.file")).unwrap_err();
         assert!(missing
             .to_string()
             .contains("absent from the exact workspace tree"));
+
+        let entity = select_materialized_tree(&source, Some("entity:compose")).unwrap_err();
+        assert!(
+            entity
+                .to_string()
+                .contains("share one repository-authority snapshot"),
+            "{entity}"
+        );
     }
 
     #[test]
