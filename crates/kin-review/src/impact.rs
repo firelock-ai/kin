@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashSet};
 
 use kin_model::entity::{Entity, EntityRole};
 use kin_model::graph::GraphStore;
-use kin_model::ids::{EntityId, SemanticChangeId};
+use kin_model::ids::{EntityId, RepoPath, SemanticChangeId};
 use kin_model::provenance::{Actor, ActorId, ActorKind, Approval, ApprovalDecision, AuditEvent};
 use kin_model::relation::{GraphNodeId, Relation, RelationKind};
 use kin_model::work::{Annotation, StalenessState, WorkItem, WorkScope};
@@ -102,8 +102,10 @@ impl<G: GraphStore> ImpactGraph for LiveGraph<'_, G> {
         }
 
         for file in source_files {
-            let file_id = kin_model::FilePathId::new(&file);
-            let Some(artifact_id) = self.0.artifact_id_for_path(&file_id) else {
+            let Ok(path) = RepoPath::from_utf8(file.clone()) else {
+                return Ok(false);
+            };
+            let Some(artifact_id) = self.0.artifact_id_at_path(&path) else {
                 return Ok(false);
             };
             let artifact = GraphNodeId::Artifact(artifact_id);
@@ -723,7 +725,26 @@ mod tests {
         Visibility,
     };
     use kin_model::ids::*;
-    use kin_model::EntityStore;
+    use kin_model::{EntityStore, LocatedEntry, TransactionDelta, TreeDelta, TreeEntry};
+
+    fn admit_test_artifact(graph: &kin_db::InMemoryGraph, path: &str) -> ArtifactId {
+        let path = RepoPath::from_utf8(path).expect("valid test repository path");
+        let artifact_id = ArtifactId::new();
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: LocatedEntry::new(
+                        path,
+                        TreeEntry::blob(Hash256::from_bytes([0x5a; 32]), false),
+                    ),
+                }],
+            })
+            .expect("test artifact admission");
+        artifact_id
+    }
 
     fn test_entity(name: &str) -> Entity {
         Entity {
@@ -890,7 +911,7 @@ mod tests {
         }];
         let artifact_ids = kin_index::linker::ArtifactIdentityMap::from([(
             "src/lib.py".to_string(),
-            graph.ensure_artifact_id(&FilePathId::new("src/lib.py")),
+            admit_test_artifact(&graph, "src/lib.py"),
         )]);
         let mut coverage = kin_index::link_cross_file_with_completeness(
             &complete_files,

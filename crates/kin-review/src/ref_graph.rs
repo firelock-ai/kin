@@ -408,7 +408,10 @@ impl<G: GraphStore> ImpactGraph for GraphAtRef<'_, G> {
 mod tests {
     use super::*;
     use kin_db::InMemoryGraph;
-    use kin_model::change::{EntityDelta, RelationDelta, SemanticChange};
+    use kin_model::change::{
+        EntityDelta, LocatedEntry, RelationDelta, SemanticChange, TransactionDelta, TreeDelta,
+        TreeEntry,
+    };
     use kin_model::entity::{
         Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint,
         Visibility,
@@ -417,6 +420,28 @@ mod tests {
     use kin_model::ids::*;
     use kin_model::relation::{GraphNodeId, RelationOrigin};
     use kin_model::timestamp::Timestamp;
+
+    fn admit_test_artifact(graph: &InMemoryGraph, path: &str) -> ArtifactId {
+        let path = RepoPath::from_utf8(path).expect("valid test repository path");
+        if let Some(artifact_id) = graph.artifact_id_at_path(&path) {
+            return artifact_id;
+        }
+        let artifact_id = ArtifactId::new();
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: LocatedEntry::new(
+                        path,
+                        TreeEntry::blob(Hash256::from_bytes([0x4d; 32]), false),
+                    ),
+                }],
+            })
+            .expect("test artifact admission");
+        artifact_id
+    }
 
     fn test_entity(name: &str) -> Entity {
         Entity {
@@ -466,8 +491,10 @@ mod tests {
         files
             .iter()
             .map(|file| {
-                let file_id = FilePathId::new(file.file_path.as_str());
-                (file.file_path.clone(), graph.ensure_artifact_id(&file_id))
+                (
+                    file.file_path.clone(),
+                    admit_test_artifact(graph, &file.file_path),
+                )
             })
             .collect()
     }

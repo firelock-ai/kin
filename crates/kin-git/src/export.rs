@@ -877,14 +877,8 @@ mod tests {
         ) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
-        fn artifact_id_for_path(&self, _: &kin_model::FilePathId) -> Option<kin_model::ArtifactId> {
+        fn artifact_id_at_path(&self, _: &kin_model::RepoPath) -> Option<kin_model::ArtifactId> {
             None
-        }
-        fn ensure_artifact_id(
-            &self,
-            _: &kin_model::FilePathId,
-        ) -> std::result::Result<kin_model::ArtifactId, Self::Error> {
-            Ok(kin_model::ArtifactId::new())
         }
         fn upsert_file_layout(
             &self,
