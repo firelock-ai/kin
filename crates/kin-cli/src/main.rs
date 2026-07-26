@@ -92,30 +92,19 @@ enum Command {
         /// Head change ID
         head: Option<String>,
     },
-    /// ⚠ WARNING: Remove Kin metadata from this repository.
+    /// Verify the graph-derived working tree and detach Kin from this repository.
     ///
-    /// By default (safe): stops the daemon and removes .kin/ graph + metadata.
-    /// Working files are left exactly as they are.
-    ///
-    /// With --revert-files (DESTRUCTIVE): additionally overwrites every working
-    /// file with the pre-init snapshot copy, destroying any uncommitted changes.
-    /// Requires typing "revert" to confirm unless --yes is also given.
-    /// A backup of current files is created before any mutation.
-    ///
-    /// Eject never touches .git: Kin only restores files it snapshotted at init,
-    /// and Git history is left intact. After eject the directory is a plain Git
-    /// repository again.
+    /// Eject never restores initialization-time files. It requires every
+    /// graph-owned artifact and blob to match the current projection, stops the
+    /// repository daemon, rechecks persisted graph truth, and atomically moves
+    /// `.kin/` to a recoverable sibling archive. Working files are not rewritten.
     Eject {
-        /// DESTRUCTIVE: overwrite working files with the pre-init snapshot and
-        /// delete the Kin graph. Requires typing "revert" to confirm (or --yes).
-        #[arg(long)]
-        revert_files: bool,
-        /// Skip typed confirmation for --revert-files (for non-interactive use).
+        /// Skip the typed "eject" confirmation.
         #[arg(long)]
         yes: bool,
-        /// Deprecated: use --yes. Kept for compatibility; has no effect without --revert-files.
-        #[arg(long, hide = true)]
-        force: bool,
+        /// Permanently delete the detached metadata archive after the atomic move.
+        #[arg(long, requires = "yes")]
+        purge_metadata: bool,
     },
     /// Show downstream impact of an entity
     Impact {
@@ -1969,10 +1958,9 @@ fn main() -> Result<()> {
                 },
                 Command::Diff { base, head } => commands::diff::run(base, head).await,
                 Command::Eject {
-                    revert_files,
                     yes,
-                    force,
-                } => commands::eject::run(revert_files, yes || force).await,
+                    purge_metadata,
+                } => commands::eject::run(yes, purge_metadata).await,
                 Command::Impact {
                     entity,
                     depth,
