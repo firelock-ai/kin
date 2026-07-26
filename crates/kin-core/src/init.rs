@@ -40,7 +40,12 @@ pub struct InitResult {
     pub manifest: KinManifest,
     pub repository_id: RepositoryId,
     pub workspace_id: WorkspaceId,
-    pub default_ref: RefName,
+    /// Exact material workspace HEAD established by initialization.
+    ///
+    /// Symbolic targets retain byte-exact `RefName` identity. Detached Git
+    /// annotated tags are represented by their verified peeled commit; their
+    /// exact raw tag target remains in `GitExternalAuthority`.
+    pub head: WorkspaceHead,
     pub authority: RepositoryBootstrap,
 }
 
@@ -251,7 +256,7 @@ pub fn init(working_dir: &Path) -> Result<InitResult> {
         path = %canonical_working_dir.display(),
         repository = %result.repository_id,
         workspace = %result.workspace_id,
-        default_ref = %result.default_ref,
+        head = ?result.head,
         "initialized unborn kin repository authority"
     );
 
@@ -464,7 +469,7 @@ fn publish_repository_layout_with_hooks(
         manifest,
         repository_id: prepared.repository_id.clone(),
         workspace_id: prepared.workspace_id,
-        default_ref: prepared.default_ref.clone(),
+        head: bootstrap.workspace.workspace_head.clone(),
         authority: bootstrap,
     })
 }
@@ -1195,14 +1200,14 @@ mod tests {
         assert!(result.layout.logs_dir().exists());
         assert!(result.layout.adapters_dir().exists());
 
-        assert_eq!(result.default_ref, RefName::branch(b"main").unwrap());
-        assert_eq!(result.authority.initial_change_id, None);
         assert_eq!(
-            result.authority.workspace.workspace_head,
+            result.head,
             WorkspaceHead::Symbolic {
-                target: result.default_ref.clone()
+                target: RefName::branch(b"main").unwrap()
             }
         );
+        assert_eq!(result.authority.initial_change_id, None);
+        assert_eq!(result.authority.workspace.workspace_head, result.head);
         assert_eq!(result.authority.workspace.base_target, None);
         assert_eq!(result.authority.workspace.base_tree_hash, None);
         assert!(!result.authority.workspace.is_dirty());

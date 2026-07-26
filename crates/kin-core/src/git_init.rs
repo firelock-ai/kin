@@ -693,6 +693,12 @@ mod tests {
             }
         );
         assert_eq!(
+            result.head,
+            kin_model::WorkspaceHead::Detached {
+                target: material_target.clone()
+            }
+        );
+        assert_eq!(
             result.authority.workspace.base_target,
             Some(material_target)
         );
@@ -748,10 +754,51 @@ mod tests {
             }
         );
         assert_eq!(
+            result.head,
+            kin_model::WorkspaceHead::Symbolic {
+                target: tag_ref.clone()
+            }
+        );
+        assert_eq!(
             result.authority.workspace.base_target,
             Some(kin_model::RefTarget::external_object(
                 ExternalObjectId::new(ExternalObjectKind::Commit, commit_oid)
             ))
+        );
+        assert_no_staging_directories(root.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn byte_symbolic_git_head_is_reported_exactly_without_inventing_main() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        let raw_branch_leaf = b"raw-\xff".to_vec();
+        let mut raw_head = b"ref: refs/heads/".to_vec();
+        raw_head.extend_from_slice(&raw_branch_leaf);
+        raw_head.push(b'\n');
+        std::fs::write(source.join(".git/HEAD"), raw_head).unwrap();
+
+        let result = init_from_git(&source).unwrap();
+
+        let mut expected = b"refs/heads/".to_vec();
+        expected.extend_from_slice(&raw_branch_leaf);
+        assert!(matches!(
+            &result.head,
+            kin_model::WorkspaceHead::Symbolic { target } if target.as_bytes() == expected
+        ));
+        assert!(matches!(
+            &result.authority.workspace.workspace_head,
+            kin_model::WorkspaceHead::Symbolic { target } if target.as_bytes() == expected
+        ));
+        assert_ne!(
+            match &result.head {
+                kin_model::WorkspaceHead::Symbolic { target } => target.as_bytes(),
+                kin_model::WorkspaceHead::Detached { .. } => unreachable!(),
+            },
+            b"refs/heads/main"
         );
         assert_no_staging_directories(root.path());
     }
