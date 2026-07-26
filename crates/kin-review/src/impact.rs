@@ -888,13 +888,18 @@ mod tests {
             relations: Vec::new(),
             imports: Vec::new(),
         }];
-        let mut coverage =
-            kin_index::link_cross_file_with_completeness(&complete_files, &completeness);
+        let artifact_ids = kin_index::linker::ArtifactIdentityMap::from([(
+            "src/lib.py".to_string(),
+            graph.ensure_artifact_id(&FilePathId::new("src/lib.py")),
+        )]);
+        let mut coverage = kin_index::link_cross_file_with_completeness(
+            &complete_files,
+            &artifact_ids,
+            &completeness,
+        )
+        .expect("graph-owned artifact identity must satisfy coverage linking");
         let mut extraction_incomplete = coverage[0].clone();
         extraction_incomplete.id = RelationId::from_bytes([0xee; 16]);
-        extraction_incomplete.dst = GraphNodeId::Artifact(kin_model::ArtifactId::seed_from_path(
-            "kin-internal://test/extraction-incomplete/src/lib.py",
-        ));
         extraction_incomplete.evidence = vec![RelationEvidence {
             source_path: Some("src/lib.py".to_string()),
             parser_rule: Some(kin_index::CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1.to_string()),

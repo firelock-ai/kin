@@ -459,6 +459,19 @@ mod tests {
         }
     }
 
+    fn graph_artifact_identities(
+        graph: &InMemoryGraph,
+        files: &[kin_index::FileParseData],
+    ) -> kin_index::linker::ArtifactIdentityMap {
+        files
+            .iter()
+            .map(|file| {
+                let file_id = FilePathId::new(file.file_path.as_str());
+                (file.file_path.clone(), graph.ensure_artifact_id(&file_id))
+            })
+            .collect()
+    }
+
     #[test]
     fn ref_scoped_parse_coverage_requires_positive_full_file_markers() {
         let live = InMemoryGraph::new();
@@ -471,16 +484,19 @@ mod tests {
             relations: Vec::new(),
             imports: Vec::new(),
         }];
+        let artifact_ids = graph_artifact_identities(&live, &files);
 
         let materialize = |parse_completeness| {
             let completeness = kin_index::FileParseCompletenessMap::from([(
                 "src/lib.py".to_string(),
                 parse_completeness,
             )]);
-            let relations = kin_index::link_cross_file_with_completeness(&files, &completeness)
-                .into_iter()
-                .map(|relation| (relation.id, relation))
-                .collect();
+            let relations =
+                kin_index::link_cross_file_with_completeness(&files, &artifact_ids, &completeness)
+                    .expect("graph-owned artifact identities must satisfy coverage linking")
+                    .into_iter()
+                    .map(|relation| (relation.id, relation))
+                    .collect();
             GraphAtRef::from_state(
                 &live,
                 at,
@@ -517,7 +533,8 @@ mod tests {
             kin_model::ParseCompleteness::Full,
         )]);
         let mut dual_relations =
-            kin_index::link_cross_file_with_completeness(&files, &full_completeness)
+            kin_index::link_cross_file_with_completeness(&files, &artifact_ids, &full_completeness)
+                .expect("graph-owned artifact identities must satisfy coverage linking")
                 .into_iter()
                 .map(|relation| (relation.id, relation))
                 .collect::<HashMap<_, _>>();
@@ -585,11 +602,16 @@ mod tests {
                 kin_model::ParseCompleteness::Partial("omitted keyword call".to_string()),
             ),
         ]);
-        let mut relations =
-            kin_index::link_cross_file_with_completeness(&coverage_files, &completeness)
-                .into_iter()
-                .map(|relation| (relation.id, relation))
-                .collect::<HashMap<_, _>>();
+        let coverage_artifact_ids = graph_artifact_identities(&live, &coverage_files);
+        let mut relations = kin_index::link_cross_file_with_completeness(
+            &coverage_files,
+            &coverage_artifact_ids,
+            &completeness,
+        )
+        .expect("graph-owned artifact identities must satisfy coverage linking")
+        .into_iter()
+        .map(|relation| (relation.id, relation))
+        .collect::<HashMap<_, _>>();
         let mut positional_call = test_relation(0x7b, caller.id, target.id, RelationKind::Calls);
         positional_call.evidence = vec![kin_model::RelationEvidence {
             parser_rule: Some(kin_index::CALL_SHAPE_EVIDENCE_AGGREGATION_V1.to_string()),
