@@ -45,8 +45,8 @@ pub use storage::{
     PersistOutcome, VersionedAuthorityState,
 };
 pub use storage::{
-    ChangeAdmissionPolicy, PersistedRepositoryAuthority, RepositoryAuthorityManager,
-    RepositoryAuthorityState,
+    ChangeAdmissionPolicy, LocalRepositoryAuthorityFreeze, PersistedRepositoryAuthority,
+    RepositoryAuthorityManager, RepositoryAuthorityState,
 };
 pub use storage::{LoadStrategy, SystemMemInfo, TieredConfig, TieredGraph};
 pub use store::{

@@ -42,7 +42,8 @@ use crate::storage::authority::{
 };
 use crate::storage::backend::{
     load_recovered_snapshot, validate_source_blob_size, verify_source_blob_digest, Generation,
-    SnapshotCursor, SnapshotSaveOutcome, StorageBackend, MAX_SOURCE_BLOB_BYTES,
+    LocalAuthorityFreezeLock, LocalFileBackend, SnapshotCursor, SnapshotSaveOutcome,
+    StorageBackend, MAX_SOURCE_BLOB_BYTES,
 };
 use crate::storage::format::GraphSnapshot;
 
@@ -532,6 +533,125 @@ pub struct RepositoryAuthorityManager<B: StorageBackend + ?Sized + 'static> {
     publication: AuthorityPublication<RepositoryAuthorityState, RepositorySnapshotPersistence<B>>,
 }
 
+/// Exclusive, cross-process lease over one fully revalidated local repository
+/// authority generation.
+///
+/// The existing per-repository storage lock remains held until this value is
+/// dropped. Namespace transitions such as exact export/eject must keep the
+/// guard alive through their final projection check and atomic metadata move.
+/// The guard cannot be created for an unpersisted repository or a stale root
+/// bundle.
+#[must_use = "dropping the guard releases the local repository authority freeze"]
+#[derive(Debug)]
+pub struct LocalRepositoryAuthorityFreeze {
+    state: RepositoryAuthorityState,
+    _lock: LocalAuthorityFreezeLock,
+}
+
+impl LocalRepositoryAuthorityFreeze {
+    /// Exact persisted authority reloaded after the exclusive lock was held.
+    pub fn authority(&self) -> &RepositoryAuthorityState {
+        &self.state
+    }
+
+    /// Cryptographic root bundle protected by this freeze.
+    pub fn roots(&self) -> &RootBundle {
+        self.state.roots()
+    }
+}
+
+struct FrozenLocalBodyBackend<'a> {
+    backend: &'a LocalFileBackend,
+    freeze: &'a LocalAuthorityFreezeLock,
+}
+
+impl FrozenLocalBodyBackend<'_> {
+    fn unsupported(operation: &str) -> KinDbError {
+        storage(format!(
+            "{operation} is unavailable through a frozen local body-validation view"
+        ))
+    }
+}
+
+impl StorageBackend for FrozenLocalBodyBackend<'_> {
+    fn load_snapshot(&self, _repo_id: &str) -> Result<Option<(Vec<u8>, Generation)>, KinDbError> {
+        Err(Self::unsupported("snapshot load"))
+    }
+
+    fn load_source_blob(
+        &self,
+        repo_id: &str,
+        digest: [u8; 32],
+    ) -> Result<Option<Vec<u8>>, KinDbError> {
+        self.load_source_blob_bounded(repo_id, digest, MAX_SOURCE_BLOB_BYTES)
+    }
+
+    fn load_source_blob_bounded(
+        &self,
+        repo_id: &str,
+        digest: [u8; 32],
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>, KinDbError> {
+        self.backend
+            .load_source_blob_bounded_while_frozen(self.freeze, repo_id, digest, max_bytes)
+    }
+
+    fn save_snapshot(
+        &self,
+        _repo_id: &str,
+        _data: &[u8],
+        _expected_gen: Generation,
+    ) -> Result<Generation, KinDbError> {
+        Err(Self::unsupported("snapshot save"))
+    }
+
+    fn save_delta(
+        &self,
+        _repo_id: &str,
+        _delta_data: &[u8],
+        _base_gen: Generation,
+    ) -> Result<Generation, KinDbError> {
+        Err(Self::unsupported("delta save"))
+    }
+
+    fn load_deltas_since(
+        &self,
+        _repo_id: &str,
+        _since_gen: Generation,
+    ) -> Result<Vec<(Vec<u8>, Generation)>, KinDbError> {
+        Err(Self::unsupported("delta load"))
+    }
+
+    fn clear_deltas(&self, _repo_id: &str) -> Result<(), KinDbError> {
+        Err(Self::unsupported("delta cleanup"))
+    }
+
+    fn save_overlay(
+        &self,
+        _repo_id: &str,
+        _session_id: &str,
+        _data: &[u8],
+    ) -> Result<(), KinDbError> {
+        Err(Self::unsupported("overlay save"))
+    }
+
+    fn load_overlay(
+        &self,
+        _repo_id: &str,
+        _session_id: &str,
+    ) -> Result<Option<Vec<u8>>, KinDbError> {
+        Err(Self::unsupported("overlay load"))
+    }
+
+    fn delete_overlay(&self, _repo_id: &str, _session_id: &str) -> Result<(), KinDbError> {
+        Err(Self::unsupported("overlay delete"))
+    }
+
+    fn list_repos(&self) -> Result<Vec<String>, KinDbError> {
+        Err(Self::unsupported("repository listing"))
+    }
+}
+
 impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
     /// Open existing authority or prepare an unpersisted generation-zero repo.
     pub fn open(repository_id: RepositoryId, backend: Arc<B>) -> Result<Self, KinDbError> {
@@ -759,6 +879,70 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
                 next,
                 output: receipt,
             })
+        })
+    }
+}
+
+impl RepositoryAuthorityManager<LocalFileBackend> {
+    /// Freeze one expected local authority generation for a namespace
+    /// transition.
+    ///
+    /// This acquires the already-existing per-repository OS lock without
+    /// creating storage, reloads the full persisted snapshot while holding
+    /// that lock, repeats every repository-v6 structural/history/body
+    /// validation performed by [`RepositoryAuthorityManager::open`], and
+    /// requires its roots to match both the caller's expectation and this
+    /// manager's published state. Competing local writers remain blocked until
+    /// the returned guard is dropped.
+    pub fn freeze_current_authority(
+        &self,
+        expected_roots: &RootBundle,
+    ) -> Result<LocalRepositoryAuthorityFreeze, KinDbError> {
+        let published_roots = self.read_authority().roots().clone();
+        if &published_roots != expected_roots {
+            return Err(ModelError::Conflict(format!(
+                "repository {} published authority moved from the expected root bundle before local freeze",
+                self.repository_id
+            ))
+            .into());
+        }
+
+        let locked = self
+            .backend
+            .freeze_existing_authority(self.repository_id.as_str())?;
+        let snapshot = GraphSnapshot::from_bytes(&locked.authority().snapshot_bytes)?;
+        let metadata = snapshot.repository_authority.as_ref().ok_or_else(|| {
+            storage(format!(
+                "repository {} frozen snapshot has no v11 authority envelope",
+                self.repository_id
+            ))
+        })?;
+        if metadata.repository_id != self.repository_id {
+            return Err(storage(format!(
+                "frozen snapshot authority belongs to {}, not {}",
+                metadata.repository_id, self.repository_id
+            )));
+        }
+        snapshot.validate_storage_admission()?;
+        let all_changes: Vec<_> = snapshot.changes.values().cloned().collect();
+        validate_history_replay(&snapshot, &all_changes)?;
+        let body_backend = FrozenLocalBodyBackend {
+            backend: self.backend.as_ref(),
+            freeze: &locked,
+        };
+        validate_all_authority_bodies(&body_backend, &self.repository_id, &snapshot)?;
+
+        let state = RepositoryAuthorityState { snapshot };
+        if state.roots() != expected_roots || state.roots() != &published_roots {
+            return Err(ModelError::Conflict(format!(
+                "repository {} persisted authority moved from the expected root bundle while local freeze was acquired",
+                self.repository_id
+            ))
+            .into());
+        }
+        Ok(LocalRepositoryAuthorityFreeze {
+            state,
+            _lock: locked,
         })
     }
 }
@@ -3464,8 +3648,8 @@ mod tests {
         }
     }
 
-    fn arbitrary_repository_transaction(
-        manager: &RepositoryAuthorityManager<MemoryBackend>,
+    fn arbitrary_repository_transaction<B: StorageBackend + ?Sized + 'static>(
+        manager: &RepositoryAuthorityManager<B>,
     ) -> RepositoryTransaction {
         let fixtures: Vec<(u128, Vec<u8>, Vec<u8>, TreeEntry)> = vec![
             (
@@ -5910,6 +6094,161 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reopened.read_authority().generation(), 1);
+    }
+
+    #[test]
+    fn local_authority_freeze_reloads_expected_roots_and_blocks_a_writer() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let stale_backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        let stale =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&stale_backend)).unwrap();
+        let stale_roots = stale.read_authority().roots().clone();
+
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .unwrap();
+        let error = stale
+            .freeze_current_authority(&stale_roots)
+            .expect_err("a stale in-memory manager must not freeze newer persisted authority");
+        assert!(error
+            .to_string()
+            .contains("persisted authority moved from the expected root bundle"));
+
+        let expected_roots = manager.read_authority().roots().clone();
+        let competing_backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let competing =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&competing_backend))
+                .unwrap();
+        let transaction = unborn_workspace_transaction(&competing, 0x5402, 0x5403, b"release");
+        let freeze = manager
+            .freeze_current_authority(&expected_roots)
+            .expect("current persisted authority must freeze");
+        assert_eq!(freeze.roots(), &expected_roots);
+        assert_eq!(freeze.authority().roots(), &expected_roots);
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = competing.commit_repository_transaction(transaction);
+            finished_tx.send(result).unwrap();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "a competing repository writer must remain blocked while the freeze guard lives"
+        );
+
+        drop(freeze);
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("writer must resume after freeze release")
+            .expect("writer must commit against the unchanged frozen parent");
+        writer.join().unwrap();
+
+        let reopened = RepositoryAuthorityManager::open(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        )
+        .unwrap();
+        assert_eq!(reopened.read_authority().generation(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_authority_freeze_revokes_a_blocked_writer_after_namespace_detach() {
+        let directory = TempDir::new().unwrap();
+        let base = directory.path().join("kindb");
+        std::fs::create_dir(&base).unwrap();
+        let backend = Arc::new(LocalFileBackend::new(&base));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        manager
+            .commit_repository_transaction(unborn_workspace_transaction(
+                &manager, 0x5500, 0x5501, b"main",
+            ))
+            .unwrap();
+
+        let competing = RepositoryAuthorityManager::open(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(&base)),
+        )
+        .unwrap();
+        let transaction = unborn_workspace_transaction(&competing, 0x5502, 0x5503, b"release");
+        let expected = manager.read_authority().roots().clone();
+        let freeze = manager.freeze_current_authority(&expected).unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx
+                .send(competing.commit_repository_transaction(transaction))
+                .unwrap();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "writer must be waiting behind the held repository lock"
+        );
+
+        let detached = directory.path().join("detached-kindb");
+        std::fs::rename(&base, &detached).unwrap();
+        drop(freeze);
+        let error = finished_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("blocked writer must wake after freeze release")
+            .expect_err("a writer pinned before detach must not resurrect authority");
+        assert!(
+            error.to_string().contains("namespace changed")
+                || error
+                    .to_string()
+                    .contains("unavailable for existing-authority access"),
+            "unexpected post-detach writer error: {error}"
+        );
+        writer.join().unwrap();
+        assert!(
+            !base.exists(),
+            "the blocked writer must not recreate the detached local storage root"
+        );
+        assert!(
+            detached.exists(),
+            "the exact detached authority namespace must remain recoverable"
+        );
+    }
+
+    #[test]
+    fn local_authority_freeze_rejects_an_unpersisted_repository() {
+        let directory = TempDir::new().unwrap();
+        let manager = RepositoryAuthorityManager::open(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        )
+        .unwrap();
+        let expected = manager.read_authority().roots().clone();
+
+        let error = manager
+            .freeze_current_authority(&expected)
+            .expect_err("generation-zero memory state is not persisted local authority");
+        assert!(
+            error
+                .to_string()
+                .contains("unavailable for existing-authority access")
+                || error
+                    .to_string()
+                    .contains("has no existing local snapshot authority to freeze")
+        );
     }
 
     #[test]

@@ -1827,6 +1827,36 @@ pub struct LocalFileBackend {
     source_blob_before_publish_hook: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
 }
 
+/// One existing local repository authority held beneath its exclusive
+/// cross-process lock.
+///
+/// This is crate-private because callers need the fully validated
+/// [`RepositoryAuthorityState`](crate::storage::RepositoryAuthorityState)
+/// wrapper exposed by `RepositoryAuthorityManager`, not raw snapshot bytes.
+#[derive(Debug)]
+pub(crate) struct LocalAuthorityFreezeLock {
+    repo_id: String,
+    authority: SnapshotAuthority,
+    _lock_file: std::fs::File,
+}
+
+impl LocalAuthorityFreezeLock {
+    pub(crate) fn authority(&self) -> &SnapshotAuthority {
+        &self.authority
+    }
+
+    fn require_repository(&self, repo_id: &str) -> Result<(), KinDbError> {
+        if self.repo_id == repo_id {
+            Ok(())
+        } else {
+            Err(KinDbError::StorageError(format!(
+                "local authority freeze belongs to repo {}, not {repo_id}",
+                self.repo_id
+            )))
+        }
+    }
+}
+
 const LOCAL_AUTHORITY_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1922,27 +1952,91 @@ impl LocalFileBackend {
         self.deltas_dir(repo_id).join(format!("{gen:020}.kndd"))
     }
 
-    fn acquire_lock(&self, repo_id: &str) -> Result<std::fs::File, KinDbError> {
-        let lock_path = self.base_path.join(repo_id).join(".lock");
-        if let Some(parent) = lock_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                KinDbError::StorageError(format!(
-                    "failed to create directory {}: {e}",
-                    parent.display()
-                ))
-            })?;
+    fn existing_repository_path(&self, repo_id: &str) -> Result<Option<PathBuf>, KinDbError> {
+        validate_source_blob_repo_id(repo_id)?;
+        let repository_path = self.base_path.join(repo_id);
+        let metadata = match std::fs::symlink_metadata(&repository_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(KinDbError::StorageError(format!(
+                    "failed to inspect local repository authority directory {}: {error}",
+                    repository_path.display()
+                )))
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(KinDbError::StorageError(format!(
+                "local repository authority directory {} is not a real directory",
+                repository_path.display()
+            )));
         }
-        let lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|e| {
-                KinDbError::StorageError(format!(
-                    "failed to open lock file {}: {e}",
-                    lock_path.display()
-                ))
-            })?;
+        Ok(Some(repository_path))
+    }
+
+    fn acquire_lock(&self, repo_id: &str) -> Result<std::fs::File, KinDbError> {
+        validate_source_blob_repo_id(repo_id)?;
+        let base_metadata = std::fs::symlink_metadata(&self.base_path).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "local storage root {} is unavailable; refusing to recreate a detached authority namespace: {error}",
+                self.base_path.display()
+            ))
+        })?;
+        if base_metadata.file_type().is_symlink() || !base_metadata.is_dir() {
+            return Err(KinDbError::StorageError(format!(
+                "local storage root {} is not a real directory",
+                self.base_path.display()
+            )));
+        }
+        let repository_path = self.base_path.join(repo_id);
+        match std::fs::create_dir(&repository_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(KinDbError::StorageError(format!(
+                    "failed to create local repository authority directory {}: {error}",
+                    repository_path.display()
+                )))
+            }
+        }
+        self.existing_repository_path(repo_id)?.ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "local repository authority directory {} disappeared during initialization",
+                repository_path.display()
+            ))
+        })?;
+        let lock_path = repository_path.join(".lock");
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).read(true).write(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let lock_file = options.open(&lock_path).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to open lock file {}: {error}",
+                lock_path.display()
+            ))
+        })?;
+        let opened_metadata = lock_file.metadata().map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to inspect opened local repository authority lock {}: {error}",
+                lock_path.display()
+            ))
+        })?;
+        if !opened_metadata.is_file() {
+            return Err(KinDbError::StorageError(format!(
+                "opened local repository authority lock {} is not a regular file",
+                lock_path.display()
+            )));
+        }
         use fs2::FileExt;
         lock_file.lock_exclusive().map_err(|e| {
             KinDbError::StorageError(format!(
@@ -1950,7 +2044,236 @@ impl LocalFileBackend {
                 lock_path.display()
             ))
         })?;
+        self.confirm_existing_lock_visible(&lock_path, &lock_file)?;
         Ok(lock_file)
+    }
+
+    fn acquire_existing_lock(&self, repo_id: &str) -> Result<std::fs::File, KinDbError> {
+        let repository_path = self.existing_repository_path(repo_id)?.ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "local repository authority directory {} is unavailable for existing-authority access",
+                self.base_path.join(repo_id).display()
+            ))
+        })?;
+
+        let lock_path = repository_path.join(".lock");
+        let lock_metadata = std::fs::symlink_metadata(&lock_path).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "existing local repository authority lock {} is unavailable: {error}",
+                lock_path.display()
+            ))
+        })?;
+        if lock_metadata.file_type().is_symlink() || !lock_metadata.is_file() {
+            return Err(KinDbError::StorageError(format!(
+                "existing local repository authority lock {} is not a regular file",
+                lock_path.display()
+            )));
+        }
+
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let lock_file = options.open(&lock_path).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to open existing local repository authority lock {}: {error}",
+                lock_path.display()
+            ))
+        })?;
+        let opened_metadata = lock_file.metadata().map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to inspect opened local repository authority lock {}: {error}",
+                lock_path.display()
+            ))
+        })?;
+        if !opened_metadata.is_file() {
+            return Err(KinDbError::StorageError(format!(
+                "opened local repository authority lock {} is not a regular file",
+                lock_path.display()
+            )));
+        }
+
+        use fs2::FileExt;
+        lock_file.lock_exclusive().map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to acquire existing local repository authority lock {}: {error}",
+                lock_path.display()
+            ))
+        })?;
+        self.confirm_existing_lock_visible(&lock_path, &lock_file)?;
+        Ok(lock_file)
+    }
+
+    fn confirm_existing_lock_visible(
+        &self,
+        lock_path: &Path,
+        lock_file: &std::fs::File,
+    ) -> Result<(), KinDbError> {
+        let visible = std::fs::symlink_metadata(lock_path).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "local repository authority namespace changed while acquiring {}: {error}",
+                lock_path.display()
+            ))
+        })?;
+        if visible.file_type().is_symlink() || !visible.is_file() {
+            return Err(KinDbError::StorageError(format!(
+                "local repository authority namespace replaced lock {}",
+                lock_path.display()
+            )));
+        }
+
+        #[cfg(unix)]
+        {
+            let opened = lock_file.metadata().map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to inspect held local repository authority lock {}: {error}",
+                    lock_path.display()
+                ))
+            })?;
+            if opened.dev() != visible.dev() || opened.ino() != visible.ino() {
+                return Err(KinDbError::StorageError(format!(
+                    "local repository authority lock {} changed while Kin waited",
+                    lock_path.display()
+                )));
+            }
+        }
+        #[cfg(windows)]
+        {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true);
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+            let visible_file = options.open(lock_path).map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to reopen visible local repository authority lock {}: {error}",
+                    lock_path.display()
+                ))
+            })?;
+            if windows_source_file_identity(lock_file)?
+                != windows_source_file_identity(&visible_file)?
+            {
+                return Err(KinDbError::StorageError(format!(
+                    "local repository authority lock {} changed while Kin waited",
+                    lock_path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn freeze_existing_authority(
+        &self,
+        repo_id: &str,
+    ) -> Result<LocalAuthorityFreezeLock, KinDbError> {
+        let lock_file = self.acquire_existing_lock(repo_id)?;
+        let authority = self.load_authority_unlocked(repo_id)?.ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "repo {repo_id} has no existing local snapshot authority to freeze"
+            ))
+        })?;
+        if authority.snapshot_generation != authority.head_generation {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id} has incremental journal authority at generation {} above snapshot {}; repository freeze requires one complete full snapshot",
+                authority.head_generation, authority.snapshot_generation
+            )));
+        }
+        self.confirm_existing_lock_visible(
+            &self.base_path.join(repo_id).join(".lock"),
+            &lock_file,
+        )?;
+        Ok(LocalAuthorityFreezeLock {
+            repo_id: repo_id.to_string(),
+            authority,
+            _lock_file: lock_file,
+        })
+    }
+
+    pub(crate) fn load_source_blob_bounded_while_frozen(
+        &self,
+        freeze: &LocalAuthorityFreezeLock,
+        repo_id: &str,
+        digest: [u8; 32],
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>, KinDbError> {
+        freeze.require_repository(repo_id)?;
+        validate_source_blob_repo_id(repo_id)?;
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (digest, max_bytes);
+            return Err(KinDbError::StorageError(
+                "secure local immutable source storage is unavailable on this platform; use the GCS backend"
+                    .to_string(),
+            ));
+        }
+        #[cfg(windows)]
+        {
+            let capability =
+                open_windows_source_blob_capability(&self.base_path, repo_id, digest, false)?;
+            confirm_windows_source_blob_namespace(&self.base_path, repo_id, digest, &capability)?;
+            let digest_hex = hex::encode(digest);
+            let Some(data) = read_windows_source_file_at(
+                capability.leaf_dir(),
+                std::ffi::OsStr::new(&digest_hex),
+                max_bytes,
+                false,
+            )?
+            else {
+                return Ok(None);
+            };
+            verify_source_blob_digest(
+                digest,
+                &data.data,
+                &capability.leaf_path.display().to_string(),
+            )?;
+            confirm_windows_source_blob_namespace(&self.base_path, repo_id, digest, &capability)?;
+            return Ok(Some(data.data));
+        }
+        #[cfg(unix)]
+        {
+            let capability = open_source_blob_capability(
+                &self.base_path,
+                repo_id,
+                digest,
+                false,
+                false,
+                &self.source_root_confirmed_for_process,
+            )?;
+            confirm_source_blob_namespace(
+                &self.base_path,
+                repo_id,
+                digest,
+                &capability,
+                &self.source_root_confirmed_for_process,
+            )?;
+            let digest_hex = hex::encode(digest);
+            let Some(data) = read_source_file_at(&capability.leaf_dir, &digest_hex, max_bytes)?
+            else {
+                return Ok(None);
+            };
+            verify_source_blob_digest(
+                digest,
+                &data.data,
+                &capability.leaf_path.display().to_string(),
+            )?;
+            confirm_source_blob_namespace(
+                &self.base_path,
+                repo_id,
+                digest,
+                &capability,
+                &self.source_root_confirmed_for_process,
+            )?;
+            Ok(Some(data.data))
+        }
     }
 
     fn sync_parent(path: &Path) -> Result<(), KinDbError> {
@@ -3017,12 +3340,18 @@ impl StorageBackend for LocalFileBackend {
         &self,
         repo_id: &str,
     ) -> Result<Option<SnapshotAuthority>, KinDbError> {
-        let _lock = self.acquire_lock(repo_id)?;
+        if self.existing_repository_path(repo_id)?.is_none() {
+            return Ok(None);
+        }
+        let _lock = self.acquire_existing_lock(repo_id)?;
         self.load_authority_unlocked(repo_id)
     }
 
     fn load_recovery_state(&self, repo_id: &str) -> Result<SnapshotRecoveryState, KinDbError> {
-        let _lock = self.acquire_lock(repo_id)?;
+        if self.existing_repository_path(repo_id)?.is_none() {
+            return Ok((None, Vec::new()));
+        }
+        let _lock = self.acquire_existing_lock(repo_id)?;
         let authority = self.load_authority_unlocked(repo_id)?;
         let authority_record = self.read_authority_record_raw_unlocked(repo_id)?;
         match (authority.as_ref(), authority_record.as_ref()) {
@@ -3066,7 +3395,13 @@ impl StorageBackend for LocalFileBackend {
         data: &[u8],
         expected_gen: Generation,
     ) -> Result<Generation, KinDbError> {
-        let _lock = self.acquire_lock(repo_id)?;
+        let _lock = if expected_gen == GENERATION_INIT
+            && self.existing_repository_path(repo_id)?.is_none()
+        {
+            self.acquire_lock(repo_id)?
+        } else {
+            self.acquire_existing_lock(repo_id)?
+        };
         let current = self.load_authority_unlocked(repo_id)?;
         let current_record = self.read_authority_record_raw_unlocked(repo_id)?;
         match (current.as_ref(), current_record.as_ref()) {
@@ -3190,7 +3525,7 @@ impl StorageBackend for LocalFileBackend {
         delta_data: &[u8],
         base_gen: Generation,
     ) -> Result<Generation, KinDbError> {
-        let _lock = self.acquire_lock(repo_id)?;
+        let _lock = self.acquire_existing_lock(repo_id)?;
         let _ = self.load_authority_unlocked(repo_id)?;
         let Some(mut record) = self.read_authority_record_unlocked(repo_id)? else {
             return Err(KinDbError::StorageError(format!(
@@ -3246,13 +3581,19 @@ impl StorageBackend for LocalFileBackend {
         repo_id: &str,
         since_gen: Generation,
     ) -> Result<Vec<(Vec<u8>, Generation)>, KinDbError> {
-        let _lock = self.acquire_lock(repo_id)?;
+        if self.existing_repository_path(repo_id)?.is_none() {
+            return Ok(Vec::new());
+        }
+        let _lock = self.acquire_existing_lock(repo_id)?;
         let _ = self.load_authority_unlocked(repo_id)?;
         self.load_deltas_since_unlocked(repo_id, since_gen)
     }
 
     fn clear_deltas(&self, repo_id: &str) -> Result<(), KinDbError> {
-        let _lock = self.acquire_lock(repo_id)?;
+        if self.existing_repository_path(repo_id)?.is_none() {
+            return Ok(());
+        }
+        let _lock = self.acquire_existing_lock(repo_id)?;
         let _ = self.load_authority_unlocked(repo_id)?;
         #[cfg(test)]
         if let Some(hook) = self.compaction_before_delta_cleanup_hook.lock().take() {
@@ -3997,6 +4338,24 @@ mod tests {
         assert_eq!(
             backend.load_source_blob("repo-a", digest).unwrap(),
             Some(data.to_vec())
+        );
+    }
+
+    #[test]
+    fn local_authority_freeze_does_not_create_a_missing_namespace() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repository_path = dir.path().join("missing-repo");
+
+        let error = backend
+            .freeze_existing_authority("missing-repo")
+            .expect_err("freeze must require an existing local repository authority");
+        assert!(error
+            .to_string()
+            .contains("unavailable for existing-authority access"));
+        assert!(
+            !repository_path.exists(),
+            "a read/freeze API must not create repository storage"
         );
     }
 

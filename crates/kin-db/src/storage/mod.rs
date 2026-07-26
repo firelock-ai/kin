@@ -42,8 +42,8 @@ pub use merkle::{
     RETRIEVAL_AUTHORITY_HASH_VERSION, ZERO_HASH,
 };
 pub use repository::{
-    ChangeAdmissionPolicy, PersistedRepositoryAuthority, RepositoryAuthorityManager,
-    RepositoryAuthorityState,
+    ChangeAdmissionPolicy, LocalRepositoryAuthorityFreeze, PersistedRepositoryAuthority,
+    RepositoryAuthorityManager, RepositoryAuthorityState,
 };
 pub use snapshot::SnapshotManager;
 #[cfg(feature = "vector")]
