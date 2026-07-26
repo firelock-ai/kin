@@ -3,7 +3,8 @@
 
 use anyhow::{Context, Result};
 use kin_model::{
-    Entity, EntityFilter, EntityId, GraphNodeId, GraphStore, RelationKind, RepoPath, SourceSpan,
+    Entity, EntityFilter, EntityId, EntityStore, GraphNodeId, GraphStore, RelationKind, RepoPath,
+    SourceSpan,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
