@@ -1,23 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! End-to-end acceptance tests for Kin.
+//! Cross-crate acceptance tests for current Kin repository authority.
 //!
-//! These tests exercise the full vertical stack — from init through
-//! parse/index/project to session coordination and review.
-//!
-//! Organization:
-//! - V1 acceptance: sovereign init, parse+index, projection, branch+merge, context, review, git export
-//! - Phase 7 acceptance: session lifecycle, intent collision, traffic-aware context, orphan sweep
+//! Pre-release compatibility suites that depended on the removed branch,
+//! overlay, sidecar-object, and snapshot Git APIs are intentionally absent.
+//! Exact repository-v6 init/branch/checkout/export behavior is covered at the
+//! owning crate boundaries; this crate keeps only genuine cross-crate flows.
 
 #[cfg(test)]
 mod helpers;
-
-#[cfg(test)]
-mod v1_acceptance;
-
-#[cfg(test)]
-mod p3_acceptance;
 
 #[cfg(test)]
 mod p7_acceptance;
@@ -26,25 +18,13 @@ mod p7_acceptance;
 mod p8_acceptance;
 
 #[cfg(test)]
-mod cross_file_relations;
-
-#[cfg(test)]
-mod p9_acceptance;
-
-#[cfg(test)]
 mod never_drop;
 
 #[cfg(test)]
 mod p10_acceptance;
 
 #[cfg(test)]
-mod p11_mutation_parity;
-
-#[cfg(test)]
 mod provenance_chain;
-
-#[cfg(test)]
-mod checkout_acceptance;
 
 #[cfg(test)]
 mod round_trip_fuzz;

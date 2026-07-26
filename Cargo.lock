@@ -3346,26 +3346,17 @@ name = "kin-integration-tests"
 version = "0.3.6"
 dependencies = [
  "kin-blobs",
- "kin-cli",
  "kin-context",
  "kin-core",
  "kin-daemon",
  "kin-db",
- "kin-git",
  "kin-index",
  "kin-migrate",
  "kin-model",
  "kin-parser",
  "kin-projection",
  "kin-reconcile",
- "kin-review",
- "kin-runtime",
- "pretty_assertions",
- "serde_json",
- "sha2 0.11.0",
  "tempfile",
- "tokio",
- "uuid",
 ]
 
 [[package]]

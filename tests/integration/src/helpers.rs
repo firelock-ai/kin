@@ -8,28 +8,20 @@ use std::sync::Arc;
 
 use kin_db::InMemoryGraph;
 use kin_model::{
-    change::EntityDelta, AuthorId, BranchName, Entity, EntityId, EntityKind, EntityMetadata,
-    EntityRole, FingerprintAlgorithm, Hash256, LanguageId, SemanticChange, SemanticChangeId,
-    SemanticFingerprint, Timestamp, Visibility,
+    Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, Hash256,
+    LanguageId, SemanticChangeId, SemanticFingerprint, Visibility,
 };
 
-/// Set up a full Kin repository in a temp directory with a snapshot-backed graph store.
+/// Set up an isolated graph fixture and temp working directory.
 ///
-/// Returns (tempdir, graph_store, genesis_id).
+/// Repository-v6 authority acceptance creates and reopens a real repository
+/// explicitly. Session, review, and verification tests use this helper only
+/// for an in-memory semantic graph and must not treat it as repository truth.
 pub fn init_kin_repo() -> (tempfile::TempDir, Arc<InMemoryGraph>, SemanticChangeId) {
     let dir = tempfile::tempdir().unwrap();
-    let init_result = kin_core::init(dir.path()).unwrap();
-
-    // kin_core::init() creates an InMemoryGraph and saves it as a KinDB snapshot.
-    // Re-load it from the snapshot file.
-    let snap_path = init_result.layout.root().join("kindb").join("graph.kndb");
-    let snap = kin_db::SnapshotManager::open(&snap_path).unwrap();
-    let graph = snap.graph();
-
-    let genesis = kin_core::build_genesis_change();
-    let genesis_id = genesis.id;
-
-    (dir, graph, genesis_id)
+    let graph = Arc::new(InMemoryGraph::default());
+    let fixture_root = SemanticChangeId::from_hash(Hash256::from_bytes([0; 32]));
+    (dir, graph, fixture_root)
 }
 
 /// Create a test entity with the given name and file origin.
@@ -60,50 +52,8 @@ pub fn make_entity(name: &str, file: &str, kind: EntityKind) -> Entity {
     }
 }
 
-/// Create a SemanticChange that adds entities.
-pub fn make_change(
-    parent: SemanticChangeId,
-    entities: Vec<Entity>,
-    message: &str,
-) -> SemanticChange {
-    let mut hasher = sha2::Sha256::new();
-    use sha2::Digest;
-    hasher.update(message.as_bytes());
-    hasher.update(uuid::Uuid::new_v4().as_bytes());
-    let result = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&result);
-    let id = SemanticChangeId::from_hash(Hash256::from_bytes(bytes));
-
-    SemanticChange {
-        id,
-        parents: vec![parent],
-        timestamp: Timestamp::now(),
-        author: AuthorId::new("test"),
-        message: message.to_string(),
-        entity_deltas: entities.into_iter().map(EntityDelta::Added).collect(),
-        relation_deltas: vec![],
-        tree_deltas: vec![],
-        projected_files: vec![],
-        spec_link: None,
-        evidence: vec![],
-        risk_summary: None,
-        authored_on: Some(BranchName::new("main")),
-    }
-}
-
 /// Write a Rust source file to a directory.
 pub fn write_rust_file(dir: &Path, rel_path: &str, content: &str) -> PathBuf {
-    let path = dir.join(rel_path);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    std::fs::write(&path, content).unwrap();
-    path
-}
-
-/// Write a TypeScript source file to a directory.
-pub fn write_ts_file(dir: &Path, rel_path: &str, content: &str) -> PathBuf {
     let path = dir.join(rel_path);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).unwrap();
