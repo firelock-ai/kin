@@ -17,6 +17,7 @@ pub mod authority;
 pub mod error;
 pub mod lossless;
 pub mod preflight;
+pub mod repository_export;
 pub mod semantic_import;
 
 pub use admission_history::{admit_semantic_git_import, AdmittedSemanticGitImportPlan};
@@ -34,5 +35,9 @@ pub use preflight::{
     GitLocalIgnoreInputFact, GitLocalIgnoreSourceKind, GitMigrationCompatibilityFacts,
     GitMigrationPreflightProof, GitRemoteConfigFact, GitRemoteMappingFacts,
     GitTrackedWorktreeProof, IgnoredLocalEntry, IgnoredLocalEntryKind, IgnoredLocalWorktreeFact,
+};
+pub use repository_export::{
+    export_repository_to_git, RepositoryGitCommitBinding, RepositoryGitExportPlan,
+    RepositoryGitExportResult,
 };
 pub use semantic_import::{plan_semantic_git_import, GitWorkspaceSeed, SemanticGitImportPlan};

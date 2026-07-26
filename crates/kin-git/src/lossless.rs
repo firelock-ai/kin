@@ -835,7 +835,7 @@ fn object_format_for_oid(oid: GitObjectId) -> GitObjectFormat {
     }
 }
 
-fn reject_existing_destination(output_path: &Path) -> Result<()> {
+pub(crate) fn reject_existing_destination(output_path: &Path) -> Result<()> {
     match fs::symlink_metadata(output_path) {
         Ok(_) => Err(GitError::DestinationExists(
             output_path.display().to_string(),
@@ -845,7 +845,7 @@ fn reject_existing_destination(output_path: &Path) -> Result<()> {
     }
 }
 
-fn claim_staging_path(parent: &Path) -> Result<PathBuf> {
+pub(crate) fn claim_staging_path(parent: &Path) -> Result<PathBuf> {
     loop {
         let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let candidate = parent.join(format!(
@@ -879,7 +879,7 @@ fn create_private_directory(path: &Path) -> std::io::Result<()> {
     target_os = "android",
     target_os = "redox"
 ))]
-fn publish_staging(staging: &Path, output_path: &Path) -> Result<()> {
+pub(crate) fn publish_staging(staging: &Path, output_path: &Path) -> Result<()> {
     rustix::fs::renameat_with(
         rustix::fs::CWD,
         staging,
@@ -902,7 +902,7 @@ fn publish_staging(staging: &Path, output_path: &Path) -> Result<()> {
     target_os = "android",
     target_os = "redox"
 )))]
-fn publish_staging(staging: &Path, output_path: &Path) -> Result<()> {
+pub(crate) fn publish_staging(staging: &Path, output_path: &Path) -> Result<()> {
     // Windows rename already fails when the destination exists. Other targets
     // retain the explicit preflight check and fail any rename error closed.
     reject_existing_destination(output_path)?;
@@ -958,7 +958,7 @@ fn build_staging_repository(
     Ok(())
 }
 
-fn ref_edit(name: &[u8], target: &RefTarget) -> Result<gix::refs::transaction::RefEdit> {
+pub(crate) fn ref_edit(name: &[u8], target: &RefTarget) -> Result<gix::refs::transaction::RefEdit> {
     let name = gix::bstr::BString::from(name.to_vec())
         .try_into()
         .map_err(|error| GitError::InvalidSnapshot(format!("invalid Git ref name: {error}")))?;
@@ -977,7 +977,7 @@ fn ref_edit(name: &[u8], target: &RefTarget) -> Result<gix::refs::transaction::R
     })
 }
 
-fn head_edit(head: &WorkspaceHead) -> Result<gix::refs::transaction::RefEdit> {
+pub(crate) fn head_edit(head: &WorkspaceHead) -> Result<gix::refs::transaction::RefEdit> {
     let target = match head {
         WorkspaceHead::Symbolic { target } => {
             gix::refs::Target::Symbolic(gix_full_name(target.as_bytes())?)
