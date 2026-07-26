@@ -7,8 +7,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use super::init::{collect_on_disk_tree_entries, is_repo_owned_graph_path};
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GraphHealthReport {
     pub supported_entity_source_file_count: usize,
@@ -42,11 +40,11 @@ struct ContaminationSummary {
 }
 
 pub(crate) fn inspect_graph(
-    layout: &kin_core::KinLayout,
+    _layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,
 ) -> Result<GraphHealthReport> {
     let stats = graph.graph_stats();
-    let supported_inputs = collect_supported_inputs(layout, graph)?;
+    let supported_inputs = collect_supported_inputs(graph);
     let contamination = collect_contamination(graph)?;
     Ok(build_graph_health_report(
         &stats,
@@ -55,20 +53,15 @@ pub(crate) fn inspect_graph(
     ))
 }
 
-fn collect_supported_inputs(
-    layout: &kin_core::KinLayout,
-    graph: &kin_db::InMemoryGraph,
-) -> Result<SupportedInputCounts> {
-    let source_root = kin_core::source_dir(layout);
-    let admitted_entries = collect_on_disk_tree_entries(&source_root, graph)?;
+fn collect_supported_inputs(graph: &kin_db::InMemoryGraph) -> SupportedInputCounts {
     let mut entity_source = 0usize;
     let mut shallow_source = 0usize;
 
-    for (repo_path, entry) in admitted_entries {
-        if !matches!(entry, TreeEntry::Blob { .. }) {
+    for artifact in graph.resolved_tree().artifacts_by_path() {
+        if !matches!(artifact.entry, TreeEntry::Blob { .. }) {
             continue;
         }
-        let Some(path) = repo_path.as_utf8() else {
+        let Some(path) = artifact.path.as_utf8() else {
             continue;
         };
         match kin_index::FileClassifier::classify(Path::new(path)) {
@@ -83,10 +76,10 @@ fn collect_supported_inputs(
         }
     }
 
-    Ok(SupportedInputCounts {
+    SupportedInputCounts {
         entity_source,
         shallow_source,
-    })
+    }
 }
 
 fn collect_contamination(graph: &kin_db::InMemoryGraph) -> Result<ContaminationSummary> {
@@ -96,7 +89,7 @@ fn collect_contamination(graph: &kin_db::InMemoryGraph) -> Result<ContaminationS
 
     for entity in graph.list_all_entities()? {
         if let Some(file_origin) = entity.file_origin {
-            if !is_repo_owned_graph_path(&file_origin.0) {
+            if !kin_index::should_index_repo_relative_path(Path::new(&file_origin.0)) {
                 contaminated_entity_count += 1;
                 path_set.insert(file_origin.0);
             }
@@ -104,21 +97,21 @@ fn collect_contamination(graph: &kin_db::InMemoryGraph) -> Result<ContaminationS
     }
 
     for shallow in graph.list_shallow_files()? {
-        if !is_repo_owned_graph_path(&shallow.file_id.0) {
+        if !kin_index::should_index_repo_relative_path(Path::new(&shallow.file_id.0)) {
             contaminated_non_entity_count += 1;
             path_set.insert(shallow.file_id.0);
         }
     }
 
     for artifact in graph.list_structured_artifacts()? {
-        if !is_repo_owned_graph_path(&artifact.file_id.0) {
+        if !kin_index::should_index_repo_relative_path(Path::new(&artifact.file_id.0)) {
             contaminated_non_entity_count += 1;
             path_set.insert(artifact.file_id.0);
         }
     }
 
     for artifact in graph.list_opaque_artifacts()? {
-        if !is_repo_owned_graph_path(&artifact.file_id.0) {
+        if !kin_index::should_index_repo_relative_path(Path::new(&artifact.file_id.0)) {
             contaminated_non_entity_count += 1;
             path_set.insert(artifact.file_id.0);
         }
