@@ -80,10 +80,9 @@ impl PersistableMcpStore for kin_db::InMemoryGraph {
             .map(|parent| parent.join("text-index"))
             .ok_or_else(|| McpError::Other("snapshot path has no parent directory".into()))?;
         let manager = kin_db::SnapshotManager::new(snapshot_path.to_path_buf());
-        manager.swap(kin_db::InMemoryGraph::from_snapshot_with_text_index(
-            snapshot,
-            text_index_path,
-        ));
+        let graph = kin_db::InMemoryGraph::from_snapshot_with_text_index(snapshot, text_index_path)
+            .map_err(McpError::graph)?;
+        manager.swap(graph);
         manager.save().map_err(McpError::graph)?;
         Ok(())
     }

@@ -4,9 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
-use kin_model::{
-    Entity, EntityId, EntityKind, EntityRole, EntityStore, FilePathId, GraphStore, RelationKind,
-};
+use kin_model::{Entity, EntityId, EntityKind, EntityRole, EntityStore, GraphStore, RelationKind};
 use serde::{Deserialize, Serialize};
 
 use super::graph_health::inspect_graph;
@@ -753,7 +751,7 @@ fn graph_source_record(
         .span
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("entity '{}' has no source span", entity.name))?;
-    let bytes = read_entity_file_bytes_from_graph(layout, graph, file_origin)?;
+    let bytes = read_entity_file_bytes_from_graph(layout, graph, entity)?;
     if span.start_byte >= span.end_byte {
         anyhow::bail!(
             "entity '{}' has an empty or invalid source span ({}..{})",
@@ -796,70 +794,104 @@ fn graph_source_record(
     })
 }
 
-fn read_entity_file_bytes_from_graph(
+pub(crate) fn read_entity_file_bytes_from_graph(
     layout: &kin_core::KinLayout,
     graph: &impl GraphStore,
-    file_id: &FilePathId,
+    entity: &Entity,
 ) -> Result<Vec<u8>> {
+    let file_id = entity
+        .file_origin
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("entity '{}' has no file origin", entity.name))?;
     let branch_name = kin_core::read_current_branch(layout)?;
-
-    // Try the filesystem branch first, then fall back to any branch in the
-    // graph.  Scoped/historical graphs may not carry the exact branch name
-    // that the on-disk `.kin/HEAD` advertises (e.g. when the scope points to
-    // a sibling change lineage).
-    let branch = match graph.get_branch(&branch_name)? {
-        Some(b) => b,
-        None => {
-            // Fallback: pick any branch present in the graph.
-            let all = graph.list_branches()?;
-            if let Some(b) = all.into_iter().next() {
-                tracing::debug!(
-                    fs_branch = %branch_name,
-                    graph_branch = %b.name,
-                    "filesystem branch not in graph, falling back"
-                );
-                b
-            } else {
-                // Last resort: try to read the file hash directly from the
-                // graph's file_hash store (populated by scoped snapshot).
-                if let Ok(Some(hash)) = graph.get_file_hash(file_id) {
-                    let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())?;
-                    let blob_hash = kin_blobs::Hash256(*hash.as_bytes());
-                    return blob_store.read(&blob_hash).with_context(|| {
-                        format!(
-                            "graph blob for file '{}' is unavailable (hash {}, no branch); source body cannot be read from daemon-backed graph",
-                            file_id.0, blob_hash,
-                        )
-                    });
-                }
-                anyhow::bail!(
-                    "current branch '{}' not found in graph and no fallback branch available",
-                    branch_name
-                );
-            }
-        }
-    };
-
-    let hash = if let Ok(Some(h)) = graph.get_file_hash(file_id) {
-        h
-    } else {
-        let genesis = kin_core::build_genesis_change();
-        let tree = kin_core::build_file_tree(graph, &genesis.id, &branch.head)?;
-        match tree.get(file_id) {
-            Some(h) => *h,
-            None => {
-                anyhow::bail!("file '{}' not found in graph file tree", file_id.0);
-            }
-        }
+    let branch = graph.get_branch(&branch_name)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "current branch '{}' is absent from graph truth; refusing to select an unrelated branch",
+            branch_name
+        )
+    })?;
+    let revision = graph
+        .resolve_entity_revision_at(&entity.id, &branch.head)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "entity {} has no active committed revision at branch '{}' head {}",
+                entity.id,
+                branch.name,
+                branch.head
+            )
+        })?;
+    if revision.entity.file_origin != entity.file_origin || revision.entity.span != entity.span {
+        anyhow::bail!(
+            "entity {} is not the active committed source revision at branch '{}' head {}",
+            entity.id,
+            branch.name,
+            branch.head
+        );
+    }
+    let path = kin_model::RepoPath::from_utf8(file_id.0.clone()).with_context(|| {
+        format!(
+            "entity source path '{}' is not repository-relative",
+            file_id.0
+        )
+    })?;
+    let tree = graph
+        .resolve_tree_at(&branch.head)
+        .with_context(|| format!("resolve exact repository tree at {}", branch.head))?;
+    let artifact = tree.artifact_at_path(&path).ok_or_else(|| {
+        anyhow::anyhow!(
+            "entity source '{}' is absent from exact graph tree at branch '{}' head {}",
+            file_id.0,
+            branch.name,
+            branch.head
+        )
+    })?;
+    let introduced_tree = graph
+        .resolve_tree_at(&revision.introduced_by)
+        .with_context(|| {
+            format!(
+                "resolve entity {} introduction tree at {}",
+                entity.id, revision.introduced_by
+            )
+        })?;
+    let introduced_artifact = introduced_tree.artifact_at_path(&path).ok_or_else(|| {
+        anyhow::anyhow!(
+            "entity {} revision {} was introduced without an artifact at '{}'",
+            entity.id,
+            revision.revision_id,
+            file_id.0
+        )
+    })?;
+    if introduced_artifact.artifact_id != artifact.artifact_id {
+        anyhow::bail!(
+            "entity source path '{}' was reused: entity {} is bound to artifact {:?}, current artifact is {:?}",
+            file_id.0,
+            entity.id,
+            introduced_artifact.artifact_id,
+            artifact.artifact_id
+        );
+    }
+    let kin_model::TreeEntry::Blob {
+        hash: blob_identity,
+        ..
+    } = artifact.entry
+    else {
+        anyhow::bail!(
+            "entity source '{}' resolves to non-source entry {:?} for artifact {:?} at branch '{}' head {}",
+            file_id.0,
+            artifact.entry,
+            artifact.artifact_id,
+            branch.name,
+            branch.head
+        );
     };
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())?;
-    let blob_hash = kin_blobs::Hash256(*hash.as_bytes());
+    let blob_hash = kin_blobs::Hash256(*blob_identity.as_bytes());
     blob_store
         .read(&blob_hash)
         .with_context(|| {
             format!(
-                "graph blob for file '{}' is unavailable (hash {}, branch '{}', head {}); source body cannot be read from daemon-backed graph",
-                file_id.0, blob_hash, branch.name, branch.head
+                "graph blob for artifact {:?} at '{}' is unavailable (hash {}, branch '{}', head {}); source body cannot be read",
+                artifact.artifact_id, file_id.0, blob_hash, branch.name, branch.head
             )
         })
 }
@@ -868,10 +900,10 @@ fn read_entity_file_bytes_from_graph(
 mod tests {
     use super::*;
     use kin_model::{
-        ArtifactDelta, ArtifactDeltaKind, AuthorId, Branch, BranchName, ChangeStore, Entity,
-        EntityMetadata, FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, Relation,
-        RelationId, RelationOrigin, SemanticChange, SemanticChangeId, SemanticFingerprint,
-        SourceSpan, Timestamp, Visibility,
+        ArtifactId, AuthorId, Branch, BranchName, ChangeStore, Entity, EntityDelta, EntityMetadata,
+        FilePathId, FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, LocatedEntry, Relation,
+        RelationId, RelationOrigin, RepoPath, SemanticChange, SemanticChangeId,
+        SemanticFingerprint, SourceSpan, Timestamp, TreeDelta, TreeEntry, Visibility,
     };
     use std::fs;
 
@@ -1106,29 +1138,30 @@ mod tests {
         } else {
             Hash256::from_bytes([0x99; 32])
         };
-        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: change_id,
-                parents: vec![genesis.id],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "add source".to_string(),
-                entity_deltas: vec![],
-                relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
-                    file_id: file_id.clone(),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(blob_hash),
-                }],
-                projected_files: vec![file_id.clone()],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: Some(branch_name.clone()),
-            })
-            .unwrap();
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32])),
+            parents: vec![genesis.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "add source".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            tree_deltas: vec![TreeDelta::Added {
+                artifact_id: ArtifactId::new(),
+                new: LocatedEntry::new(
+                    RepoPath::from_utf8(file_id.0.clone()).unwrap(),
+                    TreeEntry::blob(blob_hash, false),
+                ),
+            }],
+            projected_files: vec![file_id.clone()],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(branch_name.clone()),
+        };
+        change.id = kin_model::compute_semantic_change_id(&change).unwrap();
+        let change_id = change.id;
+        graph.create_change(&change).unwrap();
         graph
             .create_branch(&Branch {
                 name: branch_name.clone(),
@@ -1161,6 +1194,38 @@ mod tests {
         entity
     }
 
+    fn commit_source_entity(fixture: &GraphSourceFixture, entity: &Entity) {
+        fixture.graph.upsert_entity(entity).unwrap();
+        let branch_name = BranchName::new("main");
+        let parent = fixture
+            .graph
+            .get_branch(&branch_name)
+            .unwrap()
+            .unwrap()
+            .head;
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x43; 32])),
+            parents: vec![parent],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: format!("add entity {}", entity.name),
+            entity_deltas: vec![EntityDelta::Added(entity.clone())],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            projected_files: vec![entity.file_origin.clone().unwrap()],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(branch_name.clone()),
+        };
+        change.id = kin_model::compute_semantic_change_id(&change).unwrap();
+        fixture.graph.create_change(&change).unwrap();
+        fixture
+            .graph
+            .update_branch_head(&branch_name, &change.id)
+            .unwrap();
+    }
+
     #[test]
     fn graph_source_reads_exact_body_from_graph_blob_by_uuid() {
         let source = "fn before() {}\nfn target() {\n    2 + 2\n}\nfn after() {}\n";
@@ -1171,7 +1236,7 @@ mod tests {
 
         let entity = source_entity("target", fixture.file_id.clone(), start, end);
         let id = entity.id;
-        fixture.graph.upsert_entity(&entity).unwrap();
+        commit_source_entity(&fixture, &entity);
 
         let response =
             build_graph_source_response(&fixture.layout, &fixture.graph, &id.to_string()).unwrap();
@@ -1184,13 +1249,76 @@ mod tests {
     }
 
     #[test]
+    fn graph_source_rejects_path_reuse_by_a_different_artifact() {
+        let original = b"fn target() {}\n";
+        let fixture = graph_source_fixture(Some(original));
+        let entity = source_entity("target", fixture.file_id.clone(), 0, original.len() - 1);
+        let id = entity.id;
+        commit_source_entity(&fixture, &entity);
+
+        let branch_name = BranchName::new("main");
+        let parent = fixture
+            .graph
+            .get_branch(&branch_name)
+            .unwrap()
+            .unwrap()
+            .head;
+        let path = RepoPath::from_utf8(fixture.file_id.0.clone()).unwrap();
+        let parent_tree = fixture.graph.resolve_tree_at(&parent).unwrap();
+        let old_artifact = parent_tree.artifact_at_path(&path).unwrap();
+        let replacement_hash = kin_blobs::BlobStore::new(fixture.layout.objects_dir())
+            .unwrap()
+            .write(b"fn replacement() {}\n")
+            .unwrap();
+        let mut replacement = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x44; 32])),
+            parents: vec![parent],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "replace source artifact".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            tree_deltas: vec![
+                TreeDelta::Removed {
+                    artifact_id: old_artifact.artifact_id,
+                    old: old_artifact.located_entry(),
+                },
+                TreeDelta::Added {
+                    artifact_id: ArtifactId::new(),
+                    new: LocatedEntry::new(path, TreeEntry::blob(replacement_hash, false)),
+                },
+            ],
+            projected_files: vec![fixture.file_id.clone()],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(branch_name.clone()),
+        };
+        replacement.id = kin_model::compute_semantic_change_id(&replacement).unwrap();
+        fixture.graph.create_change(&replacement).unwrap();
+        fixture
+            .graph
+            .update_branch_head(&branch_name, &replacement.id)
+            .unwrap();
+
+        let error = build_graph_source_response(&fixture.layout, &fixture.graph, &id.to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("source path 'src/lib.rs' was reused"),
+            "{error}"
+        );
+        assert!(error.contains(&id.to_string()), "{error}");
+    }
+
+    #[test]
     fn graph_source_returns_error_on_oob_span() {
         let source = "fn target() {}\n";
         let fixture = graph_source_fixture(Some(source.as_bytes()));
         let end = source.len() + 10;
         let entity = source_entity("target", fixture.file_id.clone(), 0, end);
         let id = entity.id;
-        fixture.graph.upsert_entity(&entity).unwrap();
+        commit_source_entity(&fixture, &entity);
 
         let err = build_graph_source_response(&fixture.layout, &fixture.graph, &id.to_string())
             .unwrap_err()
@@ -1208,20 +1336,14 @@ mod tests {
         let fixture = graph_source_fixture(None);
         let entity = source_entity("target", fixture.file_id.clone(), 0, 8);
         let id = entity.id;
-        fixture.graph.upsert_entity(&entity).unwrap();
+        commit_source_entity(&fixture, &entity);
 
         let err = build_graph_source_response(&fixture.layout, &fixture.graph, &id.to_string())
             .unwrap_err()
             .to_string();
 
-        assert!(
-            err.contains("graph blob for file 'src/lib.rs' is unavailable"),
-            "{err}"
-        );
-        assert!(
-            err.contains("source body cannot be read from daemon-backed graph"),
-            "{err}"
-        );
+        assert!(err.contains("at 'src/lib.rs' is unavailable"), "{err}");
+        assert!(err.contains("source body cannot be read"), "{err}");
     }
 
     #[test]
@@ -1234,7 +1356,7 @@ mod tests {
 
         let entity = source_entity("target", fixture.file_id.clone(), start, end);
         let id = entity.id;
-        fixture.graph.upsert_entity(&entity).unwrap();
+        commit_source_entity(&fixture, &entity);
 
         match build_entity_source_outcome(&fixture.layout, &fixture.graph, &id.to_string()).unwrap()
         {

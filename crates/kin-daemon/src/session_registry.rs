@@ -105,7 +105,32 @@ impl SessionCoordinator {
         cwd: PathBuf,
         capabilities: SessionCapabilities,
     ) -> Result<SessionId> {
-        let session_id = SessionId::new();
+        self.register_session_with_id(
+            SessionId::new(),
+            vendor,
+            client_name,
+            transport,
+            pid,
+            cwd,
+            capabilities,
+        )
+    }
+
+    /// Register a session using an ID already allocated by a local launcher.
+    ///
+    /// This keeps the process identity, workspace directory, MCP header, and
+    /// coordinator lease on one UUID instead of manufacturing parallel IDs at
+    /// each boundary.
+    pub fn register_session_with_id(
+        &self,
+        session_id: SessionId,
+        vendor: &str,
+        client_name: &str,
+        transport: SessionTransport,
+        pid: Option<u32>,
+        cwd: PathBuf,
+        capabilities: SessionCapabilities,
+    ) -> Result<SessionId> {
         let now = Timestamp::now();
         let session = AgentSession {
             session_id,

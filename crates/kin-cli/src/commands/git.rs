@@ -14,7 +14,7 @@ fn checked_out_git_repo_path(layout: &kin_core::KinLayout) -> PathBuf {
     layout.working_dir().to_path_buf()
 }
 
-pub(crate) fn sync_export_path(layout: &kin_core::KinLayout) -> PathBuf {
+pub(crate) fn transport_export_path(layout: &kin_core::KinLayout) -> PathBuf {
     default_export_path(layout)
 }
 
@@ -129,50 +129,6 @@ pub(crate) fn git_ref_exists(repo_path: &Path, ref_name: &str) -> Result<bool> {
     }
 }
 
-// Reserved for the deferred inbound git-transport pull re-import path (see
-// `commands::pull`): updates a transport-mirror branch to a fetched ref before
-// re-import. Kept (with test coverage) so the path can be re-enabled in a later
-// alpha without re-deriving it.
-#[allow(dead_code)]
-pub(crate) fn set_transport_branch_head(
-    repo_path: &Path,
-    branch_name: &str,
-    target_ref: &str,
-) -> Result<()> {
-    let update_ref = git_output(
-        repo_path,
-        &[
-            "update-ref",
-            &format!("refs/heads/{branch_name}"),
-            target_ref,
-        ],
-    )?;
-    if !update_ref.status.success() {
-        anyhow::bail!(
-            "failed to update git transport branch '{}' in {}: {}",
-            branch_name,
-            repo_path.display(),
-            String::from_utf8_lossy(&update_ref.stderr).trim()
-        );
-    }
-
-    let head = git_output(
-        repo_path,
-        &["symbolic-ref", "HEAD", &format!("refs/heads/{branch_name}")],
-    )
-    .map_err(|e| anyhow::anyhow!("failed to set transport branch '{}': {}", branch_name, e))?;
-    if !head.status.success() {
-        anyhow::bail!(
-            "failed to set git transport HEAD to '{}' in {}: {}",
-            branch_name,
-            repo_path.display(),
-            String::from_utf8_lossy(&head.stderr).trim()
-        );
-    }
-
-    Ok(())
-}
-
 fn resolve_export_path(
     layout: &kin_core::KinLayout,
     output: Option<String>,
@@ -232,45 +188,9 @@ pub async fn export(output: Option<String>, in_place: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn import(_path: Option<String>) -> Result<()> {
-    anyhow::bail!(
-        "`kin git import` is disabled because it mutates local graph snapshots. \
-         Use `kin init --git-history ...` for bootstrap imports or `kin migrate` for explicit offline migration."
-    );
-}
-
-pub async fn sync(in_place: bool) -> Result<()> {
-    println!("Syncing Kin <-> Git...");
-
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-
-    // Step 1: Import from Git -> Kin (if a .git directory exists)
-    let git_dir = layout.working_dir().join(".git");
-    if git_dir.exists() {
-        println!("  Importing from Git -> Kin...");
-        import(None).await?;
-    } else {
-        println!("  No .git directory found, skipping import.");
-    }
-
-    // Step 2: Export Kin -> Git
-    let export_target = if in_place {
-        checked_out_git_repo_path(&layout)
-    } else {
-        sync_export_path(&layout)
-    };
-    println!("  Exporting Kin -> Git at '{}'...", export_target.display());
-    export(Some(export_target.to_string_lossy().into_owned()), in_place).await?;
-
-    println!("Sync complete (bidirectional).");
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     fn configure_identity(repo_path: &Path) {
         Command::new("git")
@@ -294,20 +214,26 @@ mod tests {
     }
 
     #[test]
-    fn sync_export_uses_git_export_dir_even_when_git_exists() {
+    fn transport_export_uses_dedicated_dir_even_when_git_exists() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
 
-        assert_eq!(sync_export_path(&layout), dir.path().join(".git-export"));
+        assert_eq!(
+            transport_export_path(&layout),
+            dir.path().join(".git-export")
+        );
     }
 
     #[test]
-    fn sync_export_falls_back_when_git_is_missing() {
+    fn transport_export_uses_dedicated_dir_without_git() {
         let dir = tempfile::tempdir().unwrap();
         let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
 
-        assert_eq!(sync_export_path(&layout), dir.path().join(".git-export"));
+        assert_eq!(
+            transport_export_path(&layout),
+            dir.path().join(".git-export")
+        );
     }
 
     #[test]
@@ -363,25 +289,5 @@ mod tests {
             String::from_utf8_lossy(&remote.stdout).trim(),
             "https://example.com/firelock/kin.git"
         );
-    }
-
-    #[test]
-    fn set_transport_branch_head_switches_to_requested_branch() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        git_output(&repo, &["init"]).unwrap();
-        configure_identity(&repo);
-        fs::write(repo.join("hello.txt"), "world\n").unwrap();
-        git_output(&repo, &["add", "."]).unwrap();
-        git_output(&repo, &["commit", "-m", "init"]).unwrap();
-        git_output(&repo, &["branch", "-M", "master"]).unwrap();
-        git_output(&repo, &["branch", "main"]).unwrap();
-
-        set_transport_branch_head(&repo, "main", "refs/heads/main").unwrap();
-
-        let branch = git_output(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
-        assert!(branch.status.success());
-        assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "main");
     }
 }

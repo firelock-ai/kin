@@ -4,9 +4,8 @@
 //! Runtime graph⇄file drift detection for `kin doctor --drift [--heal]`.
 //!
 //! The graph is the source of truth; the working tree is a projection of it.
-//! This check compares the graph's expected content hash for every projected
-//! source file against the bytes currently on disk and classifies any
-//! divergence:
+//! This check compares every exact graph-owned repository entry against the
+//! current filesystem projection and classifies any divergence:
 //!
 //! * `drifted`   — the file exists on both sides but the on-disk bytes hash to
 //!   something other than graph truth (edited out of band, truncated write, …).
@@ -15,9 +14,9 @@
 //! * `untracked` — the file is on disk but the graph has no record of it (added
 //!   out of band, a skewed reconcile that never landed in the graph, …).
 //!
-//! Detection is a thin wrapper over `kin_db::engine::compute_diff`, hashing the
-//! working tree through the exact same enumeration the indexer uses so the two
-//! hash sets are directly comparable.
+//! Detection is a thin wrapper over `kin_db::engine::compute_diff`, observing
+//! the filesystem through the exact repository-tree importer. Semantic
+//! classification and language support do not affect membership.
 //!
 //! `--heal` restores drifted and missing files *from* graph-owned blob truth
 //! *to* disk. Content only ever flows graph → disk: the drifted on-disk bytes
@@ -25,21 +24,21 @@
 //! no truth for) are never silently absorbed.
 
 use anyhow::{anyhow, Result};
-use kin_model::{EntityFilter, EntityStore, FilePathId};
+use kin_model::{EntityFilter, EntityStore, FilePathId, RepoPath, TreeEntry};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use super::init::{collect_on_disk_file_hashes, is_repo_owned_graph_path};
+use super::init::collect_on_disk_tree_entries;
 
 /// Classified graph⇄file drift. Serialized verbatim as the `--json` payload.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DriftReport {
     /// Files present on both sides whose on-disk hash differs from graph truth.
-    pub drifted: Vec<String>,
+    pub drifted: Vec<RepoPath>,
     /// Files the graph tracks that are absent from the working tree.
-    pub missing: Vec<String>,
+    pub missing: Vec<RepoPath>,
     /// Files on disk the graph does not track.
-    pub untracked: Vec<String>,
+    pub untracked: Vec<RepoPath>,
 }
 
 impl DriftReport {
@@ -57,20 +56,18 @@ impl DriftReport {
 /// Classify drift between graph truth and the on-disk file set.
 ///
 /// Thin wrapper over `kin_db::engine::compute_diff`: `modified → drifted`,
-/// `removed → missing`, `added → untracked`. Internal control-plane paths
-/// (`.kin/…`) the graph tracks but the working tree never projects are dropped
-/// from `missing` so they cannot masquerade as drift. Each class is sorted so
-/// the report is deterministic.
-pub fn detect_drift(graph: &kin_db::InMemoryGraph, on_disk: &[(String, [u8; 32])]) -> DriftReport {
+/// `removed → missing`, `added → untracked`. No graph entry is hidden by
+/// semantic-indexing policy: a reserved control path in graph truth is a
+/// corruption signal, not something doctor silently filters. Each class is
+/// sorted so the report is deterministic.
+pub fn detect_drift(
+    graph: &kin_db::InMemoryGraph,
+    on_disk: &[(RepoPath, TreeEntry)],
+) -> DriftReport {
     let diff = kin_db::engine::compute_diff(graph, on_disk);
 
     let mut drifted = diff.modified_files.clone();
-    let mut missing: Vec<String> = diff
-        .removed_files
-        .iter()
-        .filter(|path| is_repo_owned_graph_path(path))
-        .cloned()
-        .collect();
+    let mut missing = diff.removed_files.clone();
     let mut untracked = diff.added_files.clone();
 
     drifted.sort();
@@ -87,9 +84,9 @@ pub fn detect_drift(graph: &kin_db::InMemoryGraph, on_disk: &[(String, [u8; 32])
 /// Outcome of a `--heal` pass.
 struct HealOutcome {
     /// Files restored to graph truth on disk.
-    healed: Vec<String>,
+    healed: Vec<RepoPath>,
     /// Files that could not be healed, with the reason.
-    failed: Vec<(String, String)>,
+    failed: Vec<(RepoPath, String)>,
 }
 
 /// `kin doctor --drift [--heal]`.
@@ -108,7 +105,7 @@ pub async fn run(heal: bool, json: bool) -> Result<()> {
     let graph = snap.graph();
 
     let source_root = kin_core::source_dir(&layout);
-    let on_disk = collect_on_disk_file_hashes(&source_root)?;
+    let on_disk = collect_on_disk_tree_entries(&source_root, graph.as_ref())?;
 
     let report = detect_drift(graph.as_ref(), &on_disk);
 
@@ -161,37 +158,37 @@ fn heal_drift(
     Ok(HealOutcome { healed, failed })
 }
 
-/// Restore one file to graph truth: read the blob the graph's file-hash points
-/// to and write it to disk. Content flows graph → disk only — the drifted
-/// on-disk bytes are never read to decide truth (Zero File-Search Authority).
+/// Restore one entry to graph truth, including executable mode or symlink
+/// identity. Content flows graph → disk only — drifted on-disk bytes are never
+/// read to decide truth (Zero File-Search Authority).
 fn heal_file(
     layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,
     source_root: &Path,
-    path: &str,
+    path: &RepoPath,
 ) -> Result<()> {
-    // `InMemoryGraph::get_file_hash` is the inherent `&str -> Option<[u8; 32]>`
-    // accessor — the same raw-hash space as `set_file_hash` and `compute_diff`.
-    let expected_bytes = graph
-        .get_file_hash(path)
-        .ok_or_else(|| anyhow!("graph has no expected hash for {path}"))?;
-    let expected = kin_model::Hash256::from_bytes(expected_bytes);
-    let bytes = kin_core::read_blob_from_layout(layout, &expected)
+    let tree = graph.resolved_tree();
+    let artifact = tree
+        .artifact_at_path(path)
+        .ok_or_else(|| anyhow!("graph has no exact tree entry for {path}"))?;
+    let expected = artifact.entry;
+    let blob_identity = expected.blob_identity().ok_or_else(|| {
+        anyhow!(
+            "artifact {:?} at {path} is a gitlink; child repository projection is required and doctor will not fabricate it",
+            artifact.artifact_id
+        )
+    })?;
+    let bytes = kin_core::read_blob_from_layout(layout, &blob_identity)
         .ok_or_else(|| anyhow!("graph-owned blob for {path} is unavailable; cannot heal"))?;
     // The blob must actually hash to the graph's expectation before we let it
     // overwrite the working tree.
-    if kin_blobs::digest(&bytes) != expected {
+    if kin_blobs::digest(&bytes) != blob_identity {
         return Err(anyhow!(
             "graph-owned blob for {path} failed its integrity check; refusing to write"
         ));
     }
-    let dest = source_root.join(path);
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow!("failed to create {}: {e}", parent.display()))?;
-    }
-    std::fs::write(&dest, &bytes)
-        .map_err(|e| anyhow!("failed to write {}: {e}", dest.display()))?;
+    kin_core::materialize_source_entry(source_root, path, expected, &bytes)
+        .map_err(|error| anyhow!("failed to materialize exact tree entry {path}: {error}"))?;
     Ok(())
 }
 
@@ -256,10 +253,14 @@ fn print_human_report(
 
 /// Print a diverging file plus the graph entities attributed to it, so drift is
 /// attributable — "which entities, which file" — not just a bare path.
-fn print_file_with_entities(graph: &kin_db::InMemoryGraph, path: &str) {
+fn print_file_with_entities(graph: &kin_db::InMemoryGraph, path: &RepoPath) {
     println!("  • {path}");
+    let Some(path_utf8) = path.as_utf8() else {
+        println!("      (byte-exact non-UTF-8 path; no semantic entity enrichment)");
+        return;
+    };
     let filter = EntityFilter {
-        file_path: Some(FilePathId::new(path)),
+        file_path: Some(FilePathId::new(path_utf8)),
         ..Default::default()
     };
     if let Ok(entities) = graph.query_entities(&filter) {
@@ -276,20 +277,76 @@ fn print_file_with_entities(graph: &kin_db::InMemoryGraph, path: &str) {
 mod tests {
     use super::*;
     use kin_db::InMemoryGraph;
+    use kin_model::{
+        ArtifactId, AuthorId, ChangeStore, GitObjectId, Hash256, LocatedEntry, SemanticChange,
+        SemanticChangeId, Timestamp, TransactionDelta, TreeDelta,
+    };
 
-    /// Build an in-memory graph whose file-hash truth is exactly `files`.
-    fn graph_with(files: &[(&str, [u8; 32])]) -> InMemoryGraph {
+    fn path(value: &str) -> RepoPath {
+        RepoPath::from_utf8(value).unwrap()
+    }
+
+    fn regular(hash: [u8; 32]) -> TreeEntry {
+        TreeEntry::blob(Hash256::from_bytes(hash), false)
+    }
+
+    fn graph_with_entries(files: Vec<(RepoPath, TreeEntry)>) -> InMemoryGraph {
         let graph = InMemoryGraph::new();
-        for (path, hash) in files {
-            graph.set_file_hash(path, *hash);
-        }
+        let genesis = kin_core::build_genesis_change();
+        graph.create_change(&genesis).unwrap();
+
+        let tree_deltas = files
+            .iter()
+            .map(|(path, entry)| TreeDelta::Added {
+                artifact_id: ArtifactId::new(),
+                new: LocatedEntry::new(path.clone(), *entry),
+            })
+            .collect::<Vec<_>>();
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: tree_deltas.clone(),
+            })
+            .unwrap();
+        let projected_files = files
+            .iter()
+            .filter_map(|(path, _)| path.as_utf8().map(|value| FilePathId::new(value)))
+            .collect();
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x44; 32])),
+            parents: vec![genesis.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("doctor-test"),
+            message: "seed exact doctor tree".to_string(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas,
+            projected_files,
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            authored_on: None,
+        };
+        change.id = kin_model::compute_semantic_change_id(&change).unwrap();
+        graph.create_change(&change).unwrap();
         graph
     }
 
-    fn on_disk(files: &[(&str, [u8; 32])]) -> Vec<(String, [u8; 32])> {
+    /// Build an in-memory graph whose exact blob truth is exactly `files`.
+    fn graph_with(files: &[(&str, [u8; 32])]) -> InMemoryGraph {
+        graph_with_entries(
+            files
+                .iter()
+                .map(|(value, hash)| (path(value), regular(*hash)))
+                .collect(),
+        )
+    }
+
+    fn on_disk(files: &[(&str, [u8; 32])]) -> Vec<(RepoPath, TreeEntry)> {
         files
             .iter()
-            .map(|(path, hash)| ((*path).to_string(), *hash))
+            .map(|(value, hash)| (path(value), regular(*hash)))
             .collect()
     }
 
@@ -303,13 +360,80 @@ mod tests {
     }
 
     #[test]
+    fn exact_scan_keeps_graph_tracked_files_visible_after_ignore_rule_changes() {
+        let repo = tempfile::tempdir().unwrap();
+        let tracked_bytes = b"graph-owned bytes";
+        let ignore_bytes = b"tracked.bin\n";
+        std::fs::write(repo.path().join("tracked.bin"), tracked_bytes).unwrap();
+        std::fs::write(repo.path().join(".kinignore"), ignore_bytes).unwrap();
+        let graph = graph_with_entries(vec![
+            (
+                path("tracked.bin"),
+                TreeEntry::blob(
+                    Hash256::from_bytes(kin_blobs::digest_bytes(tracked_bytes)),
+                    false,
+                ),
+            ),
+            (
+                path(".kinignore"),
+                TreeEntry::blob(
+                    Hash256::from_bytes(kin_blobs::digest_bytes(ignore_bytes)),
+                    false,
+                ),
+            ),
+        ]);
+
+        let observed =
+            collect_on_disk_tree_entries(repo.path(), &graph).expect("complete exact scan");
+        let report = detect_drift(&graph, &observed);
+
+        assert!(report.is_clean(), "tracked ignore transition: {report:?}");
+    }
+
+    #[test]
+    fn exact_scan_preserves_gitlink_without_expanding_host_checkout() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("vendor/child/src")).unwrap();
+        std::fs::write(
+            repo.path().join("vendor/child/src/lib.rs"),
+            b"host checkout is not parent repository truth",
+        )
+        .unwrap();
+        let ordinary_bytes = b"ordinary";
+        std::fs::write(repo.path().join("ordinary.txt"), ordinary_bytes).unwrap();
+        let gitlink = TreeEntry::gitlink(GitObjectId::sha1([0x77; 20]));
+        let graph = graph_with_entries(vec![
+            (path("vendor/child"), gitlink),
+            (
+                path("ordinary.txt"),
+                TreeEntry::blob(
+                    Hash256::from_bytes(kin_blobs::digest_bytes(ordinary_bytes)),
+                    false,
+                ),
+            ),
+        ]);
+
+        let observed =
+            collect_on_disk_tree_entries(repo.path(), &graph).expect("complete exact scan");
+        let report = detect_drift(&graph, &observed);
+
+        assert!(report.is_clean(), "graph-only Gitlink drift: {report:?}");
+        assert!(observed
+            .iter()
+            .any(|(repo_path, entry)| repo_path == &path("vendor/child") && entry == &gitlink));
+        assert!(!observed
+            .iter()
+            .any(|(repo_path, _)| repo_path == &path("vendor/child/src/lib.rs")));
+    }
+
+    #[test]
     fn file_edited_while_daemon_paused_is_drifted() {
         // Graph truth says lib.rs hashes to [1;32]; the file was edited while the
         // daemon (graph) was paused, so disk now hashes to something else.
         let graph = graph_with(&[("src/lib.rs", [1; 32])]);
         let disk = on_disk(&[("src/lib.rs", [9; 32])]);
         let report = detect_drift(&graph, &disk);
-        assert_eq!(report.drifted, vec!["src/lib.rs".to_string()]);
+        assert_eq!(report.drifted, vec![path("src/lib.rs")]);
         assert!(report.missing.is_empty());
         assert!(report.untracked.is_empty());
     }
@@ -320,7 +444,7 @@ mod tests {
         let graph = graph_with(&[("src/app.rs", [7; 32])]);
         let disk = on_disk(&[("src/app.rs", [0; 32])]);
         let report = detect_drift(&graph, &disk);
-        assert_eq!(report.drifted, vec!["src/app.rs".to_string()]);
+        assert_eq!(report.drifted, vec![path("src/app.rs")]);
         assert!(report.missing.is_empty());
         assert!(report.untracked.is_empty());
     }
@@ -331,7 +455,7 @@ mod tests {
         let graph = graph_with(&[("src/a.rs", [1; 32]), ("src/b.rs", [2; 32])]);
         let disk = on_disk(&[("src/a.rs", [1; 32])]);
         let report = detect_drift(&graph, &disk);
-        assert_eq!(report.missing, vec!["src/b.rs".to_string()]);
+        assert_eq!(report.missing, vec![path("src/b.rs")]);
         assert!(report.drifted.is_empty());
         assert!(report.untracked.is_empty());
     }
@@ -342,7 +466,7 @@ mod tests {
         let graph = graph_with(&[("src/a.rs", [1; 32])]);
         let disk = on_disk(&[("src/a.rs", [1; 32]), ("src/ghost.rs", [5; 32])]);
         let report = detect_drift(&graph, &disk);
-        assert_eq!(report.untracked, vec!["src/ghost.rs".to_string()]);
+        assert_eq!(report.untracked, vec![path("src/ghost.rs")]);
         assert!(report.drifted.is_empty());
         assert!(report.missing.is_empty());
     }
@@ -354,9 +478,9 @@ mod tests {
         let graph = graph_with(&[("src/fresh.rs", [3; 32]), ("src/absent.rs", [4; 32])]);
         let disk = on_disk(&[("src/fresh.rs", [30; 32]), ("src/stray.rs", [8; 32])]);
         let report = detect_drift(&graph, &disk);
-        assert_eq!(report.drifted, vec!["src/fresh.rs".to_string()]);
-        assert_eq!(report.missing, vec!["src/absent.rs".to_string()]);
-        assert_eq!(report.untracked, vec!["src/stray.rs".to_string()]);
+        assert_eq!(report.drifted, vec![path("src/fresh.rs")]);
+        assert_eq!(report.missing, vec![path("src/absent.rs")]);
+        assert_eq!(report.untracked, vec![path("src/stray.rs")]);
         assert!(!report.is_clean());
         assert_eq!(report.total(), 3);
     }
@@ -366,26 +490,20 @@ mod tests {
         let graph = graph_with(&[("src/z.rs", [1; 32]), ("src/a.rs", [2; 32])]);
         let disk = on_disk(&[("src/z.rs", [9; 32]), ("src/a.rs", [9; 32])]);
         let report = detect_drift(&graph, &disk);
-        assert_eq!(
-            report.drifted,
-            vec!["src/a.rs".to_string(), "src/z.rs".to_string()]
-        );
+        assert_eq!(report.drifted, vec![path("src/a.rs"), path("src/z.rs")]);
     }
 
     #[test]
-    fn internal_control_plane_paths_are_not_missing() {
-        // The graph tracks internal .kin/ paths the working tree never projects;
-        // they must not masquerade as missing drift.
+    fn internal_control_plane_paths_are_not_hidden() {
+        // Exact graph corruption is reported. Doctor must not carry forward the
+        // legacy behavior that silently filtered reserved control paths.
         let graph = graph_with(&[
             ("src/lib.rs", [1; 32]),
             (".kin/snapshot/manifest.json", [5; 32]),
         ]);
         let disk = on_disk(&[("src/lib.rs", [1; 32])]);
         let report = detect_drift(&graph, &disk);
-        assert!(
-            report.is_clean(),
-            "internal paths leaked as drift: {report:?}"
-        );
+        assert_eq!(report.missing, vec![path(".kin/snapshot/manifest.json")]);
     }
 
     #[test]
@@ -398,10 +516,11 @@ mod tests {
         // hash as graph truth.
         let blob_store = kin_blobs::BlobStore::new(layout.objects_dir()).unwrap();
         let truth = b"pub fn answer() -> u32 { 42 }\n";
-        blob_store.write(truth).unwrap();
-
-        let graph = InMemoryGraph::new();
-        graph.set_file_hash("src/answer.rs", kin_blobs::digest_bytes(truth));
+        let truth_hash = blob_store.write(truth).unwrap();
+        let graph = graph_with_entries(vec![(
+            path("src/answer.rs"),
+            TreeEntry::blob(Hash256::from_bytes(*truth_hash.as_bytes()), false),
+        )]);
 
         // The working tree holds a drifted copy.
         let source_root = kin_core::source_dir(&layout);
@@ -410,12 +529,12 @@ mod tests {
         std::fs::write(&dest, b"// corrupted / drifted content\n").unwrap();
 
         let report = DriftReport {
-            drifted: vec!["src/answer.rs".to_string()],
+            drifted: vec![path("src/answer.rs")],
             ..Default::default()
         };
         let outcome = heal_drift(&layout, &graph, &source_root, &report).unwrap();
 
-        assert_eq!(outcome.healed, vec!["src/answer.rs".to_string()]);
+        assert_eq!(outcome.healed, vec![path("src/answer.rs")]);
         assert!(
             outcome.failed.is_empty(),
             "unexpected failures: {:?}",
@@ -432,22 +551,23 @@ mod tests {
 
         let blob_store = kin_blobs::BlobStore::new(layout.objects_dir()).unwrap();
         let truth = b"MISSING BUT KNOWN TO THE GRAPH\n";
-        blob_store.write(truth).unwrap();
-
-        let graph = InMemoryGraph::new();
-        graph.set_file_hash("docs/notes.txt", kin_blobs::digest_bytes(truth));
+        let truth_hash = blob_store.write(truth).unwrap();
+        let graph = graph_with_entries(vec![(
+            path("docs/notes.txt"),
+            TreeEntry::blob(Hash256::from_bytes(*truth_hash.as_bytes()), false),
+        )]);
 
         let source_root = kin_core::source_dir(&layout);
         let dest = source_root.join("docs/notes.txt");
         assert!(!dest.exists());
 
         let report = DriftReport {
-            missing: vec!["docs/notes.txt".to_string()],
+            missing: vec![path("docs/notes.txt")],
             ..Default::default()
         };
         let outcome = heal_drift(&layout, &graph, &source_root, &report).unwrap();
 
-        assert_eq!(outcome.healed, vec!["docs/notes.txt".to_string()]);
+        assert_eq!(outcome.healed, vec![path("docs/notes.txt")]);
         assert!(outcome.failed.is_empty());
         assert_eq!(std::fs::read(&dest).unwrap(), truth);
     }
@@ -460,19 +580,113 @@ mod tests {
         let init = kin_core::init(repo.path()).unwrap();
         let layout = init.layout;
 
-        let graph = InMemoryGraph::new();
-        graph.set_file_hash("src/orphan.rs", [123; 32]);
+        let graph = graph_with(&[("src/orphan.rs", [123; 32])]);
 
         let source_root = kin_core::source_dir(&layout);
         let report = DriftReport {
-            missing: vec!["src/orphan.rs".to_string()],
+            missing: vec![path("src/orphan.rs")],
             ..Default::default()
         };
         let outcome = heal_drift(&layout, &graph, &source_root, &report).unwrap();
 
         assert!(outcome.healed.is_empty());
         assert_eq!(outcome.failed.len(), 1);
-        assert_eq!(outcome.failed[0].0, "src/orphan.rs");
+        assert_eq!(outcome.failed[0].0, path("src/orphan.rs"));
         assert!(!source_root.join("src/orphan.rs").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn heal_preserves_executable_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo.path()).unwrap();
+        let layout = init.layout;
+        let blob_store = kin_blobs::BlobStore::new(layout.objects_dir()).unwrap();
+        let truth = b"#!/bin/sh\nexit 0\n";
+        let truth_hash = blob_store.write(truth).unwrap();
+        let script = path("bin/tool");
+        let graph = graph_with_entries(vec![(
+            script.clone(),
+            TreeEntry::blob(Hash256::from_bytes(*truth_hash.as_bytes()), true),
+        )]);
+        let report = DriftReport {
+            missing: vec![script.clone()],
+            ..Default::default()
+        };
+
+        let outcome = heal_drift(&layout, &graph, &kin_core::source_dir(&layout), &report).unwrap();
+
+        assert_eq!(outcome.healed, vec![script]);
+        let mode = std::fs::metadata(repo.path().join("bin/tool"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn heal_recreates_symlink_identity() {
+        let repo = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo.path()).unwrap();
+        let layout = init.layout;
+        let blob_store = kin_blobs::BlobStore::new(layout.objects_dir()).unwrap();
+        let target_hash = blob_store.write(b"target.txt").unwrap();
+        let link = path("current");
+        let graph = graph_with_entries(vec![(
+            link.clone(),
+            TreeEntry::symlink(Hash256::from_bytes(*target_hash.as_bytes())),
+        )]);
+        let report = DriftReport {
+            missing: vec![link.clone()],
+            ..Default::default()
+        };
+
+        let outcome = heal_drift(&layout, &graph, &kin_core::source_dir(&layout), &report).unwrap();
+
+        assert_eq!(outcome.healed, vec![link]);
+        assert_eq!(
+            std::fs::read_link(repo.path().join("current")).unwrap(),
+            std::path::PathBuf::from("target.txt")
+        );
+    }
+
+    #[test]
+    fn heal_refuses_gitlink_without_child_projection() {
+        let repo = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo.path()).unwrap();
+        let layout = init.layout;
+        let gitlink = path("vendor/child");
+        let graph = graph_with_entries(vec![(
+            gitlink.clone(),
+            TreeEntry::gitlink(GitObjectId::sha1([0x55; 20])),
+        )]);
+        let report = DriftReport {
+            missing: vec![gitlink.clone()],
+            ..Default::default()
+        };
+
+        let outcome = heal_drift(&layout, &graph, &kin_core::source_dir(&layout), &report).unwrap();
+
+        assert!(outcome.healed.is_empty());
+        assert_eq!(outcome.failed[0].0, gitlink);
+        assert!(outcome.failed[0].1.contains("child repository projection"));
+    }
+
+    #[test]
+    fn drift_json_preserves_non_utf8_paths_losslessly() {
+        let exact_path = RepoPath::from_bytes(b"assets/\xff.bin".to_vec()).unwrap();
+        let graph = graph_with_entries(vec![(exact_path.clone(), regular([0x66; 32]))]);
+
+        let report = detect_drift(&graph, &[]);
+
+        assert_eq!(report.missing, vec![exact_path]);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["missing"][0]["bytes_hex"],
+            serde_json::Value::String("6173736574732fff2e62696e".to_string())
+        );
     }
 }

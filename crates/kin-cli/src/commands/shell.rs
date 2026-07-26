@@ -28,8 +28,9 @@ pub async fn run(
         None => None,
     };
 
+    let repo_binding = super::session_process::VerifiedRepoBinding::resolve(&layout).await?;
     let ws = super::session_workspace::create_session_workspace(
-        &layout,
+        &repo_binding,
         &session_dir,
         mat_strategy,
         None,
@@ -44,65 +45,86 @@ pub async fn run(
     // native command contract for interactive terminals while ensuring
     // discovery commands see live, unreconciled workspace edits.
     let shim_env =
-        native_session_shim_env(&layout, &ws.root, restrict_discovery, restrict_filesystem)?;
-    let daemon_url = match std::env::var("KIN_DAEMON_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    {
-        Some(url) => url,
-        None => crate::daemon_client::resolve_daemon_url(&layout)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("kin daemon is required for shell session binding"))?,
-    };
-    let repo_id = super::remote::resolve_repo_id(&layout).ok();
-    let mut launch_env = shell_session_env(session_id, &ws.root, &daemon_url, repo_id.as_deref());
-    launch_env.extend(shim_env);
+        native_session_shim_env(&layout, &ws.root, restrict_discovery, restrict_filesystem)
+            .map_err(|error| {
+                anyhow::anyhow!(
+            "failed to prepare shell session environment: {error}. Session workspace kept at {}",
+            session_dir.display()
+        )
+            })?;
+    let process_binding =
+        super::session_process::SessionProcessBinding::new(&repo_binding, session_id, &ws.root);
+    process_binding.persist_context().map_err(|error| {
+        anyhow::anyhow!(
+            "failed to persist session context: {error}. Session workspace kept at {}",
+            session_dir.display()
+        )
+    })?;
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".into());
 
-    let status = std::process::Command::new(&shell)
-        .current_dir(&ws.root)
-        .envs(launch_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+    let mut command = std::process::Command::new(&shell);
+    process_binding
+        .configure_command(&mut command, shim_env.iter().map(|(k, v)| (k, v)))
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to bind shell process to session: {error}. Session workspace kept at {}",
+                session_dir.display()
+            )
+        })?;
+    let lease = repo_binding
+        .register_session(session_id, &ws.root, "kin shell")
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to register session: {error}. Session workspace kept at {}",
+                session_dir.display()
+            )
+        })?;
+    let status = match command
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .status()
-        .map_err(|e| anyhow::anyhow!("failed to launch shell '{}': {}", shell, e))?;
+    {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = lease.finish().await;
+            return Err(anyhow::anyhow!(
+                "failed to launch shell '{}': {}. Session workspace kept at {}",
+                shell,
+                error,
+                session_dir.display()
+            ));
+        }
+    };
 
     let code = status.code().unwrap_or(1);
     eprintln!("\nShell exited (code {}).", code);
 
-    close_session_after_shell(&layout, &session_dir).await?;
+    let close_result = close_session_after_shell(&repo_binding, &session_dir, code).await;
+    let lease_result = lease.finish().await;
 
+    if code != 0 {
+        if let Err(error) = close_result {
+            eprintln!("Kin: failed to report preserved session workspace: {error}");
+        }
+        if let Err(error) = lease_result {
+            eprintln!("Kin: failed to end daemon session lease: {error}");
+        }
+        std::process::exit(code);
+    }
+    close_result?;
+    lease_result?;
     Ok(())
 }
 
-fn shell_session_env(
-    session_id: uuid::Uuid,
-    ws_root: &std::path::Path,
-    daemon_url: &str,
-    repo_id: Option<&str>,
-) -> Vec<(String, String)> {
-    let mut env = vec![
-        ("KIN_SESSION".into(), session_id.to_string()),
-        ("KIN_SESSION_ID".into(), session_id.to_string()),
-        (
-            "KIN_SESSION_DIR".into(),
-            ws_root.to_string_lossy().into_owned(),
-        ),
-        ("KIN_DAEMON_URL".into(), daemon_url.to_string()),
-    ];
-    if let Some(repo_id) = repo_id {
-        env.push(("KIN_REPO_ID".into(), repo_id.to_string()));
-    }
-    env
-}
-
 async fn close_session_after_shell(
-    layout: &kin_core::KinLayout,
+    binding: &super::session_process::VerifiedRepoBinding,
     session_dir: &std::path::Path,
+    exit_code: i32,
 ) -> Result<()> {
-    super::session_closeout::finalize_shell_session(layout, session_dir).await
+    super::session_closeout::finalize_shell_session(binding, session_dir, exit_code).await
 }
 
 fn native_session_shim_env(
@@ -163,43 +185,6 @@ mod tests {
     }
 
     #[test]
-    fn shell_env_vars_are_set_correctly() {
-        // Validate that the env var names we use match expected conventions
-        let session_id = uuid::Uuid::new_v4();
-        let session_str = session_id.to_string();
-        let ws_root = std::path::Path::new("/tmp/test-repo/.kin/runs/session-test");
-        let env = super::shell_session_env(
-            session_id,
-            ws_root,
-            "http://127.0.0.1:4242",
-            Some("repo-uuid"),
-        );
-
-        // KIN_SESSION should be a valid UUID string
-        assert!(uuid::Uuid::parse_str(&session_str).is_ok());
-        for (key, expected) in [
-            ("KIN_SESSION", session_id.to_string()),
-            ("KIN_SESSION_ID", session_id.to_string()),
-            ("KIN_SESSION_DIR", ws_root.to_string_lossy().into_owned()),
-            ("KIN_DAEMON_URL", "http://127.0.0.1:4242".to_string()),
-            ("KIN_REPO_ID", "repo-uuid".to_string()),
-        ] {
-            assert_eq!(
-                env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str()),
-                Some(expected.as_str()),
-                "missing or wrong {key}"
-            );
-        }
-
-        // Session dir path construction
-        let root = std::path::Path::new("/tmp/test-repo");
-        let session_dir = root.join("runs").join(format!("session-{}", session_id));
-        assert!(session_dir
-            .to_string_lossy()
-            .contains(&session_id.to_string()));
-    }
-
-    #[test]
     fn native_session_shim_env_targets_workspace_and_can_deny_discovery() {
         let dir = tempfile::tempdir().unwrap();
         let kin_dir = dir.path().join(".kin");
@@ -257,9 +242,14 @@ mod tests {
         )
         .unwrap();
 
-        finalize_shell_session_with_writer(&layout, &session_dir, &mut stderr)
-            .await
-            .unwrap();
+        finalize_shell_session_with_writer(
+            &crate::commands::session_closeout::test_binding(&layout),
+            &session_dir,
+            0,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
 
         let output = String::from_utf8(stderr).unwrap();
         assert!(output.contains("Warning: failed to reconcile session changes"));
@@ -291,9 +281,14 @@ mod tests {
         std::fs::create_dir_all(session_dir.join("src")).unwrap();
         std::fs::write(session_dir.join("src/lib.rs"), "pub fn stable_source( {\n").unwrap();
 
-        finalize_shell_session_with_writer(&layout, &session_dir, &mut stderr)
-            .await
-            .unwrap();
+        finalize_shell_session_with_writer(
+            &crate::commands::session_closeout::test_binding(&layout),
+            &session_dir,
+            0,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
 
         let output = String::from_utf8(stderr).unwrap();
         assert!(output.contains("Warning: failed to reconcile session changes"));

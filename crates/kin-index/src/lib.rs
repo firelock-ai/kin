@@ -6,9 +6,11 @@
 //! This crate orchestrates file parsing, blob storage, and graph updates.
 //! It also provides a file watcher for incremental re-indexing.
 //!
-//! Key design: the indexer updates the WorkingCopy overlay only. It does NOT
-//! create SemanticChange nodes — that is `kin commit`'s job.
+//! Key design: the indexer proposes deltas for an exact graph-owned
+//! `WorkspaceState`. It does not create `SemanticChange` history on its own;
+//! repository authority commits workspace and history transitions atomically.
 
+pub mod admission;
 pub mod artifacts;
 pub mod classifier;
 pub mod error;
@@ -16,9 +18,16 @@ pub mod fingerprint;
 pub mod linker;
 pub mod overlay;
 pub mod pipeline;
+pub mod repository;
 pub mod support;
 pub mod watcher;
 
+pub use admission::{
+    enforce_sensitive_admission, is_intrinsic_repository_control_path, AdmissionCase,
+    AdmissionDecision, AdmissionDecisionReason, AdmissionMatcherError, AdmissionRuleProvenance,
+    AdmissionRuleSource, ResolvedAdmissionMatcher, ResolvedAdmissionRuleSet,
+    SensitiveAdmissionError, SensitiveFindingKind,
+};
 pub use artifacts::extract_artifact;
 pub use classifier::{FileClassification, FileClassifier};
 pub use error::{IndexError, Result};
@@ -43,47 +52,28 @@ pub use pipeline::{
     classify_file_role, entity_semantics_changed, normalize_file_path_id, IndexPipeline,
     IndexedAny, IndexedFile, COMMAND_EFFECT_CONTRACT_KEY,
 };
+pub use repository::{
+    host_path_from_repo_path, is_repository_control_path, read_verified_scanned_entry,
+    repo_path_from_host_relative, scan_repository, scan_repository_preserving_graph_only,
+    should_track_host_relative_path, CompleteRepositoryScan, CompleteScanToken,
+    IncompleteRepositoryScan, RepositoryIgnore, RepositoryScanDiagnostics, ScannedEntryKind,
+    ScannedRepositoryEntry,
+};
 pub use support::{compute_coverage_report, CoverageReport};
 pub use watcher::{FileEvent, FileWatcher};
 
 use std::path::Path;
 
-/// Directories that should be skipped during file collection for indexing.
-///
-/// This is the canonical skip list. All graph-building paths (init, commit,
-/// migrate) must use this to ensure identical entity sets for the same repo.
-pub const SKIP_DIRS: &[&str] = &[
-    "node_modules",
-    "target",
-    "__pycache__",
-    "vendor",
-    ".next",
-    "dist",
-    "build",
-    "out",
-];
-
-/// Returns true if a directory name should be skipped during file collection.
-///
-/// Checks both the canonical `SKIP_DIRS` list and Kin/Git internal directories.
+/// Returns true only for Kin/Git control directories.
 pub fn should_skip_dir(name: &str) -> bool {
-    matches!(name, ".kin" | ".git" | ".git-export")
-        || name.starts_with(".kin-")
-        || name.starts_with(".bench-")
-        || SKIP_DIRS.contains(&name)
+    kin_model::RepoPath::from_utf8(name)
+        .map(|path| is_repository_control_path(&path))
+        .unwrap_or(false)
 }
 
-/// Returns true when a repo-relative path is admissible for indexing.
-///
-/// Any path containing a skipped/internal directory component is rejected.
+/// Returns true when a repo-relative host path is not Kin/Git control metadata.
 pub fn should_index_repo_relative_path(path: &Path) -> bool {
-    path.components().all(|component| match component {
-        std::path::Component::Normal(name) => !should_skip_dir(name.to_string_lossy().as_ref()),
-        std::path::Component::CurDir => true,
-        std::path::Component::ParentDir
-        | std::path::Component::RootDir
-        | std::path::Component::Prefix(_) => false,
-    })
+    should_track_host_relative_path(path)
 }
 
 use kin_blobs::BlobStore;
