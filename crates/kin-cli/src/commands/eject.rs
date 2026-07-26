@@ -88,9 +88,12 @@ pub async fn run(yes: bool) -> Result<()> {
     staged_git.install_coexistence_config(&config_proof)?;
     config_proof.revalidate(&layout.config_path())?;
 
-    let staged_git_capability =
-        kin_core::ExactProjectionGitStage::open_existing(staged_git.git_dir())
-            .context("retain the fully prepared replacement Git directory")?;
+    let staged_git_capability = kin_core::ExactProjectionGitStage::open_existing(
+        staged_git.git_dir(),
+        staged_git.export_proof(),
+        &final_capture.workspace.tree,
+    )
+    .context("retain and re-verify the fully prepared replacement Git directory")?;
     let (archive, archive_target) = create_eject_archive(&layout)?;
     config_proof.revalidate(&layout.config_path())?;
     // This consumes the projection freeze and owns every namespace mutation:
@@ -235,6 +238,7 @@ impl WorkspaceProjectionProof {
 struct StagedGitRepository {
     _directory: tempfile::TempDir,
     git_dir: PathBuf,
+    export_proof: kin_git::RepositoryGitExportProof,
     imported_commits: usize,
     native_commits: usize,
 }
@@ -316,6 +320,7 @@ impl StagedGitRepository {
         Ok(Self {
             _directory: directory,
             git_dir,
+            export_proof: result.proof,
             imported_commits: result.imported_commits_reused,
             native_commits: result.native_commits_written,
         })
@@ -323,6 +328,10 @@ impl StagedGitRepository {
 
     fn git_dir(&self) -> &Path {
         &self.git_dir
+    }
+
+    fn export_proof(&self) -> &kin_git::RepositoryGitExportProof {
+        &self.export_proof
     }
 
     fn install_coexistence_config(&self, proof: &GitCoexistenceConfigProof) -> Result<()> {
