@@ -650,7 +650,7 @@ struct DaemonAuthState {
 }
 
 fn is_public_route(path: &str) -> bool {
-    let path = path.strip_prefix("/v1").unwrap_or(path);
+    let path = path.strip_prefix("/v2").unwrap_or(path);
     matches!(path, "/health" | "/ready" | "/readiness" | "/spine/health")
 }
 
@@ -7097,7 +7097,7 @@ struct SpineXrefParams {
     entity: String,
 }
 
-/// Stable wire response for the canonical `GET /v1/spine/edges` bulk read.
+/// Stable wire response for the canonical `GET /spine/edges` bulk read.
 /// Field order plus the snapshot's canonical collections make identical graph
 /// authority serialize to identical response bytes.
 #[derive(Debug, Serialize)]
@@ -7210,7 +7210,7 @@ async fn spine_xref(
     ))
 }
 
-/// `GET /v1/spine/edges` — one atomic graph-authoritative cross-repo snapshot.
+/// `GET /spine/edges` — one atomic graph-authoritative cross-repo snapshot.
 ///
 /// This is a read-only protected daemon route. It returns the complete edge
 /// universe held by the spine in deterministic order, rather than sampling
@@ -8482,20 +8482,23 @@ mod tests {
         let bytes = b"shared archive payload\n";
         let digest: [u8; 32] = Sha256::digest(bytes).into();
         let hash = Hash256::from_bytes(digest);
-        let tree = HashMap::from([
-            (
-                FilePathId::new("src/first.rs"),
-                TreeEntry::regular(hash, false),
+        let tree = kin_model::ResolvedTree::from_artifacts([
+            kin_model::ResolvedArtifact::new(
+                kin_model::ArtifactId::new(),
+                RepoPath::from_utf8("src/first.rs").unwrap(),
+                TreeEntry::blob(hash, false),
             ),
-            (
-                FilePathId::new("src/second.rs"),
-                TreeEntry::regular(hash, true),
+            kin_model::ResolvedArtifact::new(
+                kin_model::ArtifactId::new(),
+                RepoPath::from_utf8("src/second.rs").unwrap(),
+                TreeEntry::blob(hash, true),
             ),
-        ]);
+        ])
+        .unwrap();
         let mut loads = 0;
         let entries = load_exact_source_entries_with(tree, |_, requested, max_bytes| {
             loads += 1;
-            assert_eq!(requested, digest);
+            assert_eq!(requested, hash);
             assert_eq!(max_bytes, EXACT_SOURCE_MAX_EXPANDED_BYTES as u64);
             Ok(Some(bytes.to_vec()))
         })
@@ -8517,21 +8520,26 @@ mod tests {
         let second = b"second immutable payload with a different length\n";
         let first_digest: [u8; 32] = Sha256::digest(first).into();
         let second_digest: [u8; 32] = Sha256::digest(second).into();
-        let tree = HashMap::from([
-            (
-                FilePathId::new("src/first.rs"),
-                TreeEntry::regular(Hash256::from_bytes(first_digest), false),
+        let first_hash = Hash256::from_bytes(first_digest);
+        let second_hash = Hash256::from_bytes(second_digest);
+        let tree = kin_model::ResolvedTree::from_artifacts([
+            kin_model::ResolvedArtifact::new(
+                kin_model::ArtifactId::new(),
+                RepoPath::from_utf8("src/first.rs").unwrap(),
+                TreeEntry::blob(first_hash, false),
             ),
-            (
-                FilePathId::new("src/second.rs"),
-                TreeEntry::regular(Hash256::from_bytes(second_digest), false),
+            kin_model::ResolvedArtifact::new(
+                kin_model::ArtifactId::new(),
+                RepoPath::from_utf8("src/second.rs").unwrap(),
+                TreeEntry::blob(second_hash, false),
             ),
-        ]);
+        ])
+        .unwrap();
         let mut expected = [
-            (first_digest, first.as_slice()),
-            (second_digest, second.as_slice()),
+            (first_hash, first.as_slice()),
+            (second_hash, second.as_slice()),
         ];
-        expected.sort_by_key(|(digest, _)| *digest);
+        expected.sort_by_key(|(digest, _)| digest.to_string());
         let mut observed = Vec::new();
 
         load_exact_source_entries_with(tree, |_, requested, max_bytes| {
@@ -8552,214 +8560,6 @@ mod tests {
             observed[1].1,
             EXACT_SOURCE_MAX_EXPANDED_BYTES as u64 - expected[0].1.len() as u64
         );
-    }
-
-    #[test]
-    fn historical_release_evidence_omits_unbound_later_verification_runs() {
-        use kin_model::VerificationStore;
-
-        let graph = kin_db::InMemoryGraph::new();
-        let root = kin_core::build_genesis_change();
-        graph.create_change(&root).unwrap();
-        let entity = test_entity("source_bound", "src/lib.rs");
-        let mut source_change = root.clone();
-        source_change.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x85; 32]));
-        source_change.parents = vec![root.id];
-        source_change.message = "historical source".to_string();
-        source_change.entity_deltas = vec![kin_model::EntityDelta::Added(entity.clone())];
-        graph.create_change(&source_change).unwrap();
-        graph.upsert_entity(&entity).unwrap();
-
-        let run = kin_model::VerificationRun {
-            run_id: kin_model::VerificationRunId::new(),
-            test_ids: vec![],
-            status: kin_model::VerificationStatus::Passing,
-            runner: kin_model::TestRunner::Cargo,
-            started_at: Timestamp::now(),
-            finished_at: Some(Timestamp::now()),
-            duration_ms: Some(1),
-            evidence_blob: None,
-            exit_code: Some(0),
-        };
-        graph.create_verification_run(&run).unwrap();
-        graph
-            .link_run_proves_entity(&run.run_id, &entity.id)
-            .unwrap();
-        assert_eq!(
-            kin_review::passing_proof_coverage(&graph)
-                .unwrap()
-                .covered_entities,
-            1,
-            "the current unbound run is a false-green without historical filtering"
-        );
-
-        let snapshot = graph.to_snapshot();
-        let (historical, _) =
-            release_evidence_graph_at(&graph, &snapshot, &source_change.id).unwrap();
-        let coverage = kin_review::passing_proof_coverage(&historical).unwrap();
-        assert_eq!(coverage.total_entities, 1);
-        assert_eq!(coverage.covered_entities, 0);
-        assert_eq!(coverage.missing_proof, vec![entity.id]);
-    }
-
-    #[test]
-    fn later_unbound_tests_cannot_rewrite_historical_security_or_anchor() {
-        use kin_model::{EntityStore, VerificationStore};
-
-        let graph = kin_db::InMemoryGraph::new();
-        let root = kin_core::build_genesis_change();
-        graph.create_change(&root).unwrap();
-        let mut entity = test_entity("historical_endpoint", "src/api.rs");
-        entity.kind = EntityKind::ApiEndpoint;
-        let mut source_change = root.clone();
-        source_change.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x86; 32]));
-        source_change.parents = vec![root.id];
-        source_change.message = "historical endpoint source".to_string();
-        source_change.entity_deltas = vec![kin_model::EntityDelta::Added(entity.clone())];
-        graph.create_change(&source_change).unwrap();
-        graph.upsert_entity(&entity).unwrap();
-
-        let before_snapshot = graph.to_snapshot();
-        let (before_graph, before_root) =
-            release_evidence_graph_at(&graph, &before_snapshot, &source_change.id).unwrap();
-        let before_security_count = kin_review::security_findings(&before_graph, true)
-            .unwrap()
-            .len();
-        assert!(before_security_count > 0);
-
-        let release_check = RepoReleaseCheckEvidence {
-            pass: false,
-            blockers: vec!["fixed historical blocker".to_string()],
-        };
-        let coverage = RepoCoverageEvidence {
-            total_entities: 1,
-            covered_entities: 0,
-            coverage_ratio: 0.0,
-            missing_proof_count: 1,
-        };
-        let before_security = RepoSecurityEvidence {
-            finding_count: before_security_count,
-        };
-        let before_anchor = release_evidence_anchor(
-            "repo",
-            &source_change.id.to_string(),
-            "fixed-manifest",
-            before_root,
-            &release_check,
-            &coverage,
-            &before_security,
-        );
-
-        let test = kin_model::TestCase {
-            test_id: kin_model::TestId::new(),
-            name: "later_endpoint_test".to_string(),
-            language: "rust".to_string(),
-            kind: kin_model::TestKind::Unit,
-            scopes: vec![kin_model::WorkScope::Entity(entity.id)],
-            runner: kin_model::TestRunner::Cargo,
-            file_origin: Some(FilePathId::new("tests/later.rs")),
-        };
-        graph.create_test_case(&test).unwrap();
-        graph
-            .create_assertion(&kin_model::Assertion {
-                assertion_id: kin_model::AssertionId::new(),
-                summary: "later assertion".to_string(),
-                expected_behavior: "later behavior".to_string(),
-                target_scope: kin_model::WorkScope::Entity(entity.id),
-            })
-            .unwrap();
-        graph
-            .create_contract(&kin_model::Contract {
-                id: EntityId::new(),
-                kind: kin_model::ContractKind::OpenApi,
-                name: "later contract".to_string(),
-                schema_hash: Hash256::from_bytes([0x87; 32]),
-                producers: vec![entity.id],
-                consumers: vec![],
-                version: None,
-            })
-            .unwrap();
-        graph
-            .create_mock_hint(&kin_model::MockHint {
-                hint_id: kin_model::MockHintId::new(),
-                test_id: test.test_id,
-                dependency_scope: kin_model::WorkScope::Entity(entity.id),
-                strategy: kin_model::MockStrategy::Stub,
-            })
-            .unwrap();
-        graph
-            .upsert_relation(&kin_model::Relation {
-                id: kin_model::RelationId::new(),
-                kind: RelationKind::Tests,
-                // The release scanner's entity relation API currently admits
-                // only entity-to-entity edges. This uncommitted overlay edge
-                // has the exact shape that the former historical graft copied
-                // and that can false-green `untested-api`.
-                src: GraphNodeId::Entity(entity.id),
-                dst: GraphNodeId::Entity(entity.id),
-                confidence: 1.0,
-                origin: kin_model::RelationOrigin::Inferred,
-                created_in: None,
-                import_source: None,
-                evidence: vec![],
-            })
-            .unwrap();
-        assert!(
-            kin_review::security_findings(&graph, true).unwrap().len() < before_security_count,
-            "the later unbound Tests relation must demonstrate the false-green current graph"
-        );
-
-        let mut after_snapshot = graph.to_snapshot();
-        after_snapshot
-            .test_covers_entity
-            .push((test.test_id, entity.id));
-        assert!(!after_snapshot.test_cases.is_empty());
-        assert!(!after_snapshot.assertions.is_empty());
-        assert!(!after_snapshot.contracts.is_empty());
-        assert!(!after_snapshot.mock_hints.is_empty());
-        assert!(!after_snapshot.test_covers_entity.is_empty());
-        assert!(after_snapshot
-            .relations
-            .values()
-            .any(|relation| matches!(relation.kind, RelationKind::Tests | RelationKind::Covers)));
-
-        let after_snapshot_root = kin_db::compute_graph_root_hash(&after_snapshot);
-        let after_frozen = kin_db::InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
-            after_snapshot.clone(),
-            after_snapshot_root,
-        );
-        let (after_graph, after_root) =
-            release_evidence_graph_at(&after_frozen, &after_snapshot, &source_change.id).unwrap();
-        let historical_snapshot = after_graph.to_snapshot();
-        assert!(historical_snapshot.test_cases.is_empty());
-        assert!(historical_snapshot.assertions.is_empty());
-        assert!(historical_snapshot.contracts.is_empty());
-        assert!(historical_snapshot.mock_hints.is_empty());
-        assert!(historical_snapshot.test_covers_entity.is_empty());
-        assert!(!historical_snapshot
-            .relations
-            .values()
-            .any(|relation| matches!(relation.kind, RelationKind::Tests | RelationKind::Covers)));
-
-        let after_security_count = kin_review::security_findings(&after_graph, true)
-            .unwrap()
-            .len();
-        let after_security = RepoSecurityEvidence {
-            finding_count: after_security_count,
-        };
-        let after_anchor = release_evidence_anchor(
-            "repo",
-            &source_change.id.to_string(),
-            "fixed-manifest",
-            after_root,
-            &release_check,
-            &coverage,
-            &after_security,
-        );
-
-        assert_eq!(after_security_count, before_security_count);
-        assert_eq!(after_root, before_root);
-        assert_eq!(after_anchor, before_anchor);
     }
 
     #[test]
@@ -8940,289 +8740,6 @@ mod tests {
         assert!(validate_exact_source_symlink("dir/link", "../.kin-session/base.json").is_err());
         assert!(validate_exact_source_symlink("dir/link", "../.KiN-SeSsIoN/base.json").is_err());
         assert!(validate_exact_source_symlink("dir/link", "../README.md").is_ok());
-    }
-
-    fn exact_source_backend_state(repo_id: &str) -> Arc<DaemonState> {
-        install_test_registry_override();
-        let directory =
-            std::env::temp_dir().join(format!("kin-daemon-exact-source-{}", uuid::Uuid::new_v4()));
-        let kin_dir = directory.join(".kin");
-        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
-        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
-        let layout = kin_core::KinLayout::new(kin_dir);
-        kin_core::manifest::KinManifest::new()
-            .save(&layout.manifest_path())
-            .unwrap();
-        let backend = directory.join("backend");
-        std::fs::create_dir_all(&backend).unwrap();
-        Arc::new(
-            DaemonState::open_with_backend(
-                layout,
-                Box::new(kin_db::LocalFileBackend::new(backend)),
-                repo_id,
-                None,
-            )
-            .unwrap(),
-        )
-    }
-
-    fn exact_source_delta(
-        state: &DaemonState,
-        path: &str,
-        kind: TreeEntryKind,
-        old_entry: Option<TreeEntry>,
-        data: &[u8],
-    ) -> TreeDelta {
-        let blob_hash = state.blobs.write(data).unwrap();
-        let file_id = FilePathId::new(path);
-        let new_entry = TreeEntry {
-            blob_hash: Hash256::from_bytes(blob_hash.0),
-            kind,
-        };
-        match old_entry {
-            Some(old_entry) => TreeDelta::Modified {
-                file_id,
-                old_entry,
-                new_entry,
-            },
-            None => TreeDelta::Added { file_id, new_entry },
-        }
-    }
-
-    fn install_two_change_exact_source_history(
-        state: &DaemonState,
-    ) -> (SemanticChangeId, SemanticChangeId) {
-        let branch_name = BranchName::new("main");
-        let old_readme = state.blobs.write(b"old source\n").unwrap();
-        let old_readme_entry = TreeEntry::regular(Hash256::from_bytes(old_readme.0), false);
-        let first_entity = test_entity("first_source_entity", "src/first.rs");
-        state.graph.upsert_entity(&first_entity).unwrap();
-        let first = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([81; 32])),
-            parents: vec![],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("human-test"),
-            message: "first exact source".to_string(),
-            entity_deltas: vec![EntityDelta::Added(first_entity)],
-            relation_deltas: vec![],
-            tree_deltas: vec![
-                TreeDelta::Added {
-                    file_id: FilePathId::new("README.md"),
-                    new_entry: old_readme_entry,
-                },
-                exact_source_delta(
-                    state,
-                    "bin/run",
-                    TreeEntryKind::Regular { executable: true },
-                    None,
-                    b"#!/bin/sh\necho old\n",
-                ),
-                exact_source_delta(state, "current", TreeEntryKind::Symlink, None, b"bin/run"),
-            ],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(branch_name.clone()),
-        };
-        state.graph.create_change(&first).unwrap();
-        state
-            .graph
-            .create_branch(&Branch {
-                name: branch_name.clone(),
-                head: first.id,
-            })
-            .unwrap();
-
-        let second_entity = test_entity("second_source_entity", "src/second.rs");
-        state.graph.upsert_entity(&second_entity).unwrap();
-        let second = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([82; 32])),
-            parents: vec![first.id],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("human-test"),
-            message: "newer exact source".to_string(),
-            entity_deltas: vec![EntityDelta::Added(second_entity)],
-            relation_deltas: vec![],
-            tree_deltas: vec![exact_source_delta(
-                state,
-                "README.md",
-                TreeEntryKind::Regular { executable: false },
-                Some(old_readme_entry),
-                b"new source\n",
-            )],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(branch_name.clone()),
-        };
-        state.graph.create_change(&second).unwrap();
-        state
-            .graph
-            .update_branch_head(&branch_name, &second.id)
-            .unwrap();
-        state.save_snapshot_full().unwrap();
-        (first.id, second.id)
-    }
-
-    async fn exact_source_get(
-        app: Router,
-        path: String,
-        authenticated: bool,
-    ) -> axum::response::Response {
-        let mut request = Request::get(path);
-        if authenticated {
-            request = request.header(header::AUTHORIZATION, "Bearer exact-source-token");
-        }
-        app.oneshot(request.body(Body::empty()).unwrap())
-            .await
-            .unwrap()
-    }
-
-    fn read_exact_source_tar_entry(
-        archive: &[u8],
-        wanted: &str,
-    ) -> (u32, bool, Option<String>, Vec<u8>) {
-        use std::io::Read;
-
-        let decoder = flate2::read::GzDecoder::new(archive);
-        let mut archive = tar::Archive::new(decoder);
-        for entry in archive.entries().unwrap() {
-            let mut entry = entry.unwrap();
-            if entry.path().unwrap().as_ref() != FsPath::new(wanted) {
-                continue;
-            }
-            let mode = entry.header().mode().unwrap();
-            let is_symlink = entry.header().entry_type().is_symlink();
-            let link = entry
-                .link_name()
-                .unwrap()
-                .map(|target| target.to_string_lossy().into_owned());
-            let mut data = Vec::new();
-            entry.read_to_end(&mut data).unwrap();
-            return (mode, is_symlink, link, data);
-        }
-        panic!("archive entry {wanted:?} was not found")
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn exact_source_routes_are_authenticated_historical_and_file_independent() {
-        let repo_id = "exact-route-repo";
-        let state = exact_source_backend_state(repo_id);
-        let (old_change, new_change) = install_two_change_exact_source_history(&state);
-        let app = router_with_auth(Arc::clone(&state), Some("exact-source-token".to_string()));
-        let old_path = format!("/repos/{repo_id}/archive/tar/{old_change}");
-
-        let rejected = exact_source_get(app.clone(), old_path.clone(), false).await;
-        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
-
-        let old_response = exact_source_get(app.clone(), old_path.clone(), true).await;
-        assert_eq!(old_response.status(), StatusCode::OK);
-        assert_eq!(
-            old_response.headers()["x-kin-source-change-id"],
-            old_change.to_string()
-        );
-        let old_manifest = old_response.headers()["x-kin-source-manifest-sha256"].clone();
-        let old_archive_frame = axum::body::to_bytes(old_response.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        // Tower's in-process transport hands the server-owned Bytes directly
-        // to the test client. Copy into client-owned storage and release that
-        // server allocation, matching a real network write completing.
-        let old_archive = old_archive_frame.to_vec();
-        drop(old_archive_frame);
-        assert_eq!(
-            read_exact_source_tar_entry(&old_archive, "kin-source/README.md"),
-            (0o644, false, None, b"old source\n".to_vec())
-        );
-        assert_eq!(
-            read_exact_source_tar_entry(&old_archive, "kin-source/bin/run"),
-            (0o755, false, None, b"#!/bin/sh\necho old\n".to_vec())
-        );
-        assert_eq!(
-            read_exact_source_tar_entry(&old_archive, "kin-source/current"),
-            (0o777, true, Some("bin/run".to_string()), Vec::new())
-        );
-
-        // A newer branch head and a decoy working-tree file cannot change the
-        // bytes returned for the explicitly requested historical source ID.
-        std::fs::write(state.layout.working_dir().join("README.md"), b"raw decoy\n").unwrap();
-        let repeated = exact_source_get(app.clone(), old_path, true).await;
-        assert_eq!(repeated.status(), StatusCode::OK);
-        assert_eq!(
-            repeated.headers()["x-kin-source-manifest-sha256"],
-            old_manifest
-        );
-        let repeated_archive_frame = axum::body::to_bytes(repeated.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let repeated_archive = repeated_archive_frame.to_vec();
-        drop(repeated_archive_frame);
-        assert_eq!(old_archive, repeated_archive);
-
-        let new_response = exact_source_get(
-            app.clone(),
-            format!("/repos/{repo_id}/archive/tar/{new_change}"),
-            true,
-        )
-        .await;
-        assert_eq!(new_response.status(), StatusCode::OK);
-        let new_manifest = new_response.headers()["x-kin-source-manifest-sha256"].clone();
-        assert_ne!(old_manifest, new_manifest);
-        let new_archive_frame = axum::body::to_bytes(new_response.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let new_archive = new_archive_frame.to_vec();
-        drop(new_archive_frame);
-        assert_eq!(
-            read_exact_source_tar_entry(&new_archive, "kin-source/README.md").3,
-            b"new source\n"
-        );
-
-        let old_evidence = exact_source_get(
-            app.clone(),
-            format!("/repos/{repo_id}/release/evidence/{old_change}"),
-            true,
-        )
-        .await;
-        assert_eq!(old_evidence.status(), StatusCode::OK);
-        let old_evidence: RepoReleaseEvidenceResponse = serde_json::from_slice(
-            &axum::body::to_bytes(old_evidence.into_body(), 64 * 1024)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        let new_evidence = exact_source_get(
-            app,
-            format!("/repos/{repo_id}/release/evidence/{new_change}"),
-            true,
-        )
-        .await;
-        assert_eq!(new_evidence.status(), StatusCode::OK);
-        let new_evidence: RepoReleaseEvidenceResponse = serde_json::from_slice(
-            &axum::body::to_bytes(new_evidence.into_body(), 64 * 1024)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-
-        assert_eq!(old_evidence.source_change_id, old_change.to_string());
-        assert_eq!(new_evidence.source_change_id, new_change.to_string());
-        assert_eq!(old_evidence.coverage.total_entities, 1);
-        assert_eq!(new_evidence.coverage.total_entities, 2);
-        assert_eq!(old_evidence.coverage.missing_proof_count, 1);
-        assert_eq!(new_evidence.coverage.missing_proof_count, 2);
-        assert_ne!(old_evidence.authority_anchor, new_evidence.authority_anchor);
-        assert_eq!(
-            old_evidence.source_manifest_sha256,
-            old_manifest.to_str().unwrap()
-        );
-        assert_eq!(
-            new_evidence.source_manifest_sha256,
-            new_manifest.to_str().unwrap()
-        );
     }
 
     #[test]
@@ -9760,12 +9277,11 @@ mod tests {
     }
     use axum::routing::get as axum_get;
     use kin_model::{
-        Actor, ActorId, ActorKind, AgentSession, AnnotationFilter, Approval, ApprovalDecision,
-        ApprovalId, AuditEventId, AuthorId, Branch, BranchName, Entity, EntityDelta, EntityId,
-        EntityKind, EntityRole, FileLayout, FilePathId, FingerprintAlgorithm, Hash256, IdentityRef,
-        ImportSection, IntentScope, LanguageId, Priority, RelationKind, SemanticChange,
-        SemanticChangeId, SemanticFingerprint, SourceRegion, SourceSpan, TestCase, TestKind,
-        TestRunner, Timestamp, Visibility, WorkItem, WorkKind, WorkScope, WorkStatus, WorkStore,
+        AgentSession, AnnotationFilter, AuthorId, Entity, EntityDelta, EntityId, EntityKind,
+        EntityRole, FilePathId, FingerprintAlgorithm, Hash256, IdentityRef, IntentScope,
+        LanguageId, Priority, SemanticChange, SemanticChangeId, SemanticFingerprint, SourceSpan,
+        TestCase, TestKind, TestRunner, Timestamp, Visibility, WorkItem, WorkKind, WorkScope,
+        WorkStatus, WorkStore,
     };
     use kin_model::{ReviewStore, VerificationStore};
     use kin_registry::Ecosystem;
@@ -9804,13 +9320,7 @@ mod tests {
         install_test_registry_override();
         let dir = std::env::temp_dir().join(format!("kin-daemon-test-state-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let kin_dir = dir.join(".kin");
-        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
-        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
-        let layout = kin_core::KinLayout::new(kin_dir);
-        kin_core::manifest::KinManifest::new()
-            .save(&layout.manifest_path())
-            .unwrap();
+        let layout = kin_core::init(&dir).unwrap().layout;
         Arc::new(match repo_id {
             Some(repo_id) => DaemonState::open_for_test(layout, repo_id).unwrap(),
             None => DaemonState::open(layout).unwrap(),
@@ -9896,287 +9406,90 @@ mod tests {
         }
     }
 
-    fn install_branch_entries(
-        state: &Arc<DaemonState>,
-        entries: impl IntoIterator<Item = (FilePathId, TreeEntry)>,
-    ) {
-        let branch_name = BranchName::new("main");
-        let genesis = kin_core::build_genesis_change();
-        state.graph.create_change(&genesis).unwrap();
-        let entries: Vec<_> = entries.into_iter().collect();
-        let projected_files = entries.iter().map(|(file_id, _)| file_id.clone()).collect();
-
-        let change = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x77; 32])),
-            parents: vec![genesis.id],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("test"),
-            message: "install exact test tree".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            tree_deltas: entries
-                .into_iter()
-                .map(|(file_id, new_entry)| TreeDelta::Added { file_id, new_entry })
-                .collect(),
-            projected_files,
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(branch_name.clone()),
-        };
-        state.graph.create_change(&change).unwrap();
-        state
-            .graph
-            .create_branch(&Branch {
-                name: branch_name.clone(),
-                head: change.id,
-            })
-            .unwrap();
-        kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
-    }
-
-    fn install_branch_file(state: &Arc<DaemonState>, rel_path: &str, content: &[u8]) {
-        let blob_hash = state.blobs.write(content).unwrap();
-        install_branch_entries(
-            state,
-            [(
-                FilePathId::new(rel_path),
-                TreeEntry::regular(Hash256::from_bytes(blob_hash.0), false),
-            )],
-        );
-    }
-
-    fn install_release_test_branch(state: &Arc<DaemonState>) -> SemanticChangeId {
-        let genesis = kin_core::build_genesis_change();
-        state.graph.create_change(&genesis).unwrap();
-        state
-            .graph
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
-        genesis.id
-    }
-
-    fn install_release_entity_head(
-        state: &Arc<DaemonState>,
-        entity: &Entity,
-        id_byte: u8,
-    ) -> SemanticChange {
-        let genesis = kin_core::build_genesis_change();
-        state.graph.create_change(&genesis).unwrap();
-        let change = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
-            parents: vec![genesis.id],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("agent-test"),
-            message: "add release entity".to_string(),
-            entity_deltas: vec![EntityDelta::Added(entity.clone())],
-            relation_deltas: vec![],
-            tree_deltas: vec![],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(BranchName::new("main")),
-        };
-        state.graph.upsert_entity(entity).unwrap();
-        state.graph.create_change(&change).unwrap();
-        state
-            .graph
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head: change.id,
-            })
-            .unwrap();
-        change
-    }
-
-    fn release_test_change(parent: SemanticChangeId, id_byte: u8) -> SemanticChange {
-        release_test_change_with_count(parent, id_byte, 0)
-    }
-
-    fn release_test_change_with_count(
-        parent: SemanticChangeId,
-        id_byte: u8,
-        entity_count: usize,
-    ) -> SemanticChange {
-        SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
-            parents: vec![parent],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("kin-release"),
-            message: format!("release: test ({entity_count} entities snapshot)"),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            tree_deltas: vec![],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(BranchName::new("main")),
-        }
-    }
-
-    fn release_test_payload(change: &SemanticChange) -> serde_json::Value {
-        serde_json::json!({
-            "change": change,
-            "branch_name": "main",
-            "release_policy": {
-                "force": true,
-                "require_proof": false,
-                "require_approval": false,
-            },
-        })
-    }
-
-    fn exact_source_test_change(
-        parent: SemanticChangeId,
-        id_byte: u8,
-        file_id: &str,
-        kind: TreeEntryKind,
-        hash: Hash256,
-    ) -> SemanticChange {
-        SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
-            parents: vec![parent],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("exact-source-api-test"),
-            message: "exact source API fixture".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            tree_deltas: vec![TreeDelta::Added {
-                file_id: FilePathId::new(file_id),
-                new_entry: TreeEntry {
-                    blob_hash: hash,
-                    kind,
-                },
-            }],
-            projected_files: vec![FilePathId::new(file_id)],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(BranchName::new("main")),
-        }
-    }
-
-    fn install_source_test_head(state: &Arc<DaemonState>, change: &SemanticChange) {
-        state.graph.create_change(change).unwrap();
-        state
-            .graph
-            .update_branch_head(&BranchName::new("main"), &change.id)
-            .unwrap();
-    }
-
-    fn api_local_object_path(state: &DaemonState, hash: Hash256) -> PathBuf {
-        let encoded = hash.to_string();
-        state
-            .layout
-            .ingest_cas_dir()
-            .join(&encoded[..2])
-            .join(&encoded[2..])
-    }
-
-    fn install_exact_checkout_branches(
-        state: &Arc<DaemonState>,
-    ) -> (SemanticChange, SemanticChange) {
-        let genesis = kin_core::build_genesis_change();
-        state.graph.create_change(&genesis).unwrap();
-        let main_blob = state.blobs.write(b"main checkout bytes\n").unwrap();
-        let main = exact_source_test_change(
-            genesis.id,
-            0xbc,
-            "src/shared.rs",
-            TreeEntryKind::Regular { executable: false },
-            Hash256::from_bytes(main_blob.0),
-        );
-        state.graph.create_change(&main).unwrap();
-        state
-            .graph
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head: main.id,
-            })
-            .unwrap();
-
-        let feature_blob = state.blobs.write(b"feature checkout bytes\n").unwrap();
-        let main_entry = TreeEntry::regular(Hash256::from_bytes(main_blob.0), false);
-        let feature_entry = TreeEntry::regular(Hash256::from_bytes(feature_blob.0), false);
-        let feature = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([0xbd; 32])),
-            parents: vec![main.id],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("exact-checkout-api-test"),
-            message: "feature checkout fixture".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            tree_deltas: vec![TreeDelta::Modified {
-                file_id: FilePathId::new("src/shared.rs"),
-                old_entry: main_entry,
-                new_entry: feature_entry,
-            }],
-            projected_files: vec![FilePathId::new("src/shared.rs")],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(BranchName::new("feature")),
-        };
-        state.graph.create_change(&feature).unwrap();
-        state
-            .graph
-            .create_branch(&Branch {
-                name: BranchName::new("feature"),
-                head: feature.id,
-            })
-            .unwrap();
-        kin_core::write_current_branch(&state.layout, &BranchName::new("main")).unwrap();
-        std::fs::create_dir_all(state.layout.working_dir().join("src")).unwrap();
-        std::fs::write(
-            state.layout.working_dir().join("src/shared.rs"),
-            b"main checkout bytes\n",
-        )
-        .unwrap();
-        (main, feature)
-    }
-
-    fn advance_branch_with_file(
+    fn install_repository_file(
         state: &Arc<DaemonState>,
         rel_path: &str,
         content: &[u8],
-        id_byte: u8,
-    ) {
-        let branch_name = BranchName::new("main");
-        let parent = state
-            .graph
-            .get_branch(&branch_name)
-            .unwrap()
-            .expect("main branch")
-            .head;
+    ) -> SemanticChangeId {
         let blob_hash = state.blobs.write(content).unwrap();
-        let change = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
-            parents: vec![parent],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("test"),
-            message: "advance test branch".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            tree_deltas: vec![TreeDelta::Added {
-                file_id: FilePathId::new(rel_path),
-                new_entry: TreeEntry::regular(Hash256::from_bytes(blob_hash.0), false),
-            }],
-            projected_files: vec![FilePathId::new(rel_path)],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(branch_name.clone()),
-        };
-        state.graph.create_change(&change).unwrap();
+        let artifact_id = kin_model::ArtifactId::new();
+        let path = RepoPath::from_utf8(rel_path).unwrap();
         state
             .graph
-            .update_branch_head(&branch_name, &change.id)
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![kin_model::TreeDelta::Added {
+                    artifact_id,
+                    new: kin_model::LocatedEntry::new(
+                        path,
+                        TreeEntry::blob(Hash256::from_bytes(blob_hash.0), false),
+                    ),
+                }],
+                admission_policy_delta: None,
+            })
             .unwrap();
+        let plan = crate::repository_commit::plan_native_commit(
+            &state.layout,
+            &state.graph,
+            &state.blobs,
+            kin_model::OperationId::new(),
+            Timestamp::now(),
+            AuthorId::new("api-test"),
+            format!("install {rel_path}"),
+        )
+        .unwrap();
+        crate::repository_commit::commit_native_plan(&state.layout, &state.blobs, plan)
+            .unwrap()
+            .change
+            .id
+    }
+
+    #[tokio::test]
+    async fn exact_source_route_reads_repository_cas_and_ignores_checkout_bytes() {
+        let state = test_state();
+        let repo_id = state.cached_repo_id.clone();
+        let change_id = install_repository_file(&state, "README.md", b"graph-owned source\n");
+        let app = router_with_auth(Arc::clone(&state), Some("exact-source-token".to_string()));
+        let path = format!("/repos/{repo_id}/archive/tar/{change_id}");
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(Request::get(&path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let request = || {
+            Request::get(&path)
+                .header(header::AUTHORIZATION, "Bearer exact-source-token")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let first = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            first.headers()["x-kin-source-change-id"],
+            change_id.to_string()
+        );
+        let manifest = first.headers()["x-kin-source-manifest-sha256"].clone();
+        let first = axum::body::to_bytes(first.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(!first.is_empty());
+
+        std::fs::write(
+            state.layout.working_dir().join("README.md"),
+            b"unadmitted checkout decoy\n",
+        )
+        .unwrap();
+        let repeated = app.oneshot(request()).await.unwrap();
+        assert_eq!(repeated.status(), StatusCode::OK);
+        assert_eq!(repeated.headers()["x-kin-source-manifest-sha256"], manifest);
+        let repeated = axum::body::to_bytes(repeated.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(repeated, first);
     }
 
     #[tokio::test]
@@ -10377,1238 +9690,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn graph_commit_creates_missing_branch_for_first_hosted_publish() {
-        let state = test_state();
-        let entity = test_entity("served_fn", "src/lib.py");
-        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x83; 32]));
-        let payload = serde_json::json!({
-            "change": {
-                "id": change_id,
-                "parents": [],
-                "timestamp": Timestamp::now(),
-                "author": "tester",
-                "message": "first hosted publish",
-                "entity_deltas": [{ "Added": entity }],
-                "relation_deltas": [],
-                "tree_deltas": [],
-                "projected_files": [],
-                "spec_link": null,
-                "evidence": [],
-                "risk_summary": null,
-                "authored_on": "main",
-            },
-            "branch_name": "main",
-        });
-        let app = router(Arc::clone(&state));
-
-        let response = app
-            .clone()
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let refs_path = format!("/repos/{}/refs", state.cached_repo_id);
-        let refs_response = app
-            .oneshot(Request::get(refs_path).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(refs_response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(refs_response.into_body(), 8192)
-            .await
-            .unwrap();
-        let refs: RepoRefsResponse = serde_json::from_slice(&body).unwrap();
-        let change_id_string = change_id.to_string();
-        assert_eq!(refs.branch_name.as_deref(), Some("main"));
-        assert_eq!(refs.head_ref.as_deref(), Some(change_id_string.as_str()));
-        assert_eq!(state.graph.entity_count(), 1);
-    }
-
-    #[tokio::test]
-    async fn graph_commit_rejects_same_id_with_different_payload_before_mutation() {
-        let state = test_state();
-        let mut existing = kin_core::build_genesis_change();
-        existing.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x84; 32]));
-        existing.message = "immutable original".to_string();
-        state.graph.create_change(&existing).unwrap();
-
-        let entity = test_entity("must_not_land", "src/lib.rs");
-        let mut conflicting = existing.clone();
-        conflicting.message = "conflicting replacement".to_string();
-        conflicting.entity_deltas = vec![kin_model::EntityDelta::Added(entity)];
-        let payload = serde_json::json!({
-            "change": conflicting,
-            "branch_name": "main",
-        });
-
-        let response = router(Arc::clone(&state))
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(state.graph.entity_count(), 0);
-        assert_eq!(
-            state
-                .graph
-                .get_change(&existing.id)
-                .unwrap()
-                .unwrap()
-                .message,
-            "immutable original"
-        );
-    }
-
-    #[tokio::test]
-    async fn graph_commit_stale_parent_returns_409_before_any_mutation() {
-        let state = test_state();
-        let live_head = install_release_test_branch(&state);
-        let entity = test_entity("must_not_land", "src/stale.rs");
-        let candidate_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x91; 32]));
-        let candidate = SemanticChange {
-            id: candidate_id,
-            parents: vec![SemanticChangeId::from_hash(Hash256::from_bytes([0x90; 32]))],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("tester"),
-            message: "stale candidate".to_string(),
-            entity_deltas: vec![EntityDelta::Added(entity)],
-            relation_deltas: vec![],
-            tree_deltas: vec![],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(BranchName::new("main")),
-        };
-        let root_before = state.graph.compute_root_hash();
-        let generation_before = state
-            .snapshot_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
-
-        let response = router(Arc::clone(&state))
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({ "change": candidate, "branch_name": "main" }).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"], "stale_branch_head");
-        assert_eq!(json["mutation_applied"], false);
-        assert_eq!(json["change_materialized"], false);
-        assert_eq!(json["actual_head"], live_head.to_string());
-        assert!(state.graph.get_change(&candidate_id).unwrap().is_none());
-        assert_eq!(state.graph.entity_count(), 0);
-        assert_eq!(state.graph.compute_root_hash(), root_before);
-        assert_eq!(
-            state
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst),
-            generation_before
-        );
-
-        // The same stale response is not absence proof when the immutable
-        // change already exists but is detached from this branch.
-        state.graph.create_change(&candidate).unwrap();
-        let response = router(Arc::clone(&state))
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({ "change": candidate, "branch_name": "main" }).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"], "stale_branch_head");
-        assert_eq!(json["mutation_applied"], false);
-        assert_eq!(json["change_materialized"], true);
-    }
-
-    #[tokio::test]
-    async fn graph_commit_local_exact_source_preflight_is_atomic_and_accepts_valid_cas() {
-        let valid_state = test_state();
-        let valid_parent = install_release_test_branch(&valid_state);
-        let valid_blob = valid_state.blobs.write(b"verified source\n").unwrap();
-        let valid_change = exact_source_test_change(
-            valid_parent,
-            0xb0,
-            "src/lib.rs",
-            TreeEntryKind::Regular { executable: false },
-            Hash256::from_bytes(valid_blob.0),
-        );
-        let valid_response = router(Arc::clone(&valid_state))
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({ "change": valid_change, "branch_name": "main" }).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(valid_response.status(), StatusCode::OK);
-        assert!(valid_state
-            .graph
-            .get_change(&valid_change.id)
-            .unwrap()
-            .is_some());
-        assert_eq!(
-            valid_state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            valid_change.id
-        );
-
-        for case in ["missing", "corrupt", "unsafe_path", "unsafe_symlink"] {
-            let state = test_state();
-            let parent = install_release_test_branch(&state);
-            let (file_id, kind, hash) = match case {
-                "missing" => (
-                    "src/missing.rs",
-                    TreeEntryKind::Regular { executable: false },
-                    Hash256::from_bytes(kin_blobs::digest_bytes(b"missing source")),
-                ),
-                "corrupt" => {
-                    let blob = state.blobs.write(b"expected source").unwrap();
-                    let hash = Hash256::from_bytes(blob.0);
-                    std::fs::write(api_local_object_path(&state, hash), b"corrupt source").unwrap();
-                    (
-                        "src/corrupt.rs",
-                        TreeEntryKind::Regular { executable: false },
-                        hash,
-                    )
-                }
-                "unsafe_path" => {
-                    let blob = state.blobs.write(b"control overwrite").unwrap();
-                    (
-                        ".kin/authority",
-                        TreeEntryKind::Regular { executable: false },
-                        Hash256::from_bytes(blob.0),
-                    )
-                }
-                "unsafe_symlink" => {
-                    let blob = state.blobs.write(b"../../outside").unwrap();
-                    (
-                        "src/escape",
-                        TreeEntryKind::Symlink,
-                        Hash256::from_bytes(blob.0),
-                    )
-                }
-                _ => unreachable!(),
-            };
-            let change = exact_source_test_change(parent, 0xb1, file_id, kind, hash);
-            let root_before = state.graph.compute_root_hash();
-            let generation_before = state
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst);
-
-            let response = router(Arc::clone(&state))
-                .oneshot(
-                    Request::post("/graph/commit")
-                        .header("content-type", "application/json")
-                        .body(Body::from(
-                            json!({ "change": change, "branch_name": "main" }).to_string(),
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-
-            assert_eq!(
-                response.status(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "{case} must fail exact-source admission"
-            );
-            let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
-                .await
-                .unwrap();
-            assert!(
-                String::from_utf8_lossy(&body).contains("exact source"),
-                "unexpected {case} response: {}",
-                String::from_utf8_lossy(&body)
-            );
-            assert!(state.graph.get_change(&change.id).unwrap().is_none());
-            assert_eq!(
-                state
-                    .graph
-                    .get_branch(&BranchName::new("main"))
-                    .unwrap()
-                    .unwrap()
-                    .head,
-                parent
-            );
-            assert_eq!(state.graph.compute_root_hash(), root_before);
-            assert_eq!(
-                state
-                    .snapshot_generation
-                    .load(std::sync::atomic::Ordering::SeqCst),
-                generation_before
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn release_admission_rejects_unmaterializable_source_tree_atomically() {
-        for case in ["missing", "corrupt", "unsafe_path", "unsafe_symlink"] {
-            let state = test_state();
-            let parent = install_release_test_branch(&state);
-            let (file_id, kind, hash) = match case {
-                "missing" => (
-                    "src/missing.rs",
-                    TreeEntryKind::Regular { executable: false },
-                    Hash256::from_bytes(kin_blobs::digest_bytes(b"missing source")),
-                ),
-                "corrupt" => {
-                    let blob = state.blobs.write(b"expected release source").unwrap();
-                    let hash = Hash256::from_bytes(blob.0);
-                    std::fs::write(api_local_object_path(&state, hash), b"corrupt source").unwrap();
-                    (
-                        "src/corrupt.rs",
-                        TreeEntryKind::Regular { executable: false },
-                        hash,
-                    )
-                }
-                "unsafe_path" => {
-                    let blob = state.blobs.write(b"control overwrite").unwrap();
-                    (
-                        ".kin/release",
-                        TreeEntryKind::Regular { executable: false },
-                        Hash256::from_bytes(blob.0),
-                    )
-                }
-                "unsafe_symlink" => {
-                    let blob = state.blobs.write(b"../../outside").unwrap();
-                    (
-                        "src/escape",
-                        TreeEntryKind::Symlink,
-                        Hash256::from_bytes(blob.0),
-                    )
-                }
-                _ => unreachable!(),
-            };
-            let source = exact_source_test_change(parent, 0xb2, file_id, kind, hash);
-            install_source_test_head(&state, &source);
-            let release = release_test_change(source.id, 0xb3);
-            let root_before = state.graph.compute_root_hash();
-            let generation_before = state
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst);
-
-            let response = router(Arc::clone(&state))
-                .oneshot(
-                    Request::post("/graph/commit")
-                        .header("content-type", "application/json")
-                        .body(Body::from(release_test_payload(&release).to_string()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-
-            assert_eq!(
-                response.status(),
-                StatusCode::FAILED_DEPENDENCY,
-                "{case} release source must fail closed"
-            );
-            let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
-                .await
-                .unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(body["error"], "release_source_not_exact");
-            assert_eq!(body["source_head"], source.id.to_string());
-            assert_eq!(body["mutation_applied"], false);
-            assert!(state.graph.get_change(&release.id).unwrap().is_none());
-            assert_eq!(
-                state
-                    .graph
-                    .get_branch(&BranchName::new("main"))
-                    .unwrap()
-                    .unwrap()
-                    .head,
-                source.id
-            );
-            assert_eq!(state.graph.compute_root_hash(), root_before);
-            assert_eq!(
-                state
-                    .snapshot_generation
-                    .load(std::sync::atomic::Ordering::SeqCst),
-                generation_before
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn release_admission_accepts_materializable_exact_local_source_tree() {
-        let state = test_state();
-        let parent = install_release_test_branch(&state);
-        let blob = state.blobs.write(b"release exact source\n").unwrap();
-        let source = exact_source_test_change(
-            parent,
-            0xb4,
-            "src/release.rs",
-            TreeEntryKind::Regular { executable: false },
-            Hash256::from_bytes(blob.0),
-        );
-        install_source_test_head(&state, &source);
-        let release = release_test_change(source.id, 0xb5);
-
-        let response = router(Arc::clone(&state))
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(release_test_payload(&release).to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(state.graph.get_change(&release.id).unwrap().is_some());
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            release.id
-        );
-    }
-
-    #[tokio::test]
-    async fn release_admission_rejects_noncanonical_one_sided_markers() {
-        for case in ["author_only", "message_only"] {
-            let state = test_state();
-            let parent = install_release_test_branch(&state);
-            let mut candidate = release_test_change(parent, 0xb8);
-            match case {
-                "author_only" => candidate.message = "ordinary commit".to_string(),
-                "message_only" => candidate.author = AuthorId::new("ordinary-author"),
-                _ => unreachable!(),
-            }
-            let root_before = state.graph.compute_root_hash();
-
-            let response = router(Arc::clone(&state))
-                .oneshot(
-                    Request::post("/graph/commit")
-                        .header("content-type", "application/json")
-                        .body(Body::from(
-                            json!({ "change": candidate, "branch_name": "main" }).to_string(),
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{case}");
-            let body = axum::body::to_bytes(response.into_body(), 4096)
-                .await
-                .unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(body["error"], "invalid_release_marker", "{case}");
-            assert_eq!(body["mutation_applied"], false, "{case}");
-            assert!(state.graph.get_change(&candidate.id).unwrap().is_none());
-            assert_eq!(state.graph.compute_root_hash(), root_before);
-        }
-    }
-
-    #[tokio::test]
-    async fn release_admission_rejects_marker_count_not_bound_to_source() {
-        let state = test_state();
-        let parent = install_release_test_branch(&state);
-        let mut candidate = release_test_change(parent, 0xb9);
-        candidate.message = "release: test (1 entities snapshot)".to_string();
-        let root_before = state.graph.compute_root_hash();
-
-        let response = router(Arc::clone(&state))
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(release_test_payload(&candidate).to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["error"], "invalid_release_snapshot_count");
-        assert_eq!(body["marker_entity_count"], 1);
-        assert_eq!(body["source_entity_count"], 0);
-        assert_eq!(body["mutation_applied"], false);
-        assert!(state.graph.get_change(&candidate.id).unwrap().is_none());
-        assert_eq!(state.graph.compute_root_hash(), root_before);
-    }
-
-    #[tokio::test]
-    async fn release_admission_rejects_exact_file_directory_collision() {
-        let state = test_state();
-        let parent = install_release_test_branch(&state);
-        let file_hash = Hash256::from_bytes(state.blobs.write(b"file bytes").unwrap().0);
-        let child_hash = Hash256::from_bytes(state.blobs.write(b"child bytes").unwrap().0);
-        let mut source = exact_source_test_change(
-            parent,
-            0xb6,
-            "pkg",
-            TreeEntryKind::Regular { executable: false },
-            file_hash,
-        );
-        source.tree_deltas.push(TreeDelta::Added {
-            file_id: FilePathId::new("pkg/lib.rs"),
-            new_entry: TreeEntry::regular(child_hash, false),
-        });
-        install_source_test_head(&state, &source);
-        let release = release_test_change(source.id, 0xb7);
-        let root_before = state.graph.compute_root_hash();
-        let generation_before = state
-            .snapshot_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
-
-        let response = router(Arc::clone(&state))
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(release_test_payload(&release).to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
-        assert!(state.graph.get_change(&release.id).unwrap().is_none());
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            source.id
-        );
-        assert_eq!(state.graph.compute_root_hash(), root_before);
-        assert_eq!(
-            state
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst),
-            generation_before
-        );
-    }
-
-    #[tokio::test]
-    async fn queued_release_observes_competing_head_and_returns_409() {
-        let state = test_state();
-        let original_head = install_release_test_branch(&state);
-        let release = release_test_change(original_head, 0x92);
-        let release_id = release.id;
-        let payload = release_test_payload(&release);
-
-        let guard = state.coordination_gate.lock().await;
-        let app = router(Arc::clone(&state));
-        let request = tokio::spawn(async move {
-            app.oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-        });
-        tokio::task::yield_now().await;
-
-        let mut competing = kin_core::build_genesis_change();
-        competing.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x93; 32]));
-        competing.parents = vec![original_head];
-        competing.message = "competing branch advance".to_string();
-        state.graph.create_change(&competing).unwrap();
-        state
-            .graph
-            .update_branch_head(&BranchName::new("main"), &competing.id)
-            .unwrap();
-        drop(guard);
-
-        let response = request.await.unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"], "stale_branch_head");
-        assert_eq!(json["actual_head"], competing.id.to_string());
-        assert!(state.graph.get_change(&release_id).unwrap().is_none());
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            competing.id
-        );
-    }
-
-    #[tokio::test]
-    async fn live_overlay_deletion_cannot_make_strict_release_green() {
-        let state = test_state();
-        let entity = test_entity("historical_entity", "src/live.rs");
-        let source = install_release_entity_head(&state, &entity, 0x93);
-        let release = release_test_change_with_count(source.id, 0x94, 1);
-        let release_id = release.id;
-        let payload = json!({
-            "change": release,
-            "branch_name": "main",
-            "release_policy": {
-                "force": true,
-                "require_proof": true,
-                "require_approval": false,
-            },
-        });
-
-        let guard = state.coordination_gate.lock().await;
-        let app = router(Arc::clone(&state));
-        let request = tokio::spawn(async move {
-            app.oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-        });
-        tokio::task::yield_now().await;
-
-        // This ambient/live deletion is not a semantic change and therefore
-        // cannot alter policy for the immutable release parent.
-        state.graph.remove_entity(&entity.id).unwrap();
-        drop(guard);
-
-        let response = request.await.unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"], "release_policy_failed");
-        assert_eq!(json["gate"], "proof");
-        assert_eq!(json["source_head"], source.id.to_string());
-        assert_eq!(
-            json["missing_proof"],
-            serde_json::json!([entity.id.to_string()])
-        );
-        assert!(state.graph.get_change(&release_id).unwrap().is_none());
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            source.id
-        );
-    }
-
-    #[tokio::test]
-    async fn changed_stable_id_entity_cannot_reuse_an_unbound_old_run() {
-        let state = test_state();
-        let old = test_entity("stable_entity", "src/stable.rs");
-        let first = install_release_entity_head(&state, &old, 0xa0);
-
-        let old_run = kin_model::VerificationRun {
-            run_id: kin_model::VerificationRunId::new(),
-            test_ids: vec![],
-            status: kin_model::VerificationStatus::Passing,
-            runner: kin_model::TestRunner::Cargo,
-            started_at: Timestamp::now(),
-            finished_at: Some(Timestamp::now()),
-            duration_ms: Some(1),
-            evidence_blob: None,
-            exit_code: Some(0),
-        };
-        state.graph.create_verification_run(&old_run).unwrap();
-        state
-            .graph
-            .link_run_proves_entity(&old_run.run_id, &old.id)
-            .unwrap();
-
-        let mut changed = old.clone();
-        changed.signature = "def stable_entity(required)".to_string();
-        changed.fingerprint.signature_hash = Hash256::from_bytes([0x44; 32]);
-        let second = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([0xa1; 32])),
-            parents: vec![first.id],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("agent-test"),
-            message: "change stable entity".to_string(),
-            entity_deltas: vec![EntityDelta::Modified {
-                old: old.clone(),
-                new: changed.clone(),
-            }],
-            relation_deltas: vec![],
-            tree_deltas: vec![],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(BranchName::new("main")),
-        };
-        state.graph.upsert_entity(&changed).unwrap();
-        state.graph.create_change(&second).unwrap();
-        state
-            .graph
-            .update_branch_head(&BranchName::new("main"), &second.id)
-            .unwrap();
-
-        let release = release_test_change_with_count(second.id, 0xa2, 1);
-        let response = router(Arc::clone(&state))
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "change": release,
-                            "branch_name": "main",
-                            "release_policy": {
-                                "force": true,
-                                "require_proof": true,
-                                "require_approval": false,
-                            },
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["gate"], "proof");
-        assert_eq!(json["source_head"], second.id.to_string());
-        assert_eq!(
-            json["missing_proof"],
-            serde_json::json!([changed.id.to_string()])
-        );
-    }
-
-    #[test]
-    fn release_approval_scope_keeps_reachable_and_rejects_unrelated_approvals() {
-        let state = test_state();
-        let entity = test_entity("approved_entity", "src/approved.rs");
-        let source = install_release_entity_head(&state, &entity, 0xa3);
-        let root = source.parents[0];
-        let approver = ActorId::from_hash(Hash256::from_bytes([0xa4; 32]));
-        state
-            .graph
-            .create_actor(&Actor {
-                actor_id: approver,
-                kind: ActorKind::Human,
-                display_name: "release reviewer".to_string(),
-                external_refs: vec![],
-            })
-            .unwrap();
-
-        let mut unrelated = kin_core::build_genesis_change();
-        unrelated.id = SemanticChangeId::from_hash(Hash256::from_bytes([0xa5; 32]));
-        unrelated.parents = vec![root];
-        unrelated.author = AuthorId::new("agent-unrelated");
-        unrelated.message = "unrelated change".to_string();
-        state.graph.create_change(&unrelated).unwrap();
-        state
-            .graph
-            .create_approval(&Approval {
-                approval_id: ApprovalId::new(),
-                change_id: unrelated.id,
-                approver,
-                decision: ApprovalDecision::Approved,
-                reason: "not authority for the release source".to_string(),
-                timestamp: Timestamp::now(),
-            })
-            .unwrap();
-
-        let policy = DaemonReleasePolicy {
-            force: true,
-            require_proof: false,
-            require_approval: true,
-        };
-        let error = enforce_daemon_release_policy(&state.graph, &source.id, 1, &policy)
-            .expect_err("an unrelated approval must not authorize the source history");
-        assert_eq!(error.0, StatusCode::CONFLICT);
-        let body: serde_json::Value = serde_json::from_str(&error.1).unwrap();
-        assert_eq!(body["gate"], "approval");
-        assert_eq!(body["unapproved_changes"], json!([source.id.to_string()]));
-
-        state
-            .graph
-            .create_approval(&Approval {
-                approval_id: ApprovalId::new(),
-                change_id: source.id,
-                approver,
-                decision: ApprovalDecision::Approved,
-                reason: "reviewed immutable release source".to_string(),
-                timestamp: Timestamp::now(),
-            })
-            .unwrap();
-        enforce_daemon_release_policy(&state.graph, &source.id, 1, &policy)
-            .expect("the reachable human approval must satisfy the gate");
-    }
-
-    #[tokio::test]
-    async fn strict_release_retry_rechecks_parent_without_generation_or_event() {
-        let state = test_state();
-        let entity = test_entity("strict_retry", "src/retry.rs");
-        let source = install_release_entity_head(&state, &entity, 0xa6);
-        let release = release_test_change_with_count(source.id, 0xa7, 1);
-        let app = router(Arc::clone(&state));
-
-        let first = app
-            .clone()
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(release_test_payload(&release).to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(first.status(), StatusCode::OK);
-        let generation = state
-            .snapshot_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
-        let mut events = state.event_tx.subscribe();
-
-        let strict_retry = app
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "change": release,
-                            "branch_name": "main",
-                            "release_policy": {
-                                "force": true,
-                                "require_proof": true,
-                                "require_approval": false,
-                            },
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(strict_retry.status(), StatusCode::CONFLICT);
-        assert_eq!(
-            state
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst),
-            generation,
-            "failed policy retry must not create a generation"
-        );
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            release.id
-        );
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-    }
-
-    #[tokio::test]
-    async fn exact_release_retry_is_idempotent() {
-        let state = test_state();
-        let head = install_release_test_branch(&state);
-        let release = release_test_change(head, 0x95);
-        let payload = release_test_payload(&release);
-        let app = router(Arc::clone(&state));
-
-        let mut committed_generation = None;
-
-        for _ in 0..2 {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::post("/graph/commit")
-                        .header("content-type", "application/json")
-                        .body(Body::from(payload.to_string()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let generation = state
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst);
-            if let Some(committed_generation) = committed_generation {
-                assert_eq!(
-                    generation, committed_generation,
-                    "an already-finalized retry must not create another authority generation"
-                );
-            } else {
-                committed_generation = Some(generation);
-            }
-        }
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            release.id
-        );
-        let release_markers = state
-            .graph
-            .to_snapshot()
-            .changes
-            .values()
-            .filter(|change| change.author.to_string() == "kin-release")
-            .count();
-        assert_eq!(release_markers, 1, "retry created a second release marker");
-    }
-
-    #[tokio::test]
-    async fn exact_release_retry_reconciles_after_branch_advances() {
-        let state = test_state();
-        let head = install_release_test_branch(&state);
-        let release = release_test_change(head, 0x96);
-        let payload = release_test_payload(&release);
-        let app = router(Arc::clone(&state));
-
-        let first = app
-            .clone()
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(first.status(), StatusCode::OK);
-
-        let descendant = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x97; 32])),
-            parents: vec![release.id],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("later-human"),
-            message: "advance after release".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            tree_deltas: vec![],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(BranchName::new("main")),
-        };
-        state.graph.create_change(&descendant).unwrap();
-        state
-            .graph
-            .update_branch_head(&BranchName::new("main"), &descendant.id)
-            .unwrap();
-
-        let retry = app
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(retry.status(), StatusCode::OK);
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            descendant.id,
-            "reconciling an older release marker must not rewind the branch"
-        );
-    }
-
-    #[tokio::test]
-    async fn graph_commit_retry_persists_after_pre_authority_save_failure() {
-        let state = test_state();
-        let head = install_release_test_branch(&state);
-        let release = release_test_change(head, 0x9a);
-        let payload = release_test_payload(&release);
-        let app = router(Arc::clone(&state));
-        let mut events = state.event_tx.subscribe();
-        state.fail_next_snapshot_save_for_test();
-
-        let first = app
-            .clone()
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let body = axum::body::to_bytes(first.into_body(), 4096).await.unwrap();
-        assert!(
-            String::from_utf8_lossy(&body).contains("injected pre-authority snapshot save failure")
-        );
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            release.id,
-            "the failed request has already advanced in-memory authority"
-        );
-        assert!(state.graph.has_unpersisted_changes());
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-
-        let retry = app
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(retry.status(), StatusCode::OK);
-        assert!(!state.graph.has_unpersisted_changes());
-
-        let snapshot =
-            kin_db::SnapshotManager::open_read_only(state.layout.kindb_snapshot_path()).unwrap();
-        assert!(snapshot.graph().get_change(&release.id).unwrap().is_some());
-        assert_eq!(
-            snapshot
-                .graph()
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            release.id
-        );
-        match events.try_recv().expect("the durable retry must emit once") {
-            DaemonEvent::GraphRootChanged { new_root_hash, .. } => {
-                assert_eq!(new_root_hash, release.id.to_string())
-            }
-            other => panic!("retry emitted the wrong event: {other:?}"),
-        }
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-    }
-
-    #[tokio::test]
-    async fn graph_commit_retry_finalizes_committed_generation_without_recommit() {
-        let state = test_state();
-        let head = install_release_test_branch(&state);
-        let release = release_test_change(head, 0x9b);
-        let payload = release_test_payload(&release);
-        let app = router(Arc::clone(&state));
-        let mut events = state.event_tx.subscribe();
-        state.fail_next_finalization_for_test();
-
-        let first = app
-            .clone()
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let committed_generation = state
-            .snapshot_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
-        assert!(committed_generation > kin_db::GENERATION_INIT);
-        assert_eq!(DaemonState::read_generation_marker(&state.layout), 0);
-        assert!(!state.graph.has_unpersisted_changes());
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-
-        let retry = app
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(retry.status(), StatusCode::OK);
-        assert_eq!(
-            state
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst),
-            committed_generation,
-            "finalization retry must not recommit graph authority"
-        );
-        assert_eq!(
-            DaemonState::read_generation_marker(&state.layout),
-            committed_generation
-        );
-        match events
-            .try_recv()
-            .expect("finalization retry must release the queued event")
-        {
-            DaemonEvent::GraphRootChanged { new_root_hash, .. } => {
-                assert_eq!(new_root_hash, release.id.to_string())
-            }
-            other => panic!("finalization retry emitted the wrong event: {other:?}"),
-        }
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-    }
-
-    #[tokio::test]
-    async fn identical_non_release_retry_with_missing_audit_effect_fails_closed() {
-        let state = test_state();
-        let head = install_release_test_branch(&state);
-        let mut change = kin_core::build_genesis_change();
-        change.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x9c; 32]));
-        change.parents = vec![head];
-        change.author = AuthorId::new("non-release-client");
-        change.message = "ordinary commit with audit".to_string();
-        change.authored_on = Some(BranchName::new("main"));
-        state.graph.create_change(&change).unwrap();
-        state
-            .graph
-            .update_branch_head(&BranchName::new("main"), &change.id)
-            .unwrap();
-
-        let audit = kin_model::provenance::AuditEvent {
-            event_id: AuditEventId::new(),
-            actor_id: ActorId::new(),
-            action: "ordinary_commit".to_string(),
-            target_scope: None,
-            timestamp: Timestamp::now(),
-            details: Some("must not be silently skipped".to_string()),
-        };
-        let response = router(Arc::clone(&state))
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "change": change,
-                            "branch_name": "main",
-                            "audit_event": audit,
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"], "stale_branch_head");
-        assert_eq!(json["mutation_applied"], false);
-        assert!(state.graph.query_audit_events(None, 10).unwrap().is_empty());
-        assert!(state.graph.has_unpersisted_changes());
-        assert_eq!(
-            state
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst),
-            kin_db::GENERATION_INIT,
-            "the retry must not persist a head missing its requested audit effect"
-        );
-    }
-
-    #[tokio::test]
-    async fn release_policy_rejects_nonempty_change_before_mutation() {
-        let state = test_state();
-        let head = install_release_test_branch(&state);
-        let entity = test_entity("must_not_release", "src/release.rs");
-        let entity_id = entity.id;
-        let mut release = release_test_change(head, 0x96);
-        release.entity_deltas.push(EntityDelta::Added(entity));
-        let release_id = release.id;
-
-        let response = router(Arc::clone(&state))
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(release_test_payload(&release).to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(state.graph.get_change(&release_id).unwrap().is_none());
-        assert!(state.graph.get_entity(&entity_id).unwrap().is_none());
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            head
-        );
-    }
-
-    #[tokio::test]
     async fn health_surfaces_graph_generation_marker() {
         // /health must read and surface the persisted snapshot generation marker
         // (.kin/kindb/head-generation) so the MCP envelope can express graph_as_of.
@@ -11666,162 +9747,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn locate_endpoint_resolves_historical_ref_queries() {
-        std::env::set_var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", "true");
-        let state = test_state();
-        let graph = state.graph.as_ref();
-        let add_git_ref = "1111111111111111111111111111111111111111";
-        let modify_git_ref = "2222222222222222222222222222222222222222";
-
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x31; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
-                parents: vec![],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "genesis".to_string(),
-                entity_deltas: vec![],
-                relation_deltas: vec![],
-                tree_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
-
-        let entity_v1 = test_entity("handler", "src/lib.py");
-        let mut entity_v2 = entity_v1.clone();
-        entity_v2.name = "processor".to_string();
-        entity_v2.signature = "def processor()".to_string();
-        entity_v2.fingerprint.signature_hash = Hash256::from_bytes([0x04; 32]);
-
-        let add_id = kin_git::semantic_change_id_from_git_oid_hex(add_git_ref).unwrap();
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
-                parents: vec![genesis_id],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "add handler".to_string(),
-                entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
-                relation_deltas: vec![],
-                tree_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
-
-        let modify_id = kin_git::semantic_change_id_from_git_oid_hex(modify_git_ref).unwrap();
-        graph
-            .create_change(&SemanticChange {
-                id: modify_id,
-                parents: vec![add_id],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "rename handler".to_string(),
-                entity_deltas: vec![EntityDelta::Modified {
-                    old: entity_v1,
-                    new: entity_v2,
-                }],
-                relation_deltas: vec![],
-                tree_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
-
-        let app = router(state);
-
-        let historical = app
-            .clone()
-            .oneshot(
-                Request::post("/locate")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "text": "handler failure",
-                            "explain": false,
-                            "max_files": 10,
-                            "max_files_explicit": true,
-                            "reference": format!("git:{add_git_ref}"),
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(historical.status(), StatusCode::OK);
-        let historical_body = axum::body::to_bytes(historical.into_body(), 4096)
-            .await
-            .unwrap();
-        let historical_json: kin_cli::commands::locate::LocateResult =
-            serde_json::from_slice(&historical_body).unwrap();
-        assert!(
-            historical_json
-                .files
-                .iter()
-                .any(|file| file.path == "src/lib.py"),
-            "historical locate should resolve the pre-rename symbol"
-        );
-
-        let current = app
-            .oneshot(
-                Request::post("/locate")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "text": "handler failure",
-                            "explain": false,
-                            "max_files": 10,
-                            "max_files_explicit": true,
-                            "reference": format!("git:{modify_git_ref}"),
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(current.status(), StatusCode::OK);
-        let current_body = axum::body::to_bytes(current.into_body(), 4096)
-            .await
-            .unwrap();
-        let current_json: kin_cli::commands::locate::LocateResult =
-            serde_json::from_slice(&current_body).unwrap();
-        assert!(
-            current_json
-                .files
-                .iter()
-                .all(|file| file.path != "src/lib.py"),
-            "current locate should not match the historical symbol name"
-        );
-        std::env::remove_var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
-    }
-
-    #[tokio::test]
     async fn mcp_tools_call_semantic_search_uses_live_graph() {
         let state = test_state();
         let entity = test_entity("handler", "src/lib.py");
         state.graph.upsert_entity(&entity).unwrap();
-        let branch_name = BranchName::new("main");
-        state
-            .graph
-            .create_branch(&Branch {
-                name: branch_name.clone(),
-                head: kin_core::build_genesis_change().id,
-            })
-            .unwrap();
-        kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -12542,7 +10471,7 @@ mod tests {
     async fn search_endpoint_uses_live_graph() {
         let state = test_state();
         let source = "def handler():\n    return 1\n";
-        install_branch_file(&state, "src/lib.py", source.as_bytes());
+        install_repository_file(&state, "src/lib.py", source.as_bytes());
         std::fs::create_dir_all(state.layout.working_dir().join("src")).unwrap();
         std::fs::write(
             state.layout.working_dir().join("src/lib.py"),
@@ -12786,7 +10715,7 @@ mod tests {
     #[tokio::test]
     async fn session_workspace_endpoint_materializes_live_graph() {
         let state = test_state();
-        install_branch_file(&state, "src/lib.py", b"graph truth\n");
+        install_repository_file(&state, "src/lib.py", b"graph truth\n");
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -12828,493 +10757,6 @@ mod tests {
     /// opposite expectations never race under the parallel test runner.
     fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::test_env_lock()
-    }
-
-    #[tokio::test]
-    async fn branch_endpoint_mutates_live_graph() {
-        let state = test_state();
-        let branch_name = BranchName::new("main");
-        state
-            .graph
-            .create_branch(&Branch {
-                name: branch_name.clone(),
-                head: kin_core::build_genesis_change().id,
-            })
-            .unwrap();
-        kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
-        state
-            .is_initialized
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let app = router(state.clone());
-
-        let response = app
-            .oneshot(
-                Request::post("/commands/branch")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({ "command": "create", "name": "feature" }).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(state
-            .graph
-            .get_branch(&BranchName::new("feature"))
-            .unwrap()
-            .is_some());
-    }
-
-    #[tokio::test]
-    async fn graph_branch_mutations_reject_unknown_heads_without_authority_changes() {
-        let state = test_state();
-        let genesis = kin_core::build_genesis_change();
-        state.graph.create_change(&genesis).unwrap();
-        state
-            .graph
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
-        state
-            .is_initialized
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let missing = SemanticChangeId::from_hash(Hash256::from_bytes([0xbe; 32]));
-        let stale = SemanticChangeId::from_hash(Hash256::from_bytes([0xbf; 32]));
-        let root_before = state.graph.compute_root_hash();
-        let generation_before = state
-            .snapshot_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
-        let app = router(Arc::clone(&state));
-
-        let create = app
-            .clone()
-            .oneshot(
-                Request::post("/graph/branches")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({ "name": "unknown", "head": missing.to_string() }).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(create.status(), StatusCode::NOT_FOUND);
-        let body = axum::body::to_bytes(create.into_body(), 4096)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["error"], "branch_head_not_found");
-        assert_eq!(body["mutation_applied"], false);
-        assert!(state
-            .graph
-            .get_branch(&BranchName::new("unknown"))
-            .unwrap()
-            .is_none());
-
-        let update = app
-            .clone()
-            .oneshot(
-                Request::put("/graph/branches/main/head")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "head": missing.to_string(),
-                            "expected_head": genesis.id.to_string(),
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(update.status(), StatusCode::NOT_FOUND);
-        let body = axum::body::to_bytes(update.into_body(), 4096)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["error"], "branch_head_not_found");
-        assert_eq!(body["mutation_applied"], false);
-
-        let stale_update = app
-            .oneshot(
-                Request::put("/graph/branches/main/head")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "head": missing.to_string(),
-                            "expected_head": stale.to_string(),
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(stale_update.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(stale_update.into_body(), 4096)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["error"], "stale_branch_head");
-        assert_eq!(body["mutation_applied"], false);
-
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            genesis.id
-        );
-        assert_eq!(state.graph.compute_root_hash(), root_before);
-        assert_eq!(
-            state
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst),
-            generation_before
-        );
-    }
-
-    #[tokio::test]
-    async fn graph_branch_head_update_rejects_backward_and_sideways_moves() {
-        let state = test_state();
-        let genesis = kin_core::build_genesis_change();
-        let mut child = genesis.clone();
-        child.id = SemanticChangeId::from_hash(Hash256::from_bytes([0xc1; 32]));
-        child.parents = vec![genesis.id];
-        child.message = "child".to_string();
-        let mut sibling = child.clone();
-        sibling.id = SemanticChangeId::from_hash(Hash256::from_bytes([0xc2; 32]));
-        sibling.message = "sibling".to_string();
-        state.graph.create_change(&genesis).unwrap();
-        state.graph.create_change(&child).unwrap();
-        state.graph.create_change(&sibling).unwrap();
-        state
-            .graph
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
-        state
-            .is_initialized
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let app = router(Arc::clone(&state));
-
-        let forward = app
-            .clone()
-            .oneshot(
-                Request::put("/graph/branches/main/head")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "head": child.id.to_string(),
-                            "expected_head": genesis.id.to_string(),
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(forward.status(), StatusCode::OK);
-
-        for rejected in [genesis.id, sibling.id] {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::put("/graph/branches/main/head")
-                        .header("content-type", "application/json")
-                        .body(Body::from(
-                            json!({
-                                "head": rejected.to_string(),
-                                "expected_head": child.id.to_string(),
-                            })
-                            .to_string(),
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::CONFLICT);
-            let body = axum::body::to_bytes(response.into_body(), 4096)
-                .await
-                .unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(body["error"], "non_fast_forward_branch_update");
-            assert_eq!(body["mutation_applied"], false);
-        }
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            child.id
-        );
-    }
-
-    #[tokio::test]
-    async fn v1_branch_head_mutation_is_explicitly_retired() {
-        let response = router(test_state())
-            .oneshot(
-                Request::put("/v1/graph/branches/main/head")
-                    .header("content-type", "application/json")
-                    .body(Body::from(json!({ "head": "legacy" }).to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::GONE);
-        assert_eq!(response.headers()["X-Kin-API-Version"], API_VERSION);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["error"], "v1_branch_head_update_retired");
-        assert_eq!(body["mutation_applied"], false);
-    }
-
-    #[tokio::test]
-    async fn checkout_requests_are_serialized_by_the_authority_gate() {
-        let state = test_state();
-        let (main, feature) = install_exact_checkout_branches(&state);
-        state
-            .is_initialized
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let guard = state.coordination_gate.lock().await;
-        let app = router(Arc::clone(&state));
-        let mut first = tokio::spawn({
-            let app = app.clone();
-            async move {
-                app.oneshot(
-                    Request::post("/commands/checkout")
-                        .header("content-type", "application/json")
-                        .body(Body::from(
-                            json!({
-                                "path": "src/shared.rs",
-                                "change_id": feature.id.to_string(),
-                            })
-                            .to_string(),
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-            }
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut first)
-                .await
-                .is_err(),
-            "first checkout must wait for the authority gate"
-        );
-        let mut second = tokio::spawn(async move {
-            app.oneshot(
-                Request::post("/commands/checkout")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "path": "src/shared.rs",
-                            "change_id": main.id.to_string(),
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut second)
-                .await
-                .is_err(),
-            "second checkout must queue behind the same authority gate"
-        );
-        assert_eq!(
-            std::fs::read(state.layout.working_dir().join("src/shared.rs")).unwrap(),
-            b"main checkout bytes\n"
-        );
-
-        drop(guard);
-        // On failure, surface the error body: this test flaked once on CI with a
-        // bare 500 and the discarded body was the only thing that could have
-        // named the cause. 300 solo repetitions under load pass, so whatever
-        // fails here is cross-test interference the next occurrence must
-        // identify itself.
-        for (label, handle) in [("first", &mut first), ("second", &mut second)] {
-            let response = handle.await.unwrap();
-            let status = response.status();
-            if status != StatusCode::OK {
-                let body = axum::body::to_bytes(response.into_body(), 65536)
-                    .await
-                    .unwrap();
-                panic!(
-                    "{label} checkout returned {status} after the gate released: {}",
-                    String::from_utf8_lossy(&body)
-                );
-            }
-        }
-        assert_eq!(
-            std::fs::read(state.layout.working_dir().join("src/shared.rs")).unwrap(),
-            b"main checkout bytes\n",
-            "FIFO checkout A/B must leave the second target fully materialized"
-        );
-    }
-
-    #[tokio::test]
-    async fn session_scoped_checkout_cannot_mutate_primary_working_tree() {
-        let state = test_state();
-        let (main, feature) = install_exact_checkout_branches(&state);
-        state
-            .is_initialized
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let session_id = SessionId::new();
-        state
-            .set_session_scope(
-                &session_id,
-                feature.id.to_string(),
-                feature.id,
-                Arc::new(kin_db::InMemoryGraph::new()),
-            )
-            .await;
-
-        let response = router(Arc::clone(&state))
-            .oneshot(
-                Request::post("/commands/checkout")
-                    .header("content-type", "application/json")
-                    .header("X-Kin-Session", session_id.to_string())
-                    .body(Body::from(
-                        json!({
-                            "path": "src/shared.rs",
-                            "change_id": feature.id.to_string(),
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(
-            std::fs::read(state.layout.working_dir().join("src/shared.rs")).unwrap(),
-            b"main checkout bytes\n"
-        );
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            main.id
-        );
-    }
-
-    #[tokio::test]
-    async fn branch_switch_and_head_update_wait_for_the_authority_gate() {
-        let state = test_state();
-        let (_main, feature) = install_exact_checkout_branches(&state);
-        state
-            .is_initialized
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let advanced = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([0xc0; 32])),
-            parents: vec![feature.id],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("branch-gate-test"),
-            message: "advance feature after switch barrier".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            tree_deltas: vec![],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(BranchName::new("feature")),
-        };
-        state.graph.create_change(&advanced).unwrap();
-        let guard = state.coordination_gate.lock().await;
-        let app = router(Arc::clone(&state));
-        let mut switch = tokio::spawn({
-            let app = app.clone();
-            async move {
-                app.oneshot(
-                    Request::post("/commands/branch")
-                        .header("content-type", "application/json")
-                        .body(Body::from(
-                            json!({ "command": "switch", "name": "feature" }).to_string(),
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-            }
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut switch)
-                .await
-                .is_err(),
-            "branch switch must wait for the authority gate"
-        );
-        let mut update = tokio::spawn(async move {
-            app.oneshot(
-                Request::put("/graph/branches/feature/head")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "head": advanced.id.to_string(),
-                            "expected_head": feature.id.to_string(),
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut update)
-                .await
-                .is_err(),
-            "branch head update must wait for the same authority gate"
-        );
-        assert_eq!(
-            kin_core::read_current_branch(&state.layout).unwrap(),
-            BranchName::new("main")
-        );
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("feature"))
-                .unwrap()
-                .unwrap()
-                .head,
-            feature.id
-        );
-
-        drop(guard);
-        assert_eq!(switch.await.unwrap().status(), StatusCode::OK);
-        assert_eq!(update.await.unwrap().status(), StatusCode::OK);
-        assert_eq!(
-            kin_core::read_current_branch(&state.layout).unwrap(),
-            BranchName::new("feature")
-        );
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("feature"))
-                .unwrap()
-                .unwrap()
-                .head,
-            advanced.id
-        );
     }
 
     #[tokio::test]
@@ -13797,29 +11239,24 @@ mod tests {
             .graph
             .create_change(&SemanticChange {
                 id: change_id,
+                origin: kin_model::ChangeOrigin::Native,
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "add handler".to_string(),
-                entity_deltas: vec![EntityDelta::Added(entity.clone())],
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity.clone(),
+                }],
                 relation_deltas: vec![],
                 tree_deltas: vec![],
+                admission_policy_delta: None,
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
             })
             .unwrap();
         state.graph.upsert_entity(&entity).unwrap();
-        state
-            .graph
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head: change_id,
-            })
-            .unwrap();
-        kin_core::write_current_branch(&state.layout, &BranchName::new("main")).unwrap();
 
         let app = router(state);
         let blame_response = app
@@ -13891,29 +11328,24 @@ mod tests {
             .graph
             .create_change(&SemanticChange {
                 id: change_id,
+                origin: kin_model::ChangeOrigin::Native,
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "add handler".to_string(),
-                entity_deltas: vec![EntityDelta::Added(entity.clone())],
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity.clone(),
+                }],
                 relation_deltas: vec![],
                 tree_deltas: vec![],
+                admission_policy_delta: None,
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
             })
             .unwrap();
         state.graph.upsert_entity(&entity).unwrap();
-        state
-            .graph
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head: change_id,
-            })
-            .unwrap();
-        kin_core::write_current_branch(&state.layout, &BranchName::new("main")).unwrap();
 
         // Subscribe before issuing any request so every broadcast is observable.
         let mut events = state.event_tx.subscribe();
@@ -14715,136 +12147,6 @@ mod tests {
     // VFS endpoints
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn vfs_version_returns_zero_initially() {
-        let state = test_state();
-        let app = router(state);
-        let response = app
-            .oneshot(Request::get("/vfs/version").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["version"], 0);
-    }
-
-    #[tokio::test]
-    async fn vfs_tree_empty_graph() {
-        let state = test_state();
-        let app = router(state);
-        let response = app
-            .oneshot(Request::get("/vfs/tree").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["entries"].as_object().unwrap().is_empty());
-        assert!(json["sizes"].as_object().unwrap().is_empty());
-        assert!(json["timestamps"].as_object().unwrap().is_empty());
-        assert!(json.get("files").is_none());
-    }
-
-    #[tokio::test]
-    async fn vfs_tree_returns_exact_entries_sizes_and_kinds() {
-        let state = test_state();
-        let compose = b"services:\n  api:\n    image: kin/example\n";
-        let executable = b"#!/bin/sh\nexec kin \"$@\"\n";
-        let link_target = b"scripts/run-kin";
-        let binary = [0x00, 0xff, 0x89, b'K', b'I', b'N'];
-
-        let compose_hash = state.blobs.write(compose).unwrap();
-        let executable_hash = state.blobs.write(executable).unwrap();
-        let link_hash = state.blobs.write(link_target).unwrap();
-        let binary_hash = state.blobs.write(&binary).unwrap();
-        install_branch_entries(
-            &state,
-            [
-                (
-                    FilePathId::new("compose.yaml"),
-                    TreeEntry::regular(Hash256::from_bytes(compose_hash.0), false),
-                ),
-                (
-                    FilePathId::new("scripts/run-kin"),
-                    TreeEntry::regular(Hash256::from_bytes(executable_hash.0), true),
-                ),
-                (
-                    FilePathId::new("current"),
-                    TreeEntry::symlink(Hash256::from_bytes(link_hash.0)),
-                ),
-                (
-                    FilePathId::new("assets/logo.bin"),
-                    TreeEntry::regular(Hash256::from_bytes(binary_hash.0), false),
-                ),
-            ],
-        );
-
-        let response = router(state)
-            .oneshot(Request::get("/vfs/tree").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-
-        let object = json.as_object().unwrap();
-        assert_eq!(
-            object.keys().map(String::as_str).collect::<HashSet<_>>(),
-            HashSet::from(["entries", "sizes", "timestamps"])
-        );
-        let entries = object["entries"].as_object().unwrap();
-        let sizes = object["sizes"].as_object().unwrap();
-        assert_eq!(entries.len(), 4);
-        assert_eq!(
-            entries.keys().collect::<HashSet<_>>(),
-            sizes.keys().collect()
-        );
-        assert_eq!(sizes["compose.yaml"], compose.len());
-        assert_eq!(sizes["scripts/run-kin"], executable.len());
-        assert_eq!(sizes["current"], link_target.len());
-        assert_eq!(sizes["assets/logo.bin"], binary.len());
-        assert_eq!(
-            entries["scripts/run-kin"]["kind"],
-            serde_json::json!({ "type": "regular", "executable": true })
-        );
-        assert_eq!(
-            entries["current"]["kind"],
-            serde_json::json!({ "type": "symlink" })
-        );
-    }
-
-    #[test]
-    fn vfs_tree_rejects_noncanonical_and_colliding_paths() {
-        let entry = TreeEntry::regular(Hash256::from_bytes([0x11; 32]), false);
-        for invalid in [
-            "",
-            "/absolute",
-            "dir/",
-            "dir//file",
-            "dir/./file",
-            "dir/../file",
-        ] {
-            let tree = HashMap::from([(FilePathId::new(invalid), entry)]);
-            assert!(
-                validate_vfs_tree_paths(&tree).is_err(),
-                "{invalid:?} must be rejected"
-            );
-        }
-
-        let collision = HashMap::from([
-            (FilePathId::new("tools"), entry),
-            (FilePathId::new("tools/run"), entry),
-        ]);
-        assert!(validate_vfs_tree_paths(&collision).is_err());
-    }
-
     #[test]
     fn vfs_range_parser_rejects_malformed_multi_and_unsatisfiable_ranges() {
         for malformed in [
@@ -14885,344 +12187,6 @@ mod tests {
         let clamped =
             HeaderMap::from_iter([(header::RANGE, HeaderValue::from_static("bytes=7-99"))]);
         assert_eq!(parse_vfs_byte_range(&clamped, 10), Ok(Some((7, 9))));
-    }
-
-    #[tokio::test]
-    async fn vfs_read_serves_exact_full_and_ranged_graph_blob_bytes() {
-        let state = test_state();
-        let bytes = [0x00, 0xff, 0x89, b'K', b'I', b'N', 0x01, 0x02];
-        let blob_hash = state.blobs.write(&bytes).unwrap();
-        let model_hash = Hash256::from_bytes(blob_hash.0);
-        install_branch_entries(
-            &state,
-            [(
-                FilePathId::new("assets/logo.bin"),
-                TreeEntry::regular(model_hash, false),
-            )],
-        );
-        let app = router(state);
-
-        let full = app
-            .clone()
-            .oneshot(
-                Request::get("/vfs/read/assets/logo.bin")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(full.status(), StatusCode::OK);
-        assert_eq!(
-            full.headers()["x-kin-blob-hash"].to_str().unwrap(),
-            model_hash.to_string()
-        );
-        assert_eq!(full.headers()[header::ACCEPT_RANGES], "bytes");
-        let full_body = axum::body::to_bytes(full.into_body(), 1024).await.unwrap();
-        assert_eq!(full_body.as_ref(), bytes);
-
-        let partial = app
-            .oneshot(
-                Request::get("/vfs/read/assets/logo.bin")
-                    .header(header::RANGE, "bytes=2-5")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
-        assert_eq!(partial.headers()[header::CONTENT_RANGE], "bytes 2-5/8");
-        assert_eq!(
-            partial.headers()["x-kin-blob-hash"].to_str().unwrap(),
-            model_hash.to_string()
-        );
-        let partial_body = axum::body::to_bytes(partial.into_body(), 1024)
-            .await
-            .unwrap();
-        assert_eq!(partial_body.as_ref(), &bytes[2..=5]);
-    }
-
-    #[tokio::test]
-    async fn vfs_read_rejects_bad_ranges_with_correct_status_and_metadata() {
-        let state = test_state();
-        install_branch_file(&state, "data.bin", b"12345");
-        let app = router(state);
-
-        let malformed = app
-            .clone()
-            .oneshot(
-                Request::get("/vfs/read/data.bin")
-                    .header(header::RANGE, "bytes=0-1,3-4")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
-
-        let unsatisfiable = app
-            .oneshot(
-                Request::get("/vfs/read/data.bin")
-                    .header(header::RANGE, "bytes=5-9")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(unsatisfiable.status(), StatusCode::RANGE_NOT_SATISFIABLE);
-        assert_eq!(unsatisfiable.headers()[header::CONTENT_RANGE], "bytes */5");
-        assert_eq!(unsatisfiable.headers()[header::ACCEPT_RANGES], "bytes");
-    }
-
-    #[tokio::test]
-    async fn vfs_tree_and_read_fail_loud_on_missing_graph_blob() {
-        let state = test_state();
-        let missing_hash = Hash256::from_bytes([0x42; 32]);
-        install_branch_entries(
-            &state,
-            [(
-                FilePathId::new("missing.bin"),
-                TreeEntry::regular(missing_hash, false),
-            )],
-        );
-        let app = router(state);
-
-        let tree = app
-            .clone()
-            .oneshot(Request::get("/vfs/tree").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(tree.status(), StatusCode::INTERNAL_SERVER_ERROR);
-
-        let read = app
-            .oneshot(
-                Request::get("/vfs/read/missing.bin")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(read.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[tokio::test]
-    async fn vfs_read_ignores_projected_overlay_when_tree_advertises_graph_blob() {
-        let state = test_state();
-        let committed = b"fn value() -> u8 { 1 }\n";
-        install_branch_file(&state, "src/lib.rs", committed);
-
-        let entity_id = EntityId::new();
-        let file_id = FilePathId::new("src/lib.rs");
-        let layout = FileLayout {
-            file_id: file_id.clone(),
-            parse_completeness: Default::default(),
-            imports: ImportSection {
-                byte_range: 0..0,
-                items: Vec::new(),
-            },
-            regions: vec![SourceRegion::EntityRef {
-                entity_id,
-                byte_range: 0..committed.len(),
-            }],
-        };
-        state
-            .projection
-            .write()
-            .await
-            .register_file(layout, committed.to_vec());
-        state
-            .working_copy
-            .write()
-            .await
-            .uncommitted_mutations
-            .entity_bodies
-            .insert(entity_id, b"fn value() -> u8 { 2 }\n".to_vec());
-
-        let response = router(state)
-            .oneshot(
-                Request::get("/vfs/read/src/lib.rs?session_id=ignored")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 1024)
-            .await
-            .unwrap();
-        assert_eq!(body.as_ref(), committed);
-    }
-
-    #[tokio::test]
-    async fn vfs_snapshot_reuses_materialization_at_the_same_graph_key() {
-        let state = test_state();
-        install_branch_file(&state, "src/one.rs", b"one");
-        state.bump_version();
-
-        let first = current_vfs_snapshot(&state).await.unwrap();
-        let second = current_vfs_snapshot(&state).await.unwrap();
-
-        assert!(Arc::ptr_eq(&first, &second));
-        assert!(first.files.contains_key(&FilePathId::new("src/one.rs")));
-    }
-
-    #[tokio::test]
-    async fn concurrent_cold_vfs_readers_single_flight_one_materialization() {
-        use std::sync::atomic::Ordering;
-
-        const READERS: usize = 24;
-        let state = test_state();
-        install_branch_file(&state, "src/one.rs", b"one");
-        state.bump_version();
-
-        let start = Arc::new(tokio::sync::Barrier::new(READERS));
-        let mut readers = Vec::new();
-        for _ in 0..READERS {
-            let state = Arc::clone(&state);
-            let start = Arc::clone(&start);
-            readers.push(tokio::spawn(async move {
-                start.wait().await;
-                current_vfs_snapshot(&state).await.unwrap()
-            }));
-        }
-
-        let mut snapshots = Vec::new();
-        for reader in readers {
-            snapshots.push(reader.await.unwrap());
-        }
-        let first = &snapshots[0];
-        assert!(snapshots
-            .iter()
-            .all(|snapshot| Arc::ptr_eq(first, snapshot)));
-        assert_eq!(state.vfs_tree_build_count.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn old_vfs_builder_held_across_invalidation_cannot_publish_stale_snapshot() {
-        use std::sync::atomic::Ordering;
-
-        let state = test_state();
-        install_branch_file(&state, "src/one.rs", b"one");
-        state.bump_version();
-
-        let materialized = Arc::new(std::sync::Barrier::new(2));
-        let resume = Arc::new(std::sync::Barrier::new(2));
-        *state
-            .vfs_tree_build_test_hook
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(crate::state::VfsTreeBuildTestHook {
-                materialized: Arc::clone(&materialized),
-                resume: Arc::clone(&resume),
-            });
-
-        let old_builder = {
-            let state = Arc::clone(&state);
-            tokio::spawn(async move { current_vfs_snapshot(&state).await.unwrap() })
-        };
-        tokio::task::spawn_blocking(move || materialized.wait())
-            .await
-            .unwrap();
-
-        // The first build has materialized the old head but has not reached publication.
-        // Complete a head change and cache invalidation before allowing it to continue.
-        advance_branch_with_file(&state, "src/two.rs", b"two", 0x7a);
-        state.bump_version();
-        tokio::task::spawn_blocking(move || resume.wait())
-            .await
-            .unwrap();
-
-        let observed = old_builder.await.unwrap();
-        assert!(observed.files.contains_key(&FilePathId::new("src/one.rs")));
-        assert!(observed.files.contains_key(&FilePathId::new("src/two.rs")));
-        assert_eq!(state.vfs_tree_build_count.load(Ordering::SeqCst), 2);
-
-        let cached = read_recover(&state.vfs_tree_cache)
-            .as_ref()
-            .cloned()
-            .expect("new-head snapshot cached");
-        assert!(Arc::ptr_eq(&observed, &cached));
-        assert_eq!(observed.key, current_vfs_cache_key(&state).unwrap());
-    }
-
-    #[tokio::test]
-    async fn vfs_snapshot_invalidates_on_head_change_without_serving_stale_tree() {
-        let state = test_state();
-        install_branch_file(&state, "src/one.rs", b"one");
-        state.bump_version();
-        let first = current_vfs_snapshot(&state).await.unwrap();
-
-        advance_branch_with_file(&state, "src/two.rs", b"two", 0x78);
-        state.bump_version();
-
-        assert!(read_recover(&state.vfs_tree_cache).is_none());
-
-        let refreshed = current_vfs_snapshot(&state).await.unwrap();
-        assert!(!Arc::ptr_eq(&first, &refreshed));
-        assert_ne!(first.key, refreshed.key);
-        assert!(refreshed.files.contains_key(&FilePathId::new("src/one.rs")));
-        assert!(refreshed.files.contains_key(&FilePathId::new("src/two.rs")));
-
-        let mut readers = Vec::new();
-        for _ in 0..16 {
-            let state = Arc::clone(&state);
-            readers.push(tokio::spawn(async move {
-                current_vfs_snapshot(&state).await.unwrap()
-            }));
-        }
-        for reader in readers {
-            let observed = reader.await.unwrap();
-            assert_eq!(observed.key, refreshed.key);
-            assert!(Arc::ptr_eq(&observed, &refreshed));
-        }
-    }
-
-    #[tokio::test]
-    async fn concurrent_vfs_readers_never_reuse_the_old_head_after_invalidation() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-        const READERS: usize = 16;
-        let state = test_state();
-        install_branch_file(&state, "src/one.rs", b"one");
-        state.bump_version();
-        let old = current_vfs_snapshot(&state).await.unwrap();
-
-        let start = Arc::new(tokio::sync::Barrier::new(READERS + 1));
-        let invalidated = Arc::new(AtomicBool::new(false));
-        let post_invalidation_reads = Arc::new(AtomicUsize::new(0));
-        let mut readers = Vec::new();
-        for _ in 0..READERS {
-            let state = Arc::clone(&state);
-            let start = Arc::clone(&start);
-            let invalidated = Arc::clone(&invalidated);
-            let post_invalidation_reads = Arc::clone(&post_invalidation_reads);
-            let old_key = old.key.clone();
-            readers.push(tokio::spawn(async move {
-                start.wait().await;
-                loop {
-                    let began_after_invalidation = invalidated.load(Ordering::Acquire);
-                    let observed = current_vfs_snapshot(&state).await.unwrap();
-                    if began_after_invalidation {
-                        assert_ne!(observed.key, old_key);
-                        assert!(observed.files.contains_key(&FilePathId::new("src/two.rs")));
-                        post_invalidation_reads.fetch_add(1, Ordering::Relaxed);
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            }));
-        }
-
-        // Release the readers against the warm old-head cache, then publish a new head while
-        // those tasks are actively issuing snapshot requests.
-        start.wait().await;
-        advance_branch_with_file(&state, "src/two.rs", b"two", 0x79);
-        state.bump_version();
-        invalidated.store(true, Ordering::Release);
-
-        for reader in readers {
-            reader.await.unwrap();
-        }
-        assert_eq!(post_invalidation_reads.load(Ordering::Relaxed), READERS);
     }
 
     #[tokio::test]
@@ -15381,6 +12345,17 @@ mod tests {
         }
     }
 
+    fn link_admitted_consumer_files(
+        files: &[kin_index::FileParseData],
+    ) -> Vec<kin_model::Relation> {
+        let artifact_ids: HashMap<String, kin_model::ArtifactId> = files
+            .iter()
+            .map(|file| (file.file_path.clone(), kin_model::ArtifactId::new()))
+            .collect();
+        kin_index::link_cross_file(files, &artifact_ids)
+            .expect("consumer fixture paths were explicitly admitted")
+    }
+
     /// The daemon's /spine/xref and /spine/impact serve real cross-repo edges
     /// materialized from a parsed + linked fixture through the production refresh
     /// path, and fail loud rather than return an empty impact.
@@ -15395,7 +12370,7 @@ mod tests {
             "use provider::do_work;\n\npub fn run_task() {\n    do_work();\n}\n",
         );
         let consumer_entities = consumer.entities.clone();
-        let consumer_relations = kin_index::link_cross_file(&[consumer]);
+        let consumer_relations = link_admitted_consumer_files(&[consumer]);
         let run_task_id = consumer_entities
             .iter()
             .find(|e| e.name == "run_task")
@@ -15489,7 +12464,7 @@ mod tests {
 
         let snapshot = app
             .clone()
-            .oneshot(Request::get("/v1/spine/edges").body(Body::empty()).unwrap())
+            .oneshot(Request::get("/spine/edges").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(snapshot.status(), StatusCode::OK);
@@ -15679,7 +12654,7 @@ mod tests {
         let app = router(state);
         let read_snapshot = |app: Router| async move {
             let response = app
-                .oneshot(Request::get("/v1/spine/edges").body(Body::empty()).unwrap())
+                .oneshot(Request::get("/spine/edges").body(Body::empty()).unwrap())
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
@@ -15746,7 +12721,7 @@ mod tests {
             "use provider::do_work;\n\npub fn run_task() {\n    do_work();\n}\n",
         );
         let consumer_entities = consumer.entities.clone();
-        let consumer_relations = kin_index::link_cross_file(&[consumer]);
+        let consumer_relations = link_admitted_consumer_files(&[consumer]);
         let run_task_id = consumer_entities
             .iter()
             .find(|e| e.name == "run_task")
@@ -15759,7 +12734,7 @@ mod tests {
             "use provider::do_work;\n\npub fn other_task() {\n    do_work();\n}\n",
         );
         let consumer2_entities = consumer2.entities.clone();
-        let consumer2_relations = kin_index::link_cross_file(&[consumer2]);
+        let consumer2_relations = link_admitted_consumer_files(&[consumer2]);
 
         // downstream: imports consumer::run_task (the 2nd hop).
         let downstream = parse_consumer_source(
@@ -15767,7 +12742,7 @@ mod tests {
             "use consumer::run_task;\n\npub fn orchestrate() {\n    run_task();\n}\n",
         );
         let downstream_entities = downstream.entities.clone();
-        let downstream_relations = kin_index::link_cross_file(&[downstream]);
+        let downstream_relations = link_admitted_consumer_files(&[downstream]);
         let orchestrate_id = downstream_entities
             .iter()
             .find(|e| e.name == "orchestrate")
@@ -16044,7 +13019,7 @@ mod tests {
             "use provider::do_work;\n\npub fn run_task() {\n    do_work();\n}\n",
         );
         let consumer_entities = consumer.entities.clone();
-        let consumer_relations = kin_index::link_cross_file(&[consumer]);
+        let consumer_relations = link_admitted_consumer_files(&[consumer]);
         let run_task_id = consumer_entities
             .iter()
             .find(|e| e.name == "run_task")
@@ -16870,19 +13845,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn v1_prefix_routes_to_same_handler() {
+    async fn v1_prefix_is_not_routed() {
         let state = test_state();
         let app = router(state);
         let response = app
             .oneshot(Request::get("/v1/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let json: HealthResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json.status, "ok");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -16893,21 +13863,6 @@ mod tests {
             .oneshot(Request::get("/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(
-            response.headers().get("X-Kin-API-Version").unwrap(),
-            API_VERSION
-        );
-    }
-
-    #[tokio::test]
-    async fn v1_prefix_also_includes_api_version_header() {
-        let state = test_state();
-        let app = router(state);
-        let response = app
-            .oneshot(Request::get("/v1/status").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get("X-Kin-API-Version").unwrap(),
             API_VERSION
@@ -16997,14 +13952,14 @@ mod tests {
 
         let rejected = app
             .clone()
-            .oneshot(Request::get("/v1/spine/edges").body(Body::empty()).unwrap())
+            .oneshot(Request::get("/spine/edges").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
 
         let accepted = app
             .oneshot(
-                Request::get("/v1/spine/edges")
+                Request::get("/spine/edges")
                     .header("authorization", "Bearer secret-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -17028,7 +13983,7 @@ mod tests {
             "/ready",
             "/readiness",
             "/spine/health",
-            "/v1/health",
+            "/v2/health",
         ] {
             let response = app
                 .clone()
@@ -18330,574 +15285,5 @@ mod tests {
                 "degradations must serialize as an array"
             );
         }
-    }
-
-    // ---------------------------------------------------------------
-    // Rung-3 write veto (KIN_WRITE_VETO) — wired apply-path behavior.
-    //
-    // These exercise the real `vfs_write_notify` handler in-process (no daemon
-    // is spawned). `KIN_WRITE_VETO` is process-global, so the env-touching
-    // tests serialize on `VETO_ENV_LOCK` and restore the variable via an RAII
-    // guard so a leak never bleeds into another test. The lock is a
-    // `tokio::sync::Mutex` so the guard can be safely held across the handler's
-    // `.await` (a std `MutexGuard` would trip `clippy::await_holding_lock`).
-    // ---------------------------------------------------------------
-
-    static VETO_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    struct EnvVarGuard(&'static str);
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            std::env::remove_var(self.0);
-        }
-    }
-
-    fn veto_file_target(state: &Arc<DaemonState>, rel: &str) -> (FilePathId, String) {
-        let abs = state.layout.working_dir().join(rel);
-        let file_id = kin_index::normalize_file_path_id(&abs, state.layout.working_dir());
-        (file_id, abs.to_string_lossy().into_owned())
-    }
-
-    fn write_disk_file(state: &Arc<DaemonState>, rel: &str, content: &str) {
-        let abs = state.layout.working_dir().join(rel);
-        if let Some(parent) = abs.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(&abs, content).unwrap();
-    }
-
-    fn register_foreign_session(state: &Arc<DaemonState>, name: &str) -> SessionId {
-        state
-            .coordinator
-            .register_session(
-                name,
-                "task",
-                SessionTransport::Mcp,
-                None,
-                state.layout.working_dir().to_path_buf(),
-                SessionCapabilities {
-                    can_write: true,
-                    ..SessionCapabilities::default()
-                },
-            )
-            .unwrap()
-    }
-
-    async fn write_notify(app: Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
-        let mut request =
-            Request::post("/vfs/write-notify").header("content-type", "application/json");
-        if let Some(session_id) = body.get("session_id").and_then(serde_json::Value::as_str) {
-            request = request.header("X-Kin-Session", session_id);
-        }
-        let resp = app
-            .oneshot(request.body(Body::from(body.to_string())).unwrap())
-            .await
-            .unwrap();
-        let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-        (status, json)
-    }
-
-    #[tokio::test]
-    async fn graph_only_write_notify_fails_before_reindex_or_graph_mutation() {
-        let state = test_state();
-        state
-            .filesystem_reconcile_disabled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let (_, abs) = veto_file_target(&state, "src/graph_only.rs");
-        write_disk_file(
-            &state,
-            "src/graph_only.rs",
-            "pub fn must_not_enter_graph() -> u8 { 7 }\n",
-        );
-        let root_before = state.graph.compute_root_hash();
-        let entities_before = state.graph.entity_count();
-        let version_before = state.vfs_version.load(std::sync::atomic::Ordering::Relaxed);
-
-        let (status, json) = write_notify(
-            router(Arc::clone(&state)),
-            serde_json::json!({ "file_path": abs }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(json["error"], "filesystem_reconcile_disabled");
-        assert_eq!(json["reindexed"], false);
-        assert_eq!(state.graph.compute_root_hash(), root_before);
-        assert_eq!(state.graph.entity_count(), entities_before);
-        assert_eq!(
-            state.vfs_version.load(std::sync::atomic::Ordering::Relaxed),
-            version_before
-        );
-    }
-
-    #[tokio::test]
-    async fn write_notify_enforce_foreign_hard_intent_returns_409() {
-        let _lock = VETO_ENV_LOCK.lock().await;
-        let state = test_state();
-        let (file_id, abs) = veto_file_target(&state, "src/lib.py");
-        // The veto short-circuits before reconcile reads the file, so the file
-        // need not exist on disk for the rejection path.
-        let foreign = register_foreign_session(&state, "other-agent");
-        state
-            .coordinator
-            .register_intent(
-                &foreign,
-                vec![IntentScope::Artifact(file_id)],
-                LockType::Hard,
-                "rewriting lib",
-                None,
-            )
-            .unwrap();
-
-        let _env = EnvVarGuard("KIN_WRITE_VETO");
-        std::env::set_var("KIN_WRITE_VETO", "enforce");
-        *state
-            .coordination_mode
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            kin_mcp::CoordinationEnforcementMode::Enforce;
-        let caller = register_foreign_session(&state, "caller");
-        let (status, json) = write_notify(
-            router(state),
-            serde_json::json!({ "file_path": abs, "session_id": caller.to_string() }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(json["error"], "write_veto");
-        assert_eq!(json["conflict_type"], "HardCollision");
-        assert!(!json["blocking_intents"].as_array().unwrap().is_empty());
-        assert_eq!(
-            json["blocking_intents"][0]["session_id"],
-            foreign.to_string()
-        );
-    }
-
-    #[tokio::test]
-    async fn write_notify_off_keeps_soft_notification_without_annotation() {
-        // Explicit KIN_WRITE_VETO=off identity: with a foreign hard intent
-        // present the reconciler's own check still declines to fold the write
-        // (reindexed:false), NO 409 is produced, and — because the veto never
-        // evaluated — NO write_veto_warning is attached.
-        let _lock = VETO_ENV_LOCK.lock().await;
-        let _env = EnvVarGuard("KIN_WRITE_VETO");
-        std::env::set_var("KIN_WRITE_VETO", "off");
-
-        let state = test_state();
-        let (file_id, abs) = veto_file_target(&state, "src/lib.py");
-        write_disk_file(&state, "src/lib.py", "def foo():\n    return 1\n");
-        let foreign = register_foreign_session(&state, "other-agent");
-        state
-            .coordinator
-            .register_intent(
-                &foreign,
-                vec![IntentScope::Artifact(file_id)],
-                LockType::Hard,
-                "rewriting lib",
-                None,
-            )
-            .unwrap();
-
-        let (status, json) =
-            write_notify(router(state), serde_json::json!({ "file_path": abs })).await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["reindexed"], false);
-        assert!(json.get("write_veto_warning").is_none());
-    }
-
-    #[tokio::test]
-    async fn write_notify_warn_default_annotates_without_409() {
-        // Warn-by-default (KIN_WRITE_VETO unset): a foreign hard intent does NOT
-        // reject the write (status OK, no 409), but the response carries a
-        // write_veto_warning naming the blocking session so the agent sees the
-        // collision it would have hit under enforce.
-        let _lock = VETO_ENV_LOCK.lock().await;
-        let _env = EnvVarGuard("KIN_WRITE_VETO");
-        std::env::remove_var("KIN_WRITE_VETO");
-
-        let state = test_state();
-        let (file_id, abs) = veto_file_target(&state, "src/lib.py");
-        write_disk_file(&state, "src/lib.py", "def foo():\n    return 1\n");
-        let foreign = register_foreign_session(&state, "other-agent");
-        state
-            .coordinator
-            .register_intent(
-                &foreign,
-                vec![IntentScope::Artifact(file_id)],
-                LockType::Hard,
-                "rewriting lib",
-                None,
-            )
-            .unwrap();
-
-        let (status, json) =
-            write_notify(router(state), serde_json::json!({ "file_path": abs })).await;
-
-        assert_eq!(status, StatusCode::OK);
-        let warning = &json["write_veto_warning"];
-        assert_eq!(warning["would_block"], true);
-        assert_eq!(
-            warning["blocking_intents"][0]["session_id"],
-            foreign.to_string()
-        );
-    }
-
-    #[tokio::test]
-    async fn write_notify_warn_own_intent_allows_without_annotation() {
-        // Warn own-write guard at the handler: a session editing a file it has
-        // itself hard-locked is folded (reindexed:true) and NOT flagged — no
-        // write_veto_warning on an own write.
-        let _lock = VETO_ENV_LOCK.lock().await;
-        let _env = EnvVarGuard("KIN_WRITE_VETO");
-        std::env::remove_var("KIN_WRITE_VETO");
-
-        let state = test_state();
-        let (file_id, abs) = veto_file_target(&state, "src/lib.py");
-        write_disk_file(&state, "src/lib.py", "def foo():\n    return 1\n");
-        let caller = register_foreign_session(&state, "me");
-        state
-            .coordinator
-            .register_intent(
-                &caller,
-                vec![IntentScope::Artifact(file_id)],
-                LockType::Hard,
-                "editing my own file",
-                None,
-            )
-            .unwrap();
-
-        let (status, json) = write_notify(
-            router(state),
-            serde_json::json!({ "file_path": abs, "session_id": caller.to_string() }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["reindexed"], true);
-        assert!(json.get("write_veto_warning").is_none());
-    }
-
-    #[tokio::test]
-    async fn write_notify_enforce_own_intent_allows_write() {
-        // Own-write guard at the handler: a session editing a file it has
-        // itself hard-locked is allowed, and the write is folded into the graph.
-        let _lock = VETO_ENV_LOCK.lock().await;
-        let state = test_state();
-        let (file_id, abs) = veto_file_target(&state, "src/lib.py");
-        write_disk_file(&state, "src/lib.py", "def foo():\n    return 1\n");
-        let caller = register_foreign_session(&state, "me");
-        state
-            .coordinator
-            .register_intent(
-                &caller,
-                vec![IntentScope::Artifact(file_id)],
-                LockType::Hard,
-                "editing my own file",
-                None,
-            )
-            .unwrap();
-
-        let _env = EnvVarGuard("KIN_WRITE_VETO");
-        std::env::set_var("KIN_WRITE_VETO", "enforce");
-        *state
-            .coordination_mode
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            kin_mcp::CoordinationEnforcementMode::Enforce;
-        let (status, json) = write_notify(
-            router(state),
-            serde_json::json!({ "file_path": abs, "session_id": caller.to_string() }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["reindexed"], true);
-    }
-
-    #[tokio::test]
-    async fn write_notify_enforce_foreign_soft_intent_allows_write() {
-        // Soft intents are advisory: even under enforce, a foreign soft intent
-        // never vetoes the write.
-        let _lock = VETO_ENV_LOCK.lock().await;
-        let state = test_state();
-        let (file_id, abs) = veto_file_target(&state, "src/lib.py");
-        write_disk_file(&state, "src/lib.py", "def foo():\n    return 1\n");
-        let foreign = register_foreign_session(&state, "other-agent");
-        state
-            .coordinator
-            .register_intent(
-                &foreign,
-                vec![IntentScope::Artifact(file_id)],
-                LockType::Soft,
-                "watching lib",
-                None,
-            )
-            .unwrap();
-
-        let _env = EnvVarGuard("KIN_WRITE_VETO");
-        std::env::set_var("KIN_WRITE_VETO", "enforce");
-        *state
-            .coordination_mode
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            kin_mcp::CoordinationEnforcementMode::Enforce;
-        let caller = register_foreign_session(&state, "caller");
-        let (status, json) = write_notify(
-            router(state),
-            serde_json::json!({ "file_path": abs, "session_id": caller.to_string() }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["reindexed"], true);
-    }
-
-    #[tokio::test]
-    async fn write_notify_enforce_rejects_read_only_and_mismatched_callers() {
-        let _lock = VETO_ENV_LOCK.lock().await;
-        let state = test_state();
-        *state
-            .coordination_mode
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            kin_mcp::CoordinationEnforcementMode::Enforce;
-        let (_, abs) = veto_file_target(&state, "src/lib.py");
-        let read_only = state
-            .coordinator
-            .register_session(
-                "read-only",
-                "reader",
-                SessionTransport::Mcp,
-                None,
-                state.layout.working_dir().to_path_buf(),
-                SessionCapabilities::default(),
-            )
-            .unwrap();
-        let (status, json) = write_notify(
-            router(Arc::clone(&state)),
-            serde_json::json!({ "file_path": abs, "session_id": read_only.to_string() }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert!(json["capability_violations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value == "can_write=false"));
-
-        let first = register_foreign_session(&state, "first");
-        let second = register_foreign_session(&state, "second");
-        let response = router(state)
-            .oneshot(
-                Request::post("/vfs/write-notify")
-                    .header("content-type", "application/json")
-                    .header("X-Kin-Session", first.to_string())
-                    .body(Body::from(
-                        serde_json::json!({
-                            "file_path": abs,
-                            "session_id": second.to_string()
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    }
-
-    async fn file_changed(app: Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
-        let mut request =
-            Request::post("/vfs/file-changed").header("content-type", "application/json");
-        if let Some(session_id) = body.get("session_id").and_then(serde_json::Value::as_str) {
-            request = request.header("X-Kin-Session", session_id);
-        }
-        let resp = app
-            .oneshot(request.body(Body::from(body.to_string())).unwrap())
-            .await
-            .unwrap();
-        let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-        (status, json)
-    }
-
-    #[tokio::test]
-    async fn graph_only_file_changed_fails_before_reconcile_or_graph_mutation() {
-        let state = test_state();
-        state
-            .filesystem_reconcile_disabled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let (_, abs) = veto_file_target(&state, "src/graph_only_changed.rs");
-        write_disk_file(
-            &state,
-            "src/graph_only_changed.rs",
-            "pub fn must_not_reconcile() -> u8 { 9 }\n",
-        );
-        let root_before = state.graph.compute_root_hash();
-        let entities_before = state.graph.entity_count();
-        let version_before = state.vfs_version.load(std::sync::atomic::Ordering::Relaxed);
-
-        let (status, json) = file_changed(
-            router(Arc::clone(&state)),
-            serde_json::json!({ "path": abs }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(json["error"], "filesystem_reconcile_disabled");
-        assert_eq!(json["reindexed"], false);
-        assert_eq!(state.graph.compute_root_hash(), root_before);
-        assert_eq!(state.graph.entity_count(), entities_before);
-        assert_eq!(
-            state.vfs_version.load(std::sync::atomic::Ordering::Relaxed),
-            version_before
-        );
-    }
-
-    #[tokio::test]
-    async fn file_changed_enforce_foreign_hard_intent_returns_409() {
-        // The veto must cover /vfs/file-changed too — otherwise enforce-mode is
-        // trivially bypassable by choosing this endpoint over /vfs/write-notify.
-        let _lock = VETO_ENV_LOCK.lock().await;
-        let state = test_state();
-        let (file_id, abs) = veto_file_target(&state, "src/lib.py");
-        let foreign = register_foreign_session(&state, "other-agent");
-        state
-            .coordinator
-            .register_intent(
-                &foreign,
-                vec![IntentScope::Artifact(file_id)],
-                LockType::Hard,
-                "rewriting lib",
-                None,
-            )
-            .unwrap();
-
-        let _env = EnvVarGuard("KIN_WRITE_VETO");
-        std::env::set_var("KIN_WRITE_VETO", "enforce");
-        *state
-            .coordination_mode
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            kin_mcp::CoordinationEnforcementMode::Enforce;
-        let caller = register_foreign_session(&state, "caller");
-        let (status, json) = file_changed(
-            router(state),
-            serde_json::json!({ "path": abs, "session_id": caller.to_string() }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(json["error"], "write_veto");
-        assert!(!json["blocking_intents"].as_array().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn file_changed_off_keeps_soft_notification_without_annotation() {
-        // Explicit KIN_WRITE_VETO=off identity for the file-changed path:
-        // foreign hard intent present, soft 200 {status:"error"}, no 409, and no
-        // write_veto_warning (the veto never evaluated).
-        let _lock = VETO_ENV_LOCK.lock().await;
-        let _env = EnvVarGuard("KIN_WRITE_VETO");
-        std::env::set_var("KIN_WRITE_VETO", "off");
-
-        let state = test_state();
-        let (file_id, abs) = veto_file_target(&state, "src/lib.py");
-        write_disk_file(&state, "src/lib.py", "def foo():\n    return 1\n");
-        let foreign = register_foreign_session(&state, "other-agent");
-        state
-            .coordinator
-            .register_intent(
-                &foreign,
-                vec![IntentScope::Artifact(file_id)],
-                LockType::Hard,
-                "rewriting lib",
-                None,
-            )
-            .unwrap();
-
-        let (status, json) = file_changed(router(state), serde_json::json!({ "path": abs })).await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["status"], "error");
-        assert!(json.get("write_veto_warning").is_none());
-    }
-
-    #[tokio::test]
-    async fn file_changed_warn_default_annotates_without_409() {
-        // Warn-by-default on /vfs/file-changed: a foreign hard intent is not
-        // rejected (status OK, no 409) but the soft response carries a
-        // write_veto_warning naming the blocking session.
-        let _lock = VETO_ENV_LOCK.lock().await;
-        let _env = EnvVarGuard("KIN_WRITE_VETO");
-        std::env::remove_var("KIN_WRITE_VETO");
-
-        let state = test_state();
-        let (file_id, abs) = veto_file_target(&state, "src/lib.py");
-        write_disk_file(&state, "src/lib.py", "def foo():\n    return 1\n");
-        let foreign = register_foreign_session(&state, "other-agent");
-        state
-            .coordinator
-            .register_intent(
-                &foreign,
-                vec![IntentScope::Artifact(file_id)],
-                LockType::Hard,
-                "rewriting lib",
-                None,
-            )
-            .unwrap();
-
-        let (status, json) = file_changed(router(state), serde_json::json!({ "path": abs })).await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            json["write_veto_warning"]["blocking_intents"][0]["session_id"],
-            foreign.to_string()
-        );
-    }
-
-    #[tokio::test]
-    async fn file_changed_enforce_own_intent_allows_write() {
-        // The additive session_id field lets file-changed honor the own-write
-        // guard: a session editing a file it has itself hard-locked is allowed.
-        let _lock = VETO_ENV_LOCK.lock().await;
-        let state = test_state();
-        let (file_id, abs) = veto_file_target(&state, "src/lib.py");
-        write_disk_file(&state, "src/lib.py", "def foo():\n    return 1\n");
-        let caller = register_foreign_session(&state, "me");
-        state
-            .coordinator
-            .register_intent(
-                &caller,
-                vec![IntentScope::Artifact(file_id)],
-                LockType::Hard,
-                "editing my own file",
-                None,
-            )
-            .unwrap();
-
-        let _env = EnvVarGuard("KIN_WRITE_VETO");
-        std::env::set_var("KIN_WRITE_VETO", "enforce");
-        *state
-            .coordination_mode
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            kin_mcp::CoordinationEnforcementMode::Enforce;
-        let (status, json) = file_changed(
-            router(state),
-            serde_json::json!({ "path": abs, "session_id": caller.to_string() }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["status"], "reconciled");
     }
 }
