@@ -53,6 +53,10 @@ fn main() {
             serde_json::to_string_pretty(&schema_for!(kin_model::GitObjectId)).unwrap(),
         ),
         (
+            "GitExternalAuthority",
+            serde_json::to_string_pretty(&schema_for!(kin_model::GitExternalAuthority)).unwrap(),
+        ),
+        (
             "LocatedEntry",
             serde_json::to_string_pretty(&schema_for!(kin_model::LocatedEntry)).unwrap(),
         ),

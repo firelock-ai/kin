@@ -18,6 +18,7 @@ pub mod error;
 pub mod evidence;
 pub mod external;
 pub mod federation;
+pub mod git_authority;
 pub mod graph;
 pub mod identity;
 pub mod ids;
@@ -71,6 +72,13 @@ pub use external::{
 pub use federation::{
     ActorRef, GraphCapabilitySet, GraphLocator, GraphManifest, RemoteRelation, RemoteRelationKind,
     RemoteRelationOrigin, ScopeRef, SessionLease,
+};
+pub use git_authority::{
+    decode_git_external_object, DecodedGitObject, GitCommitCanonicalIdentity, GitCommitProjection,
+    GitExternalAuthority, GitExternalAuthorityError, GitMaterialHead, GitObjectBodyLoader,
+    GitObjectClosureEntry, GitObjectClosureManifest, GitObjectDependency, GitObjectDependencyKind,
+    GitObjectFormat, GitObjectRoot, GitObjectRootSource, GitRawRef, GitRawTarget, GitTreeEntryMode,
+    GitTreeEntryName, GitTreeEntryNameError, GIT_EXTERNAL_AUTHORITY_SCHEMA_VERSION,
 };
 pub use graph::{
     ChangeStore, EntityFilter, EntityStore, GraphStore, ProvenanceStore, ReviewStore, SessionStore,
