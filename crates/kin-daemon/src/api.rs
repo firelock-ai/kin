@@ -239,6 +239,8 @@ struct RegisterIntentRequest {
 
 #[derive(Debug, Deserialize)]
 struct StartSessionRequest {
+    #[serde(default)]
+    session_id: Option<String>,
     vendor: String,
     client_name: String,
     #[serde(default = "default_session_transport")]
@@ -1018,7 +1020,6 @@ fn api_routes(retire_v1_branch_head_update: bool) -> Router<Arc<DaemonState>> {
             "/commands/session-workspace",
             post(command_session_workspace),
         )
-        .route("/commands/exec", post(command_exec))
         .route("/commands/commit", post(command_commit))
         .route(
             "/graph/branches",
@@ -1969,9 +1970,28 @@ async fn start_session(
     Json(request): Json<StartSessionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let transport = parse_session_transport(&request.transport)?;
+    let requested_session_id = request
+        .session_id
+        .as_deref()
+        .map(parse_session_id)
+        .transpose()?;
+    if let Some(session_id) = requested_session_id {
+        if state
+            .coordinator
+            .get_session(&session_id)
+            .map_err(internal_error)?
+            .is_some()
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("session already exists: {session_id}"),
+            ));
+        }
+    }
     let session_id = state
         .coordinator
-        .register_session(
+        .register_session_with_id(
+            requested_session_id.unwrap_or_else(SessionId::new),
             &request.vendor,
             &request.client_name,
             transport,
@@ -3231,53 +3251,6 @@ async fn command_session_workspace(
     }
 
     let response = kin_cli::commands::session_workspace::materialize_session_workspace(
-        &state.layout,
-        state.graph.as_ref(),
-        &request,
-    )
-    .map_err(internal_error)?;
-    Ok(Json(response))
-}
-
-/// POST /commands/exec — execute inside a daemon-materialized graph workspace.
-/// Whether the daemon is permitted to run shell command execution
-/// (`POST /commands/exec`, which spawns `sh -c`). This is a high-risk
-/// capability (local RCE if an unauthorized caller reaches the loopback
-/// daemon), so it stays disabled unless the operator explicitly opts in via
-/// `KIN_DAEMON_ALLOW_EXEC`. Being initialized is necessary but NOT sufficient.
-fn exec_capability_enabled() -> bool {
-    std::env::var("KIN_DAEMON_ALLOW_EXEC")
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
-async fn command_exec(
-    State(state): State<Arc<DaemonState>>,
-    Json(request): Json<kin_cli::commands::exec::ExecRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if !state
-        .is_initialized
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "daemon not fully initialized".to_string(),
-        ));
-    }
-
-    if !exec_capability_enabled() {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "command execution is disabled; set KIN_DAEMON_ALLOW_EXEC=1 to opt in to daemon-side `sh -c` execution".to_string(),
-        ));
-    }
-
-    let response = kin_cli::commands::exec::execute_exec_request(
         &state.layout,
         state.graph.as_ref(),
         &request,
@@ -15728,59 +15701,11 @@ mod tests {
         );
     }
 
-    /// Serializes tests that mutate process-global env (`KIN_DAEMON_ALLOW_EXEC`,
-    /// `KIN_DAEMON_AUTH_TOKEN`, `KIN_DAEMON_REQUIRE_TOKEN`) so their
+    /// Serializes tests that mutate process-global env
+    /// (`KIN_DAEMON_AUTH_TOKEN`, `KIN_DAEMON_REQUIRE_TOKEN`) so their
     /// opposite expectations never race under the parallel test runner.
     fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::test_env_lock()
-    }
-
-    #[tokio::test]
-    async fn exec_endpoint_runs_against_live_graph_workspace() {
-        let _env = env_test_lock();
-        std::env::set_var("KIN_DAEMON_ALLOW_EXEC", "1");
-
-        let state = test_state();
-        install_branch_file(&state, "src/lib.py", b"daemon exec\n");
-        state
-            .is_initialized
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let app = router(state);
-
-        let response = app
-            .oneshot(
-                Request::post("/commands/exec")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "command": "cat src/lib.py",
-                            "keep": false,
-                            "strategy": null,
-                            "scope": null
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let status = response.status();
-        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
-            .await
-            .unwrap();
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "body: {}",
-            String::from_utf8_lossy(&body)
-        );
-        let result: kin_cli::commands::exec::ExecResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(result.stdout, "daemon exec\n");
-        assert_eq!(result.exit_code, 0);
-        assert!(!std::path::Path::new(&result.workspace_path).exists());
-
-        std::env::remove_var("KIN_DAEMON_ALLOW_EXEC");
     }
 
     #[tokio::test]
@@ -17776,6 +17701,7 @@ mod tests {
     async fn create_heartbeat_and_end_session() {
         let state = test_state();
         let app = router(state);
+        let requested_session_id = SessionId::new();
 
         let start_response = app
             .clone()
@@ -17784,6 +17710,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
+                            "session_id": requested_session_id.to_string(),
                             "vendor": "claude-code",
                             "client_name": "daemon-test",
                             "transport": "mcp",
@@ -17811,6 +17738,28 @@ mod tests {
         assert_eq!(start_json.vendor, "claude-code");
         assert_eq!(start_json.status, "active");
         assert_eq!(start_json.client_name, "daemon-test");
+        assert_eq!(start_json.session_id, requested_session_id.to_string());
+
+        let duplicate_response = app
+            .clone()
+            .oneshot(
+                Request::post("/session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "session_id": requested_session_id.to_string(),
+                            "vendor": "claude-code",
+                            "client_name": "duplicate",
+                            "transport": "mcp",
+                            "cwd": "/project"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate_response.status(), StatusCode::CONFLICT);
 
         let heartbeat_response = app
             .clone()
@@ -20836,30 +20785,6 @@ mod tests {
         let json: HealthResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(json.status, "attention");
         assert_eq!(json.coordination_event_persist_failures, Some(1));
-    }
-
-    #[tokio::test]
-    async fn command_exec_requires_capability_optin() {
-        // Default install (no KIN_DAEMON_ALLOW_EXEC) must refuse shell exec even
-        // for an initialized daemon — being initialized is not sufficient.
-        let _env = env_test_lock();
-        std::env::remove_var("KIN_DAEMON_ALLOW_EXEC");
-
-        let state = test_state();
-        state
-            .is_initialized
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let app = router(state);
-        let response = app
-            .oneshot(
-                Request::post("/commands/exec")
-                    .header("content-type", "application/json")
-                    .body(Body::from(json!({ "command": "echo hi" }).to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

@@ -1139,7 +1139,7 @@ fn configure_codex() -> Result<PathBuf> {
     let home = home_dir()?;
     let target = home.join(".codex").join("config.toml");
     let cwd = env::current_dir().context("could not determine the current directory")?;
-    let repo_root = kin_core::KinLayout::discover_with_daemon_url(&cwd, None)
+    let repo_root = kin_core::KinLayout::discover(&cwd)
         .and_then(|layout| layout.working_dir().canonicalize().ok())
         .with_context(|| {
             format!(
@@ -1177,7 +1177,7 @@ fn configure_windsurf() -> Result<PathBuf> {
 
 fn current_initialized_setup_repo(client: &str) -> Result<PathBuf> {
     let cwd = env::current_dir().context("could not determine the current directory")?;
-    kin_core::KinLayout::discover_with_daemon_url(&cwd, None)
+    kin_core::KinLayout::discover(&cwd)
         .and_then(|layout| layout.working_dir().canonicalize().ok())
         .and_then(|root| canonical_initialized_repo(&root))
         .with_context(|| {

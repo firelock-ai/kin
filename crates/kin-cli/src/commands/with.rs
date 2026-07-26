@@ -43,15 +43,18 @@ pub async fn run(
         ));
     }
 
-    // Build summary (best-effort, continue without it)
-    let summary = build_repo_summary_opt(&layout).await;
-
-    let guidance =
-        kin_core::generate_assistant_prompt(kind, PromptMode::Normal, &layout, summary.as_ref());
-
     if session {
+        let repo_binding = super::session_process::VerifiedRepoBinding::resolve(&layout).await?;
+        let summary = build_repo_summary_for_binding(&repo_binding).await;
+        let guidance = kin_core::generate_assistant_prompt(
+            kind,
+            PromptMode::Normal,
+            &layout,
+            summary.as_ref(),
+        );
         return run_in_session(
             &layout,
+            repo_binding,
             kind,
             &guidance,
             &task_text,
@@ -62,6 +65,10 @@ pub async fn run(
         .await;
     }
 
+    // Build summary (best-effort, continue without it).
+    let summary = build_repo_summary_opt(&layout).await;
+    let guidance =
+        kin_core::generate_assistant_prompt(kind, PromptMode::Normal, &layout, summary.as_ref());
     let full_prompt = build_full_prompt(&guidance, &task_text, passive_guidance);
 
     let headless = std::env::var("KIN_BENCHMARK").ok().as_deref() == Some("1");
@@ -96,6 +103,7 @@ pub async fn run(
 /// close the session out when it exits.
 async fn run_in_session(
     layout: &kin_core::KinLayout,
+    repo_binding: super::session_process::VerifiedRepoBinding,
     kind: AssistantKind,
     guidance: &str,
     task_text: &str,
@@ -109,22 +117,17 @@ async fn run_in_session(
         .join("runs")
         .join(format!("session-{session_id}"));
 
-    let ws = super::session_workspace::create_session_workspace(layout, &session_dir, None, None)
-        .await?;
-
-    // Pin the daemon endpoint for the assistant and everything it spawns.
-    // `kin mcp start` prefers KIN_DAEMON_URL over cwd discovery, so MCP tool
-    // calls from this assistant bind to the same repo daemon as this session.
-    let daemon_url = match std::env::var("KIN_DAEMON_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    {
-        Some(url) => url,
-        None => crate::daemon_client::resolve_daemon_url(layout)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("kin daemon is required for a session launch"))?,
-    };
-    let repo_id = super::remote::resolve_repo_id(layout).ok();
+    let ws =
+        super::session_workspace::create_session_workspace(&repo_binding, &session_dir, None, None)
+            .await?;
+    let process_binding =
+        super::session_process::SessionProcessBinding::new(&repo_binding, session_id, &ws.root);
+    process_binding.persist_context().map_err(|error| {
+        anyhow::anyhow!(
+            "failed to persist session context: {error}. Session workspace kept at {}",
+            session_dir.display()
+        )
+    })?;
 
     let session_guidance = format!("{guidance}\n\n{}", session_guidance_note(&ws.root));
     let full_prompt = build_full_prompt(&session_guidance, task_text, passive_guidance);
@@ -134,72 +137,87 @@ async fn run_in_session(
 
     // Shims target the live session workspace so shell-outs from the
     // assistant resolve against the same files it is editing.
-    let shim_env = session_shim_env(layout, &ws.root, restrict_discovery, restrict_filesystem)?;
-    let mut env = session_launch_env(session_id, &ws.root, &daemon_url, repo_id.as_deref());
-    env.extend(shim_env);
+    let shim_env = session_shim_env(
+        layout,
+        &ws.root,
+        restrict_discovery,
+        restrict_filesystem,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "failed to prepare assistant session environment: {error}. Session workspace kept at {}",
+            session_dir.display()
+        )
+    })?;
 
     eprintln!("Session workspace: {}", ws.root.display());
     eprintln!("Launching {} in session workspace...", kind);
 
-    let code = spawn_assistant_in_session(&program, &args, &ws.root, &env)?;
+    let lease = repo_binding
+        .register_session(session_id, &ws.root, "kin with")
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to register session: {error}. Session workspace kept at {}",
+                session_dir.display()
+            )
+        })?;
+    let code = match spawn_assistant_in_session(&program, &args, &process_binding, &shim_env) {
+        Ok(code) => code,
+        Err(error) => {
+            let _ = lease.finish().await;
+            return Err(error.context(format!(
+                "session workspace kept at {}",
+                session_dir.display()
+            )));
+        }
+    };
     eprintln!("\n{} exited (code {}).", kind, code);
 
-    {
+    let (close_result, lease_result) = {
         let stderr = std::io::stderr();
         let mut stderr = stderr.lock();
-        close_agent_session(layout, &session_dir, code, &mut stderr).await?;
-    }
+        let close_result =
+            close_agent_session(&repo_binding, &session_dir, code, &mut stderr).await;
+        let lease_result = lease.finish().await;
+        (close_result, lease_result)
+    };
 
-    std::process::exit(code);
+    if code != 0 {
+        if let Err(error) = close_result {
+            eprintln!("Kin: failed to report preserved session workspace: {error}");
+        }
+        if let Err(error) = lease_result {
+            eprintln!("Kin: failed to end daemon session lease: {error}");
+        }
+        std::process::exit(code);
+    }
+    close_result?;
+    lease_result?;
+    Ok(())
 }
 
 /// Spawn the assistant process with cwd set to the session workspace root.
+///
+/// A materialized session is its own file surface. Ambient loader injection
+/// and VFS identity from the repo that launched Kin must not redirect it back
+/// to that repo.
 fn spawn_assistant_in_session(
     program: &str,
     args: &[String],
-    ws_root: &Path,
-    env: &[(String, String)],
+    binding: &super::session_process::SessionProcessBinding,
+    projection_env: &[(String, String)],
 ) -> Result<i32> {
-    let status = std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    binding.configure_command(&mut command, projection_env.iter().map(|(k, v)| (k, v)))?;
+    let status = command
         .args(args)
-        .current_dir(ws_root)
-        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .status()
         .map_err(|e| anyhow::anyhow!("failed to launch '{}': {}", program, e))?;
     Ok(status.code().unwrap_or(1))
-}
-
-/// Session identity and daemon-binding env for an agent session launch.
-///
-/// - `KIN_SESSION` / `KIN_SESSION_DIR`: the `kin shell`/`kin open` contract.
-/// - `KIN_SESSION_ID`: read by the MCP daemon delegate, which forwards it as
-///   the `X-Kin-Session` header so the daemon can resolve session-scoped
-///   graph state for this agent's tool calls.
-/// - `KIN_DAEMON_URL`: pins `kin` CLI/MCP invocations inside the session to
-///   this repo's daemon instead of re-discovering from cwd.
-/// - `KIN_REPO_ID`: repo identity for provenance attribution.
-fn session_launch_env(
-    session_id: uuid::Uuid,
-    ws_root: &Path,
-    daemon_url: &str,
-    repo_id: Option<&str>,
-) -> Vec<(String, String)> {
-    let mut env = vec![
-        ("KIN_SESSION".into(), session_id.to_string()),
-        ("KIN_SESSION_ID".into(), session_id.to_string()),
-        (
-            "KIN_SESSION_DIR".into(),
-            ws_root.to_string_lossy().into_owned(),
-        ),
-        ("KIN_DAEMON_URL".into(), daemon_url.to_string()),
-    ];
-    if let Some(repo_id) = repo_id {
-        env.push(("KIN_REPO_ID".into(), repo_id.to_string()));
-    }
-    env
 }
 
 fn session_guidance_note(ws_root: &Path) -> String {
@@ -215,15 +233,16 @@ fn session_guidance_note(ws_root: &Path) -> String {
 /// Close out an agent session: a clean exit reconciles the workspace into
 /// the graph; any failure preserves the workspace with recovery commands.
 async fn close_agent_session<W: Write>(
-    layout: &kin_core::KinLayout,
+    binding: &super::session_process::VerifiedRepoBinding,
     session_dir: &Path,
     exit_code: i32,
     writer: &mut W,
 ) -> Result<()> {
     if exit_code == 0 {
         return super::session_closeout::finalize_shell_session_with_writer(
-            layout,
+            binding,
             session_dir,
+            0,
             writer,
         )
         .await;
@@ -406,18 +425,18 @@ fn build_assistant_command(
 }
 
 async fn build_repo_summary_opt(layout: &kin_core::KinLayout) -> Option<kin_core::RepoSummary> {
+    let binding = super::session_process::VerifiedRepoBinding::resolve(layout)
+        .await
+        .ok()?;
+    build_repo_summary_for_binding(&binding).await
+}
+
+async fn build_repo_summary_for_binding(
+    binding: &super::session_process::VerifiedRepoBinding,
+) -> Option<kin_core::RepoSummary> {
     use std::collections::HashMap;
 
-    let base_url = std::env::var("KIN_DAEMON_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(Some)
-        .unwrap_or(
-            crate::daemon_client::resolve_daemon_url(layout)
-                .await
-                .ok()?,
-        )?;
-    let client = crate::daemon_client::DaemonClient::from_base_url(base_url).ok()?;
+    let client = binding.client(None).ok()?;
     let status = client
         .command_status(&crate::commands::status::CommandStatusRequest::new(false))
         .await
@@ -438,6 +457,100 @@ mod tests {
     use super::*;
     use kin_core::AssistantKind;
     use serial_test::serial;
+
+    const SESSION_PROJECTION_LAUNCH_WORKER: &str = "KIN_TEST_SESSION_PROJECTION_LAUNCH_WORKER";
+    const SESSION_PROJECTION_PROBE: &str = "KIN_TEST_SESSION_PROJECTION_PROBE";
+    const SESSION_BOUNDARY_UNRELATED_ENV: &str = "KIN_TEST_SESSION_BOUNDARY_UNRELATED";
+    const AMBIENT_PROJECTION_SENTINEL: &str = "ambient-repo-projection-must-not-cross";
+    const POISONED_AUTHORITY_ENV: &[&str] = &[
+        "DYLD_INSERT_LIBRARIES",
+        "LD_PRELOAD",
+        "KIN_VFS_WORKSPACE",
+        "KIN_VFS_WORKSPACE_ALIASES",
+        "KIN_VFS_SOCK",
+        "KIN_VFS_PIPE",
+        "KIN_VFS_CANARY",
+        "KIN_VFS_INTERPOSE_ACTIVE",
+        "KIN_VFS_LAST_DIR",
+        "_KIN_VFS_LAST_DIR",
+        "KIN_SESSION",
+        "KIN_SESSION_ID",
+        "KIN_SESSION_DIR",
+        "KIN_DAEMON_URL",
+        "KIN_DAEMON_AUTH_TOKEN",
+        "KIN_REPO_ID",
+        "KIN_REPO_IDS",
+        "KIN_PRIMARY_REPO_ID",
+        "KIN_MCP_REPO",
+        "KIN_SOURCE_ROOT",
+        "KIN_WORKSPACE_ROOT",
+        "KIN_WORKSPACE_DIR",
+        "KIN_ORIGINAL_PATH",
+        "KIN_DISCOVERY_MODE",
+        "KIN_CONTENT_MODE",
+        "KIN_VFS_DISABLE",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+        "GIT_CEILING_DIRECTORIES",
+        "COMPOSE_FILE",
+        "COMPOSE_ENV_FILES",
+        "COMPOSE_PATH_SEPARATOR",
+        "COMPOSE_PROJECT_NAME",
+        "INIT_CWD",
+        "npm_config_local_prefix",
+        "MAKEFLAGS",
+        "MFLAGS",
+        "MAKELEVEL",
+        "MESON_SOURCE_ROOT",
+        "MESON_BUILD_ROOT",
+        "OLDPWD",
+    ];
+    const REMOVED_AUTHORITY_ENV: &[&str] = &[
+        "DYLD_INSERT_LIBRARIES",
+        "LD_PRELOAD",
+        "KIN_VFS_WORKSPACE",
+        "KIN_VFS_WORKSPACE_ALIASES",
+        "KIN_VFS_SOCK",
+        "KIN_VFS_PIPE",
+        "KIN_VFS_CANARY",
+        "KIN_VFS_INTERPOSE_ACTIVE",
+        "KIN_VFS_LAST_DIR",
+        "_KIN_VFS_LAST_DIR",
+        "KIN_REPO_IDS",
+        "KIN_PRIMARY_REPO_ID",
+        "KIN_MCP_REPO",
+        "KIN_WORKSPACE_ROOT",
+        "KIN_WORKSPACE_DIR",
+        "KIN_DISCOVERY_MODE",
+        "KIN_CONTENT_MODE",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+        "GIT_CEILING_DIRECTORIES",
+        "COMPOSE_FILE",
+        "COMPOSE_ENV_FILES",
+        "COMPOSE_PATH_SEPARATOR",
+        "COMPOSE_PROJECT_NAME",
+        "INIT_CWD",
+        "npm_config_local_prefix",
+        "MAKEFLAGS",
+        "MFLAGS",
+        "MAKELEVEL",
+        "MESON_SOURCE_ROOT",
+        "MESON_BUILD_ROOT",
+        "OLDPWD",
+    ];
 
     #[test]
     fn claude_command_structure() {
@@ -605,44 +718,6 @@ mod tests {
     }
 
     #[test]
-    fn session_launch_env_pins_session_and_daemon() {
-        let session_id = uuid::Uuid::new_v4();
-        let ws_root = std::path::Path::new("/tmp/repo/.kin/runs/session-x");
-
-        let env = session_launch_env(
-            session_id,
-            ws_root,
-            "http://127.0.0.1:4242",
-            Some("repo-uuid"),
-        );
-
-        for (key, expected) in [
-            ("KIN_SESSION", session_id.to_string()),
-            ("KIN_SESSION_ID", session_id.to_string()),
-            ("KIN_SESSION_DIR", ws_root.to_string_lossy().into_owned()),
-            ("KIN_DAEMON_URL", "http://127.0.0.1:4242".to_string()),
-            ("KIN_REPO_ID", "repo-uuid".to_string()),
-        ] {
-            assert_eq!(
-                env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str()),
-                Some(expected.as_str()),
-                "missing or wrong {key}"
-            );
-        }
-    }
-
-    #[test]
-    fn session_launch_env_omits_repo_id_when_unknown() {
-        let env = session_launch_env(
-            uuid::Uuid::new_v4(),
-            std::path::Path::new("/tmp/ws"),
-            "http://127.0.0.1:4242",
-            None,
-        );
-        assert!(!env.iter().any(|(k, _)| k == "KIN_REPO_ID"));
-    }
-
-    #[test]
     fn session_shim_env_targets_session_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let kin_dir = dir.path().join(".kin");
@@ -665,6 +740,175 @@ mod tests {
         let note = session_guidance_note(std::path::Path::new("/tmp/ws/session-abc"));
         assert!(note.contains("/tmp/ws/session-abc"));
         assert!(note.contains("reconciles"));
+    }
+
+    #[test]
+    fn session_projection_isolation_probe_worker() {
+        let Some(expected_root) = std::env::var_os(SESSION_PROJECTION_PROBE) else {
+            return;
+        };
+        let expected_root = std::path::PathBuf::from(expected_root);
+
+        for key in REMOVED_AUTHORITY_ENV {
+            assert!(
+                std::env::var_os(key).is_none(),
+                "{key} from the previous authority leaked into the session assistant"
+            );
+        }
+
+        let session = std::env::var("KIN_SESSION").expect("session id must be preserved");
+        assert_eq!(
+            std::env::var("KIN_SESSION_ID").unwrap(),
+            session,
+            "MCP session identity must match the session workspace identity"
+        );
+        assert_eq!(
+            std::env::var("KIN_DAEMON_URL").unwrap(),
+            "http://127.0.0.1:9/session-isolation"
+        );
+        assert_eq!(std::env::var("KIN_REPO_ID").unwrap(), "repo-isolation");
+        assert_eq!(
+            std::env::var("KIN_DAEMON_AUTH_TOKEN").unwrap(),
+            "repo-isolation-token"
+        );
+        assert_eq!(
+            std::env::var("KIN_VFS_DISABLE").unwrap(),
+            "1",
+            "materialized session descendants must not reactivate repo VFS"
+        );
+        assert_eq!(
+            std::env::var("KIN_VFS_STRICT").unwrap(),
+            "1",
+            "VFS policy is configuration, not ambient projection identity"
+        );
+        assert_eq!(
+            std::env::var(SESSION_BOUNDARY_UNRELATED_ENV).unwrap(),
+            AMBIENT_PROJECTION_SENTINEL,
+            "the boundary must not clear unrelated ambient configuration"
+        );
+        assert!(
+            !std::env::var("PATH")
+                .unwrap()
+                .contains(AMBIENT_PROJECTION_SENTINEL),
+            "the previous shim PATH leaked into the session"
+        );
+        assert!(
+            !std::env::var("KIN_ORIGINAL_PATH")
+                .unwrap()
+                .contains(AMBIENT_PROJECTION_SENTINEL),
+            "the previous original PATH leaked into the session"
+        );
+
+        for (label, actual) in [
+            ("cwd", std::env::current_dir().unwrap()),
+            (
+                "KIN_SESSION_DIR",
+                std::path::PathBuf::from(std::env::var_os("KIN_SESSION_DIR").unwrap()),
+            ),
+            (
+                "KIN_SOURCE_ROOT",
+                std::path::PathBuf::from(std::env::var_os("KIN_SOURCE_ROOT").unwrap()),
+            ),
+            (
+                "PWD",
+                std::path::PathBuf::from(std::env::var_os("PWD").unwrap()),
+            ),
+        ] {
+            assert_eq!(
+                std::fs::canonicalize(actual).unwrap(),
+                std::fs::canonicalize(&expected_root).unwrap(),
+                "{label} must target the materialized session workspace"
+            );
+        }
+    }
+
+    #[test]
+    fn session_projection_isolation_launch_worker() {
+        let Some(root) = std::env::var_os(SESSION_PROJECTION_LAUNCH_WORKER) else {
+            return;
+        };
+        let repo = std::path::PathBuf::from(root).join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let init = kin_core::init(&repo).unwrap();
+        let layout = init.layout;
+        let session_id = uuid::Uuid::new_v4();
+        let ws_root = layout.root().join(format!("runs/session-{session_id}"));
+        std::fs::create_dir_all(&ws_root).unwrap();
+
+        let repo_binding = crate::commands::session_process::VerifiedRepoBinding::for_test(
+            layout.clone(),
+            "http://127.0.0.1:9/session-isolation",
+            "repo-isolation",
+            Some("repo-isolation-token".into()),
+            std::env::var("PATH").unwrap_or_default(),
+        );
+        let process_binding = crate::commands::session_process::SessionProcessBinding::new(
+            &repo_binding,
+            session_id,
+            &ws_root,
+        );
+        let mut projection_env = session_shim_env(&layout, &ws_root, false, false).unwrap();
+        projection_env.push((
+            SESSION_PROJECTION_PROBE.into(),
+            ws_root.to_string_lossy().into_owned(),
+        ));
+
+        for key in POISONED_AUTHORITY_ENV {
+            std::env::set_var(key, AMBIENT_PROJECTION_SENTINEL);
+        }
+        std::env::set_var(
+            "PATH",
+            format!("{AMBIENT_PROJECTION_SENTINEL}:/usr/bin:/bin"),
+        );
+        std::env::set_var(SESSION_BOUNDARY_UNRELATED_ENV, AMBIENT_PROJECTION_SENTINEL);
+        std::env::set_var("KIN_VFS_STRICT", "1");
+
+        let args = vec![
+            "--exact".into(),
+            "commands::with::tests::session_projection_isolation_probe_worker".into(),
+            "--nocapture".into(),
+        ];
+        let executable = std::env::current_exe().unwrap();
+        let code = spawn_assistant_in_session(
+            &executable.to_string_lossy(),
+            &args,
+            &process_binding,
+            &projection_env,
+        )
+        .unwrap();
+        assert_eq!(code, 0, "isolated session environment probe failed");
+    }
+
+    #[test]
+    fn session_assistant_drops_ambient_projection_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        // Start the launch worker clean; it installs the controlled sentinels
+        // after startup so loader injection cannot invalidate the fixture.
+        for key in POISONED_AUTHORITY_ENV {
+            command.env_remove(key);
+        }
+        command
+            .env("PATH", "/usr/bin:/bin")
+            .args([
+                "--exact",
+                "commands::with::tests::session_projection_isolation_launch_worker",
+                "--nocapture",
+            ])
+            .env(SESSION_PROJECTION_LAUNCH_WORKER, root.path());
+
+        let output = crate::commands::test_subprocess::output_with_timeout(
+            &mut command,
+            "session projection-isolation worker",
+            crate::commands::test_subprocess::DEFAULT_TEST_SUBPROCESS_TIMEOUT,
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "session projection-isolation worker failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// Smoke: a fake `claude` binary launched via the session path must start
@@ -718,14 +962,31 @@ mod tests {
         // interactive assistant would block on the terminal and never return.
         let stub = stub_dir.join(&program);
 
-        let mut env = session_launch_env(session_id, &ws_root, "http://127.0.0.1:9/test", None);
-        env.extend(session_shim_env(&layout, &ws_root, false, false).unwrap());
+        let repo_binding = crate::commands::session_process::VerifiedRepoBinding::for_test(
+            layout.clone(),
+            "http://127.0.0.1:9/test",
+            "repo-test",
+            None,
+            std::env::var("PATH").unwrap_or_default(),
+        );
+        let process_binding = crate::commands::session_process::SessionProcessBinding::new(
+            &repo_binding,
+            session_id,
+            &ws_root,
+        );
+        let projection_env = session_shim_env(&layout, &ws_root, false, false).unwrap();
 
-        let launch_root = ws_root.clone();
         let code = crate::commands::test_subprocess::call_with_deadline(
             "session assistant launch",
             crate::commands::test_subprocess::DEFAULT_TEST_SUBPROCESS_TIMEOUT,
-            move || spawn_assistant_in_session(&stub.to_string_lossy(), &args, &launch_root, &env),
+            move || {
+                spawn_assistant_in_session(
+                    &stub.to_string_lossy(),
+                    &args,
+                    &process_binding,
+                    &projection_env,
+                )
+            },
         )
         .unwrap();
 
@@ -762,9 +1023,14 @@ mod tests {
         std::fs::write(session_dir.join("src/lib.rs"), updated).unwrap();
 
         let mut stderr = Vec::new();
-        close_agent_session(&layout, &session_dir, 0, &mut stderr)
-            .await
-            .unwrap();
+        close_agent_session(
+            &crate::commands::session_closeout::test_binding(&layout),
+            &session_dir,
+            0,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
 
         assert!(
             !session_dir.exists(),
@@ -786,9 +1052,14 @@ mod tests {
         std::fs::write(session_dir.join("partial.txt"), "half-done\n").unwrap();
 
         let mut stderr = Vec::new();
-        close_agent_session(&layout, &session_dir, 1, &mut stderr)
-            .await
-            .unwrap();
+        close_agent_session(
+            &crate::commands::session_closeout::test_binding(&layout),
+            &session_dir,
+            1,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
 
         let output = String::from_utf8(stderr).unwrap();
         assert!(output.contains("session workspace kept"));

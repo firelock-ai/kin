@@ -8,34 +8,80 @@ use anyhow::Result;
 use kin_core::{ExternalToolExecutionPolicy, KinConfig};
 use kin_model::EntityStore;
 use kin_model::{EntityFilter, EntityId};
-use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecRequest {
-    pub command: String,
-    #[serde(default)]
-    pub keep: bool,
-    #[serde(default)]
-    pub strategy: Option<String>,
-    #[serde(default)]
-    pub scope: Option<String>,
+#[derive(Debug, Clone)]
+enum ExecInvocation {
+    Direct { program: String, args: Vec<String> },
+    Shell(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecResponse {
-    pub stdout: String,
-    pub stderr: String,
-    pub exit_code: i32,
-    pub duration_ms: u64,
-    pub strategy_used: String,
-    pub workspace_path: String,
-    #[serde(default)]
-    pub planned_scope: Option<String>,
-    #[serde(default)]
-    pub kept: bool,
+impl ExecInvocation {
+    fn parse(command_parts: Vec<String>, shell: bool) -> Result<Self> {
+        if command_parts.is_empty() || command_parts.iter().all(|part| part.is_empty()) {
+            anyhow::bail!(
+                "no command provided. Usage: kin exec [--shell] [--keep|--discard] [--scope <s>] -- <command...>"
+            );
+        }
+        if shell {
+            if command_parts.len() != 1 {
+                anyhow::bail!(
+                    "`--shell` requires exactly one script argument; quote the full script, for example: kin exec --shell -- 'printf \"%s\\n\" \"$HOME\"'"
+                );
+            }
+            let command = command_parts
+                .into_iter()
+                .next()
+                .expect("one shell script checked above")
+                .trim()
+                .to_string();
+            if command.is_empty() {
+                anyhow::bail!("shell command cannot be empty");
+            }
+            return Ok(Self::Shell(command));
+        }
+        let mut parts = command_parts.into_iter();
+        let program = parts.next().expect("non-empty command checked above");
+        if program.is_empty() {
+            anyhow::bail!("command program cannot be empty");
+        }
+        Ok(Self::Direct {
+            program,
+            args: parts.collect(),
+        })
+    }
+
+    fn planning_text(&self) -> String {
+        match self {
+            Self::Direct { program, args } => std::iter::once(program.as_str())
+                .chain(args.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(" "),
+            Self::Shell(command) => command.clone(),
+        }
+    }
+
+    fn command(&self) -> std::process::Command {
+        match self {
+            Self::Direct { program, args } => {
+                let mut command = std::process::Command::new(program);
+                command.args(args);
+                command
+            }
+            Self::Shell(script) if cfg!(target_os = "windows") => {
+                let mut command = std::process::Command::new("cmd");
+                command.args(["/C", script]);
+                command
+            }
+            Self::Shell(script) => {
+                let mut command = std::process::Command::new("sh");
+                command.args(["-c", script]);
+                command
+            }
+        }
+    }
 }
 
-/// `kin exec [flags] -- <command...>` (alias: `kin run`).
+/// `kin exec [flags] -- <command...>`.
 ///
 /// Runs an ordinary command through a graph-backed session workspace:
 /// the daemon materializes graph truth into `.kin/runs/session-<id>`, the
@@ -44,27 +90,23 @@ pub struct ExecResponse {
 /// directories like `node_modules/` are excluded by the reconcile skip
 /// policy). On failure the workspace is preserved with recovery commands.
 ///
-/// The command itself always executes in this CLI process — never through
-/// the daemon's gated `/commands/exec` surface.
+/// The command itself always executes in this CLI process. Argument boundaries
+/// are preserved by default; shell parsing is available only with `--shell`.
 pub async fn run_full(
     command_parts: Vec<String>,
+    shell: bool,
     keep: bool,
     discard: bool,
     strategy: Option<String>,
     scope: Option<String>,
 ) -> Result<()> {
-    let command = command_parts.join(" ").trim().to_string();
-    if command.is_empty() {
-        return Err(anyhow::anyhow!(
-            "no command provided. Usage: kin exec [--keep|--discard] [--scope <s>] -- <command...>"
-        ));
-    }
+    let invocation = ExecInvocation::parse(command_parts, shell)?;
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
 
     let config = KinConfig::load_or_default(&layout.config_path())?;
-    let planned_scope = plan_materialization_scope(&command, scope, &config)?;
+    let planned_scope = plan_materialization_scope(&invocation.planning_text(), scope, &config)?;
 
     let parsed_strategy = strategy
         .as_deref()
@@ -79,8 +121,9 @@ pub async fn run_full(
         .join(format!("session-{session_id}"));
 
     eprintln!("Materializing session workspace...");
+    let repo_binding = super::session_process::VerifiedRepoBinding::resolve(&layout).await?;
     let ws = super::session_workspace::create_session_workspace(
-        &layout,
+        &repo_binding,
         &session_dir,
         parsed_strategy,
         planned_scope.as_deref(),
@@ -92,29 +135,69 @@ pub async fn run_full(
     }
     eprintln!("  Workspace: {}", ws.root.display());
 
-    let outcome = run_command_in_session(&ws.root, &command, &session_env(session_id, &ws.root))?;
+    let process_binding =
+        super::session_process::SessionProcessBinding::new(&repo_binding, session_id, &ws.root);
+    process_binding.persist_context().map_err(|error| {
+        anyhow::anyhow!(
+            "failed to persist session context: {error}. Session workspace kept at {}",
+            session_dir.display()
+        )
+    })?;
+    let lease = repo_binding
+        .register_session(session_id, &ws.root, "kin exec")
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to register session: {error}. Session workspace kept at {}",
+                session_dir.display()
+            )
+        })?;
+    let outcome = match run_command_in_session(
+        &invocation,
+        &process_binding,
+        std::iter::empty::<(&str, &str)>(),
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let _ = lease.finish().await;
+            return Err(error.context(format!(
+                "session workspace kept at {}",
+                session_dir.display()
+            )));
+        }
+    };
     eprintln!(
         "\nCommand exited (code {}, {}ms).",
         outcome.exit_code, outcome.duration_ms
     );
 
-    {
+    let (close_result, lease_result) = {
         let stderr = std::io::stderr();
         let mut stderr = stderr.lock();
-        close_exec_session(
-            &layout,
+        let close_result = close_exec_session(
+            &repo_binding,
             &session_dir,
             outcome.exit_code,
             keep,
             discard,
             &mut stderr,
         )
-        .await?;
-    }
+        .await;
+        let lease_result = lease.finish().await;
+        (close_result, lease_result)
+    };
 
     if outcome.exit_code != 0 {
+        if let Err(error) = close_result {
+            eprintln!("Kin: failed to report preserved session workspace: {error}");
+        }
+        if let Err(error) = lease_result {
+            eprintln!("Kin: failed to end daemon session lease: {error}");
+        }
         std::process::exit(outcome.exit_code);
     }
+    close_result?;
+    lease_result?;
     Ok(())
 }
 
@@ -124,43 +207,24 @@ struct SessionExecOutcome {
     duration_ms: u64,
 }
 
-/// Session identity env for the executed command, matching the `kin shell`
-/// contract: `KIN_SESSION`/`KIN_SESSION_ID` carry the session UUID (the MCP
-/// daemon delegate reads `KIN_SESSION_ID` to scope forwarded tool calls) and
-/// `KIN_SESSION_DIR` carries the workspace root.
-fn session_env(session_id: uuid::Uuid, ws_root: &Path) -> Vec<(String, String)> {
-    vec![
-        ("KIN_SESSION".into(), session_id.to_string()),
-        ("KIN_SESSION_ID".into(), session_id.to_string()),
-        (
-            "KIN_SESSION_DIR".into(),
-            ws_root.to_string_lossy().into_owned(),
-        ),
-    ]
-}
-
-/// Run a shell command in the materialized session workspace, streaming
-/// stdio to the caller's terminal.
-fn run_command_in_session(
-    ws_root: &Path,
-    command: &str,
-    extra_env: &[(String, String)],
-) -> Result<SessionExecOutcome> {
+/// Run a command in the materialized session workspace, streaming stdio to the
+/// caller's terminal.
+fn run_command_in_session<K, V, I>(
+    invocation: &ExecInvocation,
+    binding: &super::session_process::SessionProcessBinding,
+    projection_env: I,
+) -> Result<SessionExecOutcome>
+where
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+    I: IntoIterator<Item = (K, V)>,
+{
     let start = std::time::Instant::now();
 
-    let mut cmd = if cfg!(target_os = "windows") {
-        let mut cmd = std::process::Command::new("cmd");
-        cmd.args(["/C", command]);
-        cmd
-    } else {
-        let mut cmd = std::process::Command::new("sh");
-        cmd.args(["-c", command]);
-        cmd
-    };
+    let mut cmd = invocation.command();
 
+    binding.configure_command(&mut cmd, projection_env)?;
     let status = cmd
-        .current_dir(ws_root)
-        .envs(extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         // A real `kin exec` hands the terminal to the command, which is the
         // point of the surface. A unit test has no terminal to hand over: a
         // command that reads stdin there would wait on a descriptor nobody
@@ -190,7 +254,7 @@ fn run_command_in_session(
 /// - otherwise: reconcile into the graph and clean up; reconcile failure
 ///   preserves the workspace with recovery commands.
 async fn close_exec_session<W: Write>(
-    layout: &kin_core::KinLayout,
+    binding: &super::session_process::VerifiedRepoBinding,
     session_dir: &Path,
     exit_code: i32,
     keep: bool,
@@ -239,7 +303,8 @@ async fn close_exec_session<W: Write>(
         return Ok(());
     }
 
-    super::session_closeout::finalize_shell_session_with_writer(layout, session_dir, writer).await
+    super::session_closeout::finalize_shell_session_with_writer(binding, session_dir, 0, writer)
+        .await
 }
 
 fn session_id_hint(session_dir: &Path) -> String {
@@ -249,62 +314,6 @@ fn session_id_hint(session_dir: &Path) -> String {
         .and_then(|name| name.strip_prefix("session-"))
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| session_dir.display().to_string())
-}
-
-pub fn execute_exec_request(
-    layout: &kin_core::KinLayout,
-    graph: &kin_db::InMemoryGraph,
-    request: &ExecRequest,
-) -> Result<ExecResponse> {
-    let config = KinConfig::load_or_default(&layout.config_path())?;
-
-    let resolved_scope = resolve_materialization_scope(graph, request.scope.clone())?;
-    let planned_scope = plan_materialization_scope(&request.command, resolved_scope, &config)?;
-
-    let parsed_strategy = match &request.strategy {
-        Some(strategy) => {
-            let strat: kin_runtime::MaterializeStrategy =
-                strategy.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-            Some(strat)
-        }
-        None => None,
-    };
-
-    let workspace_path = layout
-        .root()
-        .join("runs")
-        .join(format!("exec-{}", uuid::Uuid::new_v4()));
-    let workspace = super::session_workspace::create_session_workspace_from_graph(
-        layout,
-        graph,
-        &workspace_path,
-        parsed_strategy,
-        planned_scope.as_deref(),
-    )?;
-
-    let result = kin_runtime::exec::ExecContext {
-        workspace,
-        command: request.command.clone(),
-        args: Vec::new(),
-    }
-    .run()?;
-
-    let response = ExecResponse {
-        stdout: result.stdout,
-        stderr: result.stderr,
-        exit_code: result.exit_code,
-        duration_ms: result.duration_ms,
-        workspace_path: result.workspace_path.display().to_string(),
-        strategy_used: result.strategy_used.to_string(),
-        planned_scope,
-        kept: request.keep,
-    };
-
-    if !request.keep {
-        kin_runtime::exec::cleanup_workspace(std::path::Path::new(&response.workspace_path))?;
-    }
-
-    Ok(response)
 }
 
 pub(crate) fn resolve_materialization_scope(
@@ -445,7 +454,7 @@ mod tests {
     use super::run_command_in_session;
     use super::{
         close_exec_session, detect_external_tool, plan_materialization_scope,
-        resolve_materialization_scope, session_env, ExternalToolKind,
+        resolve_materialization_scope, ExecInvocation, ExternalToolKind,
     };
     use kin_core::{ExternalToolExecutionPolicy, KinConfig, WorldPreset};
     use kin_model::{
@@ -453,6 +462,31 @@ mod tests {
         FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
     };
     use std::path::Path;
+
+    fn test_repo_binding(
+        layout: &kin_core::KinLayout,
+    ) -> crate::commands::session_process::VerifiedRepoBinding {
+        crate::commands::session_process::VerifiedRepoBinding::for_test(
+            layout.clone(),
+            "http://127.0.0.1:9/test",
+            "test-repo",
+            None,
+            std::env::var("PATH").unwrap_or_default(),
+        )
+    }
+
+    fn test_session_binding(
+        layout: &kin_core::KinLayout,
+        session_id: uuid::Uuid,
+        workspace_root: &Path,
+    ) -> crate::commands::session_process::SessionProcessBinding {
+        let repo = test_repo_binding(layout);
+        crate::commands::session_process::SessionProcessBinding::new(
+            &repo,
+            session_id,
+            workspace_root,
+        )
+    }
 
     fn test_entity(name: &str, file: &str) -> Entity {
         Entity {
@@ -557,6 +591,18 @@ mod tests {
             detect_external_tool("make test"),
             Some(ExternalToolKind::Make)
         );
+    }
+
+    #[test]
+    fn shell_mode_requires_one_explicit_script_argument() {
+        let error = ExecInvocation::parse(vec!["printf".into(), "value with spaces".into()], true)
+            .unwrap_err();
+        assert!(error.to_string().contains("exactly one script argument"));
+
+        assert!(matches!(
+            ExecInvocation::parse(vec!["printf '%s' 'value with spaces'".into()], true).unwrap(),
+            ExecInvocation::Shell(_)
+        ));
     }
 
     #[test]
@@ -668,26 +714,6 @@ mod tests {
         assert!(err.to_string().contains("pnpm"));
     }
 
-    #[test]
-    fn session_env_carries_session_identity() {
-        let session_id = uuid::Uuid::new_v4();
-        let ws_root = Path::new("/tmp/repo/.kin/runs/session-x");
-
-        let env = session_env(session_id, ws_root);
-
-        for (key, expected) in [
-            ("KIN_SESSION", session_id.to_string()),
-            ("KIN_SESSION_ID", session_id.to_string()),
-            ("KIN_SESSION_DIR", ws_root.to_string_lossy().into_owned()),
-        ] {
-            assert_eq!(
-                env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str()),
-                Some(expected.as_str()),
-                "missing or wrong {key}"
-            );
-        }
-    }
-
     #[cfg(unix)]
     #[test]
     fn run_command_in_session_runs_in_workspace_with_session_env() {
@@ -695,11 +721,20 @@ mod tests {
         let ws = dir.path().join("session-ws");
         std::fs::create_dir_all(&ws).unwrap();
         let session_id = uuid::Uuid::new_v4();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let binding = test_session_binding(&layout, session_id, &ws);
 
         let outcome = run_command_in_session(
-            &ws,
-            "pwd > observed-cwd.txt && printf '%s' \"$KIN_SESSION_ID\" > observed-session.txt",
-            &session_env(session_id, &ws),
+            &ExecInvocation::parse(
+                vec![
+                    "pwd > observed-cwd.txt && printf '%s' \"$KIN_SESSION_ID\" > observed-session.txt"
+                        .into(),
+                ],
+                true,
+            )
+            .unwrap(),
+            &binding,
+            std::iter::empty::<(&str, &str)>(),
         )
         .unwrap();
 
@@ -722,10 +757,55 @@ mod tests {
         let ws = dir.path().join("session-ws");
         std::fs::create_dir_all(&ws).unwrap();
 
-        let outcome =
-            run_command_in_session(&ws, "exit 3", &session_env(uuid::Uuid::new_v4(), &ws)).unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let binding = test_session_binding(&layout, uuid::Uuid::new_v4(), &ws);
+        let outcome = run_command_in_session(
+            &ExecInvocation::parse(vec!["exit 3".into()], true).unwrap(),
+            &binding,
+            std::iter::empty::<(&str, &str)>(),
+        )
+        .unwrap();
 
         assert_eq!(outcome.exit_code, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_exec_preserves_argument_boundaries_and_metacharacters() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("session-ws");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let binding = test_session_binding(&layout, uuid::Uuid::new_v4(), &ws);
+        let invocation = ExecInvocation::parse(
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "printf '<%s>\\n' \"$1\" \"$2\" \"$3\" \"$4\" > observed-argv.txt".into(),
+                "kin-exec-test".into(),
+                "value with spaces".into(),
+                "literal;semicolon".into(),
+                "literal-$(touch should-not-exist)".into(),
+                String::new(),
+            ],
+            false,
+        )
+        .unwrap();
+
+        let outcome =
+            run_command_in_session(&invocation, &binding, std::iter::empty::<(&str, &str)>())
+                .unwrap();
+
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(
+            std::fs::read_to_string(ws.join("observed-argv.txt")).unwrap(),
+            "<value with spaces>\n<literal;semicolon>\n<literal-$(touch should-not-exist)>\n<>\n"
+        );
+        assert!(
+            !ws.join("should-not-exist").exists(),
+            "direct mode must not reinterpret an argument as shell syntax"
+        );
     }
 
     #[cfg(unix)]
@@ -744,22 +824,27 @@ mod tests {
         crate::commands::session_base::record_materialized_base(&session_dir, None).unwrap();
 
         // Fake npm: emits a lockfile plus a node_modules tree, like a real install.
-        let mut env = stub_tool(
+        let env = stub_tool(
             &repo.path().join("stub-bin"),
             "npm",
             "printf '{\"lockfileVersion\":3}' > package-lock.json\n\
              mkdir -p node_modules/left-pad\n\
              printf 'module.exports = 1' > node_modules/left-pad/index.js",
         );
-        env.extend(session_env(uuid::Uuid::new_v4(), &session_dir));
-
-        let outcome = run_command_in_session(&session_dir, "npm install", &env).unwrap();
+        let binding = test_session_binding(&layout, uuid::Uuid::new_v4(), &session_dir);
+        let outcome = run_command_in_session(
+            &ExecInvocation::parse(vec!["npm".into(), "install".into()], false).unwrap(),
+            &binding,
+            env,
+        )
+        .unwrap();
         assert_eq!(outcome.exit_code, 0);
         assert!(session_dir.join("package-lock.json").exists());
         assert!(session_dir.join("node_modules/left-pad/index.js").exists());
 
         let mut stderr = Vec::new();
-        close_exec_session(&layout, &session_dir, 0, false, false, &mut stderr)
+        let repo_binding = test_repo_binding(&layout);
+        close_exec_session(&repo_binding, &session_dir, 0, false, false, &mut stderr)
             .await
             .unwrap();
 
@@ -787,15 +872,19 @@ mod tests {
         std::fs::create_dir_all(&session_dir).unwrap();
         std::fs::write(session_dir.join("partial.log"), "half-written output\n").unwrap();
 
-        let mut env = stub_tool(&repo.path().join("stub-bin"), "make", "exit 2");
-        env.extend(session_env(uuid::Uuid::new_v4(), &session_dir));
-
-        let outcome = run_command_in_session(&session_dir, "make test", &env).unwrap();
+        let env = stub_tool(&repo.path().join("stub-bin"), "make", "exit 2");
+        let binding = test_session_binding(&layout, uuid::Uuid::new_v4(), &session_dir);
+        let outcome = run_command_in_session(
+            &ExecInvocation::parse(vec!["make".into(), "test".into()], false).unwrap(),
+            &binding,
+            env,
+        )
+        .unwrap();
         assert_eq!(outcome.exit_code, 2);
 
         let mut stderr = Vec::new();
         close_exec_session(
-            &layout,
+            &test_repo_binding(&layout),
             &session_dir,
             outcome.exit_code,
             false,
@@ -836,14 +925,22 @@ mod tests {
 
         // Fake docker: validates that the compose file is visible from the
         // workspace cwd, like `docker compose config` would.
-        let mut env = stub_tool(
+        let env = stub_tool(
             &repo.path().join("stub-bin"),
             "docker",
             "test -f docker-compose.yml || exit 64\nprintf '%s ' \"$@\" > docker-args.txt",
         );
-        env.extend(session_env(uuid::Uuid::new_v4(), &session_dir));
-
-        let outcome = run_command_in_session(&session_dir, "docker compose config", &env).unwrap();
+        let binding = test_session_binding(&layout, uuid::Uuid::new_v4(), &session_dir);
+        let outcome = run_command_in_session(
+            &ExecInvocation::parse(
+                vec!["docker".into(), "compose".into(), "config".into()],
+                false,
+            )
+            .unwrap(),
+            &binding,
+            env,
+        )
+        .unwrap();
         assert_eq!(outcome.exit_code, 0);
         assert_eq!(
             std::fs::read_to_string(session_dir.join("docker-args.txt"))
@@ -853,9 +950,16 @@ mod tests {
         );
 
         let mut stderr = Vec::new();
-        close_exec_session(&layout, &session_dir, 0, false, false, &mut stderr)
-            .await
-            .unwrap();
+        close_exec_session(
+            &test_repo_binding(&layout),
+            &session_dir,
+            0,
+            false,
+            false,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
         assert!(!session_dir.exists());
     }
 
@@ -869,9 +973,16 @@ mod tests {
         std::fs::write(session_dir.join("new-file.txt"), "kept\n").unwrap();
 
         let mut stderr = Vec::new();
-        close_exec_session(&layout, &session_dir, 0, true, false, &mut stderr)
-            .await
-            .unwrap();
+        close_exec_session(
+            &test_repo_binding(&layout),
+            &session_dir,
+            0,
+            true,
+            false,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
 
         let output = String::from_utf8(stderr).unwrap();
         assert!(output.contains("kin reconcile keep --cleanup"));
@@ -892,9 +1003,16 @@ mod tests {
         std::fs::write(session_dir.join("scratch.txt"), "throwaway\n").unwrap();
 
         let mut stderr = Vec::new();
-        close_exec_session(&layout, &session_dir, 0, false, true, &mut stderr)
-            .await
-            .unwrap();
+        close_exec_session(
+            &test_repo_binding(&layout),
+            &session_dir,
+            0,
+            false,
+            true,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
 
         assert!(!session_dir.exists());
         assert!(!repo.path().join("scratch.txt").exists());
