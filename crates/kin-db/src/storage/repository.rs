@@ -285,9 +285,42 @@ fn require_sorted_unique<T, K: Ord>(
 #[derive(Debug, Clone)]
 pub struct RepositoryAuthorityState {
     snapshot: GraphSnapshot,
+    /// Derived acceleration over immutable, externally authenticated Git
+    /// history. This is never serialized or accepted from a transaction.
+    authenticated_gitlinks: Arc<BTreeSet<(ArtifactId, GitObjectId)>>,
 }
 
 impl RepositoryAuthorityState {
+    /// Build the read state after the enclosing snapshot has passed complete
+    /// repository-authority and history validation.
+    fn from_validated_snapshot(snapshot: GraphSnapshot) -> Self {
+        let mut authenticated_gitlinks = BTreeSet::new();
+        extend_authenticated_gitlinks(&mut authenticated_gitlinks, snapshot.changes.values());
+        Self {
+            snapshot,
+            authenticated_gitlinks: Arc::new(authenticated_gitlinks),
+        }
+    }
+
+    /// Carry the immutable authority index forward and add only Git-origin
+    /// changes from the already-validated successor transaction.
+    fn from_validated_successor(
+        current: &Self,
+        snapshot: GraphSnapshot,
+        incoming: &[kin_model::SemanticChange],
+    ) -> Self {
+        let mut authenticated_gitlinks = Arc::clone(&current.authenticated_gitlinks);
+        let mut incoming_gitlinks = BTreeSet::new();
+        extend_authenticated_gitlinks(&mut incoming_gitlinks, incoming);
+        if !incoming_gitlinks.is_empty() {
+            Arc::make_mut(&mut authenticated_gitlinks).extend(incoming_gitlinks);
+        }
+        Self {
+            snapshot,
+            authenticated_gitlinks,
+        }
+    }
+
     pub fn snapshot(&self) -> &GraphSnapshot {
         &self.snapshot
     }
@@ -301,6 +334,10 @@ impl RepositoryAuthorityState {
 
     pub fn roots(&self) -> &RootBundle {
         &self.metadata().roots
+    }
+
+    fn authenticated_gitlinks(&self) -> &BTreeSet<(ArtifactId, GitObjectId)> {
+        &self.authenticated_gitlinks
     }
 
     /// Resolve one repository ref against this exact authority generation.
@@ -395,6 +432,24 @@ impl RepositoryAuthorityState {
 
         snapshot.validate_storage_admission()?;
         Ok(Some(snapshot))
+    }
+}
+
+fn extend_authenticated_gitlinks<'a>(
+    authenticated: &mut BTreeSet<(ArtifactId, GitObjectId)>,
+    changes: impl IntoIterator<Item = &'a kin_model::SemanticChange>,
+) {
+    for change in changes {
+        if !matches!(change.origin, kin_model::ChangeOrigin::GitCommit { .. }) {
+            continue;
+        }
+        authenticated.extend(change.tree_deltas.iter().filter_map(|delta| {
+            let new = delta.new_state()?;
+            let TreeEntry::Gitlink { target } = new.entry else {
+                return None;
+            };
+            Some((delta.artifact_id(), target))
+        }));
     }
 }
 
@@ -697,7 +752,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         validate_history_replay(&snapshot, &all_changes)?;
         validate_all_authority_bodies(backend.as_ref(), &repository_id, &snapshot)?;
 
-        let initial = RepositoryAuthorityState { snapshot };
+        let initial = RepositoryAuthorityState::from_validated_snapshot(snapshot);
         let persistence = RepositorySnapshotPersistence {
             backend: Arc::clone(&backend),
             repository_id: repository_id.clone(),
@@ -932,7 +987,7 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
         };
         validate_all_authority_bodies(&body_backend, &self.repository_id, &snapshot)?;
 
-        let state = RepositoryAuthorityState { snapshot };
+        let state = RepositoryAuthorityState::from_validated_snapshot(snapshot);
         if state.roots() != expected_roots || state.roots() != &published_roots {
             return Err(ModelError::Conflict(format!(
                 "repository {} persisted authority moved from the expected root bundle while local freeze was acquired",
@@ -1131,7 +1186,10 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     snapshot.repository_authority = Some(metadata);
     snapshot.validate_storage_admission()?;
 
-    Ok((RepositoryAuthorityState { snapshot }, receipt))
+    Ok((
+        RepositoryAuthorityState::from_validated_successor(current, snapshot, &transaction.changes),
+        receipt,
+    ))
 }
 
 fn admit_external_objects<B: StorageBackend + ?Sized>(
@@ -1908,7 +1966,13 @@ fn verify_transaction_admission<B: StorageBackend + ?Sized>(
     transaction: &RepositoryTransaction,
 ) -> Result<(), KinDbError> {
     verify_workspace_admission(backend, current, snapshot, metadata, transaction)?;
-    verify_native_change_admission(backend, snapshot, metadata, transaction)
+    verify_native_change_admission(
+        backend,
+        current.authenticated_gitlinks(),
+        snapshot,
+        metadata,
+        transaction,
+    )
 }
 
 fn verify_workspace_admission<B: StorageBackend + ?Sized>(
@@ -1940,7 +2004,13 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
     )?;
 
     let mut tracked = BTreeSet::<ArtifactId>::new();
-    let mut admitted_gitlinks = BTreeSet::new();
+    // Exact Gitlinks that appeared in previously persisted, raw-tree-verified
+    // Git history are repository authority even when the current workspace or
+    // base no longer contains them. The derived index is built only from the
+    // pre-transaction state, so raw objects or Native changes in this
+    // transaction cannot authorize an arbitrary target.
+    let authenticated_gitlinks = current.authenticated_gitlinks();
+    let mut contextual_gitlinks = BTreeSet::new();
     if let Some(previous) = current
         .metadata()
         .workspaces
@@ -1953,7 +2023,7 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
                 .artifacts()
                 .map(|artifact| artifact.artifact_id),
         );
-        admitted_gitlinks.extend(previous.tree.artifacts().filter_map(|artifact| {
+        contextual_gitlinks.extend(previous.tree.artifacts().filter_map(|artifact| {
             let TreeEntry::Gitlink { target } = artifact.entry else {
                 return None;
             };
@@ -1976,7 +2046,7 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
         if was_already_admitted || is_verified_git {
             let base = resolve_change_tree(snapshot, change_id)?;
             tracked.extend(base.artifacts().map(|artifact| artifact.artifact_id));
-            admitted_gitlinks.extend(base.artifacts().filter_map(|artifact| {
+            contextual_gitlinks.extend(base.artifacts().filter_map(|artifact| {
                 let TreeEntry::Gitlink { target } = artifact.entry else {
                     return None;
                 };
@@ -1988,7 +2058,8 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
     for artifact in workspace.tree.artifacts_by_path() {
         let gitlink_is_admitted = match artifact.entry {
             TreeEntry::Gitlink { target } => {
-                admitted_gitlinks.contains(&(artifact.artifact_id, target))
+                authenticated_gitlinks.contains(&(artifact.artifact_id, target))
+                    || contextual_gitlinks.contains(&(artifact.artifact_id, target))
             }
             TreeEntry::Blob { .. } | TreeEntry::Symlink { .. } => false,
         };
@@ -2010,6 +2081,7 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
 
 fn verify_native_change_admission<B: StorageBackend + ?Sized>(
     backend: &B,
+    authenticated_gitlinks: &BTreeSet<(ArtifactId, GitObjectId)>,
     snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
     transaction: &RepositoryTransaction,
@@ -2021,22 +2093,15 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
     for change in native_changes {
         let candidate = resolve_change_tree(snapshot, change.id)?;
         let mut parent_artifacts = BTreeSet::<ArtifactId>::new();
-        let mut parent_gitlinks = BTreeSet::new();
         for parent in &change.parents {
             let parent_tree = resolve_change_tree(snapshot, *parent)?;
             parent_artifacts.extend(parent_tree.artifacts().map(|artifact| artifact.artifact_id));
-            parent_gitlinks.extend(parent_tree.artifacts().filter_map(|artifact| {
-                let TreeEntry::Gitlink { target } = artifact.entry else {
-                    return None;
-                };
-                Some((artifact.artifact_id, target))
-            }));
         }
         for artifact in candidate.artifacts() {
             let TreeEntry::Gitlink { target } = artifact.entry else {
                 continue;
             };
-            if !parent_gitlinks.contains(&(artifact.artifact_id, target)) {
+            if !authenticated_gitlinks.contains(&(artifact.artifact_id, target)) {
                 return Err(ModelError::InvalidOperation(format!(
                     "native change {} introduces gitlink {} at {} without verified Git external authority",
                     change.id, target, artifact.path
@@ -2110,6 +2175,12 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
         let matcher =
             resolve_admission_matcher(backend, &transaction.repository_id, policy, overlay)?;
         for artifact in introduced {
+            let gitlink_is_admitted = match artifact.entry {
+                TreeEntry::Gitlink { target } => {
+                    authenticated_gitlinks.contains(&(artifact.artifact_id, target))
+                }
+                TreeEntry::Blob { .. } | TreeEntry::Symlink { .. } => false,
+            };
             verify_artifact_admission(
                 backend,
                 &transaction.repository_id,
@@ -2118,7 +2189,7 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
                 ArtifactAdmissionContext {
                     policy,
                     tracked: false,
-                    gitlink_is_admitted: false,
+                    gitlink_is_admitted,
                     label: &format!("native change {}", change.id),
                 },
             )?;
@@ -3907,6 +3978,8 @@ mod tests {
         direct_authority: GitExternalAuthority,
         head: ExternalObjectRecord,
         compose: ExternalObjectRecord,
+        previous_gitlink_target: GitObjectId,
+        gitlink_target: GitObjectId,
     }
 
     fn git_authority_transaction_fixture(
@@ -3934,35 +4007,38 @@ mod tests {
             "577ffa642a989094abc1349fefc893cf2491da59",
             b"compose.yaml".to_vec(),
         );
-        let empty_tree = admit(
+        let previous_gitlink_target = GitObjectId::sha1([0x44; 20]);
+        let parent_tree = admit(
             ExternalObjectKind::Tree,
-            "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
-            Vec::<u8>::new(),
+            "3dd825f26d527ac4220a7822c48c1caf2d8ef66e",
+            git_tree_body(&[(b"submodule", b"160000", previous_gitlink_target)]),
         );
+        let gitlink_target = GitObjectId::sha1([0x55; 20]);
         let root_tree = admit(
             ExternalObjectKind::Tree,
-            "f8ca0030cfaa2d892be162947852de7804729814",
+            "3f3403f8214e9230bfa80d259e26c32bf6086d39",
             git_tree_body(&[
                 (b"compose.yaml", b"100644", compose.object.oid),
                 (b"payload.bin", b"100755", binary.object.oid),
+                (b"submodule", b"160000", gitlink_target),
                 (&[0xff], b"120000", symlink.object.oid),
             ]),
         );
         let parent = admit(
             ExternalObjectKind::Commit,
-            "a5663401dd8ebb94c317008e6a8cd2f01183a940",
-            git_commit_body(empty_tree.object.oid, &[], b"parent"),
+            "31ee15780998c760b25b08b6ab65cd981be6fbbc",
+            git_commit_body(parent_tree.object.oid, &[], b"parent"),
         );
         let head = admit(
             ExternalObjectKind::Commit,
-            "72d6709f04432f9711c9c0f9100caf54ba2d9927",
+            "dffe8495f21f28be8fddab5a6e94ee1a8202fd54",
             git_commit_body(root_tree.object.oid, &[parent.object.oid], b"head"),
         );
         let records = vec![
             compose.clone(),
             binary.clone(),
             symlink.clone(),
-            empty_tree,
+            parent_tree,
             root_tree,
             parent.clone(),
             head.clone(),
@@ -4026,7 +4102,13 @@ mod tests {
             message: "import exact Git parent".to_string(),
             entity_deltas: Vec::new(),
             relation_deltas: Vec::new(),
-            tree_deltas: Vec::new(),
+            tree_deltas: vec![TreeDelta::Added {
+                artifact_id: ArtifactId(Uuid::from_u128(0xa4)),
+                new: LocatedEntry::new(
+                    RepoPath::from_utf8("submodule").unwrap(),
+                    TreeEntry::gitlink(previous_gitlink_target),
+                ),
+            }],
             admission_policy_delta: None,
             projected_files: Vec::new(),
             spec_link: None,
@@ -4067,6 +4149,17 @@ mod tests {
                         TreeEntry::symlink(symlink.body_hash),
                     ),
                 },
+                TreeDelta::Updated {
+                    artifact_id: ArtifactId(Uuid::from_u128(0xa4)),
+                    old: LocatedEntry::new(
+                        RepoPath::from_utf8("submodule").unwrap(),
+                        TreeEntry::gitlink(previous_gitlink_target),
+                    ),
+                    new: LocatedEntry::new(
+                        RepoPath::from_utf8("submodule").unwrap(),
+                        TreeEntry::gitlink(gitlink_target),
+                    ),
+                },
             ],
             admission_policy_delta: None,
             projected_files: Vec::new(),
@@ -4092,7 +4185,87 @@ mod tests {
             direct_authority,
             head,
             compose,
+            previous_gitlink_target,
+            gitlink_target,
         }
+    }
+
+    fn unborn_gitlink_workspace_transaction(
+        manager: &RepositoryAuthorityManager<MemoryBackend>,
+        operation: u128,
+        workspace: u128,
+        artifact_id: ArtifactId,
+        target: GitObjectId,
+    ) -> RepositoryTransaction {
+        let delta = TreeDelta::Added {
+            artifact_id,
+            new: LocatedEntry::new(
+                RepoPath::from_utf8("submodule").unwrap(),
+                TreeEntry::gitlink(target),
+            ),
+        };
+        let tree = ResolvedTree::default()
+            .apply(std::slice::from_ref(&delta))
+            .unwrap();
+        let mut transaction =
+            unborn_workspace_transaction(manager, operation, workspace, b"scratch");
+        let mutation = transaction.workspace_mutation.as_mut().unwrap();
+        mutation.tree_deltas = vec![delta];
+        mutation.new_tree_hash = compute_resolved_tree_hash(&tree).unwrap();
+        transaction
+    }
+
+    fn native_gitlink_transaction(
+        manager: &RepositoryAuthorityManager<MemoryBackend>,
+        operation: u128,
+        workspace: u128,
+        artifact_id: ArtifactId,
+        target: GitObjectId,
+    ) -> RepositoryTransaction {
+        let mut transaction = unborn_gitlink_workspace_transaction(
+            manager,
+            operation,
+            workspace,
+            artifact_id,
+            target,
+        );
+        let mutation = transaction.workspace_mutation.as_mut().unwrap();
+        let shared = mutation.new_shared_admission_policy.clone();
+        let tree_hash = mutation.new_tree_hash;
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: Vec::new(),
+            timestamp: Timestamp(
+                chrono::DateTime::parse_from_rfc3339("2026-07-26T15:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            author: AuthorId::new("authority-test"),
+            message: "admit an exact previously authenticated gitlink".to_string(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: mutation.tree_deltas.clone(),
+            admission_policy_delta: Some(AdmissionPolicyDelta::initialize(shared)),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        change.id = compute_semantic_change_id(&change).unwrap();
+        mutation.new_base_target = Some(RefTarget::change(change.id));
+        mutation.new_base_tree_hash = Some(tree_hash);
+        mutation.new_head = WorkspaceHead::Symbolic {
+            target: RefName::branch(b"main").unwrap(),
+        };
+        transaction.ref_mutations.push(RefMutation {
+            name: RefName::branch(b"main").unwrap(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(RefTarget::change(change.id)),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        });
+        transaction.changes.push(change);
+        transaction
     }
 
     fn imported_repository_transaction(
@@ -4106,8 +4279,16 @@ mod tests {
         head.admission_policy_delta = Some(AdmissionPolicyDelta::initialize(shared.clone()));
         head.id = compute_semantic_change_id(&head).unwrap();
         let change_id = head.id;
-        let tree = ResolvedTree::default().apply(&head.tree_deltas).unwrap();
+        let parent_tree = ResolvedTree::default().apply(&parent.tree_deltas).unwrap();
+        let tree = parent_tree.apply(&head.tree_deltas).unwrap();
         let tree_hash = compute_resolved_tree_hash(&tree).unwrap();
+        let workspace_deltas = tree
+            .artifacts()
+            .map(|artifact| TreeDelta::Added {
+                artifact_id: artifact.artifact_id,
+                new: artifact.located_entry(),
+            })
+            .collect();
 
         transaction.changes = vec![head.clone(), parent.clone()];
         transaction.aliases = vec![
@@ -4149,7 +4330,7 @@ mod tests {
             new_head: head_state.clone(),
             new_base_target: Some(target.clone()),
             new_base_tree_hash: Some(tree_hash),
-            tree_deltas: head.tree_deltas,
+            tree_deltas: workspace_deltas,
             new_tree_hash: tree_hash,
             new_shared_admission_policy: shared,
             new_admission_policy: policy,
@@ -4169,8 +4350,16 @@ mod tests {
         head.admission_policy_delta = Some(AdmissionPolicyDelta::initialize(shared.clone()));
         head.id = compute_semantic_change_id(&head).unwrap();
         let change_id = head.id;
-        let tree = ResolvedTree::default().apply(&head.tree_deltas).unwrap();
+        let parent_tree = ResolvedTree::default().apply(&parent.tree_deltas).unwrap();
+        let tree = parent_tree.apply(&head.tree_deltas).unwrap();
         let tree_hash = compute_resolved_tree_hash(&tree).unwrap();
+        let workspace_deltas = tree
+            .artifacts()
+            .map(|artifact| TreeDelta::Added {
+                artifact_id: artifact.artifact_id,
+                new: artifact.located_entry(),
+            })
+            .collect();
 
         transaction.changes = vec![head.clone(), parent.clone()];
         transaction.aliases = vec![
@@ -4187,12 +4376,12 @@ mod tests {
 
         let (inner, inner_body) = git_record(
             ExternalObjectKind::Tag,
-            "c544005fe7a01304c88a9283581f60b879276cfc",
+            "6ca553ef57cb7ac1bb1ba68d4d8964ea72a592d0",
             git_tag_body(fixture.head.object, b"inner"),
         );
         let (outer, outer_body) = git_record(
             ExternalObjectKind::Tag,
-            "a4db91bfcd9c8432205b8d9a0955c66f01f0aea5",
+            "de8b7164024b99ed8bcbe45d6580d215248e7644",
             git_tag_body(inner.object, b"outer"),
         );
         manager
@@ -4252,7 +4441,7 @@ mod tests {
             },
             new_base_target: Some(target),
             new_base_tree_hash: Some(tree_hash),
-            tree_deltas: head.tree_deltas,
+            tree_deltas: workspace_deltas,
             new_tree_hash: tree_hash,
             new_shared_admission_policy: shared,
             new_admission_policy: policy,
@@ -4404,6 +4593,291 @@ mod tests {
     }
 
     #[test]
+    fn persisted_authenticated_gitlink_can_seed_a_new_workspace_after_reopen() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        let fixture = git_authority_transaction_fixture(&manager, 0xa101);
+        let artifact_id = ArtifactId(Uuid::from_u128(0xa4));
+        let target = fixture.gitlink_target;
+        let authority = fixture.authority.clone();
+        manager
+            .commit_repository_transaction(fixture.transaction)
+            .unwrap();
+        let mut removal = transaction_shell(&manager, 0xa102);
+        removal.git_authority_delta = Some(GitExternalAuthorityDelta::remove(authority));
+        manager.commit_repository_transaction(removal).unwrap();
+        drop(manager);
+
+        let reopened =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        assert!(
+            reopened
+                .read_authority()
+                .metadata()
+                .git_external_authority
+                .is_none(),
+            "the exact pair must survive through recorded history, not current Git state"
+        );
+        assert!(
+            reopened
+                .read_authority()
+                .authenticated_gitlinks()
+                .contains(&(artifact_id, target)),
+            "reopen must derive Gitlink authority from immutable Git-origin history"
+        );
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0xa104));
+        let transaction =
+            unborn_gitlink_workspace_transaction(&reopened, 0xa103, 0xa104, artifact_id, target);
+        reopened.commit_repository_transaction(transaction).unwrap();
+
+        let lease = reopened.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .unwrap();
+        assert_eq!(
+            workspace
+                .tree
+                .artifact_at_path(&RepoPath::from_utf8("submodule").unwrap())
+                .unwrap()
+                .entry,
+            TreeEntry::gitlink(target)
+        );
+    }
+
+    #[test]
+    fn persisted_authenticated_gitlink_can_seed_a_native_change() {
+        let manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let fixture = git_authority_transaction_fixture(&manager, 0xa111);
+        let artifact_id = ArtifactId(Uuid::from_u128(0xa4));
+        let target = fixture.gitlink_target;
+        manager
+            .commit_repository_transaction(fixture.transaction)
+            .unwrap();
+
+        let transaction = native_gitlink_transaction(&manager, 0xa112, 0xa113, artifact_id, target);
+        manager.commit_repository_transaction(transaction).unwrap();
+
+        let lease = manager.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| {
+                workspace.workspace_id == WorkspaceId::from_uuid(Uuid::from_u128(0xa113))
+            })
+            .unwrap();
+        let base = workspace
+            .base_target
+            .as_ref()
+            .map(|target| target_change_id(lease.metadata(), target).unwrap())
+            .unwrap();
+        assert!(matches!(
+            lease.snapshot().changes.get(&base).unwrap().origin,
+            ChangeOrigin::Native
+        ));
+        assert_eq!(
+            workspace
+                .tree
+                .artifact_at_path(&RepoPath::from_utf8("submodule").unwrap())
+                .unwrap()
+                .entry,
+            TreeEntry::gitlink(target)
+        );
+    }
+
+    #[test]
+    fn persisted_authenticated_gitlink_can_retarget_the_same_artifact() {
+        let manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let fixture = git_authority_transaction_fixture(&manager, 0xa118);
+        let artifact_id = ArtifactId(Uuid::from_u128(0xa4));
+        let old_target = fixture.previous_gitlink_target;
+        let new_target = fixture.gitlink_target;
+        manager
+            .commit_repository_transaction(fixture.transaction)
+            .unwrap();
+
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0xa11a));
+        manager
+            .commit_repository_transaction(unborn_gitlink_workspace_transaction(
+                &manager,
+                0xa119,
+                0xa11a,
+                artifact_id,
+                old_target,
+            ))
+            .unwrap();
+
+        let current = manager
+            .read_authority()
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .unwrap()
+            .clone();
+        let path = RepoPath::from_utf8("submodule").unwrap();
+        let delta = TreeDelta::Updated {
+            artifact_id,
+            old: LocatedEntry::new(path.clone(), TreeEntry::gitlink(old_target)),
+            new: LocatedEntry::new(path.clone(), TreeEntry::gitlink(new_target)),
+        };
+        let next_tree = current.tree.apply(std::slice::from_ref(&delta)).unwrap();
+        let mutation = WorkspaceMutation {
+            workspace_id,
+            expected: WorkspaceExpectation::MustEqual {
+                generation: current.generation,
+                head: current.head.clone(),
+                base_target: current.base_target.clone(),
+                base_tree_hash: current.base_tree_hash,
+                tree_hash: current.tree_hash,
+                admission_policy: current.admission_policy,
+            },
+            new_generation: current.generation + 1,
+            new_head: current.head.clone(),
+            new_base_target: current.base_target.clone(),
+            new_base_tree_hash: current.base_tree_hash,
+            tree_deltas: vec![delta],
+            new_tree_hash: compute_resolved_tree_hash(&next_tree).unwrap(),
+            new_shared_admission_policy: current.shared_admission_policy,
+            new_admission_policy: current.admission_policy,
+        };
+        let mut transaction = transaction_shell(&manager, 0xa11b);
+        transaction.workspace_mutation = Some(mutation);
+        manager.commit_repository_transaction(transaction).unwrap();
+
+        assert_eq!(
+            manager.read_authority().metadata().workspaces[0]
+                .tree
+                .artifact_at_path(&path)
+                .unwrap()
+                .entry,
+            TreeEntry::gitlink(new_target)
+        );
+    }
+
+    #[test]
+    fn persisted_gitlink_authority_is_exact_in_artifact_and_target() {
+        let manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let fixture = git_authority_transaction_fixture(&manager, 0xa121);
+        let artifact_id = ArtifactId(Uuid::from_u128(0xa4));
+        let target = fixture.gitlink_target;
+        manager
+            .commit_repository_transaction(fixture.transaction)
+            .unwrap();
+
+        let wrong_target = unborn_gitlink_workspace_transaction(
+            &manager,
+            0xa122,
+            0xa123,
+            artifact_id,
+            GitObjectId::sha1([0x66; 20]),
+        );
+        let error = manager
+            .commit_repository_transaction(wrong_target)
+            .expect_err("a different Gitlink target must not inherit authority");
+        assert!(
+            error
+                .to_string()
+                .contains("without verified Git external authority"),
+            "unexpected wrong-target error: {error}"
+        );
+
+        let wrong_artifact = unborn_gitlink_workspace_transaction(
+            &manager,
+            0xa124,
+            0xa125,
+            ArtifactId(Uuid::from_u128(0xb4)),
+            target,
+        );
+        let error = manager
+            .commit_repository_transaction(wrong_artifact)
+            .expect_err("a copied ArtifactId must not inherit Gitlink authority");
+        assert!(
+            error
+                .to_string()
+                .contains("without verified Git external authority"),
+            "unexpected wrong-artifact error: {error}"
+        );
+        assert_eq!(manager.read_authority().generation(), 1);
+    }
+
+    #[test]
+    fn same_transaction_git_import_cannot_authorize_an_unrelated_workspace_splice() {
+        let manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let mut fixture = git_authority_transaction_fixture(&manager, 0xa131);
+        let workspace = unborn_gitlink_workspace_transaction(
+            &manager,
+            0xa132,
+            0xa133,
+            ArtifactId(Uuid::from_u128(0xa4)),
+            fixture.gitlink_target,
+        );
+        fixture.transaction.workspace_mutation = workspace.workspace_mutation;
+        fixture.transaction.local_overlay_delta = workspace.local_overlay_delta;
+
+        let error = manager
+            .commit_repository_transaction(fixture.transaction)
+            .expect_err("successor Git history must not authorize an unrelated workspace splice");
+        assert!(
+            error
+                .to_string()
+                .contains("without verified Git external authority"),
+            "unexpected same-transaction workspace error: {error}"
+        );
+        assert_eq!(manager.read_authority().generation(), 0);
+    }
+
+    #[test]
+    fn same_transaction_git_parent_cannot_authorize_a_native_gitlink() {
+        let manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let mut fixture = git_authority_transaction_fixture(&manager, 0xa141);
+        let parent = fixture
+            .transaction
+            .changes
+            .iter()
+            .find(|change| {
+                matches!(
+                    change.origin,
+                    ChangeOrigin::GitCommit { oid } if oid == fixture.head.object.oid
+                )
+            })
+            .unwrap()
+            .id;
+        let mut native = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: vec![parent],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("authority-test"),
+            message: "attempt to inherit uncommitted Gitlink authority".to_string(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        native.id = compute_semantic_change_id(&native).unwrap();
+        fixture.transaction.changes.push(native);
+
+        let error = manager
+            .commit_repository_transaction(fixture.transaction)
+            .expect_err("a Native child must wait for Git authority to become persisted");
+        assert!(
+            error
+                .to_string()
+                .contains("without verified Git external authority"),
+            "unexpected same-transaction Native error: {error}"
+        );
+        assert_eq!(manager.read_authority().generation(), 0);
+    }
+
+    #[test]
     fn git_authority_publication_failure_leaves_no_partial_semantic_or_external_truth() {
         let backend = Arc::new(MemoryBackend::default());
         let manager = initial_manager(Arc::clone(&backend));
@@ -4416,6 +4890,10 @@ mod tests {
 
         let lease = manager.read_authority();
         assert_eq!(lease.generation(), 0);
+        assert!(
+            lease.authenticated_gitlinks().is_empty(),
+            "an unpersisted Git transaction must not contaminate the derived authority index"
+        );
         assert!(lease.metadata().git_external_authority.is_none());
         assert!(lease.metadata().external_objects.is_empty());
         assert!(lease.metadata().aliases.is_empty());
@@ -5259,14 +5737,17 @@ mod tests {
     }
 
     #[test]
-    fn native_gitlink_without_external_authority_is_rejected() {
+    fn raw_external_objects_cannot_self_authorize_a_native_gitlink() {
         let manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let fixture = git_authority_transaction_fixture(&manager, 0xad00);
+        let raw_commit_target = fixture.head.object.oid;
         let mut transaction = arbitrary_repository_transaction(&manager);
+        transaction.external_objects = fixture.transaction.external_objects;
         let gitlink = TreeDelta::Added {
             artifact_id: ArtifactId(Uuid::from_u128(17)),
             new: LocatedEntry::new(
                 RepoPath::from_utf8("vendor/semantic-runtime").unwrap(),
-                TreeEntry::gitlink(GitObjectId::sha1([0x11; 20])),
+                TreeEntry::gitlink(raw_commit_target),
             ),
         };
         let change = transaction.changes.first_mut().unwrap();
@@ -5286,7 +5767,7 @@ mod tests {
 
         let error = manager
             .commit_repository_transaction(transaction)
-            .expect_err("Native gitlinks require explicit external authority");
+            .expect_err("raw external-object records are not Gitlink authority");
         assert!(
             error
                 .to_string()
