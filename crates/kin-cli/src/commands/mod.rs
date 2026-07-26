@@ -24,6 +24,7 @@ pub mod deps;
 pub mod diff;
 pub mod eject;
 pub mod embed;
+pub mod git;
 pub mod graph;
 pub mod graph_health;
 pub mod graph_viz;

@@ -3265,18 +3265,22 @@ dependencies = [
 name = "kin-git"
 version = "0.3.6"
 dependencies = [
+ "cap-std",
  "chrono",
  "gix",
  "hex",
  "kin-blobs",
- "kin-db",
  "kin-model",
  "pretty_assertions",
  "rayon",
+ "rustix",
+ "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

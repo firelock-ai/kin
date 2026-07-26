@@ -21,10 +21,12 @@ use kin_model::{
     ResolvedTree, SemanticChange, SemanticChangeId, TreeEntry, WorkspaceHead,
 };
 
+use crate::admission_history::admit_semantic_git_import;
 use crate::error::{GitError, Result};
 use crate::lossless::{
     capture_lossless_git_repository, claim_staging_path, head_edit, publish_staging, ref_edit,
-    reject_existing_destination, GitObjectFormat as LosslessObjectFormat, LosslessGitRepository,
+    reject_existing_destination, require_anchored_publication_platform,
+    GitObjectFormat as LosslessObjectFormat, LosslessGitRepository,
 };
 use crate::semantic_import::plan_semantic_git_import;
 
@@ -39,7 +41,7 @@ pub struct RepositoryGitExportPlan {
     pub git_authority: Option<GitExternalAuthority>,
 }
 
-/// Result of atomically publishing a repository-v6 Git projection.
+/// Result of capability-anchored publication of a repository-v6 Git projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryGitExportResult {
     pub git_repo_path: PathBuf,
@@ -66,7 +68,9 @@ pub struct RepositoryGitCommitBinding {
 ///
 /// The destination must not exist. The complete repository is built in an
 /// owner-private sibling directory, recaptured through the exact Git ingestion
-/// boundary, and atomically published only after refs and `HEAD` match.
+/// boundary, and published with a retained output-parent capability only after
+/// refs and `HEAD` match. Platforms without that namespace primitive fail
+/// before creating the export.
 pub fn export_repository_to_git<L>(
     plan: &RepositoryGitExportPlan,
     source: &mut L,
@@ -91,18 +95,14 @@ where
             output_path.display()
         ))
     })?;
-    fs::create_dir_all(parent).map_err(|error| GitError::io(parent, error))?;
-    let staging = claim_staging_path(parent)?;
-    let result = match build_staging_projection(plan, source, &staging) {
+    require_anchored_publication_platform(output_path)?;
+    let mut staging = claim_staging_path(parent)?;
+    let result = match build_staging_projection(plan, source, staging.path()) {
         Ok(result) => result,
-        Err(error) => {
-            let _ = fs::remove_dir_all(&staging);
-            return Err(error);
-        }
+        Err(error) => return Err(staging.cleanup_after_error(error)),
     };
-    if let Err(error) = publish_staging(&staging, output_path) {
-        let _ = fs::remove_dir_all(&staging);
-        return Err(error);
+    if let Err(error) = publish_staging(&mut staging, output_path) {
+        return Err(staging.cleanup_after_error(error));
     }
 
     let (imported_commits_reused, native_commits_written, refs_written, change_commits) = result;
@@ -486,6 +486,42 @@ where
 
     let snapshot = lossless_snapshot_from_authority(authority)?;
     let rebuilt = plan_semantic_git_import(&snapshot, &proof_store)?;
+    let mut supplied_by_oid = BTreeMap::new();
+    for change in plan
+        .changes
+        .iter()
+        .filter(|change| matches!(change.origin, ChangeOrigin::GitCommit { .. }))
+    {
+        let ChangeOrigin::GitCommit { oid } = change.origin else {
+            unreachable!("the filter retains only Git-origin changes");
+        };
+        if supplied_by_oid.insert(oid, change).is_some() {
+            return Err(GitError::InvalidSnapshot(format!(
+                "Git export repeats imported commit {oid}"
+            )));
+        }
+    }
+    let historical_deltas = rebuilt
+        .changes
+        .iter()
+        .map(|base_change| {
+            let ChangeOrigin::GitCommit { oid } = base_change.origin else {
+                unreachable!("the exact Git planner only emits Git-origin changes");
+            };
+            let supplied = supplied_by_oid.get(&oid).ok_or_else(|| {
+                GitError::InvalidSnapshot(format!(
+                    "Git export omits imported semantic history for commit {oid}"
+                ))
+            })?;
+            Ok((
+                base_change.id,
+                supplied.entity_deltas.clone(),
+                supplied.relation_deltas.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let rebuilt = rebuilt.with_historical_semantics(&proof_store, &historical_deltas)?;
+    let rebuilt = admit_semantic_git_import(&rebuilt, &proof_store)?;
     let expected_changes = rebuilt
         .changes
         .into_iter()
@@ -948,7 +984,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::{build_git_external_authority, plan_semantic_git_import};
+    use crate::{
+        admit_semantic_git_import, build_git_external_authority, plan_semantic_git_import,
+    };
 
     struct StoreLoader<'a> {
         store: &'a BlobStore,
@@ -1007,7 +1045,11 @@ mod tests {
         let repository_id = RepositoryId::new("mixed-export").unwrap();
         let snapshot =
             capture_lossless_git_repository(&source, repository_id.clone(), &store).unwrap();
-        let imported = plan_semantic_git_import(&snapshot, &store).unwrap();
+        let imported = admit_semantic_git_import(
+            &plan_semantic_git_import(&snapshot, &store).unwrap(),
+            &store,
+        )
+        .unwrap();
         let authority = build_git_external_authority(&snapshot, &store).unwrap();
         let imported_change = imported.changes.last().unwrap().clone();
         let base_tree = imported
