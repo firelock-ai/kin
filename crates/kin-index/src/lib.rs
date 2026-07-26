@@ -15,6 +15,7 @@ pub mod artifacts;
 pub mod classifier;
 pub mod error;
 pub mod fingerprint;
+pub mod history;
 pub mod linker;
 pub mod overlay;
 pub mod pipeline;
@@ -34,6 +35,7 @@ pub use error::{IndexError, Result};
 pub use fingerprint::{
     behavior_equivalence_hash, compute_entity_fingerprint, language_supports_equivalence,
 };
+pub use history::{derive_historical_semantic_deltas, HistoricalSemanticDelta};
 pub use linker::{
     build_projection_derived_relations_for_file, build_projection_derived_relations_from_markers,
     extract_projection_source_markers, link_cross_file, link_cross_file_against_entities,
