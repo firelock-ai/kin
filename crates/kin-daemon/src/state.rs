@@ -10,8 +10,10 @@ use std::time::{Duration, Instant};
 use kin_blobs::{BlobError, BlobStore};
 use kin_core::KinLayout;
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager, StorageBackend};
+#[cfg(test)]
+use kin_model::ChangeStore;
 use kin_model::{
-    ChangeStore, EntityId, EntityStore, FilePathId, Hash256, RepoPath, RepositoryId, ResolvedTree,
+    EntityId, EntityStore, FilePathId, Hash256, RepoPath, RepositoryId, ResolvedTree,
     SemanticChange, SemanticChangeId, TreeEntry, WorkspaceId,
 };
 use kin_projection::ProjectionState;
@@ -26,11 +28,13 @@ use crate::session_registry::SessionCoordinator;
 /// change would create without first inserting that change into graph
 /// authority. The default `ChangeStore` replay then applies the same
 /// topological and merge-parent semantics as a committed change.
+#[cfg(test)]
 struct ProspectiveChangeStore<'a> {
     graph: &'a kin_db::InMemoryGraph,
     incoming: &'a SemanticChange,
 }
 
+#[cfg(test)]
 impl ChangeStore for ProspectiveChangeStore<'_> {
     type Error = kin_db::KinDbError;
 
@@ -148,23 +152,49 @@ pub(crate) fn write_persisted_mcp_transactions(
     layout: &KinLayout,
     store: &HashMap<String, kin_mcp::McpTransaction>,
 ) {
+    if let Err(error) = write_persisted_mcp_transactions_checked(layout, store) {
+        warn!(
+            path = %mcp_transactions_disk_path(layout).display(),
+            error = %error,
+            "failed to durably persist MCP transactions"
+        );
+    }
+}
+
+/// Durably mirror MCP transaction state or fail before repository authority is
+/// allowed to move.
+///
+/// The ordinary non-publication lifecycle wrapper above remains best-effort,
+/// but exact repository commits use this checked boundary for their non-terminal
+/// `committing` fence. The file and containing directory are flushed so a
+/// successful return survives process and power loss on hosts that expose
+/// directory fsync.
+pub(crate) fn write_persisted_mcp_transactions_checked(
+    layout: &KinLayout,
+    store: &HashMap<String, kin_mcp::McpTransaction>,
+) -> Result<()> {
     let path = mcp_transactions_disk_path(layout);
-    let bytes = match serde_json::to_vec(store) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            warn!(error = %err, "failed to serialize MCP transactions for durable persistence");
-            return;
-        }
-    };
+    let bytes = serde_json::to_vec(store).map_err(|error| {
+        DaemonError::Io(std::io::Error::other(format!(
+            "serialize MCP transactions: {error}"
+        )))
+    })?;
     let tmp = path.with_extension("json.tmp");
-    if let Err(err) = std::fs::write(&tmp, &bytes) {
-        warn!(path = %tmp.display(), error = %err, "failed to write MCP transactions temp file");
-        return;
-    }
-    if let Err(err) = std::fs::rename(&tmp, &path) {
-        warn!(path = %path.display(), error = %err, "failed to commit MCP transactions file");
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        if let Some(parent) = path.parent() {
+            sync_directory_metadata(parent)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = write_result {
         let _ = std::fs::remove_file(&tmp);
+        return Err(DaemonError::Io(error));
     }
+    Ok(())
 }
 
 /// One append-only, release-attributed coordination event. This is the durable
@@ -820,6 +850,10 @@ pub struct DaemonState {
     finalization_fail_once: AtomicBool,
     #[cfg(test)]
     snapshot_save_fail_once: AtomicBool,
+    /// Deterministic crash seam after exact MCP repository authority commits
+    /// but before the derived graph and terminal transaction state install.
+    #[cfg(test)]
+    pub(crate) mcp_fail_after_authority_once: AtomicBool,
     /// Monotonically increasing version counter for VFS cache invalidation.
     /// Incremented on every graph mutation (reconcile, commit, overlay update).
     /// Unlike entity_count, this never decreases on deletions.
@@ -1389,6 +1423,8 @@ impl DaemonState {
             finalization_fail_once: AtomicBool::new(false),
             #[cfg(test)]
             snapshot_save_fail_once: AtomicBool::new(false),
+            #[cfg(test)]
+            mcp_fail_after_authority_once: AtomicBool::new(false),
             vfs_version: AtomicU64::new(persisted_vfs_version),
             vfs_tree_cache: std::sync::RwLock::new(None),
             vfs_tree_build_lock: tokio::sync::Mutex::new(()),
@@ -1552,6 +1588,8 @@ impl DaemonState {
             finalization_fail_once: AtomicBool::new(false),
             #[cfg(test)]
             snapshot_save_fail_once: AtomicBool::new(false),
+            #[cfg(test)]
+            mcp_fail_after_authority_once: AtomicBool::new(false),
             vfs_version: AtomicU64::new(persisted_vfs_version),
             vfs_tree_cache: std::sync::RwLock::new(None),
             vfs_tree_build_lock: tokio::sync::Mutex::new(()),
@@ -2990,6 +3028,7 @@ impl DaemonState {
     /// Hosted graph commits do not share the caller's local object directory;
     /// an exact change whose bytes are unavailable must therefore fail before
     /// its entities, relations, change record, or branch head become visible.
+    #[cfg(test)]
     pub(crate) fn preflight_exact_source_change(
         &self,
         graph: &kin_db::InMemoryGraph,
@@ -3013,6 +3052,7 @@ impl DaemonState {
         self.preflight_materializable_source_entries(entries, "incoming exact")
     }
 
+    #[cfg(test)]
     fn preflight_materializable_source_entries(
         &self,
         entries: ResolvedTree,
@@ -3080,22 +3120,6 @@ impl DaemonState {
             start = end;
         }
         Ok(())
-    }
-
-    /// Prove that the exact source tree at `head` is both complete and fully
-    /// materializable from the daemon's immutable source authority.
-    ///
-    /// Release admission calls this while holding the same coordination gate
-    /// as marker/head mutation. Backend-backed daemons use backend objects only
-    /// (the hosted immutable authority); local daemons use their verified CAS.
-    pub(crate) fn preflight_exact_source_tree(
-        &self,
-        graph: &kin_db::InMemoryGraph,
-        head: &SemanticChangeId,
-    ) -> Result<()> {
-        let entries = graph.resolve_tree_at(head).map_err(DaemonError::from)?;
-
-        self.preflight_materializable_source_entries(entries, &format!("release source at {head}"))
     }
 
     /// Whether filesystem-to-graph compatibility ingestion is disabled for
@@ -6262,6 +6286,7 @@ mod tests {
                 scope: "file:src/lib.rs".to_string(),
                 state: "active".to_string(),
                 staged_operations: Vec::new(),
+                commit_payload_hash: None,
             },
         );
         write_persisted_mcp_transactions(&layout, &store);
