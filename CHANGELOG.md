@@ -50,7 +50,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   budget and, for adaptively sized declarations, within the confident prefix
   (`KIN_LOCATE_FUSED_DECLARATION_CAP`, default 8). Explicit `--max-files`
   widths are honored as-is.
-
 ### Changed
 
 - `kin exec` executes exact argv locally in the materialized session workspace;
