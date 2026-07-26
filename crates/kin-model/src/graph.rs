@@ -123,14 +123,11 @@ pub trait EntityStore: Send + Sync {
         &self,
     ) -> std::result::Result<Vec<crate::layout::OpaqueArtifact>, Self::Error>;
     fn delete_opaque_artifact(&self, file_id: &FilePathId) -> std::result::Result<(), Self::Error>;
-    /// Resolve a tracked path through the graph-owned artifact index.
-    fn artifact_id_for_path(&self, path: &FilePathId) -> Option<crate::ArtifactId>;
-    /// Return the graph-owned artifact identity for `path`, allocating and
-    /// persisting one when the path has not been assigned yet.
-    fn ensure_artifact_id(
-        &self,
-        path: &FilePathId,
-    ) -> std::result::Result<crate::ArtifactId, Self::Error>;
+    /// Resolve an exact tracked path through graph-owned repository state.
+    ///
+    /// This is lookup-only. Artifact identities are assigned by explicit
+    /// admission/tree transactions, never by a path query.
+    fn artifact_id_at_path(&self, path: &crate::RepoPath) -> Option<crate::ArtifactId>;
     fn upsert_file_layout(
         &self,
         layout: &crate::layout::FileLayout,
@@ -1306,14 +1303,8 @@ impl<G: EntityStore> EntityStore for &G {
     fn delete_opaque_artifact(&self, file_id: &FilePathId) -> std::result::Result<(), Self::Error> {
         (**self).delete_opaque_artifact(file_id)
     }
-    fn artifact_id_for_path(&self, path: &FilePathId) -> Option<crate::ArtifactId> {
-        (**self).artifact_id_for_path(path)
-    }
-    fn ensure_artifact_id(
-        &self,
-        path: &FilePathId,
-    ) -> std::result::Result<crate::ArtifactId, Self::Error> {
-        (**self).ensure_artifact_id(path)
+    fn artifact_id_at_path(&self, path: &crate::RepoPath) -> Option<crate::ArtifactId> {
+        (**self).artifact_id_at_path(path)
     }
     fn upsert_file_layout(
         &self,
