@@ -26,7 +26,7 @@ use super::git::{
 use super::repository_authority::ActiveRepositoryAuthority;
 
 /// Verify graph truth, install its exact Git projection, and detach Kin.
-pub async fn run(yes: bool, purge_metadata: bool) -> Result<()> {
+pub async fn run(yes: bool) -> Result<()> {
     ensure_eject_platform()?;
     let cwd = std::env::current_dir()?;
     let layout = kin_core::KinLayout::discover(&cwd)
@@ -51,7 +51,6 @@ pub async fn run(yes: bool, purge_metadata: bool) -> Result<()> {
             &captured,
             staged_git.imported_commits,
             staged_git.native_commits,
-            purge_metadata,
         )?
     {
         println!("Aborted.");
@@ -113,42 +112,22 @@ pub async fn run(yes: bool, purge_metadata: bool) -> Result<()> {
     // has revalidated, installed Git, and moved the whole `.kin` namespace.
     drop(authority_freeze);
     drop(reopened);
-    if purge_metadata {
-        fs::remove_dir_all(&archive).with_context(|| {
-            format!(
-                "Kin was ejected, but the detached metadata archive could not be purged at {}",
-                archive.display()
-            )
-        })?;
-        sync_directory(
-            archive
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("eject archive has no parent"))?,
-        )?;
+    println!(
+        "Kin ejected at authority generation {}. The working directory is now an ordinary \
+         Git repository.",
+        captured.roots.generation
+    );
+    println!("Recoverable eject archive: {}", archive.display());
+    if eject_outcome.had_previous_git {
         println!(
-            "Kin ejected at authority generation {}. The working directory is now an ordinary \
-             Git repository; detached Kin metadata and the repository-local pre-eject `.git` \
-             entry were permanently removed.",
-            captured.roots.generation
+            "The archive contains `kin/` and `previous-git/`; keep it until the ordinary Git \
+             repository has been independently backed up."
         );
     } else {
         println!(
-            "Kin ejected at authority generation {}. The working directory is now an ordinary \
-             Git repository.",
-            captured.roots.generation
+            "The archive contains `kin/`; keep it until the ordinary Git repository has been \
+             independently backed up."
         );
-        println!("Recoverable eject archive: {}", archive.display());
-        if eject_outcome.had_previous_git {
-            println!(
-                "The archive contains `kin/` and `previous-git/`; keep it until the ordinary Git \
-                 repository has been independently backed up."
-            );
-        } else {
-            println!(
-                "The archive contains `kin/`; keep it until the ordinary Git repository has been \
-                 independently backed up."
-            );
-        }
     }
     Ok(())
 }
@@ -546,7 +525,6 @@ fn confirm_eject(
     captured: &AuthorityExportSnapshot,
     imported_commits: usize,
     native_commits: usize,
-    purge_metadata: bool,
 ) -> Result<bool> {
     eprintln!();
     eprintln!("Eject Kin repository");
@@ -561,14 +539,7 @@ fn confirm_eject(
     );
     eprintln!("  Sealed credential-free Git remote and tracking config will be restored.");
     eprintln!("  Working files will not become repository authority.");
-    if purge_metadata {
-        eprintln!(
-            "  Detached Kin authority and the repository-local pre-eject `.git` entry will be \
-             permanently deleted."
-        );
-    } else {
-        eprintln!("  Detached metadata will remain in a recoverable sibling archive.");
-    }
+    eprintln!("  Detached metadata will remain in a recoverable sibling archive.");
     eprintln!();
     eprint!("Type \"eject\" to continue, or press Enter to abort: ");
 
