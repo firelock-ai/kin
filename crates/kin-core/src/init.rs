@@ -1,19 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager, StorageBackend};
 use kin_model::{
     compute_resolved_tree_hash, AdmissionPolicyDelta, AdmissionScanToken, AuthorId,
     DefaultRefExpectation, DefaultRefMutation, EffectiveAdmissionPolicyStamp, FrozenLocalOverlay,
-    FrozenLocalOverlayDelta, OperationId, RefExpectation, RefMutation, RefName, RefTarget,
+    FrozenLocalOverlayDelta, Hash256, OperationId, RefExpectation, RefMutation, RefName, RefTarget,
     RefUpdatePolicy, RepositoryAuthorityStore, RepositoryCommitReceipt, RepositoryId,
-    RepositoryTransaction, SemanticChange, SemanticChangeId, SharedAdmissionPolicy, WorkspaceHead,
-    WorkspaceId, WorkspaceMutation, WorkspaceSnapshotBinding, ADMISSION_POLICY_SEMANTICS_VERSION,
-    REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    RepositoryTransaction, RootBundle, SemanticChange, SemanticChangeId, SharedAdmissionPolicy,
+    WorkspaceExpectation, WorkspaceHead, WorkspaceId, WorkspaceMutation, WorkspaceSnapshotBinding,
+    ADMISSION_POLICY_SEMANTICS_VERSION, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
 };
+use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::config::KinConfig;
@@ -22,7 +23,7 @@ use crate::layout::{KinLayout, KIN_LAYOUT_VERSION};
 use crate::manifest::KinManifest;
 
 /// Result of creating a repository authority envelope.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryBootstrap {
     pub receipt: RepositoryCommitReceipt,
     pub workspace: WorkspaceSnapshotBinding,
@@ -42,6 +43,163 @@ pub struct InitResult {
     pub authority: RepositoryBootstrap,
 }
 
+#[derive(Clone)]
+struct RepositoryMetadataSeal {
+    config_bytes: Vec<u8>,
+    manifest_bytes: Vec<u8>,
+    config_hash: Hash256,
+    manifest_hash: Hash256,
+}
+
+/// A complete `.kin` repository assembled outside the final namespace.
+///
+/// The staging directory is private to this object and is removed on drop
+/// unless [`publish_repository_layout`] atomically installs it. Authority
+/// mutations can be committed only through [`Self::commit_repository_bootstrap`],
+/// which binds the first transaction to the exact generation-zero roots
+/// created here and supports exact-operation retry after an uncertain durable
+/// write.
+pub struct PreparedRepositoryInit {
+    layout: KinLayout,
+    config: KinConfig,
+    manifest: KinManifest,
+    repository_id: RepositoryId,
+    workspace_id: WorkspaceId,
+    default_ref: RefName,
+    initial_roots: RootBundle,
+    metadata_seal: RepositoryMetadataSeal,
+    authority: Option<RepositoryAuthorityManager<LocalFileBackend>>,
+    bootstrap: Option<RepositoryBootstrap>,
+    cleanup_armed: bool,
+}
+
+impl std::fmt::Debug for PreparedRepositoryInit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedRepositoryInit")
+            .field("layout", &self.layout)
+            .field("repository_id", &self.repository_id)
+            .field("workspace_id", &self.workspace_id)
+            .field("default_ref", &self.default_ref)
+            .field("initial_roots", &self.initial_roots)
+            .field("config_hash", &self.metadata_seal.config_hash)
+            .field("manifest_hash", &self.metadata_seal.manifest_hash)
+            .field("bootstrap", &self.bootstrap)
+            .field("cleanup_armed", &self.cleanup_armed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedRepositoryInit {
+    pub fn config(&self) -> &KinConfig {
+        &self.config
+    }
+
+    pub fn manifest(&self) -> &KinManifest {
+        &self.manifest
+    }
+
+    pub fn repository_id(&self) -> &RepositoryId {
+        &self.repository_id
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub fn default_ref(&self) -> &RefName {
+        &self.default_ref
+    }
+
+    pub fn initial_roots(&self) -> &RootBundle {
+        &self.initial_roots
+    }
+
+    /// Persist immutable source bytes inside the unpublished staging store.
+    ///
+    /// Saving a body does not grant it repository authority. A later bootstrap
+    /// transaction must reference the digest through exact tree/history
+    /// authority before publication.
+    pub fn save_source_blob(&self, digest: Hash256, data: &[u8]) -> Result<()> {
+        self.authority()?
+            .save_source_blob(digest, data)
+            .map_err(graph_error)
+    }
+
+    /// Commit exactly one complete generation-zero to generation-one
+    /// repository transition.
+    ///
+    /// Repeating the exact transaction returns the existing bootstrap. A
+    /// different transaction is rejected once bootstrap authority exists.
+    pub fn commit_repository_bootstrap(
+        &mut self,
+        transaction: &RepositoryTransaction,
+    ) -> Result<&RepositoryBootstrap> {
+        verify_metadata_seal(&self.layout, &self.metadata_seal)?;
+        let transaction_hash = transaction
+            .transaction_hash()
+            .map_err(|error| KinError::Other(error.to_string()))?;
+        let repository_id = &self.repository_id;
+        let workspace_id = self.workspace_id;
+        let default_ref = &self.default_ref;
+        let initial_roots = &self.initial_roots;
+        let authority = self.authority.as_ref().ok_or_else(|| {
+            KinError::Other("staged repository authority is no longer open".to_string())
+        })?;
+        match &mut self.bootstrap {
+            Some(bootstrap) => {
+                if bootstrap.receipt.transaction_hash != transaction_hash
+                    || bootstrap.receipt.operation_id != transaction.operation_id
+                {
+                    return Err(KinError::Other(
+                        "staged repository already has a different bootstrap transaction"
+                            .to_string(),
+                    ));
+                }
+                Ok(bootstrap)
+            }
+            slot @ None => {
+                validate_bootstrap_transaction(
+                    transaction,
+                    repository_id,
+                    workspace_id,
+                    default_ref,
+                    initial_roots,
+                )?;
+                let bootstrap = commit_bootstrap_transaction(
+                    authority,
+                    transaction,
+                    repository_id,
+                    workspace_id,
+                )?;
+                if bootstrap.receipt.generation != 1
+                    || bootstrap.receipt.roots_before != *initial_roots
+                {
+                    return Err(KinError::Graph(
+                        "repository bootstrap did not produce the exact generation-zero to generation-one transition"
+                            .to_string(),
+                    ));
+                }
+                Ok(slot.insert(bootstrap))
+            }
+        }
+    }
+
+    fn authority(&self) -> Result<&RepositoryAuthorityManager<LocalFileBackend>> {
+        self.authority.as_ref().ok_or_else(|| {
+            KinError::Other("staged repository authority is no longer open".to_string())
+        })
+    }
+}
+
+impl Drop for PreparedRepositoryInit {
+    fn drop(&mut self) {
+        if self.cleanup_armed {
+            cleanup_staging_layout(&self.layout, &self.manifest);
+        }
+    }
+}
+
 /// Initialize a new, empty Kin repository at `working_dir`.
 ///
 /// Empty initialization creates an unborn symbolic default ref and an exact
@@ -53,64 +211,257 @@ pub struct InitResult {
 ///
 /// Returns `KinError::AlreadyInitialized` if `.kin/` already exists.
 pub fn init(working_dir: &Path) -> Result<InitResult> {
-    let kin_dir = working_dir.join(".kin");
-
-    if kin_dir.exists() {
-        return Err(KinError::AlreadyInitialized(
-            working_dir.display().to_string(),
-        ));
+    let canonical_working_dir = working_dir
+        .canonicalize()
+        .map_err(|error| KinError::io(working_dir, error))?;
+    let kin_dir = canonical_working_dir.join(".kin");
+    match std::fs::symlink_metadata(&kin_dir) {
+        Ok(_) => {
+            return Err(KinError::AlreadyInitialized(
+                canonical_working_dir.display().to_string(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(KinError::io(&kin_dir, error)),
     }
-
-    std::fs::create_dir_all(&kin_dir).map_err(|error| KinError::io(&kin_dir, error))?;
-    let layout = KinLayout::new(kin_dir);
-    for directory in layout.all_dirs() {
-        std::fs::create_dir_all(&directory).map_err(|error| KinError::io(&directory, error))?;
-    }
-    std::fs::write(layout.version_path(), KIN_LAYOUT_VERSION.to_string())
-        .map_err(|error| KinError::io(layout.version_path(), error))?;
 
     let config = KinConfig::default();
-    config.save(&layout.config_path())?;
-
     let manifest = KinManifest::new();
-    manifest.save(&layout.manifest_path())?;
+    let staging_dir = canonical_working_dir.join(format!(".kin.init-{}", uuid::Uuid::new_v4()));
+    let mut prepared = prepare_repository_layout_at(&staging_dir, config, manifest)?;
+    let transaction = build_repository_bootstrap_transaction(
+        prepared.initial_roots().clone(),
+        prepared.repository_id().clone(),
+        prepared.workspace_id(),
+        prepared.default_ref().clone(),
+        SharedAdmissionPolicy::empty(0),
+        None,
+    )?;
+    prepared.commit_repository_bootstrap(&transaction)?;
+    let result = publish_repository_layout(prepared, &kin_dir)?;
+
+    info!(
+        path = %canonical_working_dir.display(),
+        repository = %result.repository_id,
+        workspace = %result.workspace_id,
+        default_ref = %result.default_ref,
+        "initialized unborn kin repository authority"
+    );
+
+    Ok(result)
+}
+
+/// Create a complete unpublished repository layout at an explicit staging
+/// path. The path must be an absolute, direct child of an existing directory
+/// and its name must begin with `.kin.init-`.
+pub fn prepare_repository_layout_at(
+    staging_kin_dir: &Path,
+    config: KinConfig,
+    manifest: KinManifest,
+) -> Result<PreparedRepositoryInit> {
+    config.validate()?;
+    let repository_uuid = uuid::Uuid::parse_str(&manifest.repo_id)
+        .map_err(|error| KinError::Other(format!("invalid repository identity: {error}")))?;
+    if repository_uuid.get_version_num() != 4 {
+        return Err(KinError::Other(
+            "repository manifest identity must be a UUID v4".to_string(),
+        ));
+    }
     let repository_id = RepositoryId::new(manifest.repo_id.clone())
         .map_err(|error| KinError::Other(format!("invalid repository identity: {error}")))?;
     let workspace_uuid = uuid::Uuid::parse_str(&manifest.workspace_id)
         .map_err(|error| KinError::Other(format!("invalid workspace identity: {error}")))?;
+    if workspace_uuid.get_version_num() != 4 {
+        return Err(KinError::Other(
+            "workspace manifest identity must be a UUID v4".to_string(),
+        ));
+    }
+    if repository_uuid == workspace_uuid {
+        return Err(KinError::Other(
+            "repository and workspace manifest identities must be distinct".to_string(),
+        ));
+    }
     let workspace_id = WorkspaceId::from_uuid(workspace_uuid);
     let default_ref = RefName::branch(config.default_branch.as_bytes())
         .map_err(|error| KinError::Other(format!("invalid default ref: {error}")))?;
+    let staging_root = canonical_staging_root(staging_kin_dir)?;
 
-    let backend = Arc::new(LocalFileBackend::new(layout.kindb_dir()));
-    let authority =
-        RepositoryAuthorityManager::open(repository_id.clone(), backend).map_err(graph_error)?;
-    let bootstrap = initialize_repository_authority(
-        &authority,
-        repository_id.clone(),
-        workspace_id,
-        default_ref.clone(),
-        SharedAdmissionPolicy::empty(0),
-        None,
+    std::fs::create_dir(&staging_root).map_err(|error| KinError::io(&staging_root, error))?;
+    let layout = KinLayout::new(staging_root);
+    let preparation = (|| {
+        for directory in layout.all_dirs() {
+            std::fs::create_dir(&directory).map_err(|error| KinError::io(&directory, error))?;
+        }
+        std::fs::write(layout.version_path(), KIN_LAYOUT_VERSION.to_string())
+            .map_err(|error| KinError::io(layout.version_path(), error))?;
+        config.save(&layout.config_path())?;
+        manifest.save(&layout.manifest_path())?;
+        let metadata_seal = capture_metadata_seal(&layout)?;
+
+        let backend = Arc::new(LocalFileBackend::new(layout.kindb_dir()));
+        let authority = RepositoryAuthorityManager::open(repository_id.clone(), backend)
+            .map_err(graph_error)?;
+        let initial_roots = authority.read_authority().roots().clone();
+        if initial_roots.generation != 0 {
+            return Err(KinError::Graph(
+                "fresh staged repository did not open at generation zero".to_string(),
+            ));
+        }
+        Ok(PreparedRepositoryInit {
+            layout: layout.clone(),
+            config,
+            manifest: manifest.clone(),
+            repository_id,
+            workspace_id,
+            default_ref,
+            initial_roots,
+            metadata_seal,
+            authority: Some(authority),
+            bootstrap: None,
+            cleanup_armed: true,
+        })
+    })();
+    if preparation.is_err() {
+        cleanup_created_staging_root(layout.root());
+    }
+    preparation
+}
+
+/// Atomically publish a fully bootstrapped staged repository as the final
+/// `.kin` directory without replacing any existing entry.
+pub fn publish_repository_layout(
+    prepared: PreparedRepositoryInit,
+    final_kin_dir: &Path,
+) -> Result<InitResult> {
+    publish_repository_layout_with_hook(prepared, final_kin_dir, |_| {})
+}
+
+fn publish_repository_layout_with_hook(
+    mut prepared: PreparedRepositoryInit,
+    final_kin_dir: &Path,
+    after_rename: impl FnOnce(&Path),
+) -> Result<InitResult> {
+    validate_publish_destination(&prepared.layout, final_kin_dir)?;
+    verify_metadata_seal(&prepared.layout, &prepared.metadata_seal)?;
+    let bootstrap = prepared.bootstrap.clone().ok_or_else(|| {
+        KinError::Other(
+            "cannot publish a staged repository before bootstrap authority commits".to_string(),
+        )
+    })?;
+    if bootstrap.receipt.generation != 1 || bootstrap.receipt.roots_before != prepared.initial_roots
+    {
+        return Err(KinError::Graph(
+            "staged repository bootstrap receipt does not bind generation zero to generation one"
+                .to_string(),
+        ));
+    }
+
+    sync_layout_recursively(prepared.layout.root())?;
+    drop(prepared.authority.take());
+    verify_repository_layout(
+        &prepared.layout,
+        &prepared.metadata_seal,
+        &prepared.repository_id,
+        prepared.workspace_id,
+        &bootstrap,
     )?;
+    // Verification may create or touch backend lock state. Flush the exact
+    // verified namespace once more before the publication rename.
+    sync_layout_recursively(prepared.layout.root())?;
+    rename_directory_noreplace(prepared.layout.root(), final_kin_dir)?;
+    prepared.cleanup_armed = false;
+    after_rename(final_kin_dir);
 
-    info!(
-        path = %working_dir.display(),
-        repository = %repository_id,
-        workspace = %workspace_id,
-        default_ref = %default_ref,
-        "initialized unborn kin repository authority"
+    let parent_sync = sync_parent_directory(
+        final_kin_dir
+            .parent()
+            .expect("validated final .kin path always has a parent"),
     );
+    let layout = KinLayout::new(final_kin_dir.to_path_buf());
+    let final_verification = verify_repository_layout(
+        &layout,
+        &prepared.metadata_seal,
+        &prepared.repository_id,
+        prepared.workspace_id,
+        &bootstrap,
+    );
+    let (config, manifest) = match (parent_sync, final_verification) {
+        (Ok(()), Ok(metadata)) => metadata,
+        (Err(sync_error), Ok(_)) => {
+            return Err(published_uncertain(final_kin_dir, sync_error));
+        }
+        (Ok(()), Err(verification_error)) => {
+            return Err(published_uncertain(final_kin_dir, verification_error));
+        }
+        (Err(sync_error), Err(verification_error)) => {
+            return Err(KinError::RepositoryPublishedButUncertain {
+                path: final_kin_dir.display().to_string(),
+                detail: format!(
+                    "parent namespace sync failed: {sync_error}; final verification failed: \
+                     {verification_error}"
+                ),
+            });
+        }
+    };
 
     Ok(InitResult {
         layout,
         config,
         manifest,
-        repository_id,
-        workspace_id,
-        default_ref,
+        repository_id: prepared.repository_id.clone(),
+        workspace_id: prepared.workspace_id,
+        default_ref: prepared.default_ref.clone(),
         authority: bootstrap,
     })
+}
+
+fn verify_repository_layout(
+    layout: &KinLayout,
+    metadata_seal: &RepositoryMetadataSeal,
+    repository_id: &RepositoryId,
+    workspace_id: WorkspaceId,
+    bootstrap: &RepositoryBootstrap,
+) -> Result<(KinConfig, KinManifest)> {
+    layout.check_version()?;
+    verify_metadata_seal(layout, metadata_seal)?;
+    let config = KinConfig::load(&layout.config_path())?;
+    let manifest = KinManifest::load(&layout.manifest_path())?;
+    if manifest.repo_id != repository_id.as_str()
+        || manifest.workspace_id != workspace_id.to_string()
+    {
+        return Err(KinError::Graph(
+            "repository manifest does not bind the committed repository and workspace identities"
+                .to_string(),
+        ));
+    }
+    let authority = RepositoryAuthorityManager::open(
+        repository_id.clone(),
+        Arc::new(LocalFileBackend::new(layout.kindb_dir())),
+    )
+    .map_err(graph_error)?;
+    let reopened_roots = authority.read_authority().roots().clone();
+    if reopened_roots != bootstrap.receipt.roots_after {
+        return Err(KinError::Graph(
+            "repository reopened with different authority roots".to_string(),
+        ));
+    }
+    let reopened_workspace = authority
+        .workspace_snapshot_binding(repository_id, &workspace_id)
+        .map_err(graph_error)?
+        .ok_or_else(|| KinError::Graph(format!("repository has no workspace {workspace_id}")))?;
+    if reopened_workspace != bootstrap.workspace {
+        return Err(KinError::Graph(
+            "repository workspace binding changed across reopen".to_string(),
+        ));
+    }
+    Ok((config, manifest))
+}
+
+fn published_uncertain(final_kin_dir: &Path, error: KinError) -> KinError {
+    KinError::RepositoryPublishedButUncertain {
+        path: final_kin_dir.display().to_string(),
+        detail: error.to_string(),
+    }
 }
 
 /// Commit the first complete repository-authority state.
@@ -131,6 +482,34 @@ pub fn initialize_repository_authority<B>(
 where
     B: StorageBackend + 'static,
 {
+    let initial_roots = authority.read_authority().roots().clone();
+    let prepared_default_ref = default_ref.clone();
+    let transaction = build_repository_bootstrap_transaction(
+        initial_roots.clone(),
+        repository_id.clone(),
+        workspace_id,
+        default_ref,
+        shared_policy,
+        initial_change,
+    )?;
+    validate_bootstrap_transaction(
+        &transaction,
+        &repository_id,
+        workspace_id,
+        &prepared_default_ref,
+        &initial_roots,
+    )?;
+    commit_bootstrap_transaction(authority, &transaction, &repository_id, workspace_id)
+}
+
+fn build_repository_bootstrap_transaction(
+    initial_roots: RootBundle,
+    repository_id: RepositoryId,
+    workspace_id: WorkspaceId,
+    default_ref: RefName,
+    shared_policy: SharedAdmissionPolicy,
+    initial_change: Option<SemanticChange>,
+) -> Result<RepositoryTransaction> {
     shared_policy
         .validate()
         .map_err(|error| KinError::Other(error.to_string()))?;
@@ -187,13 +566,12 @@ where
         new_admission_policy: admission_policy,
     };
 
-    let lease = authority.read_authority();
     let mut transaction = RepositoryTransaction {
         schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
         operation_id: OperationId::new(),
         repository_id: repository_id.clone(),
-        expected_generation: lease.roots().generation,
-        expected_roots: lease.roots().clone(),
+        expected_generation: initial_roots.generation,
+        expected_roots: initial_roots,
         actor: AuthorId::new("kin"),
         reason: if initial_change.is_some() {
             "initialize repository with admitted history".to_string()
@@ -222,7 +600,6 @@ where
             local_overlay: admission_policy.local,
         }),
     };
-    drop(lease);
 
     if let Some(change_id) = initial_change_id {
         transaction.ref_mutations.push(RefMutation {
@@ -232,23 +609,384 @@ where
             policy: RefUpdatePolicy::FastForwardOnly,
         });
     }
+    Ok(transaction)
+}
 
+fn commit_bootstrap_transaction<B>(
+    authority: &RepositoryAuthorityManager<B>,
+    transaction: &RepositoryTransaction,
+    repository_id: &RepositoryId,
+    workspace_id: WorkspaceId,
+) -> Result<RepositoryBootstrap>
+where
+    B: StorageBackend + 'static,
+{
     let receipt = authority
-        .commit_repository_transaction(transaction)
+        .commit_repository_transaction(transaction.clone())
         .map_err(graph_error)?;
     let workspace = authority
-        .workspace_snapshot_binding(&repository_id, &workspace_id)
+        .workspace_snapshot_binding(repository_id, &workspace_id)
         .map_err(graph_error)?
         .ok_or_else(|| {
             KinError::Graph(format!(
                 "repository authority committed without workspace {workspace_id}"
             ))
         })?;
+    if workspace.roots != receipt.roots_after {
+        return Err(KinError::Graph(
+            "repository bootstrap workspace is not bound to the committed roots".to_string(),
+        ));
+    }
+    workspace
+        .validate()
+        .map_err(|error| KinError::Other(error.to_string()))?;
+    let initial_change_id = transaction
+        .workspace_mutation
+        .as_ref()
+        .and_then(|mutation| match mutation.new_base_target {
+            Some(RefTarget::Change { change_id }) => Some(change_id),
+            _ => None,
+        });
     Ok(RepositoryBootstrap {
         receipt,
         workspace,
         initial_change_id,
     })
+}
+
+fn validate_bootstrap_transaction(
+    transaction: &RepositoryTransaction,
+    repository_id: &RepositoryId,
+    workspace_id: WorkspaceId,
+    default_ref: &RefName,
+    initial_roots: &RootBundle,
+) -> Result<()> {
+    transaction
+        .validate()
+        .map_err(|error| KinError::Other(error.to_string()))?;
+    if initial_roots.generation != 0
+        || transaction.expected_generation != 0
+        || &transaction.expected_roots != initial_roots
+    {
+        return Err(KinError::Other(
+            "repository bootstrap must compare-and-swap the exact generation-zero roots"
+                .to_string(),
+        ));
+    }
+    if &transaction.repository_id != repository_id {
+        return Err(KinError::Other(format!(
+            "repository bootstrap belongs to {}, not {}",
+            transaction.repository_id, repository_id
+        )));
+    }
+    let expected_default = Some(DefaultRefMutation {
+        expected: DefaultRefExpectation::MustBeUnset,
+        new_default: Some(default_ref.clone()),
+    });
+    if transaction.default_ref_mutation != expected_default {
+        return Err(KinError::Other(
+            "repository bootstrap must install the configured default ref from an unset state"
+                .to_string(),
+        ));
+    }
+    let workspace = transaction.workspace_mutation.as_ref().ok_or_else(|| {
+        KinError::Other("repository bootstrap requires an exact workspace mutation".to_string())
+    })?;
+    if workspace.workspace_id != workspace_id
+        || workspace.expected != WorkspaceExpectation::MustNotExist
+        || workspace.new_generation != 0
+    {
+        return Err(KinError::Other(
+            "repository bootstrap must initialize the staged workspace at generation zero"
+                .to_string(),
+        ));
+    }
+    let overlay = transaction.local_overlay_delta.as_ref().ok_or_else(|| {
+        KinError::Other(
+            "repository bootstrap requires a frozen local admission overlay".to_string(),
+        )
+    })?;
+    if overlay.old.is_some()
+        || overlay.new.as_ref().is_none_or(|candidate| {
+            candidate.workspace_id != workspace_id || candidate.generation != 0
+        })
+    {
+        return Err(KinError::Other(
+            "repository bootstrap must initialize the exact staged workspace overlay".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn capture_metadata_seal(layout: &KinLayout) -> Result<RepositoryMetadataSeal> {
+    let config_bytes = std::fs::read(layout.config_path())
+        .map_err(|error| KinError::io(layout.config_path(), error))?;
+    let manifest_bytes = std::fs::read(layout.manifest_path())
+        .map_err(|error| KinError::io(layout.manifest_path(), error))?;
+    Ok(RepositoryMetadataSeal {
+        config_hash: Hash256::from_bytes(Sha256::digest(&config_bytes).into()),
+        manifest_hash: Hash256::from_bytes(Sha256::digest(&manifest_bytes).into()),
+        config_bytes,
+        manifest_bytes,
+    })
+}
+
+fn verify_metadata_seal(layout: &KinLayout, seal: &RepositoryMetadataSeal) -> Result<()> {
+    verify_sealed_metadata_file(
+        &layout.config_path(),
+        "repository config",
+        &seal.config_bytes,
+        seal.config_hash,
+    )?;
+    verify_sealed_metadata_file(
+        &layout.manifest_path(),
+        "repository manifest",
+        &seal.manifest_bytes,
+        seal.manifest_hash,
+    )
+}
+
+fn verify_sealed_metadata_file(
+    path: &Path,
+    label: &str,
+    expected_bytes: &[u8],
+    expected_hash: Hash256,
+) -> Result<()> {
+    let observed = std::fs::read(path).map_err(|error| KinError::io(path, error))?;
+    let observed_hash = Hash256::from_bytes(Sha256::digest(&observed).into());
+    if observed_hash != expected_hash || observed != expected_bytes {
+        return Err(KinError::Other(format!(
+            "{label} changed after staged repository preparation"
+        )));
+    }
+    Ok(())
+}
+
+fn canonical_staging_root(staging_kin_dir: &Path) -> Result<PathBuf> {
+    if !staging_kin_dir.is_absolute() {
+        return Err(KinError::Other(format!(
+            "staged repository path must be absolute: {}",
+            staging_kin_dir.display()
+        )));
+    }
+    let name = staging_kin_dir
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|name| name.starts_with(".kin.init-") && name.len() > ".kin.init-".len())
+        .ok_or_else(|| {
+            KinError::Other(format!(
+                "staged repository name must begin with .kin.init-: {}",
+                staging_kin_dir.display()
+            ))
+        })?;
+    let supplied_parent = staging_kin_dir.parent().ok_or_else(|| {
+        KinError::Other(format!(
+            "staged repository path has no parent: {}",
+            staging_kin_dir.display()
+        ))
+    })?;
+    let parent = supplied_parent
+        .canonicalize()
+        .map_err(|error| KinError::io(supplied_parent, error))?;
+    let canonical_root = parent.join(name);
+    if canonical_root != staging_kin_dir {
+        return Err(KinError::Other(format!(
+            "staged repository path must use its canonical parent: {}",
+            canonical_root.display()
+        )));
+    }
+    Ok(canonical_root)
+}
+
+fn validate_publish_destination(layout: &KinLayout, final_kin_dir: &Path) -> Result<()> {
+    if !final_kin_dir.is_absolute()
+        || final_kin_dir.file_name() != Some(std::ffi::OsStr::new(".kin"))
+    {
+        return Err(KinError::Other(format!(
+            "published repository path must be an absolute .kin directory: {}",
+            final_kin_dir.display()
+        )));
+    }
+    let stage_parent = layout.root().parent().ok_or_else(|| {
+        KinError::Other(format!(
+            "staged repository has no parent: {}",
+            layout.root().display()
+        ))
+    })?;
+    let final_parent = final_kin_dir.parent().ok_or_else(|| {
+        KinError::Other(format!(
+            "published repository has no parent: {}",
+            final_kin_dir.display()
+        ))
+    })?;
+    let stage_parent = stage_parent
+        .canonicalize()
+        .map_err(|error| KinError::io(stage_parent, error))?;
+    let final_parent = final_parent
+        .canonicalize()
+        .map_err(|error| KinError::io(final_parent, error))?;
+    if stage_parent != final_parent || final_parent.join(".kin") != final_kin_dir {
+        return Err(KinError::Other(
+            "staged and published repository directories must be canonical siblings".to_string(),
+        ));
+    }
+    let metadata = std::fs::symlink_metadata(layout.root())
+        .map_err(|error| KinError::io(layout.root(), error))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(KinError::Other(format!(
+            "staged repository is not a real directory: {}",
+            layout.root().display()
+        )));
+    }
+    Ok(())
+}
+
+fn sync_layout_recursively(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| KinError::io(path, error))?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(KinError::Other(format!(
+            "staged repository metadata must not contain symlinks: {}",
+            path.display()
+        )));
+    }
+    if file_type.is_file() {
+        let file = std::fs::File::open(path).map_err(|error| KinError::io(path, error))?;
+        return file.sync_all().map_err(|error| KinError::io(path, error));
+    }
+    if !file_type.is_dir() {
+        return Err(KinError::Other(format!(
+            "staged repository metadata contains a special filesystem entry: {}",
+            path.display()
+        )));
+    }
+    let mut children = std::fs::read_dir(path)
+        .map_err(|error| KinError::io(path, error))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| KinError::io(path, error))?;
+    children.sort_by_key(std::fs::DirEntry::file_name);
+    for child in children {
+        sync_layout_recursively(&child.path())?;
+    }
+    sync_parent_directory(path)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let directory = std::fs::File::open(path).map_err(|error| KinError::io(path, error))?;
+    directory
+        .sync_all()
+        .map_err(|error| KinError::io(path, error))
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> Result<()> {
+    // MoveFileExW(MOVEFILE_WRITE_THROUGH) below flushes the namespace move.
+    // Windows has no supported directory fsync equivalent.
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_parent_directory(_path: &Path) -> Result<()> {
+    Err(KinError::Other(
+        "atomic repository publication is unsupported on this platform".to_string(),
+    ))
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "redox"
+))]
+fn rename_directory_noreplace(source: &Path, destination: &Path) -> Result<()> {
+    let parent_path = source.parent().expect("validated source has a parent");
+    let parent =
+        std::fs::File::open(parent_path).map_err(|error| KinError::io(parent_path, error))?;
+    rustix::fs::renameat_with(
+        &parent,
+        source
+            .file_name()
+            .expect("validated staged source has a file name"),
+        &parent,
+        destination
+            .file_name()
+            .expect("validated destination has a file name"),
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| KinError::io(destination, std::io::Error::from(error)))
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "redox"
+    ))
+))]
+fn rename_directory_noreplace(_source: &Path, _destination: &Path) -> Result<()> {
+    Err(KinError::Other(
+        "atomic no-replace repository publication is unsupported on this Unix target".to_string(),
+    ))
+}
+
+#[cfg(windows)]
+fn rename_directory_noreplace(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+
+    let source: Vec<u16> = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let destination_wide: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(KinError::io(destination, std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn rename_directory_noreplace(_source: &Path, _destination: &Path) -> Result<()> {
+    Err(KinError::Other(
+        "atomic repository publication is unsupported on this platform".to_string(),
+    ))
+}
+
+fn cleanup_created_staging_root(root: &Path) {
+    let safe_name = root
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| name.starts_with(".kin.init-") && name.len() > ".kin.init-".len());
+    let safe_directory = std::fs::symlink_metadata(root)
+        .is_ok_and(|metadata| metadata.file_type().is_dir() && !metadata.file_type().is_symlink());
+    if safe_name && safe_directory {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+fn cleanup_staging_layout(layout: &KinLayout, expected_manifest: &KinManifest) {
+    let manifest_matches = KinManifest::load(&layout.manifest_path()).is_ok_and(|manifest| {
+        manifest.repo_id == expected_manifest.repo_id
+            && manifest.workspace_id == expected_manifest.workspace_id
+    });
+    if manifest_matches {
+        cleanup_created_staging_root(layout.root());
+    }
 }
 
 fn graph_error(error: impl std::fmt::Display) -> KinError {
@@ -261,6 +999,31 @@ mod tests {
     use kin_model::{
         compute_semantic_change_id, ChangeOrigin, Hash256, RefTarget, Timestamp, WorkspaceHead,
     };
+    use sha2::{Digest, Sha256};
+
+    fn prepare_unborn(
+        working_dir: &Path,
+        suffix: &str,
+    ) -> (PreparedRepositoryInit, RepositoryTransaction) {
+        let working_dir = working_dir.canonicalize().unwrap();
+        let prepared = prepare_repository_layout_at(
+            &working_dir.join(format!(".kin.init-{suffix}")),
+            KinConfig::default(),
+            KinManifest::new(),
+        )
+        .unwrap();
+        let transaction = build_repository_bootstrap_transaction(
+            prepared.initial_roots().clone(),
+            prepared.repository_id().clone(),
+            prepared.workspace_id(),
+            prepared.default_ref().clone(),
+            SharedAdmissionPolicy::empty(0),
+            None,
+        )
+        .unwrap();
+        assert!(prepared.bootstrap.is_none());
+        (prepared, transaction)
+    }
 
     #[test]
     fn init_creates_unborn_repository_authority() {
@@ -318,6 +1081,186 @@ mod tests {
         init(directory.path()).unwrap();
         let error = init(directory.path()).unwrap_err();
         assert!(matches!(error, KinError::AlreadyInitialized(_)));
+    }
+
+    #[test]
+    fn preparation_never_exposes_partial_final_repository() {
+        let directory = tempfile::tempdir().unwrap();
+        let final_kin = directory.path().canonicalize().unwrap().join(".kin");
+        let (prepared, _) = prepare_unborn(directory.path(), "hidden");
+
+        assert!(!final_kin.exists());
+        assert!(prepared.layout.root().is_dir());
+        assert!(prepared.layout.config_path().is_file());
+        assert!(prepared.layout.manifest_path().is_file());
+        assert_eq!(prepared.initial_roots().generation, 0);
+        assert!(prepared.bootstrap.is_none());
+
+        let staging_root = prepared.layout.root().to_path_buf();
+        drop(prepared);
+        assert!(!staging_root.exists());
+        assert!(!final_kin.exists());
+    }
+
+    #[test]
+    fn preparation_rejects_aliased_manifest_identities_before_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging_root = directory
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join(".kin.init-aliased-identities");
+        let mut manifest = KinManifest::new();
+        manifest.workspace_id.clone_from(&manifest.repo_id);
+
+        let error = prepare_repository_layout_at(&staging_root, KinConfig::default(), manifest)
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("repository and workspace manifest identities must be distinct"));
+        assert!(!staging_root.exists());
+    }
+
+    #[test]
+    fn publish_atomically_reopens_exact_authority_and_source_bodies() {
+        let directory = tempfile::tempdir().unwrap();
+        let final_kin = directory.path().canonicalize().unwrap().join(".kin");
+        let (mut prepared, transaction) = prepare_unborn(directory.path(), "publish");
+        let body = b"services:\n  api:\n    image: kin:test\n\0\xff";
+        let digest = Hash256::from_bytes(Sha256::digest(body).into());
+        prepared.save_source_blob(digest, body).unwrap();
+        let staging_root = prepared.layout.root().to_path_buf();
+        let expected_repository = prepared.repository_id().clone();
+
+        let bootstrap = prepared
+            .commit_repository_bootstrap(&transaction)
+            .unwrap()
+            .clone();
+        let published = publish_repository_layout(prepared, &final_kin).unwrap();
+
+        assert!(!staging_root.exists());
+        assert_eq!(published.layout.root(), final_kin);
+        assert_eq!(published.authority, bootstrap);
+        assert_eq!(published.authority.receipt.generation, 1);
+        let reopened = RepositoryAuthorityManager::open(
+            expected_repository,
+            Arc::new(LocalFileBackend::new(published.layout.kindb_dir())),
+        )
+        .unwrap();
+        assert_eq!(reopened.load_source_blob(digest).unwrap().unwrap(), body);
+    }
+
+    #[test]
+    fn bootstrap_allows_only_exact_operation_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut prepared, transaction) = prepare_unborn(directory.path(), "retry");
+
+        let first = prepared
+            .commit_repository_bootstrap(&transaction)
+            .unwrap()
+            .clone();
+        let replay = prepared
+            .commit_repository_bootstrap(&transaction)
+            .unwrap()
+            .clone();
+        assert_eq!(first, replay);
+
+        let mut different = transaction;
+        different.operation_id = OperationId::new();
+        let error = prepared
+            .commit_repository_bootstrap(&different)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("already has a different bootstrap transaction"));
+    }
+
+    #[test]
+    fn bootstrap_rejects_a_default_ref_that_disagrees_with_prepared_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut prepared, mut transaction) =
+            prepare_unborn(directory.path(), "default-ref-mismatch");
+        transaction.default_ref_mutation = None;
+
+        let error = prepared
+            .commit_repository_bootstrap(&transaction)
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("install the configured default ref"));
+        assert_eq!(
+            prepared
+                .authority()
+                .unwrap()
+                .read_authority()
+                .roots()
+                .generation,
+            0
+        );
+    }
+
+    #[test]
+    fn metadata_mutation_fails_before_repository_visibility() {
+        let directory = tempfile::tempdir().unwrap();
+        let working_dir = directory.path().canonicalize().unwrap();
+        let final_kin = working_dir.join(".kin");
+        let (mut prepared, transaction) = prepare_unborn(directory.path(), "metadata-drift");
+        prepared.commit_repository_bootstrap(&transaction).unwrap();
+        let staging_root = prepared.layout.root().to_path_buf();
+        std::fs::write(
+            prepared.layout.config_path(),
+            b"default_branch = \"other\"\n",
+        )
+        .unwrap();
+
+        let error = publish_repository_layout(prepared, &final_kin).unwrap_err();
+
+        assert!(error.to_string().contains("repository config changed"));
+        assert!(!final_kin.exists());
+        assert!(!staging_root.exists());
+    }
+
+    #[test]
+    fn post_rename_failure_is_reported_as_published_but_uncertain() {
+        let directory = tempfile::tempdir().unwrap();
+        let working_dir = directory.path().canonicalize().unwrap();
+        let final_kin = working_dir.join(".kin");
+        let (mut prepared, transaction) = prepare_unborn(directory.path(), "uncertain");
+        prepared.commit_repository_bootstrap(&transaction).unwrap();
+        let staging_root = prepared.layout.root().to_path_buf();
+
+        let error = publish_repository_layout_with_hook(prepared, &final_kin, |published| {
+            std::fs::remove_file(published.join("manifest.json")).unwrap();
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            KinError::RepositoryPublishedButUncertain { .. }
+        ));
+        assert!(final_kin.exists());
+        assert!(!staging_root.exists());
+    }
+
+    #[test]
+    fn publish_never_replaces_a_destination_created_after_preparation() {
+        let directory = tempfile::tempdir().unwrap();
+        let working_dir = directory.path().canonicalize().unwrap();
+        let final_kin = working_dir.join(".kin");
+        let (mut prepared, transaction) = prepare_unborn(directory.path(), "collision");
+        prepared.commit_repository_bootstrap(&transaction).unwrap();
+        let staging_root = prepared.layout.root().to_path_buf();
+
+        std::fs::create_dir(&final_kin).unwrap();
+        let sentinel = final_kin.join("belongs-to-another-process");
+        std::fs::write(&sentinel, b"do not replace").unwrap();
+        let error = publish_repository_layout(prepared, &final_kin).unwrap_err();
+
+        assert!(matches!(error, KinError::Io { .. }));
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"do not replace");
+        assert!(!staging_root.exists());
     }
 
     #[test]

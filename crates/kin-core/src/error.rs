@@ -27,6 +27,12 @@ pub enum KinError {
     #[error("already initialized: {0}")]
     AlreadyInitialized(String),
 
+    #[error(
+        "repository was published at {path}, but durability or final verification is uncertain: \
+         {detail}. Do not reinitialize or delete it; reopen and verify the existing repository"
+    )]
+    RepositoryPublishedButUncertain { path: String, detail: String },
+
     #[error("not a kin repository: {0}")]
     NotARepository(String),
 
