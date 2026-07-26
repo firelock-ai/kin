@@ -13,13 +13,13 @@ use crate::state::{
     RequestGraphAuthority, LOCATE_RANKING_CACHE_CAP,
 };
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
+use kin_db::{LocalFileBackend, RepositoryAuthorityManager, StorageBackend};
 use kin_model::session::{Intent, IntentScope, IntentSummary, LockType};
 use kin_model::{
     ChangeStore, ContractId, EntityId, EntityStore, FilePathId, GraphNodeId, IntentId, RepoPath,
@@ -35,6 +35,7 @@ use uuid::Uuid;
 
 static BOOTSTRAP_EXPORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 static EXACT_SOURCE_ARCHIVE_EXPORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+const REPOSITORY_TRANSFER_HTTP_BODY_LIMIT: usize = 24 * 1024 * 1024;
 
 fn exact_source_archive_exports() -> Arc<tokio::sync::Semaphore> {
     Arc::clone(
@@ -874,6 +875,20 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/repos/{repo_id}/files", get(repo_files))
         .route("/repos/{repo_id}/refs", get(repo_refs))
         .route("/repos/{repo_id}/history", get(repo_history))
+        .route(
+            "/repos/{repo_id}/transfer/status",
+            post(repo_transfer_status),
+        )
+        .route(
+            "/repos/{repo_id}/transfer/export",
+            post(repo_transfer_export)
+                .layer(DefaultBodyLimit::max(REPOSITORY_TRANSFER_HTTP_BODY_LIMIT)),
+        )
+        .route(
+            "/repos/{repo_id}/transfer/receive",
+            post(repo_transfer_receive)
+                .layer(DefaultBodyLimit::max(REPOSITORY_TRANSFER_HTTP_BODY_LIMIT)),
+        )
         .route(
             "/repos/{repo_id}/archive/tar/{source_change_id}",
             get(repo_exact_source_tar_gz),
@@ -5969,6 +5984,159 @@ fn short_ref_name(name: &kin_model::RefName) -> String {
     name.to_string()
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepositoryTransferStatusRequest {
+    destination_ref: kin_model::RefName,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepositoryTransferExportRequest {
+    source_ref: kin_model::RefName,
+    expectation: kin_remote::repository_transfer::RepositoryTransferExpectation,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepositoryTransferReceiveRequest {
+    destination_ref: kin_model::RefName,
+    pack: kin_remote::repository_transfer::RepositoryTransferPack,
+}
+
+fn repository_transfer_authority(
+    state: &DaemonState,
+    repo_id: &str,
+) -> Result<(RepositoryId, RepositoryAuthorityManager<dyn StorageBackend>), (StatusCode, String)> {
+    if let Some(allowed) = &state.allowed_repo_ids {
+        if !allowed.contains(repo_id) {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("repository {repo_id} is not admitted by this daemon"),
+            ));
+        }
+    }
+    let repository_id = RepositoryId::new(repo_id.to_string()).map_err(|error| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("invalid repository identity: {error}"),
+        )
+    })?;
+    let backend: Arc<dyn StorageBackend> = if let Some(backend) = &state.storage_backend {
+        Arc::clone(backend)
+    } else if repo_id == state.cached_repo_id {
+        Arc::new(LocalFileBackend::new(state.layout.kindb_dir()))
+    } else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("repository {repo_id} is unavailable in local daemon mode"),
+        ));
+    };
+    let authority = RepositoryAuthorityManager::open(repository_id.clone(), backend)
+        .map_err(repository_authority_error)?;
+    Ok((repository_id, authority))
+}
+
+fn repository_transfer_error(
+    error: kin_remote::repository_transfer::RepositoryTransferError,
+) -> (StatusCode, String) {
+    use kin_remote::repository_transfer::RepositoryTransferError;
+    let status = match error {
+        RepositoryTransferError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        RepositoryTransferError::Conflict(_) => StatusCode::CONFLICT,
+        RepositoryTransferError::Storage(_) => StatusCode::FAILED_DEPENDENCY,
+    };
+    (status, error.to_string())
+}
+
+/// POST /repos/{repo_id}/transfer/status — exact destination lease and
+/// negotiated repository-v6 transfer capability.
+async fn repo_transfer_status(
+    Path(repo_id): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<RepositoryTransferStatusRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let (repository_id, authority) = repository_transfer_authority(&state, &repo_id)?;
+    let status = kin_remote::repository_transfer::repository_transfer_status(
+        &authority,
+        &repository_id,
+        &request.destination_ref,
+    )
+    .map_err(repository_transfer_error)?;
+    Ok(Json(status))
+}
+
+/// POST /repos/{repo_id}/transfer/export — build a pull/push pack from one
+/// coherent source authority lease and immutable CAS.
+async fn repo_transfer_export(
+    Path(repo_id): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<RepositoryTransferExportRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let (repository_id, authority) = repository_transfer_authority(&state, &repo_id)?;
+    if request.expectation.repository_id != repository_id {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "transfer expectation belongs to {}, not route repository {}",
+                request.expectation.repository_id, repository_id
+            ),
+        ));
+    }
+    let pack = kin_remote::repository_transfer::build_repository_transfer_pack(
+        &authority,
+        &request.source_ref,
+        &request.expectation,
+    )
+    .map_err(repository_transfer_error)?;
+    Ok(Json(pack))
+}
+
+/// POST /repos/{repo_id}/transfer/receive — validate and publish one exact
+/// fast-forward repository transaction. Actor provenance is the authenticated
+/// daemon/control-plane receiver itself; no caller-provided actor field exists
+/// on this authority payload.
+async fn repo_transfer_receive(
+    Path(repo_id): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<RepositoryTransferReceiveRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let (repository_id, authority) = repository_transfer_authority(&state, &repo_id)?;
+    let receipt = kin_remote::repository_transfer::apply_repository_transfer_pack(
+        &authority,
+        &repository_id,
+        &request.destination_ref,
+        kin_model::AuthorId::new("kin-daemon:repository-transfer-receiver"),
+        &request.pack,
+    )
+    .map_err(repository_transfer_error)?;
+
+    // Repository authority is already durable. Refresh only derived daemon
+    // views after that receipt exists; a failure here cannot revoke or fake
+    // the committed transfer.
+    if state.storage_backend.is_some() {
+        state.repo_graphs.write().await.remove(&repo_id);
+    } else if receipt.outcome
+        == kin_remote::repository_transfer::RepositoryTransferApplyOutcome::Committed
+    {
+        // An idempotent replay already updated these derived local views on
+        // the original request. Reapplying them would make the receipt path
+        // spuriously fail after authority had correctly returned its replay.
+        state
+            .record_repository_authority_commit(receipt.authority_receipt.generation)
+            .map_err(repository_commit_error)?;
+        for change in &request.pack.changes {
+            state.graph.create_change(change).map_err(internal_error)?;
+        }
+        state.bump_version();
+        state.emit_event(DaemonEvent::GraphRootChanged {
+            old_root_hash: None,
+            new_root_hash: request.pack.source_head.to_string(),
+        });
+    }
+    Ok(Json(receipt))
+}
+
 /// GET /repos — list all repos available in storage.
 ///
 /// In cloud mode this discovers repos from GCS (bucket listing), so it
@@ -9059,6 +9227,47 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let layout = kin_core::init(&dir).unwrap().layout;
         Arc::new(DaemonState::open(layout).unwrap())
+    }
+
+    #[tokio::test]
+    async fn repository_transfer_status_preserves_non_utf8_ref_bytes_and_gates_push() {
+        let state = test_state();
+        let repository_id = state.cached_repo_id.clone();
+        let destination_ref =
+            kin_model::RefName::from_bytes(b"refs/heads/raw-\xff".to_vec()).unwrap();
+        let request_body = serde_json::to_vec(&serde_json::json!({
+            "destination_ref": destination_ref,
+        }))
+        .unwrap();
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post(format!("/repos/{repository_id}/transfer/status"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let status: kin_remote::repository_transfer::RepositoryTransferStatus =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(status.destination_ref, destination_ref);
+        assert!(!status.push_apply_ready);
+        assert!(status.bounded_envelope_export_ready);
+        assert!(!status.pull_apply_ready);
+    }
+
+    #[test]
+    fn repository_transfer_receive_has_no_caller_actor_field() {
+        let forged = serde_json::json!({
+            "destination_ref": { "bytes_hex": "726566732f68656164732f6d61696e" },
+            "actor": "forged@example.com",
+            "pack": {},
+        });
+        assert!(serde_json::from_value::<RepositoryTransferReceiveRequest>(forged).is_err());
     }
 
     #[tokio::test]
