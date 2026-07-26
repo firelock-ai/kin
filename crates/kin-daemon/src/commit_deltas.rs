@@ -300,7 +300,7 @@ mod tests {
 
     use kin_blobs::BlobStore;
     use kin_model::{
-        ArtifactDeltaKind, AuthorId, EntityKind, EntityMetadata, FingerprintAlgorithm, LanguageId,
+        AuthorId, EntityKind, EntityMetadata, FingerprintAlgorithm, LanguageId,
         SemanticFingerprint, Timestamp, Visibility,
     };
 
@@ -343,7 +343,7 @@ mod tests {
         graph: &InMemoryGraph,
         entity_deltas: Vec<EntityDelta>,
         relation_deltas: Vec<RelationDelta>,
-        artifact_deltas: Vec<ArtifactDelta>,
+        tree_deltas: Vec<TreeDelta>,
         parent: &SemanticChangeId,
         branch: &str,
     ) -> SemanticChangeId {
@@ -355,7 +355,7 @@ mod tests {
             timestamp: Timestamp::now(),
             entity_deltas,
             relation_deltas,
-            artifact_deltas,
+            tree_deltas,
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -398,7 +398,7 @@ mod tests {
         let entity = make_entity("my_fn", "src/lib.rs", [1; 32]);
         graph.upsert_entity(&entity).unwrap();
 
-        // No files on disk; artifact deltas will be empty.
+        // No files on disk; tree deltas will be empty.
         let deltas = compute_deltas_vs_last_commit(&graph, &blobs, &layout, &genesis.id).unwrap();
 
         assert_eq!(
@@ -452,7 +452,7 @@ mod tests {
             deltas.entity_deltas.is_empty(),
             "no entity changes since the commit — deltas must be empty"
         );
-        assert!(deltas.artifact_deltas.is_empty());
+        assert!(deltas.tree_deltas.is_empty());
     }
 
     /// A fingerprint change on an existing committed entity produces a Modified
@@ -544,11 +544,11 @@ mod tests {
         );
     }
 
-    // ── Artifact delta tests ─────────────────────────────────────────────
+    // ── Exact tree delta tests ───────────────────────────────────────────
 
     /// A new file on disk that was not in the last commit appears as Added.
     #[test]
-    fn new_file_on_disk_appears_as_added_artifact_delta() {
+    fn new_file_on_disk_appears_as_added_tree_delta() {
         let tmp = tempfile::tempdir().unwrap();
         let init = kin_core::init(tmp.path()).unwrap();
         let layout = init.layout;
@@ -572,20 +572,30 @@ mod tests {
         let deltas = compute_deltas_vs_last_commit(&graph, &blobs, &layout, &genesis.id).unwrap();
 
         assert!(
-            !deltas.artifact_deltas.is_empty(),
-            "new file must produce artifact delta"
+            !deltas.tree_deltas.is_empty(),
+            "new file must produce a tree delta"
         );
         let added = deltas
-            .artifact_deltas
+            .tree_deltas
             .iter()
-            .filter(|d| d.kind == ArtifactDeltaKind::AddedRegularFile)
+            .filter_map(|delta| match delta {
+                TreeDelta::Added {
+                    new_entry:
+                        TreeEntry {
+                            kind: TreeEntryKind::Regular { executable: false },
+                            ..
+                        },
+                    ..
+                } => Some(()),
+                _ => None,
+            })
             .count();
-        assert!(added >= 1, "at least one Added artifact delta expected");
+        assert!(added >= 1, "at least one Added tree delta expected");
     }
 
     /// A file whose content changed since the last commit appears as Modified.
     #[test]
-    fn changed_file_appears_as_modified_artifact_delta() {
+    fn changed_file_appears_as_modified_tree_delta() {
         let tmp = tempfile::tempdir().unwrap();
         let init = kin_core::init(tmp.path()).unwrap();
         let layout = init.layout;
@@ -614,11 +624,9 @@ mod tests {
             &graph,
             vec![],
             vec![],
-            vec![ArtifactDelta {
+            vec![TreeDelta::Added {
                 file_id: file_id.clone(),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(old_hash),
+                new_entry: TreeEntry::regular(old_hash, false),
             }],
             &genesis.id,
             "main",
@@ -629,25 +637,27 @@ mod tests {
 
         let deltas = compute_deltas_vs_last_commit(&graph, &blobs, &layout, &head).unwrap();
 
-        let modified: Vec<_> = deltas
-            .artifact_deltas
+        let (old_entry, new_entry) = deltas
+            .tree_deltas
             .iter()
-            .filter(|d| d.kind == ArtifactDeltaKind::ModifiedRegularFile && d.file_id == file_id)
-            .collect();
-        assert!(
-            !modified.is_empty(),
-            "changed file must produce a Modified artifact delta"
-        );
-        assert_eq!(
-            modified[0].old_hash,
-            Some(old_hash),
-            "old hash must be the previously committed hash"
-        );
+            .find_map(|delta| match delta {
+                TreeDelta::Modified {
+                    file_id: delta_file_id,
+                    old_entry,
+                    new_entry,
+                } if delta_file_id == &file_id => Some((old_entry, new_entry)),
+                _ => None,
+            })
+            .expect("changed file must produce a Modified tree delta");
+        assert_eq!(old_entry.blob_hash, old_hash);
+        assert_eq!(old_entry.kind, TreeEntryKind::Regular { executable: false });
+        assert_ne!(new_entry.blob_hash, old_hash);
+        assert_eq!(new_entry.kind, TreeEntryKind::Regular { executable: false });
     }
 
     /// A file that was committed but no longer exists on disk appears as Removed.
     #[test]
-    fn deleted_file_appears_as_removed_artifact_delta() {
+    fn deleted_file_appears_as_removed_tree_delta() {
         let tmp = tempfile::tempdir().unwrap();
         let init = kin_core::init(tmp.path()).unwrap();
         let layout = init.layout;
@@ -672,11 +682,9 @@ mod tests {
             &graph,
             vec![],
             vec![],
-            vec![ArtifactDelta {
+            vec![TreeDelta::Added {
                 file_id: file_id.clone(),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(committed_hash),
+                new_entry: TreeEntry::regular(committed_hash, false),
             }],
             &genesis.id,
             "main",
@@ -685,20 +693,23 @@ mod tests {
         // File is NOT present on disk — simulate deletion.
         let deltas = compute_deltas_vs_last_commit(&graph, &blobs, &layout, &head).unwrap();
 
-        let removed: Vec<_> = deltas
-            .artifact_deltas
+        let old_entry = deltas
+            .tree_deltas
             .iter()
-            .filter(|d| d.kind == ArtifactDeltaKind::Removed && d.file_id == file_id)
-            .collect();
-        assert!(
-            !removed.is_empty(),
-            "deleted file must produce a Removed artifact delta"
-        );
+            .find_map(|delta| match delta {
+                TreeDelta::Removed {
+                    file_id: delta_file_id,
+                    old_entry,
+                } if delta_file_id == &file_id => Some(old_entry),
+                _ => None,
+            })
+            .expect("deleted file must produce a Removed tree delta");
+        assert_eq!(*old_entry, TreeEntry::regular(committed_hash, false));
     }
 
     #[cfg(unix)]
     #[test]
-    fn artifact_deltas_preserve_modes_symlinks_and_mode_only_changes() {
+    fn tree_deltas_preserve_modes_symlinks_and_mode_only_changes() {
         use std::os::unix::fs::{symlink, PermissionsExt};
 
         let tmp = tempfile::tempdir().unwrap();
@@ -727,29 +738,38 @@ mod tests {
         symlink("plain.txt", source.join("current")).unwrap();
 
         let initial = compute_deltas_vs_last_commit(&graph, &blobs, &layout, &genesis.id).unwrap();
-        let kinds: std::collections::BTreeMap<_, _> = initial
-            .artifact_deltas
+        let entries: std::collections::BTreeMap<_, _> = initial
+            .tree_deltas
             .iter()
-            .map(|delta| (delta.file_id.0.as_str(), delta.kind))
+            .filter_map(|delta| match delta {
+                TreeDelta::Added { file_id, new_entry } => Some((file_id.0.as_str(), *new_entry)),
+                _ => None,
+            })
             .collect();
         assert_eq!(
-            kinds.get("plain.txt"),
-            Some(&ArtifactDeltaKind::AddedRegularFile)
+            entries.get("plain.txt").map(|entry| entry.kind),
+            Some(TreeEntryKind::Regular { executable: false })
         );
         assert_eq!(
-            kinds.get("bin/run"),
-            Some(&ArtifactDeltaKind::AddedExecutableFile)
+            entries.get("bin/run").map(|entry| entry.kind),
+            Some(TreeEntryKind::Regular { executable: true })
         );
-        assert_eq!(kinds.get("current"), Some(&ArtifactDeltaKind::AddedSymlink));
+        assert_eq!(
+            entries.get("current").map(|entry| entry.kind),
+            Some(TreeEntryKind::Symlink)
+        );
         let link = initial
-            .artifact_deltas
+            .tree_deltas
             .iter()
-            .find(|delta| delta.file_id.0 == "current")
+            .find_map(|delta| match delta {
+                TreeDelta::Added { file_id, new_entry } if file_id.0 == "current" => {
+                    Some(*new_entry)
+                }
+                _ => None,
+            })
             .unwrap();
         assert_eq!(
-            blobs
-                .read(&kin_blobs::Hash256(link.new_hash.unwrap().0))
-                .unwrap(),
+            blobs.read(&kin_blobs::Hash256(link.blob_hash.0)).unwrap(),
             b"plain.txt"
         );
 
@@ -757,7 +777,7 @@ mod tests {
             &graph,
             vec![],
             vec![],
-            initial.artifact_deltas,
+            initial.tree_deltas,
             &genesis.id,
             "main",
         );
@@ -767,65 +787,24 @@ mod tests {
         std::fs::set_permissions(&regular, permissions).unwrap();
 
         let mode_only = compute_deltas_vs_last_commit(&graph, &blobs, &layout, &head).unwrap();
-        assert_eq!(mode_only.artifact_deltas.len(), 1);
+        assert_eq!(mode_only.tree_deltas.len(), 1);
+        let TreeDelta::Modified {
+            file_id,
+            old_entry,
+            new_entry,
+        } = &mode_only.tree_deltas[0]
+        else {
+            panic!("mode-only change must be Modified");
+        };
+        assert_eq!(file_id.0, "plain.txt");
         assert_eq!(
-            mode_only.artifact_deltas[0].kind,
-            ArtifactDeltaKind::ModifiedExecutableFile
-        );
-        assert_eq!(mode_only.artifact_deltas[0].file_id.0, "plain.txt");
-        assert_eq!(
-            mode_only.artifact_deltas[0].old_hash,
-            Some(Hash256::from_bytes(plain_hash.0))
+            *old_entry,
+            TreeEntry::regular(Hash256::from_bytes(plain_hash.0), false)
         );
         assert_eq!(
-            mode_only.artifact_deltas[0].old_hash,
-            mode_only.artifact_deltas[0].new_hash
+            *new_entry,
+            TreeEntry::regular(Hash256::from_bytes(plain_hash.0), true)
         );
-    }
-
-    #[test]
-    fn unchanged_legacy_file_emits_exact_mode_backfill() {
-        let tmp = tempfile::tempdir().unwrap();
-        let init = kin_core::init(tmp.path()).unwrap();
-        let layout = init.layout;
-        let graph = Arc::new(kin_db::InMemoryGraph::new());
-        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
-        let genesis = kin_core::build_genesis_change();
-        graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
-
-        let source = kin_core::source_dir(&layout);
-        std::fs::create_dir_all(&source).unwrap();
-        let content = b"legacy bytes\n";
-        std::fs::write(source.join("legacy.txt"), content).unwrap();
-        let hash = Hash256::from_bytes(blobs.write(content).unwrap().0);
-        let head = record_commit(
-            &graph,
-            vec![],
-            vec![],
-            vec![ArtifactDelta {
-                file_id: FilePathId::new("legacy.txt"),
-                kind: ArtifactDeltaKind::Added,
-                old_hash: None,
-                new_hash: Some(hash),
-            }],
-            &genesis.id,
-            "main",
-        );
-
-        let backfill = compute_deltas_vs_last_commit(&graph, &blobs, &layout, &head).unwrap();
-        assert_eq!(backfill.artifact_deltas.len(), 1);
-        assert_eq!(
-            backfill.artifact_deltas[0].kind,
-            ArtifactDeltaKind::ModifiedRegularFile
-        );
-        assert_eq!(backfill.artifact_deltas[0].old_hash, Some(hash));
-        assert_eq!(backfill.artifact_deltas[0].new_hash, Some(hash));
     }
 
     // ── End-to-end: zero deltas after recording current state ─────────────
@@ -868,11 +847,9 @@ mod tests {
             &graph,
             vec![EntityDelta::Added(entity.clone())],
             vec![],
-            vec![ArtifactDelta {
+            vec![TreeDelta::Added {
                 file_id,
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(hash),
+                new_entry: TreeEntry::regular(hash, false),
             }],
             &genesis.id,
             "main",
@@ -887,9 +864,9 @@ mod tests {
             deltas.entity_deltas.len()
         );
         assert!(
-            deltas.artifact_deltas.is_empty(),
+            deltas.tree_deltas.is_empty(),
             "no file changes: expected 0, got {}",
-            deltas.artifact_deltas.len()
+            deltas.tree_deltas.len()
         );
         assert!(
             deltas.relation_deltas.is_empty(),
