@@ -227,7 +227,13 @@ pub fn init(working_dir: &Path) -> Result<InitResult> {
 
     let config = KinConfig::default();
     let manifest = KinManifest::new();
-    let staging_dir = canonical_working_dir.join(format!(".kin.init-{}", uuid::Uuid::new_v4()));
+    let staging_parent = canonical_working_dir.parent().ok_or_else(|| {
+        KinError::Other(format!(
+            "repository root has no parent for atomic staging: {}",
+            canonical_working_dir.display()
+        ))
+    })?;
+    let staging_dir = staging_parent.join(format!(".kin.init-{}", uuid::Uuid::new_v4()));
     let mut prepared = prepare_repository_layout_at(&staging_dir, config, manifest)?;
     let transaction = build_repository_bootstrap_transaction(
         prepared.initial_roots().clone(),
@@ -372,11 +378,15 @@ fn publish_repository_layout_with_hook(
     prepared.cleanup_armed = false;
     after_rename(final_kin_dir);
 
-    let parent_sync = sync_parent_directory(
-        final_kin_dir
-            .parent()
-            .expect("validated final .kin path always has a parent"),
-    );
+    let source_parent = prepared
+        .layout
+        .root()
+        .parent()
+        .expect("validated staged path always has a parent");
+    let destination_parent = final_kin_dir
+        .parent()
+        .expect("validated final .kin path always has a parent");
+    let parent_sync = sync_publication_parents(source_parent, destination_parent);
     let layout = KinLayout::new(final_kin_dir.to_path_buf());
     let final_verification = verify_repository_layout(
         &layout,
@@ -825,11 +835,13 @@ fn validate_publish_destination(layout: &KinLayout, final_kin_dir: &Path) -> Res
     let final_parent = final_parent
         .canonicalize()
         .map_err(|error| KinError::io(final_parent, error))?;
-    if stage_parent != final_parent || final_parent.join(".kin") != final_kin_dir {
+    if final_parent.join(".kin") != final_kin_dir || layout.root() == final_kin_dir {
         return Err(KinError::Other(
-            "staged and published repository directories must be canonical siblings".to_string(),
+            "published repository path must be the canonical .kin child of its repository root"
+                .to_string(),
         ));
     }
+    validate_same_filesystem(&stage_parent, &final_parent)?;
     let metadata = std::fs::symlink_metadata(layout.root())
         .map_err(|error| KinError::io(layout.root(), error))?;
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
@@ -879,6 +891,37 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
         .map_err(|error| KinError::io(path, error))
 }
 
+fn sync_publication_parents(source_parent: &Path, destination_parent: &Path) -> Result<()> {
+    sync_parent_directory(source_parent)?;
+    if source_parent != destination_parent {
+        sync_parent_directory(destination_parent)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_same_filesystem(source_parent: &Path, destination_parent: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let source =
+        std::fs::metadata(source_parent).map_err(|error| KinError::io(source_parent, error))?;
+    let destination = std::fs::metadata(destination_parent)
+        .map_err(|error| KinError::io(destination_parent, error))?;
+    if source.dev() != destination.dev() {
+        return Err(KinError::Other(
+            "staged and published repository directories must be on the same filesystem"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_same_filesystem(_source_parent: &Path, _destination_parent: &Path) -> Result<()> {
+    // MoveFileExW below fails before mutation when the paths span volumes.
+    Ok(())
+}
+
 #[cfg(windows)]
 fn sync_parent_directory(_path: &Path) -> Result<()> {
     // MoveFileExW(MOVEFILE_WRITE_THROUGH) below flushes the namespace move.
@@ -900,15 +943,20 @@ fn sync_parent_directory(_path: &Path) -> Result<()> {
     target_os = "redox"
 ))]
 fn rename_directory_noreplace(source: &Path, destination: &Path) -> Result<()> {
-    let parent_path = source.parent().expect("validated source has a parent");
-    let parent =
-        std::fs::File::open(parent_path).map_err(|error| KinError::io(parent_path, error))?;
+    let source_parent_path = source.parent().expect("validated source has a parent");
+    let destination_parent_path = destination
+        .parent()
+        .expect("validated destination has a parent");
+    let source_parent = std::fs::File::open(source_parent_path)
+        .map_err(|error| KinError::io(source_parent_path, error))?;
+    let destination_parent = std::fs::File::open(destination_parent_path)
+        .map_err(|error| KinError::io(destination_parent_path, error))?;
     rustix::fs::renameat_with(
-        &parent,
+        &source_parent,
         source
             .file_name()
             .expect("validated staged source has a file name"),
-        &parent,
+        &destination_parent,
         destination
             .file_name()
             .expect("validated destination has a file name"),
@@ -1149,6 +1197,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reopened.load_source_blob(digest).unwrap().unwrap(), body);
+    }
+
+    #[test]
+    fn publish_atomically_moves_an_external_same_filesystem_stage() {
+        let container = tempfile::tempdir().unwrap();
+        let repository = container.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        let repository = repository.canonicalize().unwrap();
+        let staging_root = container
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join(".kin.init-external-stage");
+        let mut prepared =
+            prepare_repository_layout_at(&staging_root, KinConfig::default(), KinManifest::new())
+                .unwrap();
+        let transaction = build_repository_bootstrap_transaction(
+            prepared.initial_roots().clone(),
+            prepared.repository_id().clone(),
+            prepared.workspace_id(),
+            prepared.default_ref().clone(),
+            SharedAdmissionPolicy::empty(0),
+            None,
+        )
+        .unwrap();
+        prepared.commit_repository_bootstrap(&transaction).unwrap();
+
+        let published = publish_repository_layout(prepared, &repository.join(".kin")).unwrap();
+
+        assert_eq!(published.layout.root(), repository.join(".kin"));
+        assert!(!staging_root.exists());
     }
 
     #[test]
