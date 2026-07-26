@@ -1085,6 +1085,7 @@ mod tests {
         assert!(recovered
             .snapshot
             .resolved_tree
-            .contains_key("concurrent.rs"));
+            .artifact_id_at_path(&crate::types::RepoPath::from_utf8("concurrent.rs").unwrap())
+            .is_some());
     }
 }

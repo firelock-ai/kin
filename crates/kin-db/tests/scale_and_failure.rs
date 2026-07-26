@@ -152,7 +152,7 @@ fn generate_snapshot(n: usize, rels_per_entity: usize) -> (GraphSnapshot, Vec<En
 fn scale_100k_entities() {
     let (snapshot, entity_ids) = generate_snapshot(100_000, 2);
     let start = Instant::now();
-    let graph = InMemoryGraph::from_snapshot(snapshot);
+    let graph = InMemoryGraph::from_snapshot(snapshot).unwrap();
     let hydrate_time = start.elapsed();
 
     // Hydration smoke guard (not a perf benchmark): catches gross regressions
@@ -218,7 +218,7 @@ fn save_reload_no_drift_100_cycles() {
 
     // Save initial snapshot.
     {
-        let graph = InMemoryGraph::from_snapshot(initial_snapshot);
+        let graph = InMemoryGraph::from_snapshot(initial_snapshot).unwrap();
         let mgr = SnapshotManager::new(&path);
         mgr.swap(graph);
         mgr.save().unwrap();

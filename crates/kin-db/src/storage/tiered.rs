@@ -216,7 +216,7 @@ impl TieredGraph {
         if estimated_in_memory <= hot_budget {
             // Fits in memory — full load
             let snapshot = load_snapshot_from_disk(&path)?;
-            let graph = hydrate_graph(snapshot);
+            let graph = hydrate_graph(snapshot)?;
             Ok(Self {
                 hot: Arc::new(graph),
                 _cold_mmap: RwLock::new(None),
@@ -473,7 +473,7 @@ fn name_match_rank(name: &str, pattern: &str) -> u8 {
 }
 
 /// Hydrate a full InMemoryGraph from a snapshot.
-fn hydrate_graph(snapshot: GraphSnapshot) -> InMemoryGraph {
+fn hydrate_graph(snapshot: GraphSnapshot) -> Result<InMemoryGraph, KinDbError> {
     InMemoryGraph::from_snapshot(snapshot)
 }
 

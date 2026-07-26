@@ -328,10 +328,20 @@ mod tests {
         // Re-insert updated entities for a.rs.
         let e_a2 = test_entity("fn_a_v2", "src/a.rs");
         let rel2 = test_relation(e_a2.id, e_c.id, RelationKind::Calls);
-
-        graph.upsert_entity(&e_a2).unwrap();
-        graph.upsert_relation(&rel2).unwrap();
-        graph.admit_artifact_for_test("src/a.rs", make_entry(10));
+        let artifact_id = graph
+            .artifact_id_at_path(&path("src/a.rs"))
+            .expect("the old exact artifact remains admitted");
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![EntityDelta::Added(e_a2.clone())],
+                relation_deltas: vec![RelationDelta::Added(rel2)],
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: LocatedEntry::new(path("src/a.rs"), make_entry(1)),
+                    new: LocatedEntry::new(path("src/a.rs"), make_entry(10)),
+                }],
+            })
+            .unwrap();
 
         assert_eq!(graph.entity_count(), 2);
         assert_eq!(graph.relation_count(), 1);

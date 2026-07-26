@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use hashbrown::HashMap as FastHashMap;
-use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::de::{IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -119,133 +119,12 @@ pub(crate) struct LocateGraphSnapshot {
     pub entities: FastHashMap<EntityId, Entity>,
     pub relations: FastHashMap<RelationId, Relation>,
     pub changes: FastHashMap<SemanticChangeId, SemanticChange>,
+    pub entity_revisions: FastHashMap<EntityId, Vec<EntityRevision>>,
     pub shallow_files: Vec<ShallowTrackedFile>,
     pub file_layouts: Vec<FileLayout>,
     pub structured_artifacts: Vec<StructuredArtifact>,
     pub opaque_artifacts: Vec<OpaqueArtifact>,
     pub resolved_tree: ResolvedTree,
-}
-
-fn relation_kind_used_by_locate(kind: RelationKind) -> bool {
-    matches!(
-        kind,
-        RelationKind::Calls
-            | RelationKind::Includes
-            | RelationKind::UsesMacro
-            | RelationKind::Imports
-            | RelationKind::References
-            | RelationKind::Implements
-            | RelationKind::Extends
-            | RelationKind::Contains
-            | RelationKind::Tests
-            | RelationKind::DependsOn
-            | RelationKind::CoChanges
-    )
-}
-
-struct FilteredLocateRelation(Option<Relation>);
-
-impl<'de> Deserialize<'de> for FilteredLocateRelation {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct FilteredLocateRelationVisitor;
-
-        impl<'de> Visitor<'de> for FilteredLocateRelationVisitor {
-            type Value = FilteredLocateRelation;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("Relation sequence")
-            }
-
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                let id = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
-                let kind = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
-
-                if !relation_kind_used_by_locate(kind) {
-                    for index in 2..8 {
-                        let _: IgnoredAny = seq
-                            .next_element()?
-                            .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
-                    }
-                    while let Some(_) = seq.next_element::<IgnoredAny>()? {}
-                    return Ok(FilteredLocateRelation(None));
-                }
-
-                let src = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
-                let dst = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(3, &self))?;
-                let confidence = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(4, &self))?;
-                let origin = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(5, &self))?;
-                let created_in = seq.next_element()?.unwrap_or(None);
-                let import_source = seq.next_element()?.unwrap_or(None);
-                while let Some(_) = seq.next_element::<IgnoredAny>()? {}
-
-                Ok(FilteredLocateRelation(Some(Relation {
-                    id,
-                    kind,
-                    src,
-                    dst,
-                    confidence,
-                    origin,
-                    created_in,
-                    import_source,
-                    evidence: Vec::new(),
-                })))
-            }
-        }
-
-        deserializer.deserialize_seq(FilteredLocateRelationVisitor)
-    }
-}
-
-struct FilteredLocateRelationMap(FastHashMap<RelationId, Relation>);
-
-impl<'de> Deserialize<'de> for FilteredLocateRelationMap {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct FilteredLocateRelationMapVisitor;
-
-        impl<'de> Visitor<'de> for FilteredLocateRelationMapVisitor {
-            type Value = FilteredLocateRelationMap;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("relation map")
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut relations = FastHashMap::with_capacity(map.size_hint().unwrap_or(0));
-                while let Some(_relation_id) = map.next_key::<RelationId>()? {
-                    if let Some(relation) = map.next_value::<FilteredLocateRelation>()?.0 {
-                        relations.insert(relation.id, relation);
-                    }
-                }
-                Ok(FilteredLocateRelationMap(relations))
-            }
-        }
-
-        deserializer.deserialize_map(FilteredLocateRelationMapVisitor)
-    }
 }
 
 impl GraphSnapshot {
@@ -822,7 +701,7 @@ impl LocateGraphSnapshot {
         })
     }
 
-    fn validate_storage_admission(&self) -> Result<(), crate::error::KinDbError> {
+    pub(crate) fn validate_storage_admission(&self) -> Result<(), crate::error::KinDbError> {
         validate_semantic_change_entries(self.changes.iter(), "locate snapshot")?;
         self.validate_enrichment_admission()
     }
@@ -877,6 +756,7 @@ impl From<GraphSnapshot> for LocateGraphSnapshot {
             entities: value.entities.into_iter().collect(),
             relations: value.relations.into_iter().collect(),
             changes: value.changes.into_iter().collect(),
+            entity_revisions: value.entity_revisions.into_iter().collect(),
             shallow_files: value.shallow_files,
             file_layouts: value.file_layouts,
             structured_artifacts: value.structured_artifacts,
@@ -893,6 +773,7 @@ impl From<LocateGraphSnapshot> for GraphSnapshot {
         snapshot.entities = value.entities.into_iter().collect();
         snapshot.relations = value.relations.into_iter().collect();
         snapshot.changes = value.changes.into_iter().collect();
+        snapshot.entity_revisions = value.entity_revisions.into_iter().collect();
         snapshot.shallow_files = value.shallow_files;
         snapshot.file_layouts = value.file_layouts;
         snapshot.structured_artifacts = value.structured_artifacts;
@@ -920,6 +801,55 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
             where
                 A: SeqAccess<'de>,
             {
+                // The locate cache persists the compact ten-field projection,
+                // while mmap cold-open decodes the canonical 34-field graph
+                // snapshot directly. Both are current formats; distinguish
+                // them by their explicit MessagePack sequence width.
+                if seq.size_hint() == Some(10) {
+                    let version = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                    let entities = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                    let relations = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+                    let changes = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(3, &self))?;
+                    let entity_revisions = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(4, &self))?;
+                    let shallow_files = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(5, &self))?;
+                    let file_layouts = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(6, &self))?;
+                    let structured_artifacts = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(7, &self))?;
+                    let opaque_artifacts = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(8, &self))?;
+                    let resolved_tree = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(9, &self))?;
+                    return Ok(LocateGraphSnapshot {
+                        version,
+                        entities,
+                        relations,
+                        changes,
+                        entity_revisions,
+                        shallow_files,
+                        file_layouts,
+                        structured_artifacts,
+                        opaque_artifacts,
+                        resolved_tree,
+                    });
+                }
+
                 let version = seq
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
@@ -929,7 +859,6 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                 let relations = seq
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
-                let FilteredLocateRelationMap(relations) = relations;
 
                 let _: IgnoredAny = seq
                     .next_element()?
@@ -965,17 +894,21 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(29, &self))?;
 
-                for index in 30..34 {
+                for index in 30..33 {
                     let _: IgnoredAny = seq
                         .next_element()?
                         .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
                 }
+                let entity_revisions = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(33, &self))?;
 
                 Ok(LocateGraphSnapshot {
                     version,
                     entities,
                     relations,
                     changes,
+                    entity_revisions,
                     shallow_files,
                     file_layouts,
                     structured_artifacts,
@@ -1160,6 +1093,7 @@ impl<'a> BorrowedGraphSnapshot<'a> {
         &self,
         persisted_root_hash: Option<[u8; 32]>,
     ) -> Result<Vec<u8>, crate::error::KinDbError> {
+        self.validate_storage_admission()?;
         let body = rmp_serde::to_vec(self).map_err(|e| {
             crate::error::KinDbError::StorageError(format!("serialization failed: {e}"))
         })?;
@@ -1181,6 +1115,31 @@ impl<'a> BorrowedGraphSnapshot<'a> {
         }
 
         Ok(buf)
+    }
+
+    fn validate_storage_admission(&self) -> Result<(), crate::error::KinDbError> {
+        validate_semantic_change_entries(self.changes.iter(), "borrowed snapshot")?;
+        for file_id in self
+            .shallow_files
+            .keys()
+            .chain(self.file_layouts.keys())
+            .chain(self.structured_artifacts.keys())
+            .chain(self.opaque_artifacts.keys())
+        {
+            let path = RepoPath::from_utf8(&file_id.0).map_err(|error| {
+                crate::error::KinDbError::StorageError(format!(
+                    "semantic enrichment has invalid repository path {}: {error}",
+                    file_id.0
+                ))
+            })?;
+            if self.resolved_tree.artifact_id_at_path(&path).is_none() {
+                return Err(crate::error::KinDbError::StorageError(format!(
+                    "semantic enrichment exists without admitted repository identity at {}",
+                    file_id.0
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1297,6 +1256,17 @@ mod tests {
         let caller = test_entity("caller");
         let callee = test_entity("callee");
         let relation = test_relation(caller.id, callee.id);
+        let non_legacy_locate_relation = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::SendsMessage,
+            src: GraphNodeId::Entity(callee.id),
+            dst: GraphNodeId::Entity(caller.id),
+            confidence: 0.75,
+            origin: RelationOrigin::Inferred,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
         let change = seal_change(SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([9; 32])),
             parents: Vec::new(),
@@ -1317,9 +1287,17 @@ mod tests {
         snapshot.entities.insert(caller.id, caller.clone());
         snapshot.entities.insert(callee.id, callee.clone());
         snapshot.relations.insert(relation.id, relation.clone());
+        snapshot.relations.insert(
+            non_legacy_locate_relation.id,
+            non_legacy_locate_relation.clone(),
+        );
         snapshot.outgoing.insert(caller.id, vec![relation.id]);
         snapshot.incoming.insert(callee.id, vec![relation.id]);
         snapshot.changes.insert(change.id, change.clone());
+        snapshot.entity_revisions =
+            kin_model::graph::derive_entity_revisions_from_changes(vec![change.clone()])
+                .into_iter()
+                .collect();
         let file_id = FilePathId::new("src/main.rs");
         let assigned_artifact_id = ArtifactId::new();
         snapshot.shallow_files.push(ShallowTrackedFile {
@@ -1348,8 +1326,16 @@ mod tests {
 
         assert_eq!(decoded_root_hash, Some(persisted_root_hash));
         assert_eq!(locate_snapshot.entities.len(), 2);
-        assert_eq!(locate_snapshot.relations.len(), 1);
+        assert_eq!(locate_snapshot.relations.len(), 2);
+        assert_eq!(
+            locate_snapshot
+                .relations
+                .get(&non_legacy_locate_relation.id)
+                .map(|relation| relation.kind),
+            Some(RelationKind::SendsMessage)
+        );
         assert_eq!(locate_snapshot.changes.len(), 1);
+        assert!(!locate_snapshot.entity_revisions.is_empty());
         assert_eq!(locate_snapshot.shallow_files.len(), 1);
         assert_eq!(
             locate_snapshot
@@ -1360,8 +1346,9 @@ mod tests {
 
         let decoded: GraphSnapshot = locate_snapshot.into();
         assert_eq!(decoded.entities.len(), 2);
-        assert_eq!(decoded.relations.len(), 1);
+        assert_eq!(decoded.relations.len(), 2);
         assert_eq!(decoded.changes.len(), 1);
+        assert!(!decoded.entity_revisions.is_empty());
         assert_eq!(
             decoded
                 .resolved_tree

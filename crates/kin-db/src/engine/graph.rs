@@ -18,7 +18,9 @@ use crate::search::{
 use crate::storage::change_validation::validate_semantic_change;
 use crate::storage::format::LocateGraphSnapshot;
 use crate::storage::merkle::{
-    compute_graph_root_hash, compute_root_hash_generic, GraphHashSource, MerkleCache,
+    compute_graph_root_hash, compute_live_retrieval_authority_hash,
+    compute_locate_retrieval_authority_hash, compute_retrieval_authority_hash,
+    compute_root_hash_generic, GraphHashSource, MerkleCache,
 };
 use crate::storage::{CollectionDelta, Generation, GraphSnapshot, GraphSnapshotDelta, VecDelta};
 use crate::store::{
@@ -1674,7 +1676,37 @@ pub struct InMemoryGraph {
     /// triggered their own flushes).
     #[cfg(test)]
     merkle_flush_count: std::sync::atomic::AtomicUsize,
+    /// One-shot fault injection for the post-authority transaction cleanup
+    /// boundary. Keeps the retry-safety invariant adversarially testable.
+    #[cfg(test)]
+    fail_next_transaction_derived_cleanup: AtomicBool,
+    #[cfg(test)]
+    fail_next_text_rebuild: AtomicBool,
 }
+
+#[cfg(test)]
+thread_local! {
+    static CREATE_CHANGE_AFTER_REVISION_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_create_change_after_revision_hook(hook: impl FnOnce() + 'static) {
+    CREATE_CHANGE_AFTER_REVISION_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_create_change_after_revision_hook() {
+    CREATE_CHANGE_AFTER_REVISION_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_create_change_after_revision_hook() {}
 
 impl InMemoryGraph {
     /// Create a new empty in-memory graph (RAM-only text index).
@@ -1778,13 +1810,17 @@ impl InMemoryGraph {
             embed_stage_timings: crate::embed::EmbedStageTimings::default(),
             #[cfg(test)]
             merkle_flush_count: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_next_transaction_derived_cleanup: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_text_rebuild: AtomicBool::new(false),
         };
 
         graph
     }
 
     /// Restore a graph from a snapshot (RAM-only text index).
-    pub fn from_snapshot(snapshot: GraphSnapshot) -> Self {
+    pub fn from_snapshot(snapshot: GraphSnapshot) -> Result<Self, KinDbError> {
         let expected_root_hash = compute_graph_root_hash(&snapshot);
         Self::from_snapshot_inner(snapshot, None, expected_root_hash, false, false)
     }
@@ -1794,7 +1830,7 @@ impl InMemoryGraph {
     pub fn from_snapshot_with_root_hash(
         snapshot: GraphSnapshot,
         expected_root_hash: [u8; 32],
-    ) -> Self {
+    ) -> Result<Self, KinDbError> {
         Self::from_snapshot_inner(snapshot, None, expected_root_hash, false, false)
     }
 
@@ -1805,7 +1841,7 @@ impl InMemoryGraph {
     pub fn from_snapshot_without_text_index_with_root_hash(
         snapshot: GraphSnapshot,
         expected_root_hash: [u8; 32],
-    ) -> Self {
+    ) -> Result<Self, KinDbError> {
         Self::from_snapshot_inner(snapshot, None, expected_root_hash, false, true)
     }
 
@@ -1814,7 +1850,7 @@ impl InMemoryGraph {
     pub fn from_snapshot_with_text_index(
         snapshot: GraphSnapshot,
         text_index_path: PathBuf,
-    ) -> Self {
+    ) -> Result<Self, KinDbError> {
         let expected_root_hash = compute_graph_root_hash(&snapshot);
         Self::from_snapshot_inner(
             snapshot,
@@ -1830,7 +1866,7 @@ impl InMemoryGraph {
     pub fn from_snapshot_with_text_index_read_only(
         snapshot: GraphSnapshot,
         text_index_path: PathBuf,
-    ) -> Self {
+    ) -> Result<Self, KinDbError> {
         let expected_root_hash = compute_graph_root_hash(&snapshot);
         Self::from_snapshot_inner(
             snapshot,
@@ -1847,7 +1883,7 @@ impl InMemoryGraph {
         snapshot: GraphSnapshot,
         text_index_path: PathBuf,
         expected_root_hash: [u8; 32],
-    ) -> Self {
+    ) -> Result<Self, KinDbError> {
         Self::from_snapshot_inner(
             snapshot,
             Some(text_index_path),
@@ -1863,7 +1899,7 @@ impl InMemoryGraph {
         snapshot: GraphSnapshot,
         text_index_path: PathBuf,
         expected_root_hash: [u8; 32],
-    ) -> Self {
+    ) -> Result<Self, KinDbError> {
         Self::from_snapshot_inner(
             snapshot,
             Some(text_index_path),
@@ -1882,17 +1918,19 @@ impl InMemoryGraph {
         snapshot: LocateGraphSnapshot,
         text_index_path: Option<PathBuf>,
         expected_root_hash: [u8; 32],
-    ) -> Self {
+    ) -> Result<Self, KinDbError> {
         Self::from_locate_snapshot_inner(snapshot, text_index_path, expected_root_hash, true)
     }
 
     fn from_snapshot_inner(
         snapshot: GraphSnapshot,
         text_index_path: Option<PathBuf>,
-        expected_root_hash: [u8; 32],
+        _expected_root_hash: [u8; 32],
         read_only: bool,
         skip_text_index: bool,
-    ) -> Self {
+    ) -> Result<Self, KinDbError> {
+        snapshot.validate_storage_admission()?;
+        let retrieval_authority_hash = compute_retrieval_authority_hash(&snapshot);
         let GraphSnapshot {
             version: _,
             entities,
@@ -2001,7 +2039,7 @@ impl InMemoryGraph {
         let text_index_current = text_index
             .as_ref()
             .and_then(TextIndex::graph_root_hash)
-            .map(|hash| hash == expected_root_hash)
+            .map(|hash| hash == retrieval_authority_hash)
             .unwrap_or(false);
         let text_index_entity_coverage_current = if text_index_current {
             text_index
@@ -2156,13 +2194,17 @@ impl InMemoryGraph {
             embed_stage_timings: crate::embed::EmbedStageTimings::default(),
             #[cfg(test)]
             merkle_flush_count: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_next_transaction_derived_cleanup: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_text_rebuild: AtomicBool::new(false),
         };
 
         if !skip_text_index && (!text_index_current || !text_index_entity_coverage_current) {
-            graph.rebuild_text_index_with_root_hash(expected_root_hash);
+            graph.try_rebuild_text_index_from_graph(&graph, retrieval_authority_hash)?;
         }
 
-        graph
+        Ok(graph)
     }
 
     fn from_locate_snapshot_inner(
@@ -2170,12 +2212,16 @@ impl InMemoryGraph {
         text_index_path: Option<PathBuf>,
         expected_root_hash: [u8; 32],
         read_only: bool,
-    ) -> Self {
+    ) -> Result<Self, KinDbError> {
+        snapshot.validate_storage_admission()?;
+        let retrieval_authority_hash =
+            compute_locate_retrieval_authority_hash(&snapshot, expected_root_hash);
         let LocateGraphSnapshot {
             version: _,
             entities,
             relations,
             changes,
+            entity_revisions,
             shallow_files,
             file_layouts,
             structured_artifacts,
@@ -2223,7 +2269,7 @@ impl InMemoryGraph {
         let text_index_current = text_index
             .as_ref()
             .and_then(TextIndex::graph_root_hash)
-            .map(|hash| hash == expected_root_hash)
+            .map(|hash| hash == retrieval_authority_hash)
             .unwrap_or(false);
 
         let entity_vec: Vec<&Entity> = entities.values().collect();
@@ -2284,13 +2330,15 @@ impl InMemoryGraph {
             .collect();
         let entity_data = EntityData {
             entities,
-            entity_revisions: kin_model::graph::derive_entity_revisions_from_changes(
-                topologically_order_changes(
+            entity_revisions: if entity_revisions.is_empty() && !changes.is_empty() {
+                kin_model::graph::derive_entity_revisions_from_changes(topologically_order_changes(
                     changes.iter().map(|(id, change)| (*id, change.clone())),
-                ),
-            )
-            .into_iter()
-            .collect(),
+                ))
+                .into_iter()
+                .collect()
+            } else {
+                entity_revisions
+            },
             relations,
             outgoing,
             incoming,
@@ -2367,19 +2415,17 @@ impl InMemoryGraph {
             embed_stage_timings: crate::embed::EmbedStageTimings::default(),
             #[cfg(test)]
             merkle_flush_count: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_next_transaction_derived_cleanup: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_text_rebuild: AtomicBool::new(false),
         };
 
         if !text_index_current {
-            graph.rebuild_text_index_with_root_hash(expected_root_hash);
+            graph.try_rebuild_text_index_from_graph(&graph, retrieval_authority_hash)?;
         }
 
-        graph
-    }
-
-    fn rebuild_text_index_with_root_hash(&self, root_hash: [u8; 32]) {
-        if let Err(error) = self.try_rebuild_text_index_from_graph(self, root_hash) {
-            tracing::warn!(error = %error, "failed to rebuild text index");
-        }
+        Ok(graph)
     }
 
     fn try_rebuild_text_index_from_graph(
@@ -2425,8 +2471,17 @@ impl InMemoryGraph {
         root_hash: [u8; 32],
     ) -> Result<(), KinDbError> {
         let Some(ref ti) = self.text_index else {
+            self.text_dirty.store(false, Ordering::Release);
+            self.text_full_rebuild_required
+                .store(false, Ordering::Release);
             return Ok(());
         };
+        #[cfg(test)]
+        if self.fail_next_text_rebuild.swap(false, Ordering::AcqRel) {
+            return Err(KinDbError::StorageError(
+                "injected full text-index rebuild failure".to_string(),
+            ));
+        }
 
         {
             let _span = tracing::info_span!(
@@ -2585,10 +2640,11 @@ impl InMemoryGraph {
         &self,
         epoch: PersistenceEpoch,
         expected_root_hash: [u8; 32],
-        persist_additional: impl FnOnce() -> Result<T, KinDbError>,
+        expected_retrieval_authority_hash: [u8; 32],
+        persist_additional: impl FnOnce([u8; 32]) -> Result<T, KinDbError>,
     ) -> Result<bool, KinDbError> {
         let ent = self.entities.read();
-        let _chg = self.changes.read();
+        let chg = self.changes.read();
         let _wrk = self.work.read();
         let _rev = self.reviews.read();
         let _ver = self.verification.read();
@@ -2597,7 +2653,20 @@ impl InMemoryGraph {
         let pending = self.pending_delta.lock();
         self.flush_merkle(&ent);
         let current_root_hash = self.merkle.read().root_hash();
+        let current_retrieval_authority_hash = compute_live_retrieval_authority_hash(
+            current_root_hash,
+            &ent.entities,
+            &ent.relations,
+            &chg.changes,
+            &ent.entity_revisions,
+            &ent.resolved_tree,
+            &ent.shallow_files,
+            &ent.file_layouts,
+            &ent.structured_artifacts,
+            &ent.opaque_artifacts,
+        );
         let exact = current_root_hash == expected_root_hash
+            && current_retrieval_authority_hash == expected_retrieval_authority_hash
             && pending.in_flight_persistence.contains(&epoch.0)
             && pending.delta.is_empty()
             && !self.full_snapshot_required.load(Ordering::Acquire);
@@ -2605,8 +2674,8 @@ impl InMemoryGraph {
             return Ok(false);
         }
         let docs = Self::collect_text_index_docs(&ent)?;
-        self.try_rebuild_text_index_from_docs(docs, expected_root_hash)?;
-        persist_additional()?;
+        self.try_rebuild_text_index_from_docs(docs, expected_retrieval_authority_hash)?;
+        persist_additional(expected_retrieval_authority_hash)?;
         Ok(true)
     }
 
@@ -2660,29 +2729,6 @@ impl InMemoryGraph {
         let mut pending = self.pending_delta.lock();
         delta_map_remove(&mut pending.delta.entities, entity_id);
         delta_map_remove(&mut pending.delta.entity_revisions, entity_id);
-    }
-
-    fn record_entity_revisions_delta_upsert(
-        &self,
-        entity_id: EntityId,
-        revisions: Vec<EntityRevision>,
-    ) {
-        let mut pending = self.pending_delta.lock();
-        delta_map_upsert(&mut pending.delta.entity_revisions, entity_id, revisions);
-    }
-
-    fn record_change_delta_upsert(&self, change: SemanticChange) {
-        let mut pending = self.pending_delta.lock();
-        delta_map_upsert(&mut pending.delta.changes, change.id, change);
-    }
-
-    fn record_change_children_delta_upsert(
-        &self,
-        change_id: SemanticChangeId,
-        children: Vec<SemanticChangeId>,
-    ) {
-        let mut pending = self.pending_delta.lock();
-        delta_map_upsert(&mut pending.delta.change_children, change_id, children);
     }
 
     fn record_branch_delta_upsert(&self, branch: Branch) {
@@ -2818,11 +2864,57 @@ impl InMemoryGraph {
 
         let batch: Vec<(&Entity, &[(String, f32)])> =
             docs.iter().map(|(e, f)| (e, f.as_slice())).collect();
-        let _ = ti.upsert_with_extra_fields_batch(batch);
+        if let Err(error) = ti.upsert_with_extra_fields_batch(batch) {
+            self.quarantine_text_index_after_authority_commit(
+                "refreshing affected entity documents",
+                &error,
+            );
+            return;
+        }
 
         if !entity_ids.is_empty() {
             self.text_dirty.store(true, Ordering::Release);
         }
+    }
+
+    fn quarantine_text_index_after_authority_commit(
+        &self,
+        operation: &'static str,
+        error: &KinDbError,
+    ) {
+        self.text_full_rebuild_required
+            .store(true, Ordering::Release);
+        self.text_dirty.store(true, Ordering::Release);
+        tracing::error!(
+            operation,
+            error = %error,
+            "derived text index failed after graph authority committed; quarantined for full rebuild"
+        );
+    }
+
+    #[cfg(feature = "vector")]
+    fn quarantine_vector_index_after_authority_commit(
+        &self,
+        operation: &'static str,
+        error: &KinDbError,
+    ) {
+        tracing::error!(
+            operation,
+            error = %error,
+            "derived vector index failed after graph authority committed; reset and queued for full rebuild"
+        );
+        self.reset_vector_index();
+        self.queue_all_for_embedding();
+        self.queue_all_artifacts_for_embedding();
+        self.mark_vector_full_reconcile();
+    }
+
+    #[cfg(not(feature = "vector"))]
+    fn quarantine_vector_index_after_authority_commit(
+        &self,
+        _operation: &'static str,
+        _error: &KinDbError,
+    ) {
     }
 
     fn upsert_retrievable_text_index(
@@ -2943,7 +3035,7 @@ impl InMemoryGraph {
         &self,
         precomputed_hash: Option<crate::storage::merkle::MerkleHash>,
     ) -> Result<(Vec<u8>, crate::storage::merkle::MerkleHash), KinDbError> {
-        let (bytes, graph_root_hash, _) =
+        let (bytes, graph_root_hash, _, _) =
             self.serialize_snapshot_borrowed_inner(precomputed_hash, false)?;
         Ok((bytes, graph_root_hash))
     }
@@ -2962,11 +3054,36 @@ impl InMemoryGraph {
         ),
         KinDbError,
     > {
-        let (bytes, graph_root_hash, epoch) =
+        let (bytes, graph_root_hash, _, epoch) =
             self.serialize_snapshot_borrowed_inner(precomputed_hash, true)?;
         Ok((
             bytes,
             graph_root_hash,
+            epoch.expect("persistence serialization always allocates an epoch"),
+        ))
+    }
+
+    /// Capture one full-snapshot persistence batch together with both the
+    /// entity/relation Merkle root and the exact authority digest used to bind
+    /// retrieval sidecars.
+    pub(crate) fn begin_snapshot_persistence_with_retrieval_hash(
+        &self,
+        precomputed_hash: Option<crate::storage::merkle::MerkleHash>,
+    ) -> Result<
+        (
+            Vec<u8>,
+            crate::storage::merkle::MerkleHash,
+            crate::storage::merkle::MerkleHash,
+            PersistenceEpoch,
+        ),
+        KinDbError,
+    > {
+        let (bytes, graph_root_hash, retrieval_authority_hash, epoch) =
+            self.serialize_snapshot_borrowed_inner(precomputed_hash, true)?;
+        Ok((
+            bytes,
+            graph_root_hash,
+            retrieval_authority_hash,
             epoch.expect("persistence serialization always allocates an epoch"),
         ))
     }
@@ -2978,6 +3095,7 @@ impl InMemoryGraph {
     ) -> Result<
         (
             Vec<u8>,
+            crate::storage::merkle::MerkleHash,
             crate::storage::merkle::MerkleHash,
             Option<PersistenceEpoch>,
         ),
@@ -3013,6 +3131,18 @@ impl InMemoryGraph {
                 .unwrap_or(current)
         };
         let t_hash = t1.elapsed();
+        let retrieval_authority_hash = compute_live_retrieval_authority_hash(
+            graph_root_hash,
+            &ent.entities,
+            &ent.relations,
+            &chg.changes,
+            &ent.entity_revisions,
+            &ent.resolved_tree,
+            &ent.shallow_files,
+            &ent.file_layouts,
+            &ent.structured_artifacts,
+            &ent.opaque_artifacts,
+        );
 
         let t2 = std::time::Instant::now();
         let bytes = {
@@ -3075,7 +3205,33 @@ impl InMemoryGraph {
             "kindb.save_timer"
         );
 
-        Ok((bytes, graph_root_hash, persistence_epoch))
+        Ok((
+            bytes,
+            graph_root_hash,
+            retrieval_authority_hash,
+            persistence_epoch,
+        ))
+    }
+
+    /// Return the exact authority digest that persisted lexical/vector
+    /// sidecars must match before they can answer queries.
+    pub(crate) fn retrieval_authority_hash(&self) -> [u8; 32] {
+        let ent = self.entities.read();
+        let chg = self.changes.read();
+        self.flush_merkle(&ent);
+        let graph_root_hash = self.merkle.read().root_hash();
+        compute_live_retrieval_authority_hash(
+            graph_root_hash,
+            &ent.entities,
+            &ent.relations,
+            &chg.changes,
+            &ent.entity_revisions,
+            &ent.resolved_tree,
+            &ent.shallow_files,
+            &ent.file_layouts,
+            &ent.structured_artifacts,
+            &ent.opaque_artifacts,
+        )
     }
 
     /// Return a snapshot of the exact graph-owned repository tree.
@@ -3352,18 +3508,17 @@ impl InMemoryGraph {
         // If a full rebuild was requested (e.g., after bulk relation insert),
         // do it now before committing. This regenerates all relation-derived
         // text fields in one pass instead of per-entity updates.
-        if self
-            .text_full_rebuild_required
-            .swap(false, Ordering::AcqRel)
-        {
+        if self.text_full_rebuild_required.load(Ordering::Acquire) {
             // Use a zero root hash — persist_text_index_with_root_hash sets the
             // real one. This just ensures the text content is rebuilt.
-            self.rebuild_text_index_with_root_hash([0u8; 32]);
-            return Ok(());
+            return self.try_rebuild_text_index_from_graph(self, [0u8; 32]);
         }
         if self.text_dirty.swap(false, Ordering::AcqRel) {
             if let Some(ref ti) = self.text_index {
-                ti.commit()?;
+                if let Err(error) = ti.commit() {
+                    self.text_dirty.store(true, Ordering::Release);
+                    return Err(error);
+                }
             }
         }
         Ok(())
@@ -3376,12 +3531,8 @@ impl InMemoryGraph {
         // If relation-derived fields are stale, do a full rebuild first.
         // This is set by upsert_relations_batch to amortize the cost of
         // 20K+ individual Tantivy upserts into one full rebuild at persist time.
-        if self
-            .text_full_rebuild_required
-            .swap(false, Ordering::AcqRel)
-        {
-            self.rebuild_text_index_with_root_hash(graph_root_hash);
-            return Ok(());
+        if self.text_full_rebuild_required.load(Ordering::Acquire) {
+            return self.try_rebuild_text_index_from_graph(self, graph_root_hash);
         }
 
         if let Some(ref ti) = self.text_index {
@@ -3415,16 +3566,25 @@ impl InMemoryGraph {
             limit = limit
         )
         .entered();
-        match self.text_index {
-            Some(ref ti) => ti.fuzzy_search(query, limit),
-            None => Ok(Vec::new()),
+        let Some(ref text_index) = self.text_index else {
+            return Ok(Vec::new());
+        };
+        if self.text_full_rebuild_required.load(Ordering::Acquire) {
+            return Err(KinDbError::StorageError(
+                "derived text index is quarantined pending a full graph-authority rebuild"
+                    .to_string(),
+            ));
         }
+        text_index.fuzzy_search(query, limit)
     }
 
     /// Document frequency of `term` in the text index (its rarest token's
     /// posting count), for IDF-style term-discrimination weighting by callers.
     /// Returns 0 when there is no text index or the term is unindexed.
     pub fn text_doc_frequency(&self, term: &str) -> usize {
+        if self.text_full_rebuild_required.load(Ordering::Acquire) {
+            return 0;
+        }
         match self.text_index {
             Some(ref ti) => ti.doc_frequency(term),
             None => 0,
@@ -3434,6 +3594,9 @@ impl InMemoryGraph {
     /// Number of documents currently visible to text search (the N for IDF).
     /// Returns 0 when there is no text index.
     pub fn text_document_count(&self) -> usize {
+        if self.text_full_rebuild_required.load(Ordering::Acquire) {
+            return 0;
+        }
         match self.text_index {
             Some(ref ti) => ti.live_document_count(),
             None => 0,
@@ -5630,6 +5793,125 @@ fn remove_relations_for_entity(ent: &mut EntityData, entity_id: &EntityId) -> Ve
     removed
 }
 
+fn retire_entity_authority(
+    ent: &mut EntityData,
+    pending: &mut PendingGraphDelta,
+    entity_id: EntityId,
+    affected: &mut HashSet<EntityId>,
+    merkle_seeds: &mut HashSet<EntityId>,
+) {
+    merkle_seeds.insert(entity_id);
+    if let Some(entity) = ent.entities.remove(&entity_id) {
+        ent.indexes.remove(
+            &entity.id,
+            &entity.name,
+            entity.file_origin.as_ref(),
+            entity.kind,
+        );
+        if let Some(outgoing) = ent.outgoing.get(&entity_id) {
+            for relation_id in outgoing {
+                if let Some(relation) = ent.relations.get(relation_id) {
+                    if let Some(neighbor) = entity_neighbor_for_relation(relation, &entity_id) {
+                        affected.insert(neighbor);
+                        merkle_seeds.insert(neighbor);
+                    }
+                }
+            }
+        }
+        if let Some(incoming) = ent.incoming.get(&entity_id) {
+            for relation_id in incoming {
+                if let Some(relation) = ent.relations.get(relation_id) {
+                    if let Some(neighbor) = entity_neighbor_for_relation(relation, &entity_id) {
+                        affected.insert(neighbor);
+                        merkle_seeds.insert(neighbor);
+                    }
+                }
+            }
+        }
+    }
+
+    let removed_relations = remove_relations_for_entity(ent, &entity_id);
+    ent.entity_revisions.remove(&entity_id);
+    delta_map_remove(&mut pending.delta.entities, entity_id);
+    delta_map_remove(&mut pending.delta.entity_revisions, entity_id);
+    for relation in &removed_relations {
+        delta_map_remove(&mut pending.delta.relations, relation.id);
+        record_relation_edge_delta(pending, ent, relation);
+    }
+}
+
+fn retire_relations_for_artifacts(
+    ent: &mut EntityData,
+    pending: &mut PendingGraphDelta,
+    removed_artifact_ids: &HashSet<ArtifactId>,
+    content_changed_artifact_ids: &HashSet<ArtifactId>,
+    affected: &mut HashSet<EntityId>,
+    merkle_seeds: &mut HashSet<EntityId>,
+) {
+    let mut relation_ids = HashSet::new();
+    for artifact_id in removed_artifact_ids
+        .iter()
+        .chain(content_changed_artifact_ids)
+    {
+        let node = GraphNodeId::Artifact(*artifact_id);
+        relation_ids.extend(ent.node_outgoing.get(&node).into_iter().flatten().copied());
+        relation_ids.extend(ent.node_incoming.get(&node).into_iter().flatten().copied());
+    }
+
+    let mut relation_ids: Vec<RelationId> = relation_ids.into_iter().collect();
+    relation_ids.sort_unstable_by_key(|relation_id| *relation_id.0.as_bytes());
+    for relation_id in relation_ids {
+        let Some(relation) = ent.relations.get(&relation_id) else {
+            continue;
+        };
+        let mut incident_artifacts =
+            [relation.src, relation.dst]
+                .into_iter()
+                .filter_map(|node| match node {
+                    GraphNodeId::Artifact(artifact_id) => Some(artifact_id),
+                    _ => None,
+                });
+        let should_retire = incident_artifacts
+            .clone()
+            .any(|artifact_id| removed_artifact_ids.contains(&artifact_id))
+            || (matches!(
+                relation.origin,
+                RelationOrigin::Parsed | RelationOrigin::Inferred | RelationOrigin::Lsp
+            ) && incident_artifacts
+                .any(|artifact_id| content_changed_artifact_ids.contains(&artifact_id)));
+        if !should_retire {
+            continue;
+        }
+        let relation = ent
+            .relations
+            .remove(&relation_id)
+            .expect("relation remained present under the entity write lock");
+        let entity_ids = entity_ids_for_relation(&relation);
+        affected.extend(entity_ids.iter().copied());
+        merkle_seeds.extend(entity_ids);
+        remove_relation_indexes(ent, &relation);
+        delta_map_remove(&mut pending.delta.relations, relation.id);
+        record_relation_edge_delta(pending, ent, &relation);
+    }
+}
+
+fn graph_node_is_admitted(
+    node: GraphNodeId,
+    entity_ids: &HashSet<EntityId>,
+    artifact_ids: &HashSet<ArtifactId>,
+    work: &WorkData,
+    verification: &VerificationData,
+) -> bool {
+    match node {
+        GraphNodeId::Entity(id) => entity_ids.contains(&id),
+        GraphNodeId::Artifact(id) => artifact_ids.contains(&id),
+        GraphNodeId::Test(id) => verification.test_cases.contains_key(&id),
+        GraphNodeId::Contract(id) => verification.contracts.contains_key(&id),
+        GraphNodeId::Work(id) => work.work_items.contains_key(&id),
+        GraphNodeId::VerificationRun(id) => verification.verification_runs.contains_key(&id),
+    }
+}
+
 fn admitted_artifact_id(ent: &EntityData, file_id: &FilePathId) -> Result<ArtifactId, KinDbError> {
     let path = repo_path_for_file_path(file_id)?;
     ent.resolved_tree.artifact_id_at_path(&path).ok_or_else(|| {
@@ -5669,6 +5951,23 @@ fn tree_delta_invalidates_path_facets(delta: &TreeDelta) -> bool {
         ) => old != new,
         (Some(old), Some(new)) => old.entry != new.entry,
         (None, _) => false,
+    }
+}
+
+fn tree_delta_changes_content(delta: &TreeDelta) -> bool {
+    match (delta.old_state(), delta.new_state()) {
+        (
+            Some(LocatedEntry {
+                entry: TreeEntry::Blob { hash: old, .. },
+                ..
+            }),
+            Some(LocatedEntry {
+                entry: TreeEntry::Blob { hash: new, .. },
+                ..
+            }),
+        ) => old != new,
+        (Some(old), Some(new)) => old.entry != new.entry,
+        _ => false,
     }
 }
 
@@ -6660,7 +6959,7 @@ impl EntityStore for InMemoryGraph {
 
     fn apply_transaction_delta(&self, delta: &TransactionDelta) -> Result<(), KinDbError> {
         let mut affected = HashSet::new();
-        let mut deleted_entities = Vec::new();
+        let mut deleted_entities = HashSet::new();
         let mut merkle_seeds = HashSet::new();
         let mut retired_artifact_indexes = HashSet::new();
 
@@ -6675,11 +6974,151 @@ impl EntityStore for InMemoryGraph {
                 .resolved_tree
                 .apply(&delta.tree_deltas)
                 .map_err(tree_state_error)?;
+
+            let invalidating_file_ids: HashSet<FilePathId> = delta
+                .tree_deltas
+                .iter()
+                .filter(|tree_delta| tree_delta_invalidates_path_facets(tree_delta))
+                .filter_map(TreeDelta::old_state)
+                .filter_map(|old_state| file_path_for_repo_path(&old_state.path))
+                .collect();
+            let implicitly_retired_entity_ids: HashSet<EntityId> = ent
+                .entities
+                .values()
+                .filter(|entity| {
+                    entity
+                        .file_origin
+                        .as_ref()
+                        .is_some_and(|file_id| invalidating_file_ids.contains(file_id))
+                })
+                .map(|entity| entity.id)
+                .collect();
+            let removed_artifact_ids: HashSet<ArtifactId> = delta
+                .tree_deltas
+                .iter()
+                .filter(|tree_delta| {
+                    tree_delta.old_state().is_some() && tree_delta.new_state().is_none()
+                })
+                .map(TreeDelta::artifact_id)
+                .collect();
+            let content_changed_artifact_ids: HashSet<ArtifactId> = delta
+                .tree_deltas
+                .iter()
+                .filter(|tree_delta| tree_delta_changes_content(tree_delta))
+                .map(TreeDelta::artifact_id)
+                .collect();
+
+            // Validate all new semantic identities against the exact staged
+            // tree and the post-transaction entity set before any authority is
+            // changed. This prevents a tree transition, entity placement, or
+            // mixed-domain relation from being partially admitted.
+            let mut prospective_entity_ids: HashSet<EntityId> =
+                ent.entities.keys().copied().collect();
+            for entity_id in &implicitly_retired_entity_ids {
+                prospective_entity_ids.remove(entity_id);
+            }
+            for entity_delta in &delta.entity_deltas {
+                match entity_delta {
+                    EntityDelta::Added(entity) => {
+                        if let Some(file_id) = entity.file_origin.as_ref() {
+                            let path = repo_path_for_file_path(file_id)?;
+                            if staged_tree.artifact_id_at_path(&path).is_none() {
+                                return Err(KinDbError::StorageError(format!(
+                                    "transaction entity {} references repository path {} absent from the staged tree",
+                                    entity.id, file_id.0
+                                )));
+                            }
+                        }
+                        prospective_entity_ids.insert(entity.id);
+                    }
+                    EntityDelta::Modified { old, new } => {
+                        if old.id != new.id {
+                            return Err(KinDbError::StorageError(format!(
+                                "transaction entity modification changes identity from {} to {}",
+                                old.id, new.id
+                            )));
+                        }
+                        if let Some(file_id) = new.file_origin.as_ref() {
+                            let path = repo_path_for_file_path(file_id)?;
+                            if staged_tree.artifact_id_at_path(&path).is_none() {
+                                return Err(KinDbError::StorageError(format!(
+                                    "transaction entity {} references repository path {} absent from the staged tree",
+                                    new.id, file_id.0
+                                )));
+                            }
+                        }
+                        prospective_entity_ids.insert(new.id);
+                    }
+                    EntityDelta::Removed(entity_id) => {
+                        prospective_entity_ids.remove(entity_id);
+                    }
+                }
+            }
+
+            let staged_artifact_ids: HashSet<ArtifactId> = staged_tree
+                .artifacts()
+                .map(|artifact| artifact.artifact_id)
+                .collect();
+            let work = self.work.read();
+            let verification = self.verification.read();
+            for relation_delta in &delta.relation_deltas {
+                let RelationDelta::Added(relation) = relation_delta else {
+                    continue;
+                };
+                for (side, node) in [("source", relation.src), ("destination", relation.dst)] {
+                    if !graph_node_is_admitted(
+                        node,
+                        &prospective_entity_ids,
+                        &staged_artifact_ids,
+                        &work,
+                        &verification,
+                    ) {
+                        return Err(KinDbError::StorageError(format!(
+                            "transaction relation {} has unadmitted {side} endpoint {node}",
+                            relation.id
+                        )));
+                    }
+                }
+            }
+            drop(verification);
+            drop(work);
+
             // Keep the whole graph transaction in one persistence batch. The
             // normal record_* helpers take this lock per mutation; doing that
             // here would let a persistence detach split tree, facet, entity,
             // and relation effects across different durable deltas.
             let mut pending = self.pending_delta.lock();
+
+            // An invalidating exact-tree transition retires all semantic
+            // authority derived from the old bytes: entities placed at that
+            // path, their revisions, and every incident relation. A caller may
+            // re-admit replacements through explicit entity/relation deltas in
+            // this same transaction after the retirement.
+            let mut implicitly_retired_entity_ids: Vec<EntityId> =
+                implicitly_retired_entity_ids.into_iter().collect();
+            implicitly_retired_entity_ids.sort_unstable();
+            for entity_id in implicitly_retired_entity_ids {
+                retire_entity_authority(
+                    &mut ent,
+                    &mut pending,
+                    entity_id,
+                    &mut affected,
+                    &mut merkle_seeds,
+                );
+                deleted_entities.insert(entity_id);
+            }
+            // Artifact identity outlives a move and a same-ID content update.
+            // Removal retires every incident edge; content replacement retires
+            // only parser/inference/LSP evidence derived from the old bytes.
+            // Manual identity/workflow relations remain authoritative.
+            retire_relations_for_artifacts(
+                &mut ent,
+                &mut pending,
+                &removed_artifact_ids,
+                &content_changed_artifact_ids,
+                &mut affected,
+                &mut merkle_seeds,
+            );
 
             // 1. Retire path-keyed enrichment through the identity-bearing old
             // tree state before publishing the new tree. A later path lookup
@@ -6699,6 +7138,7 @@ impl EntityStore for InMemoryGraph {
                     continue;
                 };
                 let artifact_id = tree_delta.artifact_id();
+                retired_artifact_indexes.insert(artifact_id);
 
                 if let Some(old) = ent.file_layouts.remove(&file_id) {
                     delta_vec_remove_by_key(
@@ -6786,52 +7226,14 @@ impl EntityStore for InMemoryGraph {
                         merkle_seeds.insert(entity.id);
                     }
                     EntityDelta::Removed(id) => {
-                        deleted_entities.push(*id);
-                        merkle_seeds.insert(*id);
-                        if let Some(entity) = ent.entities.remove(id) {
-                            ent.indexes.remove(
-                                &entity.id,
-                                &entity.name,
-                                entity.file_origin.as_ref(),
-                                entity.kind,
-                            );
-                            if let Some(ref ti) = self.text_index {
-                                let _ = ti.remove(id);
-                                self.text_dirty.store(true, Ordering::Release);
-                            }
-
-                            if let Some(outgoing) = ent.outgoing.get(id) {
-                                for rel_id in outgoing {
-                                    if let Some(rel) = ent.relations.get(rel_id) {
-                                        if let Some(neighbor) =
-                                            entity_neighbor_for_relation(rel, id)
-                                        {
-                                            affected.insert(neighbor);
-                                            merkle_seeds.insert(neighbor);
-                                        }
-                                    }
-                                }
-                            }
-                            if let Some(incoming) = ent.incoming.get(id) {
-                                for rel_id in incoming {
-                                    if let Some(rel) = ent.relations.get(rel_id) {
-                                        if let Some(neighbor) =
-                                            entity_neighbor_for_relation(rel, id)
-                                        {
-                                            affected.insert(neighbor);
-                                            merkle_seeds.insert(neighbor);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        let removed_relations = remove_relations_for_entity(&mut ent, id);
-                        delta_map_remove(&mut pending.delta.entities, *id);
-                        delta_map_remove(&mut pending.delta.entity_revisions, *id);
-                        for relation in &removed_relations {
-                            delta_map_remove(&mut pending.delta.relations, relation.id);
-                            record_relation_edge_delta(&mut pending, &ent, relation);
-                        }
+                        retire_entity_authority(
+                            &mut ent,
+                            &mut pending,
+                            *id,
+                            &mut affected,
+                            &mut merkle_seeds,
+                        );
+                        deleted_entities.insert(*id);
                     }
                 }
             }
@@ -6869,18 +7271,68 @@ impl EntityStore for InMemoryGraph {
                     }
                 }
             }
+            deleted_entities.retain(|entity_id| !ent.entities.contains_key(entity_id));
             self.refresh_merkle_for_entities(&ent, merkle_seeds.iter().copied());
         }
 
-        // 5. Retire derived retrieval state for facets removed by the exact
-        // tree transaction. Sort for deterministic vector free-list reuse.
+        // Authority is now committed. Every operation below touches only
+        // derived retrieval state and must never turn this successful
+        // transaction into an `Err` that a caller might retry against the new
+        // tree. A failed cache mutation quarantines that cache for a rebuild.
+        #[cfg(test)]
+        let injected_derived_failure = self
+            .fail_next_transaction_derived_cleanup
+            .swap(false, Ordering::AcqRel);
+        #[cfg(not(test))]
+        let injected_derived_failure = false;
+        let mut vector_quarantine_error = injected_derived_failure.then(|| {
+            KinDbError::StorageError("injected post-authority vector cleanup failure".to_string())
+        });
+        if injected_derived_failure {
+            let error = KinDbError::StorageError(
+                "injected post-authority text cleanup failure".to_string(),
+            );
+            self.quarantine_text_index_after_authority_commit(
+                "fault-injected transaction cleanup",
+                &error,
+            );
+        }
+
+        let mut deleted_entities: Vec<EntityId> = deleted_entities.into_iter().collect();
+        deleted_entities.sort_unstable();
+        if !injected_derived_failure && !deleted_entities.is_empty() {
+            if let Some(ref text_index) = self.text_index {
+                if let Err(error) = text_index.remove_batch(&deleted_entities) {
+                    self.quarantine_text_index_after_authority_commit(
+                        "retiring invalidated entities",
+                        &error,
+                    );
+                } else {
+                    self.text_dirty.store(true, Ordering::Release);
+                }
+            }
+        }
+
+        // 5. Retire derived retrieval state for exact-tree artifacts. Sort for
+        // deterministic vector free-list reuse.
         let mut retired_artifact_indexes: Vec<ArtifactId> =
             retired_artifact_indexes.into_iter().collect();
         retired_artifact_indexes.sort_unstable();
         for artifact_id in &retired_artifact_indexes {
             let key = RetrievalKey::Artifact(*artifact_id);
-            self.remove_retrievable_text_index(&key)?;
-            self.remove_retrievable_vector(&key)?;
+            if !injected_derived_failure {
+                if let Err(error) = self.remove_retrievable_text_index(&key) {
+                    self.quarantine_text_index_after_authority_commit(
+                        "retiring an invalidated artifact",
+                        &error,
+                    );
+                }
+            }
+            if vector_quarantine_error.is_none() {
+                if let Err(error) = self.remove_retrievable_vector(&key) {
+                    vector_quarantine_error = Some(error);
+                }
+            }
         }
         #[cfg(feature = "vector")]
         {
@@ -6898,16 +7350,34 @@ impl EntityStore for InMemoryGraph {
             for id in &deleted_entities {
                 eq.remove(&RetrievalKey::Entity(*id));
                 if let Some(ref vi) = *vi_lock {
-                    let _ = vi.remove(id);
+                    if vector_quarantine_error.is_none() {
+                        if let Err(error) = vi.remove(id) {
+                            vector_quarantine_error = Some(error);
+                        }
+                    }
                 }
             }
         }
 
         // 7. Invalidate / refresh text index & embeddings for affected entities
-        let affected_list: Vec<EntityId> = affected.into_iter().collect();
+        let mut affected_list: Vec<EntityId> = affected
+            .into_iter()
+            .filter(|entity_id| !deleted_entities.contains(entity_id))
+            .collect();
+        affected_list.sort_unstable();
         if !affected_list.is_empty() {
             self.refresh_text_index_for_entities(&affected_list);
-            self.invalidate_entities_for_embedding(&affected_list)?;
+            if vector_quarantine_error.is_none() {
+                if let Err(error) = self.invalidate_entities_for_embedding(&affected_list) {
+                    vector_quarantine_error = Some(error);
+                }
+            }
+        }
+        if let Some(error) = vector_quarantine_error {
+            self.quarantine_vector_index_after_authority_commit(
+                "retiring exact-tree/entity retrieval state",
+                &error,
+            );
         }
 
         Ok(())
@@ -7202,11 +7672,13 @@ impl ChangeStore for InMemoryGraph {
             return Err(KinDbError::DuplicateChange(change.id.to_string()));
         }
 
+        // Revisions, child edges, and the change payload are one durable
+        // mutation. Keep the pending-delta lock for the entire authority
+        // transition so a concurrent persistence detach cannot split them
+        // across generations.
+        let mut pending = self.pending_delta.lock();
         let superseded_revisions = append_entity_revisions(&mut ent, change);
-        #[cfg(feature = "vector")]
-        self.note_superseded_vectors(&superseded_revisions);
-        #[cfg(not(feature = "vector"))]
-        let _ = superseded_revisions;
+        run_create_change_after_revision_hook();
         let revision_updates: Vec<(EntityId, Vec<EntityRevision>)> = change
             .entity_deltas
             .iter()
@@ -7222,17 +7694,27 @@ impl ChangeStore for InMemoryGraph {
             })
             .collect();
         for (entity_id, revisions) in revision_updates {
-            self.record_entity_revisions_delta_upsert(entity_id, revisions);
+            delta_map_upsert(&mut pending.delta.entity_revisions, entity_id, revisions);
         }
         // Register in parent → children index
         for parent in &change.parents {
             let children = chg.change_children.entry(*parent).or_default();
             children.push(change.id);
-            self.record_change_children_delta_upsert(*parent, children.clone());
+            delta_map_upsert(
+                &mut pending.delta.change_children,
+                *parent,
+                children.clone(),
+            );
         }
 
         chg.changes.insert(change.id, change.clone());
-        self.record_change_delta_upsert(change.clone());
+        delta_map_upsert(&mut pending.delta.changes, change.id, change.clone());
+        drop(pending);
+
+        #[cfg(feature = "vector")]
+        self.note_superseded_vectors(&superseded_revisions);
+        #[cfg(not(feature = "vector"))]
+        let _ = superseded_revisions;
         Ok(())
     }
 
@@ -9204,6 +9686,8 @@ mod tests {
             content_hash: hash,
             text_preview: Some("build:".into()),
         };
+        let entity = test_entity("make_target", &file_id.0);
+        graph.upsert_entity(&entity).unwrap();
         graph.upsert_structured_artifact(&artifact).unwrap();
         graph.clear_pending_delta();
 
@@ -9228,10 +9712,379 @@ mod tests {
                 .content_hash,
             hash
         );
+        assert!(
+            graph.get_entity(&entity.id).unwrap().is_some(),
+            "mode-only transitions must preserve entities derived from identical bytes"
+        );
         let pending = graph
             .pending_delta_snapshot(0)
             .expect("mode transition must be persisted");
         assert!(pending.structured_artifacts.is_empty());
+    }
+
+    #[test]
+    fn content_change_retires_entities_revisions_and_incident_relations() {
+        let graph = InMemoryGraph::new();
+        let changed_file = FilePathId::new("src/changed.rs");
+        let neighbor_file = FilePathId::new("src/neighbor.rs");
+        let old_entry = TreeEntry::blob(Hash256::from_bytes([0x12; 32]), false);
+        let new_entry = TreeEntry::blob(Hash256::from_bytes([0x13; 32]), false);
+        let artifact_id = graph.admit_artifact_for_test(&changed_file.0, old_entry);
+        graph.admit_artifact_for_test(
+            &neighbor_file.0,
+            TreeEntry::blob(Hash256::from_bytes([0x14; 32]), false),
+        );
+
+        let retired = test_entity("retired", &changed_file.0);
+        let neighbor = test_entity("neighbor", &neighbor_file.0);
+        graph.upsert_entity(&retired).unwrap();
+        graph.upsert_entity(&neighbor).unwrap();
+        let relation = test_relation(retired.id, neighbor.id, RelationKind::Calls);
+        graph.upsert_relation(&relation).unwrap();
+        admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+                parents: Vec::new(),
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("tester"),
+                message: "record retired revision".into(),
+                entity_deltas: vec![EntityDelta::Added(retired.clone())],
+                relation_deltas: Vec::new(),
+                tree_deltas: Vec::new(),
+                projected_files: vec![changed_file.clone()],
+                spec_link: None,
+                evidence: Vec::new(),
+                risk_summary: None,
+                authored_on: None,
+            },
+        );
+        assert!(graph
+            .to_snapshot()
+            .entity_revisions
+            .contains_key(&retired.id));
+        graph.clear_pending_delta();
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&changed_file.0, old_entry),
+                    new: test_located(&changed_file.0, new_entry),
+                }],
+            })
+            .unwrap();
+
+        assert!(graph.get_entity(&retired.id).unwrap().is_none());
+        assert!(graph.get_entity(&neighbor.id).unwrap().is_some());
+        assert_eq!(graph.relation_count(), 0);
+        let snapshot = graph.to_snapshot();
+        assert!(!snapshot.entity_revisions.contains_key(&retired.id));
+        assert!(!snapshot.relations.contains_key(&relation.id));
+        assert_eq!(
+            graph.artifact_id_at_path(&test_repo_path(&changed_file.0)),
+            Some(artifact_id),
+            "the new exact artifact remains valid without semantic enrichment"
+        );
+
+        let pending = graph
+            .pending_delta_snapshot(0)
+            .expect("retirement and tree replacement must share one delta");
+        assert!(pending.entities.removed.contains(&retired.id));
+        assert!(pending.entity_revisions.removed.contains(&retired.id));
+        assert!(pending.relations.removed.contains(&relation.id));
+        assert_eq!(pending.resolved_tree.modified.len(), 1);
+    }
+
+    #[test]
+    fn content_change_retires_derived_but_preserves_manual_artifact_relations() {
+        let graph = InMemoryGraph::new();
+        let file_id = FilePathId::new("Dockerfile");
+        let entity_file_id = FilePathId::new("src/main.rs");
+        let old_entry = TreeEntry::blob(Hash256::from_bytes([0x31; 32]), false);
+        let new_entry = TreeEntry::blob(Hash256::from_bytes([0x32; 32]), false);
+        let artifact_id = graph.admit_artifact_for_test(&file_id.0, old_entry);
+        graph.admit_artifact_for_test(
+            &entity_file_id.0,
+            TreeEntry::blob(Hash256::from_bytes([0x33; 32]), false),
+        );
+        let entity = test_entity("build_image", &entity_file_id.0);
+        graph.upsert_entity(&entity).unwrap();
+        let derived_relation = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::DependsOn,
+            src: GraphNodeId::Entity(entity.id),
+            dst: GraphNodeId::Artifact(artifact_id),
+            confidence: 1.0,
+            origin: RelationOrigin::Inferred,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let manual_relation = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::OwnedByFile,
+            src: GraphNodeId::Entity(entity.id),
+            dst: GraphNodeId::Artifact(artifact_id),
+            confidence: 1.0,
+            origin: RelationOrigin::Manual,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        graph.upsert_relation(&derived_relation).unwrap();
+        graph.upsert_relation(&manual_relation).unwrap();
+        graph.clear_pending_delta();
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&file_id.0, old_entry),
+                    new: test_located(&file_id.0, new_entry),
+                }],
+            })
+            .unwrap();
+
+        assert!(
+            graph.get_entity(&entity.id).unwrap().is_some(),
+            "an entity in a different unchanged file remains admitted"
+        );
+        assert_eq!(graph.relation_count(), 1);
+        let snapshot = graph.to_snapshot();
+        assert!(!snapshot.relations.contains_key(&derived_relation.id));
+        assert!(snapshot.relations.contains_key(&manual_relation.id));
+        let pending = graph
+            .pending_delta_snapshot(0)
+            .expect("artifact-edge retirement must share the exact-tree delta");
+        assert!(pending.relations.removed.contains(&derived_relation.id));
+        assert!(!pending.relations.removed.contains(&manual_relation.id));
+        assert_eq!(pending.resolved_tree.modified.len(), 1);
+    }
+
+    #[test]
+    fn pure_artifact_move_preserves_identity_relations() {
+        let graph = InMemoryGraph::new();
+        let old_path = "config/compose.yaml";
+        let new_path = "deploy/compose.yaml";
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x34; 32]), false);
+        let artifact_id = graph.admit_artifact_for_test(old_path, entry);
+        graph.admit_artifact_for_test(
+            "src/main.rs",
+            TreeEntry::blob(Hash256::from_bytes([0x35; 32]), false),
+        );
+        let entity = test_entity("deploy", "src/main.rs");
+        graph.upsert_entity(&entity).unwrap();
+        let relations: Vec<Relation> = [RelationOrigin::Manual, RelationOrigin::Parsed]
+            .into_iter()
+            .map(|origin| Relation {
+                id: RelationId::new(),
+                kind: RelationKind::DependsOn,
+                src: GraphNodeId::Entity(entity.id),
+                dst: GraphNodeId::Artifact(artifact_id),
+                confidence: 1.0,
+                origin,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .collect();
+        graph.upsert_relations_batch(&relations).unwrap();
+        graph.clear_pending_delta();
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(old_path, entry),
+                    new: test_located(new_path, entry),
+                }],
+            })
+            .unwrap();
+
+        let snapshot = graph.to_snapshot();
+        assert!(
+            relations
+                .iter()
+                .all(|relation| snapshot.relations.contains_key(&relation.id)),
+            "a pure location change cannot erase relations to stable artifact identity"
+        );
+        let pending = graph
+            .pending_delta_snapshot(0)
+            .expect("the move itself must be persisted");
+        assert!(pending.relations.is_empty());
+    }
+
+    #[test]
+    fn artifact_deletion_retires_all_incident_relation_origins() {
+        let graph = InMemoryGraph::new();
+        let artifact_path = "Dockerfile";
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x36; 32]), false);
+        let artifact_id = graph.admit_artifact_for_test(artifact_path, entry);
+        graph.admit_artifact_for_test(
+            "src/main.rs",
+            TreeEntry::blob(Hash256::from_bytes([0x37; 32]), false),
+        );
+        let entity = test_entity("image", "src/main.rs");
+        graph.upsert_entity(&entity).unwrap();
+        let relations: Vec<Relation> = [
+            RelationOrigin::Parsed,
+            RelationOrigin::Inferred,
+            RelationOrigin::Manual,
+            RelationOrigin::Lsp,
+        ]
+        .into_iter()
+        .map(|origin| Relation {
+            id: RelationId::new(),
+            kind: RelationKind::DependsOn,
+            src: GraphNodeId::Entity(entity.id),
+            dst: GraphNodeId::Artifact(artifact_id),
+            confidence: 1.0,
+            origin,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        })
+        .collect();
+        graph.upsert_relations_batch(&relations).unwrap();
+        graph.clear_pending_delta();
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Removed {
+                    artifact_id,
+                    old: test_located(artifact_path, entry),
+                }],
+            })
+            .unwrap();
+
+        assert_eq!(graph.relation_count(), 0);
+        let pending = graph
+            .pending_delta_snapshot(0)
+            .expect("artifact and incident-edge retirement must be atomic");
+        assert!(relations
+            .iter()
+            .all(|relation| pending.relations.removed.contains(&relation.id)));
+    }
+
+    #[test]
+    fn transaction_rejects_entity_placement_absent_from_staged_tree() {
+        let graph = InMemoryGraph::new();
+        let entity = test_entity("orphan", "src/missing.rs");
+
+        let error = graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![EntityDelta::Added(entity.clone())],
+                relation_deltas: Vec::new(),
+                tree_deltas: Vec::new(),
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("absent from the staged tree"));
+        assert!(graph.get_entity(&entity.id).unwrap().is_none());
+        assert!(graph.resolved_tree().is_empty());
+        assert!(!graph.has_pending_delta());
+    }
+
+    #[test]
+    fn transaction_rejects_unadmitted_relation_endpoint_before_any_mutation() {
+        let graph = InMemoryGraph::new();
+        let entity = test_entity("would_land", "src/new.rs");
+        let artifact_id = ArtifactId::new();
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x15; 32]), false);
+        let relation = test_relation(entity.id, EntityId::new(), RelationKind::Calls);
+
+        let error = graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![EntityDelta::Added(entity.clone())],
+                relation_deltas: vec![RelationDelta::Added(relation)],
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: test_located("src/new.rs", entry),
+                }],
+            })
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("unadmitted destination endpoint"));
+        assert!(graph.get_entity(&entity.id).unwrap().is_none());
+        assert!(graph.resolved_tree().is_empty());
+        assert!(!graph.has_pending_delta());
+    }
+
+    #[test]
+    fn post_authority_cache_failure_quarantines_without_retryable_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = InMemoryGraph::with_text_index(dir.path().join("text-index"));
+        let file_id = FilePathId::new("src/fault.rs");
+        let old_entry = TreeEntry::blob(Hash256::from_bytes([0x16; 32]), false);
+        let new_entry = TreeEntry::blob(Hash256::from_bytes([0x17; 32]), false);
+        let artifact_id = graph.admit_artifact_for_test(&file_id.0, old_entry);
+        let entity = test_entity("faulted", &file_id.0);
+        graph.upsert_entity(&entity).unwrap();
+        graph.flush_text_index().unwrap();
+        assert!(!graph.text_search("faulted", 10).unwrap().is_empty());
+        graph.clear_pending_delta();
+        graph
+            .fail_next_transaction_derived_cleanup
+            .store(true, Ordering::Release);
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&file_id.0, old_entry),
+                    new: test_located(&file_id.0, new_entry),
+                }],
+            })
+            .expect("derived cache failure cannot reverse committed authority");
+
+        assert!(graph.get_entity(&entity.id).unwrap().is_none());
+        assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(new_entry));
+        assert!(graph.text_full_rebuild_required.load(Ordering::Acquire));
+        assert!(
+            graph
+                .text_search("faulted", 10)
+                .unwrap_err()
+                .to_string()
+                .contains("quarantined"),
+            "a quarantined derived index must never answer from stale documents"
+        );
+        assert_eq!(graph.text_doc_frequency("faulted"), 0);
+        assert_eq!(graph.text_document_count(), 0);
+        graph.fail_next_text_rebuild.store(true, Ordering::Release);
+        assert!(
+            graph.flush_text_index().is_err(),
+            "the deterministic rebuild failure must reach the caller"
+        );
+        assert!(
+            graph.text_full_rebuild_required.load(Ordering::Acquire),
+            "a failed rebuild cannot clear quarantine"
+        );
+        assert!(graph.text_search("faulted", 10).is_err());
+        graph.flush_text_index().unwrap();
+        assert!(!graph.text_full_rebuild_required.load(Ordering::Acquire));
+        assert!(graph.text_search("faulted", 10).unwrap().is_empty());
+        #[cfg(feature = "vector")]
+        {
+            assert!(graph.vector_index.lock().is_none());
+            assert_eq!(
+                graph.pending_artifact_embeddings(),
+                0,
+                "an exact artifact without enrichment has no vector document to rebuild"
+            );
+        }
     }
 
     #[test]
@@ -9745,7 +10598,7 @@ mod tests {
         snapshot.outgoing.insert(e1.id, vec![rid]);
         snapshot.incoming.insert(e2.id, vec![rid]);
 
-        let graph = InMemoryGraph::from_snapshot(snapshot);
+        let graph = InMemoryGraph::from_snapshot(snapshot).unwrap();
         assert_eq!(graph.relation_count(), 1);
         // Reads the (reused) entity-level `outgoing` adjacency.
         let outgoing = graph.get_relations(&e1.id, &[]).unwrap();
@@ -10160,7 +11013,8 @@ mod tests {
         .unwrap();
 
         let graph =
-            InMemoryGraph::from_snapshot_with_text_index(snapshot, dir.path().join("text-index"));
+            InMemoryGraph::from_snapshot_with_text_index(snapshot, dir.path().join("text-index"))
+                .unwrap();
 
         // Current snapshots carry graph-assigned artifact identity explicitly;
         // restore consumes it without deriving identity from the path.
@@ -10655,6 +11509,163 @@ mod tests {
             .expect_err("spoofed identity must fail closed");
         assert!(error.to_string().contains("recomputes to"));
         assert_no_change_admission(&graph);
+    }
+
+    #[test]
+    fn public_snapshot_hydration_rejects_spoofed_change_identity() {
+        let spoofed = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0xee; 32])),
+            parents: Vec::new(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("attacker"),
+            message: "spoofed hydration".into(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            authored_on: None,
+        };
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.changes.insert(spoofed.id, spoofed);
+
+        let error = InMemoryGraph::from_snapshot(snapshot)
+            .expect_err("public hydration must validate immutable change identity");
+        assert!(error.to_string().contains("semantic change"));
+    }
+
+    #[test]
+    fn borrowed_snapshot_save_rejects_spoofed_change_identity() {
+        let graph = InMemoryGraph::new();
+        let spoofed = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0xed; 32])),
+            parents: Vec::new(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("attacker"),
+            message: "spoofed borrowed save".into(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            authored_on: None,
+        };
+        graph.changes.write().changes.insert(spoofed.id, spoofed);
+
+        let error = graph
+            .serialize_snapshot_borrowed()
+            .expect_err("borrowed persistence must validate immutable change identity");
+        assert!(error.to_string().contains("semantic change"));
+    }
+
+    #[test]
+    fn create_change_cannot_be_detached_between_revision_children_and_change() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let graph = std::sync::Arc::new(InMemoryGraph::new());
+        let parent = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            parents: Vec::new(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("tester"),
+            message: "parent".into(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            authored_on: None,
+        });
+        graph.create_change(&parent).unwrap();
+        graph.clear_pending_delta();
+
+        let entity = test_entity("atomic_change", "src/atomic.rs");
+        let child = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            parents: vec![parent.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("tester"),
+            message: "child".into(),
+            entity_deltas: vec![EntityDelta::Added(entity.clone())],
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            projected_files: vec![entity.file_origin.clone().unwrap()],
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            authored_on: None,
+        });
+
+        let (at_revision_tx, at_revision_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let creator_graph = graph.clone();
+        let creator_change = child.clone();
+        let creator = std::thread::spawn(move || {
+            set_create_change_after_revision_hook(move || {
+                at_revision_tx.send(()).unwrap();
+                continue_rx.recv().unwrap();
+            });
+            creator_graph.create_change(&creator_change)
+        });
+
+        at_revision_rx.recv().unwrap();
+        assert!(
+            graph.pending_delta.try_lock().is_none(),
+            "the pending-delta fence must already be held when revisions mutate"
+        );
+
+        let (detach_started_tx, detach_started_rx) = mpsc::channel();
+        let (detached_tx, detached_rx) = mpsc::channel();
+        let detach_graph = graph.clone();
+        let detacher = std::thread::spawn(move || {
+            detach_started_tx.send(()).unwrap();
+            detached_tx
+                .send(detach_graph.begin_delta_persistence(0))
+                .unwrap();
+        });
+        detach_started_rx.recv().unwrap();
+        assert!(
+            detached_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "persistence detach must wait for the complete change batch"
+        );
+
+        continue_tx.send(()).unwrap();
+        creator.join().unwrap().unwrap();
+        let (delta, epoch) = detached_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .expect("the complete change batch must detach");
+        detacher.join().unwrap();
+
+        let has_change = delta
+            .changes
+            .added
+            .iter()
+            .chain(delta.changes.modified.iter())
+            .any(|(id, value)| *id == child.id && value.id == child.id);
+        let has_revisions = delta
+            .entity_revisions
+            .added
+            .iter()
+            .chain(delta.entity_revisions.modified.iter())
+            .any(|(id, revisions)| *id == entity.id && !revisions.is_empty());
+        let has_child_edge = delta
+            .change_children
+            .added
+            .iter()
+            .chain(delta.change_children.modified.iter())
+            .any(|(id, children)| *id == parent.id && children.contains(&child.id));
+        assert!(has_change && has_revisions && has_child_edge);
+        assert!(graph.complete_persistence(epoch));
     }
 
     #[test]
@@ -11481,7 +12492,7 @@ mod tests {
         let mut snapshot = graph.to_snapshot();
         snapshot.entity_revisions.clear();
 
-        let reloaded = InMemoryGraph::from_snapshot(snapshot);
+        let reloaded = InMemoryGraph::from_snapshot(snapshot).unwrap();
         let repaired = reloaded.to_snapshot();
         let revisions = repaired
             .entity_revisions
@@ -15598,7 +16609,7 @@ mod tests {
         let fwd: Vec<usize> = (0..rels.len()).collect();
         let g = determinism_build(&ents, &rels, &fwd);
         let before = g.compute_root_hash();
-        let reopened = InMemoryGraph::from_snapshot(g.to_snapshot());
+        let reopened = InMemoryGraph::from_snapshot(g.to_snapshot()).unwrap();
         assert_eq!(
             before,
             reopened.compute_root_hash(),

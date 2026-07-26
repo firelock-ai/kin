@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::error::KinDbError;
-use crate::storage::format::GraphSnapshot;
+use crate::storage::format::{GraphSnapshot, LocateGraphSnapshot};
 use crate::types::*;
 
 /// Trait abstracting read-only access to the entity/relation graph for Merkle
@@ -640,6 +640,199 @@ pub fn compute_subgraph_hash_generic(
 /// This means the root is deterministic regardless of entity insertion order.
 pub fn compute_graph_root_hash(snapshot: &GraphSnapshot) -> MerkleHash {
     compute_root_hash_generic(snapshot, None)
+}
+
+/// Versioned authority for every graph domain that can change locate, lexical,
+/// or vector retrieval results.
+///
+/// The legacy graph root intentionally covers only entity/relation topology.
+/// It is therefore not a safe sidecar identity for exact repository-tree or
+/// artifact enrichment changes. This digest binds those domains as well while
+/// remaining substantially cheaper than cloning and hashing a full snapshot.
+pub const RETRIEVAL_AUTHORITY_HASH_VERSION: u32 = 1;
+
+const RETRIEVAL_AUTHORITY_DOMAIN: &[u8] = b"kin-retrieval-authority-v1:";
+
+/// Compute the retrieval-sidecar authority for an owned snapshot.
+pub fn compute_retrieval_authority_hash(snapshot: &GraphSnapshot) -> MerkleHash {
+    let mut hasher = Sha256::new();
+    hasher.update(RETRIEVAL_AUTHORITY_DOMAIN);
+    hasher.update(RETRIEVAL_AUTHORITY_HASH_VERSION.to_le_bytes());
+    hasher.update(compute_graph_root_hash(snapshot));
+
+    hash_map_domain(&mut hasher, "retrieval_entities", &snapshot.entities);
+    hash_map_domain(&mut hasher, "retrieval_relations", &snapshot.relations);
+    hash_map_domain(&mut hasher, "retrieval_changes", &snapshot.changes);
+    hash_map_domain(
+        &mut hasher,
+        "retrieval_entity_revisions",
+        &snapshot.entity_revisions,
+    );
+
+    let shallow: Vec<_> = snapshot
+        .shallow_files
+        .iter()
+        .map(|value| (&value.file_id, value))
+        .collect();
+    hash_domain_elements(&mut hasher, "retrieval_shallow_files", &shallow);
+    let layouts: Vec<_> = snapshot
+        .file_layouts
+        .iter()
+        .map(|value| (&value.file_id, value))
+        .collect();
+    hash_domain_elements(&mut hasher, "retrieval_file_layouts", &layouts);
+    let structured: Vec<_> = snapshot
+        .structured_artifacts
+        .iter()
+        .map(|value| (&value.file_id, value))
+        .collect();
+    hash_domain_elements(&mut hasher, "retrieval_structured_artifacts", &structured);
+    let opaque: Vec<_> = snapshot
+        .opaque_artifacts
+        .iter()
+        .map(|value| (&value.file_id, value))
+        .collect();
+    hash_domain_elements(&mut hasher, "retrieval_opaque_artifacts", &opaque);
+
+    let resolved: Vec<_> = snapshot.resolved_tree.artifacts().collect();
+    hash_domain_elements(&mut hasher, "retrieval_resolved_tree", &resolved);
+    finalize_sha256(hasher)
+}
+
+/// Compute the retrieval authority for the locate-only projection without
+/// materialising a second owned `GraphSnapshot`.
+pub(crate) fn compute_locate_retrieval_authority_hash(
+    snapshot: &LocateGraphSnapshot,
+    graph_root_hash: MerkleHash,
+) -> MerkleHash {
+    let mut hasher = Sha256::new();
+    hasher.update(RETRIEVAL_AUTHORITY_DOMAIN);
+    hasher.update(RETRIEVAL_AUTHORITY_HASH_VERSION.to_le_bytes());
+    hasher.update(graph_root_hash);
+
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_entities",
+        &snapshot.entities.iter().collect::<Vec<_>>(),
+    );
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_relations",
+        &snapshot.relations.iter().collect::<Vec<_>>(),
+    );
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_changes",
+        &snapshot.changes.iter().collect::<Vec<_>>(),
+    );
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_entity_revisions",
+        &snapshot.entity_revisions.iter().collect::<Vec<_>>(),
+    );
+
+    let shallow: Vec<_> = snapshot
+        .shallow_files
+        .iter()
+        .map(|value| (&value.file_id, value))
+        .collect();
+    hash_domain_elements(&mut hasher, "retrieval_shallow_files", &shallow);
+    let layouts: Vec<_> = snapshot
+        .file_layouts
+        .iter()
+        .map(|value| (&value.file_id, value))
+        .collect();
+    hash_domain_elements(&mut hasher, "retrieval_file_layouts", &layouts);
+    let structured: Vec<_> = snapshot
+        .structured_artifacts
+        .iter()
+        .map(|value| (&value.file_id, value))
+        .collect();
+    hash_domain_elements(&mut hasher, "retrieval_structured_artifacts", &structured);
+    let opaque: Vec<_> = snapshot
+        .opaque_artifacts
+        .iter()
+        .map(|value| (&value.file_id, value))
+        .collect();
+    hash_domain_elements(&mut hasher, "retrieval_opaque_artifacts", &opaque);
+
+    let resolved: Vec<_> = snapshot.resolved_tree.artifacts().collect();
+    hash_domain_elements(&mut hasher, "retrieval_resolved_tree", &resolved);
+    finalize_sha256(hasher)
+}
+
+/// Compute the same retrieval authority directly over live hashbrown stores.
+///
+/// This is the zero-clone persistence path used while graph read guards are
+/// held. Keep it byte-equivalent to [`compute_retrieval_authority_hash`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_live_retrieval_authority_hash(
+    graph_root_hash: MerkleHash,
+    entities: &hashbrown::HashMap<EntityId, Entity>,
+    relations: &hashbrown::HashMap<RelationId, Relation>,
+    changes: &hashbrown::HashMap<SemanticChangeId, SemanticChange>,
+    entity_revisions: &hashbrown::HashMap<EntityId, Vec<EntityRevision>>,
+    resolved_tree: &ResolvedTree,
+    shallow_files: &hashbrown::HashMap<FilePathId, ShallowTrackedFile>,
+    file_layouts: &hashbrown::HashMap<FilePathId, FileLayout>,
+    structured_artifacts: &hashbrown::HashMap<FilePathId, StructuredArtifact>,
+    opaque_artifacts: &hashbrown::HashMap<FilePathId, OpaqueArtifact>,
+) -> MerkleHash {
+    let mut hasher = Sha256::new();
+    hasher.update(RETRIEVAL_AUTHORITY_DOMAIN);
+    hasher.update(RETRIEVAL_AUTHORITY_HASH_VERSION.to_le_bytes());
+    hasher.update(graph_root_hash);
+
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_entities",
+        &entities.iter().collect::<Vec<_>>(),
+    );
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_relations",
+        &relations.iter().collect::<Vec<_>>(),
+    );
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_changes",
+        &changes.iter().collect::<Vec<_>>(),
+    );
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_entity_revisions",
+        &entity_revisions.iter().collect::<Vec<_>>(),
+    );
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_shallow_files",
+        &shallow_files.iter().collect::<Vec<_>>(),
+    );
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_file_layouts",
+        &file_layouts.iter().collect::<Vec<_>>(),
+    );
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_structured_artifacts",
+        &structured_artifacts.iter().collect::<Vec<_>>(),
+    );
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_opaque_artifacts",
+        &opaque_artifacts.iter().collect::<Vec<_>>(),
+    );
+    let resolved: Vec<_> = resolved_tree.artifacts().collect();
+    hash_domain_elements(&mut hasher, "retrieval_resolved_tree", &resolved);
+    finalize_sha256(hasher)
+}
+
+fn finalize_sha256(hasher: Sha256) -> MerkleHash {
+    let result = hasher.finalize();
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&result);
+    hash
 }
 
 /// Like [`compute_graph_root_hash`] but accepts an optional [`MerkleCache`].
@@ -2207,6 +2400,127 @@ mod tests {
         assert_eq!(
             compute_repo_truth_hash(&first),
             compute_repo_truth_hash(&second)
+        );
+    }
+
+    #[test]
+    fn retrieval_authority_changes_when_exact_tree_or_artifact_facets_change() {
+        let empty = GraphSnapshot::empty();
+        let mut tree_only = GraphSnapshot::empty();
+        let artifact_id = ArtifactId::new();
+        tree_only.resolved_tree = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+            artifact_id,
+            RepoPath::from_utf8("compose.yaml").unwrap(),
+            crate::types::regular_tree_entry(1),
+        )])
+        .unwrap();
+
+        assert_eq!(
+            compute_graph_root_hash(&empty),
+            compute_graph_root_hash(&tree_only),
+            "the entity/relation root deliberately does not cover exact tree truth"
+        );
+        assert_ne!(
+            compute_retrieval_authority_hash(&empty),
+            compute_retrieval_authority_hash(&tree_only),
+            "retrieval sidecars must be invalidated by exact tree changes"
+        );
+
+        let mut with_facet = tree_only.clone();
+        with_facet.structured_artifacts.push(StructuredArtifact {
+            file_id: FilePathId::new("compose.yaml"),
+            kind: ArtifactKind::ComposeFile,
+            content_hash: Hash256::from_bytes([2; 32]),
+            text_preview: Some("services:".into()),
+        });
+        assert_ne!(
+            compute_retrieval_authority_hash(&tree_only),
+            compute_retrieval_authority_hash(&with_facet),
+            "artifact retrieval documents must participate in sidecar authority"
+        );
+    }
+
+    #[test]
+    fn owned_locate_and_live_retrieval_authorities_are_byte_equivalent() {
+        let mut snapshot = GraphSnapshot::empty();
+        let artifact_id = ArtifactId::new();
+        snapshot.resolved_tree = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+            artifact_id,
+            RepoPath::from_utf8("Dockerfile").unwrap(),
+            crate::types::regular_tree_entry(3),
+        )])
+        .unwrap();
+        snapshot.opaque_artifacts.push(OpaqueArtifact {
+            file_id: FilePathId::new("Dockerfile"),
+            content_hash: Hash256::from_bytes([3; 32]),
+            mime_type: Some("text/plain".into()),
+            text_preview: Some("FROM scratch".into()),
+        });
+        let entity = test_entity("container_entry");
+        snapshot.entities.insert(entity.id, entity);
+
+        let graph_root_hash = compute_graph_root_hash(&snapshot);
+        let owned = compute_retrieval_authority_hash(&snapshot);
+        let locate = LocateGraphSnapshot::from(snapshot.clone());
+        assert_eq!(
+            owned,
+            compute_locate_retrieval_authority_hash(&locate, graph_root_hash)
+        );
+
+        let entities = snapshot
+            .entities
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let relations = snapshot
+            .relations
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let changes = snapshot
+            .changes
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let revisions = snapshot
+            .entity_revisions
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let shallow = snapshot
+            .shallow_files
+            .iter()
+            .map(|value| (value.file_id.clone(), value.clone()))
+            .collect();
+        let layouts = snapshot
+            .file_layouts
+            .iter()
+            .map(|value| (value.file_id.clone(), value.clone()))
+            .collect();
+        let structured = snapshot
+            .structured_artifacts
+            .iter()
+            .map(|value| (value.file_id.clone(), value.clone()))
+            .collect();
+        let opaque = snapshot
+            .opaque_artifacts
+            .iter()
+            .map(|value| (value.file_id.clone(), value.clone()))
+            .collect();
+        assert_eq!(
+            owned,
+            compute_live_retrieval_authority_hash(
+                graph_root_hash,
+                &entities,
+                &relations,
+                &changes,
+                &revisions,
+                &snapshot.resolved_tree,
+                &shallow,
+                &layouts,
+                &structured,
+                &opaque,
+            )
         );
     }
 
