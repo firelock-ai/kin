@@ -15,7 +15,6 @@ pub struct GraphHealthReport {
     pub graph_empty_for_supported_inputs: bool,
     pub contaminated_entity_count: usize,
     pub contaminated_non_entity_count: usize,
-    pub contaminated_file_hash_count: usize,
     pub contaminated_path_count: usize,
     pub contaminated_paths_sample: Vec<String>,
     pub test_role_entity_count: usize,
@@ -37,7 +36,6 @@ struct SupportedInputCounts {
 struct ContaminationSummary {
     entity_count: usize,
     non_entity_count: usize,
-    file_hash_count: usize,
     path_count: usize,
     path_samples: Vec<String>,
 }
@@ -116,19 +114,9 @@ fn collect_contamination(graph: &kin_db::InMemoryGraph) -> Result<ContaminationS
         }
     }
 
-    let contaminated_file_hash_paths: Vec<_> = graph
-        .indexed_file_paths()
-        .into_iter()
-        .filter(|path| !is_repo_owned_graph_path(path))
-        .collect();
-    for path in &contaminated_file_hash_paths {
-        path_set.insert(path.clone());
-    }
-
     Ok(ContaminationSummary {
         entity_count: contaminated_entity_count,
         non_entity_count: contaminated_non_entity_count,
-        file_hash_count: contaminated_file_hash_paths.len(),
         path_count: path_set.len(),
         path_samples: path_set.into_iter().take(8).collect(),
     })
@@ -217,7 +205,6 @@ fn build_graph_health_report(
         graph_empty_for_supported_inputs,
         contaminated_entity_count: contamination.entity_count,
         contaminated_non_entity_count: contamination.non_entity_count,
-        contaminated_file_hash_count: contamination.file_hash_count,
         contaminated_path_count: contamination.path_count,
         contaminated_paths_sample: contamination.path_samples.clone(),
         test_role_entity_count,
@@ -244,7 +231,7 @@ mod tests {
             structured_artifact_count: 0,
             opaque_artifact_count: 0,
             file_layout_count: 0,
-            file_hash_count: 0,
+            working_tree_entry_count: 0,
             text_indexed_entity_count: 0,
             text_index_coverage_percent: 0.0,
             indexed_embedding_count: 0,
@@ -270,7 +257,6 @@ mod tests {
         let contamination = ContaminationSummary {
             entity_count: 0,
             non_entity_count: 0,
-            file_hash_count: 0,
             path_count: 0,
             path_samples: Vec::new(),
         };
@@ -306,7 +292,6 @@ mod tests {
             &ContaminationSummary {
                 entity_count: 1,
                 non_entity_count: 2,
-                file_hash_count: 1,
                 path_count: 3,
                 path_samples: vec!["out/generated.rs".to_string()],
             },
