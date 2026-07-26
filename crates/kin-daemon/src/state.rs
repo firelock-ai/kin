@@ -986,17 +986,6 @@ pub struct DaemonState {
     pub locate_rankings: Mutex<HashMap<String, CachedLocateRanking>>,
     /// Cached `semantic_locate` result pages keyed by paging-cursor key.
     pub semantic_locate_pages: Mutex<HashMap<String, CachedSemanticPage>>,
-    /// Serializes lazy git-ancestry hydration — the full-history import behind a
-    /// `review`/`history`/`blame`/`locate --ref` ref that names an
-    /// unimported Git commit. At most one such import runs at a time: two
-    /// concurrent deep imports roughly double peak memory and can OOM-kill the
-    /// daemon. Concurrent requests for the SAME unimported commit coalesce —
-    /// whoever wins the gate imports it, and later waiters observe it already
-    /// present (the get-or-build guard in `hydrate_imported_git_ref`) and skip
-    /// the re-import. Held across the request `.await` (and moved into the
-    /// the blocking prepare task), so it is a tokio mutex behind an `Arc` — not
-    /// the std locks used for the synchronous critical sections above.
-    pub hydration_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Cached full locate entity-ranking for cursor paging. The daemon caches the
@@ -1408,7 +1397,6 @@ impl DaemonState {
             mcp_transactions: Mutex::new(HashMap::new()),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
-            hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
         };
         // Restore in-flight MCP transactions persisted before a restart
         // so staged-but-uncommitted work is not silently dropped across a daemon
@@ -1577,7 +1565,6 @@ impl DaemonState {
             mcp_transactions: Mutex::new(HashMap::new()),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
-            hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
         };
 
         // Restore in-flight MCP transactions persisted before a restart.
@@ -2740,41 +2727,10 @@ impl DaemonState {
         (Arc::clone(&self.graph), RequestGraphAuthority::Head)
     }
 
-    /// Resolve the graph authority for a request that may hydrate a Git ref.
-    ///
-    /// Ref hydration mutates the selected graph even though blame/history are
-    /// query surfaces. Treat an active temporal scope like a write lease:
-    /// prune expired entries and refresh the selected scope under the same
-    /// write lock used to clone its graph. This gives hydration a fresh scope
-    /// lease instead of starting from a nearly-expired one. Callers must still
-    /// re-resolve through this method after waiting on the global hydration
-    /// gate because the session scope may have changed while the request was
-    /// queued.
-    pub(crate) async fn graph_for_ref_hydration_with_authority(
-        &self,
-        session_id: Option<&kin_model::SessionId>,
-    ) -> (Arc<kin_db::InMemoryGraph>, RequestGraphAuthority) {
-        if let Some(session_id) = session_id {
-            let mut scopes = self.session_scopes.write().await;
-            scopes.retain(|_, scope| !scope.is_expired());
-            if let Some(scope) = scopes.get_mut(session_id) {
-                scope.created_at = Instant::now();
-                return (
-                    Arc::clone(&scope.cached_graph),
-                    RequestGraphAuthority::SessionScope,
-                );
-            }
-        }
-
-        (Arc::clone(&self.graph), RequestGraphAuthority::Head)
-    }
-
-    /// Revalidate that the authority selected before ref hydration still owns
-    /// the exact graph that was mutated. Session scopes may expire or be
-    /// replaced while synchronous history import is running; in that case the
-    /// old graph is an orphan and must not be acknowledged as current session
-    /// state. HEAD ownership is stable for the daemon lifetime.
-    pub(crate) async fn ref_hydration_authority_is_current(
+    /// Revalidate that a selected request graph is still owned by the same
+    /// authority. Session scopes may expire or be replaced during a long read;
+    /// HEAD ownership is stable for the daemon lifetime.
+    pub(crate) async fn graph_authority_is_current(
         &self,
         session_id: Option<&kin_model::SessionId>,
         graph: &Arc<kin_db::InMemoryGraph>,
@@ -4274,7 +4230,6 @@ mod tests {
             mcp_transactions: Mutex::new(HashMap::new()),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
-            hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
