@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::cell::Cell;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -103,6 +104,40 @@ struct RepositoryInitStageLease {
     owner_path: PathBuf,
     owner_file: File,
     record: RepositoryInitStageOwner,
+}
+
+/// One-shot authority to install a verified stage at its bound `.kin` path.
+///
+/// The constructor is private. A source verifier receives this capability only
+/// after staged repository authority has been durably synced, closed, reopened,
+/// and verified. Consuming it performs the atomic no-replace rename.
+#[must_use = "repository publication must be consumed or explicitly rejected"]
+pub struct RepositoryPublication<'a> {
+    staged_path: &'a Path,
+    final_kin_dir: &'a Path,
+    published: &'a Cell<bool>,
+}
+
+/// Proof that the one-shot repository publication rename succeeded.
+#[must_use = "a published repository should be post-verified before returning"]
+pub struct PublishedRepository<'a> {
+    final_kin_dir: &'a Path,
+}
+
+impl<'a> RepositoryPublication<'a> {
+    pub fn publish(self) -> Result<PublishedRepository<'a>> {
+        rename_directory_noreplace(self.staged_path, self.final_kin_dir)?;
+        self.published.set(true);
+        Ok(PublishedRepository {
+            final_kin_dir: self.final_kin_dir,
+        })
+    }
+}
+
+impl PublishedRepository<'_> {
+    pub fn path(&self) -> &Path {
+        self.final_kin_dir
+    }
 }
 
 /// A complete `.kin` repository assembled outside the final namespace.
@@ -618,28 +653,41 @@ fn recoverable_file_identity(_metadata: &std::fs::Metadata) -> RecoverableFileId
 /// Atomically publish a fully bootstrapped staged repository as the final
 /// `.kin` directory without replacing any existing entry.
 pub fn publish_repository_layout(prepared: PreparedRepositoryInit) -> Result<InitResult> {
-    publish_repository_layout_with_hooks(prepared, || Ok(()), |_| {})
+    publish_repository_layout_linearized(prepared, |publication| {
+        let _published = publication.publish()?;
+        Ok(())
+    })
 }
 
-/// Publish a staged repository only if one final read-only source check passes.
+/// Verify external source authority at the repository publication boundary.
 ///
-/// The callback runs after the staged authority has been durably synced,
-/// closed, reopened, verified, and synced again, immediately before the atomic
-/// no-replace rename. A callback error leaves the final `.kin` absent and arms
-/// normal staged cleanup. Git migration uses this boundary to repeat its exact
-/// source preflight without allowing the staging directory to contaminate the
-/// observed worktree.
-pub fn publish_repository_layout_after_check(
+/// The callback receives a one-shot [`RepositoryPublication`] only after the
+/// staged authority has been durably synced, closed, reopened, verified, and
+/// synced again. It must perform its final source proof and consume the
+/// capability at the exact chosen linearization point. It may then use the
+/// returned [`PublishedRepository`] to immediately post-verify the source.
+///
+/// An error before publication leaves `.kin` absent and reaps the owned stage.
+/// An error after publication returns
+/// [`KinError::RepositoryPublishedButUncertain`] after final Kin verification
+/// and parent namespace sync have also been attempted.
+///
+/// No supported POSIX, APFS, or Windows filesystem primitive can atomically
+/// snapshot an independently mutable Git object database, index, and worktree
+/// together with a no-replace rename of a separate `.kin` directory. This API
+/// therefore makes the rename the explicit linearization point and lets the
+/// caller verify on both sides of it; non-cooperating raw filesystem writers
+/// remain detectable rather than lockable.
+pub fn publish_repository_layout_linearized(
     prepared: PreparedRepositoryInit,
-    before_rename: impl FnOnce() -> Result<()>,
+    verify_and_publish: impl FnOnce(RepositoryPublication<'_>) -> Result<()>,
 ) -> Result<InitResult> {
-    publish_repository_layout_with_hooks(prepared, before_rename, |_| {})
+    publish_repository_layout_impl(prepared, verify_and_publish)
 }
 
-fn publish_repository_layout_with_hooks(
+fn publish_repository_layout_impl(
     mut prepared: PreparedRepositoryInit,
-    before_rename: impl FnOnce() -> Result<()>,
-    after_rename: impl FnOnce(&Path),
+    verify_and_publish: impl FnOnce(RepositoryPublication<'_>) -> Result<()>,
 ) -> Result<InitResult> {
     let final_kin_dir = prepared.final_kin_dir.clone();
     let final_kin_dir = final_kin_dir.as_path();
@@ -670,15 +718,27 @@ fn publish_repository_layout_with_hooks(
     // Verification may create or touch backend lock state. Flush the exact
     // verified namespace once more before the publication rename.
     sync_layout_recursively(prepared.layout.root())?;
-    before_rename()?;
-    rename_directory_noreplace(prepared.layout.root(), final_kin_dir)?;
+    let published = Cell::new(false);
+    let publication_result = verify_and_publish(RepositoryPublication {
+        staged_path: prepared.layout.root(),
+        final_kin_dir,
+        published: &published,
+    });
+    if !published.get() {
+        return match publication_result {
+            Err(error) => Err(error),
+            Ok(()) => Err(KinError::Other(
+                "repository publication callback returned without consuming its one-shot capability"
+                    .to_string(),
+            )),
+        };
+    }
     prepared.cleanup_armed = false;
     let owner_cleanup = prepared
         .stage_lease
         .take()
         .ok_or_else(|| KinError::Other("repository stage lease is missing".to_string()))
         .and_then(remove_stage_owner);
-    after_rename(final_kin_dir);
 
     let source_parent = prepared
         .layout
@@ -688,7 +748,7 @@ fn publish_repository_layout_with_hooks(
     let destination_parent = final_kin_dir
         .parent()
         .expect("validated final .kin path always has a parent");
-    let parent_sync =
+    let namespace_sync =
         owner_cleanup.and_then(|()| sync_publication_parents(source_parent, destination_parent));
     let layout = KinLayout::new(final_kin_dir.to_path_buf());
     let final_verification = verify_repository_layout(
@@ -698,21 +758,24 @@ fn publish_repository_layout_with_hooks(
         prepared.workspace_id,
         &bootstrap,
     );
-    let (config, manifest) = match (parent_sync, final_verification) {
-        (Ok(()), Ok(metadata)) => metadata,
-        (Err(sync_error), Ok(_)) => {
-            return Err(published_uncertain(final_kin_dir, sync_error));
-        }
-        (Ok(()), Err(verification_error)) => {
-            return Err(published_uncertain(final_kin_dir, verification_error));
-        }
-        (Err(sync_error), Err(verification_error)) => {
+    let (config, manifest) = match (publication_result, namespace_sync, final_verification) {
+        (Ok(()), Ok(()), Ok(metadata)) => metadata,
+        (publication_result, namespace_sync, final_verification) => {
+            let mut details = Vec::new();
+            if let Err(error) = publication_result {
+                details.push(format!(
+                    "post-publication source verification failed: {error}"
+                ));
+            }
+            if let Err(error) = namespace_sync {
+                details.push(format!("publication namespace sync failed: {error}"));
+            }
+            if let Err(error) = final_verification {
+                details.push(format!("final repository verification failed: {error}"));
+            }
             return Err(KinError::RepositoryPublishedButUncertain {
                 path: final_kin_dir.display().to_string(),
-                detail: format!(
-                    "parent namespace sync failed: {sync_error}; final verification failed: \
-                     {verification_error}"
-                ),
+                detail: details.join("; "),
             });
         }
     };
@@ -768,13 +831,6 @@ fn verify_repository_layout(
         ));
     }
     Ok((config, manifest))
-}
-
-fn published_uncertain(final_kin_dir: &Path, error: KinError) -> KinError {
-    KinError::RepositoryPublishedButUncertain {
-        path: final_kin_dir.display().to_string(),
-        detail: error.to_string(),
-    }
 }
 
 /// Commit the first complete repository-authority state.
@@ -2265,13 +2321,11 @@ mod tests {
         prepared.commit_repository_bootstrap(&transaction).unwrap();
         let staging_root = prepared.layout.root().to_path_buf();
 
-        let error = publish_repository_layout_with_hooks(
-            prepared,
-            || Ok(()),
-            |published| {
-                std::fs::remove_file(published.join("manifest.json")).unwrap();
-            },
-        )
+        let error = publish_repository_layout_linearized(prepared, |publication| {
+            let published = publication.publish()?;
+            std::fs::remove_file(published.path().join("manifest.json")).unwrap();
+            Ok(())
+        })
         .unwrap_err();
 
         assert!(matches!(
@@ -2310,7 +2364,7 @@ mod tests {
         prepared.commit_repository_bootstrap(&transaction).unwrap();
         let staging_root = prepared.layout.root().to_path_buf();
 
-        let error = publish_repository_layout_after_check(prepared, || {
+        let error = publish_repository_layout_linearized(prepared, |_publication| {
             Err(KinError::Other(
                 "source changed during final migration preflight".to_string(),
             ))
@@ -2321,6 +2375,53 @@ mod tests {
             .to_string()
             .contains("source changed during final migration preflight"));
         assert!(!final_kin.exists());
+        assert!(!staging_root.exists());
+    }
+
+    #[test]
+    fn successful_verifier_cannot_skip_the_one_shot_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let working_dir = directory.path().canonicalize().unwrap();
+        let final_kin = working_dir.join(".kin");
+        let (mut prepared, transaction) = prepare_unborn(directory.path(), "unused-capability");
+        prepared.commit_repository_bootstrap(&transaction).unwrap();
+        let staging_root = prepared.layout.root().to_path_buf();
+
+        let error =
+            publish_repository_layout_linearized(prepared, |_publication| Ok(())).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("without consuming its one-shot capability"));
+        assert!(!final_kin.exists());
+        assert!(!staging_root.exists());
+    }
+
+    #[test]
+    fn verifier_error_after_atomic_publication_is_fail_loud_and_not_rolled_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let working_dir = directory.path().canonicalize().unwrap();
+        let final_kin = working_dir.join(".kin");
+        let (mut prepared, transaction) = prepare_unborn(directory.path(), "post-publish-check");
+        prepared.commit_repository_bootstrap(&transaction).unwrap();
+        let staging_root = prepared.layout.root().to_path_buf();
+
+        let error = publish_repository_layout_linearized(prepared, |publication| {
+            let _published = publication.publish()?;
+            Err(KinError::Other(
+                "external source drifted after publication".to_string(),
+            ))
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            KinError::RepositoryPublishedButUncertain { .. }
+        ));
+        assert!(error
+            .to_string()
+            .contains("external source drifted after publication"));
+        assert!(final_kin.is_dir());
         assert!(!staging_root.exists());
     }
 

@@ -30,9 +30,10 @@ pub use lossless::{
     GitRehydrationResult, LosslessGitRepository,
 };
 pub use preflight::{
-    preflight_git_migration, GitBranchTrackingFact, GitIndexPreflightProof,
-    GitLocalIgnoreInputFact, GitLocalIgnoreSourceKind, GitMigrationCompatibilityFacts,
-    GitMigrationPreflightProof, GitRemoteConfigFact, GitRemoteMappingFacts,
-    GitTrackedWorktreeProof, IgnoredLocalEntry, IgnoredLocalEntryKind, IgnoredLocalWorktreeFact,
+    preflight_git_migration, preflight_git_migration_after_publication, GitBranchTrackingFact,
+    GitIndexPreflightProof, GitLocalIgnoreInputFact, GitLocalIgnoreSourceKind,
+    GitMigrationCompatibilityFacts, GitMigrationPreflightProof, GitRemoteConfigFact,
+    GitRemoteMappingFacts, GitTrackedWorktreeProof, IgnoredLocalEntry, IgnoredLocalEntryKind,
+    IgnoredLocalWorktreeFact,
 };
 pub use semantic_import::{plan_semantic_git_import, GitWorkspaceSeed, SemanticGitImportPlan};

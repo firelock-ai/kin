@@ -254,7 +254,49 @@ pub fn preflight_git_migration(
     plan: &SemanticGitImportPlan,
     blob_store: &BlobStore,
 ) -> Result<GitMigrationPreflightProof> {
-    preflight_git_migration_with_hook(repo_path, snapshot, plan, blob_store, || {})
+    preflight_git_migration_with_hook(repo_path, snapshot, plan, blob_store, None, || {})
+}
+
+/// Repeat an exact Git source proof after Kin has atomically installed `.kin`.
+///
+/// Only the supplied real `.kin` directory at the canonical worktree root is
+/// excluded from the worktree walk. Every Git object, ref, index byte, tracked
+/// leaf, ignored-local fact, and any other untracked path remains subject to
+/// the same two-observation proof as pre-publication migration.
+pub fn preflight_git_migration_after_publication(
+    repo_path: &Path,
+    published_kin_dir: &Path,
+    snapshot: &LosslessGitRepository,
+    plan: &SemanticGitImportPlan,
+    blob_store: &BlobStore,
+) -> Result<GitMigrationPreflightProof> {
+    let source_worktree =
+        fs::canonicalize(repo_path).map_err(|error| GitError::io(repo_path, error))?;
+    let expected_kin_dir = source_worktree.join(".kin");
+    let metadata = fs::symlink_metadata(published_kin_dir)
+        .map_err(|error| GitError::io(published_kin_dir, error))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(preflight_error(format!(
+            "published Kin repository is not a real directory: {}",
+            published_kin_dir.display()
+        )));
+    }
+    let published_kin_dir = fs::canonicalize(published_kin_dir)
+        .map_err(|error| GitError::io(published_kin_dir, error))?;
+    if published_kin_dir != expected_kin_dir {
+        return Err(preflight_error(format!(
+            "post-publication proof may exclude only {}",
+            expected_kin_dir.display()
+        )));
+    }
+    preflight_git_migration_with_hook(
+        &source_worktree,
+        snapshot,
+        plan,
+        blob_store,
+        Some(&published_kin_dir),
+        || {},
+    )
 }
 
 fn preflight_git_migration_with_hook(
@@ -262,13 +304,28 @@ fn preflight_git_migration_with_hook(
     snapshot: &LosslessGitRepository,
     plan: &SemanticGitImportPlan,
     blob_store: &BlobStore,
+    published_kin_dir: Option<&Path>,
     after_first_observation: impl FnOnce(),
 ) -> Result<GitMigrationPreflightProof> {
     validate_plan_binding(snapshot, plan, blob_store)?;
     let expected = expected_index_entries(snapshot, plan)?;
-    let first = observe(repo_path, snapshot, plan, blob_store, &expected)?;
+    let first = observe(
+        repo_path,
+        snapshot,
+        plan,
+        blob_store,
+        &expected,
+        published_kin_dir,
+    )?;
     after_first_observation();
-    let second = observe(repo_path, snapshot, plan, blob_store, &expected)?;
+    let second = observe(
+        repo_path,
+        snapshot,
+        plan,
+        blob_store,
+        &expected,
+        published_kin_dir,
+    )?;
     if first != second {
         return Err(preflight_error(
             "Git source changed during migration preflight; retry from a fresh snapshot",
@@ -302,6 +359,7 @@ fn observe(
     plan: &SemanticGitImportPlan,
     blob_store: &BlobStore,
     expected_entries: &BTreeMap<RepoPath, ExpectedIndexEntry>,
+    published_kin_dir: Option<&Path>,
 ) -> Result<PreflightObservation> {
     let source_worktree =
         fs::canonicalize(repo_path).map_err(|error| GitError::io(repo_path, error))?;
@@ -376,6 +434,7 @@ fn observe(
         workdir,
         expected_entries,
         blob_store,
+        published_kin_dir,
     )?;
     let snapshot_fingerprint = fingerprint_snapshot(&snapshot);
     let semantic_plan_fingerprint = fingerprint_plan(plan)?;
@@ -608,6 +667,7 @@ fn prove_worktree(
     workdir: &Path,
     expected: &BTreeMap<RepoPath, ExpectedIndexEntry>,
     blob_store: &BlobStore,
+    published_kin_dir: Option<&Path>,
 ) -> Result<(GitTrackedWorktreeProof, IgnoredLocalWorktreeFact)> {
     let ignore_inputs = local_ignore_inputs(ignore_repo)?;
     let (mut excludes, ignore_case) = frozen_ignore_stack(ignore_repo, index, &ignore_inputs)?;
@@ -621,7 +681,14 @@ fn prove_worktree(
         gitlink_count: 0,
         ignored: Vec::new(),
     };
-    walk_directory(workdir, &[], true, &mut excludes, &mut state)?;
+    walk_directory(
+        workdir,
+        &[],
+        true,
+        published_kin_dir,
+        &mut excludes,
+        &mut state,
+    )?;
     let confirmed_local_ignore_inputs = local_ignore_inputs(ignore_repo)?;
     if confirmed_local_ignore_inputs != ignore_inputs {
         return Err(preflight_error(
@@ -684,6 +751,7 @@ fn walk_directory(
     absolute: &Path,
     relative: &[u8],
     root: bool,
+    published_kin_dir: Option<&Path>,
     excludes: &mut gix::AttributeStack<'_>,
     state: &mut WorktreeWalk<'_>,
 ) -> Result<()> {
@@ -698,6 +766,10 @@ fn walk_directory(
         if root && name == b".git" {
             continue;
         }
+        let absolute_path = directory_entry.path();
+        if root && published_kin_dir.is_some_and(|published| absolute_path == published) {
+            continue;
+        }
         let path_bytes = if relative.is_empty() {
             name
         } else {
@@ -709,7 +781,6 @@ fn walk_directory(
         };
         let path = RepoPath::from_bytes(path_bytes.clone())
             .map_err(|error| preflight_error(format!("invalid worktree path: {error}")))?;
-        let absolute_path = directory_entry.path();
         let metadata = fs::symlink_metadata(&absolute_path)
             .map_err(|error| GitError::io(&absolute_path, error))?;
 
@@ -737,7 +808,14 @@ fn walk_directory(
                     byte_len: 0,
                 });
             }
-            walk_directory(&absolute_path, &path_bytes, false, excludes, state)?;
+            walk_directory(
+                &absolute_path,
+                &path_bytes,
+                false,
+                published_kin_dir,
+                excludes,
+                state,
+            )?;
         } else if ignored {
             state.ignored.push(IgnoredLocalEntry {
                 path,
@@ -2134,6 +2212,60 @@ mod tests {
     }
 
     #[test]
+    fn post_publication_proof_excludes_only_the_exact_published_kin_directory() {
+        let fixture = Fixture::clean();
+        let before = fixture.preflight().expect("pre-publication proof");
+        let published_kin = fixture.repo.join(".kin");
+        fs::create_dir(&published_kin).expect("published Kin directory");
+        fs::write(published_kin.join("VERSION"), b"6\n").expect("published Kin metadata");
+
+        let normal = fixture
+            .preflight()
+            .expect_err("ordinary preflight must not hide an ambient .kin");
+        assert!(normal.to_string().contains("untracked non-ignored"));
+        let after = preflight_git_migration_after_publication(
+            &fixture.repo,
+            &published_kin,
+            &fixture.snapshot,
+            &fixture.plan,
+            &fixture.store,
+        )
+        .expect("post-publication proof");
+        assert_eq!(after, before);
+
+        fs::write(fixture.repo.join("outside-kin.txt"), b"untracked\n").expect("untracked sibling");
+        let error = preflight_git_migration_after_publication(
+            &fixture.repo,
+            &published_kin,
+            &fixture.snapshot,
+            &fixture.plan,
+            &fixture.store,
+        )
+        .expect_err("post-publication proof must retain all other worktree authority");
+        assert!(error.to_string().contains("outside-kin.txt"));
+    }
+
+    #[test]
+    fn post_publication_proof_still_rejects_tracked_source_drift() {
+        let fixture = Fixture::clean();
+        let published_kin = fixture.repo.join(".kin");
+        fs::create_dir(&published_kin).expect("published Kin directory");
+        fs::write(published_kin.join("VERSION"), b"6\n").expect("published Kin metadata");
+        fs::write(fixture.repo.join("compose.yaml"), b"services: {}\n")
+            .expect("tracked source drift");
+
+        let error = preflight_git_migration_after_publication(
+            &fixture.repo,
+            &published_kin,
+            &fixture.snapshot,
+            &fixture.plan,
+            &fixture.store,
+        )
+        .expect_err("tracked source drift must fail after publication");
+        assert!(error.to_string().contains("bytes differ"));
+    }
+
+    #[test]
     fn rejects_materialized_gitlink_state_instead_of_silently_skipping_it() {
         let nested_marker = Fixture::clean();
         fs::write(
@@ -2453,6 +2585,7 @@ mod tests {
             &fixture.snapshot,
             &fixture.plan,
             &fixture.store,
+            None,
             move || {
                 git(&repo, &["config", "--unset-all", "remote.origin.url"]);
                 git(
@@ -2634,6 +2767,7 @@ mod tests {
             &source_change.snapshot,
             &source_change.plan,
             &source_change.store,
+            None,
             move || {
                 fs::write(repo.join("ignored/new-cache"), b"new\n").expect("TOCTOU file");
             },
@@ -2650,6 +2784,7 @@ mod tests {
             &ignore_change.snapshot,
             &ignore_change.plan,
             &ignore_change.store,
+            None,
             move || {
                 let mut file = fs::OpenOptions::new()
                     .append(true)
