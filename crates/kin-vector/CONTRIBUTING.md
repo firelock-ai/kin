@@ -75,9 +75,10 @@ contributions from the community. A few requirements:
   under your own name, not as a third-party work. Firelock asserts copyright
   over AI-generated code it produces; you assert copyright over what you
   produce and submit here.
-- **No raw model output in commit messages or comments.** Clean up generated
-  prose before it lands in public history. Write durable, human-authored
-  commit messages that describe the technical change.
+- **Review generated prose before publishing.** Commit messages and comments
+  should accurately describe the technical change. Tool-specific attribution
+  is optional and is not required. Automation must not add, remove, or rewrite
+  it.
 
 ## Commit Messages
 
@@ -102,10 +103,12 @@ Public Git history is part of the product, so keep it clean and reviewable:
   names like `fix/layer-count` or `feat/filtered-search`. Avoid embedding
   internal issue or tracker IDs in a branch name.
 - **Write durable subjects and bodies.** Commit messages should describe the
-  technical change and why it was made. Keep internal tracker IDs, session
-  identifiers, and automated authorship trailers out of public commit metadata.
-- **Don't bypass the hooks.** Repository hooks normalize commit metadata for
-  consistency — don't skip them with `--no-verify`.
+  technical change and why it was made. Keep private internal tracker
+  references and private session URLs or IDs out of public commit metadata.
+- **Use hooks as validation-only gates.** Repository hooks may reject private
+  references or likely secrets. They must not rewrite timestamps, authors,
+  committers, attribution, or history. Do not bypass a failed validation with
+  `--no-verify`; address the reported issue.
 
 ## Pull Requests
 
