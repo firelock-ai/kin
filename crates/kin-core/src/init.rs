@@ -293,7 +293,7 @@ pub fn prepare_repository_layout_at(
         .map_err(|error| KinError::Other(format!("invalid default ref: {error}")))?;
     let staging_root = canonical_staging_root(staging_kin_dir)?;
 
-    std::fs::create_dir(&staging_root).map_err(|error| KinError::io(&staging_root, error))?;
+    create_private_staging_root(&staging_root)?;
     let layout = KinLayout::new(staging_root);
     let preparation = (|| {
         for directory in layout.all_dirs() {
@@ -332,6 +332,31 @@ pub fn prepare_repository_layout_at(
         cleanup_created_staging_root(layout.root());
     }
     preparation
+}
+
+fn create_private_staging_root(staging_root: &Path) -> Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        builder.mode(0o700);
+    }
+    builder
+        .create(staging_root)
+        .map_err(|error| KinError::io(staging_root, error))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if let Err(error) =
+            std::fs::set_permissions(staging_root, std::fs::Permissions::from_mode(0o700))
+        {
+            let _ = std::fs::remove_dir(staging_root);
+            return Err(KinError::io(staging_root, error));
+        }
+    }
+    Ok(())
 }
 
 /// Atomically publish a fully bootstrapped staged repository as the final
