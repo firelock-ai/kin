@@ -68,11 +68,14 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// [OPEN GATE] Show the repository-v6 change log
+    /// Show the immutable repository-v6 change log
     Log {
         /// Maximum number of entries
         #[arg(short = 'n', long, default_value = "10")]
         count: usize,
+        /// Output the exact authority-backed report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Repository-v6 branch operations (see subcommand readiness)
     Branch {
@@ -1895,7 +1898,7 @@ fn main() -> Result<()> {
                     }
                 },
                 Command::Commit { .. } => commands::capabilities::require_ready("commit"),
-                Command::Log { count: _ } => commands::capabilities::require_ready("log"),
+                Command::Log { count, json } => commands::log::run(count, json),
                 Command::Branch { action } => match action {
                     BranchAction::List { json } => commands::branch::list(json),
                     BranchAction::Create { name: _ } => {
