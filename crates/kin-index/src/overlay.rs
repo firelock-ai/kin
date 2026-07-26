@@ -103,7 +103,7 @@ fn apply_salvaged_parse<G: GraphStore>(
         .entities
         .iter()
         .filter(|e| {
-            e.span.as_ref().map_or(false, |span| {
+            e.span.as_ref().is_some_and(|span| {
                 !error_ranges.iter().any(|&(err_start, err_end)| {
                     span.start_byte < err_end && err_start < span.end_byte
                 })

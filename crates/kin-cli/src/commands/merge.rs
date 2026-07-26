@@ -373,9 +373,9 @@ fn build_merge_change(
         .iter()
         .flat_map(|c| c.relation_deltas.clone())
         .collect();
-    let artifact_deltas: Vec<_> = their_changes
+    let tree_deltas: Vec<_> = their_changes
         .iter()
-        .flat_map(|c| c.artifact_deltas.clone())
+        .flat_map(|c| c.tree_deltas.clone())
         .collect();
 
     let mut change = SemanticChange {
@@ -386,7 +386,7 @@ fn build_merge_change(
         message: message.to_string(),
         entity_deltas,
         relation_deltas,
-        artifact_deltas,
+        tree_deltas,
         projected_files: vec![],
         spec_link: None,
         evidence: vec![],

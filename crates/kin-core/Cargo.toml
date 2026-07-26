@@ -16,6 +16,7 @@ doctest = false
 kin-model = { workspace = true }
 kin-db = { workspace = true }
 kin-blobs = { workspace = true }
+kin-git = { workspace = true }
 kin-index = { path = "../kin-index" }
 kin-parser = { workspace = true }
 serde = { workspace = true }
@@ -30,6 +31,7 @@ gix = { workspace = true }
 directories = "5"
 fs2 = { workspace = true }
 unicode-normalization = "=0.1.25"
+tempfile = { workspace = true }
 
 [target.'cfg(any(unix, windows))'.dependencies]
 cap-std = "=4.0.2"
@@ -46,5 +48,4 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 pretty_assertions = { workspace = true }

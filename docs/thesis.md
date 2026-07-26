@@ -37,12 +37,12 @@ Kin replaces the file-first, diff-first substrate with a semantic, graph-first m
 ## Adoption and Brownfield Compatibility
 
 Adopting a new substrate is hard because it usually breaks existing tools. Kin makes
-adoption survivable through migration and coexistence:
+adoption survivable through explicit migration and compatibility projections:
 
-### 1. Git coexistence
-Kin coexists with Git. Local changes are reconciled between the semantic graph and the
-filesystem/Git representation, so standard Git commands keep working while Kin reconciles
-graph changes.
+### 1. Git migration and interoperability
+Kin can import an exact Git snapshot or complete reachable history, and can export
+graph-owned state back to Git when interoperability is required. Git is an input/output
+boundary during migration, never a runtime answer authority or silent repair path.
 
 ### 2. The virtual filesystem (`kin-vfs`)
 `kin-vfs` acts as a "Trojan horse" for graph-first adoption. By intercepting filesystem
@@ -68,6 +68,6 @@ The goal is to make software engineering graph-native. In this model:
 - AI agents and humans collaborate on the same semantic graph, enabling low-overhead,
   high-precision context sharing.
 
-> File-first and Git-compatible paths are transitional migration debt, not the
+> File-first and Git-interoperable paths are transitional migration debt, not the
 > steady-state model. The durable thesis is graph-owned semantic truth, with the
 > filesystem as a derived projection over it.

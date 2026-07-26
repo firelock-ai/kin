@@ -1186,7 +1186,7 @@ mod tests {
                 new: callee.clone(),
             }],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],

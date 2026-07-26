@@ -202,14 +202,15 @@ mod tests {
             timestamp: Timestamp::now(),
             author: AuthorId::new("test"),
             message: "add my_func".into(),
-            entity_deltas: vec![EntityDelta::Added(entity)],
+            entity_deltas: vec![EntityDelta::Added { new: entity }],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         };
 
         let diff = diff_from_change(&change);

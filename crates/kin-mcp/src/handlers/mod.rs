@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+pub mod artifacts;
 pub mod common;
 
 // Handler submodules are public so each tool's rich `*_DESC` description const
@@ -33,6 +34,9 @@ pub async fn handle_tool_call<G: GraphStore>(
     session_authority_mode: SessionAuthorityMode,
 ) -> Result<ToolCallResult> {
     match tool_name {
+        // Exact repository membership and bytes
+        "kin_artifact_list" => artifacts::handle_artifact_list(arguments, store),
+        "kin_artifact_read" => artifacts::handle_artifact_read(arguments, store),
         // Entities
         "semantic_search" => entities::handle_semantic_search(arguments, store),
         "semantic_locate" => entities::handle_semantic_locate(arguments, store),
@@ -136,12 +140,13 @@ pub async fn handle_tool_call<G: GraphStore>(
 mod tests {
     use super::common::*;
     use super::*;
+    use base64::Engine as _;
     use kin_db::{InMemoryGraph, KinDbError};
     use kin_model::branch::Branch;
     use kin_model::change::SemanticChange;
     use kin_model::entity::Entity;
     use kin_model::entity::{EntityKind, Visibility};
-    use kin_model::graph::{EntityFilter, SubGraph};
+    use kin_model::graph::{ChangeStore, EntityFilter, EntityStore, SubGraph};
     use kin_model::ids::*;
     use kin_model::relation::{Relation, RelationKind};
     use kin_model::session::{IntentScope, LockType, SessionCapabilities, SessionTransport};
@@ -177,6 +182,93 @@ mod tests {
         TEST_FILE_HASHES.with(|map| {
             map.borrow_mut().insert(file_id.clone(), hash);
         });
+    }
+
+    fn build_exact_test_change(
+        entities: Vec<Entity>,
+        entries: Vec<(kin_model::ArtifactId, kin_model::RepoPath, Hash256)>,
+    ) -> SemanticChange {
+        exact_test_change(
+            vec![],
+            "admit exact MCP test tree",
+            entities
+                .into_iter()
+                .map(kin_model::EntityDelta::Added)
+                .collect(),
+            entries
+                .into_iter()
+                .map(|(artifact_id, path, hash)| kin_model::TreeDelta::Added {
+                    artifact_id,
+                    new: kin_model::LocatedEntry::new(
+                        path,
+                        kin_model::TreeEntry::blob(hash, false),
+                    ),
+                })
+                .collect(),
+        )
+    }
+
+    fn exact_test_change(
+        parents: Vec<SemanticChangeId>,
+        message: &str,
+        entity_deltas: Vec<kin_model::EntityDelta>,
+        tree_deltas: Vec<kin_model::TreeDelta>,
+    ) -> SemanticChange {
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            parents,
+            timestamp: kin_model::Timestamp::now(),
+            author: AuthorId::new("kin-mcp-test"),
+            message: message.into(),
+            entity_deltas,
+            relation_deltas: vec![],
+            tree_deltas,
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(BranchName::new("main")),
+        };
+        change.id = kin_model::compute_semantic_change_id(&change).unwrap();
+        change
+    }
+
+    fn model_blob_hash(store: &kin_blobs::BlobStore, bytes: &[u8]) -> Hash256 {
+        let hash = store.write(bytes).unwrap();
+        Hash256::from_bytes(*hash.as_bytes())
+    }
+
+    fn tool_result_json(result: ToolCallResult) -> serde_json::Value {
+        let text = match &result.content[0] {
+            crate::types::ContentBlock::Text { text } => text,
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    fn install_empty_store_exact_tree(store: &mut EmptyStore, root: &std::path::Path) {
+        let mut hashes = store.file_hashes.clone();
+        TEST_FILE_HASHES.with(|registered| {
+            hashes.extend(registered.borrow().clone());
+        });
+        let entries = hashes
+            .into_iter()
+            .map(|(file, hash)| {
+                (
+                    kin_model::ArtifactId::new(),
+                    kin_model::RepoPath::from_utf8(file.0).unwrap(),
+                    hash,
+                )
+            })
+            .collect();
+        let change =
+            build_exact_test_change(store.entities_by_id.values().cloned().collect(), entries);
+        store.changes_by_id.insert(change.id, change.clone());
+        store.branches = vec![Branch {
+            name: BranchName::new("main"),
+            head: change.id,
+        }];
+        fs::create_dir_all(root.join(".kin")).unwrap();
+        fs::write(root.join(".kin/HEAD"), b"main\n").unwrap();
     }
 
     impl kin_model::graph::EntityStore for EmptyStore {
@@ -338,6 +430,21 @@ mod tests {
         fn delete_file_layout(&self, _: &FilePathId) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
+        fn artifact_id_at_path(&self, _: &kin_model::RepoPath) -> Option<kin_model::ArtifactId> {
+            None
+        }
+        fn get_tree_entry(
+            &self,
+            _: &FilePathId,
+        ) -> std::result::Result<Option<kin_model::TreeEntry>, Self::Error> {
+            Ok(None)
+        }
+        fn apply_transaction_delta(
+            &self,
+            _: &kin_model::TransactionDelta,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
         fn traverse(
             &self,
             _: &kin_model::GraphNodeId,
@@ -363,15 +470,6 @@ mod tests {
             _: &FilePathId,
         ) -> std::result::Result<Option<kin_model::OpaqueArtifact>, Self::Error> {
             Ok(None)
-        }
-        fn get_file_hash(
-            &self,
-            file_id: &FilePathId,
-        ) -> std::result::Result<Option<kin_model::Hash256>, Self::Error> {
-            if let Some(hash) = self.file_hashes.get(file_id).copied() {
-                return Ok(Some(hash));
-            }
-            Ok(TEST_FILE_HASHES.with(|map| map.borrow().get(file_id).copied()))
         }
     }
 
@@ -1298,6 +1396,7 @@ mod tests {
         _env: EnvVarGuard,
         entity: Entity,
         hash: Hash256,
+        artifact_id: kin_model::ArtifactId,
     }
 
     /// Build an entity whose body is materialized only in a graph-owned blob
@@ -1315,6 +1414,7 @@ mod tests {
         let hash = blob_store.write(content.as_bytes()).unwrap();
 
         let file_id = kin_model::ids::FilePathId::new("validate.ts");
+        let artifact_id = kin_model::ArtifactId::new();
 
         let entity = Entity {
             id: EntityId::new(),
@@ -1354,6 +1454,7 @@ mod tests {
             _env: env,
             entity,
             hash,
+            artifact_id,
         }
     }
 
@@ -1367,6 +1468,7 @@ mod tests {
         let hash = blob_store.write(content.as_bytes()).unwrap();
 
         let file_id = kin_model::ids::FilePathId::new("validate.py");
+        let artifact_id = kin_model::ArtifactId::new();
         let signature = content
             .lines()
             .next()
@@ -1413,6 +1515,40 @@ mod tests {
             _env: env,
             entity,
             hash,
+            artifact_id,
+        }
+    }
+
+    impl GraphBackedSource {
+        fn install(&self, store: &InMemoryGraph) {
+            use kin_model::graph::{ChangeStore, EntityStore};
+
+            let change = build_exact_test_change(
+                vec![self.entity.clone()],
+                vec![(
+                    self.artifact_id,
+                    kin_model::RepoPath::from_utf8(
+                        self.entity.file_origin.as_ref().unwrap().0.clone(),
+                    )
+                    .unwrap(),
+                    self.hash,
+                )],
+            );
+            store
+                .apply_transaction_delta(&kin_model::TransactionDelta {
+                    entity_deltas: change.entity_deltas.clone(),
+                    relation_deltas: vec![],
+                    tree_deltas: change.tree_deltas.clone(),
+                })
+                .unwrap();
+            store.create_change(&change).unwrap();
+            store
+                .create_branch(&Branch {
+                    name: BranchName::new("main"),
+                    head: change.id,
+                })
+                .unwrap();
+            fs::write(self._dir.path().join(".kin/HEAD"), b"main\n").unwrap();
         }
     }
 
@@ -1545,9 +1681,11 @@ mod tests {
         let entity = &source.entity;
 
         let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
         store
             .file_hashes
             .insert(entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
 
         let value = entity_response_json(&store, entity).unwrap();
         let object = value.as_object().unwrap();
@@ -1577,11 +1715,13 @@ mod tests {
         };
 
         let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
         store
             .file_hashes
             .insert(entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
 
-        let value = focal_context_json(&store, &entry, entity, false);
+        let value = focal_context_json(&store, &entry, entity, false).unwrap();
         let object = value.as_object().unwrap();
         let body = object.get("body").and_then(|value| value.as_str()).unwrap();
 
@@ -1609,11 +1749,13 @@ mod tests {
         };
 
         let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
         store
             .file_hashes
             .insert(entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
 
-        let value = focal_context_json(&store, &entry, entity, false);
+        let value = focal_context_json(&store, &entry, entity, false).unwrap();
         let object = value.as_object().unwrap();
 
         let marker = object.get("source").and_then(|v| v.as_str()).unwrap();
@@ -1643,11 +1785,13 @@ mod tests {
         };
 
         let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
         store
             .file_hashes
             .insert(entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
 
-        let value = focal_context_json(&store, &entry, entity, false);
+        let value = focal_context_json(&store, &entry, entity, false).unwrap();
         let object = value.as_object().unwrap();
         let body = object.get("body").and_then(|value| value.as_str()).unwrap();
 
@@ -1758,6 +1902,7 @@ mod tests {
         insert_trace_relation(&mut store, &reduce_step, &step, RelationKind::References);
         insert_trace_relation(&mut store, &step, &base_step, RelationKind::Calls);
         insert_trace_relation(&mut store, &base_step, &constant, RelationKind::Imports);
+        install_empty_store_exact_tree(&mut store, dir.path());
 
         let mut args = HashMap::new();
         args.insert("query".into(), serde_json::json!(entry.name));
@@ -1823,6 +1968,7 @@ mod tests {
         let mut store = EmptyStore::default();
         store.entities_by_id.insert(step.id, step.clone());
         store.entities_by_id.insert(constant.id, constant.clone());
+        install_empty_store_exact_tree(&mut store, dir.path());
 
         let mut args = HashMap::new();
         args.insert("query".into(), serde_json::json!(step.name));
@@ -1952,6 +2098,7 @@ mod tests {
         insert_trace_relation(&mut store, &step3, &step2, RelationKind::Calls);
         insert_trace_relation(&mut store, &step2, &step1, RelationKind::Calls);
         insert_trace_relation(&mut store, &step1, &constant, RelationKind::Imports);
+        install_empty_store_exact_tree(&mut store, dir.path());
 
         let mut args = HashMap::new();
         args.insert(
@@ -2208,7 +2355,6 @@ mod tests {
         // an entity via kin_annotation_add must be recalled inside that entity's
         // get_context_pack response, through the real graph surfaces — no fake
         // or demo data, the same create/query path the product uses.
-        use kin_model::graph::EntityStore;
         let _lock = ENV_MUTEX
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -2217,11 +2363,7 @@ mod tests {
         let source = make_source_backed_entity(content);
         let entity = &source.entity;
         let store = InMemoryGraph::default();
-        store.upsert_entity(entity).unwrap();
-        store.set_file_hash(
-            &entity.file_origin.as_ref().unwrap().0,
-            *source.hash.as_bytes(),
-        );
+        source.install(&store);
 
         // Deposit via the real add handler against the entity scope.
         let mut add_args = HashMap::new();
@@ -2264,7 +2406,6 @@ mod tests {
 
     #[test]
     fn handle_trace_computation_returns_focal_body_for_entity_id() {
-        use kin_model::graph::EntityStore;
         let _lock = ENV_MUTEX
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -2273,11 +2414,7 @@ mod tests {
         let source = make_source_backed_entity(content);
         let entity = &source.entity;
         let store = InMemoryGraph::default();
-        store.upsert_entity(entity).unwrap();
-        store.set_file_hash(
-            &entity.file_origin.as_ref().unwrap().0,
-            *source.hash.as_bytes(),
-        );
+        source.install(&store);
 
         let sessions = SessionRegistry::new();
         let mut args = HashMap::new();
@@ -2305,7 +2442,6 @@ mod tests {
 
     #[test]
     fn handle_trace_computation_resolves_query_to_entity() {
-        use kin_model::graph::EntityStore;
         let _lock = ENV_MUTEX
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -2314,11 +2450,7 @@ mod tests {
         let source = make_source_backed_entity(content);
         let entity = &source.entity;
         let store = InMemoryGraph::default();
-        store.upsert_entity(entity).unwrap();
-        store.set_file_hash(
-            &entity.file_origin.as_ref().unwrap().0,
-            *source.hash.as_bytes(),
-        );
+        source.install(&store);
 
         let sessions = SessionRegistry::new();
         let mut args = HashMap::new();
@@ -2509,6 +2641,487 @@ mod tests {
     static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[test]
+    fn exact_artifact_tools_preserve_every_repository_leaf_without_entities() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        fs::create_dir_all(&kin_dir).unwrap();
+        let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+        let blobs = kin_blobs::BlobStore::new(kin_dir.join("objects")).unwrap();
+
+        let compose_path = kin_model::RepoPath::from_utf8("compose.yaml").unwrap();
+        let lock_path = kin_model::RepoPath::from_utf8("Cargo.lock").unwrap();
+        let unsupported_path = kin_model::RepoPath::from_utf8("legacy/handler.cob").unwrap();
+        let binary_path =
+            kin_model::RepoPath::from_bytes(b"assets/\xffpayload.bin".to_vec()).unwrap();
+        let executable_path = kin_model::RepoPath::from_utf8("bin/kin-hook").unwrap();
+        let symlink_path = kin_model::RepoPath::from_utf8("current-config").unwrap();
+        let gitlink_path = kin_model::RepoPath::from_utf8("vendor/external").unwrap();
+
+        let compose_bytes = b"services:\n  api:\n    image: kin:test\n";
+        let lock_bytes = b"# graph-owned lockfile\n";
+        let unsupported_bytes = b"IDENTIFICATION DIVISION.\n";
+        let binary_bytes = b"\x00\xff\x80\x01KIN";
+        let executable_bytes = b"#!/bin/sh\nexec kin \"$@\"\n";
+        let symlink_target = b"config/\xffproduction.yaml";
+
+        let compose_hash = model_blob_hash(&blobs, compose_bytes);
+        let lock_hash = model_blob_hash(&blobs, lock_bytes);
+        let unsupported_hash = model_blob_hash(&blobs, unsupported_bytes);
+        let binary_hash = model_blob_hash(&blobs, binary_bytes);
+        let executable_hash = model_blob_hash(&blobs, executable_bytes);
+        let symlink_hash = model_blob_hash(&blobs, symlink_target);
+
+        // A conflicting projection proves reads are content-addressed graph
+        // reads, never ambient working-tree reads.
+        fs::write(
+            dir.path().join("compose.yaml"),
+            b"filesystem fallback must never win\n",
+        )
+        .unwrap();
+
+        let compose_id = kin_model::ArtifactId::new();
+        let lock_id = kin_model::ArtifactId::new();
+        let unsupported_id = kin_model::ArtifactId::new();
+        let binary_id = kin_model::ArtifactId::new();
+        let executable_id = kin_model::ArtifactId::new();
+        let symlink_id = kin_model::ArtifactId::new();
+        let gitlink_id = kin_model::ArtifactId::new();
+        let gitlink_target = kin_model::GitObjectId::sha1([0x42; 20]);
+
+        let change = exact_test_change(
+            vec![],
+            "admit every exact repository leaf",
+            vec![],
+            vec![
+                kin_model::TreeDelta::Added {
+                    artifact_id: compose_id,
+                    new: kin_model::LocatedEntry::new(
+                        compose_path.clone(),
+                        kin_model::TreeEntry::blob(compose_hash, false),
+                    ),
+                },
+                kin_model::TreeDelta::Added {
+                    artifact_id: lock_id,
+                    new: kin_model::LocatedEntry::new(
+                        lock_path.clone(),
+                        kin_model::TreeEntry::blob(lock_hash, false),
+                    ),
+                },
+                kin_model::TreeDelta::Added {
+                    artifact_id: unsupported_id,
+                    new: kin_model::LocatedEntry::new(
+                        unsupported_path.clone(),
+                        kin_model::TreeEntry::blob(unsupported_hash, false),
+                    ),
+                },
+                kin_model::TreeDelta::Added {
+                    artifact_id: binary_id,
+                    new: kin_model::LocatedEntry::new(
+                        binary_path.clone(),
+                        kin_model::TreeEntry::blob(binary_hash, false),
+                    ),
+                },
+                kin_model::TreeDelta::Added {
+                    artifact_id: executable_id,
+                    new: kin_model::LocatedEntry::new(
+                        executable_path.clone(),
+                        kin_model::TreeEntry::blob(executable_hash, true),
+                    ),
+                },
+                kin_model::TreeDelta::Added {
+                    artifact_id: symlink_id,
+                    new: kin_model::LocatedEntry::new(
+                        symlink_path.clone(),
+                        kin_model::TreeEntry::symlink(symlink_hash),
+                    ),
+                },
+                kin_model::TreeDelta::Added {
+                    artifact_id: gitlink_id,
+                    new: kin_model::LocatedEntry::new(
+                        gitlink_path.clone(),
+                        kin_model::TreeEntry::gitlink(gitlink_target),
+                    ),
+                },
+            ],
+        );
+        let store = InMemoryGraph::default();
+        store.create_change(&change).unwrap();
+        assert!(
+            store
+                .query_entities(&EntityFilter::default())
+                .unwrap()
+                .is_empty(),
+            "repository membership must not depend on parser-emitted entities"
+        );
+
+        let list = artifacts::handle_artifact_list(
+            &HashMap::from([(
+                "source_change_id".into(),
+                serde_json::json!(change.id.to_string()),
+            )]),
+            &store,
+        )
+        .unwrap();
+        let listed = tool_result_json(list);
+        assert_eq!(listed["artifact_count"], 7);
+        let listed_artifacts = listed["artifacts"].as_array().unwrap();
+        assert_eq!(listed_artifacts.len(), 7);
+
+        let find_path = |path: &kin_model::RepoPath| {
+            let wire = serde_json::to_value(path).unwrap();
+            listed_artifacts
+                .iter()
+                .find(|artifact| artifact["path"] == wire)
+                .unwrap()
+        };
+        assert_eq!(find_path(&compose_path)["entry"]["type"], "blob");
+        assert_eq!(find_path(&lock_path)["entry"]["type"], "blob");
+        assert_eq!(find_path(&unsupported_path)["entry"]["type"], "blob");
+        assert_eq!(find_path(&executable_path)["entry"]["executable"], true);
+        assert_eq!(find_path(&symlink_path)["entry"]["type"], "symlink");
+        assert_eq!(find_path(&gitlink_path)["entry"]["type"], "gitlink");
+        let binary_wire = find_path(&binary_path);
+        assert_eq!(
+            binary_wire["path"],
+            serde_json::to_value(&binary_path).unwrap()
+        );
+        assert_eq!(binary_wire["path_label_lossy"], true);
+        assert!(binary_wire["path_label"]
+            .as_str()
+            .unwrap()
+            .contains('\u{fffd}'));
+
+        let compose = tool_result_json(
+            artifacts::handle_artifact_read(
+                &HashMap::from([
+                    (
+                        "artifact_id".into(),
+                        serde_json::to_value(compose_id).unwrap(),
+                    ),
+                    (
+                        "source_change_id".into(),
+                        serde_json::json!(change.id.to_string()),
+                    ),
+                ]),
+                &store,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            compose["content_base64"],
+            base64::engine::general_purpose::STANDARD.encode(compose_bytes)
+        );
+        assert_eq!(
+            compose["text_utf8"],
+            std::str::from_utf8(compose_bytes).unwrap()
+        );
+        assert_ne!(compose["text_utf8"], "filesystem fallback must never win\n");
+
+        let binary = tool_result_json(
+            artifacts::handle_artifact_read(
+                &HashMap::from([
+                    ("path".into(), serde_json::to_value(&binary_path).unwrap()),
+                    (
+                        "source_change_id".into(),
+                        serde_json::json!(change.id.to_string()),
+                    ),
+                ]),
+                &store,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            binary["content_base64"],
+            base64::engine::general_purpose::STANDARD.encode(binary_bytes)
+        );
+        assert!(binary.get("text_utf8").is_none());
+
+        let executable = tool_result_json(
+            artifacts::handle_artifact_read(
+                &HashMap::from([
+                    (
+                        "artifact_id".into(),
+                        serde_json::to_value(executable_id).unwrap(),
+                    ),
+                    (
+                        "path".into(),
+                        serde_json::to_value(&executable_path).unwrap(),
+                    ),
+                    (
+                        "source_change_id".into(),
+                        serde_json::json!(change.id.to_string()),
+                    ),
+                ]),
+                &store,
+            )
+            .unwrap(),
+        );
+        assert_eq!(executable["artifact"]["entry"]["executable"], true);
+        assert_eq!(
+            executable["content_base64"],
+            base64::engine::general_purpose::STANDARD.encode(executable_bytes)
+        );
+
+        let symlink = tool_result_json(
+            artifacts::handle_artifact_read(
+                &HashMap::from([
+                    (
+                        "artifact_id".into(),
+                        serde_json::to_value(symlink_id).unwrap(),
+                    ),
+                    (
+                        "source_change_id".into(),
+                        serde_json::json!(change.id.to_string()),
+                    ),
+                ]),
+                &store,
+            )
+            .unwrap(),
+        );
+        assert_eq!(symlink["content_kind"], "symlink_target");
+        assert_eq!(
+            symlink["content_base64"],
+            base64::engine::general_purpose::STANDARD.encode(symlink_target)
+        );
+        assert!(symlink.get("text_utf8").is_none());
+
+        let gitlink = tool_result_json(
+            artifacts::handle_artifact_read(
+                &HashMap::from([
+                    (
+                        "artifact_id".into(),
+                        serde_json::to_value(gitlink_id).unwrap(),
+                    ),
+                    (
+                        "source_change_id".into(),
+                        serde_json::json!(change.id.to_string()),
+                    ),
+                ]),
+                &store,
+            )
+            .unwrap(),
+        );
+        assert_eq!(gitlink["content_kind"], "gitlink_reference");
+        assert_eq!(
+            gitlink["git_object_id"],
+            serde_json::to_value(gitlink_target).unwrap()
+        );
+        assert!(gitlink.get("content_base64").is_none());
+    }
+
+    #[test]
+    fn exact_artifact_tools_fail_loud_on_missing_tree_blob_or_identity() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        fs::create_dir_all(&kin_dir).unwrap();
+        let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+
+        let path = kin_model::RepoPath::from_utf8("missing.bin").unwrap();
+        let artifact_id = kin_model::ArtifactId::new();
+        let missing_hash = Hash256::from_bytes([0xad; 32]);
+        let change = exact_test_change(
+            vec![],
+            "reference a deliberately missing blob",
+            vec![],
+            vec![kin_model::TreeDelta::Added {
+                artifact_id,
+                new: kin_model::LocatedEntry::new(
+                    path.clone(),
+                    kin_model::TreeEntry::blob(missing_hash, false),
+                ),
+            }],
+        );
+        let store = InMemoryGraph::default();
+        store.create_change(&change).unwrap();
+        fs::write(
+            dir.path().join("missing.bin"),
+            b"ambient bytes must not repair graph truth",
+        )
+        .unwrap();
+
+        let missing_blob = artifacts::handle_artifact_read(
+            &HashMap::from([
+                (
+                    "artifact_id".into(),
+                    serde_json::to_value(artifact_id).unwrap(),
+                ),
+                (
+                    "source_change_id".into(),
+                    serde_json::json!(change.id.to_string()),
+                ),
+            ]),
+            &store,
+        )
+        .expect_err("a graph tree entry with no content-addressed blob must fail");
+        assert!(missing_blob.to_string().contains("graph authority gap"));
+        assert!(missing_blob.to_string().contains("unavailable or corrupt"));
+        assert!(!missing_blob
+            .to_string()
+            .contains("ambient bytes must not repair graph truth"));
+
+        let absent_path = artifacts::handle_artifact_read(
+            &HashMap::from([
+                (
+                    "path".into(),
+                    serde_json::to_value(kin_model::RepoPath::from_utf8("not-present").unwrap())
+                        .unwrap(),
+                ),
+                (
+                    "source_change_id".into(),
+                    serde_json::json!(change.id.to_string()),
+                ),
+            ]),
+            &store,
+        )
+        .expect_err("an absent exact path must fail");
+        assert!(absent_path.to_string().contains("exact path is absent"));
+
+        let unknown_change = SemanticChangeId::from_hash(Hash256::from_bytes([0xee; 32]));
+        let missing_tree = artifacts::handle_artifact_list(
+            &HashMap::from([(
+                "source_change_id".into(),
+                serde_json::json!(unknown_change.to_string()),
+            )]),
+            &store,
+        )
+        .expect_err("an unknown graph head must not produce an empty repository");
+        assert!(missing_tree.to_string().contains("graph authority gap"));
+        assert!(missing_tree
+            .to_string()
+            .contains("cannot resolve exact repository tree"));
+    }
+
+    #[test]
+    fn exact_source_tracks_rename_identity_and_rejects_later_path_reuse() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = "export function validate_probe_range_1d8f8275() { return 42; }\n";
+        let source = make_source_backed_entity(content);
+        let store = InMemoryGraph::default();
+        source.install(&store);
+
+        let main = BranchName::new("main");
+        let first_head = store.get_branch(&main).unwrap().unwrap().head;
+        let old_path = kin_model::RepoPath::from_utf8("validate.ts").unwrap();
+        let renamed_path = kin_model::RepoPath::from_utf8("src/renamed.ts").unwrap();
+        let old_entry =
+            kin_model::LocatedEntry::new(old_path, kin_model::TreeEntry::blob(source.hash, false));
+        let renamed_entry = kin_model::LocatedEntry::new(
+            renamed_path.clone(),
+            kin_model::TreeEntry::blob(source.hash, false),
+        );
+        let mut renamed_entity = source.entity.clone();
+        let renamed_file = FilePathId::new("src/renamed.ts");
+        renamed_entity.file_origin = Some(renamed_file.clone());
+        renamed_entity.span.as_mut().unwrap().file = renamed_file;
+
+        let rename = exact_test_change(
+            vec![first_head],
+            "rename source without changing its identity",
+            vec![kin_model::EntityDelta::Modified {
+                old: source.entity.clone(),
+                new: renamed_entity.clone(),
+            }],
+            vec![kin_model::TreeDelta::Updated {
+                artifact_id: source.artifact_id,
+                old: old_entry,
+                new: renamed_entry.clone(),
+            }],
+        );
+        store.create_change(&rename).unwrap();
+        store.update_branch_head(&main, &rename.id).unwrap();
+
+        let renamed_source = entity_response_json(&store, &renamed_entity).unwrap();
+        assert_eq!(
+            renamed_source["artifact_id"],
+            serde_json::to_value(source.artifact_id).unwrap()
+        );
+        assert_eq!(
+            renamed_source["artifact_path"],
+            serde_json::to_value(&renamed_path).unwrap()
+        );
+        assert_eq!(renamed_source["source_excerpt"], content);
+
+        let read_after_rename = tool_result_json(
+            artifacts::handle_artifact_read(
+                &HashMap::from([
+                    (
+                        "artifact_id".into(),
+                        serde_json::to_value(source.artifact_id).unwrap(),
+                    ),
+                    (
+                        "source_change_id".into(),
+                        serde_json::json!(rename.id.to_string()),
+                    ),
+                ]),
+                &store,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            read_after_rename["artifact"]["path"],
+            serde_json::to_value(&renamed_path).unwrap()
+        );
+        assert_eq!(
+            read_after_rename["content_base64"],
+            base64::engine::general_purpose::STANDARD.encode(content.as_bytes())
+        );
+
+        let replacement_id = kin_model::ArtifactId::new();
+        let reuse = exact_test_change(
+            vec![rename.id],
+            "replace the path with a different artifact identity",
+            vec![],
+            vec![
+                kin_model::TreeDelta::Removed {
+                    artifact_id: source.artifact_id,
+                    old: renamed_entry.clone(),
+                },
+                kin_model::TreeDelta::Added {
+                    artifact_id: replacement_id,
+                    new: renamed_entry,
+                },
+            ],
+        );
+        store.create_change(&reuse).unwrap();
+        store.update_branch_head(&main, &reuse.id).unwrap();
+
+        let error = entity_response_json(&store, &renamed_entity)
+            .expect_err("an old entity revision must not read a replacement artifact");
+        assert!(error
+            .to_string()
+            .contains("path 'src/renamed.ts' was reused"));
+
+        let replacement = tool_result_json(
+            artifacts::handle_artifact_read(
+                &HashMap::from([
+                    ("path".into(), serde_json::to_value(&renamed_path).unwrap()),
+                    (
+                        "source_change_id".into(),
+                        serde_json::json!(reuse.id.to_string()),
+                    ),
+                ]),
+                &store,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            replacement["artifact"]["artifact_id"],
+            serde_json::to_value(replacement_id).unwrap()
+        );
+    }
+
+    #[test]
     fn test_entity_served_from_blob_store_file_deleted() {
         let _lock = ENV_MUTEX
             .get_or_init(|| Mutex::new(()))
@@ -2562,7 +3175,9 @@ mod tests {
         };
 
         let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
         store.file_hashes.insert(file_id, hash);
+        install_empty_store_exact_tree(&mut store, dir.path());
 
         let value = entity_response_json(&store, &entity).unwrap();
         let object = value.as_object().unwrap();
@@ -2630,21 +3245,16 @@ mod tests {
         };
 
         let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
         store.file_hashes.insert(file_id, graph_hash);
+        install_empty_store_exact_tree(&mut store, dir.path());
 
         let before_misses = GRAPH_MISS_COUNT.load(std::sync::atomic::Ordering::SeqCst);
 
-        let value = entity_response_json(&store, &entity).unwrap();
-        let object = value.as_object().unwrap();
-
-        assert!(
-            object.get("source_excerpt").is_none(),
-            "graph blob-miss must not serve a disk excerpt"
-        );
-        assert_eq!(
-            object.get("source").unwrap().as_str().unwrap(),
-            "graph-miss"
-        );
+        let error = entity_response_json(&store, &entity)
+            .expect_err("a missing graph blob must fail the MCP read loudly");
+        assert!(error.to_string().contains("unavailable or corrupt"));
+        assert!(!error.to_string().contains(disk_content));
 
         let after_misses = GRAPH_MISS_COUNT.load(std::sync::atomic::Ordering::SeqCst);
         assert!(after_misses >= before_misses + 1);
@@ -2716,22 +3326,16 @@ mod tests {
         };
 
         let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
         store.file_hashes.insert(file_id, correct_hash);
+        install_empty_store_exact_tree(&mut store, dir.path());
 
         let before_misses = GRAPH_MISS_COUNT.load(std::sync::atomic::Ordering::SeqCst);
 
-        let value = entity_response_json(&store, &entity).unwrap();
-        let object = value.as_object().unwrap();
-
-        // The corrupt blob is discarded and the graph gap is reported — no disk read.
-        assert!(
-            object.get("source_excerpt").is_none(),
-            "corrupt blob must not fall back to disk"
-        );
-        assert_eq!(
-            object.get("source").unwrap().as_str().unwrap(),
-            "graph-miss"
-        );
+        let error = entity_response_json(&store, &entity)
+            .expect_err("a corrupt graph blob must fail the MCP read loudly");
+        assert!(error.to_string().contains("unavailable or corrupt"));
+        assert!(!error.to_string().contains(content));
 
         let after_misses = GRAPH_MISS_COUNT.load(std::sync::atomic::Ordering::SeqCst);
         assert!(after_misses >= before_misses + 1);
@@ -2752,7 +3356,7 @@ mod tests {
             message: format!("change {}", id),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
