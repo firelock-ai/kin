@@ -321,6 +321,80 @@ impl RepositoryAuthorityState {
     ) -> Result<SemanticChangeId, KinDbError> {
         target_change_id(self.metadata(), target)
     }
+
+    /// Materialize one workspace-scoped, non-authoritative query snapshot from
+    /// this exact authority generation.
+    ///
+    /// Repository-v6 authority deliberately persists immutable semantic
+    /// history and exact per-workspace trees without a global "current" graph:
+    /// divergent refs and dirty workspaces make such a cache ambiguous. This
+    /// method resolves the workspace base from this coherent read lease, then
+    /// overlays the workspace's exact graph-owned tree. The result has no
+    /// repository authority envelope and is safe to hand to
+    /// [`InMemoryGraph`] for daemon, MCP, editor, benchmark, or VFS reads.
+    ///
+    /// Unsupported languages, configuration, binary artifacts, symlinks, and
+    /// gitlinks are preserved through `WorkspaceState::tree`; no filesystem or
+    /// Git fallback participates in materialization.
+    pub fn workspace_graph_snapshot(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<GraphSnapshot>, KinDbError> {
+        let Some(workspace) = self
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| &workspace.workspace_id == workspace_id)
+        else {
+            return Ok(None);
+        };
+
+        let mut snapshot = self.snapshot().clone();
+        snapshot.repository_authority = None;
+
+        if let Some(target) = workspace.base_target.as_ref() {
+            let change_id = self.resolve_target_change_id(target)?;
+            let expected_root_hash = crate::storage::merkle::compute_graph_root_hash(&snapshot);
+            let history = InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
+                snapshot.clone(),
+                expected_root_hash,
+            )?;
+            let resolved = history.resolve_graph_at(&change_id)?;
+            snapshot.entities = resolved.entities;
+            snapshot.relations = resolved.relations;
+            snapshot.entity_revisions = resolved.entity_revisions;
+        }
+
+        // Workspace tree authority is independent of its base target: dirty
+        // and unborn workspaces must retain every exact artifact even before a
+        // semantic parser can enrich it.
+        snapshot.resolved_tree = workspace.tree.clone();
+
+        // Persisted adjacency is a derived acceleration structure. Rebuild it
+        // from the resolved relation set so callers that inspect the snapshot
+        // directly receive the same coherent view as InMemoryGraph callers.
+        snapshot.outgoing.clear();
+        snapshot.incoming.clear();
+        for relation in snapshot.relations.values() {
+            if let Some(source) = relation.src.as_entity() {
+                snapshot
+                    .outgoing
+                    .entry(source)
+                    .or_default()
+                    .push(relation.id);
+            }
+            if let Some(target) = relation.dst.as_entity() {
+                snapshot
+                    .incoming
+                    .entry(target)
+                    .or_default()
+                    .push(relation.id);
+            }
+        }
+
+        snapshot.validate_storage_admission()?;
+        Ok(Some(snapshot))
+    }
 }
 
 impl VersionedAuthorityState for RepositoryAuthorityState {
@@ -622,80 +696,14 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
             .map_err(Into::into)
     }
 
-    /// Materialize one workspace-scoped, non-authoritative query snapshot.
-    ///
-    /// Repository-v6 authority deliberately persists immutable semantic
-    /// history and exact per-workspace trees without a global "current" graph:
-    /// divergent refs and dirty workspaces make such a cache ambiguous. This
-    /// method resolves the workspace base from one coherent authority lease,
-    /// then overlays the workspace's exact graph-owned tree. The result has no
-    /// repository authority envelope and is safe to hand to
-    /// [`InMemoryGraph`] for daemon, MCP, editor, benchmark, or VFS reads.
-    ///
-    /// Unsupported languages, configuration, binary artifacts, symlinks, and
-    /// gitlinks are preserved through `WorkspaceState::tree`; no filesystem or
-    /// Git fallback participates in materialization.
+    /// Materialize one workspace query snapshot from one coherent read lease.
     pub fn workspace_graph_snapshot(
         &self,
         repository_id: &RepositoryId,
         workspace_id: &WorkspaceId,
     ) -> Result<Option<GraphSnapshot>, KinDbError> {
         self.require_repository(repository_id)?;
-        let lease = self.read_authority();
-        let Some(workspace) = lease
-            .metadata()
-            .workspaces
-            .iter()
-            .find(|workspace| &workspace.workspace_id == workspace_id)
-        else {
-            return Ok(None);
-        };
-
-        let mut snapshot = lease.snapshot().clone();
-        snapshot.repository_authority = None;
-
-        if let Some(target) = workspace.base_target.as_ref() {
-            let change_id = lease.resolve_target_change_id(target)?;
-            let expected_root_hash = crate::storage::merkle::compute_graph_root_hash(&snapshot);
-            let history = InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
-                snapshot.clone(),
-                expected_root_hash,
-            )?;
-            let resolved = history.resolve_graph_at(&change_id)?;
-            snapshot.entities = resolved.entities;
-            snapshot.relations = resolved.relations;
-            snapshot.entity_revisions = resolved.entity_revisions;
-        }
-
-        // Workspace tree authority is independent of its base target: dirty
-        // and unborn workspaces must retain every exact artifact even before a
-        // semantic parser can enrich it.
-        snapshot.resolved_tree = workspace.tree.clone();
-
-        // Persisted adjacency is a derived acceleration structure. Rebuild it
-        // from the resolved relation set so callers that inspect the snapshot
-        // directly receive the same coherent view as InMemoryGraph callers.
-        snapshot.outgoing.clear();
-        snapshot.incoming.clear();
-        for relation in snapshot.relations.values() {
-            if let Some(source) = relation.src.as_entity() {
-                snapshot
-                    .outgoing
-                    .entry(source)
-                    .or_default()
-                    .push(relation.id);
-            }
-            if let Some(target) = relation.dst.as_entity() {
-                snapshot
-                    .incoming
-                    .entry(target)
-                    .or_default()
-                    .push(relation.id);
-            }
-        }
-
-        snapshot.validate_storage_admission()?;
-        Ok(Some(snapshot))
+        self.read_authority().workspace_graph_snapshot(workspace_id)
     }
 
     /// Commit one complete repository transaction.
