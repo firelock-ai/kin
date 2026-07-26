@@ -9,19 +9,237 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    identity::canonical_json_bytes, validate_semantic_change_id, AuthorId, DefaultRefMutation,
-    EffectiveAdmissionPolicyStamp, ExternalChangeAlias, ExternalObjectKind, ExternalObjectRecord,
-    FrozenLocalOverlayDelta, GitExternalAuthorityDelta, GitObjectId, Hash256, ModelError,
-    OperationId, RefMutation, RefName, RefTarget, RepositoryId, RepositoryRef, ResolvedTree,
-    Result, SemanticChange, SemanticChangeId, SharedAdmissionPolicy, TreeDelta, WorkspaceHead,
-    WorkspaceId,
+    identity::canonical_json_bytes, validate_semantic_change_id, validate_transaction_delta,
+    AuthorId, DefaultRefMutation, EffectiveAdmissionPolicyStamp, EntityDelta, ExternalChangeAlias,
+    ExternalObjectKind, ExternalObjectRecord, FrozenLocalOverlayDelta, GitExternalAuthorityDelta,
+    GitObjectId, Hash256, ModelError, OperationId, RefMutation, RefName, RefTarget, RelationDelta,
+    RepositoryId, RepositoryRef, ResolvedTree, Result, SemanticChange, SemanticChangeId,
+    SharedAdmissionPolicy, TransactionDelta, TreeDelta, WorkspaceHead, WorkspaceId,
 };
 
-/// Clean-slate transaction schema whose persistence authority performs
-/// admission itself. Version 2's caller-asserted scan token was never released
-/// and has no compatibility decoder.
-pub const REPOSITORY_TRANSACTION_SCHEMA_VERSION: u32 = 3;
+/// Clean-slate transaction schema whose persistence authority owns both exact
+/// workspace trees and their uncommitted semantic overlays.
+///
+/// Version 3 persisted only a dirty workspace tree and therefore reconstructed
+/// entity/relation state from `base_target` after restart. It has no
+/// compatibility decoder: a repository that cannot prove the complete
+/// workspace graph must be re-imported rather than silently losing semantics.
+pub const REPOSITORY_TRANSACTION_SCHEMA_VERSION: u32 = 4;
 pub const REPOSITORY_ROOT_SCHEMA_VERSION: u32 = 1;
+pub const WORKSPACE_SEMANTIC_DELTA_SCHEMA_VERSION: u32 = 1;
+pub const WORKSPACE_SEMANTIC_OVERLAY_SCHEMA_VERSION: u32 = 1;
+
+/// One canonical entity/relation transition for mutable workspace authority.
+///
+/// [`WorkspaceMutation::semantic_delta`] carries the incremental transition
+/// from the expected workspace graph to its successor. The same representation
+/// is stored cumulatively in [`WorkspaceState::semantic_overlay`] relative to
+/// `base_target`. Exact repository membership remains independently
+/// authoritative in [`WorkspaceState::tree`].
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceSemanticDelta {
+    version: u32,
+    entity_deltas: Vec<EntityDelta>,
+    relation_deltas: Vec<RelationDelta>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceSemanticDeltaWire {
+    version: u32,
+    entity_deltas: Vec<EntityDelta>,
+    relation_deltas: Vec<RelationDelta>,
+}
+
+impl<'de> Deserialize<'de> for WorkspaceSemanticDelta {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = WorkspaceSemanticDeltaWire::deserialize(deserializer)?;
+        let delta = Self {
+            version: wire.version,
+            entity_deltas: wire.entity_deltas,
+            relation_deltas: wire.relation_deltas,
+        };
+        delta.validate().map_err(serde::de::Error::custom)?;
+        Ok(delta)
+    }
+}
+
+impl WorkspaceSemanticDelta {
+    pub fn new(
+        mut entity_deltas: Vec<EntityDelta>,
+        mut relation_deltas: Vec<RelationDelta>,
+    ) -> Result<Self> {
+        entity_deltas.sort_by_key(EntityDelta::target_id);
+        relation_deltas.sort_by_key(RelationDelta::target_id);
+        let delta = Self {
+            version: WORKSPACE_SEMANTIC_DELTA_SCHEMA_VERSION,
+            entity_deltas,
+            relation_deltas,
+        };
+        delta.validate()?;
+        Ok(delta)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.version != WORKSPACE_SEMANTIC_DELTA_SCHEMA_VERSION {
+            return Err(ModelError::InvalidOperation(format!(
+                "unsupported workspace semantic delta version {}",
+                self.version
+            )));
+        }
+        if self
+            .entity_deltas
+            .windows(2)
+            .any(|pair| pair[0].target_id() >= pair[1].target_id())
+        {
+            return Err(ModelError::InvalidOperation(
+                "workspace semantic entity deltas are not in canonical unique target order"
+                    .to_string(),
+            ));
+        }
+        if self
+            .relation_deltas
+            .windows(2)
+            .any(|pair| pair[0].target_id() >= pair[1].target_id())
+        {
+            return Err(ModelError::InvalidOperation(
+                "workspace semantic relation deltas are not in canonical unique target order"
+                    .to_string(),
+            ));
+        }
+        validate_transaction_delta(&self.transaction_delta())
+    }
+
+    pub fn identity_hash(&self) -> Result<Hash256> {
+        self.validate()?;
+        let mut canonical = self.clone();
+        canonical.sort_canonical();
+        let encoded = canonical_json_bytes(&canonical)?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"kin-workspace-semantic-delta-v1\0");
+        hasher.update(
+            u64::try_from(encoded.len())
+                .map_err(|_| {
+                    ModelError::InvalidOperation("workspace semantic delta exceeds u64".to_string())
+                })?
+                .to_le_bytes(),
+        );
+        hasher.update(encoded);
+        let result = hasher.finalize();
+        let mut bytes = [0_u8; 32];
+        bytes.copy_from_slice(&result);
+        Ok(Hash256::from_bytes(bytes))
+    }
+
+    pub fn entity_deltas(&self) -> &[EntityDelta] {
+        &self.entity_deltas
+    }
+
+    pub fn relation_deltas(&self) -> &[RelationDelta] {
+        &self.relation_deltas
+    }
+
+    pub fn transaction_delta(&self) -> TransactionDelta {
+        TransactionDelta {
+            entity_deltas: self.entity_deltas.clone(),
+            relation_deltas: self.relation_deltas.clone(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entity_deltas.is_empty() && self.relation_deltas.is_empty()
+    }
+
+    fn sort_canonical(&mut self) {
+        self.entity_deltas.sort_by_key(EntityDelta::target_id);
+        self.relation_deltas.sort_by_key(RelationDelta::target_id);
+    }
+}
+
+impl Default for WorkspaceSemanticDelta {
+    fn default() -> Self {
+        Self {
+            version: WORKSPACE_SEMANTIC_DELTA_SCHEMA_VERSION,
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+        }
+    }
+}
+
+/// Canonical cumulative entity/relation state relative to a workspace base.
+///
+/// This is intentionally a different type from [`WorkspaceSemanticDelta`].
+/// Storage must derive it by diffing the requested successor workspace against
+/// its new immutable base; an incremental mutation cannot be persisted here by
+/// accident.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct WorkspaceSemanticOverlay(WorkspaceSemanticDelta);
+
+impl WorkspaceSemanticOverlay {
+    pub fn new(
+        entity_deltas: Vec<EntityDelta>,
+        relation_deltas: Vec<RelationDelta>,
+    ) -> Result<Self> {
+        Ok(Self(WorkspaceSemanticDelta::new(
+            entity_deltas,
+            relation_deltas,
+        )?))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.0.version != WORKSPACE_SEMANTIC_OVERLAY_SCHEMA_VERSION {
+            return Err(ModelError::InvalidOperation(format!(
+                "unsupported workspace semantic overlay version {}",
+                self.0.version
+            )));
+        }
+        self.0.validate()
+    }
+
+    pub fn identity_hash(&self) -> Result<Hash256> {
+        self.validate()?;
+        let encoded = canonical_json_bytes(self)?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"kin-workspace-semantic-overlay-v1\0");
+        hasher.update(
+            u64::try_from(encoded.len())
+                .map_err(|_| {
+                    ModelError::InvalidOperation(
+                        "workspace semantic overlay exceeds u64".to_string(),
+                    )
+                })?
+                .to_le_bytes(),
+        );
+        hasher.update(encoded);
+        let result = hasher.finalize();
+        let mut bytes = [0_u8; 32];
+        bytes.copy_from_slice(&result);
+        Ok(Hash256::from_bytes(bytes))
+    }
+
+    pub fn entity_deltas(&self) -> &[EntityDelta] {
+        self.0.entity_deltas()
+    }
+
+    pub fn relation_deltas(&self) -> &[RelationDelta] {
+        self.0.relation_deltas()
+    }
+
+    pub fn transaction_delta(&self) -> TransactionDelta {
+        self.0.transaction_delta()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
 
 /// One versioned digest in the repository authority root bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -111,6 +329,7 @@ pub struct WorkspaceSnapshotBinding {
     pub base_target: Option<RefTarget>,
     pub base_tree_hash: Option<Hash256>,
     pub workspace_tree_hash: Hash256,
+    pub workspace_semantic_overlay_hash: Hash256,
     pub roots: RootBundle,
     pub workspace_generation: u64,
     pub admission_policy: EffectiveAdmissionPolicyStamp,
@@ -136,14 +355,18 @@ impl WorkspaceSnapshotBinding {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.base_tree_hash.map_or_else(
-            || {
-                self.workspace_tree_hash
-                    != compute_resolved_tree_hash(&ResolvedTree::default())
-                        .expect("empty tree has a canonical identity")
-            },
-            |base| base != self.workspace_tree_hash,
-        )
+        self.workspace_semantic_overlay_hash
+            != WorkspaceSemanticOverlay::default()
+                .identity_hash()
+                .expect("empty workspace semantic overlay has a canonical identity")
+            || self.base_tree_hash.map_or_else(
+                || {
+                    self.workspace_tree_hash
+                        != compute_resolved_tree_hash(&ResolvedTree::default())
+                            .expect("empty tree has a canonical identity")
+                },
+                |base| base != self.workspace_tree_hash,
+            )
     }
 }
 
@@ -152,7 +375,7 @@ impl WorkspaceSnapshotBinding {
 /// This state is not derived from a branch on demand. The full repository tree
 /// is persisted independently so unsupported languages, configuration, binary
 /// assets, symlinks, gitlinks, and dirty changes all remain authoritative.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceState {
     pub repository_id: RepositoryId,
@@ -166,6 +389,9 @@ pub struct WorkspaceState {
     /// Exact graph-owned working tree, including uncommitted state.
     pub tree: ResolvedTree,
     pub tree_hash: Hash256,
+    /// Complete uncommitted semantic state relative to `base_target`.
+    pub semantic_overlay: WorkspaceSemanticOverlay,
+    pub semantic_overlay_hash: Hash256,
     /// Complete shared matcher policy active for this exact workspace tree.
     ///
     /// This may be newer than committed history when a dirty workspace edits
@@ -175,8 +401,11 @@ pub struct WorkspaceState {
 }
 
 impl WorkspaceState {
-    /// Build and validate the complete state in one call. The explicit
-    /// arguments make every authority-bearing field visible at call sites.
+    /// Build and validate complete workspace authority in one call.
+    ///
+    /// The semantic overlay is deliberately explicit even when empty. A
+    /// caller must never persist a dirty exact tree while accidentally
+    /// inheriting base semantics through a convenience constructor.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         repository_id: RepositoryId,
@@ -186,10 +415,12 @@ impl WorkspaceState {
         base_target: Option<RefTarget>,
         base_tree_hash: Option<Hash256>,
         tree: ResolvedTree,
+        semantic_overlay: WorkspaceSemanticOverlay,
         shared_admission_policy: SharedAdmissionPolicy,
         admission_policy: EffectiveAdmissionPolicyStamp,
     ) -> Result<Self> {
         let tree_hash = compute_resolved_tree_hash(&tree)?;
+        let semantic_overlay_hash = semantic_overlay.identity_hash()?;
         let state = Self {
             repository_id,
             workspace_id,
@@ -199,6 +430,8 @@ impl WorkspaceState {
             base_tree_hash,
             tree,
             tree_hash,
+            semantic_overlay,
+            semantic_overlay_hash,
             shared_admission_policy,
             admission_policy,
         };
@@ -232,6 +465,13 @@ impl WorkspaceState {
                 self.tree_hash, computed
             )));
         }
+        let computed_overlay = self.semantic_overlay.identity_hash()?;
+        if computed_overlay != self.semantic_overlay_hash {
+            return Err(ModelError::InvalidOperation(format!(
+                "workspace semantic overlay hash {} recomputes to {}",
+                self.semantic_overlay_hash, computed_overlay
+            )));
+        }
         Ok(())
     }
 
@@ -245,6 +485,7 @@ impl WorkspaceState {
             base_target: self.base_target.clone(),
             base_tree_hash: self.base_tree_hash,
             workspace_tree_hash: self.tree_hash,
+            workspace_semantic_overlay_hash: self.semantic_overlay_hash,
             roots,
             workspace_generation: self.generation,
             admission_policy: self.admission_policy,
@@ -254,8 +495,10 @@ impl WorkspaceState {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.base_tree_hash
-            .map_or(!self.tree.is_empty(), |base| base != self.tree_hash)
+        !self.semantic_overlay.is_empty()
+            || self
+                .base_tree_hash
+                .map_or(!self.tree.is_empty(), |base| base != self.tree_hash)
     }
 }
 
@@ -274,16 +517,18 @@ pub enum WorkspaceExpectation {
         base_target: Option<RefTarget>,
         base_tree_hash: Option<Hash256>,
         tree_hash: Hash256,
+        semantic_overlay_hash: Hash256,
         admission_policy: EffectiveAdmissionPolicyStamp,
     },
 }
 
 /// One exact graph-owned workspace transition.
 ///
-/// The authority implementation applies `tree_deltas` to the tree identified
-/// by `expected`, verifies `new_tree_hash`, and commits the resulting state in
-/// the same repository transaction as history and ref updates.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// The authority implementation applies `tree_deltas` and `semantic_delta` to
+/// the graph identified by `expected`, derives the successor's cumulative
+/// base-relative semantic overlay, verifies the exact result, and commits it
+/// in the same repository transaction as history and ref updates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceMutation {
     pub workspace_id: WorkspaceId,
@@ -294,6 +539,10 @@ pub struct WorkspaceMutation {
     pub new_base_tree_hash: Option<Hash256>,
     pub tree_deltas: Vec<TreeDelta>,
     pub new_tree_hash: Hash256,
+    /// Incremental entity/relation transition from the expected workspace
+    /// graph to the successor workspace graph. Durable storage derives and
+    /// persists the cumulative base-relative overlay from this exact delta.
+    pub semantic_delta: WorkspaceSemanticDelta,
     /// Complete shared policy active for the resulting workspace tree.
     ///
     /// A dirty or unborn workspace may contain a new `.gitignore` before any
@@ -308,6 +557,7 @@ impl WorkspaceMutation {
         &self,
         repository_id: &RepositoryId,
         current: Option<&WorkspaceState>,
+        derived_semantic_overlay: WorkspaceSemanticOverlay,
     ) -> Result<WorkspaceState> {
         self.validate_shape()?;
         let (current_tree, expected_next_generation) = match (&self.expected, current) {
@@ -325,6 +575,7 @@ impl WorkspaceMutation {
                     base_target,
                     base_tree_hash,
                     tree_hash,
+                    semantic_overlay_hash,
                     admission_policy,
                 },
                 Some(current),
@@ -337,10 +588,11 @@ impl WorkspaceMutation {
                     || current.base_target != *base_target
                     || current.base_tree_hash != *base_tree_hash
                     || current.tree_hash != *tree_hash
+                    || current.semantic_overlay_hash != *semantic_overlay_hash
                     || current.admission_policy != *admission_policy
                 {
                     return Err(ModelError::Conflict(format!(
-                        "workspace {} no longer matches its expected generation, head, base, tree, and policy",
+                        "workspace {} no longer matches its expected generation, head, base, tree, semantic overlay, and policy",
                         self.workspace_id
                     )));
                 }
@@ -391,12 +643,14 @@ impl WorkspaceMutation {
             self.new_base_target.clone(),
             self.new_base_tree_hash,
             tree,
+            derived_semantic_overlay,
             self.new_shared_admission_policy.clone(),
             self.new_admission_policy,
         )
     }
 
     fn validate_shape(&self) -> Result<()> {
+        self.semantic_delta.validate()?;
         self.new_shared_admission_policy.validate()?;
         if self.new_shared_admission_policy.stamp() != self.new_admission_policy.shared {
             return Err(ModelError::InvalidOperation(format!(
@@ -496,6 +750,7 @@ impl WorkspaceMutation {
                 && self.new_base_target == *base_target
                 && self.new_base_tree_hash == *base_tree_hash
                 && self.new_tree_hash == *tree_hash
+                && self.semantic_delta.is_empty()
                 && self.new_admission_policy == *admission_policy
             {
                 return Err(ModelError::InvalidOperation(format!(
@@ -535,7 +790,7 @@ fn validate_head_base(
 }
 
 /// Append-only record of one committed repository operation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryOperationRecord {
     pub operation_id: OperationId,
@@ -632,9 +887,10 @@ impl RepositoryOperationRecord {
             .sort_by(|left, right| left.name.cmp(&right.name));
         if let Some(workspace) = &mut canonical.workspace_mutation {
             workspace.tree_deltas.sort_by_key(TreeDelta::artifact_id);
+            workspace.semantic_delta.sort_canonical();
         }
         hash_serialized(
-            b"kin-repository-operation-v3\0",
+            b"kin-repository-operation-v4\0",
             &RepositoryOperationIdentity {
                 operation_id: canonical.operation_id,
                 repository_id: &canonical.repository_id,
@@ -852,8 +1108,9 @@ impl RepositoryTransaction {
             .sort_by(|left, right| left.name.cmp(&right.name));
         if let Some(workspace) = &mut canonical.workspace_mutation {
             workspace.tree_deltas.sort_by_key(TreeDelta::artifact_id);
+            workspace.semantic_delta.sort_canonical();
         }
-        hash_serialized(b"kin-repository-transaction-v3\0", &canonical)
+        hash_serialized(b"kin-repository-transaction-v4\0", &canonical)
     }
 }
 
@@ -865,7 +1122,7 @@ pub enum RepositoryCommitOutcome {
 }
 
 /// Durable result returned for a committed or idempotently replayed operation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryCommitReceipt {
     pub operation_id: OperationId,
@@ -972,10 +1229,11 @@ mod tests {
     use super::*;
     use crate::{
         AdmissionCase, AdmissionPolicyStamp, AdmissionRuleSource, AdmissionRuleSourceKind,
-        ArtifactId, ExternalObjectId, FrozenLocalOverlay, GitExternalAuthority,
-        GitObjectBodyLoader, GitObjectFormat, GitRawRef, GitRawTarget, LocalOverlayHash,
-        LocalOverlayStamp, LocatedEntry, RefExpectation, RefUpdatePolicy, RepoPath,
-        SharedAdmissionPolicy, TreeEntry,
+        ArtifactId, Entity, EntityId, EntityKind, EntityMetadata, ExternalObjectId,
+        FingerprintAlgorithm, FrozenLocalOverlay, GitExternalAuthority, GitObjectBodyLoader,
+        GitObjectFormat, GitRawRef, GitRawTarget, LanguageId, LocalOverlayHash, LocalOverlayStamp,
+        LocatedEntry, RefExpectation, RefUpdatePolicy, RepoPath, SemanticFingerprint,
+        SharedAdmissionPolicy, TreeEntry, Visibility,
     };
     use uuid::Uuid;
 
@@ -1127,6 +1385,33 @@ mod tests {
         }
     }
 
+    fn semantic_entity(id: u128, name: &str) -> Entity {
+        Entity {
+            id: EntityId(Uuid::from_u128(id)),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([id as u8; 32]),
+                signature_hash: Hash256::from_bytes([id as u8; 32]),
+                behavior_hash: Hash256::from_bytes([id as u8; 32]),
+                equivalence_hash: Hash256::from_bytes([id as u8; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: None,
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Private,
+            role: Default::default(),
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
     fn create_workspace_mutation(
         workspace_id: WorkspaceId,
         shared_policy: SharedAdmissionPolicy,
@@ -1145,6 +1430,7 @@ mod tests {
             new_base_tree_hash: None,
             tree_deltas: deltas,
             new_tree_hash: compute_resolved_tree_hash(&tree).unwrap(),
+            semantic_delta: WorkspaceSemanticDelta::default(),
             new_shared_admission_policy: shared_policy,
             new_admission_policy: policy,
         }
@@ -1205,6 +1491,9 @@ mod tests {
             ))),
             base_tree_hash: Some(Hash256::from_bytes([0x22; 32])),
             workspace_tree_hash: Hash256::from_bytes([0x23; 32]),
+            workspace_semantic_overlay_hash: WorkspaceSemanticOverlay::default()
+                .identity_hash()
+                .unwrap(),
             roots: roots(),
             workspace_generation: 9,
             admission_policy: EffectiveAdmissionPolicyStamp {
@@ -1223,6 +1512,142 @@ mod tests {
     }
 
     #[test]
+    fn workspace_semantic_delta_is_canonical_and_rejects_duplicate_targets() {
+        let first = semantic_entity(0x90, "first");
+        let second = semantic_entity(0x91, "second");
+        let forward = WorkspaceSemanticDelta::new(
+            vec![
+                EntityDelta::Added { new: first.clone() },
+                EntityDelta::Added {
+                    new: second.clone(),
+                },
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        let reversed = WorkspaceSemanticDelta::new(
+            vec![
+                EntityDelta::Added {
+                    new: second.clone(),
+                },
+                EntityDelta::Added { new: first.clone() },
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            forward.identity_hash().unwrap(),
+            reversed.identity_hash().unwrap()
+        );
+        let forward_overlay = WorkspaceSemanticOverlay::new(
+            vec![
+                EntityDelta::Added { new: first.clone() },
+                EntityDelta::Added {
+                    new: second.clone(),
+                },
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        let reversed_overlay = WorkspaceSemanticOverlay::new(
+            vec![
+                EntityDelta::Added {
+                    new: second.clone(),
+                },
+                EntityDelta::Added { new: first.clone() },
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            forward_overlay.identity_hash().unwrap(),
+            reversed_overlay.identity_hash().unwrap()
+        );
+        assert_ne!(
+            forward.identity_hash().unwrap(),
+            forward_overlay.identity_hash().unwrap(),
+            "incremental and cumulative identities must use distinct domains"
+        );
+
+        let error = WorkspaceSemanticDelta::new(
+            vec![
+                EntityDelta::Added { new: first.clone() },
+                EntityDelta::Removed { old: first },
+            ],
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("canonical unique target order"));
+
+        let mut encoded = serde_json::to_value(&forward).unwrap();
+        encoded
+            .get_mut("entity_deltas")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+        assert!(
+            serde_json::from_value::<WorkspaceSemanticDelta>(encoded).is_err(),
+            "noncanonical persisted semantic deltas must fail during decode"
+        );
+    }
+
+    #[test]
+    fn semantic_only_workspace_transition_is_durable_dirty_authority() {
+        let repository_id = RepositoryId::new("repo").unwrap();
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0x92));
+        let (shared_policy, policy, _) = admission_policy(workspace_id);
+        let clean =
+            create_workspace_mutation(workspace_id, shared_policy.clone(), policy, Vec::new())
+                .validate_against(&repository_id, None, WorkspaceSemanticOverlay::default())
+                .unwrap();
+        assert!(!clean.is_dirty());
+
+        let entity_delta = EntityDelta::Added {
+            new: semantic_entity(0x93, "uncommitted"),
+        };
+        let delta = WorkspaceSemanticDelta::new(vec![entity_delta.clone()], Vec::new()).unwrap();
+        let overlay = WorkspaceSemanticOverlay::new(vec![entity_delta], Vec::new()).unwrap();
+        let overlay_hash = overlay.identity_hash().unwrap();
+        let mutation = WorkspaceMutation {
+            workspace_id,
+            expected: WorkspaceExpectation::MustEqual {
+                generation: clean.generation,
+                head: clean.head.clone(),
+                base_target: clean.base_target.clone(),
+                base_tree_hash: clean.base_tree_hash,
+                tree_hash: clean.tree_hash,
+                semantic_overlay_hash: clean.semantic_overlay_hash,
+                admission_policy: clean.admission_policy,
+            },
+            new_generation: clean.generation + 1,
+            new_head: clean.head.clone(),
+            new_base_target: clean.base_target.clone(),
+            new_base_tree_hash: clean.base_tree_hash,
+            tree_deltas: Vec::new(),
+            new_tree_hash: clean.tree_hash,
+            semantic_delta: delta,
+            new_shared_admission_policy: shared_policy,
+            new_admission_policy: clean.admission_policy,
+        };
+        let dirty = mutation
+            .validate_against(&repository_id, Some(&clean), overlay)
+            .unwrap();
+        assert!(dirty.is_dirty());
+        assert_eq!(dirty.tree, clean.tree);
+        assert_eq!(dirty.semantic_overlay_hash, overlay_hash);
+
+        let encoded = serde_json::to_value(&dirty).unwrap();
+        let mut legacy = encoded.clone();
+        legacy.as_object_mut().unwrap().remove("semantic_overlay");
+        assert!(serde_json::from_value::<WorkspaceState>(legacy).is_err());
+        assert_eq!(
+            serde_json::from_value::<WorkspaceState>(encoded).unwrap(),
+            dirty
+        );
+    }
+
+    #[test]
     fn workspace_snapshot_binding_requires_complete_base_authority() {
         let mut binding = WorkspaceSnapshotBinding {
             repository_id: RepositoryId::new("repo").unwrap(),
@@ -1235,6 +1660,9 @@ mod tests {
             ))),
             base_tree_hash: Some(Hash256::from_bytes([0x32; 32])),
             workspace_tree_hash: Hash256::from_bytes([0x32; 32]),
+            workspace_semantic_overlay_hash: WorkspaceSemanticOverlay::default()
+                .identity_hash()
+                .unwrap(),
             roots: roots(),
             workspace_generation: 3,
             admission_policy: EffectiveAdmissionPolicyStamp {
@@ -1270,6 +1698,9 @@ mod tests {
             base_target: Some(head_target),
             base_tree_hash: Some(Hash256::from_bytes([0x42; 32])),
             workspace_tree_hash: Hash256::from_bytes([0x42; 32]),
+            workspace_semantic_overlay_hash: WorkspaceSemanticOverlay::default()
+                .identity_hash()
+                .unwrap(),
             roots: roots(),
             workspace_generation: 4,
             admission_policy: EffectiveAdmissionPolicyStamp {
@@ -1412,7 +1843,9 @@ mod tests {
                 ),
             ],
         );
-        let dirty = create.validate_against(&repository_id, None).unwrap();
+        let dirty = create
+            .validate_against(&repository_id, None, WorkspaceSemanticOverlay::default())
+            .unwrap();
         assert!(dirty.is_dirty());
         assert_eq!(dirty.shared_admission_policy, shared_policy);
         assert!(dirty
@@ -1429,6 +1862,7 @@ mod tests {
                 base_target: dirty.base_target.clone(),
                 base_tree_hash: dirty.base_tree_hash,
                 tree_hash: dirty.tree_hash,
+                semantic_overlay_hash: dirty.semantic_overlay_hash,
                 admission_policy: dirty.admission_policy,
             },
             new_generation: 1,
@@ -1437,11 +1871,16 @@ mod tests {
             new_base_tree_hash: Some(dirty.tree_hash),
             tree_deltas: Vec::new(),
             new_tree_hash: dirty.tree_hash,
+            semantic_delta: WorkspaceSemanticDelta::default(),
             new_shared_admission_policy: shared_policy,
             new_admission_policy: dirty.admission_policy,
         };
         let clean = commit
-            .validate_against(&repository_id, Some(&dirty))
+            .validate_against(
+                &repository_id,
+                Some(&dirty),
+                WorkspaceSemanticOverlay::default(),
+            )
             .unwrap();
         assert!(!clean.is_dirty());
         assert_eq!(clean.tree, dirty.tree);
@@ -1455,7 +1894,7 @@ mod tests {
         let (shared_policy, policy, _) = admission_policy(workspace_id);
         let current =
             create_workspace_mutation(workspace_id, shared_policy.clone(), policy, Vec::new())
-                .validate_against(&repository_id, None)
+                .validate_against(&repository_id, None, WorkspaceSemanticOverlay::default())
                 .unwrap();
         let stale = WorkspaceMutation {
             workspace_id,
@@ -1465,6 +1904,7 @@ mod tests {
                 base_target: None,
                 base_tree_hash: None,
                 tree_hash: Hash256::from_bytes([0x99; 32]),
+                semantic_overlay_hash: current.semantic_overlay_hash,
                 admission_policy: current.admission_policy,
             },
             new_generation: current.generation + 2,
@@ -1479,11 +1919,16 @@ mod tests {
             new_base_tree_hash: Some(current.tree_hash),
             tree_deltas: Vec::new(),
             new_tree_hash: current.tree_hash,
+            semantic_delta: WorkspaceSemanticDelta::default(),
             new_shared_admission_policy: shared_policy,
             new_admission_policy: current.admission_policy,
         };
         assert!(matches!(
-            stale.validate_against(&repository_id, Some(&current)),
+            stale.validate_against(
+                &repository_id,
+                Some(&current),
+                current.semantic_overlay.clone()
+            ),
             Err(ModelError::Conflict(_))
         ));
     }
@@ -1509,6 +1954,7 @@ mod tests {
             Some(target.clone()),
             Some(tree_hash),
             tree,
+            WorkspaceSemanticOverlay::default(),
             shared_policy,
             policy,
         )
@@ -1551,7 +1997,7 @@ mod tests {
 
     #[test]
     fn git_authority_delta_is_an_atomic_transaction_mutation_without_readding_cas_records() {
-        assert_eq!(REPOSITORY_TRANSACTION_SCHEMA_VERSION, 3);
+        assert_eq!(REPOSITORY_TRANSACTION_SCHEMA_VERSION, 4);
         let repository_id = RepositoryId::new("repo").unwrap();
         let old = blob_git_authority(repository_id.clone(), b"services:\n  old: {}\n");
         let new = blob_git_authority(repository_id, b"services:\n  new: {}\n");
@@ -1568,8 +2014,8 @@ mod tests {
         let update_hash = update.transaction_hash().unwrap();
         assert_eq!(
             update_hash.to_string(),
-            "897b3d6107f02ade0880195e7956f6d1618800eaf1cf5cc61ace64085a8cd424",
-            "repository transaction v3 identity is schema-pinned"
+            "ad3ef05a2450e78e1ed19de548e309408ea840ce8916385f382c89a5aeac33b5",
+            "repository transaction v4 identity is schema-pinned"
         );
         assert_ne!(initial.transaction_hash().unwrap(), update_hash);
 
@@ -1609,13 +2055,13 @@ mod tests {
         ));
         assert!(no_op.validate().unwrap_err().to_string().contains("no-op"));
 
-        let mut v1 = transaction.clone();
-        v1.schema_version = 1;
-        assert!(v1
+        let mut legacy = transaction.clone();
+        legacy.schema_version = 3;
+        assert!(legacy
             .validate()
             .unwrap_err()
             .to_string()
-            .contains("unsupported repository transaction version 1"));
+            .contains("unsupported repository transaction version 3"));
 
         let value = serde_json::to_value(&transaction).unwrap();
         assert!(value.get("git_authority_delta").is_some());
@@ -1655,8 +2101,8 @@ mod tests {
         let identity = operation.identity_hash().unwrap();
         assert_eq!(
             identity.to_string(),
-            "bad32ab496de6c755fc7f40fa7f52c2b56bb1e6d9c2e9d8f505794ba544f964e",
-            "repository operation v3 identity is schema-pinned"
+            "88697dcc0db93d8577850c9500a84f80345185b11782d48ca93cd822966ef8e7",
+            "repository operation v4 identity is schema-pinned"
         );
 
         let mut changed = operation.clone();

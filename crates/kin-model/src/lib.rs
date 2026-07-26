@@ -128,8 +128,10 @@ pub use relation::{
 pub use repository::{
     compute_resolved_tree_hash, AuthorityRoot, RepositoryAuthorityStore, RepositoryCommitOutcome,
     RepositoryCommitReceipt, RepositoryOperationRecord, RepositoryTransaction, RootBundle,
-    WorkspaceExpectation, WorkspaceMutation, WorkspaceSnapshotBinding, WorkspaceState,
-    REPOSITORY_ROOT_SCHEMA_VERSION, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    WorkspaceExpectation, WorkspaceMutation, WorkspaceSemanticDelta, WorkspaceSemanticOverlay,
+    WorkspaceSnapshotBinding, WorkspaceState, REPOSITORY_ROOT_SCHEMA_VERSION,
+    REPOSITORY_TRANSACTION_SCHEMA_VERSION, WORKSPACE_SEMANTIC_DELTA_SCHEMA_VERSION,
+    WORKSPACE_SEMANTIC_OVERLAY_SCHEMA_VERSION,
 };
 pub use retrieval::{ArtifactId, RetrievalKey, RetrievalKeyFileResolver};
 pub use session::{

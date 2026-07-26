@@ -21,9 +21,10 @@ use crate::{
 
 /// Current shared daemon/VFS workspace-tree wire schema.
 ///
-/// Versions 1 and 2 were private `kin-vfs` contracts. Version 3 is the first
-/// contract owned by `kin-model` and independently hash-verifiable.
-pub const WORKSPACE_TREE_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
+/// Versions 1 and 2 were private `kin-vfs` contracts. Version 3 was the first
+/// contract owned by `kin-model`; version 4 additionally binds the persisted
+/// semantic workspace overlay.
+pub const WORKSPACE_TREE_SNAPSHOT_SCHEMA_VERSION: u32 = 4;
 
 /// One leaf in a workspace-tree projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -124,7 +125,7 @@ impl WorkspaceTreeSnapshot {
         self.validate()?;
         let payload = canonical_json_bytes(self)?;
         let mut hasher = Sha256::new();
-        hasher.update(b"kin-workspace-tree-snapshot-v3\0");
+        hasher.update(b"kin-workspace-tree-snapshot-v4\0");
         hasher.update(
             u64::try_from(payload.len())
                 .map_err(|_| {
@@ -192,6 +193,9 @@ mod tests {
             ))),
             base_tree_hash: Some(tree_hash),
             workspace_tree_hash: tree_hash,
+            workspace_semantic_overlay_hash: crate::WorkspaceSemanticOverlay::default()
+                .identity_hash()
+                .unwrap(),
             roots: RootBundle {
                 version: REPOSITORY_ROOT_SCHEMA_VERSION,
                 generation: 4,
@@ -370,6 +374,14 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("canonical"));
+
+        let mut legacy = snapshot.clone();
+        legacy.schema = 3;
+        assert!(legacy
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("expected 4"));
 
         let mut encoded = serde_json::to_value(snapshot).unwrap();
         encoded
