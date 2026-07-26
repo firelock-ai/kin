@@ -11,8 +11,14 @@ use std::io::{Read, Write};
 use std::path::Path;
 #[cfg(any(unix, windows))]
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use kin_model::{GraphStore, RepoPath, ResolvedTree, SemanticChangeId, TreeEntry};
+use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
+use kin_model::{
+    compute_resolved_tree_hash, GraphStore, Hash256, OperationId, RepoPath,
+    RepositoryCommitReceipt, RepositoryId, RepositoryTransaction, ResolvedTree, SemanticChangeId,
+    TreeEntry,
+};
 
 use crate::{KinError, Result};
 
@@ -33,7 +39,7 @@ const RECONCILIATION_PROJECTION_LOCK_FILE: &str = "projection.lock";
 /// slow, named failure instead of a hang.
 const PROJECTION_LOCK_WAIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 #[cfg(any(unix, windows))]
-const RECONCILIATION_MANIFEST_SCHEMA: u32 = 2;
+const RECONCILIATION_MANIFEST_SCHEMA: u32 = 3;
 #[cfg(any(unix, windows))]
 const RECONCILIATION_ACTION_FILE_PREFIX: &str = "action-";
 #[cfg(any(unix, windows))]
@@ -195,6 +201,155 @@ pub fn reconcile_source_tree_with_mutation_hooks<'a, 'b>(
         after_read_only_preflight,
         after_identity_revalidation,
     )
+}
+
+/// Reconcile a graph-derived working tree and linearize its repository-v6
+/// workspace transaction at the projection transaction's commit boundary.
+///
+/// The projection WAL records the exact repository operation before any
+/// namespace mutation. Recovery rolls the filesystem back when that operation
+/// is absent and finalizes the target projection when the exact operation was
+/// durably committed, closing the process-crash window between the two stores.
+pub fn reconcile_source_tree_and_commit_repository_transaction<'a, 'b>(
+    root: &Path,
+    previous_tree: &ResolvedTree,
+    target_tree: &ResolvedTree,
+    previous_entries: impl IntoIterator<Item = (&'b RepoPath, TreeEntry, &'b [u8])>,
+    entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
+    should_preserve: impl Fn(&Path) -> bool,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    transaction: RepositoryTransaction,
+) -> Result<(usize, RepositoryCommitReceipt)> {
+    let entries = validated_source_entries(entries)?;
+    let previous_entries = validated_source_entries(previous_entries)?;
+    validate_repository_projection_transaction(
+        previous_tree,
+        target_tree,
+        &previous_entries,
+        &entries,
+        &transaction,
+    )?;
+    let marker = ReconciliationAuthorityCommit {
+        repository_id: transaction.repository_id.clone(),
+        operation_id: transaction.operation_id,
+        transaction_hash: transaction
+            .transaction_hash()
+            .map_err(|error| KinError::Other(error.to_string()))?,
+    };
+    project_reconciled_source_tree_and_commit(
+        root,
+        &previous_entries,
+        &entries,
+        &should_preserve,
+        || {},
+        || {},
+        Some(marker),
+        || commit_repository_transaction_exact(authority, transaction),
+    )
+}
+
+fn validate_repository_projection_transaction(
+    previous_tree: &ResolvedTree,
+    target_tree: &ResolvedTree,
+    previous_entries: &[ValidatedSourceEntry<'_>],
+    entries: &[ValidatedSourceEntry<'_>],
+    transaction: &RepositoryTransaction,
+) -> Result<()> {
+    let mutation = transaction.workspace_mutation.as_ref().ok_or_else(|| {
+        KinError::Other(
+            "exact-source repository projection requires one workspace mutation".to_string(),
+        )
+    })?;
+    let transitioned = previous_tree
+        .apply(&mutation.tree_deltas)
+        .map_err(|error| KinError::Other(format!("apply workspace projection deltas: {error}")))?;
+    if transitioned != *target_tree {
+        return Err(KinError::Other(
+            "workspace mutation deltas do not produce the requested projection tree".to_string(),
+        ));
+    }
+    let target_tree_hash = compute_resolved_tree_hash(target_tree)
+        .map_err(|error| KinError::Other(error.to_string()))?;
+    if mutation.new_tree_hash != target_tree_hash {
+        return Err(KinError::Other(format!(
+            "workspace mutation tree hash {} does not match requested projection tree {}",
+            mutation.new_tree_hash, target_tree_hash
+        )));
+    }
+    validate_projection_entries_match_tree("previous", previous_tree, previous_entries)?;
+    validate_projection_entries_match_tree("target", target_tree, entries)?;
+    Ok(())
+}
+
+fn validate_projection_entries_match_tree(
+    label: &str,
+    tree: &ResolvedTree,
+    entries: &[ValidatedSourceEntry<'_>],
+) -> Result<()> {
+    let mut expected = tree
+        .artifacts()
+        .map(|artifact| (&artifact.path, artifact.entry))
+        .collect::<Vec<_>>();
+    expected.sort_by(|left, right| left.0.cmp(right.0));
+    if expected.len() != entries.len()
+        || expected
+            .iter()
+            .zip(entries)
+            .any(|((path, kind), entry)| *path != entry.file_id || *kind != entry.kind)
+    {
+        return Err(KinError::Other(format!(
+            "{label} exact-source bodies do not cover the complete graph tree"
+        )));
+    }
+    for entry in entries {
+        let expected_hash = entry.kind.blob_identity().ok_or_else(|| {
+            KinError::Other(format!(
+                "{label} graph tree contains unmaterializable gitlink {}",
+                entry.file_id
+            ))
+        })?;
+        let actual_hash = kin_blobs::digest(entry.content);
+        if actual_hash != expected_hash {
+            return Err(KinError::Other(format!(
+                "{label} source body for {} hashes to {}, expected repository CAS object {}",
+                entry.file_id, actual_hash, expected_hash
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn commit_repository_transaction_exact(
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    transaction: RepositoryTransaction,
+) -> Result<RepositoryCommitReceipt> {
+    let expected_hash = transaction
+        .transaction_hash()
+        .map_err(|error| KinError::Other(error.to_string()))?;
+    match authority.commit_repository_transaction(transaction.clone()) {
+        Ok(receipt) => Ok(receipt),
+        Err(first_error) => {
+            let exact_operation_is_visible = authority
+                .read_authority()
+                .metadata()
+                .operation_log
+                .iter()
+                .find(|operation| operation.operation_id == transaction.operation_id)
+                .is_some_and(|operation| operation.transaction_hash == expected_hash);
+            if !exact_operation_is_visible {
+                return Err(KinError::Other(format!(
+                    "commit repository projection authority: {first_error}"
+                )));
+            }
+            authority
+                .commit_repository_transaction(transaction)
+                .map_err(|error| {
+                    KinError::Other(format!(
+                        "recover exact repository projection receipt after durable commit: {error}"
+                    ))
+                })
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -492,6 +647,30 @@ fn project_reconciled_source_tree(
     after_read_only_preflight: impl FnOnce(),
     after_identity_revalidation: impl FnOnce(),
 ) -> Result<usize> {
+    project_reconciled_source_tree_and_commit(
+        root,
+        previous_entries,
+        entries,
+        should_preserve,
+        after_read_only_preflight,
+        after_identity_revalidation,
+        None,
+        || Ok(()),
+    )
+    .map(|(count, ())| count)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_reconciled_source_tree_and_commit<T>(
+    root: &Path,
+    previous_entries: &[ValidatedSourceEntry<'_>],
+    entries: &[ValidatedSourceEntry<'_>],
+    should_preserve: &dyn Fn(&Path) -> bool,
+    after_read_only_preflight: impl FnOnce(),
+    after_identity_revalidation: impl FnOnce(),
+    authority_commit: Option<ReconciliationAuthorityCommit>,
+    commit: impl FnOnce() -> Result<T>,
+) -> Result<(usize, T)> {
     #[cfg(any(unix, windows))]
     {
         let projection = ProjectionRoot::open(root)?;
@@ -649,7 +828,8 @@ fn project_reconciled_source_tree(
         // Stage every target object before the first destructive namespace
         // operation. The transaction directory is retained until either all
         // publications succeed or every displaced old object is restored.
-        let mut transaction = projection.create_reconciliation_transaction()?;
+        let mut transaction =
+            projection.create_reconciliation_transaction_with_authority_commit(authority_commit)?;
         let staged = match projection
             .stage_reconciliation_entries(&transaction.directory, &entries_to_materialize)
         {
@@ -737,8 +917,37 @@ fn project_reconciled_source_tree(
             };
         }
 
-        projection.cleanup_reconciliation_transaction(transaction)?;
-        Ok(entries_to_materialize.len())
+        let committed = match commit() {
+            Ok(committed) => committed,
+            Err(error) => {
+                let rollback = projection.rollback_reconciliation_manifest(&transaction);
+                return match rollback {
+                    Ok(()) => match projection.cleanup_reconciliation_transaction(transaction) {
+                        Ok(()) => Err(error),
+                        Err(cleanup_error) => Err(KinError::Other(format!(
+                            "{error}; exact-source rollback succeeded but transaction cleanup failed: {cleanup_error}"
+                        ))),
+                    },
+                    Err(rollback_error) => Err(KinError::Other(format!(
+                        "{error}; {rollback_error}; retained recovery transaction at {}",
+                        projection
+                            .reconciliation_control_path()
+                            .join(&transaction.name)
+                            .display()
+                    ))),
+                };
+            }
+        };
+
+        projection
+            .cleanup_reconciliation_transaction(transaction)
+            .map_err(|error| {
+                KinError::Other(format!(
+                    "repository authority committed but exact-source transaction cleanup failed; \
+                     recovery will finalize the committed projection: {error}"
+                ))
+            })?;
+        Ok((entries_to_materialize.len(), committed))
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -750,6 +959,8 @@ fn project_reconciled_source_tree(
             should_preserve,
             after_read_only_preflight,
             after_identity_revalidation,
+            authority_commit,
+            commit,
         );
         Err(unsupported_safe_projection_error())
     }
@@ -838,8 +1049,16 @@ struct ReconciliationManifest {
     kin_control_identity: TrackedEntryIdentity,
     control_identity: TrackedEntryIdentity,
     transaction_identity: TrackedEntryIdentity,
+    authority_commit: Option<ReconciliationAuthorityCommit>,
     state: ReconciliationTransactionState,
     actions: Vec<ReconciliationRecoveryAction>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct ReconciliationAuthorityCommit {
+    repository_id: RepositoryId,
+    operation_id: OperationId,
+    transaction_hash: Hash256,
 }
 
 #[cfg(any(unix, windows))]
@@ -1542,6 +1761,13 @@ impl ProjectionRoot {
     }
 
     fn create_reconciliation_transaction(&self) -> Result<ReconciliationTransaction> {
+        self.create_reconciliation_transaction_with_authority_commit(None)
+    }
+
+    fn create_reconciliation_transaction_with_authority_commit(
+        &self,
+        authority_commit: Option<ReconciliationAuthorityCommit>,
+    ) -> Result<ReconciliationTransaction> {
         self.revalidate_projection_lock()?;
         for _ in 0..8 {
             let id = uuid::Uuid::new_v4().to_string();
@@ -1578,6 +1804,7 @@ impl ProjectionRoot {
                             kin_control_identity: self.kin_control_identity,
                             control_identity: self.control_identity,
                             transaction_identity: identity,
+                            authority_commit: authority_commit.clone(),
                             state: ReconciliationTransactionState::Pending,
                             actions: Vec::new(),
                         },
@@ -1707,6 +1934,40 @@ impl ProjectionRoot {
             )));
         }
         Ok(())
+    }
+
+    fn repository_authority_commit_is_installed(
+        &self,
+        marker: &ReconciliationAuthorityCommit,
+    ) -> Result<bool> {
+        let manager = RepositoryAuthorityManager::open(
+            marker.repository_id.clone(),
+            Arc::new(LocalFileBackend::new(
+                self.display_root.join(".kin").join("kindb"),
+            )),
+        )
+        .map_err(|error| {
+            KinError::Other(format!(
+                "open repository authority while recovering exact-source projection: {error}"
+            ))
+        })?;
+        let lease = manager.read_authority();
+        let Some(operation) = lease
+            .metadata()
+            .operation_log
+            .iter()
+            .find(|operation| operation.operation_id == marker.operation_id)
+        else {
+            return Ok(false);
+        };
+        if operation.transaction_hash != marker.transaction_hash {
+            return Err(KinError::Other(format!(
+                "repository operation {} exists with a different transaction identity during \
+                 exact-source projection recovery",
+                marker.operation_id
+            )));
+        }
+        Ok(true)
     }
 
     fn authenticate_reconciliation_manifest(
@@ -2144,6 +2405,7 @@ impl ProjectionRoot {
                             kin_control_identity: self.kin_control_identity,
                             control_identity: self.control_identity,
                             transaction_identity: identity,
+                            authority_commit: None,
                             state: ReconciliationTransactionState::Pending,
                             actions: Vec::new(),
                         },
@@ -2174,6 +2436,22 @@ impl ProjectionRoot {
                 )));
             }
             if manifest.state == ReconciliationTransactionState::Committed {
+                let transaction = ReconciliationTransaction {
+                    name,
+                    directory,
+                    identity,
+                    manifest,
+                    action_log_bytes: 0,
+                    action_tail_authentication: Vec::new(),
+                };
+                self.cleanup_reconciliation_transaction(transaction)?;
+                continue;
+            }
+            let authority_committed = match &manifest.authority_commit {
+                Some(marker) => self.repository_authority_commit_is_installed(marker)?,
+                None => false,
+            };
+            if authority_committed {
                 let transaction = ReconciliationTransaction {
                     name,
                     directory,
@@ -5351,7 +5629,10 @@ fn validate_source_symlink_target_with_windows_rules(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kin_model::{GitObjectId, Hash256};
+    use kin_model::{
+        AuthorId, DefaultRefExpectation, DefaultRefMutation, GitObjectId, Hash256, RefName,
+        REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    };
 
     fn repo_path(path: impl Into<String>) -> RepoPath {
         RepoPath::from_utf8(path).expect("test repository path must be valid")
@@ -5652,6 +5933,148 @@ mod tests {
             std::fs::read(root.path().join("new-target.rs")).unwrap(),
             b"untracked user bytes"
         );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn repository_commit_failure_rolls_projection_back_exactly() {
+        let root = tempfile::tempdir().unwrap();
+        let owned = repo_path("compose.yaml");
+        std::fs::write(root.path().join("compose.yaml"), b"services:\n  old: {}\n").unwrap();
+        let previous =
+            validated_source_entries([(&owned, regular(), b"services:\n  old: {}\n".as_slice())])
+                .unwrap();
+        let target = validated_source_entries([(
+            &owned,
+            regular(),
+            b"services:\n  target: {}\n".as_slice(),
+        )])
+        .unwrap();
+
+        let error = project_reconciled_source_tree_and_commit(
+            root.path(),
+            &previous,
+            &target,
+            &should_preserve_checkout_path,
+            || {},
+            || {},
+            None,
+            || -> Result<()> {
+                Err(KinError::Other(
+                    "injected repository authority conflict".to_string(),
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("injected repository authority conflict"));
+        assert_eq!(
+            std::fs::read(root.path().join("compose.yaml")).unwrap(),
+            b"services:\n  old: {}\n"
+        );
+        assert!(std::fs::read_dir(root.path().join(".kin/reconciliation"))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("tx-")));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn recovery_keeps_projection_when_exact_authority_operation_committed() {
+        let root = tempfile::tempdir().unwrap();
+        let initialized = crate::init(root.path()).unwrap();
+        let manager = RepositoryAuthorityManager::open(
+            initialized.repository_id.clone(),
+            Arc::new(LocalFileBackend::new(initialized.layout.kindb_dir())),
+        )
+        .unwrap();
+        let lease = manager.read_authority();
+        let roots = lease.roots().clone();
+        let default_ref = lease.metadata().ref_state.default_ref.clone().unwrap();
+        drop(lease);
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::new(),
+            repository_id: initialized.repository_id,
+            expected_generation: roots.generation,
+            expected_roots: roots,
+            actor: AuthorId::new("projection-crash-test"),
+            reason: "commit exact projection recovery fixture".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            ref_mutations: Vec::new(),
+            default_ref_mutation: Some(DefaultRefMutation {
+                expected: DefaultRefExpectation::MustEqual { name: default_ref },
+                new_default: Some(RefName::branch(b"alternate").unwrap()),
+            }),
+            workspace_mutation: None,
+            local_overlay_delta: None,
+        };
+        let marker = ReconciliationAuthorityCommit {
+            repository_id: transaction.repository_id.clone(),
+            operation_id: transaction.operation_id,
+            transaction_hash: transaction.transaction_hash().unwrap(),
+        };
+        let owned = repo_path("compose.yaml");
+        std::fs::write(root.path().join("compose.yaml"), b"services:\n  old: {}\n").unwrap();
+        let previous =
+            validated_source_entries([(&owned, regular(), b"services:\n  old: {}\n".as_slice())])
+                .unwrap();
+        let target = validated_source_entries([(
+            &owned,
+            regular(),
+            b"services:\n  target: {}\n".as_slice(),
+        )])
+        .unwrap();
+
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<(usize, ())> = project_reconciled_source_tree_and_commit(
+                root.path(),
+                &previous,
+                &target,
+                &should_preserve_checkout_path,
+                || {},
+                || {},
+                Some(marker),
+                || {
+                    manager.commit_repository_transaction(transaction).unwrap();
+                    panic!("simulated process crash after authority commit");
+                },
+            );
+        }));
+        assert!(crashed.is_err());
+        assert_eq!(
+            std::fs::read(root.path().join("compose.yaml")).unwrap(),
+            b"services:\n  target: {}\n"
+        );
+        assert!(std::fs::read_dir(root.path().join(".kin/reconciliation"))
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("tx-")));
+
+        drop(ProjectionRoot::open(root.path()).unwrap());
+
+        assert_eq!(
+            std::fs::read(root.path().join("compose.yaml")).unwrap(),
+            b"services:\n  target: {}\n"
+        );
+        assert!(std::fs::read_dir(root.path().join(".kin/reconciliation"))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("tx-")));
     }
 
     #[cfg(any(unix, windows))]
