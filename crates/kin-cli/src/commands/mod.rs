@@ -31,7 +31,6 @@ pub mod gc;
 pub mod git;
 pub mod graph;
 pub mod graph_health;
-pub mod graph_recover;
 pub mod graph_viz;
 pub mod health;
 pub mod history;
