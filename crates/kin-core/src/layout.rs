@@ -100,6 +100,17 @@ impl KinLayout {
         self.root.join("kindb")
     }
 
+    /// `.kin/kindb/ingest-cas/` — non-authoritative blob staging for explicit
+    /// filesystem reconciliation.
+    ///
+    /// Reconcile parses exact input bytes from this cache before a repository
+    /// transaction copies referenced bodies into repository-owned source CAS.
+    /// Runtime history, VFS, and semantic query paths must never treat this
+    /// staging directory as committed repository authority.
+    pub fn ingest_cas_dir(&self) -> PathBuf {
+        self.kindb_dir().join("ingest-cas")
+    }
+
     /// `.kin/kindb/graph.kndb` — KinDB snapshot file.
     pub fn kindb_snapshot_path(&self) -> PathBuf {
         self.kindb_dir().join("graph.kndb")
@@ -293,6 +304,7 @@ impl KinLayout {
     pub fn all_dirs(&self) -> Vec<PathBuf> {
         vec![
             self.kindb_dir(),
+            self.ingest_cas_dir(),
             self.stashes_dir(),
             self.backups_dir(),
             self.projections_dir(),
@@ -349,6 +361,10 @@ mod tests {
             PathBuf::from("/repo/.kin/manifest.json")
         );
         assert_eq!(layout.kindb_dir(), PathBuf::from("/repo/.kin/kindb"));
+        assert_eq!(
+            layout.ingest_cas_dir(),
+            PathBuf::from("/repo/.kin/kindb/ingest-cas")
+        );
         assert_eq!(
             layout.kindb_snapshot_path(),
             PathBuf::from("/repo/.kin/kindb/graph.kndb")

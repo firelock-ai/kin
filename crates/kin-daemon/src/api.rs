@@ -5006,7 +5006,7 @@ fn search_body_source_from_graph(
     let branch = graph.get_branch(&branch_name).ok()??;
     let genesis = kin_core::build_genesis_change();
     let tree = kin_core::build_file_tree(graph, &genesis.id, &branch.head).ok()?;
-    let blob_store = kin_blobs::BlobStore::new(layout.objects_dir()).ok()?;
+    let blob_store = kin_blobs::BlobStore::new(layout.ingest_cas_dir()).ok()?;
     Some((blob_store, tree))
 }
 
@@ -12563,7 +12563,7 @@ mod tests {
         let encoded = hash.to_string();
         state
             .layout
-            .objects_dir()
+            .ingest_cas_dir()
             .join(&encoded[..2])
             .join(&encoded[2..])
     }
