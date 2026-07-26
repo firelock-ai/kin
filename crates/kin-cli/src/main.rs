@@ -1148,18 +1148,6 @@ enum GitAction {
         #[arg(long, default_value_t = false)]
         in_place: bool,
     },
-    /// Import from Git history (deprecated: use `kin init` or `kin migrate` instead)
-    #[command(hide = true)]
-    Import {
-        /// Git repository path
-        path: Option<String>,
-    },
-    /// Sync with Git remote
-    Sync {
-        /// Allow exporting directly into the checked-out Git working repository
-        #[arg(long, default_value_t = false)]
-        in_place: bool,
-    },
 }
 
 #[derive(Subcommand)]
@@ -2657,8 +2645,6 @@ fn main() -> Result<()> {
                     GitAction::Export { output, in_place } => {
                         commands::git::export(output, in_place).await
                     }
-                    GitAction::Import { path } => commands::git::import(path).await,
-                    GitAction::Sync { in_place } => commands::git::sync(in_place).await,
                 },
                 Command::Intent { action } => match action {
                     IntentAction::List => commands::intent::list().await,
@@ -3010,6 +2996,34 @@ mod tests {
                     "supported graph-backed session surface missing from help: {supported}"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn git_interop_exposes_only_exact_export() {
+        on_cli_test_stack(|| {
+            for args in [
+                &["kin", "git", "import"][..],
+                &["kin", "git", "sync"][..],
+                &["kin", "git", "sync", "--in-place"][..],
+            ] {
+                assert!(
+                    Cli::try_parse_from(args).is_err(),
+                    "removed Git compatibility command must not be parseable: {args:?}"
+                );
+            }
+
+            let cli = Cli::try_parse_from(["kin", "git", "export", "--in-place"])
+                .expect("exact Git export remains the explicit interoperability surface");
+            assert!(matches!(
+                cli.command,
+                Command::Git {
+                    action: GitAction::Export {
+                        output: None,
+                        in_place: true
+                    }
+                }
+            ));
         });
     }
 
