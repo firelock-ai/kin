@@ -49,18 +49,26 @@ impl ExecContext {
 
         let start = Instant::now();
 
-        let output = if cfg!(target_os = "windows") {
-            Command::new("cmd")
-                .args(["/C", &full_command])
-                .current_dir(self.workspace.root())
-                .output()
-        } else {
-            Command::new("sh")
-                .args(["-c", &full_command])
-                .current_dir(self.workspace.root())
-                .output()
-        }
-        .map_err(|e| RuntimeError::CommandFailed(e.to_string()))?;
+        #[cfg(target_os = "windows")]
+        let mut command = {
+            let mut command = Command::new("cmd");
+            command.args(["/C", &full_command]);
+            command
+        };
+        #[cfg(not(target_os = "windows"))]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", &full_command]);
+            command
+        };
+        self.workspace
+            .configure_command_current_dir(&mut command)
+            .map_err(|error| {
+                RuntimeError::Other(format!("bind command to exact workspace: {error}"))
+            })?;
+        let output = command
+            .output()
+            .map_err(|e| RuntimeError::CommandFailed(e.to_string()))?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -144,5 +152,26 @@ mod tests {
 
         let result = ctx.run().unwrap();
         assert_eq!(result.strategy_used, MaterializeStrategy::Copy);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_command_cannot_be_redirected_by_session_path_replacement() {
+        let (_repository, workspace) = exact_workspace(&[("marker.txt", b"authority\n")]);
+        let display_root = workspace.root().to_path_buf();
+        let parked = display_root.with_extension("retained");
+        let mut command = Command::new("sh");
+        command.args(["-c", "cat marker.txt"]);
+        workspace
+            .configure_command_current_dir(&mut command)
+            .unwrap();
+
+        std::fs::rename(&display_root, &parked).unwrap();
+        std::fs::create_dir(&display_root).unwrap();
+        std::fs::write(display_root.join("marker.txt"), b"replacement\n").unwrap();
+
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"authority\n");
     }
 }
