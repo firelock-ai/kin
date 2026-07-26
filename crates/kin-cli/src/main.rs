@@ -50,7 +50,7 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// [OPEN GATE] Show repository-v6 workspace status
+    /// Show coherent repository-v6 workspace status
     Status {
         /// Output machine-readable JSON for editor integrations
         #[arg(long, default_value_t = false)]
@@ -1884,7 +1884,7 @@ fn main() -> Result<()> {
             match cli.command {
                 Command::Capabilities { json } => commands::capabilities::run(json),
                 Command::Init { path, json } => commands::init::run(path, json).await,
-                Command::Status { json: _ } => commands::capabilities::require_ready("status"),
+                Command::Status { json } => commands::status::run(json),
                 Command::Resources { action } => match action {
                     ResourcesAction::Inspect { json, profile } => {
                         commands::resources::run(json, profile).await

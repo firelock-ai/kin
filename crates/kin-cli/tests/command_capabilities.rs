@@ -37,7 +37,7 @@ fn capability_json_keeps_the_bounded_dogfood_bar_explicit() {
     assert_eq!(report["schema"], "kin.git-replacement-capabilities.v1");
     assert_eq!(report["substrate"], "repository-v6");
     assert_eq!(report["git_replacement_ready"], false);
-    assert_eq!(report["required_ready"], 1);
+    assert_eq!(report["required_ready"], 2);
     assert_eq!(report["required_total"], 11);
 
     let commands = report["commands"]
@@ -101,13 +101,13 @@ fn open_gate_commands_fail_before_repository_discovery() {
     std::fs::create_dir_all(&home).expect("create home");
 
     let output = kin_command(&home)
-        .arg("status")
+        .args(["commit", "--message", "still gated"])
         .current_dir(root.path())
         .output()
-        .expect("run gated status");
+        .expect("run gated commit");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("`kin status` is fail-closed on repository-v6"));
+    assert!(stderr.contains("`kin commit` is fail-closed on repository-v6"));
     assert!(stderr.contains("kin capabilities --json"));
 }
 
@@ -124,7 +124,7 @@ fn top_level_help_marks_open_git_replacement_surfaces() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("capabilities"));
-    assert!(stdout.contains("[OPEN GATE] Show repository-v6 workspace status"));
+    assert!(stdout.contains("Show coherent repository-v6 workspace status"));
     assert!(stdout.contains("[OPEN GATE] Create an exact semantic and artifact commit"));
     assert!(stdout.contains("[OPEN GATE] Show exact artifact and semantic changes"));
 }

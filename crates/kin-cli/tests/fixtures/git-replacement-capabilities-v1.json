@@ -21,16 +21,18 @@
     },
     {
       "command": "status",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "repository-v6 workspace/ref/root bundle",
       "required_for_bounded_dogfood": true,
       "acceptance_spec": [
         "report one coherent durable authority generation, exact workspace head/tree, dirty state, refs, and semantic-enrichment state",
         "do not infer repository membership or readiness from the filesystem or legacy branch sidecars"
       ],
-      "evidence_tests": [],
-      "note": "The existing status executor still depends on removed legacy branch and source-layout helpers."
+      "evidence_tests": [
+        "crates/kin-cli/tests/repository_status.rs"
+      ],
+      "note": "Status reads workspace, refs, roots, exact tree identity, and semantic counts from one repository authority lease; checkout and Git state are not consulted."
     },
     {
       "command": "commit",
