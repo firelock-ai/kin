@@ -124,10 +124,22 @@ fn sync_source_file_for_ack(file: &std::fs::File, display_path: &Path) -> Result
     })
 }
 
+#[cfg(windows)]
+fn sync_source_file_for_ack(file: &std::fs::File, display_path: &Path) -> Result<(), KinDbError> {
+    file.sync_all().map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to flush immutable source blob {}: {error}",
+            display_path.display()
+        ))
+    })
+}
+
 pub(crate) fn validate_source_blob_repo_id(repo_id: &str) -> Result<(), KinDbError> {
     if repo_id.is_empty()
         || repo_id.len() > 255
         || matches!(repo_id, "." | "..")
+        || repo_id.ends_with(['.', ' '])
+        || is_windows_reserved_source_component(repo_id)
         || !repo_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
@@ -137,6 +149,22 @@ pub(crate) fn validate_source_blob_repo_id(repo_id: &str) -> Result<(), KinDbErr
         )));
     }
     Ok(())
+}
+
+/// Reject DOS device aliases even on non-Windows hosts so a repository
+/// identifier has one portable storage meaning on every supported platform.
+fn is_windows_reserved_source_component(component: &str) -> bool {
+    let stem = component
+        .split_once('.')
+        .map_or(component, |(stem, _extension)| stem);
+    let upper = stem.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$")
+        || upper
+            .strip_prefix("COM")
+            .or_else(|| upper.strip_prefix("LPT"))
+            .is_some_and(
+                |suffix| matches!(suffix.as_bytes(), [digit] if (b'1'..=b'9').contains(digit)),
+            )
 }
 
 pub(crate) fn verify_source_blob_digest(
@@ -628,6 +656,729 @@ fn publish_source_file_at(
     // follows an ancestor path.
     unsafe { libc::unlinkat(directory.as_raw_fd(), staging_name.as_ptr(), 0) };
     Ok(published)
+}
+
+#[cfg(windows)]
+struct WindowsSourceBlobCapability {
+    /// Every directory from the filesystem root through the digest prefix.
+    /// The handles intentionally omit `FILE_SHARE_DELETE`, pinning the whole
+    /// namespace chain against rename or replacement for the operation.
+    directories: Vec<cap_std::fs::Dir>,
+    repo_index: usize,
+    leaf_path: PathBuf,
+}
+
+#[cfg(windows)]
+impl WindowsSourceBlobCapability {
+    fn repo_dir(&self) -> &cap_std::fs::Dir {
+        &self.directories[self.repo_index]
+    }
+
+    fn leaf_dir(&self) -> &cap_std::fs::Dir {
+        self.directories
+            .last()
+            .expect("source capability always contains its digest-prefix directory")
+    }
+}
+
+#[cfg(windows)]
+struct WindowsOpenedSourceBlob {
+    file: std::fs::File,
+    data: Vec<u8>,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowsSourceIdentity {
+    volume_serial: u64,
+    file_id: [u8; 16],
+}
+
+#[cfg(windows)]
+fn validate_windows_source_component(component: &std::ffi::OsStr) -> Result<(), KinDbError> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut components = Path::new(component).components();
+    if !matches!(
+        components.next(),
+        Some(std::path::Component::Normal(name)) if name == component
+    ) || components.next().is_some()
+    {
+        return Err(KinDbError::StorageError(format!(
+            "immutable source path component is not one normal name: {component:?}"
+        )));
+    }
+
+    let wide = component.encode_wide().collect::<Vec<_>>();
+    let invalid_character = wide.iter().any(|character| {
+        *character == 0
+            || *character < 32
+            || matches!(
+                *character,
+                value if value == u16::from(b'<')
+                    || value == u16::from(b'>')
+                    || value == u16::from(b':')
+                    || value == u16::from(b'"')
+                    || value == u16::from(b'/')
+                    || value == u16::from(b'\\')
+                    || value == u16::from(b'|')
+                    || value == u16::from(b'?')
+                    || value == u16::from(b'*')
+            )
+    });
+    if wide.is_empty()
+        || invalid_character
+        || matches!(wide.last(), Some(last) if *last == u16::from(b'.') || *last == u16::from(b' '))
+    {
+        return Err(KinDbError::StorageError(format!(
+            "immutable source path component is not a portable Windows name: {component:?}"
+        )));
+    }
+
+    let stem_end = wide
+        .iter()
+        .position(|character| *character == u16::from(b'.'))
+        .unwrap_or(wide.len());
+    let ascii_stem = wide[..stem_end]
+        .iter()
+        .copied()
+        .map(u8::try_from)
+        .collect::<Result<Vec<_>, _>>();
+    if ascii_stem
+        .ok()
+        .and_then(|stem| String::from_utf8(stem).ok())
+        .is_some_and(|stem| is_windows_reserved_source_component(&stem))
+    {
+        return Err(KinDbError::StorageError(format!(
+            "immutable source path component is a reserved Windows device name: {component:?}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_source_metadata_is_reparse(metadata: &cap_std::fs::Metadata) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    cap_fs_ext::OsMetadataExt::file_attributes(metadata) & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
+fn open_windows_source_directory_at(
+    parent: &cap_std::fs::Dir,
+    component: &std::ffi::OsStr,
+    display_path: &Path,
+    create: bool,
+) -> Result<cap_std::fs::Dir, KinDbError> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
+    use cap_std::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    validate_windows_source_component(component)?;
+    if create {
+        match parent.create_dir(component) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(KinDbError::StorageError(format!(
+                    "failed to create immutable source blob directory {}: {error}",
+                    display_path.display()
+                )));
+            }
+        }
+    }
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        // Deliberately do not share DELETE. Keeping every ancestor handle in
+        // the capability prevents path displacement for the operation.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true);
+    let file = parent.open_with(component, &options).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "refusing reparse-point or non-directory immutable source blob ancestor {} (or missing path): {error}",
+            display_path.display()
+        ))
+    })?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| KinDbError::StorageError(error.to_string()))?;
+    if windows_source_metadata_is_reparse(&metadata) || !metadata.is_dir() {
+        return Err(KinDbError::StorageError(format!(
+            "refusing reparse-point or non-directory immutable source blob ancestor {}",
+            display_path.display()
+        )));
+    }
+    Ok(cap_std::fs::Dir::from_std_file(file.into_std()))
+}
+
+#[cfg(windows)]
+fn windows_source_absolute_base(base_path: &Path) -> Result<PathBuf, KinDbError> {
+    let absolute = if base_path.is_absolute() {
+        base_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to resolve current directory for immutable source storage: {error}"
+                ))
+            })?
+            .join(base_path)
+    };
+    if absolute
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(KinDbError::StorageError(format!(
+            "immutable source blob trust root may not contain parent traversal: {}",
+            base_path.display()
+        )));
+    }
+    Ok(absolute)
+}
+
+#[cfg(windows)]
+fn open_windows_source_blob_capability(
+    base_path: &Path,
+    repo_id: &str,
+    digest: [u8; 32],
+    create: bool,
+) -> Result<WindowsSourceBlobCapability, KinDbError> {
+    validate_source_blob_repo_id(repo_id)?;
+    let absolute = windows_source_absolute_base(base_path)?;
+    let ambient_root = absolute
+        .ancestors()
+        .last()
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "immutable source blob trust root has no filesystem root: {}",
+                absolute.display()
+            ))
+        })?;
+    let relative = absolute.strip_prefix(ambient_root).map_err(|_| {
+        KinDbError::StorageError(format!(
+            "immutable source blob trust root is not beneath its filesystem root: {}",
+            absolute.display()
+        ))
+    })?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(KinDbError::StorageError(format!(
+            "immutable source blob trust root contains an unsupported component: {}",
+            absolute.display()
+        )));
+    }
+
+    let root = cap_std::fs::Dir::open_ambient_dir(ambient_root, cap_std::ambient_authority())
+        .map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to open immutable source filesystem root {}: {error}",
+                ambient_root.display()
+            ))
+        })?;
+    let mut directories = vec![root];
+    let mut display = ambient_root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            unreachable!("immutable source root components were validated")
+        };
+        display.push(name);
+        let next = open_windows_source_directory_at(
+            directories
+                .last()
+                .expect("filesystem root capability was inserted"),
+            name,
+            &display,
+            create,
+        )?;
+        directories.push(next);
+    }
+
+    let digest_hex = hex::encode(digest);
+    let repo_index = directories.len();
+    for component in [
+        std::ffi::OsStr::new(repo_id),
+        std::ffi::OsStr::new("source-blobs"),
+        std::ffi::OsStr::new("sha256"),
+        std::ffi::OsStr::new(&digest_hex[..2]),
+    ] {
+        display.push(component);
+        let next = open_windows_source_directory_at(
+            directories
+                .last()
+                .expect("filesystem root capability was inserted"),
+            component,
+            &display,
+            create,
+        )?;
+        directories.push(next);
+    }
+
+    Ok(WindowsSourceBlobCapability {
+        directories,
+        repo_index,
+        leaf_path: display,
+    })
+}
+
+#[cfg(windows)]
+fn windows_source_handle_identity(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<WindowsSourceIdentity, KinDbError> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
+    };
+
+    let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: `handle` remains live and `info` is correctly sized for
+    // `FileIdInfo`.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            (&raw mut info).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(KinDbError::StorageError(format!(
+            "failed to inspect immutable source Windows file identity: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let identity = WindowsSourceIdentity {
+        volume_serial: info.VolumeSerialNumber,
+        file_id: info.FileId.Identifier,
+    };
+    if identity.volume_serial == 0 || identity.file_id.iter().all(|byte| *byte == 0) {
+        return Err(KinDbError::StorageError(
+            "immutable source Windows object returned a zero FILE_ID_128 identity".to_string(),
+        ));
+    }
+    Ok(identity)
+}
+
+#[cfg(windows)]
+fn windows_source_directory_identity(
+    directory: &cap_std::fs::Dir,
+) -> Result<WindowsSourceIdentity, KinDbError> {
+    use std::os::windows::io::AsRawHandle;
+
+    windows_source_handle_identity(directory.as_raw_handle().cast())
+}
+
+#[cfg(windows)]
+fn windows_source_file_identity(file: &std::fs::File) -> Result<WindowsSourceIdentity, KinDbError> {
+    use std::os::windows::io::AsRawHandle;
+
+    windows_source_handle_identity(file.as_raw_handle().cast())
+}
+
+#[cfg(windows)]
+fn confirm_windows_source_blob_namespace(
+    base_path: &Path,
+    repo_id: &str,
+    digest: [u8; 32],
+    capability: &WindowsSourceBlobCapability,
+) -> Result<(), KinDbError> {
+    let current = open_windows_source_blob_capability(base_path, repo_id, digest, false)?;
+    if current.directories.len() != capability.directories.len() {
+        return Err(KinDbError::StorageError(format!(
+            "immutable source blob trust root changed while accessing {}",
+            capability.leaf_path.display()
+        )));
+    }
+    for (pinned, reopened) in capability
+        .directories
+        .iter()
+        .zip(current.directories.iter())
+    {
+        if windows_source_directory_identity(pinned)?
+            != windows_source_directory_identity(reopened)?
+        {
+            return Err(KinDbError::StorageError(format!(
+                "immutable source blob trust root changed while accessing {}",
+                capability.leaf_path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_windows_source_file_at(
+    directory: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+    writable: bool,
+) -> Result<Option<(std::fs::File, u64)>, KinDbError> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
+    use cap_std::fs::OpenOptionsExt;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
+
+    validate_windows_source_component(name)?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(writable)
+        .access_mode(if writable {
+            GENERIC_READ | GENERIC_WRITE
+        } else {
+            GENERIC_READ
+        })
+        // Immutable bytes are read through an exclusive namespace/content
+        // handle. A pre-existing incompatible writer makes the read fail
+        // closed instead of permitting a torn body.
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(false);
+    let file = match directory.open_with(name, &options) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(KinDbError::StorageError(format!(
+                "failed to open immutable source blob through pinned Windows directory: {error}"
+            )));
+        }
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| KinDbError::StorageError(error.to_string()))?;
+    if windows_source_metadata_is_reparse(&metadata) || !metadata.is_file() {
+        return Err(KinDbError::StorageError(
+            "refusing reparse-point or non-regular immutable source blob".to_string(),
+        ));
+    }
+    let byte_len = metadata.len();
+    validate_source_blob_size(byte_len, "pinned local Windows source object")?;
+    Ok(Some((file.into_std(), byte_len)))
+}
+
+#[cfg(windows)]
+fn read_windows_source_file_at(
+    directory: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+    max_bytes: u64,
+    writable: bool,
+) -> Result<Option<WindowsOpenedSourceBlob>, KinDbError> {
+    let Some((mut file, byte_len)) = open_windows_source_file_at(directory, name, writable)? else {
+        return Ok(None);
+    };
+    validate_source_blob_read_size(byte_len, max_bytes, "pinned local Windows source object")?;
+    let capacity = usize::try_from(byte_len).map_err(|_| {
+        KinDbError::StorageError(format!(
+            "pinned local Windows source object length {byte_len} does not fit in memory"
+        ))
+    })?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(capacity).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to reserve {byte_len} bytes for pinned local Windows source object: {error}"
+        ))
+    })?;
+    data.resize(capacity, 0);
+    file.read_exact(&mut data).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "pinned local Windows source object changed length while reading {byte_len} bytes: {error}"
+        ))
+    })?;
+    let mut trailing = [0_u8; 1];
+    let trailing_len = file
+        .read(&mut trailing)
+        .map_err(|error| KinDbError::StorageError(error.to_string()))?;
+    let final_len = file
+        .metadata()
+        .map_err(|error| KinDbError::StorageError(error.to_string()))?
+        .len();
+    if trailing_len != 0 || final_len != byte_len {
+        return Err(KinDbError::StorageError(format!(
+            "pinned local Windows source object changed length while reading: expected {byte_len} bytes, found at least {final_len}; the {MAX_SOURCE_BLOB_BYTES}-byte allocation safety limit remains enforced"
+        )));
+    }
+    Ok(Some(WindowsOpenedSourceBlob { file, data }))
+}
+
+#[cfg(windows)]
+fn acquire_windows_source_blob_lock(
+    repo_dir: &cap_std::fs::Dir,
+) -> Result<std::fs::File, KinDbError> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
+    use cap_std::fs::OpenOptionsExt;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let name = std::ffi::OsStr::new(".lock");
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .access_mode(GENERIC_READ | GENERIC_WRITE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(false);
+    let file = repo_dir.open_with(name, &options).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to open pinned immutable source repo lock on Windows: {error}"
+        ))
+    })?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| KinDbError::StorageError(error.to_string()))?;
+    if windows_source_metadata_is_reparse(&metadata) || !metadata.is_file() {
+        return Err(KinDbError::StorageError(
+            "refusing reparse-point or non-regular immutable source repo lock".to_string(),
+        ));
+    }
+    let lock_file = file.into_std();
+    use fs2::FileExt;
+    lock_file.lock_exclusive().map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to acquire pinned immutable source repo lock on Windows: {error}"
+        ))
+    })?;
+    Ok(lock_file)
+}
+
+#[cfg(windows)]
+fn mark_windows_source_file_for_deletion(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+    };
+
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: the exact staged handle is live and was opened with DELETE
+    // access; the disposition buffer has the required layout and size.
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle().cast(),
+            FileDispositionInfo,
+            (&raw const disposition).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+struct WindowsStagedSourceFile {
+    file: Option<std::fs::File>,
+    published: bool,
+}
+
+#[cfg(windows)]
+impl WindowsStagedSourceFile {
+    fn file(&self) -> &std::fs::File {
+        self.file
+            .as_ref()
+            .expect("staged source handle remains live until drop")
+    }
+
+    fn file_mut(&mut self) -> &mut std::fs::File {
+        self.file
+            .as_mut()
+            .expect("staged source handle remains live until drop")
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsStagedSourceFile {
+    fn drop(&mut self) {
+        if !self.published {
+            if let Some(file) = self.file.as_ref() {
+                // Best-effort exact-handle cleanup. A crash or cleanup failure
+                // can leave only a UUID-named, unreachable staging orphan; it
+                // can never become digest authority.
+                let _ = mark_windows_source_file_for_deletion(file);
+            }
+        }
+        drop(self.file.take());
+    }
+}
+
+#[cfg(windows)]
+fn create_windows_staged_source_file(
+    directory: &cap_std::fs::Dir,
+    digest_hex: &str,
+) -> Result<WindowsStagedSourceFile, KinDbError> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
+    use cap_std::fs::OpenOptionsExt;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_READ,
+    };
+
+    let staging = format!(".{digest_hex}.no-clobber-{}", uuid::Uuid::new_v4());
+    let name = std::ffi::OsStr::new(&staging);
+    validate_windows_source_component(name)?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(false);
+    let file = directory.open_with(name, &options).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to create pinned immutable source staging file on Windows: {error}"
+        ))
+    })?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| KinDbError::StorageError(error.to_string()))?;
+    if windows_source_metadata_is_reparse(&metadata) || !metadata.is_file() {
+        return Err(KinDbError::StorageError(
+            "new immutable source staging object is a reparse point or non-regular file"
+                .to_string(),
+        ));
+    }
+    Ok(WindowsStagedSourceFile {
+        file: Some(file.into_std()),
+        published: false,
+    })
+}
+
+#[cfg(windows)]
+fn rename_windows_source_file_noreplace(
+    source: &std::fs::File,
+    destination_parent: &cap_std::fs::Dir,
+    destination_name: &std::ffi::OsStr,
+) -> Result<bool, KinDbError> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FileRenameInformation, NtSetInformationFile, FILE_RENAME_INFORMATION,
+    };
+    use windows_sys::Win32::Foundation::{
+        RtlNtStatusToDosError, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_EXISTS,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    validate_windows_source_component(destination_name)?;
+    let name_wide = destination_name.encode_wide().collect::<Vec<_>>();
+    let name_bytes = name_wide
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| {
+            KinDbError::StorageError(
+                "immutable source destination length overflow on Windows".to_string(),
+            )
+        })?;
+    let buffer_bytes = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName)
+        .checked_add(name_bytes)
+        .ok_or_else(|| {
+            KinDbError::StorageError(
+                "immutable source rename buffer length overflow on Windows".to_string(),
+            )
+        })?;
+    let file_name_length = u32::try_from(name_bytes).map_err(|_| {
+        KinDbError::StorageError(
+            "immutable source destination exceeds the Windows length limit".to_string(),
+        )
+    })?;
+    let buffer_length = u32::try_from(buffer_bytes).map_err(|_| {
+        KinDbError::StorageError(
+            "immutable source rename buffer exceeds the Windows length limit".to_string(),
+        )
+    })?;
+    let mut storage = vec![0_usize; buffer_bytes.div_ceil(std::mem::size_of::<usize>())];
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    unsafe {
+        // `NtSetInformationFile` (unlike Win32
+        // `SetFileInformationByHandle`) honors a relative FileName against
+        // RootDirectory. Flags=0 is the atomic no-replace publication point.
+        (*info).Anonymous.Flags = 0;
+        (*info).RootDirectory = destination_parent.as_raw_handle().cast();
+        (*info).FileNameLength = file_name_length;
+        std::ptr::copy_nonoverlapping(
+            name_wide.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            name_wide.len(),
+        );
+    }
+    let mut io_status = IO_STATUS_BLOCK::default();
+    // SAFETY: source and destination directory handles remain live, and the
+    // aligned variable-sized rename buffer matches `FILE_RENAME_INFORMATION`.
+    let status = unsafe {
+        NtSetInformationFile(
+            source.as_raw_handle().cast(),
+            &raw mut io_status,
+            info.cast(),
+            buffer_length,
+            FileRenameInformation,
+        )
+    };
+    if status == 0 {
+        return Ok(true);
+    }
+    if matches!(
+        status,
+        STATUS_OBJECT_NAME_COLLISION | STATUS_OBJECT_NAME_EXISTS
+    ) {
+        return Ok(false);
+    }
+    // SAFETY: converting an NTSTATUS to a Win32 error code has no pointer
+    // preconditions.
+    let windows_error = unsafe { RtlNtStatusToDosError(status) };
+    Err(KinDbError::StorageError(format!(
+        "failed to publish immutable source blob without replacing Windows authority: {}",
+        std::io::Error::from_raw_os_error(windows_error as i32)
+    )))
+}
+
+#[cfg(windows)]
+fn publish_windows_source_file_at(
+    directory: &cap_std::fs::Dir,
+    digest_hex: &str,
+    data: &[u8],
+) -> Result<Option<WindowsSourceIdentity>, KinDbError> {
+    let mut staged = create_windows_staged_source_file(directory, digest_hex)?;
+    staged
+        .file_mut()
+        .write_all(data)
+        .map_err(|error| KinDbError::StorageError(error.to_string()))?;
+    sync_source_file_for_ack(
+        staged.file(),
+        Path::new("pinned immutable Windows source staging file"),
+    )?;
+    if !rename_windows_source_file_noreplace(
+        staged.file(),
+        directory,
+        std::ffi::OsStr::new(digest_hex),
+    )? {
+        return Ok(None);
+    }
+    // The handle now names the digest object. Any later durability or identity
+    // failure must leave that no-clobber publication in place for an exact
+    // retry; cleanup is only valid while the handle still names staging.
+    staged.published = true;
+
+    // Flush the exact renamed file handle after the namespace transition.
+    // Windows has no supported directory-fsync equivalent; the write-through
+    // staging handle plus this post-rename flush is its strongest supported
+    // file/metadata durability boundary.
+    sync_source_file_for_ack(
+        staged.file(),
+        Path::new("pinned immutable Windows source object"),
+    )?;
+    let identity = windows_source_file_identity(staged.file())?;
+    Ok(Some(identity))
 }
 
 pub(crate) fn checked_next_generation(
@@ -1967,13 +2718,95 @@ impl StorageBackend for LocalFileBackend {
         })?;
         validate_source_blob_size(byte_len, &format!("repo {repo_id}"))?;
         verify_source_blob_digest(digest, data, &format!("repo {repo_id}"))?;
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (repo_id, digest, data);
             return Err(KinDbError::StorageError(
                 "secure local immutable source storage is unavailable on this platform; use the GCS backend"
                     .to_string(),
             ));
+        }
+        #[cfg(windows)]
+        {
+            let capability =
+                open_windows_source_blob_capability(&self.base_path, repo_id, digest, true)?;
+            #[cfg(test)]
+            if let Some(hook) = self.source_blob_before_lock_hook.lock().take() {
+                hook();
+            }
+            let _lock = acquire_windows_source_blob_lock(capability.repo_dir())?;
+            confirm_windows_source_blob_namespace(&self.base_path, repo_id, digest, &capability)?;
+            let digest_hex = hex::encode(digest);
+
+            if let Some(existing) = read_windows_source_file_at(
+                capability.leaf_dir(),
+                std::ffi::OsStr::new(&digest_hex),
+                MAX_SOURCE_BLOB_BYTES,
+                true,
+            )? {
+                verify_source_blob_digest(
+                    digest,
+                    &existing.data,
+                    &capability.leaf_path.display().to_string(),
+                )?;
+                if existing.data != data {
+                    return Err(KinDbError::StorageError(format!(
+                        "immutable source blob collision below {}",
+                        capability.leaf_path.display()
+                    )));
+                }
+                confirm_windows_source_blob_namespace(
+                    &self.base_path,
+                    repo_id,
+                    digest,
+                    &capability,
+                )?;
+                sync_source_file_for_ack(&existing.file, &capability.leaf_path.join(&digest_hex))?;
+                return Ok(());
+            }
+
+            #[cfg(test)]
+            if let Some(hook) = self.source_blob_before_publish_hook.lock().take() {
+                hook();
+            }
+            confirm_windows_source_blob_namespace(&self.base_path, repo_id, digest, &capability)?;
+            let published_identity =
+                publish_windows_source_file_at(capability.leaf_dir(), &digest_hex, data)?;
+            let installed = read_windows_source_file_at(
+                capability.leaf_dir(),
+                std::ffi::OsStr::new(&digest_hex),
+                MAX_SOURCE_BLOB_BYTES,
+                true,
+            )?
+            .ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "immutable source blob disappeared after Windows publication below {}",
+                    capability.leaf_path.display()
+                ))
+            })?;
+            verify_source_blob_digest(
+                digest,
+                &installed.data,
+                &capability.leaf_path.display().to_string(),
+            )?;
+            if installed.data != data {
+                return Err(KinDbError::StorageError(format!(
+                    "immutable source blob changed while installing below {}",
+                    capability.leaf_path.display()
+                )));
+            }
+            if let Some(published_identity) = published_identity {
+                let installed_identity = windows_source_file_identity(&installed.file)?;
+                if installed_identity != published_identity {
+                    return Err(KinDbError::StorageError(format!(
+                        "immutable source blob was replaced after Windows publication below {}",
+                        capability.leaf_path.display()
+                    )));
+                }
+            }
+            confirm_windows_source_blob_namespace(&self.base_path, repo_id, digest, &capability)?;
+            sync_source_file_for_ack(&installed.file, &capability.leaf_path.join(&digest_hex))?;
+            return Ok(());
         }
         #[cfg(unix)]
         {
@@ -2078,13 +2911,37 @@ impl StorageBackend for LocalFileBackend {
         max_bytes: u64,
     ) -> Result<Option<Vec<u8>>, KinDbError> {
         validate_source_blob_repo_id(repo_id)?;
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (repo_id, digest, max_bytes);
             return Err(KinDbError::StorageError(
                 "secure local immutable source storage is unavailable on this platform; use the GCS backend"
                     .to_string(),
             ));
+        }
+        #[cfg(windows)]
+        {
+            let capability =
+                open_windows_source_blob_capability(&self.base_path, repo_id, digest, true)?;
+            let _lock = acquire_windows_source_blob_lock(capability.repo_dir())?;
+            confirm_windows_source_blob_namespace(&self.base_path, repo_id, digest, &capability)?;
+            let digest_hex = hex::encode(digest);
+            let Some(data) = read_windows_source_file_at(
+                capability.leaf_dir(),
+                std::ffi::OsStr::new(&digest_hex),
+                max_bytes,
+                false,
+            )?
+            else {
+                return Ok(None);
+            };
+            verify_source_blob_digest(
+                digest,
+                &data.data,
+                &capability.leaf_path.display().to_string(),
+            )?;
+            confirm_windows_source_blob_namespace(&self.base_path, repo_id, digest, &capability)?;
+            return Ok(Some(data.data));
         }
         #[cfg(unix)]
         {
@@ -2115,13 +2972,29 @@ impl StorageBackend for LocalFileBackend {
 
     fn source_blob_len(&self, repo_id: &str, digest: [u8; 32]) -> Result<Option<u64>, KinDbError> {
         validate_source_blob_repo_id(repo_id)?;
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (repo_id, digest);
             return Err(KinDbError::StorageError(
                 "secure local immutable source storage is unavailable on this platform; use the GCS backend"
                     .to_string(),
             ));
+        }
+        #[cfg(windows)]
+        {
+            let capability =
+                open_windows_source_blob_capability(&self.base_path, repo_id, digest, true)?;
+            let _lock = acquire_windows_source_blob_lock(capability.repo_dir())?;
+            confirm_windows_source_blob_namespace(&self.base_path, repo_id, digest, &capability)?;
+            let digest_hex = hex::encode(digest);
+            let opened = open_windows_source_file_at(
+                capability.leaf_dir(),
+                std::ffi::OsStr::new(&digest_hex),
+                false,
+            )?;
+            let byte_len = opened.as_ref().map(|(_, byte_len)| *byte_len);
+            confirm_windows_source_blob_namespace(&self.base_path, repo_id, digest, &capability)?;
+            return Ok(byte_len);
         }
         #[cfg(unix)]
         {
@@ -2691,6 +3564,35 @@ mod tests {
         assert!(retry_error.to_string().contains("digest mismatch"));
     }
 
+    #[test]
+    fn source_blob_repo_ids_have_one_portable_windows_meaning() {
+        for repo_id in [
+            "CON",
+            "con.txt",
+            "PRN",
+            "AUX.log",
+            "nul",
+            "CLOCK$",
+            "COM1",
+            "com9.cache",
+            "LPT1",
+            "lpt9.txt",
+            "repo.",
+            "repo ",
+        ] {
+            let error = validate_source_blob_repo_id(repo_id)
+                .expect_err("Windows device aliases and normalized names must be rejected");
+            assert!(
+                error.to_string().contains("invalid repo id"),
+                "unexpected validation error for {repo_id:?}: {error}"
+            );
+        }
+        for repo_id in ["console", "com0", "com10", "lpt0", "lpt10", "repo.name"] {
+            validate_source_blob_repo_id(repo_id)
+                .unwrap_or_else(|error| panic!("portable repo id {repo_id:?} rejected: {error}"));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn local_source_blob_rejects_symlink_object_without_touching_target() {
@@ -2934,6 +3836,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_source_blob_confirms_new_trust_root_parent_directory() {
         let dir = TempDir::new().unwrap();
@@ -3053,6 +3956,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_source_blob_retry_reconfirms_failed_publication_directory_sync() {
         let dir = TempDir::new().unwrap();
