@@ -339,12 +339,29 @@ pub fn publish_repository_layout(
     prepared: PreparedRepositoryInit,
     final_kin_dir: &Path,
 ) -> Result<InitResult> {
-    publish_repository_layout_with_hook(prepared, final_kin_dir, |_| {})
+    publish_repository_layout_with_hooks(prepared, final_kin_dir, || Ok(()), |_| {})
 }
 
-fn publish_repository_layout_with_hook(
+/// Publish a staged repository only if one final read-only source check passes.
+///
+/// The callback runs after the staged authority has been durably synced,
+/// closed, reopened, verified, and synced again, immediately before the atomic
+/// no-replace rename. A callback error leaves the final `.kin` absent and arms
+/// normal staged cleanup. Git migration uses this boundary to repeat its exact
+/// source preflight without allowing the staging directory to contaminate the
+/// observed worktree.
+pub fn publish_repository_layout_after_check(
+    prepared: PreparedRepositoryInit,
+    final_kin_dir: &Path,
+    before_rename: impl FnOnce() -> Result<()>,
+) -> Result<InitResult> {
+    publish_repository_layout_with_hooks(prepared, final_kin_dir, before_rename, |_| {})
+}
+
+fn publish_repository_layout_with_hooks(
     mut prepared: PreparedRepositoryInit,
     final_kin_dir: &Path,
+    before_rename: impl FnOnce() -> Result<()>,
     after_rename: impl FnOnce(&Path),
 ) -> Result<InitResult> {
     validate_publish_destination(&prepared.layout, final_kin_dir)?;
@@ -374,6 +391,7 @@ fn publish_repository_layout_with_hook(
     // Verification may create or touch backend lock state. Flush the exact
     // verified namespace once more before the publication rename.
     sync_layout_recursively(prepared.layout.root())?;
+    before_rename()?;
     rename_directory_noreplace(prepared.layout.root(), final_kin_dir)?;
     prepared.cleanup_armed = false;
     after_rename(final_kin_dir);
@@ -1310,9 +1328,14 @@ mod tests {
         prepared.commit_repository_bootstrap(&transaction).unwrap();
         let staging_root = prepared.layout.root().to_path_buf();
 
-        let error = publish_repository_layout_with_hook(prepared, &final_kin, |published| {
-            std::fs::remove_file(published.join("manifest.json")).unwrap();
-        })
+        let error = publish_repository_layout_with_hooks(
+            prepared,
+            &final_kin,
+            || Ok(()),
+            |published| {
+                std::fs::remove_file(published.join("manifest.json")).unwrap();
+            },
+        )
         .unwrap_err();
 
         assert!(matches!(
@@ -1339,6 +1362,29 @@ mod tests {
 
         assert!(matches!(error, KinError::Io { .. }));
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"do not replace");
+        assert!(!staging_root.exists());
+    }
+
+    #[test]
+    fn failed_final_source_check_discards_unpublished_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let working_dir = directory.path().canonicalize().unwrap();
+        let final_kin = working_dir.join(".kin");
+        let (mut prepared, transaction) = prepare_unborn(directory.path(), "final-check");
+        prepared.commit_repository_bootstrap(&transaction).unwrap();
+        let staging_root = prepared.layout.root().to_path_buf();
+
+        let error = publish_repository_layout_after_check(prepared, &final_kin, || {
+            Err(KinError::Other(
+                "source changed during final migration preflight".to_string(),
+            ))
+        })
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("source changed during final migration preflight"));
+        assert!(!final_kin.exists());
         assert!(!staging_root.exists());
     }
 

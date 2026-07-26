@@ -47,7 +47,7 @@ pub use hooks::{
 };
 pub use init::{
     init, initialize_repository_authority, prepare_repository_layout_at, publish_repository_layout,
-    InitResult, PreparedRepositoryInit, RepositoryBootstrap,
+    publish_repository_layout_after_check, InitResult, PreparedRepositoryInit, RepositoryBootstrap,
 };
 pub use layout::KinLayout;
 pub use manifest::KinManifest;
