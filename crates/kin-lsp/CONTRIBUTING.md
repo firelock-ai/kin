@@ -103,12 +103,15 @@ Public Git history is part of the product, so keep it clean and reviewable:
   embedding internal issue or tracker IDs in a branch name — a squash merge
   copies the branch name into the public commit subject, so anything in the
   branch name lands in history verbatim.
-- **Write durable subjects and bodies.** Commit messages should describe the
-  technical change and why it was made. Keep internal tracker IDs, session
-  identifiers, and automated authorship trailers out of public commit
-  metadata; link that context from the pull request instead.
-- **Don't bypass the hooks.** Repository hooks normalize commit metadata for
-  consistency — don't skip them with `--no-verify`.
+- **Keep private context private.** Do not publish private session URLs or IDs,
+  secrets, or internal-only tracker references. Put non-sensitive technical
+  context in the pull request.
+- **Preserve provenance.** Tool-specific attribution is optional and is not
+  required. Hooks must not add, remove, or rewrite it, or rewrite authors,
+  committers, timestamps, or history.
+- **Use hooks only for validation.** Hooks may reject private references or
+  secrets, but they must not mutate commit metadata or history. Do not skip
+  configured validation with `--no-verify`.
 
 ## Pull Requests
 
