@@ -12,7 +12,8 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager, RepositoryAuthorityState};
 use kin_model::{
-    GitObjectId, RefName, RefTarget, RepositoryId, SemanticChangeId, WorkspaceId, WorkspaceState,
+    GitObjectId, RefName, RefTarget, RepositoryId, RootBundle, SemanticChangeId, WorkspaceId,
+    WorkspaceState,
 };
 
 pub(crate) struct ActiveRepositoryAuthority {
@@ -51,8 +52,12 @@ impl ActiveRepositoryAuthority {
     }
 
     pub(crate) fn workspace(&self) -> Result<WorkspaceState> {
-        self.manager
-            .read_authority()
+        self.workspace_with_roots().map(|(workspace, _)| workspace)
+    }
+
+    pub(crate) fn workspace_with_roots(&self) -> Result<(WorkspaceState, RootBundle)> {
+        let lease = self.manager.read_authority();
+        let workspace = lease
             .metadata()
             .workspaces
             .iter()
@@ -64,7 +69,8 @@ impl ActiveRepositoryAuthority {
                     self.repository_id,
                     self.workspace_id
                 )
-            })
+            })?;
+        Ok((workspace, lease.roots().clone()))
     }
 
     pub(crate) fn resolve_named_ref(&self, name: &RefName) -> Result<SemanticChangeId> {

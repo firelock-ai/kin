@@ -2471,7 +2471,9 @@ mod tests {
         };
         initial_change.id = compute_semantic_change_id(&initial_change).unwrap();
 
-        let backend = Arc::new(LocalFileBackend::new(directory.path().join("kindb")));
+        let kindb = directory.path().join("kindb");
+        std::fs::create_dir(&kindb).unwrap();
+        let backend = Arc::new(LocalFileBackend::new(kindb));
         let authority = RepositoryAuthorityManager::open(repository_id.clone(), backend).unwrap();
         let bootstrap = initialize_repository_authority(
             &authority,

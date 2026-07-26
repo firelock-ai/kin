@@ -1060,9 +1060,11 @@ mod tests {
     };
 
     fn test_authority(root: &Path) -> RepositoryAuthorityManager<LocalFileBackend> {
+        let kindb = root.join("kindb");
+        std::fs::create_dir(&kindb).unwrap();
         RepositoryAuthorityManager::open(
             RepositoryId::new("ref-view-test").unwrap(),
-            Arc::new(LocalFileBackend::new(root.join("kindb"))),
+            Arc::new(LocalFileBackend::new(kindb)),
         )
         .unwrap()
     }

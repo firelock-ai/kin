@@ -9378,7 +9378,19 @@ mod tests {
         rel_path: &str,
         content: &[u8],
     ) -> SemanticChangeId {
+        install_repository_entry(state, rel_path, content, |hash| {
+            TreeEntry::blob(hash, false)
+        })
+    }
+
+    fn install_repository_entry(
+        state: &Arc<DaemonState>,
+        rel_path: &str,
+        content: &[u8],
+        entry: impl FnOnce(Hash256) -> TreeEntry,
+    ) -> SemanticChangeId {
         let blob_hash = state.blobs.write(content).unwrap();
+        let entry = entry(Hash256::from_bytes(blob_hash.0));
         let artifact_id = kin_model::ArtifactId::new();
         let path = RepoPath::from_utf8(rel_path).unwrap();
         state
@@ -9388,10 +9400,7 @@ mod tests {
                 relation_deltas: Vec::new(),
                 tree_deltas: vec![kin_model::TreeDelta::Added {
                     artifact_id,
-                    new: kin_model::LocatedEntry::new(
-                        path,
-                        TreeEntry::blob(Hash256::from_bytes(blob_hash.0), false),
-                    ),
+                    new: kin_model::LocatedEntry::new(path, entry),
                 }],
                 admission_policy_delta: None,
             })
@@ -10690,6 +10699,33 @@ mod tests {
     async fn session_workspace_endpoint_materializes_live_graph() {
         let state = test_state();
         install_repository_file(&state, "src/lib.py", b"graph truth\n");
+        install_repository_file(
+            &state,
+            "compose.yaml",
+            b"services:\n  api:\n    image: kin:test\n",
+        );
+        install_repository_entry(&state, "bin/verify", b"#!/bin/sh\nexit 0\n", |hash| {
+            TreeEntry::blob(hash, true)
+        });
+        install_repository_file(
+            &state,
+            "assets/policy.unknown",
+            b"\x00\xffopaque repository bytes\x00",
+        );
+        #[cfg(unix)]
+        install_repository_entry(
+            &state,
+            "current-compose",
+            b"compose.yaml",
+            TreeEntry::symlink,
+        );
+
+        std::fs::create_dir_all(state.layout.working_dir().join("src")).unwrap();
+        std::fs::write(
+            state.layout.working_dir().join("src/lib.py"),
+            b"checkout drift must not become session authority\n",
+        )
+        .unwrap();
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -10719,10 +10755,54 @@ mod tests {
             .unwrap();
         let result: kin_cli::commands::session_workspace::SessionWorkspaceResponse =
             serde_json::from_slice(&body).unwrap();
-        assert_eq!(result.source_kind, "blob-tree");
+        assert_eq!(result.source_kind, "exact-tree");
         assert_eq!(
             std::fs::read_to_string(session_dir.join("src/lib.py")).unwrap(),
             "graph truth\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(session_dir.join("compose.yaml")).unwrap(),
+            "services:\n  api:\n    image: kin:test\n"
+        );
+        assert_eq!(
+            std::fs::read(session_dir.join("assets/policy.unknown")).unwrap(),
+            b"\x00\xffopaque repository bytes\x00"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            assert_ne!(
+                std::fs::metadata(session_dir.join("bin/verify"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0
+            );
+            assert_eq!(
+                std::fs::read_link(session_dir.join("current-compose")).unwrap(),
+                PathBuf::from("compose.yaml")
+            );
+        }
+        assert!(session_dir.join(".kin-session/base.json").is_file());
+        let base: kin_cli::commands::session_workspace::SessionWorkspaceBase =
+            serde_json::from_slice(
+                &std::fs::read(session_dir.join(".kin-session/base.json")).unwrap(),
+            )
+            .unwrap();
+        base.validate().unwrap();
+        assert_eq!(
+            base.materialized_artifact_ids.len(),
+            base.source_workspace.tree.len()
+        );
+        #[cfg(unix)]
+        assert_eq!(base.source_workspace.tree.len(), 5);
+        #[cfg(not(unix))]
+        assert_eq!(base.source_workspace.tree.len(), 4);
+        assert!(
+            !session_dir.join(".kin").exists(),
+            "session projection must not shadow owning-repository discovery"
         );
     }
 

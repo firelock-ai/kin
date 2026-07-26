@@ -1,4 +1,22 @@
-# Session Runtime: Running Ordinary Tools and Agents in a Kin Repository
+# Session Runtime Acceptance Contract
+
+> **Current development status:** repository-v6 exact session materialization is
+> implemented at the daemon boundary, including non-code/binary artifacts,
+> executable bits, symlinks, exact source-CAS reads, scoped artifact selection,
+> and an immutable three-way-reconcile base. The public `kin exec`, `kin shell`,
+> `kin with --session`, `kin open`, and `kin reconcile` commands remain
+> fail-closed open gates. Docker and Compose are therefore represented and
+> materializable, but are **not yet claimed as end-to-end dogfood-ready through
+> these launchers**. Check `kin capabilities --json` for live availability.
+>
+> The remainder of this document is the contract those commands must satisfy
+> before their gates are opened, not a claim that every step is released today.
+
+Two exact-tree cases still fail closed at the physical session boundary:
+byte-exact non-UTF-8 repository paths (retained in repository authority and Git
+export, but not yet projected by the UTF-8 workspace boundary) and gitlinks
+(retained exactly as imported targets, but awaiting the graph-native
+cross-repository model and recursive materialization).
 
 Kin's session runtime is the venv-like execution contract for a Kin repository:
 you (or an agent) run normal project commands — `npm test`, `make`,

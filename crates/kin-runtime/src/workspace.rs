@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, info};
@@ -65,19 +64,7 @@ pub struct MaterializedWorkspace {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaterializationSourceKind {
     Filesystem,
-    BlobTree,
-}
-
-/// Input sources that the runtime can materialize into a workspace.
-pub enum MaterializationSource<'a> {
-    Filesystem {
-        source: &'a Path,
-        strategy: Option<MaterializeStrategy>,
-    },
-    BlobTree {
-        blob_store: &'a kin_blobs::BlobStore,
-        tree: &'a HashMap<kin_model::FilePathId, kin_model::Hash256>,
-    },
+    ExactTree,
 }
 
 /// Directories to skip when materializing the workspace.
@@ -92,22 +79,6 @@ const SKIP_DIRS: &[&str] = &[
 ];
 
 impl MaterializedWorkspace {
-    /// Create a materialized workspace from either filesystem or graph-owned inputs.
-    pub fn create_from_source(
-        source: MaterializationSource<'_>,
-        target: &Path,
-        scope: Option<&str>,
-    ) -> Result<Self> {
-        match source {
-            MaterializationSource::Filesystem { source, strategy } => {
-                Self::create(source, target, strategy, scope)
-            }
-            MaterializationSource::BlobTree { blob_store, tree } => {
-                Self::create_from_blob_tree(blob_store, tree, target, scope)
-            }
-        }
-    }
-
     /// Create a materialized workspace by copying files from `source` to `target`.
     ///
     /// If `strategy` is `None`, tries reflink first, then hardlink, then copy.
@@ -153,54 +124,6 @@ impl MaterializedWorkspace {
             root: target.to_path_buf(),
             strategy: used_strategy,
             source_kind: MaterializationSourceKind::Filesystem,
-        })
-    }
-
-    /// Create a workspace directly from graph-owned blob truth.
-    ///
-    /// The caller supplies the committed file tree for the desired graph state.
-    /// This keeps session materialization graph-first without consulting the
-    /// checked-out working tree as the source of truth.
-    pub fn create_from_blob_tree(
-        blob_store: &kin_blobs::BlobStore,
-        tree: &std::collections::HashMap<kin_model::FilePathId, kin_model::Hash256>,
-        target: &Path,
-        scope: Option<&str>,
-    ) -> Result<Self> {
-        std::fs::create_dir_all(target).map_err(|e| RuntimeError::io(target, e))?;
-        let scope_filter = scope_filter_from_scope(scope);
-
-        let mut entries: Vec<_> = tree.iter().collect();
-        entries.sort_by(|(left, _), (right, _)| left.0.cmp(&right.0));
-
-        for (file_id, hash) in entries {
-            if let Some(filter) = scope_filter.as_deref() {
-                if Path::new(&file_id.0) != filter {
-                    continue;
-                }
-            }
-
-            let blob_hash = kin_blobs::Hash256(*hash.as_bytes());
-            let content = blob_store.read(&blob_hash).map_err(|e| {
-                RuntimeError::Blob(format!("failed to read blob for {}: {}", file_id, e))
-            })?;
-            let path = target.join(&file_id.0);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| RuntimeError::io(parent, e))?;
-            }
-            std::fs::write(&path, &content).map_err(|e| RuntimeError::io(&path, e))?;
-        }
-
-        info!(
-            target = %target.display(),
-            file_count = tree.len(),
-            "materialized workspace from graph blob tree"
-        );
-
-        Ok(Self {
-            root: target.to_path_buf(),
-            strategy: MaterializeStrategy::Copy,
-            source_kind: MaterializationSourceKind::BlobTree,
         })
     }
 
@@ -383,7 +306,6 @@ pub fn record_verification_evidence<G: GraphStore>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use std::fs;
 
     // ---- MaterializedWorkspace tests ----
@@ -504,30 +426,6 @@ mod tests {
         assert!(dst.path().join(".python-version").exists());
         assert!(dst.path().join(".npmrc").exists());
         assert!(dst.path().join(".tool-versions").exists());
-    }
-
-    #[test]
-    fn materialize_from_blob_tree_creates_graph_backed_workspace() {
-        let objects_root = tempfile::tempdir().unwrap();
-        let blob_store = kin_blobs::BlobStore::new(objects_root.path().join("objects")).unwrap();
-        let dst = tempfile::tempdir().unwrap();
-
-        let content = b"fn graph_truth() {}\n";
-        let hash = blob_store.write(content).unwrap();
-        let mut tree = HashMap::new();
-        tree.insert(
-            kin_model::FilePathId::new("src/lib.rs"),
-            kin_model::Hash256(*hash.as_bytes()),
-        );
-
-        let mw = MaterializedWorkspace::create_from_blob_tree(&blob_store, &tree, dst.path(), None)
-            .unwrap();
-
-        assert_eq!(mw.strategy, MaterializeStrategy::Copy);
-        assert_eq!(
-            fs::read_to_string(dst.path().join("src/lib.rs")).unwrap(),
-            "fn graph_truth() {}\n"
-        );
     }
 
     #[test]
