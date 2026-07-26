@@ -12,12 +12,14 @@
 //! Earlier lossy history conversion and commit-synthesizing export APIs are not
 //! part of the clean-slate model-v6 surface.
 
+pub mod admission_history;
 pub mod authority;
 pub mod error;
 pub mod lossless;
 pub mod preflight;
 pub mod semantic_import;
 
+pub use admission_history::{admit_semantic_git_import, AdmittedSemanticGitImportPlan};
 pub use authority::build_git_external_authority;
 pub use error::{
     GitCheckoutFilterFact, GitError, LocalGitHookFact, LocalGitHookKind, RegisteredGitWorktreeFact,
