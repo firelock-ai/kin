@@ -46,7 +46,7 @@ pub fn compute_semantic_change_id(change: &SemanticChange) -> Result<SemanticCha
     append_canonical_json(&mut canonical, &payload)?;
 
     let mut hasher = Sha256::new();
-    hasher.update(b"kin-semantic-change-v4\0");
+    hasher.update(b"kin-semantic-change-v5\0");
     append_len_prefixed_hash_field(&mut hasher, &canonical)?;
     let result = hasher.finalize();
     let mut bytes = [0u8; 32];
@@ -99,7 +99,7 @@ pub fn content_identity_from_deltas(
     )?;
 
     let mut hasher = Sha256::new();
-    hasher.update(b"kin-content-v3\0");
+    hasher.update(b"kin-content-v4\0");
     append_payload_slice(&mut hasher, b"entities", &entity_payloads)?;
     append_payload_slice(&mut hasher, b"relations", &relation_payloads)?;
     append_payload_slice(&mut hasher, b"tree", &tree_payloads)?;
@@ -152,7 +152,7 @@ fn relation_deltas_have_overlapping_targets(relation_deltas: &[RelationDelta]) -
 fn tree_deltas_have_overlapping_targets(tree_deltas: &[TreeDelta]) -> bool {
     let mut tree_targets = HashSet::with_capacity(tree_deltas.len());
     for delta in tree_deltas {
-        if !tree_targets.insert(delta.file_id().clone()) {
+        if !tree_targets.insert(delta.artifact_id()) {
             return true;
         }
     }
@@ -292,9 +292,10 @@ pub fn whoami() -> String {
 mod tests {
     use super::*;
     use kin_model::{
-        relation::GraphNodeId, AuthorId, BranchName, EntityId, EntityKind, EntityMetadata,
-        EntityRole, FilePathId, FingerprintAlgorithm, LanguageId, RelationId, RelationKind,
-        RelationOrigin, SemanticFingerprint, TreeEntry, Visibility,
+        relation::GraphNodeId, ArtifactId, AuthorId, BranchName, EntityId, EntityKind,
+        EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm, LanguageId, LocatedEntry,
+        RelationId, RelationKind, RelationOrigin, RepoPath, SemanticFingerprint, Timestamp,
+        TreeEntry, Visibility,
     };
 
     fn test_entity(id: EntityId, name: &str) -> Entity {
@@ -325,15 +326,22 @@ mod tests {
     }
 
     fn modified_tree(
+        artifact_id: ArtifactId,
         path: &str,
         old_hash: Hash256,
         new_hash: Hash256,
         executable: bool,
     ) -> TreeDelta {
-        TreeDelta::Modified {
-            file_id: FilePathId::new(path),
-            old_entry: TreeEntry::regular(old_hash, false),
-            new_entry: TreeEntry::regular(new_hash, executable),
+        TreeDelta::Updated {
+            artifact_id,
+            old: LocatedEntry::new(
+                RepoPath::from_utf8(path).unwrap(),
+                TreeEntry::blob(old_hash, false),
+            ),
+            new: LocatedEntry::new(
+                RepoPath::from_utf8(path).unwrap(),
+                TreeEntry::blob(new_hash, executable),
+            ),
         }
     }
 
@@ -363,20 +371,58 @@ mod tests {
     }
 
     #[test]
+    fn semantic_change_v5_hash_domain_has_a_pinned_fixture() {
+        let mut fixture = crate::build_genesis_change();
+        fixture.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x55; 32]));
+        fixture.timestamp = Timestamp(
+            chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        fixture.author = AuthorId::new("fixture");
+        fixture.message = "phase two".to_string();
+        fixture.authored_on = Some(BranchName::new("main"));
+
+        assert_eq!(
+            compute_semantic_change_id(&fixture).unwrap().to_string(),
+            "4c2bb2dc66a780f9b807e0c08b0ab61d37ae0d861af9dea8347145932bf1f7c5",
+            "changing the kin-semantic-change-v5 domain or canonical fixture is a wire break"
+        );
+    }
+
+    #[test]
     fn content_identity_empty_deltas_is_deterministic() {
         let h1 = content_identity_from_deltas(&[], &[], &[]).unwrap();
         let h2 = content_identity_from_deltas(&[], &[], &[]).unwrap();
         assert_eq!(h1, h2);
+        assert_eq!(
+            h1,
+            [
+                0xe2, 0xe3, 0x49, 0x04, 0x8f, 0x3e, 0xed, 0x2e, 0xb2, 0xab, 0x77, 0x63, 0xdc, 0x51,
+                0xe7, 0xfd, 0xd0, 0x3f, 0xa6, 0x7c, 0xbb, 0xcc, 0x09, 0xe2, 0x07, 0xfd, 0xde, 0x68,
+                0x8c, 0x34, 0xf8, 0x8e,
+            ],
+            "changing the kin-content-v4 domain or canonical empty payload is a wire break"
+        );
     }
 
     #[test]
     fn content_identity_binds_complete_tree_delta_and_ignores_slice_order() {
+        let regular_artifact = ArtifactId(uuid::Uuid::from_u128(1));
+        let executable_artifact = ArtifactId(uuid::Uuid::from_u128(2));
+        let old_artifact = ArtifactId(uuid::Uuid::from_u128(3));
         let old_hash = Hash256::from_bytes([1; 32]);
         let new_hash = Hash256::from_bytes([2; 32]);
         let different_old_hash = Hash256::from_bytes([3; 32]);
-        let regular = modified_tree("bin/kin", old_hash, new_hash, false);
-        let executable = modified_tree("bin/kin", old_hash, new_hash, true);
-        let different_old = modified_tree("bin/kin", different_old_hash, new_hash, false);
+        let regular = modified_tree(regular_artifact, "bin/kin", old_hash, new_hash, false);
+        let executable = modified_tree(regular_artifact, "bin/kin", old_hash, new_hash, true);
+        let different_old = modified_tree(
+            regular_artifact,
+            "bin/kin",
+            different_old_hash,
+            new_hash,
+            false,
+        );
 
         let regular_id =
             content_identity_from_deltas(&[], &[], std::slice::from_ref(&regular)).unwrap();
@@ -387,9 +433,20 @@ mod tests {
         assert_ne!(regular_id, executable_id);
         assert_ne!(regular_id, different_old_id);
 
-        let ordered_executable = modified_tree("bin/kin-exec", old_hash, new_hash, true);
-        let ordered_different_old =
-            modified_tree("bin/kin-old", different_old_hash, new_hash, false);
+        let ordered_executable = modified_tree(
+            executable_artifact,
+            "bin/kin-exec",
+            old_hash,
+            new_hash,
+            true,
+        );
+        let ordered_different_old = modified_tree(
+            old_artifact,
+            "bin/kin-old",
+            different_old_hash,
+            new_hash,
+            false,
+        );
         let first = content_identity_from_deltas(
             &[],
             &[],
@@ -411,16 +468,58 @@ mod tests {
 
     #[test]
     fn content_identity_binds_order_for_duplicate_tree_targets() {
+        let artifact_id = ArtifactId(uuid::Uuid::from_u128(4));
         let first_hash = Hash256::from_bytes([1; 32]);
         let second_hash = Hash256::from_bytes([2; 32]);
         let third_hash = Hash256::from_bytes([3; 32]);
-        let first = modified_tree("src/lib.rs", first_hash, second_hash, false);
-        let second = modified_tree("src/lib.rs", second_hash, third_hash, false);
+        let first = modified_tree(artifact_id, "src/lib.rs", first_hash, second_hash, false);
+        let second = modified_tree(artifact_id, "src/lib.rs", second_hash, third_hash, false);
 
         let forward =
             content_identity_from_deltas(&[], &[], &[first.clone(), second.clone()]).unwrap();
         let reversed = content_identity_from_deltas(&[], &[], &[second, first]).unwrap();
         assert_ne!(forward, reversed);
+    }
+
+    #[test]
+    fn content_identity_binds_artifact_identity_and_byte_exact_path() {
+        let hash = Hash256::from_bytes([0x44; 32]);
+        let first_id = ArtifactId(uuid::Uuid::from_u128(5));
+        let second_id = ArtifactId(uuid::Uuid::from_u128(6));
+        let utf8_path = RepoPath::from_utf8("assets/icon.bin").unwrap();
+        let byte_path = RepoPath::from_bytes(b"assets/icon-\xff.bin".to_vec()).unwrap();
+        let delta = |artifact_id, path| TreeDelta::Added {
+            artifact_id,
+            new: LocatedEntry::new(path, TreeEntry::blob(hash, false)),
+        };
+
+        let first =
+            content_identity_from_deltas(&[], &[], &[delta(first_id, utf8_path.clone())]).unwrap();
+        let other_identity =
+            content_identity_from_deltas(&[], &[], &[delta(second_id, utf8_path)]).unwrap();
+        let other_path =
+            content_identity_from_deltas(&[], &[], &[delta(first_id, byte_path)]).unwrap();
+
+        assert_ne!(first, other_identity);
+        assert_ne!(first, other_path);
+    }
+
+    #[test]
+    fn phase_one_tree_wire_is_rejected_instead_of_rehashed() {
+        let legacy = serde_json::json!({
+            "operation": "modified",
+            "file_id": "src/lib.rs",
+            "old_entry": {
+                "blob_hash": Hash256::from_bytes([0x11; 32]),
+                "kind": { "type": "regular", "executable": false }
+            },
+            "new_entry": {
+                "blob_hash": Hash256::from_bytes([0x22; 32]),
+                "kind": { "type": "regular", "executable": false }
+            }
+        });
+
+        assert!(serde_json::from_value::<TreeDelta>(legacy).is_err());
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::path::Path;
 #[cfg(any(unix, windows))]
 use std::path::PathBuf;
 
-use kin_model::{FilePathId, GraphStore, SemanticChangeId, TreeEntry, TreeEntryKind};
+use kin_model::{GraphStore, RepoPath, ResolvedTree, SemanticChangeId, TreeEntry};
 
 use crate::{KinError, KinLayout, Result};
 
@@ -51,7 +51,7 @@ pub fn build_file_tree<G: GraphStore>(
     graph: &G,
     _genesis_id: &SemanticChangeId,
     branch_head: &SemanticChangeId,
-) -> Result<HashMap<FilePathId, TreeEntry>> {
+) -> Result<ResolvedTree> {
     graph
         .resolve_tree_at(branch_head)
         .map_err(|error| KinError::Graph(error.to_string()))
@@ -222,17 +222,22 @@ pub fn checkout_branch_between_heads_transactional_with_hooks<G: GraphStore>(
 
 fn load_source_tree_blobs(
     blob_store: &kin_blobs::BlobStore,
-    tree: HashMap<FilePathId, TreeEntry>,
-) -> Result<Vec<(FilePathId, TreeEntryKind, Vec<u8>)>> {
-    let mut entries: Vec<_> = tree.into_iter().collect();
-    entries.sort_by(|left, right| left.0 .0.cmp(&right.0 .0));
+    tree: ResolvedTree,
+) -> Result<Vec<(RepoPath, TreeEntry, Vec<u8>)>> {
+    let mut entries: Vec<_> = tree.into_artifacts().collect();
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
     entries
         .into_iter()
-        .map(|(file_id, entry)| {
-            // Convert kin_model::Hash256 to kin_blobs::Hash256.
-            let blob_hash = kin_blobs::Hash256(*entry.blob_hash.as_bytes());
+        .map(|artifact| {
+            let blob_hash = artifact.entry.blob_identity().ok_or_else(|| {
+                KinError::Other(format!(
+                    "cannot materialize gitlink {:?} at {} as repository-owned bytes",
+                    artifact.entry, artifact.path
+                ))
+            })?;
+            let blob_hash = kin_blobs::Hash256(*blob_hash.as_bytes());
             let content = blob_store.read(&blob_hash)?;
-            Ok((file_id, entry.kind, content))
+            Ok((artifact.path, artifact.entry, content))
         })
         .collect()
 }
@@ -240,7 +245,7 @@ fn load_source_tree_blobs(
 fn resolve_exact_source_tree<G: GraphStore>(
     graph: &G,
     head: &SemanticChangeId,
-) -> Result<HashMap<FilePathId, TreeEntry>> {
+) -> Result<ResolvedTree> {
     graph
         .resolve_tree_at(head)
         .map_err(|error| KinError::Graph(error.to_string()))
@@ -284,8 +289,8 @@ pub fn should_preserve_checkout_path(relative: &Path) -> bool {
 /// rename can redirect bytes outside the projection root.
 pub fn materialize_source_entry(
     root: &Path,
-    file_id: &FilePathId,
-    kind: TreeEntryKind,
+    file_id: &RepoPath,
+    kind: TreeEntry,
     content: &[u8],
 ) -> Result<()> {
     materialize_source_tree(root, [(file_id, kind, content)]).map(|_| ())
@@ -300,7 +305,7 @@ pub fn materialize_source_entry(
 /// entry to a different ambient path.
 pub fn materialize_source_tree<'a>(
     root: &Path,
-    entries: impl IntoIterator<Item = (&'a FilePathId, TreeEntryKind, &'a [u8])>,
+    entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
 ) -> Result<usize> {
     let entries = validated_source_entries(entries)?;
     project_validated_source_tree(root, &entries, None, || {})
@@ -315,7 +320,7 @@ pub fn materialize_source_tree<'a>(
 /// same retained capability rather than ambient pathnames.
 pub fn replace_source_tree<'a>(
     root: &Path,
-    entries: impl IntoIterator<Item = (&'a FilePathId, TreeEntryKind, &'a [u8])>,
+    entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
     should_preserve: impl Fn(&Path) -> bool,
 ) -> Result<usize> {
     let entries = validated_source_entries(entries)?;
@@ -333,8 +338,8 @@ pub fn replace_source_tree<'a>(
 /// ancestor.
 pub fn reconcile_source_tree<'a, 'b>(
     root: &Path,
-    previous_entries: impl IntoIterator<Item = (&'b FilePathId, TreeEntryKind, &'b [u8])>,
-    entries: impl IntoIterator<Item = (&'a FilePathId, TreeEntryKind, &'a [u8])>,
+    previous_entries: impl IntoIterator<Item = (&'b RepoPath, TreeEntry, &'b [u8])>,
+    entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
     should_preserve: impl Fn(&Path) -> bool,
 ) -> Result<usize> {
     reconcile_source_tree_with_pre_mutation_hook(
@@ -349,8 +354,8 @@ pub fn reconcile_source_tree<'a, 'b>(
 #[doc(hidden)]
 pub fn reconcile_source_tree_with_pre_mutation_hook<'a, 'b>(
     root: &Path,
-    previous_entries: impl IntoIterator<Item = (&'b FilePathId, TreeEntryKind, &'b [u8])>,
-    entries: impl IntoIterator<Item = (&'a FilePathId, TreeEntryKind, &'a [u8])>,
+    previous_entries: impl IntoIterator<Item = (&'b RepoPath, TreeEntry, &'b [u8])>,
+    entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
     should_preserve: impl Fn(&Path) -> bool,
     after_read_only_preflight: impl FnOnce(),
 ) -> Result<usize> {
@@ -369,8 +374,8 @@ pub fn reconcile_source_tree_with_pre_mutation_hook<'a, 'b>(
 #[doc(hidden)]
 pub fn reconcile_source_tree_with_mutation_hooks<'a, 'b>(
     root: &Path,
-    previous_entries: impl IntoIterator<Item = (&'b FilePathId, TreeEntryKind, &'b [u8])>,
-    entries: impl IntoIterator<Item = (&'a FilePathId, TreeEntryKind, &'a [u8])>,
+    previous_entries: impl IntoIterator<Item = (&'b RepoPath, TreeEntry, &'b [u8])>,
+    entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
     should_preserve: impl Fn(&Path) -> bool,
     after_read_only_preflight: impl FnOnce(),
     after_identity_revalidation: impl FnOnce(),
@@ -391,8 +396,8 @@ pub fn reconcile_source_tree_with_mutation_hooks<'a, 'b>(
 
 #[derive(Clone, Copy)]
 struct ValidatedSourceEntry<'a> {
-    file_id: &'a FilePathId,
-    kind: TreeEntryKind,
+    file_id: &'a RepoPath,
+    kind: TreeEntry,
     content: &'a [u8],
 }
 
@@ -434,7 +439,7 @@ fn fail_publication_if_injected() -> Result<()> {
 }
 
 fn validated_source_entries<'a>(
-    entries: impl IntoIterator<Item = (&'a FilePathId, TreeEntryKind, &'a [u8])>,
+    entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
 ) -> Result<Vec<ValidatedSourceEntry<'a>>> {
     let mut entries: Vec<_> = entries
         .into_iter()
@@ -444,7 +449,7 @@ fn validated_source_entries<'a>(
             content,
         })
         .collect();
-    entries.sort_by(|left, right| left.file_id.0.cmp(&right.file_id.0));
+    entries.sort_by(|left, right| left.file_id.cmp(right.file_id));
     validate_source_tree(
         entries
             .iter()
@@ -458,26 +463,23 @@ fn validated_source_entries<'a>(
 /// Checkout callers use this during their global preflight so unsafe paths,
 /// unsupported entry encodings, and escaping symbolic-link targets all fail
 /// before any file/directory transition is applied.
-pub fn validate_source_entry(
-    file_id: &FilePathId,
-    kind: TreeEntryKind,
-    content: &[u8],
-) -> Result<()> {
+pub fn validate_source_entry(file_id: &RepoPath, kind: TreeEntry, content: &[u8]) -> Result<()> {
     validate_source_entry_components(file_id, kind, content).map(|_| ())
 }
 
 fn validate_source_entry_components<'a>(
-    file_id: &'a FilePathId,
-    kind: TreeEntryKind,
+    file_id: &'a RepoPath,
+    kind: TreeEntry,
     content: &[u8],
 ) -> Result<Vec<&'a str>> {
-    let components = validate_source_path(&file_id.0)?;
+    let path = projection_path(file_id)?;
+    let components = validate_source_path(path)?;
 
-    if kind == TreeEntryKind::Symlink {
+    if matches!(kind, TreeEntry::Symlink { .. }) {
         let target = std::str::from_utf8(content).map_err(|_| {
             KinError::Other(format!(
                 "symbolic link target is not valid UTF-8 for {}",
-                file_id.0
+                file_id
             ))
         })?;
         validate_source_symlink_target(&components, target)?;
@@ -487,7 +489,20 @@ fn validate_source_entry_components<'a>(
             "safe exact symbolic-link checkout is unsupported on this platform".to_string(),
         ));
     }
+    if matches!(kind, TreeEntry::Gitlink { .. }) {
+        return Err(KinError::Other(format!(
+            "gitlink {file_id} is repository history, not a repository-owned source blob"
+        )));
+    }
     Ok(components)
+}
+
+fn projection_path(path: &RepoPath) -> Result<&str> {
+    path.as_utf8().ok_or_else(|| {
+        KinError::Other(format!(
+            "byte-exact repository path {path} cannot be projected by this UTF-8 filesystem boundary"
+        ))
+    })
 }
 
 /// Validate a complete exact-source tree without mutating the filesystem.
@@ -496,7 +511,7 @@ fn validate_source_entry_components<'a>(
 /// rejects path-prefix conflicts such as `a` and `a/b` before callers remove a
 /// blocking file or directory.
 pub fn validate_source_tree<'a>(
-    entries: impl IntoIterator<Item = (&'a FilePathId, TreeEntryKind, &'a [u8])>,
+    entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
 ) -> Result<()> {
     let entries: Vec<_> = entries.into_iter().collect();
     validate_source_paths(entries.iter().map(|(file_id, _, _)| *file_id))?;
@@ -512,7 +527,7 @@ pub fn validate_source_tree<'a>(
 /// validating each entry one at a time. Keeping path-shape validation separate
 /// from byte validation prevents a repository-sized second copy of the source
 /// tree from accumulating in memory merely to detect path-prefix conflicts.
-pub fn validate_source_paths<'a>(file_ids: impl IntoIterator<Item = &'a FilePathId>) -> Result<()> {
+pub fn validate_source_paths<'a>(file_ids: impl IntoIterator<Item = &'a RepoPath>) -> Result<()> {
     validate_source_path_set(file_ids)
 }
 
@@ -558,7 +573,7 @@ pub fn validate_portable_source_symlink(path: &str, target: &str) -> Result<()> 
 /// directory-as-file).
 pub fn prepare_source_tree<'a>(
     root: &Path,
-    file_ids: impl IntoIterator<Item = &'a FilePathId>,
+    file_ids: impl IntoIterator<Item = &'a RepoPath>,
 ) -> Result<()> {
     let file_ids: Vec<_> = file_ids.into_iter().collect();
     validate_source_paths(file_ids.iter().copied())?;
@@ -576,14 +591,12 @@ pub fn prepare_source_tree<'a>(
     }
 }
 
-fn validate_source_path_set<'a>(file_ids: impl IntoIterator<Item = &'a FilePathId>) -> Result<()> {
-    let mut paths: Vec<_> = file_ids
-        .into_iter()
-        .map(|file_id| {
-            let path = file_id.0.as_str();
-            (projection_path_comparison_key(path), path)
-        })
-        .collect();
+fn validate_source_path_set<'a>(file_ids: impl IntoIterator<Item = &'a RepoPath>) -> Result<()> {
+    let mut paths = Vec::new();
+    for file_id in file_ids {
+        let path = projection_path(file_id)?;
+        paths.push((projection_path_comparison_key(path), path));
+    }
     paths.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     for (_, path) in &paths {
         validate_source_path(path)?;
@@ -650,7 +663,7 @@ fn project_validated_source_tree(
     #[cfg(any(unix, windows))]
     {
         let projection = ProjectionRoot::open(root)?;
-        let tracked = TrackedPathClassifier::new(entries.iter().map(|entry| entry.file_id));
+        let tracked = TrackedPathClassifier::new(entries.iter().map(|entry| entry.file_id))?;
         let plan = projection.plan_full_replacement(&tracked, should_preserve)?;
 
         // Tests use this boundary to deterministically swap ambient pathnames
@@ -683,37 +696,37 @@ fn project_reconciled_source_tree(
     {
         let projection = ProjectionRoot::open(root)?;
         let previous =
-            TrackedPathClassifier::new(previous_entries.iter().map(|entry| entry.file_id));
-        let target = TrackedPathClassifier::new(entries.iter().map(|entry| entry.file_id));
-        let target_by_path: HashMap<_, _> = entries
-            .iter()
-            .map(|entry| (entry.file_id.0.as_str(), entry))
-            .collect();
+            TrackedPathClassifier::new(previous_entries.iter().map(|entry| entry.file_id))?;
+        let target = TrackedPathClassifier::new(entries.iter().map(|entry| entry.file_id))?;
+        let target_by_path: HashMap<_, _> =
+            entries.iter().map(|entry| (entry.file_id, entry)).collect();
         let previous_by_path: HashMap<_, _> = previous_entries
             .iter()
-            .map(|entry| (entry.file_id.0.as_str(), entry))
+            .map(|entry| (entry.file_id, entry))
             .collect();
         let affected_previous: Vec<_> = previous_entries
             .iter()
             .filter(|previous_entry| {
                 target_by_path
-                    .get(previous_entry.file_id.0.as_str())
+                    .get(previous_entry.file_id)
                     .is_none_or(|target_entry| !source_entries_match(previous_entry, target_entry))
             })
             .collect();
-        let mut removed_file_ids: Vec<_> = previous_entries
-            .iter()
-            .map(|entry| entry.file_id)
-            .filter(|file_id| target.relation(Path::new(&file_id.0)) != TrackedPathRelation::Exact)
-            .collect();
-        removed_file_ids.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        let removed = TrackedPathClassifier::new(removed_file_ids.iter().copied());
+        let mut removed_file_ids = Vec::new();
+        for entry in previous_entries {
+            let relative = Path::new(projection_path(entry.file_id)?);
+            if target.relation(relative) != TrackedPathRelation::Exact {
+                removed_file_ids.push(entry.file_id);
+            }
+        }
+        removed_file_ids.sort_unstable();
+        let removed = TrackedPathClassifier::new(removed_file_ids.iter().copied())?;
         let entries_to_materialize: Vec<_> = entries
             .iter()
             .copied()
             .filter(|target_entry| {
                 previous_by_path
-                    .get(target_entry.file_id.0.as_str())
+                    .get(target_entry.file_id)
                     .is_none_or(|previous_entry| {
                         !source_entries_match(previous_entry, target_entry)
                     })
@@ -728,25 +741,25 @@ fn project_reconciled_source_tree(
             projection.validate_tracked_entries_unchanged(&affected_previous)?;
         projection.validate_reconciliation_targets(&entries_to_materialize, &previous, &removed)?;
 
-        let files_to_delete: Vec<_> = removed_file_ids
-            .iter()
-            .map(|file_id| PathBuf::from(&file_id.0))
-            .collect();
+        let mut files_to_delete = Vec::with_capacity(removed_file_ids.len());
+        for file_id in &removed_file_ids {
+            files_to_delete.push(PathBuf::from(projection_path(file_id)?));
+        }
 
         // A generated-directory name is preservation policy only for
         // unrelated occupants. When the previous graph owns every leaf under
         // a directory and the target graph owns the directory path as a file,
         // remove that now-empty graph-owned directory explicitly so names such
         // as target/vendor/dist/build/node_modules can transition exactly.
-        let replacement_roots: Vec<_> = entries_to_materialize
-            .iter()
-            .filter_map(|entry| {
-                let relative = Path::new(&entry.file_id.0);
-                (previous.relation(relative) == TrackedPathRelation::Ancestor
-                    && removed.relation(relative) == TrackedPathRelation::Ancestor)
-                    .then(|| relative.to_path_buf())
-            })
-            .collect();
+        let mut replacement_roots = Vec::new();
+        for entry in &entries_to_materialize {
+            let relative = Path::new(projection_path(entry.file_id)?);
+            if previous.relation(relative) == TrackedPathRelation::Ancestor
+                && removed.relation(relative) == TrackedPathRelation::Ancestor
+            {
+                replacement_roots.push(relative.to_path_buf());
+            }
+        }
         let mut directories_to_replace = HashSet::new();
         for removed_path in &files_to_delete {
             for replacement_root in &replacement_roots {
@@ -3250,19 +3263,26 @@ impl ProjectionRoot {
             let name = format!("stage-{name_index}");
             let identity = self.stage_reconciliation_entry(transaction, &name, &entry)?;
             let kind = match entry.kind {
-                TreeEntryKind::Regular { .. } => ExistingObjectKind::File,
-                TreeEntryKind::Symlink => ExistingObjectKind::Symlink,
+                TreeEntry::Blob { .. } => ExistingObjectKind::File,
+                TreeEntry::Symlink { .. } => ExistingObjectKind::Symlink,
+                TreeEntry::Gitlink { .. } => {
+                    return Err(KinError::Other(format!(
+                        "gitlink {} cannot be staged as a source object",
+                        entry.file_id
+                    )));
+                }
             };
+            let display = self.display_root.join(projection_path(entry.file_id)?);
             let (inspected_identity, state) = self.inspect_named_existing_object(
                 transaction,
                 std::ffi::OsStr::new(&name),
                 kind,
-                &self.display_root.join(&entry.file_id.0),
+                &display,
             )?;
             if inspected_identity != identity {
                 return Err(KinError::Other(format!(
                     "staged exact-source object {} changed identity before journaling",
-                    self.display_root.join(&entry.file_id.0).display()
+                    display.display()
                 )));
             }
             staged.push(StagedReconciliationEntry {
@@ -3285,9 +3305,9 @@ impl ProjectionRoot {
         name: &str,
         entry: &ValidatedSourceEntry<'_>,
     ) -> Result<TrackedEntryIdentity> {
-        let display = self.display_root.join(&entry.file_id.0);
+        let display = self.display_root.join(projection_path(entry.file_id)?);
         match entry.kind {
-            TreeEntryKind::Regular { executable } => {
+            TreeEntry::Blob { executable, .. } => {
                 let fd = rustix::fs::openat(
                     transaction,
                     name,
@@ -3314,7 +3334,7 @@ impl ProjectionRoot {
                     .map_err(|error| KinError::io(&display, error))?;
                 Ok(tracked_open_file_identity(&metadata))
             }
-            TreeEntryKind::Symlink => {
+            TreeEntry::Symlink { .. } => {
                 let target =
                     std::str::from_utf8(entry.content).expect("validated UTF-8 symlink target");
                 rustix::fs::symlinkat(target, transaction, name)
@@ -3324,6 +3344,10 @@ impl ProjectionRoot {
                     .map_err(|error| KinError::io(&display, error))?;
                 Ok(tracked_entry_identity(&metadata))
             }
+            TreeEntry::Gitlink { .. } => Err(KinError::Other(format!(
+                "gitlink {} cannot be staged as a source object",
+                entry.file_id
+            ))),
         }
     }
 
@@ -3339,12 +3363,18 @@ impl ProjectionRoot {
         use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
         use windows_sys::Win32::Storage::FileSystem::DELETE;
 
-        if entry.kind == TreeEntryKind::Symlink {
+        if matches!(entry.kind, TreeEntry::Symlink { .. }) {
             return Err(KinError::Other(
                 "safe exact symbolic-link checkout is unsupported on Windows".to_string(),
             ));
         }
-        let display = self.display_root.join(&entry.file_id.0);
+        if matches!(entry.kind, TreeEntry::Gitlink { .. }) {
+            return Err(KinError::Other(format!(
+                "gitlink {} cannot be staged as a source object",
+                entry.file_id
+            )));
+        }
+        let display = self.display_root.join(projection_path(entry.file_id)?);
         let mut options = cap_std::fs::OpenOptions::new();
         options
             .read(true)
@@ -3362,10 +3392,10 @@ impl ProjectionRoot {
         tracked_open_file_identity(&file).map_err(|error| KinError::io(&display, error))
     }
 
-    fn prepare(&self, file_ids: &[&FilePathId]) -> Result<()> {
+    fn prepare(&self, file_ids: &[&RepoPath]) -> Result<()> {
         let mut paths: Vec<_> = file_ids
             .iter()
-            .map(|file_id| validate_source_path(&file_id.0))
+            .map(|file_id| projection_path(file_id).and_then(validate_source_path))
             .collect::<Result<_>>()?;
         paths.sort_unstable();
 
@@ -3403,12 +3433,12 @@ impl ProjectionRoot {
     fn prepare_without_replacement_transactional(
         &self,
         transaction: &mut ReconciliationTransaction,
-        file_ids: &[&FilePathId],
+        file_ids: &[&RepoPath],
         created_directories: &mut Vec<PublishedDirectory>,
     ) -> Result<()> {
         let mut paths: Vec<_> = file_ids
             .iter()
-            .map(|file_id| validate_source_path(&file_id.0))
+            .map(|file_id| projection_path(file_id).and_then(validate_source_path))
             .collect::<Result<_>>()?;
         paths.sort_unstable();
         for components in &paths {
@@ -3476,14 +3506,14 @@ impl ProjectionRoot {
     fn prepare_full_replacement_transactional(
         &self,
         transaction: &mut ReconciliationTransaction,
-        file_ids: &[&FilePathId],
+        file_ids: &[&RepoPath],
         created_directories: &mut Vec<PublishedDirectory>,
         next_object_backup: &mut usize,
         backed_directories: &mut Vec<BackedUpDirectory>,
     ) -> Result<()> {
         let mut paths: Vec<_> = file_ids
             .iter()
-            .map(|file_id| validate_source_path(&file_id.0))
+            .map(|file_id| projection_path(file_id).and_then(validate_source_path))
             .collect::<Result<_>>()?;
         paths.sort_unstable();
         for components in &paths {
@@ -3583,7 +3613,7 @@ impl ProjectionRoot {
         removed: &TrackedPathClassifier,
     ) -> Result<()> {
         for entry in entries {
-            let components = validate_source_path(&entry.file_id.0)?;
+            let components = projection_path(entry.file_id).and_then(validate_source_path)?;
             let mut parent = self.clone_root()?;
             let mut relative = PathBuf::new();
             let mut ancestor_missing_or_authorized = false;
@@ -3606,7 +3636,7 @@ impl ProjectionRoot {
                         return Err(KinError::Other(format!(
                             "untracked working-copy path {} blocks exact branch target {}",
                             self.display_root.join(&relative).display(),
-                            entry.file_id.0
+                            entry.file_id
                         )));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -3632,7 +3662,7 @@ impl ProjectionRoot {
                         return Err(KinError::Other(format!(
                             "untracked working-copy directory {} conflicts with exact branch target {}",
                             self.display_root.join(&relative).display(),
-                            entry.file_id.0
+                            entry.file_id
                         )));
                     }
                     let directory = self.open_existing_directory(
@@ -3647,7 +3677,7 @@ impl ProjectionRoot {
                     return Err(KinError::Other(format!(
                         "untracked working-copy path {} conflicts with exact branch target {}",
                         self.display_root.join(&relative).display(),
-                        entry.file_id.0
+                        entry.file_id
                     )));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -3720,7 +3750,9 @@ impl ProjectionRoot {
             if actual_identity != *expected_identity {
                 return Err(KinError::Other(format!(
                     "tracked working-copy path {} changed object identity after exact branch preflight; reconciliation refused",
-                    self.display_root.join(&entry.file_id.0).display()
+                    self.display_root
+                        .join(projection_path(entry.file_id)?)
+                        .display()
                 )));
             }
         }
@@ -3735,7 +3767,7 @@ impl ProjectionRoot {
         display: &Path,
     ) -> Result<TrackedEntryIdentity> {
         match entry.kind {
-            TreeEntryKind::Regular { executable } => {
+            TreeEntry::Blob { executable, .. } => {
                 #[cfg(unix)]
                 let mut file = rustix::fs::openat(
                     parent,
@@ -3803,7 +3835,7 @@ impl ProjectionRoot {
                     tracked_open_file_identity(&file).map_err(|error| KinError::io(display, error))
                 }
             }
-            TreeEntryKind::Symlink => {
+            TreeEntry::Symlink { .. } => {
                 #[cfg(unix)]
                 {
                     let metadata = parent
@@ -3832,6 +3864,10 @@ impl ProjectionRoot {
                     ))
                 }
             }
+            TreeEntry::Gitlink { .. } => Err(KinError::Other(format!(
+                "gitlink {} cannot be validated as a repository-owned source object",
+                entry.file_id
+            ))),
         }
     }
 
@@ -4243,8 +4279,14 @@ impl ProjectionRoot {
         display: &Path,
     ) -> Result<()> {
         let kind = match entry.kind {
-            TreeEntryKind::Regular { .. } => ExistingObjectKind::File,
-            TreeEntryKind::Symlink => ExistingObjectKind::Symlink,
+            TreeEntry::Blob { .. } => ExistingObjectKind::File,
+            TreeEntry::Symlink { .. } => ExistingObjectKind::Symlink,
+            TreeEntry::Gitlink { .. } => {
+                return Err(KinError::Other(format!(
+                    "gitlink {} cannot be displaced through the source projection",
+                    entry.file_id
+                )));
+            }
         };
         let (inspected_identity, inspected_state) =
             self.inspect_named_existing_object(source.parent, source.name, kind, display)?;
@@ -4625,14 +4667,21 @@ impl ProjectionRoot {
         expected_identity: TrackedEntryIdentity,
         name_index: usize,
     ) -> Result<()> {
-        let components = validate_source_path(&entry.file_id.0)?;
+        let path = projection_path(entry.file_id)?;
+        let components = validate_source_path(path)?;
         let parent = self.open_existing_parent(&components)?;
         let source_name = std::ffi::OsStr::new(components[components.len() - 1]);
         let backup_name = format!("backup-{name_index}");
         let display = self.display_path(&components);
         let kind = match entry.kind {
-            TreeEntryKind::Regular { .. } => ExistingObjectKind::File,
-            TreeEntryKind::Symlink => ExistingObjectKind::Symlink,
+            TreeEntry::Blob { .. } => ExistingObjectKind::File,
+            TreeEntry::Symlink { .. } => ExistingObjectKind::Symlink,
+            TreeEntry::Gitlink { .. } => {
+                return Err(KinError::Other(format!(
+                    "gitlink {} cannot be displaced through the source projection",
+                    entry.file_id
+                )));
+            }
         };
         let (actual_identity, state) =
             self.inspect_named_existing_object(&parent, source_name, kind, &display)?;
@@ -4645,7 +4694,7 @@ impl ProjectionRoot {
         self.record_reconciliation_action(
             transaction,
             ReconciliationRecoveryAction::BackupObject {
-                relative: PathBuf::from(&entry.file_id.0),
+                relative: PathBuf::from(path),
                 kind,
                 identity: expected_identity,
                 state,
@@ -4673,19 +4722,26 @@ impl ProjectionRoot {
         transaction: &mut ReconciliationTransaction,
         staged: &StagedReconciliationEntry<'_>,
     ) -> Result<()> {
-        let components = validate_source_path(&staged.entry.file_id.0)?;
+        let path = projection_path(staged.entry.file_id)?;
+        let components = validate_source_path(path)?;
         let parent = self.open_existing_parent(&components)?;
         let destination_name = std::ffi::OsStr::new(components[components.len() - 1]);
         let stage_name = format!("stage-{}", staged.name_index);
         let display = self.display_path(&components);
         let kind = match staged.entry.kind {
-            TreeEntryKind::Regular { .. } => ExistingObjectKind::File,
-            TreeEntryKind::Symlink => ExistingObjectKind::Symlink,
+            TreeEntry::Blob { .. } => ExistingObjectKind::File,
+            TreeEntry::Symlink { .. } => ExistingObjectKind::Symlink,
+            TreeEntry::Gitlink { .. } => {
+                return Err(KinError::Other(format!(
+                    "gitlink {} cannot be published through the source projection",
+                    staged.entry.file_id
+                )));
+            }
         };
         self.record_reconciliation_action(
             transaction,
             ReconciliationRecoveryAction::PublishObject {
-                relative: PathBuf::from(&staged.entry.file_id.0),
+                relative: PathBuf::from(path),
                 kind,
                 identity: staged.identity,
                 state: staged.state,
@@ -4782,7 +4838,7 @@ impl ProjectionRoot {
             Err(error) => return Err(KinError::io(&display, error)),
         };
         let identity = match entry.kind {
-            TreeEntryKind::Regular { executable } => {
+            TreeEntry::Blob { executable, .. } => {
                 if !metadata.is_file() || metadata_is_reparse(&metadata) {
                     return Err(conflict("the tracked path kind changed"));
                 }
@@ -4844,7 +4900,7 @@ impl ProjectionRoot {
                         .map_err(|error| KinError::io(&display, error))?
                 }
             }
-            TreeEntryKind::Symlink => {
+            TreeEntry::Symlink { .. } => {
                 #[cfg(windows)]
                 return Err(KinError::Other(
                     "safe exact symbolic-link checkout is unsupported on Windows".to_string(),
@@ -4862,6 +4918,12 @@ impl ProjectionRoot {
                     }
                     tracked_entry_identity(&metadata)
                 }
+            }
+            TreeEntry::Gitlink { .. } => {
+                return Err(KinError::Other(format!(
+                    "gitlink {} cannot be validated as a repository-owned source object",
+                    entry.file_id
+                )));
             }
         };
         Ok(identity)
@@ -5459,17 +5521,17 @@ struct TrackedPathClassifier {
 
 #[cfg(any(unix, windows))]
 impl TrackedPathClassifier {
-    fn new<'a>(tracked: impl IntoIterator<Item = &'a FilePathId>) -> Self {
+    fn new<'a>(tracked: impl IntoIterator<Item = &'a RepoPath>) -> Result<Self> {
         let mut exact = HashSet::new();
         let mut ancestors = HashSet::new();
         for file_id in tracked {
-            let key = projection_path_key(Path::new(&file_id.0));
+            let key = projection_path_key(Path::new(projection_path(file_id)?));
             for prefix_len in 1..key.len() {
                 ancestors.insert(key[..prefix_len].to_vec());
             }
             exact.insert(key);
         }
-        Self { exact, ancestors }
+        Ok(Self { exact, ancestors })
     }
 
     fn relation(&self, relative: &Path) -> TrackedPathRelation {
@@ -5705,20 +5767,34 @@ fn validate_source_symlink_target_with_windows_rules(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kin_model::Hash256;
+    use kin_model::{GitObjectId, Hash256};
 
-    fn regular() -> TreeEntryKind {
-        TreeEntryKind::Regular { executable: false }
+    fn repo_path(path: impl Into<String>) -> RepoPath {
+        RepoPath::from_utf8(path).expect("test repository path must be valid")
+    }
+
+    fn regular() -> TreeEntry {
+        TreeEntry::blob(Hash256::from_bytes([0x11; 32]), false)
+    }
+
+    fn executable() -> TreeEntry {
+        TreeEntry::blob(Hash256::from_bytes([0x22; 32]), true)
+    }
+
+    fn symlink() -> TreeEntry {
+        TreeEntry::symlink(Hash256::from_bytes([0x33; 32]))
     }
 
     #[test]
     fn materialization_rejects_unsafe_source_paths() {
         let root = tempfile::tempdir().unwrap();
+        for path in ["", "/absolute", "../escape", "src/../escape"] {
+            assert!(
+                RepoPath::from_utf8(path).is_err(),
+                "invalid repository path was accepted: {path:?}"
+            );
+        }
         for path in [
-            "",
-            "/absolute",
-            "../escape",
-            "src/../escape",
             ".kin/config",
             ".KIN/config",
             ".git/config",
@@ -5727,14 +5803,39 @@ mod tests {
             "src/.KIN-SESSION/base.json",
             "src\\escape",
         ] {
-            let result = materialize_source_entry(
-                root.path(),
-                &FilePathId(path.to_string()),
-                regular(),
-                b"blocked",
-            );
+            let path = repo_path(path);
+            let result = materialize_source_entry(root.path(), &path, regular(), b"blocked");
             assert!(result.is_err(), "unsafe path was accepted: {path:?}");
         }
+    }
+
+    #[test]
+    fn byte_exact_non_utf8_path_fails_at_the_projection_boundary() {
+        let path = RepoPath::from_bytes(b"assets/icon-\xff.bin".to_vec()).unwrap();
+        let error = validate_source_entry(&path, regular(), b"opaque bytes").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be projected by this UTF-8 filesystem boundary"),
+            "unexpected projection error: {error}"
+        );
+    }
+
+    #[test]
+    fn gitlink_fails_loud_instead_of_becoming_a_blob() {
+        let path = repo_path("vendor/runtime");
+        let error = validate_source_entry(
+            &path,
+            TreeEntry::gitlink(GitObjectId::sha1([0x44; 20])),
+            b"",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("repository history, not a repository-owned source blob"),
+            "unexpected gitlink projection error: {error}"
+        );
     }
 
     #[test]
@@ -5855,12 +5956,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_symlink_entry_validates_target_before_reporting_unsupported_publication() {
-        let error = validate_source_entry(
-            &FilePathId("dir/link".to_string()),
-            TreeEntryKind::Symlink,
-            b"CON/file",
-        )
-        .expect_err("Windows-invalid target must fail before publication");
+        let error =
+            validate_source_entry(&repo_path("dir/link".to_string()), symlink(), b"CON/file")
+                .expect_err("Windows-invalid target must fail before publication");
 
         assert!(error
             .to_string()
@@ -5879,8 +5977,8 @@ mod tests {
         ] {
             let result = materialize_source_entry(
                 root.path(),
-                &FilePathId("dir/link".to_string()),
-                TreeEntryKind::Symlink,
+                &repo_path("dir/link".to_string()),
+                symlink(),
                 target.as_bytes(),
             );
             assert!(
@@ -5895,8 +5993,8 @@ mod tests {
     fn reserved_control_plane_path_fails_before_destructive_transition() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("a-parent"), b"old complete bytes").unwrap();
-        let transition = FilePathId("a-parent/child.txt".to_string());
-        let reserved = FilePathId("z/.KIN-SESSION/base.json".to_string());
+        let transition = repo_path("a-parent/child.txt".to_string());
+        let reserved = repo_path("z/.KIN-SESSION/base.json".to_string());
 
         let error = replace_source_tree(
             root.path(),
@@ -5922,8 +6020,8 @@ mod tests {
     fn overlong_component_fails_before_destructive_transition() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("a-parent"), b"old complete bytes").unwrap();
-        let transition = FilePathId("a-parent/child.txt".to_string());
-        let overlong = FilePathId(format!("z/{}", "x".repeat(256)));
+        let transition = repo_path("a-parent/child.txt".to_string());
+        let overlong = repo_path(format!("z/{}", "x".repeat(256)));
 
         let error = replace_source_tree(
             root.path(),
@@ -5950,8 +6048,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("old-tracked.rs"), b"old tracked bytes").unwrap();
         std::fs::write(root.path().join("new-target.rs"), b"untracked user bytes").unwrap();
-        let old = FilePathId("old-tracked.rs".to_string());
-        let target = FilePathId("new-target.rs".to_string());
+        let old = repo_path("old-tracked.rs".to_string());
+        let target = repo_path("new-target.rs".to_string());
 
         let error = reconcile_source_tree(
             root.path(),
@@ -5983,12 +6081,12 @@ mod tests {
             b"generated bytes",
         )
         .unwrap();
-        let old = FilePathId("target/tracked.bin".to_string());
+        let old = repo_path("target/tracked.bin".to_string());
 
         reconcile_source_tree(
             root.path(),
             [(&old, regular(), b"graph-owned bytes".as_slice())],
-            std::iter::empty::<(&FilePathId, TreeEntryKind, &[u8])>(),
+            std::iter::empty::<(&RepoPath, TreeEntry, &[u8])>(),
             should_preserve_checkout_path,
         )
         .unwrap();
@@ -6015,8 +6113,8 @@ mod tests {
             .unwrap();
             std::fs::create_dir_all(root.path().join(".next/cache")).unwrap();
             std::fs::write(root.path().join(".next/cache/untracked"), b"cache bytes").unwrap();
-            let old = FilePathId(format!("{generated}/nested/deeper/tracked.old"));
-            let target = FilePathId(generated.to_string());
+            let old = repo_path(format!("{generated}/nested/deeper/tracked.old"));
+            let target = repo_path(generated.to_string());
 
             reconcile_source_tree(
                 root.path(),
@@ -6046,8 +6144,8 @@ mod tests {
         std::fs::create_dir_all(root.path().join("target")).unwrap();
         std::fs::write(root.path().join("target/tracked.old"), b"old graph bytes").unwrap();
         std::fs::write(root.path().join("target/editor-cache"), b"editor bytes").unwrap();
-        let old = FilePathId("target/tracked.old".to_string());
-        let target = FilePathId("target".to_string());
+        let old = repo_path("target/tracked.old".to_string());
+        let target = repo_path("target".to_string());
 
         let error = reconcile_source_tree(
             root.path(),
@@ -6076,7 +6174,7 @@ mod tests {
         std::fs::create_dir_all(root.path().join("src")).unwrap();
         let path = root.path().join("src/owned.rs");
         std::fs::write(&path, b"old graph bytes").unwrap();
-        let owned = FilePathId("src/owned.rs".to_string());
+        let owned = repo_path("src/owned.rs".to_string());
 
         let error = reconcile_source_tree_with_pre_mutation_hook(
             root.path(),
@@ -6105,12 +6203,12 @@ mod tests {
         std::fs::create_dir_all(root.path().join("src")).unwrap();
         let path = root.path().join("src/removed.rs");
         std::fs::write(&path, b"old graph bytes").unwrap();
-        let removed = FilePathId("src/removed.rs".to_string());
+        let removed = repo_path("src/removed.rs".to_string());
 
         let error = reconcile_source_tree_with_pre_mutation_hook(
             root.path(),
             [(&removed, regular(), b"old graph bytes".as_slice())],
-            std::iter::empty::<(&FilePathId, TreeEntryKind, &[u8])>(),
+            std::iter::empty::<(&RepoPath, TreeEntry, &[u8])>(),
             should_preserve_checkout_path,
             || {
                 let replacement = root.path().join("src/editor.tmp");
@@ -6198,7 +6296,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("owned.rs");
         std::fs::write(&path, b"old graph bytes").unwrap();
-        let owned = FilePathId("owned.rs".to_string());
+        let owned = repo_path("owned.rs".to_string());
 
         let error = reconcile_source_tree_with_pre_mutation_hook(
             root.path(),
@@ -6229,7 +6327,7 @@ mod tests {
         std::fs::create_dir_all(root.path().join("src")).unwrap();
         let path = root.path().join("src/owned.rs");
         std::fs::write(&path, b"old graph bytes").unwrap();
-        let owned = FilePathId("src/owned.rs".to_string());
+        let owned = repo_path("src/owned.rs".to_string());
 
         let error = reconcile_source_tree_with_pre_mutation_hook(
             root.path(),
@@ -6256,7 +6354,7 @@ mod tests {
         std::fs::create_dir_all(root.path().join("src")).unwrap();
         let path = root.path().join("src/owned.rs");
         std::fs::write(&path, b"old graph bytes").unwrap();
-        let owned = FilePathId("src/owned.rs".to_string());
+        let owned = repo_path("src/owned.rs".to_string());
 
         let error = reconcile_source_tree_with_mutation_hooks(
             root.path(),
@@ -6290,8 +6388,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("pkg")).unwrap();
         std::fs::write(root.path().join("pkg/lib.rs"), b"old graph bytes").unwrap();
-        let previous = FilePathId("pkg/lib.rs".to_string());
-        let target = FilePathId("pkg".to_string());
+        let previous = repo_path("pkg/lib.rs".to_string());
+        let target = repo_path("pkg".to_string());
 
         let error = reconcile_source_tree_with_pre_mutation_hook(
             root.path(),
@@ -6333,8 +6431,8 @@ mod tests {
                 .join("nested/deeper/tracked.old");
             std::fs::create_dir_all(previous_path.parent().unwrap()).unwrap();
             std::fs::write(&previous_path, b"old graph bytes").unwrap();
-            let previous = FilePathId(format!("{generated}/nested/deeper/tracked.old"));
-            let target = FilePathId(generated.to_string());
+            let previous = repo_path(format!("{generated}/nested/deeper/tracked.old"));
+            let target = repo_path(generated.to_string());
 
             inject_next_publication_failure();
             let error = reconcile_source_tree(
@@ -6366,8 +6464,8 @@ mod tests {
         let second_path = root.path().join("second.txt");
         std::fs::write(&first_path, b"old first bytes").unwrap();
         std::fs::write(&second_path, b"old second bytes").unwrap();
-        let first = FilePathId("first.txt".to_string());
-        let second = FilePathId("second.txt".to_string());
+        let first = repo_path("first.txt".to_string());
+        let second = repo_path("second.txt".to_string());
 
         inject_publication_failure_after(1);
         let error = reconcile_source_tree(
@@ -6408,8 +6506,8 @@ mod tests {
             b"untracked prior bytes",
         )
         .unwrap();
-        let first = FilePathId("first.txt".to_string());
-        let second = FilePathId("second.txt".to_string());
+        let first = repo_path("first.txt".to_string());
+        let second = repo_path("second.txt".to_string());
 
         inject_publication_failure_after(1);
         let error = replace_source_tree(
@@ -6526,7 +6624,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let prior = root.path().join("owned.txt");
         std::fs::write(&prior, b"exact prior bytes").unwrap();
-        let file_id = FilePathId("owned.txt".to_string());
+        let file_id = repo_path("owned.txt".to_string());
         let entry = ValidatedSourceEntry {
             file_id: &file_id,
             kind: regular(),
@@ -6579,7 +6677,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("owned.txt");
         std::fs::write(&path, b"prior bytes").unwrap();
-        let file_id = FilePathId("owned.txt".to_string());
+        let file_id = repo_path("owned.txt".to_string());
         let entry = ValidatedSourceEntry {
             file_id: &file_id,
             kind: regular(),
@@ -6643,7 +6741,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("owned.sh");
         std::fs::write(&path, b"prior bytes").unwrap();
-        let file_id = FilePathId("owned.sh".to_string());
+        let file_id = repo_path("owned.sh".to_string());
         let entry = ValidatedSourceEntry {
             file_id: &file_id,
             kind: regular(),
@@ -6700,7 +6798,7 @@ mod tests {
         let layout = crate::init(root.path()).unwrap().layout;
         let path = root.path().join("owned.txt");
         std::fs::write(&path, b"main bytes").unwrap();
-        let file_id = FilePathId("owned.txt".to_string());
+        let file_id = repo_path("owned.txt".to_string());
         let entry = ValidatedSourceEntry {
             file_id: &file_id,
             kind: regular(),
@@ -6768,7 +6866,7 @@ mod tests {
         let layout = crate::init(root.path()).unwrap().layout;
         let path = root.path().join("owned.txt");
         std::fs::write(&path, b"main bytes").unwrap();
-        let file_id = FilePathId("owned.txt".to_string());
+        let file_id = repo_path("owned.txt".to_string());
         let entry = ValidatedSourceEntry {
             file_id: &file_id,
             kind: regular(),
@@ -6974,7 +7072,7 @@ mod tests {
     #[test]
     fn graph_path_that_looks_like_legacy_transaction_name_is_materialized() {
         let root = tempfile::tempdir().unwrap();
-        let target = FilePathId(".kin-reconcile-user.tmp".to_string());
+        let target = repo_path(".kin-reconcile-user.tmp".to_string());
 
         replace_source_tree(
             root.path(),
@@ -7037,8 +7135,8 @@ mod tests {
         for unsafe_component in ["COM0.rs", "LPT¹.txt", "COM1 .txt", "NUL .log"] {
             let root = tempfile::tempdir().unwrap();
             std::fs::write(root.path().join("a-parent"), b"old complete bytes").unwrap();
-            let transition = FilePathId("a-parent/child.txt".to_string());
-            let reserved = FilePathId(format!("z/{unsafe_component}"));
+            let transition = repo_path("a-parent/child.txt".to_string());
+            let reserved = repo_path(format!("z/{unsafe_component}"));
 
             let error = replace_source_tree(
                 root.path(),
@@ -7066,7 +7164,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let destination = root.path().join("owned.txt");
         std::fs::write(&destination, b"old complete bytes").unwrap();
-        let file_id = FilePathId("owned.txt".to_string());
+        let file_id = repo_path("owned.txt".to_string());
 
         inject_next_publication_failure();
         let error =
@@ -7094,22 +7192,22 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         materialize_source_entry(
             root.path(),
-            &FilePathId("README.md".to_string()),
+            &repo_path("README.md".to_string()),
             regular(),
             b"read me\n",
         )
         .unwrap();
         materialize_source_entry(
             root.path(),
-            &FilePathId("bin/tool".to_string()),
-            TreeEntryKind::Regular { executable: true },
+            &repo_path("bin/tool".to_string()),
+            executable(),
             b"#!/bin/sh\n",
         )
         .unwrap();
         materialize_source_entry(
             root.path(),
-            &FilePathId("bin/readme".to_string()),
-            TreeEntryKind::Symlink,
+            &repo_path("bin/readme".to_string()),
+            symlink(),
             b"../README.md",
         )
         .unwrap();
@@ -7151,7 +7249,7 @@ mod tests {
 
         materialize_source_entry(
             root.path(),
-            &FilePathId("redirect/owned".to_string()),
+            &repo_path("redirect/owned".to_string()),
             regular(),
             b"must remain inside",
         )
@@ -7177,7 +7275,7 @@ mod tests {
 
         materialize_source_entry(
             root.path(),
-            &FilePathId("victim".to_string()),
+            &repo_path("victim".to_string()),
             regular(),
             b"inside",
         )
@@ -7198,8 +7296,8 @@ mod tests {
     fn source_tree_preparation_rejects_file_directory_prefix_conflicts() {
         let root = tempfile::tempdir().unwrap();
         let paths = [
-            FilePathId("same".to_string()),
-            FilePathId("same/child".to_string()),
+            repo_path("same".to_string()),
+            repo_path("same/child".to_string()),
         ];
 
         let error = prepare_source_tree(root.path(), paths.iter()).unwrap_err();
@@ -7208,8 +7306,8 @@ mod tests {
             .contains("conflicting graph-owned source paths"));
 
         let duplicate = [
-            FilePathId("duplicate".to_string()),
-            FilePathId("duplicate".to_string()),
+            repo_path("duplicate".to_string()),
+            repo_path("duplicate".to_string()),
         ];
         let error = prepare_source_tree(root.path(), duplicate.iter()).unwrap_err();
         assert!(error
@@ -7219,8 +7317,8 @@ mod tests {
         #[cfg(any(windows, target_os = "macos"))]
         {
             let aliases = [
-                FilePathId("src/Owned.rs".to_string()),
-                FilePathId("SRC/owned.rs".to_string()),
+                repo_path("src/Owned.rs".to_string()),
+                repo_path("SRC/owned.rs".to_string()),
             ];
             let error = prepare_source_tree(root.path(), aliases.iter()).unwrap_err();
             assert!(error
@@ -7237,7 +7335,7 @@ mod tests {
             ["src/caf\u{e9}.rs", "src/cafe\u{301}.rs"],
             ["src/\u{dc}ber.rs", "src/\u{fc}ber.rs"],
         ] {
-            let paths = aliases.map(|path| FilePathId(path.to_string()));
+            let paths = aliases.map(|path| repo_path(path.to_string()));
             let error = prepare_source_tree(root.path(), paths.iter()).unwrap_err();
             assert!(
                 error
@@ -7259,7 +7357,7 @@ mod tests {
             std::fs::create_dir(root.path().join("src")).unwrap();
             std::fs::write(root.path().join(ambient), b"old bytes").unwrap();
             std::fs::write(root.path().join("untracked.txt"), b"remove me").unwrap();
-            let tracked_id = FilePathId(tracked_path.to_string());
+            let tracked_id = repo_path(tracked_path.to_string());
 
             replace_source_tree(
                 root.path(),
@@ -7287,9 +7385,9 @@ mod tests {
     #[test]
     fn tracked_cleanup_classification_is_bounded_by_path_depth() {
         let tracked: Vec<_> = (0..20_000)
-            .map(|index| FilePathId(format!("src/generated/{index}/owned.rs")))
+            .map(|index| repo_path(format!("src/generated/{index}/owned.rs")))
             .collect();
-        let classifier = TrackedPathClassifier::new(tracked.iter());
+        let classifier = TrackedPathClassifier::new(tracked.iter()).unwrap();
 
         let (relation, probes) =
             classifier.relation_with_probe_count(Path::new("src/unrelated/leaf.rs"));
@@ -7315,7 +7413,7 @@ mod tests {
         std::fs::create_dir(root.path().join("SRC")).unwrap();
         std::fs::write(root.path().join("SRC/Owned.rs"), b"old bytes").unwrap();
         std::fs::write(root.path().join("untracked.txt"), b"remove me").unwrap();
-        let file_id = FilePathId("src/owned.rs".to_string());
+        let file_id = repo_path("src/owned.rs".to_string());
 
         replace_source_tree(
             root.path(),
@@ -7339,8 +7437,8 @@ mod tests {
         std::fs::create_dir(root.path().join("dir_to_file")).unwrap();
         std::fs::write(root.path().join("dir_to_file/old"), b"old child").unwrap();
         let paths = [
-            FilePathId("file_to_dir/new".to_string()),
-            FilePathId("dir_to_file".to_string()),
+            repo_path("file_to_dir/new".to_string()),
+            repo_path("dir_to_file".to_string()),
         ];
 
         prepare_source_tree(root.path(), paths.iter()).unwrap();
@@ -7363,7 +7461,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("dir_to_file")).unwrap();
         std::fs::write(root.path().join("dir_to_file/old"), b"old child").unwrap();
-        let file_id = FilePathId("dir_to_file".to_string());
+        let file_id = repo_path("dir_to_file".to_string());
 
         replace_source_tree(
             root.path(),
@@ -7400,7 +7498,7 @@ mod tests {
             let resume_worker = Arc::clone(&resume);
             let root_worker = root.clone();
             scope.spawn(move || {
-                let file_id = FilePathId("owned.txt".to_string());
+                let file_id = repo_path("owned.txt".to_string());
                 let entries =
                     validated_source_entries([(&file_id, regular(), b"inside".as_slice())])
                         .unwrap();
@@ -7444,7 +7542,7 @@ mod tests {
             let resume_worker = Arc::clone(&resume);
             let root_worker = root.clone();
             let worker = scope.spawn(move || {
-                let file_id = FilePathId("owned.txt".to_string());
+                let file_id = repo_path("owned.txt".to_string());
                 let entries =
                     validated_source_entries([(&file_id, regular(), b"inside".as_slice())])
                         .unwrap();
@@ -7494,7 +7592,7 @@ mod tests {
 
         materialize_source_entry(
             &root,
-            &FilePathId("junction/artifact".to_string()),
+            &repo_path("junction/artifact".to_string()),
             regular(),
             b"inside",
         )
@@ -7524,7 +7622,7 @@ mod tests {
             let resume_worker = Arc::clone(&resume);
             let root_worker = root.clone();
             scope.spawn(move || {
-                let file_id = FilePathId("a/b/file".to_string());
+                let file_id = repo_path("a/b/file".to_string());
                 let entries =
                     validated_source_entries([(&file_id, regular(), b"inside".as_slice())])
                         .unwrap();
@@ -7571,7 +7669,7 @@ mod tests {
             let resume_worker = Arc::clone(&resume);
             let root_worker = root.clone();
             let handle = scope.spawn(move || {
-                let file_id = FilePathId("tracked.txt".to_string());
+                let file_id = repo_path("tracked.txt".to_string());
                 let entries =
                     validated_source_entries([(&file_id, regular(), b"tracked".as_slice())])
                         .unwrap();
