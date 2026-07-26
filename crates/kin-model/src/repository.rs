@@ -9,15 +9,18 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    identity::canonical_json_bytes, validate_semantic_change_id, AdmissionScanToken, AuthorId,
-    DefaultRefMutation, EffectiveAdmissionPolicyStamp, ExternalChangeAlias, ExternalObjectKind,
-    ExternalObjectRecord, FrozenLocalOverlayDelta, GitExternalAuthorityDelta, GitObjectId, Hash256,
-    ModelError, OperationId, RefMutation, RefName, RefTarget, RepositoryId, RepositoryRef,
-    ResolvedTree, Result, SemanticChange, SemanticChangeId, SharedAdmissionPolicy, TreeDelta,
-    WorkspaceHead, WorkspaceId,
+    identity::canonical_json_bytes, validate_semantic_change_id, AuthorId, DefaultRefMutation,
+    EffectiveAdmissionPolicyStamp, ExternalChangeAlias, ExternalObjectKind, ExternalObjectRecord,
+    FrozenLocalOverlayDelta, GitExternalAuthorityDelta, GitObjectId, Hash256, ModelError,
+    OperationId, RefMutation, RefName, RefTarget, RepositoryId, RepositoryRef, ResolvedTree,
+    Result, SemanticChange, SemanticChangeId, SharedAdmissionPolicy, TreeDelta, WorkspaceHead,
+    WorkspaceId,
 };
 
-pub const REPOSITORY_TRANSACTION_SCHEMA_VERSION: u32 = 2;
+/// Clean-slate transaction schema whose persistence authority performs
+/// admission itself. Version 2's caller-asserted scan token was never released
+/// and has no compatibility decoder.
+pub const REPOSITORY_TRANSACTION_SCHEMA_VERSION: u32 = 3;
 pub const REPOSITORY_ROOT_SCHEMA_VERSION: u32 = 1;
 
 /// One versioned digest in the repository authority root bundle.
@@ -503,25 +506,6 @@ impl WorkspaceMutation {
         }
         Ok(())
     }
-
-    fn expected_scan_baseline(&self) -> Hash256 {
-        match &self.expected {
-            WorkspaceExpectation::MustNotExist => {
-                compute_resolved_tree_hash(&ResolvedTree::default())
-                    .expect("empty tree has a canonical identity")
-            }
-            WorkspaceExpectation::MustEqual { tree_hash, .. } => *tree_hash,
-        }
-    }
-
-    fn expected_scan_generation_and_head(&self) -> (u64, &WorkspaceHead) {
-        match &self.expected {
-            WorkspaceExpectation::MustNotExist => (0, &self.new_head),
-            WorkspaceExpectation::MustEqual {
-                generation, head, ..
-            } => (*generation, head),
-        }
-    }
 }
 
 fn validate_head_base(
@@ -650,7 +634,7 @@ impl RepositoryOperationRecord {
             workspace.tree_deltas.sort_by_key(TreeDelta::artifact_id);
         }
         hash_serialized(
-            b"kin-repository-operation-v2\0",
+            b"kin-repository-operation-v3\0",
             &RepositoryOperationIdentity {
                 operation_id: canonical.operation_id,
                 repository_id: &canonical.repository_id,
@@ -688,10 +672,6 @@ pub struct RepositoryTransaction {
     pub default_ref_mutation: Option<DefaultRefMutation>,
     pub workspace_mutation: Option<WorkspaceMutation>,
     pub local_overlay_delta: Option<FrozenLocalOverlayDelta>,
-    /// Required proof binding for every workspace mutation. This proves only
-    /// the observed candidate workspace tree; history-only import and
-    /// replication require their own object/history admission proof.
-    pub admission_scan_token: Option<AdmissionScanToken>,
 }
 
 impl RepositoryTransaction {
@@ -823,12 +803,6 @@ impl RepositoryTransaction {
 
         if let Some(workspace) = &self.workspace_mutation {
             workspace.validate_shape()?;
-            if self.admission_scan_token.is_none() {
-                return Err(ModelError::InvalidOperation(format!(
-                    "workspace {} mutation requires an admission scan token",
-                    workspace.workspace_id
-                )));
-            }
         }
 
         if let Some(overlay_delta) = &self.local_overlay_delta {
@@ -853,38 +827,6 @@ impl RepositoryTransaction {
             }
         }
 
-        if let Some(token) = &self.admission_scan_token {
-            token.validate()?;
-            if token.repository_id != self.repository_id {
-                return Err(ModelError::InvalidOperation(format!(
-                    "admission scan repository {} does not match transaction repository {}",
-                    token.repository_id, self.repository_id
-                )));
-            }
-            let workspace = self.workspace_mutation.as_ref().ok_or_else(|| {
-                ModelError::InvalidOperation(
-                    "admission scan token is not bound to a workspace mutation".to_string(),
-                )
-            })?;
-            if workspace.workspace_id != token.workspace_id {
-                return Err(ModelError::InvalidOperation(
-                    "workspace mutation and admission scan name different workspaces".to_string(),
-                ));
-            }
-            let (generation, head) = workspace.expected_scan_generation_and_head();
-            if token.workspace_generation != generation
-                || &token.workspace_head != head
-                || token.baseline_tree_hash != workspace.expected_scan_baseline()
-                || token.observed_tree_hash != workspace.new_tree_hash
-                || token.shared_policy != workspace.new_admission_policy.shared
-                || token.local_overlay != workspace.new_admission_policy.local
-            {
-                return Err(ModelError::Conflict(format!(
-                    "admission scan token does not bind workspace {} generation, head, baseline, candidate tree, and policy exactly",
-                    workspace.workspace_id
-                )));
-            }
-        }
         Ok(())
     }
 
@@ -911,7 +853,7 @@ impl RepositoryTransaction {
         if let Some(workspace) = &mut canonical.workspace_mutation {
             workspace.tree_deltas.sort_by_key(TreeDelta::artifact_id);
         }
-        hash_serialized(b"kin-repository-transaction-v2\0", &canonical)
+        hash_serialized(b"kin-repository-transaction-v3\0", &canonical)
     }
 }
 
@@ -1033,7 +975,7 @@ mod tests {
         ArtifactId, ExternalObjectId, FrozenLocalOverlay, GitExternalAuthority,
         GitObjectBodyLoader, GitObjectFormat, GitRawRef, GitRawTarget, LocalOverlayHash,
         LocalOverlayStamp, LocatedEntry, RefExpectation, RefUpdatePolicy, RepoPath,
-        SharedAdmissionPolicy, TreeEntry, ADMISSION_POLICY_SEMANTICS_VERSION,
+        SharedAdmissionPolicy, TreeEntry,
     };
     use uuid::Uuid;
 
@@ -1103,7 +1045,6 @@ mod tests {
         transaction.git_authority_delta = Some(delta);
         transaction.workspace_mutation = None;
         transaction.local_overlay_delta = None;
-        transaction.admission_scan_token = None;
         transaction
     }
 
@@ -1246,17 +1187,6 @@ mod tests {
             aliases: Vec::new(),
             ref_mutations: Vec::new(),
             default_ref_mutation: None,
-            admission_scan_token: Some(AdmissionScanToken {
-                repository_id,
-                workspace_id,
-                workspace_generation: 0,
-                workspace_head: mutation.new_head.clone(),
-                baseline_tree_hash: compute_resolved_tree_hash(&ResolvedTree::default()).unwrap(),
-                observed_tree_hash: mutation.new_tree_hash,
-                matcher_semantics_version: ADMISSION_POLICY_SEMANTICS_VERSION,
-                shared_policy: policy.shared,
-                local_overlay: policy.local,
-            }),
             workspace_mutation: Some(mutation),
             local_overlay_delta: Some(local_overlay_delta),
         }
@@ -1395,10 +1325,6 @@ mod tests {
         workspace.new_shared_admission_policy = shared_policy.clone();
         workspace.new_admission_policy.shared = shared_policy.stamp();
 
-        let token = transaction.admission_scan_token.as_mut().unwrap();
-        token.observed_tree_hash = workspace.new_tree_hash;
-        token.shared_policy = shared_policy.stamp();
-
         assert!(transaction.changes.is_empty());
         assert!(workspace.new_base_target.is_none());
         assert_ne!(
@@ -1430,7 +1356,6 @@ mod tests {
         let workspace = updated.workspace_mutation.as_mut().unwrap();
         workspace.new_shared_admission_policy = shared_policy.clone();
         workspace.new_admission_policy.shared = shared_policy.stamp();
-        updated.admission_scan_token.as_mut().unwrap().shared_policy = shared_policy.stamp();
         updated.validate().unwrap();
         assert_ne!(updated.transaction_hash().unwrap(), original_hash);
 
@@ -1602,12 +1527,13 @@ mod tests {
     }
 
     #[test]
-    fn scan_token_cannot_be_replayed_over_different_candidate_tree() {
+    fn transaction_hash_binds_the_exact_workspace_candidate_tree() {
         let transaction = workspace_transaction();
         transaction.validate().unwrap();
+        let original_hash = transaction.transaction_hash().unwrap();
 
-        let mut replay = transaction.clone();
-        let workspace = replay.workspace_mutation.as_mut().unwrap();
+        let mut changed = transaction;
+        let workspace = changed.workspace_mutation.as_mut().unwrap();
         workspace.tree_deltas[0] = add_artifact(
             workspace.tree_deltas[0].artifact_id(),
             b"compose.yaml".to_vec(),
@@ -1619,25 +1545,13 @@ mod tests {
             .unwrap();
         workspace.new_tree_hash = compute_resolved_tree_hash(&candidate).unwrap();
 
-        let error = replay.validate().unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("baseline, candidate tree, and policy exactly"));
-    }
-
-    #[test]
-    fn workspace_mutation_cannot_omit_admission_scan() {
-        let mut transaction = workspace_transaction();
-        transaction.admission_scan_token = None;
-        let error = transaction.validate().unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("mutation requires an admission scan token"));
+        changed.validate().unwrap();
+        assert_ne!(changed.transaction_hash().unwrap(), original_hash);
     }
 
     #[test]
     fn git_authority_delta_is_an_atomic_transaction_mutation_without_readding_cas_records() {
-        assert_eq!(REPOSITORY_TRANSACTION_SCHEMA_VERSION, 2);
+        assert_eq!(REPOSITORY_TRANSACTION_SCHEMA_VERSION, 3);
         let repository_id = RepositoryId::new("repo").unwrap();
         let old = blob_git_authority(repository_id.clone(), b"services:\n  old: {}\n");
         let new = blob_git_authority(repository_id, b"services:\n  new: {}\n");
@@ -1654,8 +1568,8 @@ mod tests {
         let update_hash = update.transaction_hash().unwrap();
         assert_eq!(
             update_hash.to_string(),
-            "e97097078bd8df6540e63965765f581e9576d1c7bbecb04452ce76b78f870964",
-            "repository transaction v2 identity is schema-pinned"
+            "897b3d6107f02ade0880195e7956f6d1618800eaf1cf5cc61ace64085a8cd424",
+            "repository transaction v3 identity is schema-pinned"
         );
         assert_ne!(initial.transaction_hash().unwrap(), update_hash);
 
@@ -1741,8 +1655,8 @@ mod tests {
         let identity = operation.identity_hash().unwrap();
         assert_eq!(
             identity.to_string(),
-            "6ac1f83097659543be35696fd78429b778b68bc51bb2bc90ce8d3760078cbd85",
-            "repository operation v2 identity is schema-pinned"
+            "bad32ab496de6c755fc7f40fa7f52c2b56bb1e6d9c2e9d8f505794ba544f964e",
+            "repository operation v3 identity is schema-pinned"
         );
 
         let mut changed = operation.clone();
@@ -1845,7 +1759,6 @@ mod tests {
             default_ref_mutation: None,
             workspace_mutation: None,
             local_overlay_delta: None,
-            admission_scan_token: None,
         };
         assert!(transaction.validate().is_err());
     }

@@ -43,11 +43,10 @@ pub mod workspace_tree;
 // Re-export all public types at crate root for convenience.
 pub use admission::{
     AdmissionCase, AdmissionPolicyDelta, AdmissionPolicyHash, AdmissionPolicyStamp,
-    AdmissionRuleSource, AdmissionRuleSourceKind, AdmissionScanToken,
-    EffectiveAdmissionPolicyStamp, FrozenLocalOverlay, FrozenLocalOverlayDelta,
-    LocalAdmissionRuleSource, LocalAdmissionRuleSourceKind, LocalOverlayHash, LocalOverlayStamp,
-    SensitiveArtifactAllowance, SensitiveArtifactKind, SharedAdmissionPolicy,
-    ADMISSION_POLICY_SEMANTICS_VERSION,
+    AdmissionRuleSource, AdmissionRuleSourceKind, EffectiveAdmissionPolicyStamp,
+    FrozenLocalOverlay, FrozenLocalOverlayDelta, LocalAdmissionRuleSource,
+    LocalAdmissionRuleSourceKind, LocalOverlayHash, LocalOverlayStamp, SensitiveArtifactAllowance,
+    SensitiveArtifactKind, SharedAdmissionPolicy, ADMISSION_POLICY_SEMANTICS_VERSION,
 };
 pub use branch::MergeState;
 pub use change::{

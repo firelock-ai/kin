@@ -118,10 +118,6 @@ fn main() {
             "SharedAdmissionPolicy",
             serde_json::to_string_pretty(&schema_for!(kin_model::SharedAdmissionPolicy)).unwrap(),
         ),
-        (
-            "AdmissionScanToken",
-            serde_json::to_string_pretty(&schema_for!(kin_model::AdmissionScanToken)).unwrap(),
-        ),
         // Work graph
         (
             "WorkItem",

@@ -8,9 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
-use crate::{
-    AuthorId, Hash256, ModelError, RepoPath, RepositoryId, Result, WorkspaceHead, WorkspaceId,
-};
+use crate::{AuthorId, Hash256, ModelError, RepoPath, Result, WorkspaceId};
 
 pub const ADMISSION_POLICY_SEMANTICS_VERSION: u32 = 2;
 
@@ -496,40 +494,6 @@ pub struct LocalOverlayStamp {
 pub struct EffectiveAdmissionPolicyStamp {
     pub shared: AdmissionPolicyStamp,
     pub local: LocalOverlayStamp,
-}
-
-/// Authority captured by one complete filesystem observation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AdmissionScanToken {
-    pub repository_id: RepositoryId,
-    pub workspace_id: WorkspaceId,
-    /// Persisted workspace generation observed before scanning.
-    pub workspace_generation: u64,
-    pub workspace_head: WorkspaceHead,
-    /// Persisted graph-owned workspace tree used as the scan baseline.
-    pub baseline_tree_hash: Hash256,
-    /// Exact candidate tree whose bytes and entry kinds were scanned.
-    ///
-    /// Binding both tree hashes prevents replaying a successful scan over
-    /// different candidate bytes that happen to share the same baseline.
-    pub observed_tree_hash: Hash256,
-    /// Matcher semantics used for ignore resolution and sensitive scanning.
-    pub matcher_semantics_version: u32,
-    pub shared_policy: AdmissionPolicyStamp,
-    pub local_overlay: LocalOverlayStamp,
-}
-
-impl AdmissionScanToken {
-    pub fn validate(&self) -> Result<()> {
-        if self.matcher_semantics_version != ADMISSION_POLICY_SEMANTICS_VERSION {
-            return Err(ModelError::InvalidOperation(format!(
-                "admission scan used matcher semantics version {}, expected {}",
-                self.matcher_semantics_version, ADMISSION_POLICY_SEMANTICS_VERSION
-            )));
-        }
-        Ok(())
-    }
 }
 
 fn hash_json(domain: &[u8], value: &impl Serialize) -> Result<Hash256> {
