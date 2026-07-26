@@ -597,7 +597,7 @@ fn gix_object_id(oid: GitObjectId) -> Result<gix::ObjectId> {
         .map_err(|error| GitError::InvalidSnapshot(format!("invalid Git object ID: {error}")))
 }
 
-fn validate_snapshot(
+pub(crate) fn validate_snapshot(
     snapshot: &LosslessGitRepository,
     blob_store: &BlobStore,
 ) -> Result<BTreeMap<ExternalObjectId, Vec<u8>>> {
