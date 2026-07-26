@@ -50,7 +50,7 @@ pub struct MigrationResult {
 ///
 /// This is the top-level entry point for `kin migrate`. It orchestrates:
 /// 1. Scanning the source Git repo
-/// 2. Planning the migration (shallow vs deep)
+/// 2. Planning the migration (exact snapshot vs full reachable history)
 /// 3. Initializing the .kin/ directory
 /// 4. Converting Git history + indexing source files
 /// 5. Committing changes and entities to the graph store
@@ -488,7 +488,7 @@ pub fn migrate_repo<G: GraphStore>(
     graph: &G,
 ) -> Result<MigrationResult> {
     let scan = scan_repo(source)?;
-    let plan = plan_migration(&scan, strategy, None, 0);
+    let plan = plan_migration(&scan, strategy, None);
     execute_migration(&plan, graph)
 }
 
@@ -1652,7 +1652,7 @@ mod tests {
     fn migration_result_serializes() {
         let result = MigrationResult {
             kin_root: "/project".into(),
-            strategy: MigrationStrategy::Shallow,
+            strategy: MigrationStrategy::Snapshot,
             commits_imported: 1,
             files_indexed: 5,
             entities_extracted: 20,
@@ -1665,14 +1665,14 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         let parsed: MigrationResult = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.commits_imported, 1);
-        assert_eq!(parsed.strategy, MigrationStrategy::Shallow);
+        assert_eq!(parsed.strategy, MigrationStrategy::Snapshot);
     }
 
     #[test]
     fn migration_result_summary() {
         let result = MigrationResult {
             kin_root: "/project".into(),
-            strategy: MigrationStrategy::Deep,
+            strategy: MigrationStrategy::Full,
             commits_imported: 50,
             files_indexed: 10,
             entities_extracted: 100,
@@ -1698,9 +1698,8 @@ mod tests {
         let plan = MigrationPlan {
             source: dir.path().to_path_buf(),
             target: dir.path().to_path_buf(),
-            strategy: MigrationStrategy::Shallow,
+            strategy: MigrationStrategy::Snapshot,
             branch: None,
-            max_commits: 0,
             source_files: vec![],
         };
 
@@ -1725,9 +1724,8 @@ mod tests {
         let plan = MigrationPlan {
             source: source.path().to_path_buf(),
             target: source.path().to_path_buf(),
-            strategy: MigrationStrategy::Shallow,
+            strategy: MigrationStrategy::Snapshot,
             branch: Some("master".into()),
-            max_commits: 0,
             source_files: vec![std::path::PathBuf::from("src/lib.rs")],
         };
 
@@ -1767,9 +1765,8 @@ mod tests {
         let plan = MigrationPlan {
             source: source.path().to_path_buf(),
             target: target.clone(),
-            strategy: MigrationStrategy::Shallow,
+            strategy: MigrationStrategy::Snapshot,
             branch: Some("master".into()),
-            max_commits: 0,
             source_files: vec![std::path::PathBuf::from("src/lib.rs")],
         };
 
@@ -1807,9 +1804,8 @@ mod tests {
         let plan = MigrationPlan {
             source: source.path().to_path_buf(),
             target,
-            strategy: MigrationStrategy::Shallow,
+            strategy: MigrationStrategy::Snapshot,
             branch: Some("master".into()),
-            max_commits: 0,
             source_files: vec![std::path::PathBuf::from("src/lib.rs")],
         };
 
@@ -1834,9 +1830,8 @@ mod tests {
         let plan = MigrationPlan {
             source: source.path().to_path_buf(),
             target: source.path().to_path_buf(),
-            strategy: MigrationStrategy::Shallow,
+            strategy: MigrationStrategy::Snapshot,
             branch: Some("main".into()),
-            max_commits: 0,
             source_files: vec![std::path::PathBuf::from("src/lib.rs")],
         };
 
@@ -1865,9 +1860,8 @@ mod tests {
         let plan = MigrationPlan {
             source: source.path().to_path_buf(),
             target: source.path().to_path_buf(),
-            strategy: MigrationStrategy::Shallow,
+            strategy: MigrationStrategy::Snapshot,
             branch: Some("main".into()),
-            max_commits: 0,
             source_files: vec![std::path::PathBuf::from("src/lib.rs")],
         };
 
@@ -2016,9 +2010,8 @@ mod tests {
             let plan = MigrationPlan {
                 source: root.clone(),
                 target: root.clone(),
-                strategy: MigrationStrategy::Shallow,
+                strategy: MigrationStrategy::Snapshot,
                 branch: Some("main".into()),
-                max_commits: 0,
                 source_files: vec![
                     std::path::PathBuf::from("src/lib.rs"),
                     std::path::PathBuf::from("src/helper.rs"),

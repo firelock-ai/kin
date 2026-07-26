@@ -52,8 +52,8 @@ enum Command {
         /// Skip LSP enrichment (faster init, tree-sitter only)
         #[arg(long, default_value_t = false)]
         no_lsp: bool,
-        /// Git history import depth for detected Git repositories: `off`, `recent`, or `full`
-        #[arg(long, default_value = "recent", value_parser = ["off", "recent", "full"])]
+        /// Git import boundary: `off`, `snapshot` (exact HEAD tree), or `full` (all reachable history)
+        #[arg(long, default_value = "snapshot", value_parser = ["off", "snapshot", "full"])]
         git_history: String,
     },
     /// Show working copy status
@@ -704,9 +704,9 @@ enum Command {
     Migrate {
         /// Source repository path (defaults to current directory)
         source: Option<String>,
-        /// Migration depth: shallow (HEAD only) or deep (full history)
-        #[arg(short, long, default_value = "shallow")]
-        depth: String,
+        /// Git history boundary: `snapshot` (exact HEAD tree) or `full` (all reachable history)
+        #[arg(long, default_value = "snapshot", value_parser = ["snapshot", "full"])]
+        history: String,
         /// Resume an interrupted migration from the last checkpoint
         #[arg(long)]
         resume: bool,
@@ -2638,9 +2638,9 @@ fn main() -> Result<()> {
                 Command::Bench { args } => commands::bench::bench_proxy(&args),
                 Command::Migrate {
                     source,
-                    depth,
+                    history,
                     resume,
-                } => commands::migrate::run(source, depth, resume).await,
+                } => commands::migrate::run(source, history, resume).await,
                 Command::Cache { action } => match action {
                     CacheAction::Status { json } => commands::cache::status(json).await,
                     CacheAction::Gc {

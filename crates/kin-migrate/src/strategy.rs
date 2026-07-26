@@ -9,14 +9,13 @@ use crate::scanner::RepoScan;
 
 /// Migration strategy: controls how much history is imported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum MigrationStrategy {
-    /// Import only HEAD (current tree state). Fast (<15s target).
-    /// Creates a single SemanticChange from the working tree.
+    /// Import an exact current-tree snapshot without claiming ancestry.
     #[default]
-    Shallow,
-    /// Import full Git history. Walks all reachable commits and
-    /// converts each into a SemanticChange with proper DAG links.
-    Deep,
+    Snapshot,
+    /// Import every reachable Git commit and exact parent edge.
+    Full,
 }
 
 /// Configuration for a migration operation.
@@ -30,8 +29,6 @@ pub struct MigrationPlan {
     pub strategy: MigrationStrategy,
     /// Branch to import (None = HEAD / default branch).
     pub branch: Option<String>,
-    /// Maximum commits to import in Deep mode (0 = unlimited).
-    pub max_commits: usize,
     /// Source files to index for entity extraction.
     pub source_files: Vec<PathBuf>,
 }
@@ -41,7 +38,6 @@ pub fn plan_migration(
     scan: &RepoScan,
     strategy: MigrationStrategy,
     target: Option<PathBuf>,
-    max_commits: usize,
 ) -> MigrationPlan {
     let target_dir = target.unwrap_or_else(|| scan.root.clone());
 
@@ -50,7 +46,6 @@ pub fn plan_migration(
         target: target_dir,
         strategy,
         branch: scan.default_branch.clone(),
-        max_commits,
         source_files: scan.source_files.clone(),
     }
 }
@@ -69,10 +64,6 @@ impl MigrationPlan {
             writeln!(out, "  Branch: {}", branch).unwrap();
         }
         writeln!(out, "  Source files: {}", self.source_files.len()).unwrap();
-        if self.strategy == MigrationStrategy::Deep && self.max_commits > 0 {
-            writeln!(out, "  Max commits: {}", self.max_commits).unwrap();
-        }
-
         out
     }
 }
@@ -92,48 +83,45 @@ mod tests {
     }
 
     #[test]
-    fn plan_shallow_migration() {
+    fn plan_snapshot_migration() {
         let scan = make_scan();
-        let plan = plan_migration(&scan, MigrationStrategy::Shallow, None, 0);
-        assert_eq!(plan.strategy, MigrationStrategy::Shallow);
+        let plan = plan_migration(&scan, MigrationStrategy::Snapshot, None);
+        assert_eq!(plan.strategy, MigrationStrategy::Snapshot);
         assert_eq!(plan.source, PathBuf::from("/project"));
         assert_eq!(plan.target, PathBuf::from("/project"));
         assert_eq!(plan.source_files.len(), 2);
     }
 
     #[test]
-    fn plan_deep_migration_with_target() {
+    fn plan_full_migration_with_target() {
         let scan = make_scan();
         let plan = plan_migration(
             &scan,
-            MigrationStrategy::Deep,
+            MigrationStrategy::Full,
             Some(PathBuf::from("/output")),
-            50,
         );
-        assert_eq!(plan.strategy, MigrationStrategy::Deep);
+        assert_eq!(plan.strategy, MigrationStrategy::Full);
         assert_eq!(plan.target, PathBuf::from("/output"));
-        assert_eq!(plan.max_commits, 50);
     }
 
     #[test]
-    fn default_strategy_is_shallow() {
-        assert_eq!(MigrationStrategy::default(), MigrationStrategy::Shallow);
+    fn default_strategy_is_snapshot() {
+        assert_eq!(MigrationStrategy::default(), MigrationStrategy::Snapshot);
     }
 
     #[test]
     fn plan_describe_output() {
         let scan = make_scan();
-        let plan = plan_migration(&scan, MigrationStrategy::Deep, None, 25);
+        let plan = plan_migration(&scan, MigrationStrategy::Full, None);
         let desc = plan.describe();
-        assert!(desc.contains("Deep"));
-        assert!(desc.contains("Max commits: 25"));
+        assert!(desc.contains("Full"));
         assert!(desc.contains("Source files: 2"));
     }
 
     #[test]
     fn strategy_serializes() {
-        let json = serde_json::to_string(&MigrationStrategy::Shallow).unwrap();
+        let json = serde_json::to_string(&MigrationStrategy::Snapshot).unwrap();
         let parsed: MigrationStrategy = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, MigrationStrategy::Shallow);
+        assert_eq!(parsed, MigrationStrategy::Snapshot);
     }
 }
