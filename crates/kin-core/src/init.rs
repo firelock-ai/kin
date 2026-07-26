@@ -433,7 +433,12 @@ pub fn prepare_repository_layout_at(
     };
     let mut stage_lease = Some(stage_lease);
     let preparation = (|| {
+        let authority_root = layout.kindb_dir();
+        let backend = create_staged_repository_authority_backend(&authority_root)?;
         for directory in layout.all_dirs() {
+            if directory == authority_root {
+                continue;
+            }
             std::fs::create_dir(&directory).map_err(|error| KinError::io(&directory, error))?;
         }
         crate::tree::initialize_projection_control_directory(layout.root())?;
@@ -443,7 +448,6 @@ pub fn prepare_repository_layout_at(
         manifest.save(&layout.manifest_path())?;
         let metadata_seal = capture_metadata_seal(&layout)?;
 
-        let backend = Arc::new(LocalFileBackend::new(layout.kindb_dir()));
         let authority = RepositoryAuthorityManager::open(repository_id.clone(), backend)
             .map_err(graph_error)?;
         let initial_roots = authority.read_authority().roots().clone();
@@ -502,6 +506,29 @@ fn create_private_staging_root(staging_root: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Create and bind the local authority backend for one unpublished repository.
+///
+/// This is intentionally an initialization-only boundary. Reopen callers must
+/// construct their backend from the already-published `kindb` root and fail
+/// closed when that root is missing; they must never call this helper to repair
+/// or recreate authority.
+fn create_staged_repository_authority_backend(
+    authority_root: &Path,
+) -> Result<Arc<LocalFileBackend>> {
+    create_private_staging_root(authority_root)?;
+    let parent = authority_root.parent().ok_or_else(|| {
+        KinError::Other(format!(
+            "staged repository authority root has no parent: {}",
+            authority_root.display()
+        ))
+    })?;
+    sync_parent_directory(parent)?;
+
+    let backend = Arc::new(LocalFileBackend::new(authority_root));
+    backend.list_repos().map_err(graph_error)?;
+    Ok(backend)
 }
 
 fn stage_id_from_directory_name(name: &str) -> Option<uuid::Uuid> {
@@ -2484,8 +2511,7 @@ mod tests {
         initial_change.id = compute_semantic_change_id(&initial_change).unwrap();
 
         let kindb = directory.path().join("kindb");
-        std::fs::create_dir(&kindb).unwrap();
-        let backend = Arc::new(LocalFileBackend::new(kindb));
+        let backend = create_staged_repository_authority_backend(&kindb).unwrap();
         let authority = RepositoryAuthorityManager::open(repository_id.clone(), backend).unwrap();
         let bootstrap = initialize_repository_authority(
             &authority,
@@ -2526,5 +2552,65 @@ mod tests {
         assert_eq!(workspace.base_target, Some(repository_ref.target));
         assert_eq!(workspace.tree_hash, bootstrap.workspace.workspace_tree_hash);
         assert_eq!(workspace.shared_admission_policy, shared_policy);
+    }
+
+    #[test]
+    fn bootstrap_refuses_to_recreate_a_missing_authority_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let kindb = directory.path().join("missing-kindb");
+        let repository_id = RepositoryId::new("missing-root-repository").unwrap();
+        let authority = RepositoryAuthorityManager::open(
+            repository_id.clone(),
+            Arc::new(LocalFileBackend::new(&kindb)),
+        )
+        .unwrap();
+
+        let error = initialize_repository_authority(
+            &authority,
+            repository_id,
+            WorkspaceId::new(),
+            AdmissionCase::Sensitive,
+            RefName::branch(b"main").unwrap(),
+            SharedAdmissionPolicy::empty(0),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("refusing to recreate a detached authority namespace"));
+        assert!(
+            !kindb.exists(),
+            "bootstrap through an unanchored backend must not create its missing root"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn staged_authority_backend_rejects_a_replaced_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let kindb = directory.path().join("kindb");
+        let detached = directory.path().join("detached-kindb");
+        let backend = create_staged_repository_authority_backend(&kindb).unwrap();
+        std::fs::rename(&kindb, &detached).unwrap();
+        create_private_staging_root(&kindb).unwrap();
+        let repository_id = RepositoryId::new("replaced-root-repository").unwrap();
+
+        let error = match RepositoryAuthorityManager::open(repository_id.clone(), backend) {
+            Ok(_) => panic!("backend accepted a replacement authority root"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("changed since this backend opened"));
+        assert!(
+            !kindb.join(repository_id.as_str()).exists(),
+            "replacement root must remain untouched"
+        );
+        assert!(
+            detached.is_dir(),
+            "original authority root remains recoverable"
+        );
     }
 }

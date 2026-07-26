@@ -15833,9 +15833,11 @@ mod tests {
         bodies: &[(Hash256, &[u8])],
     ) -> RepositoryAuthorityManager<LocalFileBackend> {
         let repository_id = RepositoryId::new(repository_name).unwrap();
+        let kindb = root.join("kindb");
+        std::fs::create_dir(&kindb).unwrap();
         let manager = RepositoryAuthorityManager::open(
             repository_id.clone(),
-            Arc::new(LocalFileBackend::new(root.join("kindb"))),
+            Arc::new(LocalFileBackend::new(kindb)),
         )
         .unwrap();
         for (digest, body) in bodies {
