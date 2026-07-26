@@ -2581,12 +2581,11 @@ async fn command_session_workspace(
 /// publishes one repository-v6 transaction containing the semantic change,
 /// exact tree, workspace base, and named-ref compare-and-swap.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CommandCommitRequest {
     operation_id: kin_model::OperationId,
     timestamp: kin_model::Timestamp,
     message: String,
-    #[serde(default)]
-    dry_run: bool,
     #[serde(default)]
     session_id: Option<String>,
 }
@@ -2693,19 +2692,12 @@ async fn command_commit(
         }
     }
 
-    if request.dry_run {
-        return Ok(Json(CommandCommitResponse {
-            change_id: change_id.to_string(),
-            branch: branch_name.to_string(),
-            entity_count,
-            relation_count,
-            file_count,
-        }));
-    }
-
-    let committed =
-        crate::repository_commit::commit_native_plan(&state.layout, state.blobs.as_ref(), plan)
-            .map_err(repository_commit_error)?;
+    let committed = crate::repository_commit::commit_native_plan_with_projection(
+        &state.layout,
+        state.blobs.as_ref(),
+        plan,
+    )
+    .map_err(repository_commit_error)?;
     state
         .record_repository_authority_commit(committed.receipt.generation)
         .map_err(repository_commit_error)?;
@@ -9617,6 +9609,146 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             generation_before
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_commit_preserves_complete_arbitrary_repository_tree() {
+        use kin_model::RepositoryAuthorityStore as _;
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let state = test_state();
+        let root = state.layout.working_dir();
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        std::fs::write(
+            root.join("compose.yaml"),
+            b"services:\n  app:\n    image: kin:test\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("Dockerfile"), b"FROM scratch\n").unwrap();
+        let mut executable = std::fs::metadata(root.join("Dockerfile"))
+            .unwrap()
+            .permissions();
+        executable.set_mode(0o755);
+        std::fs::set_permissions(root.join("Dockerfile"), executable).unwrap();
+        std::fs::write(root.join("assets/model.bin"), [0, 0xff, 0x41, 0]).unwrap();
+        std::fs::write(
+            root.join("deployment.kin-unknown"),
+            b"opaque=still-repository-truth\n",
+        )
+        .unwrap();
+        symlink("compose.yaml", root.join("current-compose")).unwrap();
+
+        let generation_before = ActiveApiRepositoryAuthority::open(&state.layout)
+            .unwrap()
+            .manager
+            .read_authority()
+            .roots()
+            .generation;
+        let app = router(Arc::clone(&state));
+        let obsolete_dry_run = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": kin_model::Timestamp::now(),
+                            "message": "obsolete dry run must not commit",
+                            "dry_run": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(obsolete_dry_run.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            ActiveApiRepositoryAuthority::open(&state.layout)
+                .unwrap()
+                .manager
+                .read_authority()
+                .roots()
+                .generation,
+            generation_before,
+            "removed dry-run payload must fail before filesystem admission"
+        );
+
+        let response = app
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": kin_model::Timestamp::now(),
+                            "message": "commit the complete arbitrary repository"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response["file_count"], 5);
+        let change_id = kin_model::SemanticChangeId::from_hash(
+            Hash256::from_hex(response["change_id"].as_str().unwrap()).unwrap(),
+        );
+
+        let authority = ActiveApiRepositoryAuthority::open(&state.layout).unwrap();
+        let lease = authority.manager.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .unwrap();
+        assert_eq!(workspace.tree.len(), 5);
+        assert_eq!(workspace.tree, state.graph.resolved_tree());
+        assert_eq!(
+            workspace
+                .tree
+                .artifact_at_path(&RepoPath::from_utf8("Dockerfile").unwrap())
+                .unwrap()
+                .entry,
+            TreeEntry::blob(
+                Hash256::from_bytes(kin_blobs::digest_bytes(b"FROM scratch\n")),
+                true
+            )
+        );
+        assert!(matches!(
+            workspace
+                .tree
+                .artifact_at_path(&RepoPath::from_utf8("current-compose").unwrap())
+                .unwrap()
+                .entry,
+            TreeEntry::Symlink { .. }
+        ));
+        assert_eq!(
+            authority
+                .manager
+                .get_repository_ref(
+                    &authority.repository_id,
+                    lease.metadata().ref_state.default_ref.as_ref().unwrap(),
+                )
+                .unwrap()
+                .unwrap()
+                .target,
+            kin_model::RefTarget::change(change_id)
+        );
+        assert!(lease
+            .snapshot()
+            .changes
+            .iter()
+            .any(|(_, change)| change.id == change_id));
     }
 
     #[tokio::test]

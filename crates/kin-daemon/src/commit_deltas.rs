@@ -433,11 +433,14 @@ mod tests {
             .artifacts_by_path()
             .map(|artifact| artifact.path.clone())
             .collect::<Vec<_>>();
-        let graph_only_paths = previous
-            .artifacts_by_path()
-            .filter(|artifact| matches!(artifact.entry, TreeEntry::Gitlink { .. }))
-            .map(|artifact| artifact.path.clone())
-            .collect::<Vec<_>>();
+        let mut graph_only_paths = Vec::new();
+        for artifact in previous.artifacts_by_path() {
+            if kin_core::source_projection_disposition(&artifact.path, artifact.entry)?
+                != kin_core::SourceProjectionDisposition::Materialized
+            {
+                graph_only_paths.push(artifact.path.clone());
+            }
+        }
         let source = layout.working_dir();
         let ignore =
             kin_index::RepositoryIgnore::load(&source).map_err(kin_index::IndexError::from)?;

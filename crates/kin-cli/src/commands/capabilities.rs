@@ -47,9 +47,12 @@ pub struct CapabilityInventory {
 struct CapabilityReport<'a> {
     schema: &'a str,
     substrate: &'a str,
-    git_replacement_ready: bool,
-    required_ready: usize,
-    required_total: usize,
+    bounded_dogfood_ready: bool,
+    bounded_dogfood_required_ready: usize,
+    bounded_dogfood_required_total: usize,
+    full_git_replacement_ready: bool,
+    ready_commands: usize,
+    command_total: usize,
     commands: &'a [CommandCapability],
 }
 
@@ -92,7 +95,15 @@ pub fn run(json: bool) -> Result<()> {
         .iter()
         .filter(|capability| capability.required_for_bounded_dogfood)
         .collect::<Vec<_>>();
-    let required_ready = required
+    let bounded_dogfood_required_ready = required
+        .iter()
+        .filter(|capability| {
+            capability.status == CapabilityStatus::Ready
+                && capability.exposure == CapabilityExposure::Enabled
+        })
+        .count();
+    let ready_commands = inventory
+        .commands
         .iter()
         .filter(|capability| {
             capability.status == CapabilityStatus::Ready
@@ -102,9 +113,12 @@ pub fn run(json: bool) -> Result<()> {
     let report = CapabilityReport {
         schema: &inventory.schema,
         substrate: &inventory.substrate,
-        git_replacement_ready: required_ready == required.len(),
-        required_ready,
-        required_total: required.len(),
+        bounded_dogfood_ready: bounded_dogfood_required_ready == required.len(),
+        bounded_dogfood_required_ready,
+        bounded_dogfood_required_total: required.len(),
+        full_git_replacement_ready: ready_commands == inventory.commands.len(),
+        ready_commands,
+        command_total: inventory.commands.len(),
         commands: &inventory.commands,
     };
 
@@ -115,14 +129,24 @@ pub fn run(json: bool) -> Result<()> {
 
     println!("Kin repository-v6 command capabilities");
     println!(
-        "Git replacement ready: {} ({}/{})",
-        if report.git_replacement_ready {
+        "Bounded dogfood ready: {} ({}/{})",
+        if report.bounded_dogfood_ready {
             "yes"
         } else {
             "no"
         },
-        report.required_ready,
-        report.required_total
+        report.bounded_dogfood_required_ready,
+        report.bounded_dogfood_required_total
+    );
+    println!(
+        "Full Git replacement ready: {} ({}/{})",
+        if report.full_git_replacement_ready {
+            "yes"
+        } else {
+            "no"
+        },
+        report.ready_commands,
+        report.command_total
     );
     println!();
     for capability in report.commands {

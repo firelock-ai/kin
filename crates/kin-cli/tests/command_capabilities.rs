@@ -36,9 +36,12 @@ fn capability_json_keeps_the_bounded_dogfood_bar_explicit() {
         serde_json::from_slice(&output.stdout).expect("capability stdout should be JSON");
     assert_eq!(report["schema"], "kin.git-replacement-capabilities.v1");
     assert_eq!(report["substrate"], "repository-v6");
-    assert_eq!(report["git_replacement_ready"], false);
-    assert_eq!(report["required_ready"], 10);
-    assert_eq!(report["required_total"], 11);
+    assert_eq!(report["bounded_dogfood_ready"], true);
+    assert_eq!(report["bounded_dogfood_required_ready"], 11);
+    assert_eq!(report["bounded_dogfood_required_total"], 11);
+    assert_eq!(report["full_git_replacement_ready"], false);
+    assert_eq!(report["ready_commands"], 13);
+    assert_eq!(report["command_total"], 32);
 
     let commands = report["commands"]
         .as_array()
@@ -95,19 +98,19 @@ fn capability_json_keeps_the_bounded_dogfood_bar_explicit() {
 }
 
 #[test]
-fn open_gate_commands_fail_before_repository_discovery() {
+fn remaining_open_gate_commands_fail_before_repository_discovery() {
     let root = tempdir().expect("temp root");
     let home = root.path().join("home");
     std::fs::create_dir_all(&home).expect("create home");
 
     let output = kin_command(&home)
-        .args(["commit", "--message", "still gated"])
+        .args(["checkout", "main"])
         .current_dir(root.path())
         .output()
-        .expect("run gated commit");
+        .expect("run gated checkout");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("`kin commit` is fail-closed on repository-v6"));
+    assert!(stderr.contains("`kin checkout` is fail-closed on repository-v6"));
     assert!(stderr.contains("kin capabilities --json"));
 }
 
@@ -125,6 +128,6 @@ fn top_level_help_marks_open_git_replacement_surfaces() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("capabilities"));
     assert!(stdout.contains("Show coherent repository-v6 workspace status"));
-    assert!(stdout.contains("[OPEN GATE] Create an exact semantic and artifact commit"));
+    assert!(stdout.contains("Create an exact semantic and artifact commit"));
     assert!(stdout.contains("Show exact repository-v6 artifact and semantic changes"));
 }

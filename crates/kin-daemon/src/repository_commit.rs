@@ -441,25 +441,38 @@ pub fn commit_native_plan_with_projection(
         authority.save_source_blob(*hash, &body)?;
     }
 
-    let previous_entries = load_projection_entries(&authority, &plan.previous_tree)?;
     let target_entries = load_projection_entries(&authority, &plan.target_tree)?;
-    let (projected, receipt) = kin_core::reconcile_source_tree_and_commit_repository_transaction(
-        layout.working_dir(),
-        &plan.previous_tree,
-        &plan.target_tree,
-        previous_entries
-            .iter()
-            .map(|(path, entry, body)| (path, *entry, body.as_slice())),
-        target_entries
-            .iter()
-            .map(|(path, entry, body)| (path, *entry, body.as_slice())),
-        &authority,
-        plan.transaction,
-    )?;
-    if projected != plan.target_tree.len() {
+    let (projected, receipt) = if plan.previous_tree == plan.target_tree {
+        kin_core::verify_unchanged_source_tree_and_commit_repository_transaction(
+            layout.working_dir(),
+            &plan.target_tree,
+            target_entries
+                .iter()
+                .map(|(path, entry, body)| (path, *entry, body.as_slice())),
+            &authority,
+            plan.transaction,
+        )?
+    } else {
+        let previous_entries = load_projection_entries(&authority, &plan.previous_tree)?;
+        kin_core::reconcile_source_tree_and_commit_repository_transaction(
+            layout.working_dir(),
+            &plan.previous_tree,
+            &plan.target_tree,
+            previous_entries
+                .iter()
+                .map(|(path, entry, body)| (path, *entry, body.as_slice())),
+            target_entries
+                .iter()
+                .map(|(path, entry, body)| (path, *entry, body.as_slice())),
+            &authority,
+            plan.transaction,
+        )?
+    };
+    let materializable = materializable_artifact_count(&plan.target_tree)?;
+    if projected != materializable {
         return Err(invalid(format!(
-            "exact projection installed {projected} artifacts but target authority contains {}",
-            plan.target_tree.len()
+            "exact projection verified {projected} source artifacts but target authority contains \
+             {materializable} materializable artifacts"
         )));
     }
     receipt.validate()?;
@@ -477,11 +490,16 @@ fn load_projection_entries(
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
     tree: &kin_model::ResolvedTree,
 ) -> Result<Vec<(kin_model::RepoPath, kin_model::TreeEntry, Vec<u8>)>> {
-    let mut entries = Vec::with_capacity(tree.len());
+    let mut entries = Vec::with_capacity(materializable_artifact_count(tree)?);
     for artifact in tree.artifacts_by_path() {
+        if kin_core::source_projection_disposition(&artifact.path, artifact.entry)?
+            != kin_core::SourceProjectionDisposition::Materialized
+        {
+            continue;
+        }
         let hash = artifact.entry.blob_identity().ok_or_else(|| {
             invalid(format!(
-                "exact native projection cannot materialize gitlink {}",
+                "materializable repository entry {} has no source identity",
                 artifact.path
             ))
         })?;
@@ -494,6 +512,18 @@ fn load_projection_entries(
         entries.push((artifact.path.clone(), artifact.entry, body));
     }
     Ok(entries)
+}
+
+fn materializable_artifact_count(tree: &kin_model::ResolvedTree) -> Result<usize> {
+    let mut count = 0;
+    for artifact in tree.artifacts_by_path() {
+        if kin_core::source_projection_disposition(&artifact.path, artifact.entry)?
+            == kin_core::SourceProjectionDisposition::Materialized
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 fn repository_identity(layout: &kin_core::KinLayout) -> Result<(RepositoryId, WorkspaceId)> {
@@ -892,6 +922,74 @@ mod tests {
                 assert!(authority.load_source_blob(hash).unwrap().is_some());
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_commit_preserves_host_unrepresentable_byte_exact_path() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        let raw_path = b"assets/icon-\xff.bin";
+        let body = b"\0opaque non-code bytes\xff";
+        let artifact = add_artifact(&graph, &blobs, raw_path, body, |hash| {
+            TreeEntry::blob(hash, false)
+        });
+        let desired = ResolvedTree::from_artifacts([artifact]).unwrap();
+
+        publish_workspace_tree(
+            &init.layout,
+            &blobs,
+            &desired,
+            OperationId::new(),
+            AuthorId::new("admission"),
+        )
+        .unwrap()
+        .expect("raw path must enter workspace authority before commit");
+        let plan = plan_native_commit(
+            &init.layout,
+            &graph,
+            &blobs,
+            OperationId::new(),
+            fixed_timestamp(),
+            AuthorId::new("dogfood"),
+            "commit byte-exact unsupported artifact".to_string(),
+        )
+        .unwrap();
+        let result = commit_native_plan_with_projection(&init.layout, &blobs, plan).unwrap();
+
+        assert_eq!(result.receipt.generation, 3);
+        assert!(
+            !root.path().join("assets").exists(),
+            "host-unrepresentable repository path must remain graph-only"
+        );
+        let authority = reopen(&init);
+        let lease = authority.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == init.workspace_id)
+            .unwrap();
+        assert_eq!(workspace.tree, desired);
+        let raw = workspace
+            .tree
+            .artifact_at_path(&RepoPath::from_bytes(raw_path.to_vec()).unwrap())
+            .unwrap();
+        let digest = raw.entry.blob_identity().unwrap();
+        assert_eq!(
+            authority.load_source_blob(digest).unwrap().as_deref(),
+            Some(body.as_slice())
+        );
+        assert_eq!(
+            authority
+                .get_repository_ref(&init.repository_id, &result.branch)
+                .unwrap()
+                .unwrap()
+                .target,
+            RefTarget::change(result.change.id)
+        );
     }
 
     #[test]
