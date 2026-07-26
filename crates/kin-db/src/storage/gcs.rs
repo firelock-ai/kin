@@ -267,22 +267,6 @@ impl GcsBackend {
         Ok(deltas)
     }
 
-    fn delta_object_identity(
-        deltas: &[(Generation, ObjectMeta)],
-    ) -> Vec<(Generation, String, Option<String>, Option<String>)> {
-        deltas
-            .iter()
-            .map(|(generation, meta)| {
-                (
-                    *generation,
-                    meta.location.to_string(),
-                    meta.version.clone(),
-                    meta.e_tag.clone(),
-                )
-            })
-            .collect()
-    }
-
     fn put_full_snapshot_cas(
         &self,
         repo_id: &str,
@@ -515,73 +499,6 @@ impl StorageBackend for GcsBackend {
         // `load_recovery_state` and `clear_deltas` both list journals and fail
         // closed if a legacy writer raced this commit; Kin's retryable
         // post-commit finalizer exercises that fence immediately.
-        Ok(generation)
-    }
-
-    fn rebuild_legacy_journal(
-        &self,
-        repo_id: &str,
-        data: &[u8],
-        expected_gen: Generation,
-    ) -> Result<Generation, KinDbError> {
-        let _snapshot = crate::storage::format::GraphSnapshot::from_bytes(data)?;
-        let captured = self.list_delta_objects(repo_id)?;
-        if captured.is_empty() {
-            return Err(KinDbError::StorageError(format!(
-                "GCS repo {repo_id} has no legacy journal to rebuild"
-            )));
-        }
-        let captured_identity = Self::delta_object_identity(&captured);
-
-        // GCS legacy filenames were wall-clock values, not a provable chain.
-        // Never infer graph truth from them. The caller supplies reconciled
-        // full bytes; versions are used only to prove the artifact set stayed
-        // unchanged before the conditional snapshot promotion.
-        let rechecked = self.list_delta_objects(repo_id)?;
-        if Self::delta_object_identity(&rechecked) != captured_identity {
-            return Err(KinDbError::StorageError(format!(
-                "GCS legacy journal changed while rebuilding repo {repo_id}; authority was not committed"
-            )));
-        }
-        let generation = self.put_full_snapshot_cas(repo_id, data, expected_gen)?;
-
-        // Authority is durable. Cleanup is deliberately best effort so an
-        // object-store outage cannot strand the caller on the old CAS cursor.
-        // Each object is re-headed and removed only if its version/ETag still
-        // matches the pre-commit capture. Any residual object keeps normal
-        // recovery fail-closed and can be reconciled by retrying this method.
-        for (_, captured_meta) in &captured {
-            let current = match self.block_on(self.store.head(&captured_meta.location)) {
-                Ok(meta) => meta,
-                Err(object_store::Error::NotFound { .. }) => continue,
-                Err(error) => {
-                    tracing::warn!(repo_id, path = %captured_meta.location, error = %error, generation, "GCS rebuild committed; deferred legacy delta verification");
-                    continue;
-                }
-            };
-            if current.version != captured_meta.version || current.e_tag != captured_meta.e_tag {
-                tracing::warn!(repo_id, path = %captured_meta.location, generation, "GCS rebuild preserved a legacy delta that changed after capture");
-                continue;
-            }
-            if let Err(error) = self.block_on(self.store.delete(&captured_meta.location)) {
-                tracing::warn!(repo_id, path = %captured_meta.location, error = %error, generation, "GCS rebuild committed; deferred captured-delta cleanup");
-            }
-        }
-        match self.list_delta_objects(repo_id) {
-            Ok(remaining) if !remaining.is_empty() => tracing::warn!(
-                repo_id,
-                generation,
-                remaining = remaining.len(),
-                "GCS rebuild committed with residual journal artifacts; recovery remains fail-closed"
-            ),
-            Err(error) => tracing::warn!(
-                repo_id,
-                generation,
-                error = %error,
-                "GCS rebuild committed; could not verify journal drain"
-            ),
-            Ok(_) => {}
-        }
         Ok(generation)
     }
 
@@ -1254,84 +1171,6 @@ mod tests {
                 .len(),
             1
         );
-    }
-
-    #[test]
-    fn gcs_explicit_rebuild_uses_caller_truth_and_preserves_committed_cursor() {
-        let store = Arc::new(VersionedMemoryStore::new());
-        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "fixture");
-        let repo_id = "legacy-rebuild";
-        let mut legacy_base = GraphSnapshot::empty();
-        legacy_base.working_tree.insert(
-            "legacy-base.rs".to_string(),
-            crate::types::regular_tree_entry(1),
-        );
-        let snapshot_path = backend.snapshot_path(repo_id);
-        let legacy_put = backend
-            .block_on(store.put(
-                &snapshot_path,
-                PutPayload::from(legacy_base.to_bytes().unwrap()),
-            ))
-            .unwrap();
-        let legacy_generation =
-            GcsBackend::numeric_version(legacy_put.version.as_deref(), "legacy test snapshot")
-                .unwrap();
-        let timestamp_generation = 1_700_000_000_000_000_000_u64;
-        let delta_path = ObjectPath::from(format!(
-            "fixture/{repo_id}/deltas/{timestamp_generation:020}.kndd"
-        ));
-        backend
-            .block_on(
-                store.put(
-                    &delta_path,
-                    PutPayload::from(
-                        crate::storage::delta::GraphSnapshotDelta::empty(legacy_generation)
-                            .to_bytes()
-                            .unwrap(),
-                    ),
-                ),
-            )
-            .unwrap();
-
-        let stale = backend
-            .rebuild_legacy_journal(
-                repo_id,
-                &legacy_base.to_bytes().unwrap(),
-                legacy_generation - 1,
-            )
-            .expect_err("snapshot CAS must reject a stale quiesce cursor");
-        assert!(stale.to_string().contains("generation mismatch"));
-
-        // GCS timestamp filenames are not replay authority. The reconciled
-        // graph below is deliberately caller-supplied and becomes the exact
-        // full snapshot committed by the migration.
-        let mut reconciled = legacy_base.clone();
-        reconciled.working_tree.insert(
-            "reconciled.rs".to_string(),
-            crate::types::regular_tree_entry(2),
-        );
-        store.fail_next_delete();
-        let committed = backend
-            .rebuild_legacy_journal(repo_id, &reconciled.to_bytes().unwrap(), legacy_generation)
-            .expect("conditional authority commit must return despite cleanup failure");
-        assert!(committed > legacy_generation);
-        let (committed_bytes, tuple_generation) = backend.load_snapshot(repo_id).unwrap().unwrap();
-        assert_eq!(tuple_generation, committed);
-        assert_eq!(committed_bytes, reconciled.to_bytes().unwrap());
-        let recovery_error = crate::storage::backend::load_recovered_snapshot(&backend, repo_id)
-            .expect_err("residual journal must keep normal recovery fail-closed");
-        assert!(recovery_error.to_string().contains("mixed-version delta"));
-
-        let retried = backend
-            .rebuild_legacy_journal(repo_id, &reconciled.to_bytes().unwrap(), committed)
-            .unwrap();
-        assert!(retried > committed);
-        assert!(backend.load_deltas_since(repo_id, 0).unwrap().is_empty());
-        let recovered = crate::storage::backend::load_recovered_snapshot(&backend, repo_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(recovered.generation, retried);
-        assert_eq!(recovered.snapshot.working_tree, reconciled.working_tree);
     }
 
     #[test]

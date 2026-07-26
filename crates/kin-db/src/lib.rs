@@ -22,6 +22,7 @@ pub use storage::format::{CompactionStats, GraphSnapshot};
 #[cfg(feature = "gcs")]
 pub use storage::GcsBackend;
 pub use storage::ReadIndex;
+pub use storage::SnapshotManager;
 #[cfg(feature = "vector")]
 pub use storage::VECTOR_INDEX_METADATA_VERSION;
 pub use storage::{
@@ -39,9 +40,6 @@ pub use storage::{
     MAX_SOURCE_BLOB_BYTES,
 };
 pub use storage::{LoadStrategy, SystemMemInfo, TieredConfig, TieredGraph};
-pub use storage::{
-    LocalAuthorityRecoveryDeltaEvidence, LocalAuthorityRecoveryEvidence, SnapshotManager,
-};
 pub use store::{
     ChangeStore, EntityStore, GraphStore, ProvenanceStore, SessionStore, VerificationStore,
     WorkStore,

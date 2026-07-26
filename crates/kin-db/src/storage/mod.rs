@@ -33,11 +33,9 @@ pub use merkle::{
     verify_entity, verify_subgraph, EntityVerification, MerkleHash, RepoTruthHash, TamperedNode,
     VerificationReport, REPO_TRUTH_HASH_VERSION, ZERO_HASH,
 };
+pub use snapshot::SnapshotManager;
 #[cfg(feature = "vector")]
 pub use snapshot::VECTOR_INDEX_METADATA_VERSION;
-pub use snapshot::{
-    LocalAuthorityRecoveryDeltaEvidence, LocalAuthorityRecoveryEvidence, SnapshotManager,
-};
 #[cfg(feature = "sql")]
 pub use sql::SqliteBackend;
 pub use tiered::{LoadStrategy, SystemMemInfo, TieredConfig, TieredGraph};
