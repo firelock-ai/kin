@@ -170,10 +170,9 @@ pub async fn fetch_spine_impact_typed(
         Err(e) => return SpineQuery::Unavailable(format!("failed to build reqwest client: {e}")),
     };
 
-    let resp = match crate::daemon_delegate::with_auth(client.get(format!(
-        "{}/v1/spine/impact",
-        daemon_url.trim_end_matches('/')
-    )))
+    let resp = match crate::daemon_delegate::with_auth(
+        client.get(format!("{}/spine/impact", daemon_url.trim_end_matches('/'))),
+    )
     .query(&[
         ("repo", repo_id),
         ("entity", &entity_id.to_string()),
@@ -216,10 +215,9 @@ pub async fn fetch_spine_xref(
         Err(e) => return SpineQuery::Unavailable(format!("failed to build reqwest client: {e}")),
     };
 
-    let resp = match crate::daemon_delegate::with_auth(client.get(format!(
-        "{}/v1/spine/xref",
-        daemon_url.trim_end_matches('/')
-    )))
+    let resp = match crate::daemon_delegate::with_auth(
+        client.get(format!("{}/spine/xref", daemon_url.trim_end_matches('/'))),
+    )
     .query(&[("repo", repo_id), ("entity", &entity_id.to_string())])
     .send()
     .await

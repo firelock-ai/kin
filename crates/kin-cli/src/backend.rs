@@ -718,10 +718,7 @@ pub async fn get_spine_impact(
         .build()?;
 
     let resp = with_daemon_auth(
-        client.get(format!(
-            "{}/v1/spine/impact",
-            daemon_url.trim_end_matches('/')
-        )),
+        client.get(format!("{}/spine/impact", daemon_url.trim_end_matches('/'))),
         layout,
     )
     .query(&[
@@ -767,10 +764,7 @@ pub async fn get_spine_xref(
         .build()?;
 
     let resp = with_daemon_auth(
-        client.get(format!(
-            "{}/v1/spine/xref",
-            daemon_url.trim_end_matches('/')
-        )),
+        client.get(format!("{}/spine/xref", daemon_url.trim_end_matches('/'))),
         layout,
     )
     .query(&[("repo", repo_id), ("entity", &entity_id.to_string())])

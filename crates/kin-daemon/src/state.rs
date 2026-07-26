@@ -1166,11 +1166,6 @@ impl DaemonState {
         Self::open_with_repo_id(layout, explicit_repo_id.as_deref())
     }
 
-    #[cfg(test)]
-    pub(crate) fn open_for_test(layout: KinLayout, repo_id: &str) -> Result<Self> {
-        Self::open_with_repo_id(layout, Some(repo_id))
-    }
-
     /// Hydrate the daemon's non-authoritative ingestion/projection CAS from one
     /// exact graph-owned workspace tree.
     ///

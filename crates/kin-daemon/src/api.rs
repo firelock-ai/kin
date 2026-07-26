@@ -9287,18 +9287,11 @@ mod tests {
     }
 
     fn test_state() -> Arc<DaemonState> {
-        test_state_with_repo_id(None)
-    }
-
-    fn test_state_with_repo_id(repo_id: Option<&str>) -> Arc<DaemonState> {
         install_test_registry_override();
         let dir = std::env::temp_dir().join(format!("kin-daemon-test-state-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let layout = kin_core::init(&dir).unwrap().layout;
-        Arc::new(match repo_id {
-            Some(repo_id) => DaemonState::open_for_test(layout, repo_id).unwrap(),
-            None => DaemonState::open(layout).unwrap(),
-        })
+        Arc::new(DaemonState::open(layout).unwrap())
     }
 
     #[tokio::test]
@@ -9451,6 +9444,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!first.is_empty());
+        let first_digest: [u8; 32] = Sha256::digest(&first).into();
+        // The archive body deliberately retains the process-wide memory
+        // admission permit for as long as its bytes are alive. Release that
+        // first allocation before asking the single-flight endpoint to
+        // reproduce it, then compare the exact content identity.
+        drop(first);
 
         std::fs::write(
             state.layout.working_dir().join("README.md"),
@@ -9463,7 +9462,8 @@ mod tests {
         let repeated = axum::body::to_bytes(repeated.into_body(), 1024 * 1024)
             .await
             .unwrap();
-        assert_eq!(repeated, first);
+        let repeated_digest: [u8; 32] = Sha256::digest(&repeated).into();
+        assert_eq!(repeated_digest, first_digest);
     }
 
     #[tokio::test]
@@ -12968,10 +12968,16 @@ mod tests {
         use kin_cli::backend::{get_spine_impact, get_spine_xref};
         use kin_mcp::handlers::common::{fetch_spine_impact_typed, fetch_spine_xref};
 
+        // The manifest-generated repository UUID is the local authority
+        // identity. Human fixture labels such as "provider" must never
+        // override or impersonate it.
+        let state = test_state();
+        let provider_repo_id = state.cached_repo_id.clone();
+
         // Fixture: provider exports do_work; consumer imports and calls it.
         let do_work_id = EntityId::new();
         let provider_entry = kin_spine::EntityEntry {
-            repo_id: "provider".to_string(),
+            repo_id: provider_repo_id.clone(),
             entity_id: do_work_id,
             name: "do_work".to_string(),
             kind: kin_model::EntityKind::Function,
@@ -12994,8 +13000,6 @@ mod tests {
 
         // Pin the daemon's canonical graph identity without mutating process
         // environment shared by concurrently executing tests.
-        let state = test_state_with_repo_id(Some("provider"));
-        assert_eq!(state.cached_repo_id, "provider");
         let mut provider_entity = test_entity("do_work", "src/lib.rs");
         provider_entity.id = do_work_id;
         state.graph.upsert_entity(&provider_entity).unwrap();
@@ -13006,7 +13010,7 @@ mod tests {
         let provider_root = hex::encode(state.graph.compute_root_hash());
         {
             let spine = state.ensure_spine().expect("spine enabled in test");
-            spine.register_repo("provider", vec![provider_entry], &provider_root);
+            spine.register_repo(&provider_repo_id, vec![provider_entry], &provider_root);
             spine.register_repo(
                 "consumer",
                 consumer_entities
@@ -13048,28 +13052,38 @@ mod tests {
 
         // ── Surface 1: daemon HTTP (also the KinLab fetch contract). ──
         let http = reqwest::Client::new();
-        let http_xref: serde_json::Value = http
-            .get(format!("{base}/v1/spine/xref"))
+        let http_xref_response = http
+            .get(format!("{base}/spine/xref"))
             .query(&[("repo", "consumer"), ("entity", run_task_str.as_str())])
             .send()
             .await
-            .expect("daemon xref request")
-            .json()
-            .await
-            .expect("daemon xref json");
+            .expect("daemon xref request");
+        let http_xref_status = http_xref_response.status();
+        let http_xref_bytes = http_xref_response.bytes().await.expect("daemon xref body");
+        assert!(
+            http_xref_status.is_success(),
+            "daemon xref returned {http_xref_status}: {}",
+            String::from_utf8_lossy(&http_xref_bytes)
+        );
+        let http_xref: serde_json::Value =
+            serde_json::from_slice(&http_xref_bytes).expect("daemon xref json");
         let daemon_xref_to_provider = http_xref["edges"]
             .as_array()
-            .map(|edges| edges.iter().any(|e| e["dst_repo"] == "provider"))
+            .map(|edges| {
+                edges
+                    .iter()
+                    .any(|e| e["dst_repo"].as_str() == Some(provider_repo_id.as_str()))
+            })
             .unwrap_or(false);
         assert!(
             daemon_xref_to_provider,
-            "daemon /v1/spine/xref must resolve the consumer->provider edge: {http_xref}"
+            "daemon /spine/xref must resolve the consumer->provider edge: {http_xref}"
         );
 
         let http_impact: serde_json::Value = http
-            .get(format!("{base}/v1/spine/impact"))
+            .get(format!("{base}/spine/impact"))
             .query(&[
-                ("repo", "provider"),
+                ("repo", provider_repo_id.as_str()),
                 ("entity", do_work_str.as_str()),
                 ("depth", "5"),
             ])
@@ -13085,7 +13099,7 @@ mod tests {
             .unwrap_or(false);
         assert!(
             daemon_impact_hits_consumer,
-            "daemon /v1/spine/impact blast radius must include consumer: {http_impact}"
+            "daemon /spine/impact blast radius must include consumer: {http_impact}"
         );
 
         // ── Surface 2: the `kin xref` / `kin impact` CLI client code. ──
@@ -13096,13 +13110,16 @@ mod tests {
             kin_spine::SpineQuery::Found(response) => response,
             other => panic!("CLI get_spine_xref expected Found, got {other:?}"),
         };
-        let cli_xref_to_provider = cli_xref.edges.iter().any(|e| e.dst_repo == "provider");
+        let cli_xref_to_provider = cli_xref
+            .edges
+            .iter()
+            .any(|e| e.dst_repo == provider_repo_id);
         assert!(
             cli_xref_to_provider,
             "kin xref CLI must resolve consumer->provider: {cli_xref:?}"
         );
 
-        let cli_impact = match get_spine_impact(&layout, "provider", &do_work_id, 5)
+        let cli_impact = match get_spine_impact(&layout, &provider_repo_id, &do_work_id, 5)
             .await
             .expect("CLI get_spine_impact call")
         {
@@ -13124,13 +13141,13 @@ mod tests {
         let mcp_xref_to_provider = mcp_xref
             .edges
             .iter()
-            .any(|edge| edge.dst_repo == "provider");
+            .any(|edge| edge.dst_repo == provider_repo_id);
         assert!(
             mcp_xref_to_provider,
             "MCP fetch_spine_xref must resolve consumer->provider: {mcp_xref:?}"
         );
 
-        let mcp_impact = match fetch_spine_impact_typed("provider", &do_work_id, 5).await {
+        let mcp_impact = match fetch_spine_impact_typed(&provider_repo_id, &do_work_id, 5).await {
             kin_spine::SpineQuery::Found(impact) => impact,
             other => panic!("MCP fetch_spine_impact_typed expected Found, got {other:?}"),
         };
@@ -13181,13 +13198,13 @@ mod tests {
         assert_eq!(body["cross_repo"]["authority_complete"], true);
         assert_eq!(
             body["cross_repo"]["authority_anchor"]["repo_id"],
-            "provider"
+            provider_repo_id
         );
         assert!(body["cross_repo"]["authority_revision"]
             .as_str()
             .is_some_and(|revision| revision.starts_with("sha256:")));
         assert_eq!(
-            body["cross_repo"]["authority_roots"]["provider"],
+            body["cross_repo"]["authority_roots"][provider_repo_id.as_str()],
             provider_root
         );
         assert!(body["references"].as_array().is_some_and(|references| {
@@ -13202,7 +13219,8 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_mcp_bulk_reachability_uses_exact_federated_authority() {
-        let state = test_state_with_repo_id(Some("provider"));
+        let state = test_state();
+        let provider_repo_id = state.cached_repo_id.clone();
         let target = test_entity("target", "src/lib.rs");
         let source = test_entity("caller", "src/app.rs");
         state.graph.upsert_entity(&target).unwrap();
@@ -13213,7 +13231,7 @@ mod tests {
         let spine = state.ensure_spine().expect("spine enabled in test");
         let provider_root = hex::encode(state.graph.compute_root_hash());
         assert_eq!(
-            spine.root_hash("provider").as_deref(),
+            spine.root_hash(&provider_repo_id).as_deref(),
             Some(provider_root.as_str())
         );
         spine.register_repo(
@@ -13229,7 +13247,7 @@ mod tests {
         spine.add_cross_repo_edge(kin_spine::CrossRepoEdge {
             src_repo: "consumer".to_string(),
             src_entity: source.id,
-            dst_repo: "provider".to_string(),
+            dst_repo: provider_repo_id.clone(),
             dst_entity: target.id,
             confidence: 0.9,
         });
@@ -13257,7 +13275,7 @@ mod tests {
         assert_eq!(body["results"][0]["federated_reference_count"], 1);
         assert_eq!(body["cross_repo"]["authority_complete"], true);
         assert_eq!(
-            body["cross_repo"]["authority_roots"]["provider"],
+            body["cross_repo"]["authority_roots"][provider_repo_id.as_str()],
             provider_root
         );
         assert_eq!(body["negative"]["safe_to_conclude_absent"], true);
@@ -13265,7 +13283,8 @@ mod tests {
 
     #[tokio::test]
     async fn xref_reads_retry_when_head_mutates_between_root_and_read_even_after_aba() {
-        let state = test_state_with_repo_id(Some("provider"));
+        let state = test_state();
+        let provider_repo_id = state.cached_repo_id.clone();
         let target = test_entity("target", "src/lib.rs");
         state.graph.upsert_entity(&target).unwrap();
         let stable_root = state.graph.compute_root_hash();
@@ -13278,7 +13297,7 @@ mod tests {
         // retry while each handler reads its detached snapshot.
         let spine = state.ensure_spine().expect("spine enabled in test");
         assert_eq!(
-            spine.root_hash("provider").as_deref(),
+            spine.root_hash(&provider_repo_id).as_deref(),
             Some(stable_root_hex.as_str())
         );
         assert!(
@@ -13323,7 +13342,7 @@ mod tests {
         assert!(command
             .spine
             .as_ref()
-            .is_some_and(|body| body.authority_complete_for("provider", &target.id)));
+            .is_some_and(|body| body.authority_complete_for(&provider_repo_id, &target.id)));
 
         let arguments = serde_json::from_value::<HashMap<String, serde_json::Value>>(json!({
             "entity_id": target.id.to_string(),
@@ -13402,7 +13421,7 @@ mod tests {
 
     #[test]
     fn mutation_wrapper_blocks_xref_during_stalled_head_and_session_batches() {
-        let state = test_state_with_repo_id(Some("provider"));
+        let state = test_state();
         let head_target = test_entity("head_target", "src/head.rs");
         state.graph.upsert_entity(&head_target).unwrap();
 
@@ -13470,7 +13489,7 @@ mod tests {
 
     #[tokio::test]
     async fn scoped_xref_fails_closed_when_selected_scope_is_replaced_mid_read() {
-        let state = test_state_with_repo_id(Some("provider"));
+        let state = test_state();
         let scoped_graph = Arc::new(kin_db::InMemoryGraph::new());
         let target = test_entity("historical_target", "src/lib.rs");
         scoped_graph.upsert_entity(&target).unwrap();
