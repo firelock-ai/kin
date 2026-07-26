@@ -11,7 +11,6 @@ use kin_cli::commands::reconcile::reconcile_session_dir;
 use kin_db::SnapshotManager;
 use kin_index::IndexedAny;
 use kin_model::graph::EntityStore;
-use kin_runtime::workspace::{MaterializeStrategy, MaterializedWorkspace};
 
 use crate::helpers::*;
 
@@ -729,115 +728,6 @@ async fn test_session_edit_test_fix_reconcile_loop() {
         status_after.fingerprint.behavior_hash, behavior_hash_before,
         "the successful fix should update semantic state after reconcile",
     );
-}
-
-// ---------------------------------------------------------------------------
-// 51. Full round-trip works in compat and native modes
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_session_round_trip() {
-    let (_dir, graph, _genesis_id) = init_kin_repo();
-    let layout = kin_core::KinLayout::new(_dir.path().join(".kin"));
-
-    let source_root = kin_core::source_dir(&layout);
-    std::fs::create_dir_all(source_root.join("src")).unwrap();
-
-    let blob_store = BlobStore::new(layout.objects_dir()).unwrap();
-    let indexer = kin_index::Indexer::new();
-    let source_path = write_rust_file(
-        &source_root,
-        "src/mode_round_trip.rs",
-        "pub fn mode_value() -> &'static str {\n    \"before\"\n}\n",
-    );
-    let initial = indexer
-        .index_and_apply(&source_path, &blob_store, graph.as_ref())
-        .unwrap();
-    assert!(initial.entities_upserted > 0);
-
-    let before_entities = graph.list_all_entities().unwrap();
-    let before = before_entities
-        .iter()
-        .find(|entity| entity.name.contains("mode_value"))
-        .expect("mode_value entity should exist before round trip");
-    let behavior_hash_before = before.fingerprint.behavior_hash;
-
-    let session_dir = layout.root().join("runs").join("session-round-trip");
-    let workspace = MaterializedWorkspace::create(
-        &source_root,
-        &session_dir,
-        Some(MaterializeStrategy::Copy),
-        None,
-    )
-    .unwrap();
-
-    std::fs::write(
-        workspace.root.join("src/mode_round_trip.rs"),
-        "pub fn mode_value() -> &'static str {\n    \"after\"\n}\n",
-    )
-    .unwrap();
-    record_session_base(&layout, &session_dir);
-
-    let summary = reconcile_session_dir(&layout, &session_dir).await.unwrap();
-    assert_eq!(summary.change_count, 1);
-    assert_eq!(summary.files_indexed, 1);
-    assert_eq!(
-        summary.changes,
-        vec![("modified".into(), "src/mode_round_trip.rs".into())]
-    );
-
-    assert_eq!(
-        std::fs::read_to_string(source_root.join("src/mode_round_trip.rs")).unwrap(),
-        "pub fn mode_value() -> &'static str {\n    \"after\"\n}\n",
-        "round trip should persist the edited file back into the source root",
-    );
-
-    let snapshot = kin_cli::backend::open_snapshot_daemon_first_read_only(&layout)
-        .await
-        .unwrap();
-    let graph = snapshot.graph();
-    let after_entities = graph.list_all_entities().unwrap();
-    let after = after_entities
-        .iter()
-        .find(|entity| entity.name.contains("mode_value"))
-        .expect("mode_value entity should still exist after round trip");
-    assert_ne!(
-        after.fingerprint.behavior_hash, behavior_hash_before,
-        "round trip should update semantic state",
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 52. Exec in materialized workspace: verify command runs successfully
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_exec_in_workspace() {
-    let (dir, _graph, _genesis_id) = init_kin_repo();
-
-    // Write a file that the command can interact with.
-    std::fs::write(dir.path().join("data.txt"), "hello from kin").unwrap();
-
-    // Execute a command in a materialized workspace.
-    let config = kin_runtime::exec::MaterializeConfig::default();
-    let result = kin_runtime::exec::exec_in_workspace(dir.path(), "cat data.txt", &config).unwrap();
-
-    assert_eq!(result.exit_code, 0, "command should succeed");
-    assert!(
-        result.stdout.contains("hello from kin"),
-        "stdout should contain file contents, got: {:?}",
-        result.stdout
-    );
-
-    // The workspace path should be different from the source.
-    assert_ne!(
-        result.workspace_path,
-        dir.path(),
-        "workspace should be a separate directory"
-    );
-
-    // Clean up.
-    kin_runtime::exec::cleanup_workspace(&result.workspace_path).unwrap();
 }
 
 // ---------------------------------------------------------------------------

@@ -16,7 +16,7 @@ pub mod workspace;
 
 pub use error::{Result, RuntimeError};
 pub use evidence::{parse_test_output, store_evidence, CapturedEvidence};
-pub use exec::{cleanup_workspace, exec_in_workspace, ExecContext, ExecResult, MaterializeConfig};
+pub use exec::{ExecContext, ExecResult};
 pub use replay::{extract_replay_metadata, ReplayMetadata};
 pub use run::{create_run, execute_run, RunOptions, RunStatus, ValidationRun};
 pub use workspace::{MaterializeStrategy, MaterializedWorkspace};
