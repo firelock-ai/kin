@@ -197,11 +197,676 @@ pub fn reconcile_source_tree_with_mutation_hooks<'a, 'b>(
     )
 }
 
+/// Reconcile a graph-derived working tree and linearize its repository-v6
+/// workspace transaction at the projection transaction's commit boundary.
+///
+/// The projection WAL records the exact repository operation before any
+/// namespace mutation. Recovery rolls the filesystem back when that operation
+/// is absent and finalizes the target projection when the exact operation was
+/// durably committed, closing the process-crash window between the two stores.
+pub fn reconcile_source_tree_and_commit_repository_transaction<'a, 'b>(
+    root: &Path,
+    previous_tree: &ResolvedTree,
+    target_tree: &ResolvedTree,
+    previous_entries: impl IntoIterator<Item = (&'b RepoPath, TreeEntry, &'b [u8])>,
+    entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    transaction: RepositoryTransaction,
+) -> Result<(usize, RepositoryCommitReceipt)> {
+    let entries = validated_source_entries(entries)?;
+    let previous_entries = validated_source_entries(previous_entries)?;
+    validate_repository_projection_transaction(
+        previous_tree,
+        target_tree,
+        &previous_entries,
+        &entries,
+        &transaction,
+    )?;
+    let marker = ReconciliationAuthorityCommit {
+        repository_id: transaction.repository_id.clone(),
+        operation_id: transaction.operation_id,
+        transaction_hash: transaction
+            .transaction_hash()
+            .map_err(|error| KinError::Other(error.to_string()))?,
+    };
+    project_reconciled_source_tree_and_commit(
+        root,
+        &previous_entries,
+        &entries,
+        &should_preserve_checkout_path,
+        || {},
+        || {},
+        Some(marker),
+        || commit_repository_transaction_exact(authority, transaction),
+    )
+}
+
+fn validate_repository_projection_transaction(
+    previous_tree: &ResolvedTree,
+    target_tree: &ResolvedTree,
+    previous_entries: &[ValidatedSourceEntry<'_>],
+    entries: &[ValidatedSourceEntry<'_>],
+    transaction: &RepositoryTransaction,
+) -> Result<()> {
+    let mutation = transaction.workspace_mutation.as_ref().ok_or_else(|| {
+        KinError::Other(
+            "exact-source repository projection requires one workspace mutation".to_string(),
+        )
+    })?;
+    let transitioned = previous_tree
+        .apply(&mutation.tree_deltas)
+        .map_err(|error| KinError::Other(format!("apply workspace projection deltas: {error}")))?;
+    if transitioned != *target_tree {
+        return Err(KinError::Other(
+            "workspace mutation deltas do not produce the requested projection tree".to_string(),
+        ));
+    }
+    let target_tree_hash = compute_resolved_tree_hash(target_tree)
+        .map_err(|error| KinError::Other(error.to_string()))?;
+    if mutation.new_tree_hash != target_tree_hash {
+        return Err(KinError::Other(format!(
+            "workspace mutation tree hash {} does not match requested projection tree {}",
+            mutation.new_tree_hash, target_tree_hash
+        )));
+    }
+    validate_projection_entries_match_tree("previous", previous_tree, previous_entries)?;
+    validate_projection_entries_match_tree("target", target_tree, entries)?;
+    Ok(())
+}
+
+fn validate_projection_entries_match_tree(
+    label: &str,
+    tree: &ResolvedTree,
+    entries: &[ValidatedSourceEntry<'_>],
+) -> Result<()> {
+    let mut expected = tree
+        .artifacts()
+        .map(|artifact| (&artifact.path, artifact.entry))
+        .collect::<Vec<_>>();
+    expected.sort_by(|left, right| left.0.cmp(right.0));
+    if expected.len() != entries.len()
+        || expected
+            .iter()
+            .zip(entries)
+            .any(|((path, kind), entry)| *path != entry.file_id || *kind != entry.kind)
+    {
+        return Err(KinError::Other(format!(
+            "{label} exact-source bodies do not cover the complete graph tree"
+        )));
+    }
+    for entry in entries {
+        let expected_hash = entry.kind.blob_identity().ok_or_else(|| {
+            KinError::Other(format!(
+                "{label} graph tree contains unmaterializable gitlink {}",
+                entry.file_id
+            ))
+        })?;
+        let actual_hash = kin_blobs::digest(entry.content);
+        if actual_hash != expected_hash {
+            return Err(KinError::Other(format!(
+                "{label} source body for {} hashes to {}, expected repository CAS object {}",
+                entry.file_id, actual_hash, expected_hash
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn load_projection_proof_blob(
+    blobs: &kin_blobs::BlobStore,
+    path: &RepoPath,
+    entry: TreeEntry,
+) -> Result<Vec<u8>> {
+    let expected = entry.blob_identity().ok_or_else(|| {
+        KinError::Other(format!(
+            "graph tree contains unmaterializable gitlink {path}"
+        ))
+    })?;
+    let blob_hash = kin_blobs::Hash256::from_bytes(*expected.as_bytes());
+    let content = blobs.read(&blob_hash).map_err(|error| {
+        KinError::Other(format!(
+            "load exact projection body {expected} for {path}: {error}"
+        ))
+    })?;
+    let actual = kin_blobs::digest(&content);
+    if actual.as_bytes() != expected.as_bytes() {
+        return Err(KinError::Other(format!(
+            "exact projection body for {path} hashes to {actual}, expected repository CAS object {expected}"
+        )));
+    }
+    Ok(content)
+}
+
+/// Initialize the reconciliation control state inside an existing `.kin`
+/// directory.
+///
+/// Repository initialization calls this against its private staging
+/// directory, before publishing that directory as `.kin`. Runtime exact-tree
+/// guards deliberately use an existing-only open instead, so a missing lock or
+/// authority key is never repaired while repository authority is being frozen.
+pub(crate) fn initialize_projection_control_directory(kin_dir: &Path) -> Result<()> {
+    #[cfg(any(unix, windows))]
+    {
+        let kin_control = open_projection_root_nofollow(kin_dir)?;
+        let display_control = kin_dir.join(RECONCILIATION_CONTROL_DIRECTORY);
+        let control = open_or_create_private_directory(
+            &kin_control,
+            std::ffi::OsStr::new(RECONCILIATION_CONTROL_DIRECTORY),
+            &display_control,
+        )?;
+        let (_projection_lock, _projection_lock_identity) = acquire_reconciliation_projection_lock(
+            &control,
+            &display_control,
+            PROJECTION_LOCK_WAIT_DEADLINE,
+        )?;
+        load_or_create_reconciliation_authority_key(&control, &display_control)?;
+        sync_directory_capability(&control, &display_control)?;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = kin_dir;
+        Err(unsupported_safe_projection_error())
+    }
+}
+
+/// Exclusive, non-creating capability over an existing exact-source projection.
+///
+/// The guard holds Kin's projection lock and no-follow capabilities for the
+/// working root and `.kin/reconciliation` namespace. It does not open repository
+/// authority, so callers that also freeze repository-v6 state must acquire this
+/// guard first and retain it while they acquire authority.
+pub struct ExactProjectionFreeze {
+    #[cfg(any(unix, windows))]
+    projection: ProjectionRoot,
+    #[cfg(any(unix, windows))]
+    root_identity: TrackedEntryIdentity,
+}
+
+/// Identity-bound proof that one complete [`ResolvedTree`] matched the working
+/// projection while an [`ExactProjectionFreeze`] was held.
+pub struct ExactProjectionVerification {
+    tree_hash: Hash256,
+    #[cfg(any(unix, windows))]
+    entries: Vec<ExactProjectionVerifiedEntry>,
+}
+
+#[cfg(any(unix, windows))]
+struct ExactProjectionVerifiedEntry {
+    path: RepoPath,
+    kind: TreeEntry,
+    identity: TrackedEntryIdentity,
+}
+
+/// Retained, no-follow capability for an already-created eject archive.
+///
+/// Keeping this target alive prevents the final metadata move from reopening
+/// an ambient destination path after verification.
+pub struct ExactProjectionDetachTarget {
+    #[cfg(any(unix, windows))]
+    parent: cap_std::fs::Dir,
+    #[cfg(any(unix, windows))]
+    directory: cap_std::fs::Dir,
+    #[cfg(any(unix, windows))]
+    name: OsString,
+    #[cfg(any(unix, windows))]
+    identity: TrackedEntryIdentity,
+    display_path: std::path::PathBuf,
+}
+
+impl std::fmt::Debug for ExactProjectionFreeze {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExactProjectionFreeze")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ExactProjectionVerification {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExactProjectionVerification")
+            .field("tree_hash", &self.tree_hash)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ExactProjectionDetachTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExactProjectionDetachTarget")
+            .field("display_path", &self.display_path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExactProjectionDetachTarget {
+    /// Retain an already-created real directory without following its leaf.
+    pub fn open_existing(path: &Path) -> Result<Self> {
+        #[cfg(any(unix, windows))]
+        {
+            let parent_path = path.parent().ok_or_else(|| {
+                KinError::Other(format!(
+                    "projection detach target has no parent: {}",
+                    path.display()
+                ))
+            })?;
+            let name = path.file_name().ok_or_else(|| {
+                KinError::Other(format!(
+                    "projection detach target has no file name: {}",
+                    path.display()
+                ))
+            })?;
+            let parent = open_projection_root_nofollow(parent_path)?;
+            let directory = open_directory_nofollow(&parent, name)
+                .map_err(|error| KinError::io(path, error))?;
+            let identity = tracked_open_directory_identity(&directory)
+                .map_err(|error| KinError::io(path, error))?;
+            Ok(Self {
+                parent,
+                directory,
+                name: name.to_os_string(),
+                identity,
+                display_path: path.to_path_buf(),
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = path;
+            Err(unsupported_safe_projection_error())
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn revalidate(&self) -> Result<()> {
+        let named = open_directory_nofollow(&self.parent, &self.name)
+            .map_err(|error| KinError::io(&self.display_path, error))?;
+        if tracked_open_directory_identity(&named)
+            .map_err(|error| KinError::io(&self.display_path, error))?
+            != self.identity
+        {
+            return Err(KinError::Other(format!(
+                "projection detach target {} was replaced while retained",
+                self.display_path.display()
+            )));
+        }
+        if tracked_open_directory_identity(&self.directory)
+            .map_err(|error| KinError::io(&self.display_path, error))?
+            != self.identity
+        {
+            return Err(KinError::Other(format!(
+                "retained projection detach target {} changed identity",
+                self.display_path.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl ExactProjectionFreeze {
+    /// Acquire the existing projection lock without creating `.kin`, its
+    /// reconciliation directory, lock file, or authority key.
+    pub fn acquire_existing(root: &Path) -> Result<Self> {
+        #[cfg(any(unix, windows))]
+        {
+            let projection =
+                ProjectionRoot::open_existing_for_freeze(root, PROJECTION_LOCK_WAIT_DEADLINE)?;
+            let root_identity = tracked_open_directory_identity(&projection.root)
+                .map_err(|error| KinError::io(root, error))?;
+            let freeze = Self {
+                projection,
+                root_identity,
+            };
+            freeze.revalidate_namespace()?;
+            Ok(freeze)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = root;
+            Err(unsupported_safe_projection_error())
+        }
+    }
+
+    /// Verify exact bytes, Git mode/kind, and symbolic-link targets for every
+    /// artifact in `tree`, traversing every ancestor through no-follow handles.
+    ///
+    /// Extra untracked working-copy paths are deliberately outside this proof:
+    /// they remain ordinary untracked files after eject rather than becoming
+    /// repository authority.
+    pub fn verify_resolved_tree<'a>(
+        &self,
+        tree: &ResolvedTree,
+        entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
+    ) -> Result<ExactProjectionVerification> {
+        #[cfg(any(unix, windows))]
+        {
+            self.revalidate_namespace()?;
+            let entries = validated_projection_proof_entries(entries)?;
+            validate_projection_entries_match_tree("frozen", tree, &entries)?;
+            let entry_refs = entries.iter().collect::<Vec<_>>();
+            let identities = self
+                .projection
+                .validate_frozen_entries_unchanged(&entry_refs)?;
+            self.revalidate_namespace()?;
+            let tree_hash = compute_resolved_tree_hash(tree)
+                .map_err(|error| KinError::Other(error.to_string()))?;
+            Ok(ExactProjectionVerification {
+                tree_hash,
+                entries: entries
+                    .into_iter()
+                    .zip(identities)
+                    .map(|(entry, identity)| ExactProjectionVerifiedEntry {
+                        path: entry.file_id.clone(),
+                        kind: entry.kind,
+                        identity,
+                    })
+                    .collect(),
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (tree, entries);
+            Err(unsupported_safe_projection_error())
+        }
+    }
+
+    /// Bounded-memory variant of [`Self::verify_resolved_tree`] that reads one
+    /// exact body at a time from a content-addressed blob store.
+    pub fn verify_resolved_tree_from_blobs(
+        &self,
+        tree: &ResolvedTree,
+        blobs: &kin_blobs::BlobStore,
+    ) -> Result<ExactProjectionVerification> {
+        #[cfg(any(unix, windows))]
+        {
+            self.revalidate_namespace()?;
+            validate_projection_proof_paths(
+                tree.artifacts_by_path().map(|artifact| &artifact.path),
+            )?;
+            let mut verified = Vec::with_capacity(tree.len());
+            for artifact in tree.artifacts_by_path() {
+                validate_projection_proof_entry_path(&artifact.path, artifact.entry)?;
+                let content = load_projection_proof_blob(blobs, &artifact.path, artifact.entry)?;
+                let entry = ValidatedSourceEntry {
+                    file_id: &artifact.path,
+                    kind: artifact.entry,
+                    content: &content,
+                };
+                let identity = self.projection.validate_frozen_entry_unchanged(&entry)?;
+                verified.push(ExactProjectionVerifiedEntry {
+                    path: artifact.path.clone(),
+                    kind: artifact.entry,
+                    identity,
+                });
+            }
+            self.revalidate_namespace()?;
+            let tree_hash = compute_resolved_tree_hash(tree)
+                .map_err(|error| KinError::Other(error.to_string()))?;
+            Ok(ExactProjectionVerification {
+                tree_hash,
+                entries: verified,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (tree, blobs);
+            Err(unsupported_safe_projection_error())
+        }
+    }
+
+    /// Revalidate a prior exact proof, including object identities, immediately
+    /// before a namespace transition.
+    pub fn revalidate_resolved_tree<'a>(
+        &self,
+        verification: &ExactProjectionVerification,
+        tree: &ResolvedTree,
+        entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
+    ) -> Result<()> {
+        #[cfg(any(unix, windows))]
+        {
+            self.revalidate_namespace()?;
+            let tree_hash = compute_resolved_tree_hash(tree)
+                .map_err(|error| KinError::Other(error.to_string()))?;
+            if tree_hash != verification.tree_hash {
+                return Err(KinError::Other(
+                    "resolved projection tree changed after exact verification".to_string(),
+                ));
+            }
+            let entries = validated_projection_proof_entries(entries)?;
+            validate_projection_entries_match_tree("revalidated", tree, &entries)?;
+            if entries.len() != verification.entries.len()
+                || entries
+                    .iter()
+                    .zip(&verification.entries)
+                    .any(|(entry, verified)| {
+                        entry.file_id != &verified.path || entry.kind != verified.kind
+                    })
+            {
+                return Err(KinError::Other(
+                    "exact projection verification does not describe this resolved tree"
+                        .to_string(),
+                ));
+            }
+            let entry_refs = entries.iter().collect::<Vec<_>>();
+            let expected_identities = verification
+                .entries
+                .iter()
+                .map(|entry| entry.identity)
+                .collect::<Vec<_>>();
+            self.projection
+                .revalidate_frozen_entries_unchanged(&entry_refs, &expected_identities)?;
+            self.revalidate_namespace()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (verification, tree, entries);
+            Err(unsupported_safe_projection_error())
+        }
+    }
+
+    /// Bounded-memory variant of [`Self::revalidate_resolved_tree`].
+    pub fn revalidate_resolved_tree_from_blobs(
+        &self,
+        verification: &ExactProjectionVerification,
+        tree: &ResolvedTree,
+        blobs: &kin_blobs::BlobStore,
+    ) -> Result<()> {
+        #[cfg(any(unix, windows))]
+        {
+            self.revalidate_namespace()?;
+            let tree_hash = compute_resolved_tree_hash(tree)
+                .map_err(|error| KinError::Other(error.to_string()))?;
+            if tree_hash != verification.tree_hash {
+                return Err(KinError::Other(
+                    "resolved projection tree changed after exact verification".to_string(),
+                ));
+            }
+            validate_projection_proof_paths(
+                tree.artifacts_by_path().map(|artifact| &artifact.path),
+            )?;
+            if tree.len() != verification.entries.len() {
+                return Err(KinError::Other(
+                    "exact projection verification does not cover this resolved tree".to_string(),
+                ));
+            }
+            for (artifact, verified) in tree.artifacts_by_path().zip(verification.entries.iter()) {
+                if artifact.path != verified.path || artifact.entry != verified.kind {
+                    return Err(KinError::Other(
+                        "exact projection verification does not describe this resolved tree"
+                            .to_string(),
+                    ));
+                }
+                let path = validate_projection_proof_entry_path(&artifact.path, artifact.entry)?;
+                let content = load_projection_proof_blob(blobs, &artifact.path, artifact.entry)?;
+                let entry = ValidatedSourceEntry {
+                    file_id: &artifact.path,
+                    kind: artifact.entry,
+                    content: &content,
+                };
+                let identity = self.projection.validate_frozen_entry_unchanged(&entry)?;
+                if identity != verified.identity {
+                    return Err(KinError::Other(format!(
+                        "tracked working-copy path {} changed object identity after exact projection verification",
+                        self.projection.display_root.join(path.relative).display()
+                    )));
+                }
+            }
+            self.revalidate_namespace()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (verification, tree, blobs);
+            Err(unsupported_safe_projection_error())
+        }
+    }
+
+    /// Revalidate the exact projection and atomically move the retained `.kin`
+    /// directory into `target/destination_name` without replacement.
+    ///
+    /// This consumes the guard so its kernel lock remains held through the
+    /// identity-checked move and is released only after `.kin` is detached.
+    pub fn detach_verified_to<'a>(
+        self,
+        verification: &ExactProjectionVerification,
+        tree: &ResolvedTree,
+        entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
+        target: &ExactProjectionDetachTarget,
+        destination_name: &std::ffi::OsStr,
+    ) -> Result<()> {
+        #[cfg(any(unix, windows))]
+        {
+            self.revalidate_resolved_tree(verification, tree, entries)?;
+            self.detach_after_revalidation(target, destination_name)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (verification, tree, entries, target, destination_name);
+            Err(unsupported_safe_projection_error())
+        }
+    }
+
+    /// Bounded-memory variant of [`Self::detach_verified_to`].
+    pub fn detach_verified_to_from_blobs(
+        self,
+        verification: &ExactProjectionVerification,
+        tree: &ResolvedTree,
+        blobs: &kin_blobs::BlobStore,
+        target: &ExactProjectionDetachTarget,
+        destination_name: &std::ffi::OsStr,
+    ) -> Result<()> {
+        #[cfg(any(unix, windows))]
+        {
+            self.revalidate_resolved_tree_from_blobs(verification, tree, blobs)?;
+            self.detach_after_revalidation(target, destination_name)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (verification, tree, blobs, target, destination_name);
+            Err(unsupported_safe_projection_error())
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn detach_after_revalidation(
+        self,
+        target: &ExactProjectionDetachTarget,
+        destination_name: &std::ffi::OsStr,
+    ) -> Result<()> {
+        let mut components = Path::new(destination_name).components();
+        if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+            || components.next().is_some()
+        {
+            return Err(KinError::Other(format!(
+                "projection detach destination is not one safe path component: {:?}",
+                destination_name
+            )));
+        }
+        target.revalidate()?;
+        self.revalidate_namespace()?;
+        self.projection
+            .move_open_directory_from_expected_source_exact(
+                NamedEntryLocation {
+                    parent: &self.projection.root,
+                    name: std::ffi::OsStr::new(".kin"),
+                },
+                NamedEntryLocation {
+                    parent: &target.directory,
+                    name: destination_name,
+                },
+                &self.projection.kin_control,
+                self.projection.kin_control_identity,
+                &self.projection.display_root.join(".kin"),
+            )
+    }
+
+    #[cfg(any(unix, windows))]
+    fn revalidate_namespace(&self) -> Result<()> {
+        let named_root = open_projection_root_nofollow(&self.projection.display_root)?;
+        if tracked_open_directory_identity(&named_root)
+            .map_err(|error| KinError::io(&self.projection.display_root, error))?
+            != self.root_identity
+        {
+            return Err(KinError::Other(format!(
+                "projection root {} was replaced while frozen",
+                self.projection.display_root.display()
+            )));
+        }
+        if tracked_open_directory_identity(&self.projection.root)
+            .map_err(|error| KinError::io(&self.projection.display_root, error))?
+            != self.root_identity
+        {
+            return Err(KinError::Other(format!(
+                "retained projection root {} changed identity",
+                self.projection.display_root.display()
+            )));
+        }
+        self.projection.revalidate_projection_lock()
+    }
+}
+
+fn commit_repository_transaction_exact(
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    transaction: RepositoryTransaction,
+) -> Result<RepositoryCommitReceipt> {
+    let expected_hash = transaction
+        .transaction_hash()
+        .map_err(|error| KinError::Other(error.to_string()))?;
+    match authority.commit_repository_transaction(transaction.clone()) {
+        Ok(receipt) => Ok(receipt),
+        Err(first_error) => {
+            let exact_operation_is_visible = authority
+                .read_authority()
+                .metadata()
+                .operation_log
+                .iter()
+                .find(|operation| operation.operation_id == transaction.operation_id)
+                .is_some_and(|operation| operation.transaction_hash == expected_hash);
+            if !exact_operation_is_visible {
+                return Err(KinError::Other(format!(
+                    "commit repository projection authority: {first_error}"
+                )));
+            }
+            authority
+                .commit_repository_transaction(transaction)
+                .map_err(|error| {
+                    KinError::Other(format!(
+                        "recover exact repository projection receipt after durable commit: {error}"
+                    ))
+                })
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ValidatedSourceEntry<'a> {
     file_id: &'a RepoPath,
     kind: TreeEntry,
     content: &'a [u8],
+}
+
+struct ValidatedProjectionPath {
+    components: Vec<std::ffi::OsString>,
+    relative: std::path::PathBuf,
 }
 
 #[cfg(test)]
@@ -261,6 +926,25 @@ fn validated_source_entries<'a>(
     Ok(entries)
 }
 
+fn validated_projection_proof_entries<'a>(
+    entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
+) -> Result<Vec<ValidatedSourceEntry<'a>>> {
+    let mut entries = entries
+        .into_iter()
+        .map(|(file_id, kind, content)| ValidatedSourceEntry {
+            file_id,
+            kind,
+            content,
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.file_id.cmp(right.file_id));
+    validate_projection_proof_paths(entries.iter().map(|entry| entry.file_id))?;
+    for entry in &entries {
+        validate_projection_proof_entry_path(entry.file_id, entry.kind)?;
+    }
+    Ok(entries)
+}
+
 /// Validate an exact-source entry without touching the projection root.
 ///
 /// Checkout callers use this during their global preflight so unsafe paths,
@@ -298,6 +982,104 @@ fn validate_source_entry_components<'a>(
         )));
     }
     Ok(components)
+}
+
+fn validate_projection_proof_entry_path(
+    file_id: &RepoPath,
+    kind: TreeEntry,
+) -> Result<ValidatedProjectionPath> {
+    if matches!(kind, TreeEntry::Gitlink { .. }) {
+        return Err(KinError::Other(format!(
+            "gitlink {file_id} is repository history, not a materialized working-copy object"
+        )));
+    }
+    validate_projection_proof_path(file_id)
+}
+
+fn validate_projection_proof_paths<'a>(
+    paths: impl IntoIterator<Item = &'a RepoPath>,
+) -> Result<()> {
+    let mut paths = paths
+        .into_iter()
+        .map(|path| {
+            validate_projection_proof_path(path)?;
+            let key = if let Some(path) = path.as_utf8() {
+                projection_path_comparison_key(path).into_bytes()
+            } else {
+                let mut key = path.as_bytes().to_vec();
+                #[cfg(any(windows, target_os = "macos"))]
+                key.make_ascii_lowercase();
+                key
+            };
+            Ok((key, path))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    paths.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    for pair in paths.windows(2) {
+        if pair[1].0 == pair[0].0
+            || pair[1]
+                .0
+                .strip_prefix(pair[0].0.as_slice())
+                .is_some_and(|suffix| suffix.starts_with(b"/"))
+        {
+            return Err(KinError::Other(format!(
+                "conflicting graph-owned source paths {:?} and {:?}",
+                pair[0].1, pair[1].1
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_projection_proof_path(file_id: &RepoPath) -> Result<ValidatedProjectionPath> {
+    if let Some(path) = file_id.as_utf8() {
+        let components = validate_source_path(path)?;
+        let mut relative = std::path::PathBuf::new();
+        let components = components
+            .into_iter()
+            .map(|component| {
+                relative.push(component);
+                std::ffi::OsString::from(component)
+            })
+            .collect();
+        return Ok(ValidatedProjectionPath {
+            components,
+            relative,
+        });
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let mut relative = std::path::PathBuf::new();
+        let mut components = Vec::new();
+        for component in file_id.as_bytes().split(|byte| *byte == b'/') {
+            if component.len() > 255
+                || component.eq_ignore_ascii_case(b".kin")
+                || component.eq_ignore_ascii_case(b".git")
+                || component.eq_ignore_ascii_case(b".kin-session")
+            {
+                return Err(KinError::Other(format!(
+                    "unsafe graph-owned source path {file_id}"
+                )));
+            }
+            let component = std::ffi::OsStr::from_bytes(component).to_os_string();
+            relative.push(&component);
+            components.push(component);
+        }
+        Ok(ValidatedProjectionPath {
+            components,
+            relative,
+        })
+    }
+
+    #[cfg(any(not(unix), target_os = "macos"))]
+    {
+        Err(KinError::Other(format!(
+            "byte-exact repository path {file_id} cannot be verified by this filesystem boundary"
+        )))
+    }
 }
 
 fn projection_path(path: &RepoPath) -> Result<&str> {
@@ -1276,6 +2058,32 @@ fn load_or_create_reconciliation_authority_key(
 }
 
 #[cfg(any(unix, windows))]
+fn load_existing_reconciliation_authority_key(
+    control: &cap_std::fs::Dir,
+    display_control: &Path,
+) -> Result<[u8; 32]> {
+    let display = display_control.join(RECONCILIATION_AUTHORITY_FILE);
+    let mut file = open_reconciliation_control_file(
+        control,
+        std::ffi::OsStr::new(RECONCILIATION_AUTHORITY_FILE),
+    )
+    .map_err(|error| KinError::io(&display, error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| KinError::io(&display, error))?;
+    if !metadata.is_file() || metadata.len() != 32 {
+        return Err(KinError::Other(format!(
+            "reconciliation authority {} is not an exact 32-byte regular file",
+            display.display()
+        )));
+    }
+    let mut key = [0_u8; 32];
+    file.read_exact(&mut key)
+        .map_err(|error| KinError::io(&display, error))?;
+    Ok(key)
+}
+
+#[cfg(any(unix, windows))]
 enum ProjectionLockAttemptError {
     /// The kernel lock is held by a live projection; the caller may wait.
     Contended(std::io::Error),
@@ -1294,18 +2102,18 @@ impl From<KinError> for ProjectionLockAttemptError {
 fn try_acquire_reconciliation_projection_lock(
     control: &cap_std::fs::Dir,
     display_control: &Path,
+    create_if_missing: bool,
 ) -> std::result::Result<(std::fs::File, TrackedEntryIdentity), ProjectionLockAttemptError> {
     let name = std::ffi::OsStr::new(RECONCILIATION_PROJECTION_LOCK_FILE);
     #[cfg(unix)]
-    let file = rustix::fs::openat(
-        control,
-        name,
-        rustix::fs::OFlags::RDWR
-            | rustix::fs::OFlags::CREATE
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::from_raw_mode(0o600),
-    )
+    let file = {
+        let mut flags =
+            rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC;
+        if create_if_missing {
+            flags |= rustix::fs::OFlags::CREATE;
+        }
+        rustix::fs::openat(control, name, flags, rustix::fs::Mode::from_raw_mode(0o600))
+    }
     .map(std::fs::File::from)
     .map_err(|error| {
         KinError::io(
@@ -1320,7 +2128,7 @@ fn try_acquire_reconciliation_projection_lock(
         options
             .read(true)
             .write(true)
-            .create(true)
+            .create(create_if_missing)
             .follow(FollowSymlinks::No);
         control
             .open_with(name, &options)
@@ -1408,10 +2216,43 @@ fn acquire_reconciliation_projection_lock(
     display_control: &Path,
     wait_deadline: std::time::Duration,
 ) -> Result<(std::fs::File, TrackedEntryIdentity)> {
+    acquire_reconciliation_projection_lock_with_creation(
+        control,
+        display_control,
+        wait_deadline,
+        true,
+    )
+}
+
+#[cfg(any(unix, windows))]
+fn acquire_existing_reconciliation_projection_lock(
+    control: &cap_std::fs::Dir,
+    display_control: &Path,
+    wait_deadline: std::time::Duration,
+) -> Result<(std::fs::File, TrackedEntryIdentity)> {
+    acquire_reconciliation_projection_lock_with_creation(
+        control,
+        display_control,
+        wait_deadline,
+        false,
+    )
+}
+
+#[cfg(any(unix, windows))]
+fn acquire_reconciliation_projection_lock_with_creation(
+    control: &cap_std::fs::Dir,
+    display_control: &Path,
+    wait_deadline: std::time::Duration,
+    create_if_missing: bool,
+) -> Result<(std::fs::File, TrackedEntryIdentity)> {
     let started = std::time::Instant::now();
     let mut backoff = std::time::Duration::from_millis(25);
     loop {
-        match try_acquire_reconciliation_projection_lock(control, display_control) {
+        match try_acquire_reconciliation_projection_lock(
+            control,
+            display_control,
+            create_if_missing,
+        ) {
             Ok((file, identity)) => {
                 record_projection_lock_holder(&file);
                 return Ok((file, identity));
@@ -1486,23 +2327,7 @@ impl ProjectionRoot {
         root: &Path,
         lock_deadline: std::time::Duration,
     ) -> Result<Self> {
-        #[cfg(unix)]
-        let capability = {
-            let root_fd = rustix::fs::open(
-                root,
-                rustix::fs::OFlags::RDONLY
-                    | rustix::fs::OFlags::DIRECTORY
-                    | rustix::fs::OFlags::NOFOLLOW
-                    | rustix::fs::OFlags::CLOEXEC,
-                rustix::fs::Mode::empty(),
-            )
-            .map(std::fs::File::from)
-            .map_err(|error| KinError::io(root, std::io::Error::from(error)))?;
-            cap_std::fs::Dir::from_std_file(root_fd)
-        };
-        #[cfg(windows)]
-        let capability =
-            open_windows_projection_root(root).map_err(|error| KinError::io(root, error))?;
+        let capability = open_projection_root_nofollow(root)?;
         let kin_control = open_or_create_private_directory(
             &capability,
             std::ffi::OsStr::new(".kin"),
@@ -1539,6 +2364,63 @@ impl ProjectionRoot {
         };
         projection.recover_reconciliation_transactions()?;
         Ok(projection)
+    }
+
+    fn open_existing_for_freeze(root: &Path, lock_deadline: std::time::Duration) -> Result<Self> {
+        let capability = open_projection_root_nofollow(root)?;
+        let kin_control = open_directory_nofollow(&capability, std::ffi::OsStr::new(".kin"))
+            .map_err(|error| KinError::io(root.join(".kin"), error))?;
+        let kin_control_identity = tracked_open_directory_identity(&kin_control)
+            .map_err(|error| KinError::io(root.join(".kin"), error))?;
+        let display_control = root.join(".kin").join(RECONCILIATION_CONTROL_DIRECTORY);
+        let control = open_directory_nofollow(
+            &kin_control,
+            std::ffi::OsStr::new(RECONCILIATION_CONTROL_DIRECTORY),
+        )
+        .map_err(|error| KinError::io(&display_control, error))?;
+        let control_identity = tracked_open_directory_identity(&control)
+            .map_err(|error| KinError::io(&display_control, error))?;
+        let (projection_lock, projection_lock_identity) =
+            acquire_existing_reconciliation_projection_lock(
+                &control,
+                &display_control,
+                lock_deadline,
+            )?;
+        let authority_key = load_existing_reconciliation_authority_key(&control, &display_control)?;
+        let projection = Self {
+            root: capability,
+            kin_control,
+            control,
+            projection_lock,
+            projection_lock_identity,
+            display_root: root.to_path_buf(),
+            kin_control_identity,
+            control_identity,
+            authority_key,
+        };
+        projection.revalidate_projection_lock()?;
+        projection.refuse_reconciliation_transactions()?;
+        Ok(projection)
+    }
+
+    fn refuse_reconciliation_transactions(&self) -> Result<()> {
+        let entries = self
+            .control
+            .entries()
+            .map_err(|error| KinError::io(self.reconciliation_control_path(), error))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| KinError::io(self.reconciliation_control_path(), error))?;
+            if entry.file_name().to_string_lossy().starts_with("tx-") {
+                return Err(KinError::Other(format!(
+                    "exact projection freeze refused while reconciliation transaction {} remains; recover it before eject",
+                    self.reconciliation_control_path()
+                        .join(entry.file_name())
+                        .display()
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn create_reconciliation_transaction(&self) -> Result<ReconciliationTransaction> {
@@ -3343,6 +4225,39 @@ impl ProjectionRoot {
         Ok(())
     }
 
+    fn validate_frozen_entries_unchanged(
+        &self,
+        entries: &[&ValidatedSourceEntry<'_>],
+    ) -> Result<Vec<TrackedEntryIdentity>> {
+        entries
+            .iter()
+            .map(|entry| self.validate_frozen_entry_unchanged(entry))
+            .collect()
+    }
+
+    fn revalidate_frozen_entries_unchanged(
+        &self,
+        entries: &[&ValidatedSourceEntry<'_>],
+        expected_identities: &[TrackedEntryIdentity],
+    ) -> Result<()> {
+        if entries.len() != expected_identities.len() {
+            return Err(KinError::Other(
+                "exact projection verification identity preflight is inconsistent".to_string(),
+            ));
+        }
+        for (entry, expected_identity) in entries.iter().zip(expected_identities) {
+            let actual_identity = self.validate_frozen_entry_unchanged(entry)?;
+            if actual_identity != *expected_identity {
+                let path = validate_projection_proof_path(entry.file_id)?;
+                return Err(KinError::Other(format!(
+                    "tracked working-copy path {} changed object identity after exact projection verification",
+                    self.display_root.join(path.relative).display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_named_source_entry(
         &self,
         parent: &cap_std::fs::Dir,
@@ -3554,8 +4469,43 @@ impl ProjectionRoot {
         expected_identity: TrackedEntryIdentity,
         display: &Path,
     ) -> Result<()> {
-        #[cfg(unix)]
-        let _ = source;
+        self.move_open_directory_exact_with_source_policy(
+            source,
+            destination,
+            directory,
+            expected_identity,
+            display,
+            false,
+        )
+    }
+
+    fn move_open_directory_from_expected_source_exact(
+        &self,
+        source: NamedEntryLocation<'_>,
+        destination: NamedEntryLocation<'_>,
+        directory: &cap_std::fs::Dir,
+        expected_identity: TrackedEntryIdentity,
+        display: &Path,
+    ) -> Result<()> {
+        self.move_open_directory_exact_with_source_policy(
+            source,
+            destination,
+            directory,
+            expected_identity,
+            display,
+            true,
+        )
+    }
+
+    fn move_open_directory_exact_with_source_policy(
+        &self,
+        source: NamedEntryLocation<'_>,
+        destination: NamedEntryLocation<'_>,
+        directory: &cap_std::fs::Dir,
+        expected_identity: TrackedEntryIdentity,
+        display: &Path,
+        require_expected_source: bool,
+    ) -> Result<()> {
         let retained_identity = tracked_open_directory_identity(directory)
             .map_err(|error| KinError::io(display, error))?;
         if retained_identity != expected_identity {
@@ -3568,6 +4518,35 @@ impl ProjectionRoot {
         #[cfg(unix)]
         let (restore_parent, restore_name) =
             self.locate_open_directory(directory, expected_identity, display)?;
+        #[cfg(unix)]
+        if require_expected_source {
+            let located_parent_identity = tracked_open_directory_identity(&restore_parent)
+                .map_err(|error| KinError::io(display, error))?;
+            let expected_parent_identity = tracked_open_directory_identity(source.parent)
+                .map_err(|error| KinError::io(display, error))?;
+            if located_parent_identity != expected_parent_identity
+                || restore_name.as_os_str() != source.name
+            {
+                return Err(KinError::Other(format!(
+                    "retained exact-source directory {} moved away from its expected source name before namespace mutation",
+                    display.display()
+                )));
+            }
+        }
+        #[cfg(windows)]
+        if require_expected_source {
+            let named = open_directory_nofollow(source.parent, source.name)
+                .map_err(|error| KinError::io(display, error))?;
+            if tracked_open_directory_identity(&named)
+                .map_err(|error| KinError::io(display, error))?
+                != expected_identity
+            {
+                return Err(KinError::Other(format!(
+                    "retained exact-source directory {} moved away from its expected source name before namespace mutation",
+                    display.display()
+                )));
+            }
+        }
         #[cfg(windows)]
         let (restore_parent, restore_name) = (
             source
@@ -3594,9 +4573,8 @@ impl ProjectionRoot {
             false,
         )
         .map_err(|error| KinError::io(display, error))?;
-        sync_namespace_parents(&restore_parent, display, destination.parent, display)?;
 
-        let destination_validation = (|| {
+        let post_move = (|| {
             // Read-only identity check: `named` only reads its identity for the
             // comparison below and is dropped, so DELETE access is unnecessary.
             let named = open_directory_nofollow(destination.parent, destination.name)
@@ -3609,9 +4587,9 @@ impl ProjectionRoot {
                     display.display()
                 )));
             }
-            Ok(())
+            sync_namespace_parents(&restore_parent, display, destination.parent, display)
         })();
-        if let Err(error) = destination_validation {
+        if let Err(error) = post_move {
             #[cfg(unix)]
             let restoration = self
                 .locate_open_directory(directory, expected_identity, display)
@@ -4386,7 +5364,37 @@ impl ProjectionRoot {
     ) -> Result<TrackedEntryIdentity> {
         let components =
             validate_source_entry_components(entry.file_id, entry.kind, entry.content)?;
-        let display = self.display_path(&components);
+        let mut relative = PathBuf::new();
+        let components = components
+            .into_iter()
+            .map(|component| {
+                relative.push(component);
+                OsString::from(component)
+            })
+            .collect();
+        self.validate_tracked_entry_unchanged_at_path(
+            entry,
+            &ValidatedProjectionPath {
+                components,
+                relative,
+            },
+        )
+    }
+
+    fn validate_frozen_entry_unchanged(
+        &self,
+        entry: &ValidatedSourceEntry<'_>,
+    ) -> Result<TrackedEntryIdentity> {
+        let path = validate_projection_proof_entry_path(entry.file_id, entry.kind)?;
+        self.validate_tracked_entry_unchanged_at_path(entry, &path)
+    }
+
+    fn validate_tracked_entry_unchanged_at_path(
+        &self,
+        entry: &ValidatedSourceEntry<'_>,
+        path: &ValidatedProjectionPath,
+    ) -> Result<TrackedEntryIdentity> {
+        let display = self.display_root.join(&path.relative);
         let conflict = |reason: &str| {
             KinError::Other(format!(
                 "tracked working-copy path {} differs from prior workspace source ({reason}); exact workspace reconciliation refused",
@@ -4395,7 +5403,7 @@ impl ProjectionRoot {
         };
         let mut parent = self.clone_root()?;
         let mut relative = PathBuf::new();
-        for component in &components[..components.len() - 1] {
+        for component in &path.components[..path.components.len() - 1] {
             relative.push(component);
             let metadata = match parent.symlink_metadata(component) {
                 Ok(metadata) => metadata,
@@ -4409,11 +5417,10 @@ impl ProjectionRoot {
             if !metadata.is_dir() || metadata_is_reparse(&metadata) {
                 return Err(conflict("a parent path is not the expected directory"));
             }
-            parent =
-                self.open_existing_directory(&parent, std::ffi::OsStr::new(component), &relative)?;
+            parent = self.open_existing_directory(&parent, component, &relative)?;
         }
 
-        let name = components[components.len() - 1];
+        let name = path.components[path.components.len() - 1].as_os_str();
         let metadata = match parent.symlink_metadata(name) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -4425,17 +5432,6 @@ impl ProjectionRoot {
             TreeEntry::Blob { executable, .. } => {
                 if !metadata.is_file() || metadata_is_reparse(&metadata) {
                     return Err(conflict("the tracked path kind changed"));
-                }
-                #[cfg(windows)]
-                let _ = executable;
-                #[cfg(unix)]
-                {
-                    use cap_std::fs::PermissionsExt;
-
-                    let actual_executable = metadata.permissions().mode() & 0o111 != 0;
-                    if actual_executable != executable {
-                        return Err(conflict("the executable bit changed"));
-                    }
                 }
 
                 #[cfg(unix)]
@@ -4466,6 +5462,17 @@ impl ProjectionRoot {
                     return Err(conflict("the tracked path kind changed while opening"));
                 }
                 #[cfg(windows)]
+                let _ = executable;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+
+                    let actual_executable = opened_metadata.permissions().mode() & 0o111 != 0;
+                    if actual_executable != executable {
+                        return Err(conflict("the executable bit changed"));
+                    }
+                }
+                #[cfg(windows)]
                 if metadata_is_reparse(&opened_metadata) {
                     return Err(conflict("the tracked path kind changed while opening"));
                 }
@@ -4494,13 +5501,22 @@ impl ProjectionRoot {
                     if !metadata_is_reparse(&metadata) {
                         return Err(conflict("the tracked path kind changed"));
                     }
-                    let target = parent
-                        .read_link(name)
-                        .map_err(|error| KinError::io(&display, error))?;
-                    if target.to_str().map(str::as_bytes) != Some(entry.content) {
+                    let target = rustix::fs::readlinkat(&parent, name, Vec::new())
+                        .map_err(|error| KinError::io(&display, error.into()))?;
+                    if target.as_bytes() != entry.content {
                         return Err(conflict("the symbolic-link target changed"));
                     }
-                    tracked_entry_identity(&metadata)
+                    let revalidated = parent
+                        .symlink_metadata(name)
+                        .map_err(|error| KinError::io(&display, error))?;
+                    if !metadata_is_reparse(&revalidated)
+                        || tracked_entry_identity(&revalidated) != tracked_entry_identity(&metadata)
+                    {
+                        return Err(conflict(
+                            "the symbolic-link identity changed while reading its target",
+                        ));
+                    }
+                    tracked_entry_identity(&revalidated)
                 }
             }
             TreeEntry::Gitlink { .. } => {
@@ -4656,6 +5672,26 @@ impl ProjectionRoot {
     fn display_path(&self, components: &[&str]) -> PathBuf {
         self.display_root.join(components.join("/"))
     }
+}
+
+#[cfg(unix)]
+fn open_projection_root_nofollow(path: &Path) -> Result<cap_std::fs::Dir> {
+    rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map(std::fs::File::from)
+    .map(cap_std::fs::Dir::from_std_file)
+    .map_err(|error| KinError::io(path, std::io::Error::from(error)))
+}
+
+#[cfg(windows)]
+fn open_projection_root_nofollow(path: &Path) -> Result<cap_std::fs::Dir> {
+    open_windows_projection_root(path).map_err(|error| KinError::io(path, error))
 }
 
 #[cfg(unix)]
@@ -5351,7 +6387,10 @@ fn validate_source_symlink_target_with_windows_rules(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kin_model::{GitObjectId, Hash256};
+    use kin_model::{
+        ArtifactId, AuthorId, DefaultRefExpectation, DefaultRefMutation, GitObjectId, Hash256,
+        RefName, ResolvedArtifact, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    };
 
     fn repo_path(path: impl Into<String>) -> RepoPath {
         RepoPath::from_utf8(path).expect("test repository path must be valid")
@@ -5367,6 +6406,19 @@ mod tests {
 
     fn symlink() -> TreeEntry {
         TreeEntry::symlink(Hash256::from_bytes([0x33; 32]))
+    }
+
+    fn exact_blob(content: &[u8], executable: bool) -> TreeEntry {
+        TreeEntry::blob(kin_blobs::digest(content), executable)
+    }
+
+    fn exact_tree(path: &RepoPath, entry: TreeEntry) -> ResolvedTree {
+        ResolvedTree::from_artifacts([ResolvedArtifact::new(
+            ArtifactId::new(),
+            path.clone(),
+            entry,
+        )])
+        .unwrap()
     }
 
     #[test]
@@ -5403,6 +6455,31 @@ mod tests {
                 .contains("cannot be projected by this UTF-8 filesystem boundary"),
             "unexpected projection error: {error}"
         );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn exact_projection_freeze_verifies_a_non_utf8_unix_path() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("assets")).unwrap();
+        let mut projected = root.path().join("assets");
+        projected.push(std::ffi::OsStr::from_bytes(b"icon-\xff.bin"));
+        let content = b"opaque bytes";
+        std::fs::write(&projected, content).unwrap();
+        drop(ProjectionRoot::open(root.path()).unwrap());
+
+        let path = RepoPath::from_bytes(b"assets/icon-\xff.bin".to_vec()).unwrap();
+        let entry = exact_blob(content, false);
+        let tree = exact_tree(&path, entry);
+        let freeze = ExactProjectionFreeze::acquire_existing(root.path()).unwrap();
+        let verification = freeze
+            .verify_resolved_tree(&tree, [(&path, entry, content.as_slice())])
+            .unwrap();
+        freeze
+            .revalidate_resolved_tree(&verification, &tree, [(&path, entry, content.as_slice())])
+            .unwrap();
     }
 
     #[test]
@@ -5872,6 +6949,190 @@ mod tests {
             waited < std::time::Duration::from_secs(10),
             "the contender must not burn the full deadline once the lock frees"
         );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn exact_projection_freeze_does_not_create_missing_control_state() {
+        let root = tempfile::tempdir().unwrap();
+
+        let error = ExactProjectionFreeze::acquire_existing(root.path())
+            .expect_err("freeze must not initialize a repository");
+
+        assert!(
+            error.to_string().contains(".kin"),
+            "unexpected missing-control error: {error}"
+        );
+        assert!(
+            !root.path().join(".kin").exists(),
+            "existing-only freeze created repository control state"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn exact_projection_revalidation_rejects_same_byte_object_substitution() {
+        let root = tempfile::tempdir().unwrap();
+        let path = repo_path("compose.yaml");
+        let content = b"services:\n  api:\n    image: example/api\n";
+        let entry = exact_blob(content, false);
+        let tree = exact_tree(&path, entry);
+        materialize_source_tree(root.path(), [(&path, entry, content.as_slice())]).unwrap();
+
+        let freeze = ExactProjectionFreeze::acquire_existing(root.path()).unwrap();
+        let verification = freeze
+            .verify_resolved_tree(&tree, [(&path, entry, content.as_slice())])
+            .unwrap();
+
+        let projected = root.path().join("compose.yaml");
+        let displaced = root.path().join("compose.yaml.displaced");
+        std::fs::rename(&projected, &displaced).unwrap();
+        std::fs::write(&projected, content).unwrap();
+
+        let error = freeze
+            .revalidate_resolved_tree(&verification, &tree, [(&path, entry, content.as_slice())])
+            .expect_err("same-byte inode substitution must invalidate the proof");
+        assert!(
+            error.to_string().contains("changed object identity"),
+            "unexpected substitution error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_projection_freeze_never_follows_a_symlink_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("nested")).unwrap();
+        let content = b"outside bytes";
+        std::fs::write(outside.path().join("nested/compose.yaml"), content).unwrap();
+        symlink(outside.path().join("nested"), root.path().join("nested")).unwrap();
+        drop(ProjectionRoot::open(root.path()).unwrap());
+
+        let path = repo_path("nested/compose.yaml");
+        let entry = exact_blob(content, false);
+        let tree = exact_tree(&path, entry);
+        let freeze = ExactProjectionFreeze::acquire_existing(root.path()).unwrap();
+
+        let error = freeze
+            .verify_resolved_tree(&tree, [(&path, entry, content.as_slice())])
+            .expect_err("a matching body behind a symlink ancestor must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("a parent path is not the expected directory"),
+            "unexpected symlink-ancestor error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_projection_freeze_accepts_arbitrary_git_symlink_target_bytes() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = repo_path("external-link");
+        let target = b"/absolute/\xff-target/outside/repository";
+        let entry = TreeEntry::symlink(kin_blobs::digest(target));
+        let tree = exact_tree(&path, entry);
+        symlink(
+            std::ffi::OsStr::from_bytes(target),
+            root.path().join("external-link"),
+        )
+        .unwrap();
+        drop(ProjectionRoot::open(root.path()).unwrap());
+
+        let freeze = ExactProjectionFreeze::acquire_existing(root.path()).unwrap();
+        let verification = freeze
+            .verify_resolved_tree(&tree, [(&path, entry, target.as_slice())])
+            .expect("read-only eject proof must not apply checkout target policy");
+        freeze
+            .revalidate_resolved_tree(&verification, &tree, [(&path, entry, target.as_slice())])
+            .unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn exact_projection_detach_moves_the_retained_control_directory() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("repository");
+        let archive = outer.path().join("archive");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&archive).unwrap();
+        let path = repo_path("Dockerfile");
+        let content = b"FROM scratch\n";
+        let entry = exact_blob(content, false);
+        let tree = exact_tree(&path, entry);
+        materialize_source_tree(&root, [(&path, entry, content.as_slice())]).unwrap();
+        let proof_directory = tempfile::tempdir().unwrap();
+        let blobs = kin_blobs::BlobStore::new(proof_directory.path().to_path_buf()).unwrap();
+        assert_eq!(
+            blobs.write(content).unwrap().as_bytes(),
+            entry.blob_identity().unwrap().as_bytes()
+        );
+
+        let freeze = ExactProjectionFreeze::acquire_existing(&root).unwrap();
+        let verification = freeze
+            .verify_resolved_tree_from_blobs(&tree, &blobs)
+            .unwrap();
+        let target = ExactProjectionDetachTarget::open_existing(&archive).unwrap();
+        freeze
+            .detach_verified_to_from_blobs(
+                &verification,
+                &tree,
+                &blobs,
+                &target,
+                std::ffi::OsStr::new("kin"),
+            )
+            .unwrap();
+
+        assert!(!root.join(".kin").exists());
+        assert!(archive.join("kin/reconciliation/projection.lock").is_file());
+        assert_eq!(std::fs::read(root.join("Dockerfile")).unwrap(), content);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn exact_projection_detach_rejects_replaced_archive_target() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("repository");
+        let archive = outer.path().join("archive");
+        let displaced_archive = outer.path().join("archive.displaced");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&archive).unwrap();
+        let path = repo_path("compose.yaml");
+        let content = b"services: {}\n";
+        let entry = exact_blob(content, false);
+        let tree = exact_tree(&path, entry);
+        materialize_source_tree(&root, [(&path, entry, content.as_slice())]).unwrap();
+
+        let freeze = ExactProjectionFreeze::acquire_existing(&root).unwrap();
+        let verification = freeze
+            .verify_resolved_tree(&tree, [(&path, entry, content.as_slice())])
+            .unwrap();
+        let target = ExactProjectionDetachTarget::open_existing(&archive).unwrap();
+        std::fs::rename(&archive, &displaced_archive).unwrap();
+        std::fs::create_dir(&archive).unwrap();
+
+        let error = freeze
+            .detach_verified_to(
+                &verification,
+                &tree,
+                [(&path, entry, content.as_slice())],
+                &target,
+                std::ffi::OsStr::new("kin"),
+            )
+            .expect_err("replaced archive target must block detach");
+        assert!(
+            error.to_string().contains("detach target") && error.to_string().contains("replaced"),
+            "unexpected target-replacement error: {error}"
+        );
+        assert!(root.join(".kin").is_dir());
+        assert!(!archive.join("kin").exists());
+        assert!(!displaced_archive.join("kin").exists());
     }
 
     #[cfg(unix)]

@@ -323,6 +323,7 @@ pub fn prepare_repository_layout_at(
         for directory in layout.all_dirs() {
             std::fs::create_dir(&directory).map_err(|error| KinError::io(&directory, error))?;
         }
+        crate::tree::initialize_projection_control_directory(layout.root())?;
         std::fs::write(layout.version_path(), KIN_LAYOUT_VERSION.to_string())
             .map_err(|error| KinError::io(layout.version_path(), error))?;
         config.save(&layout.config_path())?;
@@ -1163,6 +1164,17 @@ mod tests {
         assert!(result.layout.runs_dir().exists());
         assert!(result.layout.logs_dir().exists());
         assert!(result.layout.adapters_dir().exists());
+        assert!(result
+            .layout
+            .root()
+            .join("reconciliation/projection.lock")
+            .is_file());
+        assert!(result
+            .layout
+            .root()
+            .join("reconciliation/authority.key")
+            .is_file());
+        drop(crate::tree::ExactProjectionFreeze::acquire_existing(directory.path()).unwrap());
 
         assert_eq!(result.default_ref, RefName::branch(b"main").unwrap());
         assert_eq!(result.authority.initial_change_id, None);
