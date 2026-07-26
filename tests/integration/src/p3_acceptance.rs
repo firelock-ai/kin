@@ -646,8 +646,7 @@ fn git_export_import_round_trip() {
 
     // Import from the exported Git repo.
     let import_opts = kin_git::ImportOptions {
-        shallow: false,
-        max_commits: 0,
+        mode: kin_git::GitImportMode::Full,
         branch: Some("main".to_string()),
     };
     let imported = kin_git::import_git_history(&git_dir, genesis_id, &import_opts)

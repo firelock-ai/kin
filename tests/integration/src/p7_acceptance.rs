@@ -221,7 +221,7 @@ fn traffic_aware_context_pack_includes_traffic() {
 // -----------------------------------------------------------------------
 
 #[test]
-fn brownfield_shallow_migration() {
+fn brownfield_snapshot_migration() {
     let dir = tempfile::tempdir().unwrap();
 
     // Create a minimal Git repo.
@@ -275,9 +275,8 @@ fn brownfield_shallow_migration() {
             let target = tempfile::tempdir().unwrap();
             let plan = kin_migrate::plan_migration(
                 &scan,
-                kin_migrate::MigrationStrategy::Shallow,
+                kin_migrate::MigrationStrategy::Snapshot,
                 Some(target.path().to_path_buf()),
-                0,
             );
 
             let result = kin_migrate::execute_migration_persisted(&plan);
@@ -327,7 +326,7 @@ fn brownfield_shallow_migration() {
 // -----------------------------------------------------------------------
 
 #[test]
-fn brownfield_shallow_migration_preserves_mixed_repo_shape() {
+fn brownfield_snapshot_migration_preserves_mixed_repo_shape() {
     let dir = tempfile::tempdir().unwrap();
 
     let git_init = std::process::Command::new("git")
@@ -402,9 +401,8 @@ fn brownfield_shallow_migration_preserves_mixed_repo_shape() {
             let target = tempfile::tempdir().unwrap();
             let plan = kin_migrate::plan_migration(
                 &scan,
-                kin_migrate::MigrationStrategy::Shallow,
+                kin_migrate::MigrationStrategy::Snapshot,
                 Some(target.path().to_path_buf()),
-                0,
             );
 
             let result = kin_migrate::execute_migration_persisted(&plan);

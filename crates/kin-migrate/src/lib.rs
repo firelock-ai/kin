@@ -7,7 +7,7 @@
 //! server) into a sovereign Kin repo by:
 //! 1. Detecting the source forge and parsing repository coordinates
 //! 2. Scanning the repo for source files, branches, and commits
-//! 3. Planning the migration (shallow HEAD-only or deep full-history)
+//! 3. Planning the migration (exact HEAD snapshot or full reachable history)
 //! 4. Initializing the .kin/ directory structure
 //! 5. Importing Git history as SemanticChange objects
 //! 6. Indexing source files for entity/relation extraction

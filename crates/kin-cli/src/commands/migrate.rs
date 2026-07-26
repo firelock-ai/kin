@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-/// `kin migrate [source] --depth shallow|deep [--resume]` — Migrate a Git repo to Kin.
-pub async fn run(source: Option<String>, depth: String, resume: bool) -> Result<()> {
+/// `kin migrate [source] --history snapshot|full [--resume]`.
+pub async fn run(source: Option<String>, history: String, resume: bool) -> Result<()> {
     let source_path = source
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().expect("cannot determine current directory"));
@@ -19,10 +19,13 @@ pub async fn run(source: Option<String>, depth: String, resume: bool) -> Result<
         );
     }
 
-    let strategy = match depth.to_lowercase().as_str() {
-        "shallow" => kin_migrate::strategy::MigrationStrategy::Shallow,
-        "deep" => kin_migrate::strategy::MigrationStrategy::Deep,
-        _ => anyhow::bail!("invalid depth '{}': expected 'shallow' or 'deep'", depth),
+    let strategy = match history.to_lowercase().as_str() {
+        "snapshot" => kin_migrate::strategy::MigrationStrategy::Snapshot,
+        "full" => kin_migrate::strategy::MigrationStrategy::Full,
+        _ => anyhow::bail!(
+            "invalid history mode '{}': expected 'snapshot' or 'full'",
+            history
+        ),
     };
 
     // Check for an existing checkpoint if --resume is set.
@@ -56,7 +59,7 @@ pub async fn run(source: Option<String>, depth: String, resume: bool) -> Result<
     );
     println!("  Source files: {}", scan.source_files.len());
 
-    let plan = kin_migrate::plan_migration(&scan, strategy, None, 0);
+    let plan = kin_migrate::plan_migration(&scan, strategy, None);
     print!("{}", plan.describe());
 
     println!("Executing migration...");

@@ -623,12 +623,10 @@ pub async fn run(
     phase!("snapshot_repo");
 
     let is_warm = kin_dir.exists();
-    // Git history hydration has one repository-invariant, non-colliding
-    // boundary root: Kin's canonical genesis. It must never be replaced with
-    // the current branch head on a warm init. The branch head is only the
-    // parent of this init's auto-parse change; using it as the imported Git
-    // root can either leave an out-of-window dangling parent or close a cycle
-    // when that head is itself one of the imported Git changes.
+    // Full Git history has one repository-invariant, non-colliding boundary
+    // root: Kin's canonical genesis. It must never be replaced with the current
+    // branch head on a warm init. Snapshot mode also attaches its standalone
+    // exact-tree change to genesis so it makes no ancestry claim.
     let history_boundary_root = kin_core::build_genesis_change().id;
     let (layout, snap, blob_store, auto_parse_parent_id) = if is_warm {
         let layout = kin_core::KinLayout::discover(&dir)
@@ -863,11 +861,15 @@ pub async fn run(
     // source file. In particular, a repository whose HEAD deletes its final
     // file still has authoritative committed history to import or repair.
     if is_git_repo {
-        if let Some(import_opts) = git_history_import_options(&git_history) {
+        if let Some(import_opts) = git_history_import_options(&git_history)? {
+            let cochange_limit = match import_opts.mode {
+                kin_git::GitImportMode::Snapshot => 50,
+                kin_git::GitImportMode::Full => 0,
+            };
             match crate::commands::cochange::refresh_from_git_history_with_limit(
                 graph.as_ref(),
                 &dir,
-                import_opts.max_commits,
+                cochange_limit,
             ) {
                 Ok(count) if count > 0 => {
                     if !json {
@@ -884,92 +886,52 @@ pub async fn run(
                 }
             }
 
-            match kin_git::import_git_history_with_blobs(
+            let mut imported = kin_git::import_git_history_with_blobs(
                 &dir,
                 history_boundary_root,
                 &import_opts,
                 Some(&blob_store),
-            ) {
-                Ok(mut imported) if !imported.is_empty() => {
-                    let imported_git_commit_count = imported.len();
-                    // Anchor the (possibly truncated) history at a full base
-                    // universe so ref-scoped blast at historical refs sees
-                    // committed inbound edges across files untouched inside
-                    // the window. Must run BEFORE enrichment: the base-link
-                    // change is then parsed, linked, and used as each
-                    // windowed commit's semantic baseline by the same pass.
-                    match kin_git::anchor_imported_history_at_base_link(
-                        &dir,
-                        &mut imported,
-                        history_boundary_root,
-                        Some(&blob_store),
-                    ) {
-                        Ok(Some(base_id)) => {
-                            debug!(base_link = %base_id, "anchored imported history at base-link change");
-                        }
-                        Ok(None) => {}
-                        Err(err) => return Err(err).with_context(|| {
-                            format!(
-                                "anchor imported Git history at its exact base universe ({git_history})"
-                            )
-                        }),
-                    }
+            )
+            .with_context(|| format!("import Git repository boundary ({git_history})"))?;
+            if !imported.is_empty() {
+                // Imported repository state is an authority path. Invalid
+                // enrichment/checkpoint state must stop init rather than
+                // silently publish artifact-only history.
+                enrich_imported_changes_with_semantics_checkpointed(
+                    &mut imported,
+                    &blob_store,
+                    layout.root(),
+                    history_boundary_root,
+                    false,
+                )
+                .with_context(|| {
+                    format!("enrich imported Git history with semantic deltas ({git_history})")
+                })?;
 
-                    // Historical semantic truth is an authority path. A
-                    // checkpoint with a stale version key or invalid digest
-                    // must stop init rather than silently degrade the graph
-                    // to artifact-only history.
-                    enrich_imported_changes_with_semantics_checkpointed(
-                        &mut imported,
-                        &blob_store,
-                        layout.root(),
-                        history_boundary_root,
-                        // Certification: `kin init` builds the authoritative
-                        // repo graph and must reject a hydration invariant
-                        // rather than silently degrade it.
-                        false,
-                    )
-                    .with_context(|| {
-                        format!("enrich imported Git history with semantic deltas ({git_history})")
-                    })?;
-
-                    let mut last_id = None;
-                    for ic in &imported {
-                        create_deterministic_change_once(
-                            graph.as_ref(),
-                            &ic.change,
-                            DeterministicChangeProvenance::Stable,
-                        )?;
-                        last_id = Some(ic.change.id);
-                    }
-                    if let Some(head) = last_id {
-                        graph.update_branch_head(&branch_name, &head)?;
-                    }
-                    if !json {
-                        let mode_label = match git_history.as_str() {
-                            "recent" => "recent",
-                            "full" => "full",
-                            _ => git_history.as_str(),
-                        };
-                        println!(
-                            "  Imported {} {mode_label} Git commit(s) as semantic history.",
-                            imported_git_commit_count
-                        );
-                    }
+                let mut last_id = None;
+                for imported_change in &imported {
+                    create_deterministic_change_once(
+                        graph.as_ref(),
+                        &imported_change.change,
+                        DeterministicChangeProvenance::Stable,
+                    )?;
+                    last_id = Some(imported_change.change.id);
                 }
-                Ok(_) => {}
-                Err(err) => {
-                    if git_history == "full" {
-                        return Err(anyhow!(
-                            "failed to import full Git history during init: {}",
-                            err
-                        ));
+                if let Some(head) = last_id {
+                    graph.update_branch_head(&branch_name, &head)?;
+                }
+                if !json {
+                    match import_opts.mode {
+                        kin_git::GitImportMode::Snapshot => {
+                            println!("  Imported exact Git HEAD snapshot as graph-owned truth.");
+                        }
+                        kin_git::GitImportMode::Full => {
+                            println!(
+                                "  Imported {} Git commit(s) as exact semantic history.",
+                                imported.len()
+                            );
+                        }
                     }
-                    warn!(
-                        error = %err,
-                        mode = %git_history,
-                        "failed to import Git history during init (non-fatal)"
-                    );
                 }
             }
         }
@@ -1158,18 +1120,17 @@ pub async fn run(
     Ok(())
 }
 
-fn git_history_import_options(mode: &str) -> Option<kin_git::ImportOptions> {
+fn git_history_import_options(mode: &str) -> Result<Option<kin_git::ImportOptions>> {
     match mode {
-        "off" => None,
-        "recent" => Some(kin_git::ImportOptions {
-            max_commits: 50,
-            ..Default::default()
-        }),
-        "full" => Some(kin_git::ImportOptions::default()),
-        other => {
-            tracing::warn!(mode = %other, "unknown git history mode; skipping import");
-            None
-        }
+        "off" => Ok(None),
+        "snapshot" => Ok(Some(kin_git::ImportOptions {
+            mode: kin_git::GitImportMode::Snapshot,
+            branch: None,
+        })),
+        "full" => Ok(Some(kin_git::ImportOptions::default())),
+        other => Err(anyhow!(
+            "invalid Git history mode {other:?}; expected off, snapshot, or full"
+        )),
     }
 }
 
@@ -5321,21 +5282,16 @@ mod tests {
     }
 
     #[test]
-    fn git_history_import_options_supports_recent_full_and_off() {
-        assert!(git_history_import_options("off").is_none());
+    fn git_history_import_options_supports_snapshot_full_and_off() {
+        assert!(git_history_import_options("off").unwrap().is_none());
 
-        let recent = git_history_import_options("recent").unwrap();
-        assert_eq!(recent.max_commits, 50);
-        assert!(!recent.shallow);
+        let snapshot = git_history_import_options("snapshot").unwrap().unwrap();
+        assert_eq!(snapshot.mode, GitImportMode::Snapshot);
 
-        let full = git_history_import_options("full").unwrap();
-        assert_eq!(full.max_commits, 0);
-        assert!(!full.shallow);
+        let full = git_history_import_options("full").unwrap().unwrap();
+        assert_eq!(full.mode, GitImportMode::Full);
 
-        assert_eq!(
-            recent.max_commits, 50,
-            "recent must bound both co-change mining and semantic history import"
-        );
+        assert!(git_history_import_options("partial").is_err());
     }
 
     #[test]
@@ -6877,491 +6833,6 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 .output()
                 .map(|output| output.status.success())
                 .unwrap_or(false)
-    }
-
-    /// Replay the DAG reachable from `head` and report whether a LIVE relation
-    /// exists whose source entity is named `src_name` and destination entity is
-    /// named `dst_name`. Names are resolved from the reachable entity deltas;
-    /// relation deltas are applied in the returned parents-first order.
-    fn replayed_edge_present(
-        imported: &[kin_git::ImportedChange],
-        head: SemanticChangeId,
-        src_name: &str,
-        dst_name: &str,
-    ) -> bool {
-        let graph = kin_db::InMemoryGraph::new();
-        for ic in imported {
-            graph.create_change(&ic.change).unwrap();
-        }
-        let reachable = kin_core::collect_changes_at_ref(&graph, &head).unwrap();
-
-        let mut names: HashMap<EntityId, String> = HashMap::new();
-        for change in &reachable {
-            for delta in &change.entity_deltas {
-                match delta {
-                    EntityDelta::Added(entity) => {
-                        names.insert(entity.id, entity.name.clone());
-                    }
-                    EntityDelta::Modified { new, .. } => {
-                        names.insert(new.id, new.name.clone());
-                    }
-                    EntityDelta::Removed(_) => {}
-                }
-            }
-        }
-
-        let mut live: HashMap<RelationId, Relation> = HashMap::new();
-        for change in &reachable {
-            for delta in &change.relation_deltas {
-                match delta {
-                    RelationDelta::Added(relation) => {
-                        live.insert(relation.id, relation.clone());
-                    }
-                    RelationDelta::Removed(id) => {
-                        live.remove(id);
-                    }
-                }
-            }
-        }
-
-        let node_name = |node: &GraphNodeId| -> Option<&str> {
-            match node {
-                GraphNodeId::Entity(id) => names.get(id).map(String::as_str),
-                _ => None,
-            }
-        };
-        live.values().any(|relation| {
-            node_name(&relation.src) == Some(src_name) && node_name(&relation.dst) == Some(dst_name)
-        })
-    }
-
-    #[test]
-    fn base_link_anchor_surfaces_untouched_consumer_edge_at_historical_head() {
-        // End-to-end proof that a consumer living in a file NEVER
-        // touched inside a truncated import window must still yield a committed
-        // inbound relation delta that ref-scoped replay surfaces at a historical
-        // head. Previously the window base linked against a touched-files-only
-        // universe, so the consumer edge existed ONLY in live adjacency and the
-        // genesis auto-parse change — both siblings of the historical chain — and
-        // blast radius at a historical ref replayed as 0.
-        let dir = tempfile::tempdir().unwrap();
-        if !init_git_repo_for_test(dir.path()) {
-            eprintln!("git not available, skipping base-link anchor e2e test");
-            return;
-        }
-
-        let tools_path = dir.path().join("src/utils/tools.ts");
-        let api_path = dir.path().join("src/routes/api.ts");
-        fs::create_dir_all(tools_path.parent().unwrap()).unwrap();
-        fs::create_dir_all(api_path.parent().unwrap()).unwrap();
-
-        let commit = |msg: &str, epoch: i64| {
-            let stamp = format!("{epoch} +0000");
-            let _ = Command::new("git")
-                .args(["add", "."])
-                .current_dir(dir.path())
-                .output();
-            let _ = Command::new("git")
-                .args(["commit", "-m", msg])
-                .env("GIT_AUTHOR_DATE", &stamp)
-                .env("GIT_COMMITTER_DATE", &stamp)
-                .current_dir(dir.path())
-                .output();
-        };
-
-        // c1 (base, will fall OUTSIDE a 3-commit window): callee `foo` and its
-        // cross-file consumer `handler`, which calls `foo`.
-        fs::write(&tools_path, "export function foo() { return 1; }\n").unwrap();
-        fs::write(
-            &api_path,
-            "import { foo } from '../utils/tools';\nexport function handler() { foo(); }\n",
-        )
-        .unwrap();
-        commit("c1 base", 1_000_000_000);
-        // c2..c4 touch ONLY tools.ts — api.ts (the consumer) is never touched
-        // anywhere inside the imported window.
-        for (epoch, body) in [
-            (1_000_000_100_i64, "2"),
-            (1_000_000_200, "3"),
-            (1_000_000_300, "4"),
-        ] {
-            fs::write(
-                &tools_path,
-                format!("export function foo() {{ return {body}; }}\n"),
-            )
-            .unwrap();
-            commit("touch tools", epoch);
-        }
-
-        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x60; 32]));
-        let opts = kin_git::ImportOptions {
-            max_commits: 3,
-            ..Default::default()
-        };
-
-        // --- Anchored path (Fix D) ---
-        let mut anchored = kin_git::import_git_history_with_blobs(
-            dir.path(),
-            genesis_id,
-            &opts,
-            Some(&blob_store),
-        )
-        .unwrap();
-        let base_id = kin_git::anchor_imported_history_at_base_link(
-            dir.path(),
-            &mut anchored,
-            genesis_id,
-            Some(&blob_store),
-        )
-        .unwrap()
-        .expect("a truncated window must yield a base-link change");
-        enrich_imported_changes_with_semantics_and_genesis(&mut anchored, &blob_store, genesis_id)
-            .unwrap();
-
-        // The base-link root change itself must carry the inbound handler→foo
-        // edge, resolved against the FULL base universe.
-        let base_change = &anchored[0].change;
-        assert_eq!(base_change.id, base_id, "base-link is the prepended root");
-        let mut base_names: HashMap<EntityId, String> = HashMap::new();
-        for delta in &base_change.entity_deltas {
-            match delta {
-                EntityDelta::Added(entity) => {
-                    base_names.insert(entity.id, entity.name.clone());
-                }
-                EntityDelta::Modified { new, .. } => {
-                    base_names.insert(new.id, new.name.clone());
-                }
-                EntityDelta::Removed(_) => {}
-            }
-        }
-        let base_node_name = |node: &GraphNodeId| -> Option<&str> {
-            match node {
-                GraphNodeId::Entity(id) => base_names.get(id).map(String::as_str),
-                _ => None,
-            }
-        };
-        assert!(
-            base_change.relation_deltas.iter().any(|delta| matches!(
-                delta,
-                RelationDelta::Added(relation)
-                    if base_node_name(&relation.src) == Some("handler")
-                        && base_node_name(&relation.dst) == Some("foo")
-            )),
-            "base-link must carry the committed inbound handler→foo edge, got {:?}",
-            base_change.relation_deltas
-        );
-
-        // ...and ref-scoped replay from the historical head must surface it live.
-        let head = anchored.last().unwrap().change.id;
-        assert!(
-            replayed_edge_present(&anchored, head, "handler", "foo"),
-            "anchored: the inbound handler→foo edge must be live at the historical head"
-        );
-
-        // --- Negative control: the SAME window with NO base-link anchor ---
-        // This is the pre-Fix-D behavior; the untouched consumer edge must be
-        // absent, proving the anchor is what surfaces it.
-        let mut control = kin_git::import_git_history_with_blobs(
-            dir.path(),
-            genesis_id,
-            &opts,
-            Some(&blob_store),
-        )
-        .unwrap();
-        enrich_imported_changes_with_semantics_and_genesis(&mut control, &blob_store, genesis_id)
-            .unwrap();
-        let control_head = control.last().unwrap().change.id;
-        assert!(
-            !replayed_edge_present(&control, control_head, "handler", "foo"),
-            "pre-Fix-D control: an untouched consumer edge must NOT be reachable at the head"
-        );
-    }
-
-    #[test]
-    fn base_link_cpp_receiver_method_edge_survives_at_historical_head() {
-        // Regression guard for the incremental-linker parity fix. A C++ receiver-method
-        // call `w.work()` resolves to a `Type::method` (`Widget::work`) only through
-        // the linker's bare-name index. The batch resolver has always had that
-        // index; the incremental linker did not, so a base-link built as a
-        // full-tree snapshot would carry the edge but the FIRST windowed commit
-        // that touches the callee re-links the consumer via the reverse-dependency
-        // closure with the incremental linker, which could not reproduce the edge
-        // and emitted a spurious Removed — deleting it at exactly the historical
-        // head a revert lands on. The existing TS e2e test cannot catch this: TS
-        // import edges resolve in BOTH linkers, so they always survive. This test
-        // uses a batch-only edge shape and asserts survival at the HEAD ref (not
-        // just the base-link), which is what a ref-scoped blast query reads.
-        let dir = tempfile::tempdir().unwrap();
-        if !init_git_repo_for_test(dir.path()) {
-            eprintln!("git not available, skipping c2 survival test");
-            return;
-        }
-
-        let lib_path = dir.path().join("widget.hpp");
-        let app_path = dir.path().join("app.cpp");
-
-        let commit = |msg: &str, epoch: i64| {
-            let stamp = format!("{epoch} +0000");
-            let _ = Command::new("git")
-                .args(["add", "."])
-                .current_dir(dir.path())
-                .output();
-            let _ = Command::new("git")
-                .args(["commit", "-m", msg])
-                .env("GIT_AUTHOR_DATE", &stamp)
-                .env("GIT_COMMITTER_DATE", &stamp)
-                .current_dir(dir.path())
-                .output();
-        };
-
-        // c1 (base, falls OUTSIDE a 3-commit window): the callee `Widget::work`
-        // and its cross-file consumer `run`, which calls it via `w.work()` — a
-        // bare-name receiver-method call resolvable only through the bare-name
-        // index, never an exact cross-file name match or an ES-style import.
-        fs::write(&lib_path, "struct Widget { int work() { return 1; } };\n").unwrap();
-        fs::write(
-            &app_path,
-            "#include \"widget.hpp\"\nint run() { Widget w; return w.work(); }\n",
-        )
-        .unwrap();
-        commit("c1 base", 1_000_000_000);
-        // c2..c4 touch ONLY widget.hpp (the callee); app.cpp (the consumer) is
-        // never touched anywhere inside the imported window.
-        for (epoch, body) in [
-            (1_000_000_100_i64, "2"),
-            (1_000_000_200, "3"),
-            (1_000_000_300, "4"),
-        ] {
-            fs::write(
-                &lib_path,
-                format!("struct Widget {{ int work() {{ return {body}; }} }};\n"),
-            )
-            .unwrap();
-            commit("touch widget", epoch);
-        }
-
-        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x71; 32]));
-        let opts = kin_git::ImportOptions {
-            max_commits: 3,
-            ..Default::default()
-        };
-
-        // --- Anchored path (Fix D base-link + incremental (c2) parity) ---
-        let mut anchored = kin_git::import_git_history_with_blobs(
-            dir.path(),
-            genesis_id,
-            &opts,
-            Some(&blob_store),
-        )
-        .unwrap();
-        let base_id = kin_git::anchor_imported_history_at_base_link(
-            dir.path(),
-            &mut anchored,
-            genesis_id,
-            Some(&blob_store),
-        )
-        .unwrap()
-        .expect("a truncated window must yield a base-link change");
-        enrich_imported_changes_with_semantics_and_genesis(&mut anchored, &blob_store, genesis_id)
-            .unwrap();
-
-        // The base-link carries the bare-name receiver-method edge...
-        assert!(
-            replayed_edge_present(&anchored, base_id, "run", "Widget::work"),
-            "base-link must carry the receiver-method edge run->Widget::work"
-        );
-        // ...and it must SURVIVE at the historical head, even though every windowed
-        // commit touches the callee (pulling the consumer into the reverse-dep
-        // closure). Before the (c2) parity fix the incremental relink dropped it
-        // here, so this assertion is the one that fails on the half-fix.
-        let head = anchored.last().unwrap().change.id;
-        assert!(
-            replayed_edge_present(&anchored, head, "run", "Widget::work"),
-            "anchored: the receiver-method edge must remain live at the historical head"
-        );
-
-        // --- Negative control: the SAME window with NO base-link anchor ---
-        // Without the anchor the consumer file is never in the graph at any
-        // windowed ref, so the edge cannot exist — proving the anchor is what
-        // brings the base universe in and the (c2) parity is what keeps it.
-        let mut control = kin_git::import_git_history_with_blobs(
-            dir.path(),
-            genesis_id,
-            &opts,
-            Some(&blob_store),
-        )
-        .unwrap();
-        enrich_imported_changes_with_semantics_and_genesis(&mut control, &blob_store, genesis_id)
-            .unwrap();
-        let control_head = control.last().unwrap().change.id;
-        assert!(
-            !replayed_edge_present(&control, control_head, "run", "Widget::work"),
-            "unanchored control: an untouched consumer edge must NOT be reachable at the head"
-        );
-    }
-
-    #[test]
-    fn base_link_anchor_and_enrichment_are_byte_stable_across_runs() {
-        // Determinism is the whole risk of Fix D: a citable proof is void if the
-        // anchored, enriched history is not byte-identical run to run. Build one
-        // truncated-window history, then run import → anchor → enrich twice and
-        // assert every change (id, parents, and the ORDER of every delta list) is
-        // identical. This exercises: the deterministic first-parent walk to the
-        // window base, the sorted-path base-tree enumeration, content-addressed
-        // entity ids, and the relation-delta id sort.
-        let dir = tempfile::tempdir().unwrap();
-        if !init_git_repo_for_test(dir.path()) {
-            eprintln!("git not available, skipping base-link determinism test");
-            return;
-        }
-
-        let tools_path = dir.path().join("src/utils/tools.ts");
-        let api_path = dir.path().join("src/routes/api.ts");
-        let extra_path = dir.path().join("src/utils/extra.ts");
-        fs::create_dir_all(tools_path.parent().unwrap()).unwrap();
-        fs::create_dir_all(api_path.parent().unwrap()).unwrap();
-
-        let commit = |msg: &str, epoch: i64| {
-            let stamp = format!("{epoch} +0000");
-            let _ = Command::new("git")
-                .args(["add", "."])
-                .current_dir(dir.path())
-                .output();
-            let _ = Command::new("git")
-                .args(["commit", "-m", msg])
-                .env("GIT_AUTHOR_DATE", &stamp)
-                .env("GIT_COMMITTER_DATE", &stamp)
-                .current_dir(dir.path())
-                .output();
-        };
-
-        // Base carries several files (multiple consumers) so the base-link's
-        // delta ordering has real surface to be unstable if anything is unsorted.
-        fs::write(&tools_path, "export function foo() { return 1; }\n").unwrap();
-        fs::write(&extra_path, "export function bar() { return 9; }\n").unwrap();
-        fs::write(
-            &api_path,
-            "import { foo } from '../utils/tools';\nimport { bar } from '../utils/extra';\n\
-             export function handler() { foo(); bar(); }\n",
-        )
-        .unwrap();
-        commit("c1 base", 1_000_000_000);
-        for (epoch, body) in [
-            (1_000_000_100_i64, "2"),
-            (1_000_000_200, "3"),
-            (1_000_000_300, "4"),
-        ] {
-            fs::write(
-                &tools_path,
-                format!("export function foo() {{ return {body}; }}\n"),
-            )
-            .unwrap();
-            commit("touch tools", epoch);
-        }
-
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x61; 32]));
-        let opts = kin_git::ImportOptions {
-            max_commits: 3,
-            ..Default::default()
-        };
-
-        let run = || -> Vec<SemanticChange> {
-            // A fresh blob store per run proves the output does not depend on
-            // pre-existing store state either.
-            let blob_root = tempfile::tempdir().unwrap();
-            let blob_store = kin_blobs::BlobStore::new(blob_root.path().join("objects")).unwrap();
-            let mut imported = kin_git::import_git_history_with_blobs(
-                dir.path(),
-                genesis_id,
-                &opts,
-                Some(&blob_store),
-            )
-            .unwrap();
-            kin_git::anchor_imported_history_at_base_link(
-                dir.path(),
-                &mut imported,
-                genesis_id,
-                Some(&blob_store),
-            )
-            .unwrap();
-            enrich_imported_changes_with_semantics_and_genesis(
-                &mut imported,
-                &blob_store,
-                genesis_id,
-            )
-            .unwrap();
-            imported.into_iter().map(|ic| ic.change).collect()
-        };
-
-        let first = run();
-        let second = run();
-
-        // Guard against a vacuous pass: the base-link plus the 3-commit window.
-        assert_eq!(first.len(), 4, "expected base-link + 3 windowed commits");
-
-        // (1) THE Fix-D determinism guarantee: change ids, parents, and the ORDER
-        // and identity of every entity/relation/tree delta are byte-identical.
-        // The only non-deterministic surface in a SemanticChange is
-        // `Entity.metadata.extra`, a `HashMap` of auxiliary embedding-context
-        // strings (a pre-existing, kin-wide parser artifact that no entity id,
-        // relation id, blast, or review path keys on — those derive from
-        // (file, name, kind, index) and (src, dst, kind)). Neutralize only that
-        // key-iteration order, then require the rest to match exactly.
-        let structural = |changes: &[SemanticChange]| -> Vec<String> {
-            changes
-                .iter()
-                .map(|change| {
-                    let mut change = change.clone();
-                    for delta in &mut change.entity_deltas {
-                        match delta {
-                            EntityDelta::Added(entity) => entity.metadata.extra.clear(),
-                            EntityDelta::Modified { old, new } => {
-                                old.metadata.extra.clear();
-                                new.metadata.extra.clear();
-                            }
-                            EntityDelta::Removed(_) => {}
-                        }
-                    }
-                    format!("{change:#?}")
-                })
-                .collect()
-        };
-        assert_eq!(
-            structural(&first),
-            structural(&second),
-            "anchored + enriched history (ids, fingerprints, spans, delta ordering, \
-             relations, artifacts) must be byte-identical across runs"
-        );
-
-        // (2) The auxiliary metadata.extra CONTENT is itself stable — only its
-        // key order varies. Compare as a sorted multiset so a genuine content
-        // drift would still fail, but key-order alone does not.
-        let extra_multiset = |changes: &[SemanticChange]| -> Vec<String> {
-            let mut lines = Vec::new();
-            for change in changes {
-                for delta in &change.entity_deltas {
-                    let entities: Vec<&Entity> = match delta {
-                        EntityDelta::Added(entity) => vec![entity],
-                        EntityDelta::Modified { old, new } => vec![old, new],
-                        EntityDelta::Removed(_) => vec![],
-                    };
-                    for entity in entities {
-                        for (key, value) in &entity.metadata.extra {
-                            lines.push(format!("{:?}|{key}={value}", entity.id));
-                        }
-                    }
-                }
-            }
-            lines.sort();
-            lines
-        };
-        assert_eq!(
-            extra_multiset(&first),
-            extra_multiset(&second),
-            "metadata.extra content must be identical across runs (order-independent)"
-        );
     }
 
     #[test]
@@ -9409,7 +8880,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             true,
             false,
             true,
-            "recent".to_string(),
+            "snapshot".to_string(),
         )
         .await
         .unwrap();
@@ -9426,7 +8897,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
 
     #[tokio::test]
     #[serial]
-    async fn consecutive_default_git_history_inits_keep_canonical_boundary_root() {
+    async fn consecutive_full_git_history_inits_keep_canonical_boundary_root() {
         let repo_dir = tempfile::tempdir().unwrap();
         if !init_git_repo_for_test(repo_dir.path())
             || !commit_git_file_for_test(
@@ -9455,7 +8926,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 true,
                 false,
                 true,
-                "recent".to_string(),
+                "full".to_string(),
             )
             .await
             .unwrap();
@@ -9546,7 +9017,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
 
     #[tokio::test]
     #[serial]
-    async fn git_history_off_then_recent_uses_canonical_boundary_root() {
+    async fn git_history_off_then_full_uses_canonical_boundary_root() {
         let repo_dir = tempfile::tempdir().unwrap();
         if !init_git_repo_for_test(repo_dir.path())
             || !commit_git_file_for_test(
@@ -9581,7 +9052,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             true,
             false,
             true,
-            "recent".to_string(),
+            "full".to_string(),
         )
         .await
         .unwrap();
@@ -9628,7 +9099,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             true,
             false,
             true,
-            "recent".to_string(),
+            "snapshot".to_string(),
         )
         .await
         .unwrap();

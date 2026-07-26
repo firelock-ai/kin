@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use kin_blobs::BlobStore;
-use kin_git::{import_git_history_with_blobs, ImportOptions, ImportedChange};
+use kin_git::{import_git_history_with_blobs, GitImportMode, ImportOptions, ImportedChange};
 use kin_index::IndexPipeline;
 use kin_model::SemanticChangeId;
 use tracing::info;
@@ -44,16 +44,17 @@ pub fn convert(
     .entered();
     // Import Git history.
     let import_opts = ImportOptions {
-        shallow: plan.strategy == MigrationStrategy::Shallow,
-        max_commits: plan.max_commits,
+        mode: match plan.strategy {
+            MigrationStrategy::Snapshot => GitImportMode::Snapshot,
+            MigrationStrategy::Full => GitImportMode::Full,
+        },
         branch: plan.branch.clone(),
     };
 
     let imported = {
         let _span = tracing::info_span!(
             "kin.migrate.convert.import_git_history",
-            shallow = import_opts.shallow,
-            max_commits = import_opts.max_commits,
+            mode = ?import_opts.mode,
             has_branch = import_opts.branch.is_some()
         )
         .entered();
