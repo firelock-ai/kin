@@ -3722,13 +3722,13 @@ impl InMemoryGraph {
         Ok(0)
     }
 
-    /// Load a persisted HNSW vector index from disk.
+    /// Load persisted HNSW bytes for internal index construction.
     ///
     /// Dimensions are read from the file — no embedder needed. This means
     /// semantic search works even when `embeddings` feature is off, as long
     /// as a pre-built index exists on disk.
-    #[cfg(feature = "vector")]
-    pub fn load_vector_index(&self, path: &std::path::Path) -> Result<usize, KinDbError> {
+    #[cfg(all(test, feature = "vector"))]
+    pub(crate) fn load_vector_index(&self, path: &std::path::Path) -> Result<usize, KinDbError> {
         let _span = tracing::info_span!(
             "kindb.load_vector_index",
             path = %path.display()
@@ -3747,12 +3747,11 @@ impl InMemoryGraph {
         Ok(count)
     }
 
-    /// Load a persisted index, rejecting it ONLY if it positively declares a
-    /// model/graph identity incompatible with `expected` (a legacy unstamped
-    /// index is grandfathered and still loads).
+    /// Load a persisted index only when its model and graph descriptor proves
+    /// compatibility with `expected`.
     ///
-    /// Unlike [`InMemoryGraph::load_vector_index`], an incompatible or unreadable
-    /// index is NOT installed and does NOT error — it returns
+    /// An incompatible or unreadable index is NOT installed and does NOT error;
+    /// it returns
     /// [`VectorIndexLoad::Incompatible`] so the caller can archive + rebuild
     /// instead of crash-looping or serving silently-wrong neighbors. The in-memory
     /// index is left untouched on incompatibility.
@@ -3763,7 +3762,7 @@ impl InMemoryGraph {
         expected: &crate::vector::IndexDescriptor,
     ) -> crate::vector::VectorIndexLoad {
         use crate::vector::{IndexLoadOutcome, VectorIndexLoad};
-        match VectorIndex::load_compatible_grandfathered(path, expected) {
+        match VectorIndex::load_compatible(path, expected) {
             IndexLoadOutcome::Loaded(index) => {
                 let count = index.len();
                 *self.vector_index.lock() = Some(Arc::new(index));
@@ -3816,6 +3815,15 @@ impl InMemoryGraph {
         if let Some(ref index) = *self.vector_index.lock() {
             index.set_descriptor(descriptor);
         }
+    }
+
+    /// Return the loaded vector index's persisted compatibility descriptor.
+    #[cfg(feature = "vector")]
+    pub fn vector_index_descriptor(&self) -> Option<crate::vector::IndexDescriptor> {
+        self.vector_index
+            .lock()
+            .as_ref()
+            .map(|index| index.descriptor())
     }
 
     #[cfg(feature = "embeddings")]
@@ -4330,9 +4338,8 @@ impl InMemoryGraph {
     /// Drop the in-memory vector index so the next embedding pass rebuilds it
     /// from scratch at the CURRENT embedder dimension.
     ///
-    /// This is the migration path for a repo whose persisted index was built at
-    /// a different embedding dimension (e.g. an older 384-dim model) than the
-    /// model now in use (768-dim). A normal embed pass reuses the loaded index
+    /// This is the rebuild path when a persisted index was produced at a
+    /// different embedding dimension than the configured model. A normal embed pass reuses the loaded index
     /// and upserts fail with a dimension mismatch; clearing the in-memory index
     /// lets `queue_missing_for_embedding` re-queue every entity/artifact (the
     /// emptied index reports nothing as indexed) and `get_vector_index` lazily
@@ -9760,16 +9767,21 @@ mod tests {
         };
         let artifact_file_id = artifact.file_id.clone();
         snapshot.structured_artifacts.push(artifact);
+        let artifact_id = ArtifactId::new();
+        snapshot
+            .artifact_index
+            .insert(artifact_file_id.clone(), artifact_id);
 
         let graph =
             InMemoryGraph::from_snapshot_with_text_index(snapshot, dir.path().join("text-index"));
 
-        // Identity is graph-assigned: read the id the graph minted on restore.
-        let artifact_key = RetrievalKey::Artifact(
-            graph
-                .artifact_id_for_path(&artifact_file_id)
-                .expect("restored artifact must have a graph-assigned id"),
+        // Current snapshots carry graph-assigned artifact identity explicitly;
+        // restore consumes it without deriving identity from the path.
+        assert_eq!(
+            graph.artifact_id_for_path(&artifact_file_id),
+            Some(artifact_id)
         );
+        let artifact_key = RetrievalKey::Artifact(artifact_id);
 
         let hits = graph.text_search("extension registry", 10).unwrap();
         assert!(
@@ -12473,7 +12485,7 @@ mod tests {
     #[cfg(feature = "vector")]
     #[test]
     fn reset_vector_index_requeues_every_entity_for_rebuild() {
-        // Simulates the stale-dimension migration: a repo arrives with a loaded
+        // Simulates a stale-dimension rebuild: a repo arrives with a loaded
         // index that already covers every entity, so a normal pass would queue
         // nothing. Resetting must drop the index and let a full re-queue happen
         // so the rebuild produces a fresh index at the live embedder dimension.

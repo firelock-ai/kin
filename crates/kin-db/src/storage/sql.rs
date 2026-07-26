@@ -11,7 +11,7 @@
 //!
 //! Schema:
 //! ```text
-//! snapshots(repo_id TEXT PK, data BLOB, generation INTEGER)
+//! snapshots(repo_id TEXT PK, data BLOB, generation INTEGER, snapshot_generation INTEGER)
 //! overlays(repo_id TEXT, session_id TEXT, data BLOB, PK(repo_id, session_id))
 //! ```
 
@@ -110,7 +110,7 @@ impl SqliteBackend {
                  repo_id    TEXT    PRIMARY KEY,
                  data       BLOB    NOT NULL,
                  generation INTEGER NOT NULL DEFAULT 0,
-                 snapshot_generation INTEGER
+                 snapshot_generation INTEGER NOT NULL
              );
 
              CREATE TABLE IF NOT EXISTS overlays (
@@ -129,63 +129,55 @@ impl SqliteBackend {
         )
         .map_err(|e| KinDbError::StorageError(format!("failed to initialize SQL schema: {e}")))?;
 
-        let has_snapshot_generation = {
-            let mut statement = conn
-                .prepare("PRAGMA table_info(snapshots)")
-                .map_err(|error| {
-                    KinDbError::StorageError(format!(
-                        "failed to inspect SQLite snapshots schema: {error}"
-                    ))
-                })?;
-            let columns = statement
-                .query_map([], |row| row.get::<_, String>(1))
-                .map_err(|error| {
-                    KinDbError::StorageError(format!(
-                        "failed to read SQLite snapshots schema: {error}"
-                    ))
-                })?;
-            let mut found = false;
-            for column in columns {
-                if column.map_err(|error| {
-                    KinDbError::StorageError(format!(
-                        "failed to decode SQLite snapshots schema: {error}"
-                    ))
-                })? == "snapshot_generation"
-                {
-                    found = true;
-                }
-            }
-            found
-        };
-        if !has_snapshot_generation {
-            conn.execute(
-                "ALTER TABLE snapshots ADD COLUMN snapshot_generation INTEGER",
-                [],
-            )
+        let mut statement = conn
+            .prepare("PRAGMA table_info(snapshots)")
             .map_err(|error| {
                 KinDbError::StorageError(format!(
-                    "failed to add SQLite snapshot-generation authority: {error}"
+                    "failed to inspect SQLite snapshots schema: {error}"
                 ))
             })?;
+        let columns = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .map_err(|error| {
+                KinDbError::StorageError(format!("failed to read SQLite snapshots schema: {error}"))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to decode SQLite snapshots schema: {error}"
+                ))
+            })?;
+        let exact_current_schema = [
+            ("repo_id", "TEXT", 0, None, 1),
+            ("data", "BLOB", 1, None, 0),
+            ("generation", "INTEGER", 1, Some("0"), 0),
+            ("snapshot_generation", "INTEGER", 1, None, 0),
+        ];
+        let matches_current = columns.len() == exact_current_schema.len()
+            && columns.iter().zip(exact_current_schema).all(
+                |((name, sql_type, not_null, default, primary_key), expected)| {
+                    (
+                        name.as_str(),
+                        sql_type.as_str(),
+                        *not_null,
+                        default.as_deref(),
+                        *primary_key,
+                    ) == expected
+                },
+            );
+        if !matches_current {
+            return Err(KinDbError::StorageError(
+                "SQLite snapshots table is not the exact current authority schema".to_string(),
+            ));
         }
-
-        // A legacy row is safely self-contained only when it has no journal.
-        // Rows with legacy deltas keep NULL and fail closed on recovery because
-        // their snapshot base cannot be proven from the old schema.
-        conn.execute(
-            "UPDATE snapshots AS snapshots_row
-             SET snapshot_generation = generation
-             WHERE snapshot_generation IS NULL
-               AND NOT EXISTS (
-                   SELECT 1 FROM deltas WHERE deltas.repo_id = snapshots_row.repo_id
-               )",
-            [],
-        )
-        .map_err(|error| {
-            KinDbError::StorageError(format!(
-                "failed to migrate safe SQLite snapshot authorities: {error}"
-            ))
-        })?;
 
         Ok(())
     }
@@ -217,7 +209,7 @@ impl SqliteBackend {
                 |row| {
                     Ok((
                         row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
                     ))
                 },
@@ -231,11 +223,6 @@ impl SqliteBackend {
         let Some((snapshot_bytes, snapshot_generation, head_generation)) = row else {
             return Ok(None);
         };
-        let snapshot_generation = snapshot_generation.ok_or_else(|| {
-            KinDbError::StorageError(format!(
-                "SQLite repo {repo_id} has legacy deltas but no provable snapshot-base generation"
-            ))
-        })?;
         let snapshot_generation =
             Self::decode_generation(snapshot_generation, "snapshot authority")?;
         let head_generation = Self::decode_generation(head_generation, "head authority")?;
@@ -346,7 +333,7 @@ impl StorageBackend for SqliteBackend {
                 KinDbError::StorageError(format!("SQLite begin transaction failed: {e}"))
             })?;
 
-        let current_gen: Option<(i64, Option<i64>)> = tx
+        let current_gen: Option<(i64, i64)> = tx
             .query_row(
                 "SELECT generation, snapshot_generation FROM snapshots WHERE repo_id = ?1",
                 params![repo_id],
@@ -363,11 +350,6 @@ impl StorageBackend for SqliteBackend {
         let stored_gen = match current_gen {
             Some((generation, snapshot_generation)) => {
                 let generation = Self::decode_generation(generation, "head authority")?;
-                let snapshot_generation = snapshot_generation.ok_or_else(|| {
-                    KinDbError::StorageError(format!(
-                        "SQLite repo {repo_id} has no provable snapshot-base generation"
-                    ))
-                })?;
                 let snapshot_generation =
                     Self::decode_generation(snapshot_generation, "snapshot authority")?;
                 if snapshot_generation > generation {
@@ -438,7 +420,7 @@ impl StorageBackend for SqliteBackend {
             })?;
 
         // Read current generation for CAS
-        let current_gen: Option<(i64, Option<i64>)> = tx
+        let current_gen: Option<(i64, i64)> = tx
             .query_row(
                 "SELECT generation, snapshot_generation FROM snapshots WHERE repo_id = ?1",
                 params![repo_id],
@@ -456,11 +438,6 @@ impl StorageBackend for SqliteBackend {
                 "SQLite repo {repo_id} has no base snapshot for delta persistence"
             )));
         };
-        let snapshot_generation = snapshot_generation.ok_or_else(|| {
-            KinDbError::StorageError(format!(
-                "SQLite repo {repo_id} has no provable snapshot-base generation"
-            ))
-        })?;
         let snapshot_generation =
             Self::decode_generation(snapshot_generation, "snapshot authority")?;
         let stored_gen = Self::decode_generation(current_gen, "head authority")?;
@@ -642,6 +619,39 @@ mod tests {
 
     fn test_backend() -> SqliteBackend {
         SqliteBackend::in_memory().unwrap()
+    }
+
+    #[test]
+    fn sqlite_backend_rejects_noncurrent_snapshot_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE snapshots (
+                 repo_id TEXT PRIMARY KEY,
+                 data BLOB NOT NULL,
+                 generation INTEGER NOT NULL DEFAULT 0,
+                 snapshot_generation INTEGER
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = match SqliteBackend::new(&path) {
+            Ok(_) => panic!("nullable snapshot authority schema must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("not the exact current authority schema"));
+    }
+
+    #[test]
+    fn sqlite_backend_reopens_current_snapshot_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current.sqlite");
+        drop(SqliteBackend::new(&path).unwrap());
+        SqliteBackend::new(&path).unwrap();
     }
 
     #[test]

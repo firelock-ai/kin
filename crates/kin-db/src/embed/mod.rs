@@ -566,6 +566,7 @@ pub mod adaptive_split {
 /// The default nomic-embed-text-v1.5 keeps semantic search local while bringing
 /// embedding build time down enough for repo-scale indexing to stay practical on
 /// developer machines.
+#[cfg(feature = "embeddings")]
 const DEFAULT_MODEL_ID: &str = "nomic-ai/nomic-embed-text-v1.5";
 /// Asymmetric query instruction for SweRankEmbed / nomic_bert code retrievers.
 ///
@@ -580,6 +581,7 @@ const DEFAULT_LMSTUDIO_EMBED_MODEL_ID: &str = "text-embedding-nomic-embed-text-v
 const DEFAULT_OPENAI_EMBED_MODEL_ID: &str = "text-embedding-3-small";
 
 /// Default model revision.
+#[cfg(feature = "embeddings")]
 const DEFAULT_REVISION: &str = "main";
 
 /// Serializes `--lib` unit tests that build a real [`CodeEmbedder`] against
@@ -644,6 +646,7 @@ const FILE_SURFACE_CONTEXT_KEY: &str = "file_surface_context";
 /// path, name, signature, doc summary, body preview), so right-truncation past this
 /// length drops boilerplate (Parameters/Examples/References prose), not semantics —
 /// while keeping every embed command sub-second and the daemon alive at scale.
+#[cfg(feature = "embeddings")]
 const EMBED_MAX_SEQ_LEN: usize = 2048;
 
 /// Maximum characters of an entity's docstring (`doc_summary`) folded into its
@@ -3666,6 +3669,7 @@ mod tests {
     };
 
     /// Default embedding dimensions (768, nomic-embed-text-v1.5).
+    #[cfg(feature = "embeddings")]
     const DEFAULT_EMBED_DIMS: usize = 768;
 
     #[test]

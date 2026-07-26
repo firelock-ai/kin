@@ -651,7 +651,7 @@ pub fn load_recovered_snapshot<B: StorageBackend + ?Sized>(
             return Ok(None);
         }
         return Err(KinDbError::StorageError(format!(
-            "repo {repo_id} has {} persisted deltas but no base snapshot",
+            "repo {repo_id} has {} persisted deltas but no current snapshot authority",
             raw_deltas.len()
         )));
     };
@@ -831,9 +831,9 @@ pub trait StorageBackend: Send + Sync {
     /// Implementations must inspect trusted object metadata before reading a
     /// body, reject objects larger than `max_bytes`, and also retain the
     /// backend-wide [`MAX_SOURCE_BLOB_BYTES`] safety boundary. This default is
-    /// deliberately fail-closed instead of delegating to [`load_source_blob`]
-    /// so a backend compiled before bounded reads existed cannot accidentally
-    /// allocate an unbounded legacy result on a security-sensitive path.
+    /// deliberately fail-closed instead of delegating to [`load_source_blob`],
+    /// because a security-sensitive caller must never silently downgrade to
+    /// an unbounded allocation.
     fn load_source_blob_bounded(
         &self,
         repo_id: &str,
@@ -1299,7 +1299,7 @@ impl LocalFileBackend {
             })?;
             if digest != identity.sha256 {
                 return Err(KinDbError::StorageError(format!(
-                    "acknowledged delta digest mismatch for repo {repo_id} generation {}: expected {}, found {digest}; a mixed-version writer replaced committed journal bytes",
+                    "acknowledged delta digest mismatch for repo {repo_id} generation {}: expected {}, found {digest}; committed journal bytes changed",
                     identity.generation, identity.sha256
                 )));
             }
@@ -1325,7 +1325,7 @@ impl LocalFileBackend {
             let digest = Self::snapshot_digest(bytes);
             if digest != identity.sha256 {
                 return Err(KinDbError::StorageError(format!(
-                    "acknowledged delta digest mismatch for repo {repo_id} generation {} while loading recovery bytes: expected {}, found {digest}; a mixed-version writer replaced committed journal bytes",
+                    "acknowledged delta digest mismatch for repo {repo_id} generation {} while loading recovery bytes: expected {}, found {digest}; committed journal bytes changed",
                     identity.generation, identity.sha256
                 )));
             }
@@ -1361,7 +1361,7 @@ impl LocalFileBackend {
                 let digest = Self::snapshot_digest(bytes);
                 if digest != identity.sha256 {
                     return Err(KinDbError::StorageError(format!(
-                        "retired delta digest mismatch for repo {repo_id} generation {generation}: expected {}, found {digest}; a mixed-version writer replaced bytes after full promotion",
+                        "retired delta digest mismatch for repo {repo_id} generation {generation}: expected {}, found {digest}; retired bytes changed after full promotion",
                         identity.sha256
                     )));
                 }
@@ -1697,14 +1697,14 @@ impl LocalFileBackend {
             let quarantines = load_quarantined_deltas(&self.deltas_dir(repo_id))?;
             if !quarantines.is_empty() {
                 return Err(KinDbError::StorageError(format!(
-                    "repo {repo_id} has {} quarantined deltas but no atomic authority; recovery is fail-closed",
+                    "repo {repo_id} has {} quarantined deltas but no current snapshot authority; recovery is fail-closed",
                     quarantines.len()
                 )));
             }
             let deltas = self.load_deltas_since_unlocked(repo_id, GENERATION_INIT)?;
             if !deltas.is_empty() {
                 return Err(KinDbError::StorageError(format!(
-                    "repo {repo_id} has {} deltas but no atomic authority; recovery is fail-closed",
+                    "repo {repo_id} has {} deltas but no current snapshot authority; recovery is fail-closed",
                     deltas.len()
                 )));
             }
@@ -2355,9 +2355,9 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    struct LegacyUnboundedOnlyBackend;
+    struct UnboundedOnlyBackend;
 
-    impl StorageBackend for LegacyUnboundedOnlyBackend {
+    impl StorageBackend for UnboundedOnlyBackend {
         fn load_snapshot(
             &self,
             _repo_id: &str,
@@ -2370,7 +2370,7 @@ mod tests {
             _repo_id: &str,
             _digest: [u8; 32],
         ) -> Result<Option<Vec<u8>>, KinDbError> {
-            panic!("the bounded default must not call the legacy unbounded method")
+            panic!("the bounded default must not downgrade to the unbounded method")
         }
 
         fn save_snapshot(
@@ -2434,10 +2434,10 @@ mod tests {
     }
 
     #[test]
-    fn bounded_source_blob_default_fails_closed_without_calling_legacy_load() {
-        let error = LegacyUnboundedOnlyBackend
+    fn bounded_source_blob_default_fails_closed_without_calling_unbounded_load() {
+        let error = UnboundedOnlyBackend
             .load_source_blob_bounded("repo-a", [0; 32], 4)
-            .expect_err("legacy backends must opt in to bounded reads");
+            .expect_err("backends must explicitly implement bounded reads");
         assert!(error
             .to_string()
             .contains("bounded immutable source blob reads are not supported"));
@@ -3189,7 +3189,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_full_save_must_reject_journal_without_base() {
+    fn initial_full_save_must_reject_journal_without_current_authority() {
         let dir = TempDir::new().unwrap();
         let backend = LocalFileBackend::new(dir.path());
         let repo_id = "initial-save-unbound-journal";
@@ -3209,9 +3209,64 @@ mod tests {
                 GENERATION_INIT,
             )
             .expect_err("initial full save must not create authority over an unbound journal");
-        assert!(error.to_string().contains("staged unacknowledged delta"));
+        assert!(error
+            .to_string()
+            .contains("deltas but no current snapshot authority"));
         assert!(!backend.authority_path(repo_id).exists());
         assert!(backend.delta_path(repo_id, 1).exists());
+    }
+
+    #[test]
+    fn local_backend_accepts_only_the_exact_current_authority_shape() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "exact-current-authority";
+        backend
+            .save_snapshot(
+                repo_id,
+                &GraphSnapshot::empty().to_bytes().unwrap(),
+                GENERATION_INIT,
+            )
+            .unwrap();
+        let authority_path = backend.authority_path(repo_id);
+        let current: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&authority_path).unwrap()).unwrap();
+
+        for rejected_version in [1, 2] {
+            let mut candidate = current.clone();
+            candidate["version"] = serde_json::json!(rejected_version);
+            LocalFileBackend::atomic_write(
+                &authority_path,
+                &serde_json::to_vec(&candidate).unwrap(),
+            )
+            .unwrap();
+            let error = backend
+                .load_snapshot_authority(repo_id)
+                .expect_err("old authority versions must not be migrated");
+            assert!(
+                error
+                    .to_string()
+                    .contains("unsupported local authority version"),
+                "unexpected old-version error: {error}"
+            );
+        }
+
+        for required_field in ["acknowledged_deltas", "retired_deltas"] {
+            let mut candidate = current.clone();
+            candidate.as_object_mut().unwrap().remove(required_field);
+            LocalFileBackend::atomic_write(
+                &authority_path,
+                &serde_json::to_vec(&candidate).unwrap(),
+            )
+            .unwrap();
+            let error = backend
+                .load_snapshot_authority(repo_id)
+                .expect_err("current authority identity arrays are required");
+            assert!(
+                error.to_string().contains(required_field),
+                "unexpected missing-field error for {required_field}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -3243,7 +3298,7 @@ mod tests {
     fn local_atomic_authority_rejects_replaced_acknowledged_delta_at_same_head() {
         let dir = TempDir::new().unwrap();
         let backend = LocalFileBackend::new(dir.path());
-        let repo_id = "mixed-version-replaced-delta";
+        let repo_id = "replaced-acknowledged-delta";
         let base = GraphSnapshot::empty();
         let gen1 = backend
             .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
@@ -3258,9 +3313,8 @@ mod tests {
             .save_delta(repo_id, &committed.to_bytes().unwrap(), gen1)
             .unwrap();
 
-        // A pre-authority writer uses the deterministic generation filename
-        // and replaces the already-acknowledged bytes without moving atomic
-        // authority.
+        // Replacing the deterministic generation filename without moving
+        // current authority must fail exact-byte validation.
         let replacement = crate::storage::delta::GraphSnapshotDelta::empty(gen1);
         LocalFileBackend::atomic_write(
             &backend.delta_path(repo_id, gen2),
@@ -3278,7 +3332,7 @@ mod tests {
     fn local_recovery_validates_the_exact_delta_bytes_it_returns() {
         let dir = TempDir::new().unwrap();
         let backend = LocalFileBackend::new(dir.path());
-        let repo_id = "mixed-version-recovery-read-race";
+        let repo_id = "recovery-read-race";
         let base = GraphSnapshot::empty();
         let gen1 = backend
             .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
@@ -3637,7 +3691,7 @@ mod tests {
         let error = backend
             .load_deltas_since(unbound_repo, GENERATION_INIT)
             .expect_err("quarantine without authority must fail closed");
-        assert!(error.to_string().contains("no atomic authority"));
+        assert!(error.to_string().contains("no current snapshot authority"));
         assert!(unbound.exists());
     }
 

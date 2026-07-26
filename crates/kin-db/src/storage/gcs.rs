@@ -148,9 +148,11 @@ impl GcsBackend {
         Ok(encoded)
     }
 
-    fn decode_full_snapshot_authority(bytes: &[u8]) -> Result<(Vec<u8>, bool), KinDbError> {
+    fn decode_full_snapshot_authority(bytes: &[u8]) -> Result<Vec<u8>, KinDbError> {
         if !bytes.starts_with(&GCS_FULL_AUTHORITY_MAGIC) {
-            return Ok((bytes.to_vec(), false));
+            return Err(KinDbError::StorageError(
+                "GCS snapshot object is not a current full-authority envelope".to_string(),
+            ));
         }
         if bytes.len() < GCS_FULL_AUTHORITY_HEADER_LEN {
             return Err(KinDbError::StorageError(
@@ -184,13 +186,10 @@ impl GcsBackend {
                 "GCS full-snapshot authority digest mismatch".to_string(),
             ));
         }
-        Ok((payload.to_vec(), true))
+        Ok(payload.to_vec())
     }
 
-    fn load_snapshot_object(
-        &self,
-        repo_id: &str,
-    ) -> Result<Option<(SnapshotAuthority, bool)>, KinDbError> {
+    fn load_snapshot_object(&self, repo_id: &str) -> Result<Option<SnapshotAuthority>, KinDbError> {
         let path = self.snapshot_path(repo_id);
         let get_result = match self.block_on(self.store.get(&path)) {
             Ok(result) => result,
@@ -208,15 +207,12 @@ impl GcsBackend {
         let bytes = self.block_on(get_result.bytes()).map_err(|error| {
             KinDbError::StorageError(format!("GCS read bytes failed for {path}: {error}"))
         })?;
-        let (snapshot_bytes, has_full_authority) = Self::decode_full_snapshot_authority(&bytes)?;
-        Ok(Some((
-            SnapshotAuthority {
-                snapshot_bytes,
-                snapshot_generation: generation,
-                head_generation: generation,
-            },
-            has_full_authority,
-        )))
+        let snapshot_bytes = Self::decode_full_snapshot_authority(&bytes)?;
+        Ok(Some(SnapshotAuthority {
+            snapshot_bytes,
+            snapshot_generation: generation,
+            head_generation: generation,
+        }))
     }
 
     fn list_delta_objects(
@@ -454,25 +450,21 @@ impl StorageBackend for GcsBackend {
         &self,
         repo_id: &str,
     ) -> Result<Option<SnapshotAuthority>, KinDbError> {
-        Ok(self
-            .load_snapshot_object(repo_id)?
-            .map(|(authority, _)| authority))
+        self.load_snapshot_object(repo_id)
     }
 
     fn load_recovery_state(&self, repo_id: &str) -> Result<SnapshotRecoveryState, KinDbError> {
         // GCS incremental writes are disabled until snapshot+journal authority
-        // has one conditional commit point. Any visible journal is therefore
-        // unbound legacy state or a post-migration write from an old binary.
-        // Silently deleting or ignoring it would acknowledge graph state that
-        // is absent from the full-snapshot authority.
+        // has one conditional commit point. Any visible journal is unbound
+        // state and must fail closed.
         let deltas = self.list_delta_objects(repo_id)?;
         if !deltas.is_empty() {
             return Err(KinDbError::StorageError(format!(
-                "GCS repo {repo_id} has {} unbound or mixed-version delta objects; drain legacy writers and reconcile them before retrying",
+                "GCS repo {repo_id} has {} unbound delta objects outside current authority",
                 deltas.len()
             )));
         }
-        let Some((authority, _has_full_authority)) = self.load_snapshot_object(repo_id)? else {
+        let Some(authority) = self.load_snapshot_object(repo_id)? else {
             return Ok((None, Vec::new()));
         };
         Ok((Some(authority), Vec::new()))
@@ -488,7 +480,7 @@ impl StorageBackend for GcsBackend {
         let deltas = self.list_delta_objects(repo_id)?;
         if !deltas.is_empty() {
             return Err(KinDbError::StorageError(format!(
-                "refusing GCS full-snapshot commit for repo {repo_id}: {} legacy or mixed-version delta objects remain",
+                "refusing GCS full-snapshot commit for repo {repo_id}: {} unbound delta objects remain",
                 deltas.len()
             )));
         }
@@ -497,8 +489,7 @@ impl StorageBackend for GcsBackend {
         // this point authority has committed and callers must receive its new
         // generation so their CAS cursor cannot remain on the pre-commit value.
         // `load_recovery_state` and `clear_deltas` both list journals and fail
-        // closed if a legacy writer raced this commit; Kin's retryable
-        // post-commit finalizer exercises that fence immediately.
+        // closed if an unbound write raced this commit.
         Ok(generation)
     }
 
@@ -519,29 +510,20 @@ impl StorageBackend for GcsBackend {
         since_gen: Generation,
     ) -> Result<Vec<(Vec<u8>, Generation)>, KinDbError> {
         let deltas = self.list_delta_objects(repo_id)?;
-        let mut result = Vec::with_capacity(deltas.len());
-        for (generation, meta) in deltas {
-            if generation <= since_gen {
-                continue;
-            }
-            let path = meta.location;
-            let get_result = self.block_on(self.store.get(&path)).map_err(|e| {
-                KinDbError::StorageError(format!("GCS delta read failed for {path}: {e}"))
-            })?;
-            let bytes = self.block_on(get_result.bytes()).map_err(|e| {
-                KinDbError::StorageError(format!("GCS delta bytes failed for {path}: {e}"))
-            })?;
-            result.push((bytes.to_vec(), generation));
+        if deltas.is_empty() {
+            return Ok(Vec::new());
         }
-
-        Ok(result)
+        Err(KinDbError::StorageError(format!(
+            "GCS repo {repo_id} has {} unbound delta objects while reading after generation {since_gen}",
+            deltas.len()
+        )))
     }
 
     fn clear_deltas(&self, repo_id: &str) -> Result<(), KinDbError> {
         let deltas = self.list_delta_objects(repo_id)?;
         if !deltas.is_empty() {
             return Err(KinDbError::StorageError(format!(
-                "refusing to delete {} unbound GCS delta objects for repo {repo_id}; reconcile mixed-version writes explicitly",
+                "refusing to delete {} unbound GCS delta objects for repo {repo_id}",
                 deltas.len()
             )));
         }
@@ -660,7 +642,6 @@ mod tests {
     struct VersionedMemoryStore {
         inner: InMemory,
         state: Arc<tokio::sync::Mutex<VersionState>>,
-        fail_next_delete: Arc<AtomicBool>,
         report_next_get_as_oversized: Arc<AtomicBool>,
         body_get_count: Arc<AtomicUsize>,
     }
@@ -673,14 +654,9 @@ mod tests {
                     next_generation: 100,
                     versions: HashMap::new(),
                 })),
-                fail_next_delete: Arc::new(AtomicBool::new(false)),
                 report_next_get_as_oversized: Arc::new(AtomicBool::new(false)),
                 body_get_count: Arc::new(AtomicUsize::new(0)),
             }
-        }
-
-        fn fail_next_delete(&self) {
-            self.fail_next_delete.store(true, Ordering::SeqCst);
         }
 
         fn report_next_get_as_oversized(&self) {
@@ -784,19 +760,6 @@ mod tests {
             &self,
             locations: BoxStream<'static, ObjectStoreResult<ObjectPath>>,
         ) -> BoxStream<'static, ObjectStoreResult<ObjectPath>> {
-            if self.fail_next_delete.swap(false, Ordering::SeqCst) {
-                return locations
-                    .then(|location| async move {
-                        let location = location?;
-                        Err(object_store::Error::Generic {
-                            store: "VersionedMemoryStore",
-                            source: Box::new(std::io::Error::other(format!(
-                                "injected delete failure for {location}"
-                            ))),
-                        })
-                    })
-                    .boxed();
-            }
             let state = Arc::clone(&self.state);
             self.inner
                 .delete_stream(locations)
@@ -1035,14 +998,12 @@ mod tests {
     fn gcs_full_snapshot_authority_envelope_roundtrips_and_detects_corruption() {
         let bytes = GraphSnapshot::empty().to_bytes().unwrap();
         let encoded = GcsBackend::encode_full_snapshot_authority(&bytes).unwrap();
-        let (decoded, authoritative) =
-            GcsBackend::decode_full_snapshot_authority(&encoded).unwrap();
-        assert!(authoritative);
+        let decoded = GcsBackend::decode_full_snapshot_authority(&encoded).unwrap();
         assert_eq!(decoded, bytes);
 
-        let (legacy, authoritative) = GcsBackend::decode_full_snapshot_authority(&bytes).unwrap();
-        assert!(!authoritative);
-        assert_eq!(legacy, bytes);
+        let error = GcsBackend::decode_full_snapshot_authority(&bytes)
+            .expect_err("raw snapshot bytes are not current GCS authority");
+        assert!(error.to_string().contains("not a current"));
 
         let mut corrupt = encoded;
         *corrupt.last_mut().unwrap() ^= 0xff;
@@ -1052,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn gcs_backend_disables_uncommitted_legacy_delta_authority() {
+    fn gcs_backend_rejects_unbound_delta_objects() {
         let backend = test_backend();
         let repo_id = "restart-repo";
         assert!(!backend.supports_incremental_deltas());
@@ -1066,20 +1027,24 @@ mod tests {
             .to_string()
             .contains("no single conditional snapshot+journal authority"));
 
-        let legacy_path = ObjectPath::from(format!("test/{repo_id}/deltas/{:020}.kndd", 43_u64));
+        let unbound_path = ObjectPath::from(format!("test/{repo_id}/deltas/{:020}.kndd", 43_u64));
         backend
-            .block_on(backend.store.put(&legacy_path, PutPayload::from(delta)))
+            .block_on(backend.store.put(&unbound_path, PutPayload::from(delta)))
             .unwrap();
-        assert_eq!(backend.load_deltas_since(repo_id, 0).unwrap().len(), 1);
+        backend
+            .load_deltas_since(repo_id, 0)
+            .expect_err("unbound GCS deltas must not be exposed as replay authority");
         let recovery_error = backend
             .load_recovery_state(repo_id)
-            .expect_err("unbound legacy GCS journals must fail closed");
-        assert!(recovery_error.to_string().contains("mixed-version delta"));
+            .expect_err("unbound GCS journals must fail closed");
+        assert!(recovery_error.to_string().contains("unbound delta"));
         let cleanup_error = backend
             .clear_deltas(repo_id)
             .expect_err("automatic cleanup must not erase unbound journal state");
         assert!(cleanup_error.to_string().contains("refusing to delete"));
-        assert_eq!(backend.load_deltas_since(repo_id, 0).unwrap().len(), 1);
+        backend
+            .load_deltas_since(repo_id, 0)
+            .expect_err("unbound journal state must remain fail-closed");
     }
 
     #[test]
@@ -1139,10 +1104,10 @@ mod tests {
     }
 
     #[test]
-    fn gcs_versioned_fixture_fails_closed_on_post_authority_legacy_journal() {
+    fn gcs_versioned_fixture_fails_closed_on_post_authority_unbound_journal() {
         let store = Arc::new(VersionedMemoryStore::new());
         let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "fixture");
-        let repo_id = "mixed-version";
+        let repo_id = "unbound-journal";
         let bytes = GraphSnapshot::empty().to_bytes().unwrap();
         let generation = backend
             .save_snapshot(repo_id, &bytes, GENERATION_INIT)
@@ -1159,18 +1124,14 @@ mod tests {
             .unwrap();
 
         let recovery_error = crate::storage::backend::load_recovered_snapshot(&backend, repo_id)
-            .expect_err("post-authority legacy journal must fail closed");
-        assert!(recovery_error.to_string().contains("mixed-version delta"));
+            .expect_err("post-authority unbound journal must fail closed");
+        assert!(recovery_error.to_string().contains("unbound delta"));
         backend
             .clear_deltas(repo_id)
-            .expect_err("mixed-version journal must be preserved for reconciliation");
-        assert_eq!(
-            backend
-                .load_deltas_since(repo_id, generation)
-                .unwrap()
-                .len(),
-            1
-        );
+            .expect_err("unbound journal must not be silently deleted");
+        backend
+            .load_deltas_since(repo_id, generation)
+            .expect_err("unbound journal must not become replay authority");
     }
 
     #[test]

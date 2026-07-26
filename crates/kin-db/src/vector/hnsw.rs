@@ -244,40 +244,10 @@ impl VectorIndex {
             .map_err(|e| KinDbError::IndexError(e.to_string()))
     }
 
-    /// Load a previously saved HNSW index from disk.
-    ///
-    /// Returns a new `VectorIndex` with the loaded index data.
-    /// The `dimensions` parameter is used to validate the loaded data matches.
-    #[deprecated(
-        note = "dimension-only validation cannot detect a same-dimension model or \
-                graph swap and will serve silently-wrong neighbors; use \
-                `load_compatible` / `load_compatible_grandfathered` to verify the \
-                index self-description, or `load_from_disk` when no expectation \
-                exists"
-    )]
-    pub fn load(path: &Path, dimensions: usize) -> Result<Self, KinDbError> {
-        let _span = tracing::info_span!(
-            "kindb.vector_index.load",
-            path = %path.display(),
-            dimensions = dimensions
-        )
-        .entered();
-        let loaded = Self::load_from_disk(path)?;
-        let loaded_dims = loaded.dimensions();
-        if loaded_dims != dimensions {
-            return Err(KinDbError::IndexError(format!(
-                "loaded vector index has dimensions {loaded_dims}, expected {dimensions}"
-            )));
-        }
-        Ok(loaded)
-    }
-
-    /// Load a previously saved HNSW index from disk without dimension validation.
-    ///
-    /// The dimensions are read from the persisted data. Use this when the
-    /// embedder is not available (e.g., loading an existing index for search
-    /// without the `embeddings` feature enabled).
-    pub fn load_from_disk(path: &Path) -> Result<Self, KinDbError> {
+    /// Decode persisted index bytes for internal inspection and strict
+    /// descriptor validation.
+    #[cfg(test)]
+    pub(crate) fn load_from_disk(path: &Path) -> Result<Self, KinDbError> {
         let _span = tracing::info_span!(
             "kindb.vector_index.load_from_disk",
             path = %path.display()
@@ -295,10 +265,16 @@ impl VectorIndex {
     /// a model/graph mismatch (kin-vector's typed `ModelMismatch`) or a corrupt
     /// file both resolve to [`IndexLoadOutcome::Incompatible`] so the caller can
     /// archive-and-rebuild rather than crash-loop or serve silently-wrong
-    /// neighbors. `expected` pins only the fields it sets to `Some`; an index
-    /// whose descriptor cannot satisfy a pinned field is treated as incompatible
-    /// (this includes a legacy/unstamped index when the caller pins identity).
+    /// neighbors. Both expected model and graph identities are required; an
+    /// unstamped or partially bound descriptor is incompatible.
     pub fn load_compatible(path: &Path, expected: &IndexDescriptor) -> IndexLoadOutcome {
+        if expected.model_id.as_deref().is_none_or(str::is_empty)
+            || expected.graph_root.as_deref().is_none_or(str::is_empty)
+        {
+            return IndexLoadOutcome::Incompatible(
+                "expected vector descriptor must bind model_id and graph_root".to_string(),
+            );
+        }
         let inner = match kin_vector::VectorIndex::<RetrievalKey>::load_from_disk(path) {
             Ok(inner) => inner,
             Err(e) => {
@@ -306,36 +282,6 @@ impl VectorIndex {
             }
         };
         match inner.descriptor().verify_compatible(expected) {
-            Ok(()) => IndexLoadOutcome::Loaded(Self { inner }),
-            Err(e) => IndexLoadOutcome::Incompatible(e.to_string()),
-        }
-    }
-
-    /// Like [`VectorIndex::load_compatible`], but GRANDFATHERS a legacy index
-    /// that does not self-describe: only a field the stored index actually
-    /// stamped is enforced. An unstamped index (the pre-stamping format) loads
-    /// regardless — it cannot prove a mismatch and must remain usable — while a
-    /// stamped index that positively declares a different model/graph is
-    /// rejected as [`IndexLoadOutcome::Incompatible`] (kin-vector's typed
-    /// `ModelMismatch`). A corrupt/unreadable index is also `Incompatible`.
-    pub fn load_compatible_grandfathered(
-        path: &Path,
-        expected: &IndexDescriptor,
-    ) -> IndexLoadOutcome {
-        let inner = match kin_vector::VectorIndex::<RetrievalKey>::load_from_disk(path) {
-            Ok(inner) => inner,
-            Err(e) => {
-                return IndexLoadOutcome::Incompatible(format!("unreadable vector index: {e}"))
-            }
-        };
-        let stored = inner.descriptor();
-        // Enforce only the fields the stored index actually stamped (grandfather
-        // unstamped fields to None = "don't care").
-        let effective = IndexDescriptor {
-            model_id: stored.model_id.as_ref().and(expected.model_id.clone()),
-            graph_root: stored.graph_root.as_ref().and(expected.graph_root.clone()),
-        };
-        match stored.verify_compatible(&effective) {
             Ok(()) => IndexLoadOutcome::Loaded(Self { inner }),
             Err(e) => IndexLoadOutcome::Incompatible(e.to_string()),
         }
@@ -646,10 +592,10 @@ mod tests {
             VectorIndex::load_compatible(&path, &descriptor("model-A@1", "root-2")),
             IndexLoadOutcome::Incompatible(_)
         ));
-        // Pinning nothing (sidecar-vouched path) loads regardless.
+        // An unbound expectation is never authority.
         assert!(matches!(
             VectorIndex::load_compatible(&path, &IndexDescriptor::default()),
-            IndexLoadOutcome::Loaded(_)
+            IndexLoadOutcome::Incompatible(_)
         ));
     }
 
@@ -660,7 +606,7 @@ mod tests {
 
         let idx = VectorIndex::new(4).unwrap();
         idx.upsert(EntityId::new(), &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        // No set_descriptor → legacy/unstamped index.
+        // No set_descriptor: an unstamped index cannot prove compatibility.
         idx.save(&path).unwrap();
 
         // A pinned identity cannot be proven by an unstamped index → incompatible.
@@ -669,7 +615,7 @@ mod tests {
                 &path,
                 &IndexDescriptor {
                     model_id: Some("model-A@1".into()),
-                    graph_root: None,
+                    graph_root: Some("root-1".into()),
                 },
             ),
             IndexLoadOutcome::Incompatible(_)

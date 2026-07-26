@@ -809,6 +809,7 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::TempDir;
 
+    #[cfg(feature = "vector")]
     use crate::storage::{build_entity_hash_map, compute_graph_root_hash, verify_subgraph};
     #[cfg(feature = "vector")]
     use crate::vector::VectorIndex;
@@ -840,6 +841,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "vector")]
     fn test_entity_with_language(name: &str, path: &str, language: LanguageId) -> Entity {
         Entity {
             file_origin: Some(FilePathId::new(path)),

@@ -144,35 +144,6 @@ pub(crate) fn recovery_marker_path(path: &Path) -> PathBuf {
     append_suffix(path, ".tmp.meta")
 }
 
-/// Path a corrupt snapshot is moved aside to when verify-on-read fails.
-///
-/// `tag` is a short hex fingerprint of the offending content so repeated
-/// corruption of the same bytes lands on a stable name instead of piling up.
-pub(crate) fn quarantine_path(path: &Path, tag: &str) -> PathBuf {
-    append_suffix(path, &format!(".corrupt-{tag}"))
-}
-
-/// Atomically move a corrupt primary snapshot aside so it is never served and
-/// the path is free for a healed snapshot to take its place.
-///
-/// Mirrors the corrupt-object quarantine kin-blobs performs on a failed
-/// verify-on-read: the bad bytes are preserved for forensics under a distinct
-/// name rather than deleted or silently overwritten.
-pub(crate) fn quarantine_corrupt_snapshot(path: &Path, tag: &str) -> Result<PathBuf, KinDbError> {
-    ensure_regular_path_entry(path, "snapshot selected for quarantine")?;
-    let dest = quarantine_path(path, tag);
-    std::fs::rename(path, &dest).map_err(|e| {
-        KinDbError::StorageError(format!(
-            "failed to quarantine corrupt snapshot {} → {}: {e}",
-            path.display(),
-            dest.display()
-        ))
-    })?;
-    ensure_regular_path_entry(&dest, "quarantined snapshot")?;
-    sync_parent_dir(path)?;
-    Ok(dest)
-}
-
 fn unique_staging_path(path: &Path, kind: &str) -> PathBuf {
     append_suffix(
         path,
@@ -529,33 +500,6 @@ pub(crate) fn claim_exact_path(
         )));
     }
     Ok(claim)
-}
-
-pub(crate) fn publish_new_file_no_clobber(
-    path: &Path,
-    bytes: &[u8],
-    role: &str,
-) -> Result<bool, KinDbError> {
-    let staged = unique_staging_path(path, "no-clobber");
-    write_new_bytes_and_fsync(&staged, bytes)?;
-    match std::fs::hard_link(&staged, path) {
-        Ok(()) => {
-            sync_parent_dir(path)?;
-            let _ = std::fs::remove_file(&staged);
-            Ok(true)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let _ = std::fs::remove_file(&staged);
-            Ok(false)
-        }
-        Err(error) => {
-            let _ = std::fs::remove_file(&staged);
-            Err(KinDbError::StorageError(format!(
-                "failed to publish {role} {} without clobbering: {error}",
-                path.display()
-            )))
-        }
-    }
 }
 
 /// Remove the exact recovery candidate and marker entries observed at call
@@ -1501,42 +1445,20 @@ mod tests {
         assert!(error.to_string().contains("non-regular"));
     }
 
-    #[cfg(unix)]
     #[test]
-    fn quarantine_replaces_preplanted_symlink_destination_without_clobbering_target() {
-        use std::os::unix::fs::symlink;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("graph.kndb");
-        let sentinel = dir.path().join("sentinel");
-        std::fs::write(&path, b"corrupt").unwrap();
-        std::fs::write(&sentinel, b"sentinel").unwrap();
-        let destination = quarantine_path(&path, "bad0");
-        symlink(&sentinel, &destination).unwrap();
-
-        let quarantined = quarantine_corrupt_snapshot(&path, "bad0").unwrap();
-        assert_eq!(quarantined, destination);
-        assert_eq!(std::fs::read(&quarantined).unwrap(), b"corrupt");
-        assert_eq!(std::fs::read(&sentinel).unwrap(), b"sentinel");
-    }
-
-    #[test]
-    fn atomic_write_and_quarantine_support_bare_relative_paths() {
+    fn atomic_write_supports_bare_relative_paths() {
         const CHILD: &str = "KINDB_BARE_RELATIVE_MMAP_CHILD";
         if std::env::var_os(CHILD).is_some() {
             let path = Path::new("graph.kndb");
             atomic_write_bytes_no_magic(path, b"bare").unwrap();
             assert_eq!(std::fs::read(path).unwrap(), b"bare");
-            let quarantined = quarantine_corrupt_snapshot(path, "bare").unwrap();
-            assert_eq!(quarantined, PathBuf::from("graph.kndb.corrupt-bare"));
-            assert_eq!(std::fs::read(quarantined).unwrap(), b"bare");
             return;
         }
 
         let dir = tempfile::tempdir().unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
-            .arg("storage::mmap::tests::atomic_write_and_quarantine_support_bare_relative_paths")
+            .arg("storage::mmap::tests::atomic_write_supports_bare_relative_paths")
             .arg("--nocapture")
             .env(CHILD, "1")
             .current_dir(dir.path())
