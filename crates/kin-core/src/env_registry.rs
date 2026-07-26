@@ -227,7 +227,6 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_SUPERVISOR_REEXEC_DISABLE", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "disable supervisor self-reexec on binary mtime change" },
 
     // ---- init / embed / registry / storage -----------------------------------
-    EnvVarSpec { name: "KIN_INIT_MAX_FILES", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "cap on files ingested during init" },
     EnvVarSpec { name: "KIN_EMBED_MAX_PASSES", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "cap on embedding passes per embed run" },
     EnvVarSpec { name: "KIN_EMBED_PASS_SECONDS", kind: Kind::Secs, default: "", sensitivity: Sensitivity::Operational, summary: "per-pass wall-clock budget for an embed run" },
     EnvVarSpec { name: "KIN_EMBED_MAX_TOTAL_SECONDS", kind: Kind::Secs, default: "600", sensitivity: Sensitivity::Operational, summary: "total wall-clock budget for a single `kin embed` under the interactive/small resource profiles; the run stops at the budget with a resumable partial index; unconstrained profiles ignore it" },
@@ -276,7 +275,6 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_LOCATE_TELEMETRY", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Diagnostic, summary: "emit locate telemetry" },
     EnvVarSpec { name: "KIN_LOCATE_PIPELINE_REPORT", kind: Kind::Str, default: "", sensitivity: Sensitivity::Diagnostic, summary: "write a locate pipeline report (path or flag)" },
     EnvVarSpec { name: "KIN_SCOPE_TIMING", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Diagnostic, summary: "print scope graph build timing to stderr" },
-    EnvVarSpec { name: "KIN_HYDRATE_STAGE_TIMINGS", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Diagnostic, summary: "emit one machine-readable JSON line of per-phase history-hydration stage timings to stderr, alongside the human summary" },
     EnvVarSpec { name: "KIN_PROFILE_OUT", kind: Kind::Path, default: "", sensitivity: Sensitivity::Diagnostic, summary: "write a command profiling session to this path" },
     EnvVarSpec { name: "KIN_PROFILE_SUMMARY", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Diagnostic, summary: "print a profiling summary at command exit" },
     EnvVarSpec { name: "KIN_PROFILE_SAMPLE_MS", kind: Kind::Usize, default: "250", sensitivity: Sensitivity::Diagnostic, summary: "resource sampling interval for the profiler" },

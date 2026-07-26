@@ -43,18 +43,6 @@ enum Command {
         /// Output machine-readable JSON status instead of human text
         #[arg(long, default_value_t = false)]
         json: bool,
-        /// Skip the Git repository check (init even if .git/ exists)
-        #[arg(long, default_value_t = false)]
-        force: bool,
-        /// Show detailed classification, parsing, and role assignment info
-        #[arg(short, long, default_value_t = false)]
-        verbose: bool,
-        /// Skip LSP enrichment (faster init, tree-sitter only)
-        #[arg(long, default_value_t = false)]
-        no_lsp: bool,
-        /// Git import boundary: `off`, `snapshot` (exact HEAD tree), or `full` (all reachable history)
-        #[arg(long, default_value = "snapshot", value_parser = ["off", "snapshot", "full"])]
-        git_history: String,
     },
     /// Show working copy status
     Status {
@@ -311,8 +299,9 @@ enum Command {
     /// Embeddings enable semantic similarity
     /// search in `kin locate` and `kin search --semantic`.
     ///
-    /// Fast init + progressive embedding: `kin init` builds the graph instantly,
-    /// then `kin embed` adds vector search capability as a separate step.
+    /// Repository admission and enrichment are separate: `kin init` commits
+    /// repository authority; `kin embed` adds vectors for graph-owned entities
+    /// after semantic enrichment exists.
     ///
     /// If a repo was indexed with an older model at a different dimension, pass
     /// `--rebuild` to drop the stale index and re-embed every entity at the
@@ -691,9 +680,6 @@ enum Command {
         /// Distinct destination (defaults to an in-place migration)
         #[arg(long)]
         target: Option<PathBuf>,
-        /// Git history boundary: `snapshot` (exact HEAD tree) or `full` (all reachable history)
-        #[arg(long, default_value = "snapshot", value_parser = ["snapshot", "full"])]
-        history: String,
     },
     /// Inspect and bound the on-disk embedding cache
     Cache {
@@ -1897,14 +1883,7 @@ fn main() -> Result<()> {
     let result = runtime.block_on(
         (async move {
             match cli.command {
-                Command::Init {
-                    path,
-                    json,
-                    force,
-                    verbose,
-                    no_lsp,
-                    git_history,
-                } => commands::init::run(path, json, force, verbose, no_lsp, git_history).await,
+                Command::Init { path, json } => commands::init::run(path, json).await,
                 Command::Status { json } => {
                     if json {
                         commands::status::run_json().await
@@ -2596,11 +2575,7 @@ fn main() -> Result<()> {
                     commands::release::rollback_with_options(change_id, feature).await
                 }
                 Command::Bench { args } => commands::bench::bench_proxy(&args),
-                Command::Migrate {
-                    source,
-                    target,
-                    history,
-                } => commands::migrate::run(source, target, history).await,
+                Command::Migrate { source, target } => commands::migrate::run(source, target).await,
                 Command::Cache { action } => match action {
                     CacheAction::Status { json } => commands::cache::status(json).await,
                     CacheAction::Gc {

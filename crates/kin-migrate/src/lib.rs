@@ -3,17 +3,9 @@
 
 //! Git forge migration pipeline for Kin.
 //!
-//! Converts a Git repository (from GitHub, GitLab, Bitbucket, or any Git
-//! server) into a sovereign Kin repo by:
-//! 1. Detecting the source forge and parsing repository coordinates
-//! 2. Selecting the source ref without deriving membership from the worktree
-//! 3. Planning the migration (exact HEAD snapshot or full reachable history)
-//! 4. Initializing the .kin/ directory structure
-//! 5. Importing Git history as SemanticChange objects
-//! 6. Enriching the graph-owned imported head from blob-store bytes
-//! 7. Writing everything to the graph store
+//! Detects Git forges and delegates repository admission to Kin's single exact,
+//! atomic repository-v6 bootstrap boundary.
 
-pub mod converter;
 pub mod error;
 pub mod executor;
 pub mod finalize;
