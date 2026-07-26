@@ -123,7 +123,6 @@ impl AdmittedSemanticGitImportPlan {
             default_ref_mutation: self.default_ref_mutation,
             workspace_mutation: None,
             local_overlay_delta: None,
-            admission_scan_token: None,
         };
         transaction.validate()?;
         Ok(transaction)

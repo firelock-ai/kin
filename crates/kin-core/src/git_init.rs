@@ -17,11 +17,10 @@ use kin_git::{
     GitMigrationPreflightProof, LosslessGitRepository,
 };
 use kin_model::{
-    compute_resolved_tree_hash, AdmissionScanToken, AuthorId, EffectiveAdmissionPolicyStamp,
+    compute_resolved_tree_hash, AdmissionCase, AuthorId, EffectiveAdmissionPolicyStamp,
     FrozenLocalOverlay, FrozenLocalOverlayDelta, GitExternalAuthorityDelta, Hash256,
     LocalAdmissionRuleSource, LocalAdmissionRuleSourceKind, LocatedEntry, OperationId,
-    RepositoryId, RepositoryTransaction, ResolvedTree, TreeDelta, WorkspaceExpectation,
-    WorkspaceMutation, ADMISSION_POLICY_SEMANTICS_VERSION,
+    RepositoryId, RepositoryTransaction, TreeDelta, WorkspaceExpectation, WorkspaceMutation,
 };
 use tracing::info;
 
@@ -232,8 +231,6 @@ fn bind_workspace_authority(
             "admitted Git workspace tree does not match its canonical base identity".to_string(),
         ));
     }
-    let empty_tree_hash = compute_resolved_tree_hash(&ResolvedTree::default())
-        .map_err(|error| KinError::Other(error.to_string()))?;
     let tree_deltas = workspace_seed
         .base_tree
         .artifacts()
@@ -260,17 +257,6 @@ fn bind_workspace_authority(
         new_admission_policy: effective_policy,
     });
     transaction.local_overlay_delta = Some(FrozenLocalOverlayDelta::initialize(local_overlay));
-    transaction.admission_scan_token = Some(AdmissionScanToken {
-        repository_id: transaction.repository_id.clone(),
-        workspace_id,
-        workspace_generation: 0,
-        workspace_head: workspace_seed.head,
-        baseline_tree_hash: empty_tree_hash,
-        observed_tree_hash: tree_hash,
-        matcher_semantics_version: ADMISSION_POLICY_SEMANTICS_VERSION,
-        shared_policy: effective_policy.shared,
-        local_overlay: effective_policy.local,
-    });
     Ok(())
 }
 
@@ -308,7 +294,12 @@ fn frozen_local_overlay(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    FrozenLocalOverlay::new(workspace_id, 0, sources)
+    let case = if proof.ignored_local.ignore_case {
+        AdmissionCase::FoldAscii
+    } else {
+        AdmissionCase::Sensitive
+    };
+    FrozenLocalOverlay::new(workspace_id, 0, case, sources)
         .map_err(|error| KinError::Other(error.to_string()))
 }
 
