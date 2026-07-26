@@ -12,7 +12,7 @@
         "fresh Git repositories import the complete exact reachable object, ref, change, tree, mode, symlink, gitlink, and non-code-artifact closure atomically",
         "fresh non-Git repositories create only an unborn repository-v6 authority",
         "existing .kin and non-empty non-Git directories fail without mutation",
-        "remote or unsafe Git mappings fail closed before .kin publication"
+        "safe exact Git remote mappings are sealed into graph-adjacent local transport config while unsafe mappings fail closed before .kin publication"
       ],
       "evidence_tests": [
         "crates/kin-cli/tests/init_json.rs"

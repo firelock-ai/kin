@@ -231,12 +231,10 @@ fn log_walks_exact_merge_dag_and_ignores_git_and_checkout_drift() {
     );
 }
 
-/// Repository-v6 currently rejects this exact detached-tag workspace during
-/// admission because kin-db resolves workspace base trees/policy through
-/// commit-only targets. Keep the desired acceptance executable: remove the
-/// ignore as soon as kin-db peels authority-recorded tags through source CAS.
+/// A detached annotated tag has no repository default ref. Admission keeps the
+/// raw tag target as external Git authority while the material workspace and
+/// semantic history start at its CAS-verified peeled commit.
 #[test]
-#[ignore = "pending kin-db repository-v6 detached annotated-tag base resolution"]
 fn log_peels_detached_annotated_tag_only_through_admitted_cas() {
     let root = tempdir().expect("temp root");
     let home = root.path().join("home");
@@ -275,10 +273,20 @@ fn log_peels_detached_annotated_tag_only_through_admitted_cas() {
         String::from_utf8_lossy(&init.stdout),
         String::from_utf8_lossy(&init.stderr)
     );
+    let init_payload: Value =
+        serde_json::from_slice(&init.stdout).expect("detached tag init stdout should be JSON");
+    assert_eq!(init_payload["schema"], "kin.init-result.v4");
+    assert!(init_payload["default_ref"].is_null());
+    assert_eq!(init_payload["raw_git_head"]["type"], "direct");
+    assert_eq!(
+        init_payload["raw_git_head"]["object"]["kind"],
+        "tag",
+        "raw detached tag identity was not preserved"
+    );
     let before = require_kin_json(&repo, &home, &["log", "--json"]);
     assert_eq!(before["workspace_head"]["type"], "detached");
     assert_eq!(before["start_target"]["type"], "external_object");
-    assert_eq!(before["start_target"]["object"]["kind"], "tag");
+    assert_eq!(before["start_target"]["object"]["kind"], "commit");
     let entries = before["entries"].as_array().expect("log entries");
     assert_eq!(entries.len(), 1);
     assert_eq!(entry_origin_oid(&entries[0]), commit_oid);
