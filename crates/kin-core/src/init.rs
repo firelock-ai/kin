@@ -8,11 +8,12 @@ use kin_db::{LocalFileBackend, RepositoryAuthorityManager, StorageBackend};
 use kin_model::{
     compute_resolved_tree_hash, AdmissionPolicyDelta, AdmissionScanToken, AuthorId,
     DefaultRefExpectation, DefaultRefMutation, EffectiveAdmissionPolicyStamp, FrozenLocalOverlay,
-    FrozenLocalOverlayDelta, Hash256, OperationId, RefExpectation, RefMutation, RefName, RefTarget,
-    RefUpdatePolicy, RepositoryAuthorityStore, RepositoryCommitReceipt, RepositoryId,
-    RepositoryTransaction, RootBundle, SemanticChange, SemanticChangeId, SharedAdmissionPolicy,
-    WorkspaceExpectation, WorkspaceHead, WorkspaceId, WorkspaceMutation, WorkspaceSnapshotBinding,
-    ADMISSION_POLICY_SEMANTICS_VERSION, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    FrozenLocalOverlayDelta, GitRawTarget, Hash256, OperationId, RefExpectation, RefMutation,
+    RefName, RefTarget, RefUpdatePolicy, RepositoryAuthorityStore, RepositoryCommitReceipt,
+    RepositoryId, RepositoryTransaction, RootBundle, SemanticChange, SemanticChangeId,
+    SharedAdmissionPolicy, WorkspaceExpectation, WorkspaceHead, WorkspaceId, WorkspaceMutation,
+    WorkspaceSnapshotBinding, ADMISSION_POLICY_SEMANTICS_VERSION,
+    REPOSITORY_TRANSACTION_SCHEMA_VERSION,
 };
 use sha2::{Digest, Sha256};
 use tracing::info;
@@ -609,6 +610,7 @@ fn build_repository_bootstrap_transaction(
         external_objects: Vec::new(),
         changes: initial_change.into_iter().collect(),
         aliases: Vec::new(),
+        git_authority_delta: None,
         ref_mutations: Vec::new(),
         default_ref_mutation: Some(DefaultRefMutation {
             expected: DefaultRefExpectation::MustBeUnset,
@@ -707,19 +709,57 @@ fn validate_bootstrap_transaction(
             transaction.repository_id, repository_id
         )));
     }
-    let expected_default = Some(DefaultRefMutation {
-        expected: DefaultRefExpectation::MustBeUnset,
-        new_default: Some(default_ref.clone()),
-    });
+    let expected_default = transaction
+        .git_authority_delta
+        .as_ref()
+        .and_then(|delta| delta.new.as_ref())
+        .map_or_else(
+            || {
+                Some(DefaultRefMutation {
+                    expected: DefaultRefExpectation::MustBeUnset,
+                    new_default: Some(default_ref.clone()),
+                })
+            },
+            |git_authority| match &git_authority.raw_head {
+                GitRawTarget::Symbolic { target } => Some(DefaultRefMutation {
+                    expected: DefaultRefExpectation::MustBeUnset,
+                    new_default: Some(target.clone()),
+                }),
+                GitRawTarget::Direct { .. } => None,
+            },
+        );
     if transaction.default_ref_mutation != expected_default {
         return Err(KinError::Other(
-            "repository bootstrap must install the configured default ref from an unset state"
+            "repository bootstrap default ref must exactly match native config or raw Git HEAD"
                 .to_string(),
         ));
     }
     let workspace = transaction.workspace_mutation.as_ref().ok_or_else(|| {
         KinError::Other("repository bootstrap requires an exact workspace mutation".to_string())
     })?;
+    if let Some(delta) = &transaction.git_authority_delta {
+        if delta.old.is_some() {
+            return Err(KinError::Other(
+                "repository bootstrap cannot replace pre-existing Git authority".to_string(),
+            ));
+        }
+        let git_authority = delta.new.as_ref().ok_or_else(|| {
+            KinError::Other("repository bootstrap cannot remove absent Git authority".to_string())
+        })?;
+        let expected_head = match &git_authority.raw_head {
+            GitRawTarget::Symbolic { target } => WorkspaceHead::Symbolic {
+                target: target.clone(),
+            },
+            GitRawTarget::Direct { object } => WorkspaceHead::Detached {
+                target: RefTarget::ExternalObject { object: *object },
+            },
+        };
+        if workspace.new_head != expected_head {
+            return Err(KinError::Other(
+                "repository bootstrap workspace head must exactly match raw Git HEAD".to_string(),
+            ));
+        }
+    }
     if workspace.workspace_id != workspace_id
         || workspace.expected != WorkspaceExpectation::MustNotExist
         || workspace.new_generation != 0
@@ -1284,9 +1324,7 @@ mod tests {
             .commit_repository_bootstrap(&transaction)
             .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("install the configured default ref"));
+        assert!(error.to_string().contains("default ref must exactly match"));
         assert_eq!(
             prepared
                 .authority()
