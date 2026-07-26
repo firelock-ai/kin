@@ -802,64 +802,45 @@ fn read_entity_file_bytes_from_graph(
     file_id: &FilePathId,
 ) -> Result<Vec<u8>> {
     let branch_name = kin_core::read_current_branch(layout)?;
-
-    // Try the filesystem branch first, then fall back to any branch in the
-    // graph.  Scoped/historical graphs may not carry the exact branch name
-    // that the on-disk `.kin/HEAD` advertises (e.g. when the scope points to
-    // a sibling change lineage).
-    let branch = match graph.get_branch(&branch_name)? {
-        Some(b) => b,
-        None => {
-            // Fallback: pick any branch present in the graph.
-            let all = graph.list_branches()?;
-            if let Some(b) = all.into_iter().next() {
-                tracing::debug!(
-                    fs_branch = %branch_name,
-                    graph_branch = %b.name,
-                    "filesystem branch not in graph, falling back"
-                );
-                b
-            } else {
-                // Last resort: try to read the file hash directly from the
-                // graph's file_hash store (populated by scoped snapshot).
-                if let Ok(Some(entry)) = graph.get_tree_entry(file_id) {
-                    let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())?;
-                    let blob_hash = kin_blobs::Hash256(*entry.blob_hash.as_bytes());
-                    return blob_store.read(&blob_hash).with_context(|| {
-                        format!(
-                            "graph blob for file '{}' is unavailable (hash {}, no branch); source body cannot be read from daemon-backed graph",
-                            file_id.0, blob_hash,
-                        )
-                    });
-                }
-                anyhow::bail!(
-                    "current branch '{}' not found in graph and no fallback branch available",
-                    branch_name
-                );
-            }
-        }
-    };
-
-    let entry = if let Ok(Some(entry)) = graph.get_tree_entry(file_id) {
-        entry
-    } else {
-        let genesis = kin_core::build_genesis_change();
-        let tree = kin_core::build_file_tree(graph, &genesis.id, &branch.head)?;
-        match tree.get(file_id) {
-            Some(entry) => *entry,
-            None => {
-                anyhow::bail!("file '{}' not found in graph file tree", file_id.0);
-            }
-        }
-    };
+    let branch = graph.get_branch(&branch_name)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "current branch '{}' is absent from graph truth; refusing to select an unrelated branch",
+            branch_name
+        )
+    })?;
+    let path = kin_model::RepoPath::from_utf8(file_id.0.clone()).with_context(|| {
+        format!(
+            "entity source path '{}' is not repository-relative",
+            file_id.0
+        )
+    })?;
+    let tree = graph
+        .resolve_tree_at(&branch.head)
+        .with_context(|| format!("resolve exact repository tree at {}", branch.head))?;
+    let artifact = tree.artifact_at_path(&path).ok_or_else(|| {
+        anyhow::anyhow!(
+            "entity source '{}' is absent from exact graph tree at branch '{}' head {}",
+            file_id.0,
+            branch.name,
+            branch.head
+        )
+    })?;
+    let blob_identity = artifact.entry.blob_identity().ok_or_else(|| {
+        anyhow::anyhow!(
+            "entity source '{}' resolves to a gitlink at branch '{}' head {}; gitlinks have no repository-local source bytes",
+            file_id.0,
+            branch.name,
+            branch.head
+        )
+    })?;
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())?;
-    let blob_hash = kin_blobs::Hash256(*entry.blob_hash.as_bytes());
+    let blob_hash = kin_blobs::Hash256(*blob_identity.as_bytes());
     blob_store
         .read(&blob_hash)
         .with_context(|| {
             format!(
-                "graph blob for file '{}' is unavailable (hash {}, branch '{}', head {}); source body cannot be read from daemon-backed graph",
-                file_id.0, blob_hash, branch.name, branch.head
+                "graph blob for artifact {:?} at '{}' is unavailable (hash {}, branch '{}', head {}); source body cannot be read",
+                artifact.artifact_id, file_id.0, blob_hash, branch.name, branch.head
             )
         })
 }
@@ -868,10 +849,10 @@ fn read_entity_file_bytes_from_graph(
 mod tests {
     use super::*;
     use kin_model::{
-        AuthorId, Branch, BranchName, ChangeStore, Entity, EntityMetadata, FingerprintAlgorithm,
-        GraphNodeId, Hash256, LanguageId, Relation, RelationId, RelationOrigin, SemanticChange,
-        SemanticChangeId, SemanticFingerprint, SourceSpan, Timestamp, TreeDelta, TreeEntry,
-        Visibility,
+        ArtifactId, AuthorId, Branch, BranchName, ChangeStore, Entity, EntityMetadata,
+        FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, LocatedEntry, Relation, RelationId,
+        RelationOrigin, RepoPath, SemanticChange, SemanticChangeId, SemanticFingerprint,
+        SourceSpan, Timestamp, TreeDelta, TreeEntry, Visibility,
     };
     use std::fs;
 
@@ -1106,27 +1087,30 @@ mod tests {
         } else {
             Hash256::from_bytes([0x99; 32])
         };
-        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: change_id,
-                parents: vec![genesis.id],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "add source".to_string(),
-                entity_deltas: vec![],
-                relation_deltas: vec![],
-                tree_deltas: vec![TreeDelta::Added {
-                    file_id: file_id.clone(),
-                    new_entry: TreeEntry::regular(blob_hash, false),
-                }],
-                projected_files: vec![file_id.clone()],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: Some(branch_name.clone()),
-            })
-            .unwrap();
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32])),
+            parents: vec![genesis.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "add source".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            tree_deltas: vec![TreeDelta::Added {
+                artifact_id: ArtifactId::new(),
+                new: LocatedEntry::new(
+                    RepoPath::from_utf8(file_id.0.clone()).unwrap(),
+                    TreeEntry::blob(blob_hash, false),
+                ),
+            }],
+            projected_files: vec![file_id.clone()],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(branch_name.clone()),
+        };
+        change.id = kin_model::compute_semantic_change_id(&change).unwrap();
+        let change_id = change.id;
+        graph.create_change(&change).unwrap();
         graph
             .create_branch(&Branch {
                 name: branch_name.clone(),
@@ -1212,14 +1196,8 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(
-            err.contains("graph blob for file 'src/lib.rs' is unavailable"),
-            "{err}"
-        );
-        assert!(
-            err.contains("source body cannot be read from daemon-backed graph"),
-            "{err}"
-        );
+        assert!(err.contains("at 'src/lib.rs' is unavailable"), "{err}");
+        assert!(err.contains("source body cannot be read"), "{err}");
     }
 
     #[test]
