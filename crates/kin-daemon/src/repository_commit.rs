@@ -559,12 +559,7 @@ mod tests {
             b"compose.yaml",
             TreeEntry::symlink,
         );
-        let gitlink = ResolvedArtifact::new(
-            ArtifactId::new(),
-            RepoPath::from_utf8("vendor/semantic-engine").unwrap(),
-            TreeEntry::gitlink(kin_model::GitObjectId::sha1([0x73; 20])),
-        );
-        let desired = ResolvedTree::from_artifacts([compose, opaque, symlink, gitlink]).unwrap();
+        let desired = ResolvedTree::from_artifacts([compose, opaque, symlink]).unwrap();
 
         let initial_authority = reopen(&init);
         let initial_lease = initial_authority.read_authority();
@@ -589,7 +584,7 @@ mod tests {
         .expect("dirty exact tree must advance workspace authority");
         assert_eq!(result.receipt.generation, 2);
         assert_eq!(result.workspace_id, init.workspace_id);
-        assert_eq!(result.file_count, 4);
+        assert_eq!(result.file_count, 3);
         assert_eq!(
             result.tree_hash,
             compute_resolved_tree_hash(&desired).unwrap()
@@ -633,6 +628,45 @@ mod tests {
     }
 
     #[test]
+    fn workspace_admission_cannot_invent_unverified_gitlink_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let desired = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+            ArtifactId::new(),
+            RepoPath::from_utf8("vendor/semantic-engine").unwrap(),
+            TreeEntry::gitlink(kin_model::GitObjectId::sha1([0x73; 20])),
+        )])
+        .unwrap();
+
+        let error = publish_workspace_tree(
+            &init.layout,
+            &blobs,
+            &desired,
+            OperationId::new(),
+            AuthorId::new("dogfood"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("without verified Git external authority"),
+            "unexpected external-authority rejection: {error}"
+        );
+        let authority = reopen(&init);
+        let lease = authority.read_authority();
+        assert_eq!(lease.roots().generation, 1);
+        assert!(lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == init.workspace_id)
+            .unwrap()
+            .tree
+            .is_empty());
+    }
+
+    #[test]
     fn workspace_admission_missing_body_cannot_advance_authority() {
         let root = tempfile::tempdir().unwrap();
         let init = kin_core::init(root.path()).unwrap();
@@ -652,7 +686,13 @@ mod tests {
             AuthorId::new("dogfood"),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("Blob not found"));
+        assert!(
+            matches!(
+                &error,
+                DaemonError::Blob(kin_blobs::BlobError::NotFound { .. })
+            ),
+            "missing admitted body must surface the typed blob absence, got {error:?}"
+        );
         let authority = reopen(&init);
         let lease = authority.read_authority();
         assert_eq!(lease.roots().generation, 1);
@@ -864,7 +904,13 @@ mod tests {
         )
         .unwrap();
         let error = commit_native_plan(&init.layout, &blobs, plan).unwrap_err();
-        assert!(error.to_string().contains("Blob not found"));
+        assert!(
+            matches!(
+                &error,
+                DaemonError::Blob(kin_blobs::BlobError::NotFound { .. })
+            ),
+            "missing graph body must surface the typed blob absence, got {error:?}"
+        );
         assert_eq!(reopen(&init).read_authority().roots().generation, 1);
     }
 }
