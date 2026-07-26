@@ -13,11 +13,11 @@ use std::sync::Arc;
 
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
 use kin_model::{
-    compute_resolved_tree_hash, compute_semantic_change_id, AuthorId, ChangeOrigin, ChangeStore,
+    compute_resolved_tree_hash, compute_semantic_change_id, AuthorId, ChangeOrigin,
     EffectiveAdmissionPolicyStamp, Hash256, ModelError, OperationId, RefExpectation, RefMutation,
     RefName, RefTarget, RefUpdatePolicy, RepositoryCommitReceipt, RepositoryId,
     RepositoryTransaction, SemanticChange, SemanticChangeId, SharedAdmissionPolicy, Timestamp,
-    TreeEntry, WorkspaceExpectation, WorkspaceHead, WorkspaceId, WorkspaceMutation,
+    WorkspaceExpectation, WorkspaceHead, WorkspaceId, WorkspaceMutation,
     REPOSITORY_TRANSACTION_SCHEMA_VERSION,
 };
 
@@ -336,7 +336,7 @@ mod tests {
     use super::*;
     use kin_model::{
         ArtifactId, LocatedEntry, RepoPath, RepositoryAuthorityStore, ResolvedArtifact,
-        ResolvedTree, TransactionDelta, TreeDelta,
+        ResolvedTree, TransactionDelta, TreeDelta, TreeEntry,
     };
 
     fn add_artifact(

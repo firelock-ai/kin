@@ -24,9 +24,8 @@ use std::collections::BTreeMap;
 
 use kin_db::{GraphSnapshot, InMemoryGraph};
 use kin_model::{
-    graph::ResolvedGraphState, ArtifactId, ChangeStore, EntityDelta, EntityStore, FilePathId,
-    Hash256, LocatedEntry, RelationDelta, RepoPath, ResolvedTree, SemanticChangeId, TreeDelta,
-    TreeEntry,
+    graph::ResolvedGraphState, ChangeStore, EntityDelta, Hash256, RelationDelta, RepoPath,
+    ResolvedTree, SemanticChangeId, TreeDelta, TreeEntry,
 };
 
 use crate::error::{DaemonError, Result};
@@ -202,6 +201,7 @@ fn read_scanned_entry(scanned: &kin_index::ScannedRepositoryEntry) -> Result<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_model::{ArtifactId, EntityStore, FilePathId, LocatedEntry};
 
     use std::sync::Arc;
 
