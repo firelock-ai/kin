@@ -9,8 +9,8 @@
 use std::collections::HashSet;
 
 use kin_model::{
-    ArtifactDelta, Entity, EntityDelta, Hash256, Relation, RelationDelta, SemanticChange,
-    SemanticChangeId,
+    Entity, EntityDelta, Hash256, Relation, RelationDelta, SemanticChange, SemanticChangeId,
+    TreeDelta,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -30,7 +30,7 @@ pub fn compute_semantic_change_id(change: &SemanticChange) -> Result<SemanticCha
     let _ = content_identity_from_deltas(
         &change.entity_deltas,
         &change.relation_deltas,
-        &change.artifact_deltas,
+        &change.tree_deltas,
     )?;
 
     let mut payload = serde_json::to_value(change)?;
@@ -46,7 +46,7 @@ pub fn compute_semantic_change_id(change: &SemanticChange) -> Result<SemanticCha
     append_canonical_json(&mut canonical, &payload)?;
 
     let mut hasher = Sha256::new();
-    hasher.update(b"kin-semantic-change-v3\0");
+    hasher.update(b"kin-semantic-change-v4\0");
     append_len_prefixed_hash_field(&mut hasher, &canonical)?;
     let result = hasher.finalize();
     let mut bytes = [0u8; 32];
@@ -60,14 +60,14 @@ pub fn compute_semantic_change_id(change: &SemanticChange) -> Result<SemanticCha
 /// insertion order does not affect the result. If deltas overlap a replay
 /// target, their order is retained because graph replay is order-sensitive.
 /// Every field of every delta participates, including entity
-/// bodies/fingerprints, relation evidence/confidence, and artifact kind plus
-/// old/new hashes. This is deliberately not an ID-only projection: two
+/// bodies/fingerprints, relation evidence/confidence, and exact tree entry
+/// transitions. This is deliberately not an ID-only projection: two
 /// immutable `SemanticChange` records must never receive the same ID merely
 /// because they touch the same graph IDs or file paths.
 pub fn content_identity_from_deltas(
     entity_deltas: &[EntityDelta],
     relation_deltas: &[RelationDelta],
-    artifact_deltas: &[ArtifactDelta],
+    tree_deltas: &[TreeDelta],
 ) -> Result<[u8; 32]> {
     for delta in entity_deltas {
         match delta {
@@ -93,16 +93,16 @@ pub fn content_identity_from_deltas(
         relation_deltas,
         relation_deltas_have_overlapping_targets(relation_deltas),
     )?;
-    let artifact_payloads = replay_equivalent_payloads(
-        artifact_deltas,
-        artifact_deltas_have_overlapping_targets(artifact_deltas),
+    let tree_payloads = replay_equivalent_payloads(
+        tree_deltas,
+        tree_deltas_have_overlapping_targets(tree_deltas),
     )?;
 
     let mut hasher = Sha256::new();
-    hasher.update(b"kin-content-v2\0");
+    hasher.update(b"kin-content-v3\0");
     append_payload_slice(&mut hasher, b"entities", &entity_payloads)?;
     append_payload_slice(&mut hasher, b"relations", &relation_payloads)?;
-    append_payload_slice(&mut hasher, b"artifacts", &artifact_payloads)?;
+    append_payload_slice(&mut hasher, b"tree", &tree_payloads)?;
     let result = hasher.finalize();
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(&result);
@@ -149,10 +149,10 @@ fn relation_deltas_have_overlapping_targets(relation_deltas: &[RelationDelta]) -
     false
 }
 
-fn artifact_deltas_have_overlapping_targets(artifact_deltas: &[ArtifactDelta]) -> bool {
-    let mut artifact_targets = HashSet::with_capacity(artifact_deltas.len());
-    for delta in artifact_deltas {
-        if !artifact_targets.insert(delta.file_id.clone()) {
+fn tree_deltas_have_overlapping_targets(tree_deltas: &[TreeDelta]) -> bool {
+    let mut tree_targets = HashSet::with_capacity(tree_deltas.len());
+    for delta in tree_deltas {
+        if !tree_targets.insert(delta.file_id().clone()) {
             return true;
         }
     }

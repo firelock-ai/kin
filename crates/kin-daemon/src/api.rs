@@ -23,8 +23,8 @@ use axum::{Json, Router};
 use kin_model::session::{Intent, IntentScope, IntentSummary, LockType};
 use kin_model::{
     Branch, BranchName, ChangeStore, ContractId, EntityId, EntityStore, FileLayout, FilePathId,
-    GraphNodeId, IntentId, ProvenanceStore, ResolvedSourceEntry, SessionCapabilities, SessionId,
-    SessionStore, SessionTransport, SourceEntryKind, SourceTreeResolution, WorkStore,
+    GraphNodeId, IntentId, ProvenanceStore, SessionCapabilities, SessionId, SessionStore,
+    SessionTransport, TreeDelta, TreeEntry, TreeEntryKind, WorkStore,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -2323,7 +2323,7 @@ async fn graph_commit(
     let release_shape_is_empty = request.change.parents.len() == 1
         && request.change.entity_deltas.is_empty()
         && request.change.relation_deltas.is_empty()
-        && request.change.artifact_deltas.is_empty()
+        && request.change.tree_deltas.is_empty()
         && request.change.projected_files.is_empty()
         && request.shallow_files.is_empty()
         && request.shallow_clears.is_empty()
@@ -3378,11 +3378,11 @@ async fn command_commit(
 
     let entity_deltas = commit_deltas.entity_deltas;
     let relation_deltas = commit_deltas.relation_deltas;
-    let artifact_deltas = commit_deltas.artifact_deltas;
+    let tree_deltas = commit_deltas.tree_deltas;
 
     let entity_count = entity_deltas.len();
     let relation_count = relation_deltas.len();
-    let file_count = artifact_deltas.len();
+    let file_count = tree_deltas.len();
 
     // --- Lease enforcement gate (same as /graph/commit) ---
     {
@@ -3458,7 +3458,7 @@ async fn command_commit(
         timestamp: kin_model::Timestamp::now(),
         entity_deltas,
         relation_deltas,
-        artifact_deltas,
+        tree_deltas,
         projected_files: vec![],
         spec_link: None,
         evidence: vec![],
@@ -5418,7 +5418,7 @@ fn search_body_source_from_graph(
     graph: &kin_db::InMemoryGraph,
 ) -> Option<(
     kin_blobs::BlobStore,
-    HashMap<kin_model::FilePathId, kin_model::Hash256>,
+    HashMap<kin_model::FilePathId, kin_model::TreeEntry>,
 )> {
     let branch_name = kin_core::read_current_branch(layout).ok()?;
     let branch = graph.get_branch(&branch_name).ok()??;
@@ -5430,15 +5430,15 @@ fn search_body_source_from_graph(
 
 fn search_body_from_graph(
     blob_store: &kin_blobs::BlobStore,
-    tree: &HashMap<kin_model::FilePathId, kin_model::Hash256>,
+    tree: &HashMap<kin_model::FilePathId, kin_model::TreeEntry>,
     entity: &kin_cli::commands::search::DaemonSearchEntityRecord,
     max_lines: usize,
 ) -> Option<(String, usize)> {
     let rel_path = entity.file.as_deref()?;
     let file_id = safe_graph_relative_file_id(rel_path)?;
-    let hash = tree.get(&file_id)?;
+    let entry = tree.get(&file_id)?;
     let bytes = blob_store
-        .read(&kin_blobs::Hash256(*hash.as_bytes()))
+        .read(&kin_blobs::Hash256(*entry.blob_hash.as_bytes()))
         .ok()?;
     let start = entity.start_byte?.min(bytes.len());
     let end = entity.end_byte?.min(bytes.len());
@@ -7368,7 +7368,7 @@ async fn repo_files(
         .get_repo_graph(&repo_id)
         .await
         .map_err(internal_error)?;
-    let mut files = graph.indexed_file_paths();
+    let mut files = graph.working_tree_paths();
     files.sort();
     Ok(Json(RepoFilesResponse {
         repo_id,
@@ -8180,19 +8180,23 @@ fn build_vfs_tree_snapshot(
         .get_changes_since(&genesis_id, &head_id)
         .map_err(internal_error)?;
 
-    let mut files: HashMap<FilePathId, kin_model::Hash256> = HashMap::new();
+    let mut files: HashMap<FilePathId, TreeEntry> = HashMap::new();
     let mut timestamps: HashMap<FilePathId, u64> = HashMap::new();
     for change in &changes {
         let epoch_secs = change.timestamp.0.timestamp() as u64;
-        for delta in &change.artifact_deltas {
-            if delta.kind.is_removed() {
-                files.remove(&delta.file_id);
-                timestamps.remove(&delta.file_id);
-            } else {
-                if let Some(hash) = delta.new_hash {
-                    files.insert(delta.file_id.clone(), hash);
+        for delta in &change.tree_deltas {
+            match delta {
+                TreeDelta::Added { file_id, new_entry }
+                | TreeDelta::Modified {
+                    file_id, new_entry, ..
+                } => {
+                    files.insert(file_id.clone(), *new_entry);
+                    timestamps.insert(file_id.clone(), epoch_secs);
                 }
-                timestamps.insert(delta.file_id.clone(), epoch_secs);
+                TreeDelta::Removed { file_id, .. } => {
+                    files.remove(file_id);
+                    timestamps.remove(file_id);
+                }
             }
         }
     }
@@ -8301,33 +8305,11 @@ async fn vfs_tree(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let snapshot = current_vfs_snapshot(&state).await?;
-    let mut tree = (*snapshot.files).clone();
 
-    // Merge overlay: add files for new entities, remove deleted entities' files.
-    let wc = state.working_copy.read().await;
-    let overlay = &wc.uncommitted_mutations;
-
-    // Add files from newly-added entities that have a file_origin.
-    for entity in overlay.entity_adds.values() {
-        if let Some(ref file_id) = entity.file_origin {
-            if !tree.contains_key(file_id) {
-                // Placeholder hash — the VFS read path will project from overlay bodies.
-                tree.insert(file_id.clone(), kin_model::Hash256::from_bytes([0; 32]));
-            }
-        }
-    }
-
-    // Remove files whose sole entities have been removed.
-    // (Only remove if ALL entities for that file are in the remove set.)
-    // For now, just mark removed entity files so the VFS can exclude them.
-    // Full implementation requires cross-referencing layout regions.
-    // Stub: no removals from tree yet — callers check overlay.entity_removes.
-
-    drop(wc);
-
-    let files: HashMap<String, String> = tree
-        .into_iter()
-        .map(|(path, hash)| (path.0, hash.to_string()))
+    let files: HashMap<String, String> = snapshot
+        .files
+        .iter()
+        .map(|(path, entry)| (path.0.clone(), entry.blob_hash.to_string()))
         .collect();
 
     let ts: HashMap<String, u64> = snapshot
@@ -8350,9 +8332,9 @@ async fn vfs_stat(
 
     // Check if the path is a file.
     let file_id = FilePathId::new(&path);
-    if let Some(hash) = tree.get(&file_id) {
+    if let Some(entry) = tree.get(&file_id) {
         // Try to get the size from the blob store.
-        let blob_hash = kin_blobs::Hash256(hash.0);
+        let blob_hash = kin_blobs::Hash256(entry.blob_hash.0);
         let size = state
             .blobs
             .read(&blob_hash)
@@ -8360,13 +8342,20 @@ async fn vfs_stat(
             .unwrap_or(0);
 
         let mtime = timestamps.get(&file_id).copied().unwrap_or(0);
+        let (is_file, is_symlink, mode) = match entry.kind {
+            TreeEntryKind::Regular { executable } => {
+                (true, false, if executable { 0o755 } else { 0o644 })
+            }
+            TreeEntryKind::Symlink => (false, true, 0o777),
+        };
 
         return Ok(Json(json!({
-            "is_file": true,
+            "is_file": is_file,
             "is_dir": false,
+            "is_symlink": is_symlink,
             "size": size,
-            "content_hash": hash.to_string(),
-            "mode": 0o644,
+            "content_hash": entry.blob_hash.to_string(),
+            "mode": mode,
             "mtime": mtime,
         })));
     }
@@ -8418,11 +8407,11 @@ async fn vfs_read(
     let tree = &snapshot.files;
 
     let file_id = FilePathId::new(&path);
-    let hash = tree
+    let entry = tree
         .get(&file_id)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("file not found: {path}")))?;
 
-    let blob_hash = kin_blobs::Hash256(hash.0);
+    let blob_hash = kin_blobs::Hash256(entry.blob_hash.0);
     let blob_data = state.blobs.read(&blob_hash).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -9867,26 +9856,10 @@ fn parse_exact_source_change_id(
 fn resolve_exact_source_tree(
     graph: &kin_db::InMemoryGraph,
     requested_change: &kin_model::SemanticChangeId,
-) -> Result<HashMap<FilePathId, ResolvedSourceEntry>, (StatusCode, String)> {
-    match graph
-        .resolve_source_tree_at(requested_change)
-        .map_err(internal_error)?
-    {
-        SourceTreeResolution::Exact { entries } => Ok(entries),
-        SourceTreeResolution::Incomplete { gaps } => {
-            let gap_summary = gaps
-                .iter()
-                .map(|gap| format!("{}@{}:{:?}", gap.file_id, gap.change_id, gap.reason))
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err((
-                StatusCode::FAILED_DEPENDENCY,
-                format!(
-                    "exact source history is incomplete for {requested_change}: {gap_summary}; no fallback was attempted"
-                ),
-            ))
-        }
-    }
+) -> Result<HashMap<FilePathId, TreeEntry>, (StatusCode, String)> {
+    graph
+        .resolve_tree_at(requested_change)
+        .map_err(internal_error)
 }
 
 fn validate_exact_source_path(path: &str) -> Result<(), (StatusCode, String)> {
@@ -10103,7 +10076,7 @@ fn build_exact_source_tar_gz(
 fn load_exact_source_entries(
     state: &DaemonState,
     repo_id: &str,
-    tree: std::collections::HashMap<FilePathId, ResolvedSourceEntry>,
+    tree: std::collections::HashMap<FilePathId, TreeEntry>,
 ) -> Result<Vec<ExactSourceEntry>, (StatusCode, String)> {
     let backend = state.storage_backend.as_ref().ok_or_else(|| {
         (
@@ -10136,7 +10109,7 @@ fn load_exact_source_entries(
 }
 
 fn load_exact_source_entries_with(
-    tree: std::collections::HashMap<FilePathId, ResolvedSourceEntry>,
+    tree: std::collections::HashMap<FilePathId, TreeEntry>,
     mut load_blob: impl FnMut(
         &FilePathId,
         [u8; 32],
@@ -10246,12 +10219,12 @@ fn load_exact_source_entries_with(
         let mut symlink_target: Option<Arc<str>> = None;
         for (file_id, source) in &files[start..end] {
             match source.kind {
-                SourceEntryKind::File { executable } => entries.push(ExactSourceEntry::File {
+                TreeEntryKind::Regular { executable } => entries.push(ExactSourceEntry::File {
                     path: file_id.0.clone(),
                     data: Arc::clone(&data),
                     executable,
                 }),
-                SourceEntryKind::Symlink => {
+                TreeEntryKind::Symlink => {
                     let target = if let Some(target) = &symlink_target {
                         Arc::clone(target)
                     } else {
@@ -10435,10 +10408,10 @@ fn release_evidence_graph_at(
     snapshot.entity_revisions = resolved.entity_revisions;
     snapshot.entity_tombstones = resolved.entity_tombstones;
     snapshot.relation_tombstones = resolved.relation_tombstones;
-    snapshot.file_hashes = resolved
-        .file_tree
+    snapshot.working_tree = resolved
+        .tree
         .into_iter()
-        .map(|(file_id, hash)| (file_id.0, *hash.as_bytes()))
+        .map(|(file_id, entry)| (file_id.0, entry))
         .collect();
 
     for change_id in &reachable {
@@ -10699,17 +10672,17 @@ fn repo_name(state: &DaemonState) -> String {
 fn collect_archive_files(
     state: &DaemonState,
     snapshot: &VfsTreeSnapshot,
-) -> Result<Vec<(String, Vec<u8>)>, (StatusCode, String)> {
-    let mut files: Vec<(String, Vec<u8>)> = Vec::with_capacity(snapshot.files.len());
-    for (file_id, hash) in snapshot.files.iter() {
-        let blob_hash = kin_blobs::Hash256(hash.0);
+) -> Result<Vec<(String, TreeEntryKind, Vec<u8>)>, (StatusCode, String)> {
+    let mut files: Vec<(String, TreeEntryKind, Vec<u8>)> = Vec::with_capacity(snapshot.files.len());
+    for (file_id, entry) in snapshot.files.iter() {
+        let blob_hash = kin_blobs::Hash256(entry.blob_hash.0);
         let data = state.blobs.read(&blob_hash).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("blob read error for {}: {e}", file_id.0),
             )
         })?;
-        files.push((file_id.0.clone(), data));
+        files.push((file_id.0.clone(), entry.kind, data));
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(files)
@@ -10730,20 +10703,46 @@ async fn archive_tar_gz(
         let gz = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::fast());
         let mut archive = tar::Builder::new(gz);
 
-        for (path, data) in &files {
+        for (path, kind, data) in &files {
             let mut hdr = tar::Header::new_gnu();
-            hdr.set_size(data.len() as u64);
-            hdr.set_mode(0o644);
-            hdr.set_cksum();
             let entry_path = format!("{prefix}{path}");
-            archive
-                .append_data(&mut hdr, &entry_path, data.as_slice())
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("tar write error: {e}"),
-                    )
-                })?;
+            match kind {
+                TreeEntryKind::Regular { executable } => {
+                    hdr.set_entry_type(tar::EntryType::Regular);
+                    hdr.set_size(data.len() as u64);
+                    hdr.set_mode(if *executable { 0o755 } else { 0o644 });
+                    hdr.set_cksum();
+                    archive
+                        .append_data(&mut hdr, &entry_path, data.as_slice())
+                        .map_err(|e| {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("tar write error: {e}"),
+                            )
+                        })?;
+                }
+                TreeEntryKind::Symlink => {
+                    let target = exact_symlink_target_path(data, path)?;
+                    hdr.set_entry_type(tar::EntryType::Symlink);
+                    hdr.set_size(0);
+                    hdr.set_mode(0o777);
+                    hdr.set_link_name(&target).map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("tar symlink target error for {path}: {e}"),
+                        )
+                    })?;
+                    hdr.set_cksum();
+                    archive
+                        .append_data(&mut hdr, &entry_path, std::io::empty())
+                        .map_err(|e| {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("tar write error: {e}"),
+                            )
+                        })?;
+                }
+            }
         }
 
         archive.finish().map_err(|e| {
@@ -10782,12 +10781,21 @@ async fn archive_zip(
     {
         let cursor = std::io::Cursor::new(&mut buf);
         let mut zip = zip::ZipWriter::new(cursor);
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated)
-            .unix_permissions(0o644);
-
-        for (path, data) in &files {
+        for (path, kind, data) in &files {
             let entry_path = format!("{prefix}{path}");
+            let mode = match kind {
+                TreeEntryKind::Regular { executable } => {
+                    if *executable {
+                        0o100755
+                    } else {
+                        0o100644
+                    }
+                }
+                TreeEntryKind::Symlink => 0o120777,
+            };
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(mode);
             zip.start_file(&entry_path, options).map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -10822,6 +10830,31 @@ async fn archive_zip(
         ],
         buf,
     ))
+}
+
+#[cfg(unix)]
+fn exact_symlink_target_path(
+    target: &[u8],
+    _source_path: &str,
+) -> Result<PathBuf, (StatusCode, String)> {
+    use std::os::unix::ffi::OsStringExt;
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(target.to_vec())))
+}
+
+#[cfg(not(unix))]
+fn exact_symlink_target_path(
+    target: &[u8],
+    source_path: &str,
+) -> Result<PathBuf, (StatusCode, String)> {
+    let target = std::str::from_utf8(target).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "symlink target for {source_path} cannot be represented exactly on this platform"
+            ),
+        )
+    })?;
+    Ok(PathBuf::from(target))
 }
 
 fn internal_error<E: std::fmt::Display>(error: E) -> (StatusCode, String) {
@@ -12845,7 +12878,7 @@ mod tests {
             message: "add release entity".to_string(),
             entity_deltas: vec![EntityDelta::Added(entity.clone())],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -12881,7 +12914,7 @@ mod tests {
             message: format!("release: test ({entity_count} entities snapshot)"),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -13256,7 +13289,7 @@ mod tests {
                 "message": "first hosted publish",
                 "entity_deltas": [{ "Added": entity }],
                 "relation_deltas": [],
-                "artifact_deltas": [],
+                "tree_deltas": [],
                 "projected_files": [],
                 "spec_link": null,
                 "evidence": [],
@@ -13349,7 +13382,7 @@ mod tests {
             message: "stale candidate".to_string(),
             entity_deltas: vec![EntityDelta::Added(entity)],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -13948,7 +13981,7 @@ mod tests {
                 new: changed.clone(),
             }],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -14207,7 +14240,7 @@ mod tests {
             message: "advance after release".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -14554,7 +14587,7 @@ mod tests {
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -14579,7 +14612,7 @@ mod tests {
                 message: "add handler".to_string(),
                 entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -14601,7 +14634,7 @@ mod tests {
                     new: entity_v2,
                 }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -16102,7 +16135,7 @@ mod tests {
             message: "advance feature after switch barrier".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -16673,7 +16706,7 @@ mod tests {
                 message: "add handler".to_string(),
                 entity_deltas: vec![EntityDelta::Added(entity.clone())],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -17296,7 +17329,7 @@ mod tests {
                 message: "add handler".to_string(),
                 entity_deltas: vec![EntityDelta::Added(entity.clone())],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],

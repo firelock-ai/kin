@@ -147,9 +147,9 @@ where
 
 fn changed_files_from_change(change: &SemanticChange) -> BTreeSet<String> {
     change
-        .artifact_deltas
+        .tree_deltas
         .iter()
-        .map(|delta| delta.file_id.0.clone())
+        .map(|delta| delta.file_id().0.clone())
         .collect()
 }
 

@@ -651,7 +651,7 @@ mod tests {
             message: "test change".into(),
             entity_deltas,
             relation_deltas,
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],

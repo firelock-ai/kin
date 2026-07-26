@@ -226,7 +226,7 @@ async fn run_continue(
     let theirs_changes = graph.get_changes_since(&target_head, &source_head)?;
     let mut included_deltas = Vec::new();
     let mut included_relation_deltas = Vec::new();
-    let mut included_artifact_deltas = Vec::new();
+    let mut included_tree_deltas = Vec::new();
 
     // Collect entity IDs resolved as "ours" (skip their deltas for these).
     let ours_entity_ids: std::collections::HashSet<String> = state
@@ -248,9 +248,9 @@ async fn run_continue(
                 included_deltas.push(delta.clone());
             }
         }
-        // Include all non-entity deltas (relations, artifacts).
+        // Include all non-entity deltas (relations and exact tree entries).
         included_relation_deltas.extend(change.relation_deltas.clone());
-        included_artifact_deltas.extend(change.artifact_deltas.clone());
+        included_tree_deltas.extend(change.tree_deltas.clone());
     }
 
     // Build merge commit.
@@ -259,12 +259,12 @@ async fn run_continue(
         &source_head,
         included_deltas,
         included_relation_deltas,
-        included_artifact_deltas,
+        included_tree_deltas,
         &format!(
             "Merge '{}' into '{}' (conflicts resolved)",
             state.source_branch, state.target_branch
         ),
-    );
+    )?;
 
     crate::backend::require_daemon_commit(layout, &merge, &state.target_branch).await?;
 
@@ -300,32 +300,24 @@ fn build_resolution_merge(
     theirs_head: &SemanticChangeId,
     entity_deltas: Vec<EntityDelta>,
     relation_deltas: Vec<kin_model::RelationDelta>,
-    artifact_deltas: Vec<kin_model::ArtifactDelta>,
+    tree_deltas: Vec<kin_model::TreeDelta>,
     message: &str,
-) -> SemanticChange {
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(b"kin-merge-resolved-v1:");
-    hasher.update(ours_head.0.as_bytes());
-    hasher.update(theirs_head.0.as_bytes());
-    let result = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&result);
-    let id = SemanticChangeId::from_hash(Hash256::from_bytes(bytes));
-
-    SemanticChange {
-        id,
+) -> Result<SemanticChange> {
+    let mut change = SemanticChange {
+        id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
         parents: vec![*ours_head, *theirs_head],
         timestamp: Timestamp::now(),
         author: AuthorId::new("kin-merge"),
         message: message.to_string(),
         entity_deltas,
         relation_deltas,
-        artifact_deltas,
+        tree_deltas,
         projected_files: vec![],
         spec_link: None,
         evidence: vec![],
         risk_summary: None,
         authored_on: None,
-    }
+    };
+    change.id = kin_core::compute_semantic_change_id(&change)?;
+    Ok(change)
 }

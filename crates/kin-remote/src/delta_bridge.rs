@@ -183,7 +183,7 @@ mod tests {
             message: "test change".to_string(),
             entity_deltas: deltas,
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],

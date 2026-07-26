@@ -6,8 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use kin_model::ChangeStore;
-use kin_model::{FilePathId, Hash256};
+use kin_model::{FilePathId, Hash256, TreeEntry, TreeEntryKind};
 use serde::Deserialize;
 
 use crate::commands::remote;
@@ -24,6 +25,7 @@ pub(crate) struct NativeRepoSnapshot {
 pub(crate) struct NativeRepoFile {
     pub path: String,
     pub content: Vec<u8>,
+    pub kind: TreeEntryKind,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -48,7 +50,8 @@ struct NativeRepoRepository {
 #[derive(Debug, Deserialize)]
 struct NativeRepoSnapshotFile {
     path: String,
-    content: String,
+    content_base64: String,
+    kind: TreeEntryKind,
 }
 
 fn native_repo_snapshot_endpoint(target: &remote::NativeRemoteTarget) -> String {
@@ -109,7 +112,10 @@ pub(crate) async fn fetch_snapshot(
     for file in repo_snapshot.files {
         files.push(NativeRepoFile {
             path: file.path,
-            content: file.content.into_bytes(),
+            content: base64::engine::general_purpose::STANDARD
+                .decode(file.content_base64)
+                .context("native snapshot contains invalid base64 content")?,
+            kind: file.kind,
         });
     }
 
@@ -124,6 +130,64 @@ pub(crate) async fn fetch_snapshot(
 
 fn hash_bytes(bytes: &[u8]) -> Hash256 {
     kin_blobs::digest(bytes)
+}
+
+#[cfg(unix)]
+fn symlink_target_bytes(target: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    target.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn symlink_target_bytes(target: &Path) -> Vec<u8> {
+    target.to_string_lossy().as_bytes().to_vec()
+}
+
+#[cfg(unix)]
+fn regular_file_is_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn regular_file_is_executable(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+fn read_exact_disk_entry(path: &Path) -> Result<Option<(TreeEntry, Vec<u8>)>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
+        }
+    };
+    let file_type = metadata.file_type();
+    let (content, kind) = if file_type.is_symlink() {
+        let target = fs::read_link(path)
+            .with_context(|| format!("failed to read symlink {}", path.display()))?;
+        (symlink_target_bytes(&target), TreeEntryKind::Symlink)
+    } else if file_type.is_file() {
+        (
+            fs::read(path).with_context(|| format!("failed to read {}", path.display()))?,
+            TreeEntryKind::Regular {
+                executable: regular_file_is_executable(&metadata),
+            },
+        )
+    } else {
+        return Ok(None);
+    };
+    Ok(Some((
+        TreeEntry {
+            blob_hash: hash_bytes(&content),
+            kind,
+        },
+        content,
+    )))
+}
+
+fn entry_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
 }
 
 fn open_snapshot_daemon_first_blocking(
@@ -171,7 +235,7 @@ fn collect_workspace_files_recursive(
             continue;
         }
 
-        if file_type.is_file() {
+        if file_type.is_file() || file_type.is_symlink() {
             collected.push(path);
         }
     }
@@ -180,7 +244,7 @@ fn collect_workspace_files_recursive(
 
 pub(crate) fn ensure_clean_working_tree(
     layout: &kin_core::KinLayout,
-) -> Result<HashMap<FilePathId, Hash256>> {
+) -> Result<HashMap<FilePathId, TreeEntry>> {
     let snap = open_snapshot_daemon_first_blocking(layout)?;
     let graph = &*snap.graph();
     let branch_name = kin_core::read_current_branch(layout)?;
@@ -203,15 +267,19 @@ pub(crate) fn ensure_clean_working_tree(
             .to_string_lossy()
             .to_string();
         let file_id = FilePathId::new(&relative);
-        let expected_hash = current_tree.get(&file_id).ok_or_else(|| {
+        let expected_entry = current_tree.get(&file_id).ok_or_else(|| {
             anyhow::anyhow!(
                 "working tree has uncommitted file '{}'. Commit or remove local changes before `kin pull`.",
                 relative
             )
         })?;
-        let bytes = fs::read(&file_path)
-            .with_context(|| format!("failed to read {}", file_path.display()))?;
-        if hash_bytes(&bytes) != *expected_hash {
+        let Some((actual_entry, _)) = read_exact_disk_entry(&file_path)? else {
+            anyhow::bail!(
+                "working tree path '{}' is not a regular file or symlink",
+                relative
+            );
+        };
+        if actual_entry != *expected_entry {
             anyhow::bail!(
                 "working tree has uncommitted changes in '{}'. Commit or discard local changes before `kin pull`.",
                 relative
@@ -235,7 +303,7 @@ pub(crate) fn ensure_clean_working_tree(
 pub(crate) fn sync_snapshot_to_working_tree(
     layout: &kin_core::KinLayout,
     snapshot: &NativeRepoSnapshot,
-    current_tree: &HashMap<FilePathId, Hash256>,
+    current_tree: &HashMap<FilePathId, TreeEntry>,
 ) -> Result<NativeSyncStats> {
     let workspace_root = kin_core::source_dir(layout);
     let mut stats = NativeSyncStats::default();
@@ -250,7 +318,7 @@ pub(crate) fn sync_snapshot_to_working_tree(
             continue;
         }
         let path = resolve_repo_file_path(&workspace_root, &file_id.0)?;
-        if path.exists() {
+        if entry_exists(&path) {
             fs::remove_file(&path)
                 .with_context(|| format!("failed to remove {}", path.display()))?;
             prune_empty_parent_dirs(&workspace_root, path.parent());
@@ -259,19 +327,22 @@ pub(crate) fn sync_snapshot_to_working_tree(
     }
 
     for file in &snapshot.files {
-        let destination = resolve_repo_file_path(&workspace_root, &file.path)?;
-        let current_hash = current_tree.get(&FilePathId::new(&file.path));
-        let incoming_hash = hash_bytes(&file.content);
-        if current_hash.is_some_and(|existing| *existing == incoming_hash) {
+        resolve_repo_file_path(&workspace_root, &file.path)?;
+        let current_entry = current_tree.get(&FilePathId::new(&file.path));
+        let incoming_entry = TreeEntry {
+            blob_hash: hash_bytes(&file.content),
+            kind: file.kind,
+        };
+        if current_entry == Some(&incoming_entry) {
             continue;
         }
 
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        fs::write(&destination, &file.content)
-            .with_context(|| format!("failed to write {}", destination.display()))?;
+        kin_core::materialize_source_entry(
+            &workspace_root,
+            &FilePathId::new(&file.path),
+            file.kind,
+            &file.content,
+        )?;
         stats.written_files += 1;
     }
 
@@ -400,7 +471,10 @@ pub(crate) async fn fetch_delta(
     for file in delta_resp.changed_files {
         changed_files.push(NativeRepoFile {
             path: file.path,
-            content: file.content.into_bytes(),
+            content: base64::engine::general_purpose::STANDARD
+                .decode(file.content_base64)
+                .context("native delta contains invalid base64 content")?,
+            kind: file.kind,
         });
     }
 
@@ -419,7 +493,7 @@ pub(crate) async fn fetch_delta(
 pub(crate) fn apply_delta_to_working_tree(
     layout: &kin_core::KinLayout,
     delta: &NativeRepoDelta,
-    current_tree: &HashMap<FilePathId, Hash256>,
+    current_tree: &HashMap<FilePathId, TreeEntry>,
 ) -> Result<NativeDeltaSyncStats> {
     let workspace_root = kin_core::source_dir(layout);
     let mut stats = NativeDeltaSyncStats::default();
@@ -427,7 +501,7 @@ pub(crate) fn apply_delta_to_working_tree(
     // Remove deleted files
     for removed_path in &delta.removed_paths {
         let path = resolve_repo_file_path(&workspace_root, removed_path)?;
-        if path.exists() {
+        if entry_exists(&path) {
             fs::remove_file(&path)
                 .with_context(|| format!("failed to remove {}", path.display()))?;
             prune_empty_parent_dirs(&workspace_root, path.parent());
@@ -437,22 +511,24 @@ pub(crate) fn apply_delta_to_working_tree(
 
     // Write added/modified files
     for file in &delta.changed_files {
-        let destination = resolve_repo_file_path(&workspace_root, &file.path)?;
-        let current_hash = current_tree.get(&FilePathId::new(&file.path));
-        let incoming_hash = hash_bytes(&file.content);
+        resolve_repo_file_path(&workspace_root, &file.path)?;
+        let current_entry = current_tree.get(&FilePathId::new(&file.path));
+        let incoming_entry = TreeEntry {
+            blob_hash: hash_bytes(&file.content),
+            kind: file.kind,
+        };
 
-        // Skip if content is identical (shouldn't happen in a well-formed delta,
-        // but defensive).
-        if current_hash.is_some_and(|existing| *existing == incoming_hash) {
+        // Skip if content, mode, and entry kind are identical.
+        if current_entry == Some(&incoming_entry) {
             continue;
         }
 
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        fs::write(&destination, &file.content)
-            .with_context(|| format!("failed to write {}", destination.display()))?;
+        kin_core::materialize_source_entry(
+            &workspace_root,
+            &FilePathId::new(&file.path),
+            file.kind,
+            &file.content,
+        )?;
         stats.written_files += 1;
     }
 
