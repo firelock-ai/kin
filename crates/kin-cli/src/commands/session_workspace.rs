@@ -129,9 +129,14 @@ pub fn create_session_workspace_from_authority(
     layout
         .check_version()
         .context("repository layout is not repository-v6 compatible")?;
-    validate_session_directory(layout, session_dir)?;
+    let session_name = validate_session_directory(layout, session_dir)?;
     require_exact_copy_strategy(strategy)?;
 
+    // Projection lock first: a session writer that began before exact eject
+    // must stay bound to that repository epoch and may not wake onto a
+    // replacement `.kin`.
+    let projection_freeze = kin_core::ExactProjectionFreeze::acquire_existing(layout.working_dir())
+        .context("freeze the existing repository projection before creating a session")?;
     let authority = ActiveRepositoryAuthority::open(layout)?;
     let (source_workspace, authority_roots) = authority.workspace_with_roots()?;
     let selected_tree = select_materialized_tree(&source_workspace.tree, scope)?;
@@ -179,30 +184,24 @@ pub fn create_session_workspace_from_authority(
     let base_metadata =
         serde_json::to_vec_pretty(&base).context("encode exact session workspace base")?;
 
-    std::fs::create_dir(session_dir).with_context(|| {
-        format!(
-            "create fresh session workspace {}; an existing path is never reused",
-            session_dir.display()
+    let (projection, _) = projection_freeze
+        .materialize_session_source_tree(
+            session_name,
+            &base_metadata,
+            source_bodies
+                .iter()
+                .map(|(path, entry, body)| (path, *entry, body.as_slice())),
         )
-    })?;
-    kin_core::materialize_session_source_tree(
-        session_dir,
-        &base_metadata,
-        source_bodies
-            .iter()
-            .map(|(path, entry, body)| (path, *entry, body.as_slice())),
-    )
-    .with_context(|| {
-        format!(
-            "materialize exact repository tree at {}; the failed workspace was preserved for inspection",
-            session_dir.display()
-        )
-    })?;
+        .with_context(|| {
+            format!(
+                "materialize exact repository tree at {} through retained session authority",
+                session_dir.display()
+            )
+        })?;
 
-    Ok(MaterializedWorkspace::from_existing(
-        session_dir.to_path_buf(),
+    Ok(MaterializedWorkspace::from_exact_session(
+        projection,
         MaterializeStrategy::Copy,
-        MaterializationSourceKind::ExactTree,
     ))
 }
 
@@ -220,8 +219,8 @@ pub fn materialize_session_workspace(
     let workspace =
         create_session_workspace_from_authority(layout, &root, strategy, request.scope.as_deref())?;
     Ok(SessionWorkspaceResponse {
-        root: workspace.root.display().to_string(),
-        strategy: workspace.strategy.to_string(),
+        root: workspace.root().display().to_string(),
+        strategy: workspace.strategy().to_string(),
         source_kind: match workspace.source_kind() {
             MaterializationSourceKind::ExactTree => "exact-tree",
         }
@@ -239,7 +238,10 @@ fn require_exact_copy_strategy(strategy: Option<MaterializeStrategy>) -> Result<
     }
 }
 
-fn validate_session_directory(layout: &kin_core::KinLayout, session_dir: &Path) -> Result<()> {
+fn validate_session_directory<'a>(
+    layout: &kin_core::KinLayout,
+    session_dir: &'a Path,
+) -> Result<&'a str> {
     let runs_dir = layout.runs_dir();
     if !session_dir.is_absolute() {
         bail!(
@@ -265,21 +267,7 @@ fn validate_session_directory(layout: &kin_core::KinLayout, session_dir: &Path) 
         );
     }
 
-    let runs_metadata = std::fs::symlink_metadata(&runs_dir)
-        .with_context(|| format!("inspect session root {}", runs_dir.display()))?;
-    if runs_metadata.file_type().is_symlink() || !runs_metadata.is_dir() {
-        bail!(
-            "session root {} is not a real directory",
-            runs_dir.display()
-        );
-    }
-    if std::fs::symlink_metadata(session_dir).is_ok() {
-        bail!(
-            "session workspace {} already exists; Kin never reuses a materialized workspace",
-            session_dir.display()
-        );
-    }
-    Ok(())
+    Ok(name)
 }
 
 fn select_materialized_tree(source: &ResolvedTree, scope: Option<&str>) -> Result<ResolvedTree> {
@@ -378,18 +366,18 @@ mod tests {
     }
 
     #[test]
-    fn session_directory_must_be_a_fresh_direct_child_of_runs() {
+    fn session_directory_must_name_a_direct_child_of_runs() {
         let repository = tempfile::tempdir().unwrap();
         let layout = kin_core::KinLayout::new(repository.path().join(".kin"));
-        std::fs::create_dir_all(layout.runs_dir()).unwrap();
         let valid = layout.runs_dir().join("session-test");
-        validate_session_directory(&layout, &valid).unwrap();
+        assert_eq!(
+            validate_session_directory(&layout, &valid).unwrap(),
+            "session-test"
+        );
 
         let nested = layout.runs_dir().join("nested/session-test");
         assert!(validate_session_directory(&layout, &nested).is_err());
         let outside = repository.path().join("session-test");
         assert!(validate_session_directory(&layout, &outside).is_err());
-        std::fs::create_dir(&valid).unwrap();
-        assert!(validate_session_directory(&layout, &valid).is_err());
     }
 }

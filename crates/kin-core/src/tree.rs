@@ -37,6 +37,10 @@ const RECONCILIATION_PROJECTION_LOCK_FILE: &str = "projection.lock";
 const SESSION_PROJECTION_CONTROL_DIRECTORY: &str = ".kin-session";
 #[cfg(any(unix, windows))]
 const SESSION_PROJECTION_BASE_FILE: &str = "base.json";
+#[cfg(any(unix, windows))]
+const SESSION_RUNS_DIRECTORY: &str = "runs";
+#[cfg(any(unix, windows))]
+const SESSION_STAGING_DIRECTORY_PREFIX: &str = ".session-stage-";
 
 /// How long a caller waits for a live exact-source projection to finish before
 /// failing loud. Bounded so an undiscovered lock-order cycle degrades to a
@@ -133,21 +137,13 @@ pub fn materialize_source_tree<'a>(
 /// Keeping this control plane separate from `.kin/` ensures repository
 /// discovery from inside the session continues to bind the owning repository
 /// rather than mistaking the derived workspace for an independent authority.
-pub fn materialize_session_source_tree<'a>(
+#[cfg(test)]
+fn materialize_session_source_tree<'a>(
     root: &Path,
     base_metadata: &[u8],
     entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
 ) -> Result<usize> {
-    if base_metadata.is_empty() {
-        return Err(KinError::Other(
-            "session projection base metadata must not be empty".to_string(),
-        ));
-    }
-    let entries: Vec<_> = entries.into_iter().collect();
-    for (path, entry, body) in &entries {
-        validate_source_content_identity(path, *entry, body)?;
-    }
-    let entries = validated_source_entries(entries)?;
+    let entries = validated_session_source_entries(base_metadata, entries)?;
     project_validated_session_source_tree(root, &entries, base_metadata)
 }
 
@@ -418,6 +414,27 @@ pub struct ExactProjectionFreeze {
     root_identity: TrackedEntryIdentity,
 }
 
+/// Opaque authority-bearing handle for one exact session projection.
+///
+/// The handle can only be produced by materializing graph-owned source through
+/// an [`ExactProjectionFreeze`]. It retains the repository projection lock,
+/// the original `.kin/runs` directory, and the published session directory, so
+/// downstream runtime code cannot relabel an arbitrary ambient path as exact.
+pub struct ExactSessionProjection {
+    repository_freeze: ExactProjectionFreeze,
+    #[cfg(any(unix, windows))]
+    projection: ProjectionRoot,
+    #[cfg(any(unix, windows))]
+    runs: cap_std::fs::Dir,
+    #[cfg(any(unix, windows))]
+    runs_identity: TrackedEntryIdentity,
+    #[cfg(any(unix, windows))]
+    session_name: OsString,
+    #[cfg(any(unix, windows))]
+    session_identity: TrackedEntryIdentity,
+    display_root: std::path::PathBuf,
+}
+
 /// Identity-bound proof that one complete [`ResolvedTree`] matched the working
 /// projection while an [`ExactProjectionFreeze`] was held.
 pub struct ExactProjectionVerification {
@@ -485,6 +502,53 @@ impl std::fmt::Debug for ExactProjectionFreeze {
         formatter
             .debug_struct("ExactProjectionFreeze")
             .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ExactSessionProjection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExactSessionProjection")
+            .field("display_root", &self.display_root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExactSessionProjection {
+    /// Absolute display path of the capability-owned session directory.
+    pub fn root(&self) -> &Path {
+        &self.display_root
+    }
+
+    /// Revalidate the repository epoch, `.kin/runs`, published session name,
+    /// retained session directory, and session projection lock.
+    pub fn revalidate(&self) -> Result<()> {
+        #[cfg(any(unix, windows))]
+        {
+            let runs_display = self
+                .repository_freeze
+                .projection
+                .display_projection_control
+                .join(SESSION_RUNS_DIRECTORY);
+            self.repository_freeze.revalidate_session_runs(
+                &self.runs,
+                self.runs_identity,
+                &runs_display,
+            )?;
+            validate_named_directory_identity(
+                &self.runs,
+                &self.session_name,
+                &self.projection.root,
+                self.session_identity,
+                &self.display_root,
+                "published session directory",
+            )?;
+            self.projection.revalidate_projection_lock()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(unsupported_safe_projection_error())
+        }
     }
 }
 
@@ -737,6 +801,189 @@ impl ExactProjectionFreeze {
             let _ = root;
             Err(unsupported_safe_projection_error())
         }
+    }
+
+    /// Materialize and atomically publish one exact session projection beneath
+    /// the retained repository's `.kin/runs` directory, creating that
+    /// directory through the retained `.kin` capability when absent.
+    ///
+    /// The final child is never opened or created through its ambient path.
+    /// Kin materializes into an unguessable retained staging child, then moves
+    /// that exact directory to `session_name` with no replacement while the
+    /// repository projection lock remains held.
+    pub fn materialize_session_source_tree<'a>(
+        self,
+        session_name: &str,
+        base_metadata: &[u8],
+        entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
+    ) -> Result<(ExactSessionProjection, usize)> {
+        let entries = validated_session_source_entries(base_metadata, entries)?;
+        #[cfg(any(unix, windows))]
+        {
+            self.materialize_validated_session_source_tree(
+                session_name,
+                base_metadata,
+                &entries,
+                || {},
+            )
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (self, session_name, base_metadata, entries);
+            Err(unsupported_safe_projection_error())
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn materialize_validated_session_source_tree(
+        self,
+        session_name: &str,
+        base_metadata: &[u8],
+        entries: &[ValidatedSourceEntry<'_>],
+        after_runs_open: impl FnOnce(),
+    ) -> Result<(ExactSessionProjection, usize)> {
+        validate_session_projection_name(session_name)?;
+        self.revalidate_namespace()?;
+
+        let runs_display = self
+            .projection
+            .display_projection_control
+            .join(SESSION_RUNS_DIRECTORY);
+        let runs = open_or_create_private_directory(
+            &self.projection.kin_control,
+            std::ffi::OsStr::new(SESSION_RUNS_DIRECTORY),
+            &runs_display,
+        )
+        .map_err(|error| {
+            KinError::Other(format!(
+                "open or create retained repository session root {}: {error}",
+                runs_display.display()
+            ))
+        })?;
+        let runs_identity = tracked_open_directory_identity(&runs)
+            .map_err(|error| KinError::io(&runs_display, error))?;
+
+        after_runs_open();
+        self.revalidate_session_runs(&runs, runs_identity, &runs_display)?;
+
+        let final_name = OsString::from(session_name);
+        let final_display = runs_display.join(&final_name);
+        ensure_session_child_absent(&runs, &final_name, &final_display)?;
+
+        let (stage_name, stage_display, stage_identity, stage_root) =
+            create_retained_session_stage(&runs, &runs_display)?;
+        let mut projection =
+            ProjectionRoot::open_session_from_capability(stage_root, &stage_display).map_err(
+                |error| {
+                    KinError::Other(format!(
+                        "initialize retained session staging directory {}: {error}",
+                        stage_display.display()
+                    ))
+                },
+            )?;
+        let tracked = TrackedPathClassifier::new(entries.iter().map(|entry| entry.file_id))?;
+        let plan = projection.plan_full_replacement(&tracked, None)?;
+        projection.apply_full_replacement(entries, plan)?;
+        projection.install_session_base_metadata(base_metadata)?;
+        sync_directory_capability(&projection.root, &stage_display)?;
+
+        self.revalidate_namespace()?;
+        self.revalidate_session_runs(&runs, runs_identity, &runs_display)?;
+        validate_named_directory_identity(
+            &runs,
+            &stage_name,
+            &projection.root,
+            stage_identity,
+            &stage_display,
+            "session staging directory",
+        )?;
+        ensure_session_child_absent(&runs, &final_name, &final_display)?;
+
+        self.projection
+            .move_open_directory_from_expected_source_exact(
+                NamedEntryLocation {
+                    parent: &runs,
+                    name: &stage_name,
+                },
+                NamedEntryLocation {
+                    parent: &runs,
+                    name: &final_name,
+                },
+                &projection.root,
+                stage_identity,
+                &stage_display,
+            )?;
+        projection.retarget_display_root(final_display.clone());
+
+        let post_publish = self
+            .revalidate_namespace()
+            .and_then(|()| self.revalidate_session_runs(&runs, runs_identity, &runs_display))
+            .and_then(|()| {
+                validate_named_directory_identity(
+                    &runs,
+                    &final_name,
+                    &projection.root,
+                    stage_identity,
+                    &final_display,
+                    "published session directory",
+                )
+            })
+            .and_then(|()| projection.revalidate_projection_lock());
+        if let Err(error) = post_publish {
+            let rollback = self
+                .projection
+                .move_open_directory_from_expected_source_exact(
+                    NamedEntryLocation {
+                        parent: &runs,
+                        name: &final_name,
+                    },
+                    NamedEntryLocation {
+                        parent: &runs,
+                        name: &stage_name,
+                    },
+                    &projection.root,
+                    stage_identity,
+                    &final_display,
+                );
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(KinError::Other(format!(
+                    "{error}; retained session publication rollback also failed: {rollback_error}"
+                ))),
+            };
+        }
+
+        let count = entries.len();
+        Ok((
+            ExactSessionProjection {
+                repository_freeze: self,
+                projection,
+                runs,
+                runs_identity,
+                session_name: final_name,
+                session_identity: stage_identity,
+                display_root: final_display,
+            },
+            count,
+        ))
+    }
+
+    #[cfg(any(unix, windows))]
+    fn revalidate_session_runs(
+        &self,
+        runs: &cap_std::fs::Dir,
+        expected_identity: TrackedEntryIdentity,
+        display: &Path,
+    ) -> Result<()> {
+        self.revalidate_namespace()?;
+        validate_named_directory_identity(
+            &self.projection.kin_control,
+            std::ffi::OsStr::new(SESSION_RUNS_DIRECTORY),
+            runs,
+            expected_identity,
+            display,
+            "repository session root",
+        )
     }
 
     /// Verify exact bytes, Git mode/kind, and symbolic-link targets for every
@@ -1693,6 +1940,22 @@ fn validate_source_content_identity(
     Ok(())
 }
 
+fn validated_session_source_entries<'a>(
+    base_metadata: &[u8],
+    entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
+) -> Result<Vec<ValidatedSourceEntry<'a>>> {
+    if base_metadata.is_empty() {
+        return Err(KinError::Other(
+            "session projection base metadata must not be empty".to_string(),
+        ));
+    }
+    let entries: Vec<_> = entries.into_iter().collect();
+    for (path, entry, body) in &entries {
+        validate_source_content_identity(path, *entry, body)?;
+    }
+    validated_source_entries(entries)
+}
+
 fn validate_projection_proof_entry_path(
     file_id: &RepoPath,
     kind: TreeEntry,
@@ -1975,6 +2238,7 @@ fn project_validated_source_tree(
     }
 }
 
+#[cfg(test)]
 fn project_validated_session_source_tree(
     root: &Path,
     entries: &[ValidatedSourceEntry<'_>],
@@ -2824,6 +3088,108 @@ fn open_or_create_private_directory(
     )))
 }
 
+fn validate_session_projection_name(name: &str) -> Result<()> {
+    let mut components = Path::new(name).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(component)) if component == std::ffi::OsStr::new(name))
+        || components.next().is_some()
+        || !name.starts_with("session-")
+        || name.len() == "session-".len()
+    {
+        return Err(KinError::Other(format!(
+            "session projection name must be one 'session-<id>' path component: {name:?}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+fn ensure_session_child_absent(
+    parent: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+    display: &Path,
+) -> Result<()> {
+    match parent.symlink_metadata(name) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(KinError::io(display, error)),
+        Ok(_) => Err(KinError::Other(format!(
+            "session workspace {} already exists; Kin never reuses a materialized workspace",
+            display.display()
+        ))),
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn validate_named_directory_identity(
+    parent: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+    retained: &cap_std::fs::Dir,
+    expected_identity: TrackedEntryIdentity,
+    display: &Path,
+    label: &str,
+) -> Result<()> {
+    let named =
+        open_directory_nofollow(parent, name).map_err(|error| KinError::io(display, error))?;
+    if tracked_open_directory_identity(&named).map_err(|error| KinError::io(display, error))?
+        != expected_identity
+    {
+        return Err(KinError::Other(format!(
+            "{label} {} was replaced while retained",
+            display.display()
+        )));
+    }
+    if tracked_open_directory_identity(retained).map_err(|error| KinError::io(display, error))?
+        != expected_identity
+    {
+        return Err(KinError::Other(format!(
+            "retained {label} {} changed identity",
+            display.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+fn create_retained_session_stage(
+    runs: &cap_std::fs::Dir,
+    runs_display: &Path,
+) -> Result<(OsString, PathBuf, TrackedEntryIdentity, cap_std::fs::Dir)> {
+    for _ in 0..8 {
+        let stage_name = OsString::from(format!(
+            "{SESSION_STAGING_DIRECTORY_PREFIX}{}",
+            uuid::Uuid::new_v4()
+        ));
+        let stage_display = runs_display.join(&stage_name);
+        match runs.create_dir(&stage_name) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(KinError::io(&stage_display, error)),
+        }
+        sync_directory_capability(runs, runs_display)?;
+        let stage = open_directory_nofollow_for_removal(runs, &stage_name)
+            .map_err(|error| KinError::io(&stage_display, error))?;
+        #[cfg(unix)]
+        rustix::fs::fchmod(&stage, rustix::fs::Mode::from_raw_mode(0o700))
+            .map_err(|error| KinError::io(&stage_display, error.into()))?;
+        let identity = tracked_open_directory_identity(&stage)
+            .map_err(|error| KinError::io(&stage_display, error))?;
+        validate_named_directory_identity(
+            runs,
+            &stage_name,
+            &stage,
+            identity,
+            &stage_display,
+            "session staging directory",
+        )?;
+        sync_directory_capability(&stage, &stage_display)?;
+        sync_directory_capability(runs, runs_display)?;
+        return Ok((stage_name, stage_display, identity, stage));
+    }
+    Err(KinError::Other(format!(
+        "could not allocate a unique retained session staging directory beneath {}",
+        runs_display.display()
+    )))
+}
+
 #[cfg(unix)]
 fn open_reconciliation_control_file(
     parent: &cap_std::fs::Dir,
@@ -3227,9 +3593,20 @@ impl ProjectionRoot {
         Self::open_with_projection_lock_deadline(root, PROJECTION_LOCK_WAIT_DEADLINE)
     }
 
+    #[cfg(test)]
     fn open_session(root: &Path) -> Result<Self> {
         Self::open_with_control_directory(
             root,
+            std::ffi::OsStr::new(SESSION_PROJECTION_CONTROL_DIRECTORY),
+            None,
+            PROJECTION_LOCK_WAIT_DEADLINE,
+        )
+    }
+
+    fn open_session_from_capability(root: cap_std::fs::Dir, display_root: &Path) -> Result<Self> {
+        Self::open_with_control_directory_capability(
+            root,
+            display_root,
             std::ffi::OsStr::new(SESSION_PROJECTION_CONTROL_DIRECTORY),
             None,
             PROJECTION_LOCK_WAIT_DEADLINE,
@@ -3255,6 +3632,22 @@ impl ProjectionRoot {
         lock_deadline: std::time::Duration,
     ) -> Result<Self> {
         let capability = open_projection_root_nofollow(root)?;
+        Self::open_with_control_directory_capability(
+            capability,
+            root,
+            projection_control_name,
+            repository_authority_kindb,
+            lock_deadline,
+        )
+    }
+
+    fn open_with_control_directory_capability(
+        capability: cap_std::fs::Dir,
+        root: &Path,
+        projection_control_name: &std::ffi::OsStr,
+        repository_authority_kindb: Option<PathBuf>,
+        lock_deadline: std::time::Duration,
+    ) -> Result<Self> {
         let display_projection_control = root.join(projection_control_name);
         let kin_control = open_or_create_private_directory(
             &capability,
@@ -3297,6 +3690,11 @@ impl ProjectionRoot {
         Ok(projection)
     }
 
+    fn retarget_display_root(&mut self, display_root: PathBuf) {
+        self.display_projection_control = display_root.join(&self.projection_control_name);
+        self.display_root = display_root;
+    }
+
     fn open_existing_for_freeze(root: &Path, lock_deadline: std::time::Duration) -> Result<Self> {
         let capability = open_projection_root_nofollow(root)?;
         let kin_control = open_directory_nofollow(&capability, std::ffi::OsStr::new(".kin"))
@@ -3325,6 +3723,9 @@ impl ProjectionRoot {
             projection_lock,
             projection_lock_identity,
             display_root: root.to_path_buf(),
+            projection_control_name: OsString::from(".kin"),
+            display_projection_control: root.join(".kin"),
+            repository_authority_kindb: Some(root.join(".kin").join("kindb")),
             kin_control_identity,
             control_identity,
             authority_key,
@@ -7847,6 +8248,172 @@ mod tests {
                 .contains("repository history, not a repository-owned source blob"),
             "unexpected gitlink projection error: {error}"
         );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn authority_owned_session_creates_runs_then_stages_and_publishes() {
+        let repository = tempfile::tempdir().unwrap();
+        let initialized = crate::init(repository.path()).unwrap();
+        std::fs::remove_dir(initialized.layout.runs_dir()).unwrap();
+        let path = repo_path("compose.yaml");
+        let body = b"services: {}\n";
+        let entry = TreeEntry::blob(Hash256::from_bytes(kin_blobs::digest_bytes(body)), false);
+        let freeze =
+            ExactProjectionFreeze::acquire_existing(initialized.layout.working_dir()).unwrap();
+
+        let (session, count) = freeze
+            .materialize_session_source_tree(
+                "session-capability",
+                br#"{"schema":1}"#,
+                [(&path, entry, body.as_slice())],
+            )
+            .unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(
+            session.root(),
+            initialized.layout.runs_dir().join("session-capability")
+        );
+        assert_eq!(
+            std::fs::read(session.root().join("compose.yaml")).unwrap(),
+            body
+        );
+        assert!(
+            std::fs::read_dir(initialized.layout.runs_dir())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(SESSION_STAGING_DIRECTORY_PREFIX)),
+            "successful publication must not leave a staging child"
+        );
+        session.revalidate().unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn authority_owned_session_rejects_a_replaced_runs_directory_before_mutation() {
+        let repository = tempfile::tempdir().unwrap();
+        let initialized = crate::init(repository.path()).unwrap();
+        let path = repo_path("compose.yaml");
+        let body = b"services: {}\n";
+        let entry = TreeEntry::blob(Hash256::from_bytes(kin_blobs::digest_bytes(body)), false);
+        let entries =
+            validated_session_source_entries(br#"{"schema":1}"#, [(&path, entry, body.as_slice())])
+                .unwrap();
+        let runs = initialized.layout.runs_dir();
+        let displaced = initialized.layout.root().join("runs-displaced");
+        let freeze =
+            ExactProjectionFreeze::acquire_existing(initialized.layout.working_dir()).unwrap();
+
+        let error = freeze
+            .materialize_validated_session_source_tree(
+                "session-raced",
+                br#"{"schema":1}"#,
+                &entries,
+                || {
+                    std::fs::rename(&runs, &displaced).unwrap();
+                    std::fs::create_dir(&runs).unwrap();
+                },
+            )
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("session root") && error.to_string().contains("replaced"),
+            "unexpected replaced-runs error: {error}"
+        );
+        assert!(!runs.join("session-raced").exists());
+        assert!(!displaced.join("session-raced").exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn authority_owned_session_refuses_an_existing_final_child_without_reuse() {
+        let repository = tempfile::tempdir().unwrap();
+        let initialized = crate::init(repository.path()).unwrap();
+        let existing = initialized.layout.runs_dir().join("session-existing");
+        std::fs::create_dir(&existing).unwrap();
+        std::fs::write(existing.join("owner-marker"), b"pre-existing").unwrap();
+        let path = repo_path("compose.yaml");
+        let body = b"services: {}\n";
+        let entry = TreeEntry::blob(Hash256::from_bytes(kin_blobs::digest_bytes(body)), false);
+        let freeze =
+            ExactProjectionFreeze::acquire_existing(initialized.layout.working_dir()).unwrap();
+
+        let error = freeze
+            .materialize_session_source_tree(
+                "session-existing",
+                br#"{"schema":1}"#,
+                [(&path, entry, body.as_slice())],
+            )
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("already exists")
+                && error.to_string().contains("never reuses"),
+            "unexpected existing-session error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(existing.join("owner-marker")).unwrap(),
+            b"pre-existing"
+        );
+        assert!(!existing.join("compose.yaml").exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn blocked_session_writer_rejects_a_replaced_repository_epoch() {
+        let repository = tempfile::tempdir().unwrap();
+        let initialized = crate::init(repository.path()).unwrap();
+        let working_dir = initialized.layout.working_dir().to_path_buf();
+        let detached_kin = working_dir.join(".kin-detached");
+        let freeze = ExactProjectionFreeze::acquire_existing(&working_dir).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let worker_root = working_dir.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let path = repo_path("compose.yaml");
+            let body = b"services: {}\n";
+            let entry = TreeEntry::blob(Hash256::from_bytes(kin_blobs::digest_bytes(body)), false);
+            let result = ExactProjectionFreeze::acquire_existing(&worker_root).and_then(|freeze| {
+                freeze
+                    .materialize_session_source_tree(
+                        "session-stale",
+                        br#"{"schema":1}"#,
+                        [(&path, entry, body.as_slice())],
+                    )
+                    .map(|_| ())
+            });
+            finished_tx.send(()).unwrap();
+            result
+        });
+
+        started_rx.recv().unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "writer unexpectedly escaped the held repository projection lock"
+        );
+        std::fs::rename(initialized.layout.root(), &detached_kin).unwrap();
+        let replacement = crate::init(&working_dir).unwrap();
+        drop(freeze);
+
+        let error = worker
+            .join()
+            .unwrap()
+            .expect_err("writer blocked on the detached epoch must fail closed");
+        assert!(
+            error.to_string().contains("replaced")
+                || error.to_string().contains("changed identity")
+                || error.to_string().contains("unavailable"),
+            "unexpected stale-epoch error: {error}"
+        );
+        assert!(!detached_kin.join("runs/session-stale").exists());
+        assert!(!replacement.layout.runs_dir().join("session-stale").exists());
     }
 
     #[cfg(any(unix, windows))]

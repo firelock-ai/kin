@@ -1,16 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::path::PathBuf;
-
-use tracing::info;
-
 use kin_model::graph::GraphStore;
 use kin_model::ids::EntityId;
 use kin_model::verification::VerificationRun;
 use kin_model::work::WorkId;
-
-use crate::error::{Result, RuntimeError};
 
 /// Strategy for materializing workspace files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,12 +46,8 @@ impl std::str::FromStr for MaterializeStrategy {
 /// ready for command execution.
 #[derive(Debug)]
 pub struct MaterializedWorkspace {
-    /// Root path of the materialized workspace.
-    pub root: PathBuf,
-    /// Strategy that was actually used.
-    pub strategy: MaterializeStrategy,
-    /// Which runtime-owned source path produced this workspace.
-    source_kind: MaterializationSourceKind,
+    projection: kin_core::ExactSessionProjection,
+    strategy: MaterializeStrategy,
 }
 
 /// Which runtime-owned source path materialized the workspace.
@@ -67,32 +57,37 @@ pub enum MaterializationSourceKind {
 }
 
 impl MaterializedWorkspace {
-    /// Remove the materialized workspace directory.
-    pub fn cleanup(&self) -> Result<()> {
-        if self.root.exists() {
-            std::fs::remove_dir_all(&self.root).map_err(|e| RuntimeError::io(&self.root, e))?;
-            info!(path = %self.root.display(), "cleaned up materialized workspace");
+    /// Construct a runtime handle from Kin's opaque authority-issued session
+    /// projection. Arbitrary ambient paths cannot be promoted to this type.
+    pub fn from_exact_session(
+        projection: kin_core::ExactSessionProjection,
+        strategy: MaterializeStrategy,
+    ) -> Self {
+        Self {
+            projection,
+            strategy,
         }
-        Ok(())
+    }
+
+    /// Root of the retained exact session projection.
+    pub fn root(&self) -> &std::path::Path {
+        self.projection.root()
+    }
+
+    /// Materialization strategy used for this exact session.
+    pub fn strategy(&self) -> MaterializeStrategy {
+        self.strategy
+    }
+
+    /// Revalidate the authority-bearing projection before a runtime consumer
+    /// relies on its ambient display path.
+    pub fn revalidate(&self) -> kin_core::Result<()> {
+        self.projection.revalidate()
     }
 
     /// Return which runtime-owned source path produced this workspace.
     pub fn source_kind(&self) -> MaterializationSourceKind {
-        self.source_kind
-    }
-
-    /// Reconstruct a materialized workspace handle for a directory already
-    /// created by another runtime boundary.
-    pub fn from_existing(
-        root: PathBuf,
-        strategy: MaterializeStrategy,
-        source_kind: MaterializationSourceKind,
-    ) -> Self {
-        Self {
-            root,
-            strategy,
-            source_kind,
-        }
+        MaterializationSourceKind::ExactTree
     }
 }
 
@@ -126,20 +121,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exact_materialization_handle_cleans_up_its_directory() {
-        let dst_root = tempfile::tempdir().unwrap();
-        let dst = dst_root.path().join("workspace");
-        std::fs::create_dir(&dst).unwrap();
-        std::fs::write(dst.join("file.txt"), b"data").unwrap();
-        let workspace = MaterializedWorkspace::from_existing(
-            dst.clone(),
-            MaterializeStrategy::Copy,
-            MaterializationSourceKind::ExactTree,
+    fn exact_materialization_handle_requires_authority_issued_projection() {
+        let repository = tempfile::tempdir().unwrap();
+        kin_core::init(repository.path()).unwrap();
+        let path = kin_model::RepoPath::from_utf8("compose.yaml").unwrap();
+        let body = b"services: {}\n";
+        let entry = kin_model::TreeEntry::blob(
+            kin_model::Hash256::from_bytes(kin_blobs::digest_bytes(body)),
+            false,
         );
+        let freeze = kin_core::ExactProjectionFreeze::acquire_existing(repository.path()).unwrap();
+        let (projection, count) = freeze
+            .materialize_session_source_tree(
+                "session-runtime-handle",
+                br#"{"schema":1}"#,
+                [(&path, entry, body.as_slice())],
+            )
+            .unwrap();
+        let workspace =
+            MaterializedWorkspace::from_exact_session(projection, MaterializeStrategy::Copy);
 
-        assert!(dst.exists());
-        workspace.cleanup().unwrap();
-        assert!(!dst.exists());
+        assert_eq!(count, 1);
+        assert_eq!(workspace.strategy(), MaterializeStrategy::Copy);
+        assert_eq!(
+            workspace.source_kind(),
+            MaterializationSourceKind::ExactTree
+        );
+        assert_eq!(
+            std::fs::read(workspace.root().join("compose.yaml")).unwrap(),
+            body
+        );
+        workspace.revalidate().unwrap();
     }
 
     #[test]

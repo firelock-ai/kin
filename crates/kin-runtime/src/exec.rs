@@ -32,6 +32,9 @@ pub struct ExecContext {
 impl ExecContext {
     /// Run the command in the materialized workspace directory.
     pub fn run(&self) -> Result<ExecResult> {
+        self.workspace
+            .revalidate()
+            .map_err(|error| RuntimeError::Other(format!("revalidate exact workspace: {error}")))?;
         let full_command = if self.args.is_empty() {
             self.command.clone()
         } else {
@@ -40,7 +43,7 @@ impl ExecContext {
 
         info!(
             command = %full_command,
-            workspace = %self.workspace.root.display(),
+            workspace = %self.workspace.root().display(),
             "executing in materialized workspace"
         );
 
@@ -49,12 +52,12 @@ impl ExecContext {
         let output = if cfg!(target_os = "windows") {
             Command::new("cmd")
                 .args(["/C", &full_command])
-                .current_dir(&self.workspace.root)
+                .current_dir(self.workspace.root())
                 .output()
         } else {
             Command::new("sh")
                 .args(["-c", &full_command])
-                .current_dir(&self.workspace.root)
+                .current_dir(self.workspace.root())
                 .output()
         }
         .map_err(|e| RuntimeError::CommandFailed(e.to_string()))?;
@@ -66,8 +69,8 @@ impl ExecContext {
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
             duration_ms,
-            workspace_path: self.workspace.root.clone(),
-            strategy_used: self.workspace.strategy,
+            workspace_path: self.workspace.root().to_path_buf(),
+            strategy_used: self.workspace.strategy(),
         })
     }
 }
@@ -75,27 +78,47 @@ impl ExecContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workspace::MaterializationSourceKind;
-    use std::fs;
 
-    fn exact_workspace(root: PathBuf) -> MaterializedWorkspace {
-        MaterializedWorkspace::from_existing(
-            root,
-            MaterializeStrategy::Copy,
-            MaterializationSourceKind::ExactTree,
+    fn exact_workspace(files: &[(&str, &[u8])]) -> (tempfile::TempDir, MaterializedWorkspace) {
+        let repository = tempfile::tempdir().unwrap();
+        kin_core::init(repository.path()).unwrap();
+        let paths = files
+            .iter()
+            .map(|(path, _)| kin_model::RepoPath::from_utf8((*path).to_string()).unwrap())
+            .collect::<Vec<_>>();
+        let entries = paths
+            .iter()
+            .zip(files.iter())
+            .map(|(path, (_, body))| {
+                (
+                    path,
+                    kin_model::TreeEntry::blob(
+                        kin_model::Hash256::from_bytes(kin_blobs::digest_bytes(body)),
+                        false,
+                    ),
+                    *body,
+                )
+            })
+            .collect::<Vec<_>>();
+        let freeze = kin_core::ExactProjectionFreeze::acquire_existing(repository.path()).unwrap();
+        let (projection, _) = freeze
+            .materialize_session_source_tree(
+                "session-runtime-exec",
+                br#"{"schema":1}"#,
+                entries
+                    .iter()
+                    .map(|(path, entry, body)| (*path, *entry, *body)),
+            )
+            .unwrap();
+        (
+            repository,
+            MaterializedWorkspace::from_exact_session(projection, MaterializeStrategy::Copy),
         )
     }
 
     #[test]
     fn exec_context_with_args() {
-        let src = tempfile::tempdir().unwrap();
-        fs::write(src.path().join("a.txt"), "aaa").unwrap();
-        fs::write(src.path().join("b.txt"), "bbb").unwrap();
-
-        let dst = tempfile::tempdir().unwrap();
-        fs::copy(src.path().join("a.txt"), dst.path().join("a.txt")).unwrap();
-        fs::copy(src.path().join("b.txt"), dst.path().join("b.txt")).unwrap();
-        let workspace = exact_workspace(dst.path().to_path_buf());
+        let (_repository, workspace) = exact_workspace(&[("a.txt", b"aaa"), ("b.txt", b"bbb")]);
 
         let ctx = ExecContext {
             workspace,
@@ -111,12 +134,7 @@ mod tests {
 
     #[test]
     fn exec_context_reports_strategy() {
-        let src = tempfile::tempdir().unwrap();
-        fs::write(src.path().join("x.txt"), "x").unwrap();
-
-        let dst = tempfile::tempdir().unwrap();
-        fs::copy(src.path().join("x.txt"), dst.path().join("x.txt")).unwrap();
-        let workspace = exact_workspace(dst.path().to_path_buf());
+        let (_repository, workspace) = exact_workspace(&[("x.txt", b"x")]);
 
         let ctx = ExecContext {
             workspace,
