@@ -3207,6 +3207,7 @@ mod tests {
                         crate::types::regular_tree_entry(2),
                     ),
                 }],
+                admission_policy_delta: None,
             })
             .unwrap();
 
@@ -4141,14 +4142,17 @@ mod tests {
             timestamp: Timestamp::now(),
             author: AuthorId::new("tester"),
             message: "cochange".into(),
-            entity_deltas: vec![EntityDelta::Added(caller.clone())],
+            entity_deltas: vec![EntityDelta::Added {
+                new: caller.clone(),
+            }],
             relation_deltas: Vec::new(),
             tree_deltas: Vec::new(),
             projected_files: vec![FilePathId::new("src/main.rs")],
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
-            authored_on: Some(BranchName::new("main")),
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         });
         let relation = Relation {
             id: RelationId::new(),
@@ -4221,14 +4225,17 @@ mod tests {
             timestamp: Timestamp::now(),
             author: AuthorId::new("tester"),
             message: "cochange".into(),
-            entity_deltas: vec![EntityDelta::Added(caller.clone())],
+            entity_deltas: vec![EntityDelta::Added {
+                new: caller.clone(),
+            }],
             relation_deltas: Vec::new(),
             tree_deltas: Vec::new(),
             projected_files: vec![FilePathId::new("src/main.rs")],
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
-            authored_on: Some(BranchName::new("main")),
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         });
 
         let calls = Relation {
@@ -4421,7 +4428,8 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         };
         let mut snapshot = crate::storage::format::LocateGraphSnapshot::from(
             crate::storage::GraphSnapshot::empty(),
@@ -4621,22 +4629,19 @@ mod tests {
             timestamp: Timestamp::now(),
             author: AuthorId::new("tester"),
             message: "snapshot roundtrip".into(),
-            entity_deltas: vec![EntityDelta::Added(entity.clone())],
+            entity_deltas: vec![EntityDelta::Added {
+                new: entity.clone(),
+            }],
             relation_deltas: Vec::new(),
             tree_deltas: Vec::new(),
             projected_files: vec![FilePathId::new("src/main.rs")],
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
-            authored_on: Some(BranchName::new("main")),
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         });
         graph.create_change(&change).unwrap();
-        graph
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head: change.id,
-            })
-            .unwrap();
 
         let shallow = ShallowTrackedFile {
             file_id: FilePathId::new("src/main.rs"),
@@ -4797,14 +4802,6 @@ mod tests {
         let graph = reloaded.graph();
 
         assert!(graph.get_change(&change.id).unwrap().is_some());
-        assert_eq!(
-            graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            change.id
-        );
         assert_eq!(graph.list_shallow_files().unwrap().len(), 1);
         assert_eq!(graph.list_structured_artifacts().unwrap().len(), 1);
         assert_eq!(graph.list_opaque_artifacts().unwrap().len(), 1);
@@ -5078,6 +5075,7 @@ mod tests {
                     old: LocatedEntry::new(RepoPath::from_utf8(&file_id.0).unwrap(), old_entry),
                     new: LocatedEntry::new(RepoPath::from_utf8(&file_id.0).unwrap(), new_entry),
                 }],
+                admission_policy_delta: None,
             })
             .unwrap();
         assert_ne!(before_authority, graph.retrieval_authority_hash());
@@ -5143,6 +5141,7 @@ mod tests {
                     old: LocatedEntry::new(RepoPath::from_utf8(&file_id.0).unwrap(), old_entry),
                     new: LocatedEntry::new(RepoPath::from_utf8(&file_id.0).unwrap(), new_entry),
                 }],
+                admission_policy_delta: None,
             })
             .unwrap();
         assert_eq!(
@@ -5618,11 +5617,10 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
         mgr.save().unwrap();
 
-        let branch = kin_model::Branch {
-            name: kin_model::BranchName::new("main"),
-            head: kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([7; 32])),
-        };
-        graph.create_branch(&branch).unwrap();
+        graph.admit_artifact_for_test(
+            "compose.yaml",
+            TreeEntry::blob(Hash256::from_bytes([7; 32]), false),
+        );
         mgr.save().unwrap();
 
         let persisted = crate::search::TextIndex::open_read_only(Some(&text_index_path)).unwrap();
@@ -6341,6 +6339,7 @@ mod tests {
                     old: LocatedEntry::new(RepoPath::from_utf8(&old_path.0).unwrap(), entry),
                     new: LocatedEntry::new(RepoPath::from_utf8(&new_path.0).unwrap(), entry),
                 }],
+                admission_policy_delta: None,
             })
             .unwrap();
 

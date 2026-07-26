@@ -111,9 +111,6 @@ pub struct GraphSnapshotDelta {
     pub changes: CollectionDelta<SemanticChangeId, SemanticChange>,
     pub change_children: CollectionDelta<SemanticChangeId, Vec<SemanticChangeId>>,
 
-    // Branches
-    pub branches: CollectionDelta<BranchName, Branch>,
-
     // Work graph
     pub work_items: CollectionDelta<WorkId, WorkItem>,
     pub annotations: CollectionDelta<AnnotationId, Annotation>,
@@ -160,7 +157,7 @@ impl GraphSnapshotDelta {
     pub const MAGIC: [u8; 4] = *b"KNDD";
 
     /// Current delta format version.
-    pub const CURRENT_VERSION: u32 = 3;
+    pub const CURRENT_VERSION: u32 = 4;
 
     /// Size of the SHA-256 checksum appended to the wire format.
     pub const CHECKSUM_LEN: usize = 32;
@@ -175,7 +172,6 @@ impl GraphSnapshotDelta {
             incoming: CollectionDelta::default(),
             changes: CollectionDelta::default(),
             change_children: CollectionDelta::default(),
-            branches: CollectionDelta::default(),
             work_items: CollectionDelta::default(),
             annotations: CollectionDelta::default(),
             work_links: VecDelta::default(),
@@ -213,7 +209,6 @@ impl GraphSnapshotDelta {
             && self.incoming.is_empty()
             && self.changes.is_empty()
             && self.change_children.is_empty()
-            && self.branches.is_empty()
             && self.work_items.is_empty()
             && self.annotations.is_empty()
             && self.work_links.is_empty()
@@ -247,7 +242,6 @@ impl GraphSnapshotDelta {
         self.entities.change_count()
             + self.relations.change_count()
             + self.changes.change_count()
-            + self.branches.change_count()
             + self.work_items.change_count()
             + self.annotations.change_count()
             + self.reviews.change_count()
@@ -480,6 +474,10 @@ pub fn compute_graph_delta(
     new: &GraphSnapshot,
     base_generation: Generation,
 ) -> GraphSnapshotDelta {
+    assert!(
+        old.repository_authority.is_none() && new.repository_authority.is_none(),
+        "repository-authority snapshots require one full-snapshot transaction CAS"
+    );
     let old_tree: HashMap<ArtifactId, LocatedEntry> = old
         .resolved_tree
         .artifacts()
@@ -498,7 +496,6 @@ pub fn compute_graph_delta(
         incoming: diff_maps_eq(&old.incoming, &new.incoming),
         changes: diff_maps(&old.changes, &new.changes),
         change_children: diff_maps_eq(&old.change_children, &new.change_children),
-        branches: diff_maps(&old.branches, &new.branches),
         work_items: diff_maps(&old.work_items, &new.work_items),
         annotations: diff_maps(&old.annotations, &new.annotations),
         work_links: diff_vecs(&old.work_links, &new.work_links),
@@ -618,6 +615,12 @@ pub fn apply_graph_delta(
     snapshot: &mut GraphSnapshot,
     delta: &GraphSnapshotDelta,
 ) -> Result<(), KinDbError> {
+    if snapshot.repository_authority.is_some() {
+        return Err(KinDbError::StorageError(
+            "repository-authority snapshots cannot be mutated through incremental graph deltas"
+                .to_string(),
+        ));
+    }
     delta.validate_semantic_changes()?;
     // Apply into a private candidate so repository identity/path truth and
     // every enrichment that depends on it are validated as one state
@@ -635,9 +638,6 @@ pub fn apply_graph_delta(
     // Change history
     apply_map_delta(&mut staged.changes, &delta.changes);
     apply_map_delta(&mut staged.change_children, &delta.change_children);
-
-    // Branches
-    apply_map_delta(&mut staged.branches, &delta.branches);
 
     // Work graph
     apply_map_delta(&mut staged.work_items, &delta.work_items);
@@ -759,7 +759,8 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
-            authored_on: Some(BranchName::new("main")),
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         });
         change.message.push_str(" after id was sealed");
         let mut delta = GraphSnapshotDelta::empty(0);
@@ -788,7 +789,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("unsupported delta version: 2 (expected 3)"));
+            .contains("unsupported delta version: 2 (expected 4)"));
     }
 
     // -- Helpers -----------------------------------------------------------
@@ -1015,35 +1016,6 @@ mod tests {
         apply_graph_delta(&mut result, &delta).unwrap();
         assert_eq!(result.relations.len(), 1);
         assert!(result.relations.contains_key(&rel_id));
-    }
-
-    #[test]
-    fn compute_and_apply_branch_delta() {
-        let mut old = GraphSnapshot::empty();
-        let mut new = GraphSnapshot::empty();
-
-        let branch_name = BranchName::new("main");
-        let old_branch = Branch {
-            name: branch_name.clone(),
-            head: SemanticChangeId(Hash256::from_bytes([1; 32])),
-        };
-        let new_branch = Branch {
-            head: SemanticChangeId(Hash256::from_bytes([2; 32])),
-            ..old_branch.clone()
-        };
-
-        old.branches.insert(branch_name.clone(), old_branch);
-        new.branches.insert(branch_name.clone(), new_branch);
-
-        let delta = compute_graph_delta(&old, &new, 1);
-        assert_eq!(delta.branches.modified.len(), 1);
-
-        let mut result = old.clone();
-        apply_graph_delta(&mut result, &delta).unwrap();
-        assert_eq!(
-            result.branches.get(&branch_name).unwrap().head,
-            SemanticChangeId(Hash256::from_bytes([2; 32]))
-        );
     }
 
     #[test]

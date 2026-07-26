@@ -446,6 +446,21 @@ impl StorageBackend for GcsBackend {
         Ok(Some(data))
     }
 
+    fn source_blob_len(&self, repo_id: &str, digest: [u8; 32]) -> Result<Option<u64>, KinDbError> {
+        validate_source_blob_repo_id(repo_id)?;
+        let path = self.source_blob_path(repo_id, digest)?;
+        match self.block_on(self.store.head(&path)) {
+            Ok(metadata) => {
+                validate_source_blob_size(metadata.size, path.as_ref())?;
+                Ok(Some(metadata.size))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(error) => Err(KinDbError::StorageError(format!(
+                "GCS source blob metadata load failed for {path}: {error}"
+            ))),
+        }
+    }
+
     fn load_snapshot_authority(
         &self,
         repo_id: &str,
@@ -848,8 +863,16 @@ mod tests {
             reopened.load_source_blob("repo-a", digest).unwrap(),
             Some(data.to_vec())
         );
+        assert_eq!(
+            reopened.source_blob_len("repo-a", digest).unwrap(),
+            Some(data.len() as u64)
+        );
         assert!(reopened
             .load_source_blob("repo-b", digest)
+            .unwrap()
+            .is_none());
+        assert!(reopened
+            .source_blob_len("repo-b", digest)
             .unwrap()
             .is_none());
     }

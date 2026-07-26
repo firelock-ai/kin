@@ -846,6 +846,24 @@ pub trait StorageBackend: Send + Sync {
         ))
     }
 
+    /// Load the exact byte length of an immutable source blob.
+    ///
+    /// Backends should override this with a metadata-only implementation.
+    /// The default remains correct for simple/test backends by performing one
+    /// integrity-checked bounded read; callers never fall back to filesystem or
+    /// Git metadata on an authority path.
+    fn source_blob_len(&self, repo_id: &str, digest: [u8; 32]) -> Result<Option<u64>, KinDbError> {
+        self.load_source_blob_bounded(repo_id, digest, MAX_SOURCE_BLOB_BYTES)?
+            .map(|data| {
+                u64::try_from(data.len()).map_err(|_| {
+                    KinDbError::StorageError(
+                        "immutable source blob length does not fit u64".to_string(),
+                    )
+                })
+            })
+            .transpose()
+    }
+
     /// Save a snapshot with compare-and-swap semantics.
     ///
     /// `expected_gen` is the generation returned by the last `load_snapshot`
@@ -2026,6 +2044,33 @@ impl StorageBackend for LocalFileBackend {
         }
     }
 
+    fn source_blob_len(&self, repo_id: &str, digest: [u8; 32]) -> Result<Option<u64>, KinDbError> {
+        validate_source_blob_repo_id(repo_id)?;
+        #[cfg(not(unix))]
+        {
+            let _ = (repo_id, digest);
+            return Err(KinDbError::StorageError(
+                "secure local immutable source storage is unavailable on this platform; use the GCS backend"
+                    .to_string(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            let capability = open_source_blob_capability(
+                &self.base_path,
+                repo_id,
+                digest,
+                true,
+                false,
+                &self.source_root_confirmed_for_process,
+            )?;
+            let _lock = acquire_source_blob_lock(&capability.repo_dir)?;
+            let digest_hex = hex::encode(digest);
+            Ok(open_source_file_at(&capability.leaf_dir, &digest_hex)?
+                .map(|(_, byte_len)| byte_len))
+        }
+    }
+
     fn load_snapshot_authority(
         &self,
         repo_id: &str,
@@ -2462,8 +2507,16 @@ mod tests {
             reopened.load_source_blob("repo-a", digest).unwrap(),
             Some(data.to_vec())
         );
+        assert_eq!(
+            reopened.source_blob_len("repo-a", digest).unwrap(),
+            Some(data.len() as u64)
+        );
         assert!(reopened
             .load_source_blob("repo-b", digest)
+            .unwrap()
+            .is_none());
+        assert!(reopened
+            .source_blob_len("repo-b", digest)
             .unwrap()
             .is_none());
     }

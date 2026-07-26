@@ -8,10 +8,11 @@
 
 // IDs
 pub use kin_model::{
-    ArtifactId, ArtifactRevisionId, AuthorId, BranchId, BranchName, ConflictId, ContractId,
-    EntityId, EntityRevisionId, EvidenceId, FilePathId, GitObjectId, Hash256, IntentId, LanguageId,
-    RelationId, RelationRevisionId, RepoPath, ResolvedArtifact, ResolvedTree, RetrievalKey,
-    RetrievalKeyFileResolver, SemanticChangeId, SessionId, SpecId, TreeEntry, TreeStateError,
+    ArtifactId, ArtifactRevisionId, AuthorId, ConflictId, ContractId, EntityId, EntityRevisionId,
+    EvidenceId, FilePathId, GitObjectId, Hash256, IntentId, LanguageId, OperationId, RefName,
+    RefTarget, RelationId, RelationRevisionId, RepoPath, RepositoryId, ResolvedArtifact,
+    ResolvedTree, RetrievalKey, RetrievalKeyFileResolver, SemanticChangeId, SessionId, SpecId,
+    TreeEntry, TreeStateError, WorkspaceId,
 };
 
 // Entity types
@@ -27,9 +28,6 @@ pub use kin_model::ArtifactRevision;
 pub use kin_model::{
     EntityDelta, LocatedEntry, RelationDelta, SemanticChange, TransactionDelta, TreeDelta,
 };
-
-// Branch types
-pub use kin_model::{Branch, GraphOverlay, MergeState, WorkingCopy};
 
 // Graph query types
 pub use kin_model::{EntityFilter, SubGraph};

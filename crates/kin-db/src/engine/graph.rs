@@ -292,7 +292,7 @@ fn semantic_change_payload(change: &SemanticChange) -> Result<SemanticChangePayl
     let mut exact_float_bits = Vec::new();
     for delta in &change.entity_deltas {
         match delta {
-            EntityDelta::Added(entity) => record_entity_float_bits(
+            EntityDelta::Added { new: entity } => record_entity_float_bits(
                 change.id,
                 entity,
                 "entity fingerprint stability score",
@@ -312,17 +312,46 @@ fn semantic_change_payload(change: &SemanticChange) -> Result<SemanticChangePayl
                     &mut exact_float_bits,
                 )?;
             }
-            EntityDelta::Removed(_) => {}
+            EntityDelta::Removed { old } => record_entity_float_bits(
+                change.id,
+                old,
+                "removed entity fingerprint stability score",
+                &mut exact_float_bits,
+            )?,
         }
     }
     for delta in &change.relation_deltas {
-        if let RelationDelta::Added(relation) = delta {
-            record_change_float(
-                change.id,
-                "relation confidence",
-                relation.confidence,
-                &mut exact_float_bits,
-            )?;
+        match delta {
+            RelationDelta::Added { new } => {
+                record_change_float(
+                    change.id,
+                    "relation confidence",
+                    new.confidence,
+                    &mut exact_float_bits,
+                )?;
+            }
+            RelationDelta::Modified { old, new } => {
+                record_change_float(
+                    change.id,
+                    "old relation confidence",
+                    old.confidence,
+                    &mut exact_float_bits,
+                )?;
+                record_change_float(
+                    change.id,
+                    "new relation confidence",
+                    new.confidence,
+                    &mut exact_float_bits,
+                )?;
+            }
+            RelationDelta::Removed { old } => {
+                record_change_float(
+                    change.id,
+                    "removed relation confidence",
+                    old.confidence,
+                    &mut exact_float_bits,
+                )?;
+            }
         }
     }
     Ok(SemanticChangePayload {
@@ -485,7 +514,7 @@ fn append_entity_revisions(ent: &mut EntityData, change: &SemanticChange) -> Vec
     let mut superseded = Vec::new();
     for delta in &change.entity_deltas {
         match delta {
-            EntityDelta::Added(entity) => {
+            EntityDelta::Added { new: entity } => {
                 if entity_unchanged_since_last_revision(ent, entity) {
                     continue;
                 }
@@ -510,7 +539,7 @@ fn append_entity_revisions(ent: &mut EntityData, change: &SemanticChange) -> Vec
                     previous_revision,
                 ));
             }
-            EntityDelta::Removed(_) => {}
+            EntityDelta::Removed { .. } => {}
         }
     }
     superseded
@@ -913,13 +942,12 @@ impl GraphHashSource for EntityData {
     }
 }
 
-/// Semantic change DAG + branches.
+/// Semantic change DAG. Named refs are repository authority, not graph state.
 #[derive(Clone)]
 struct ChangeData {
     changes: HashMap<SemanticChangeId, SemanticChange>,
     /// Parent → children in the change DAG.
     change_children: HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
-    branches: HashMap<BranchName, Branch>,
 }
 
 /// Work items, annotations, links.
@@ -1599,7 +1627,7 @@ impl PreparedEmbedBatch {
 pub struct InMemoryGraph {
     /// Core entity/relation graph.
     entities: RwLock<EntityData>,
-    /// Semantic change DAG + branches.
+    /// Semantic change DAG. Repository refs live in the shared authority cell.
     changes: RwLock<ChangeData>,
     /// Work items, annotations, links.
     work: RwLock<WorkData>,
@@ -1753,7 +1781,6 @@ impl InMemoryGraph {
             changes: RwLock::new(ChangeData {
                 changes: HashMap::new(),
                 change_children: HashMap::new(),
-                branches: HashMap::new(),
             }),
             work: RwLock::new(WorkData {
                 work_items: HashMap::new(),
@@ -1939,7 +1966,6 @@ impl InMemoryGraph {
             incoming: persisted_incoming,
             changes,
             change_children,
-            branches,
             work_items,
             annotations,
             work_links,
@@ -1966,17 +1992,22 @@ impl InMemoryGraph {
             intents,
             downstream_warnings,
             entity_revisions,
+            // Repository authority is owned by the immutable publication
+            // manager, never by this in-place mutable graph.
+            repository_authority: _,
         } = snapshot;
-        let entity_revisions: HashMap<EntityId, Vec<EntityRevision>> =
-            if entity_revisions.is_empty() && !changes.is_empty() {
-                kin_model::graph::derive_entity_revisions_from_changes(topologically_order_changes(
-                    changes.iter().map(|(id, change)| (*id, change.clone())),
-                ))
-                .into_iter()
-                .collect()
-            } else {
-                entity_revisions.into_iter().collect()
-            };
+        let entity_revisions: HashMap<EntityId, Vec<EntityRevision>> = if entity_revisions
+            .is_empty()
+            && !changes.is_empty()
+        {
+            kin_model::graph::derive_entity_revisions_from_changes(topologically_order_changes(
+                changes.iter().map(|(id, change)| (*id, change.clone())),
+            ))?
+            .into_iter()
+            .collect()
+        } else {
+            entity_revisions.into_iter().collect()
+        };
         let _span = tracing::info_span!(
             "kindb.graph.from_snapshot",
             entities = entities.len(),
@@ -2134,7 +2165,6 @@ impl InMemoryGraph {
             changes: RwLock::new(ChangeData {
                 changes: changes.into_iter().collect(),
                 change_children: change_children.into_iter().collect(),
-                branches: branches.into_iter().collect(),
             }),
             work: RwLock::new(WorkData {
                 work_items: work_items.into_iter().collect(),
@@ -2331,9 +2361,11 @@ impl InMemoryGraph {
         let entity_data = EntityData {
             entities,
             entity_revisions: if entity_revisions.is_empty() && !changes.is_empty() {
-                kin_model::graph::derive_entity_revisions_from_changes(topologically_order_changes(
-                    changes.iter().map(|(id, change)| (*id, change.clone())),
-                ))
+                kin_model::graph::derive_entity_revisions_from_changes(
+                    topologically_order_changes(
+                        changes.iter().map(|(id, change)| (*id, change.clone())),
+                    ),
+                )?
                 .into_iter()
                 .collect()
             } else {
@@ -2358,7 +2390,6 @@ impl InMemoryGraph {
             changes: RwLock::new(ChangeData {
                 changes,
                 change_children: HashMap::new(),
-                branches: HashMap::new(),
             }),
             work: RwLock::new(WorkData {
                 work_items: HashMap::new(),
@@ -2729,16 +2760,6 @@ impl InMemoryGraph {
         let mut pending = self.pending_delta.lock();
         delta_map_remove(&mut pending.delta.entities, entity_id);
         delta_map_remove(&mut pending.delta.entity_revisions, entity_id);
-    }
-
-    fn record_branch_delta_upsert(&self, branch: Branch) {
-        let mut pending = self.pending_delta.lock();
-        delta_map_upsert(&mut pending.delta.branches, branch.name.clone(), branch);
-    }
-
-    fn record_branch_delta_remove(&self, name: BranchName) {
-        let mut pending = self.pending_delta.lock();
-        delta_map_remove(&mut pending.delta.branches, name);
     }
 
     fn record_relation_delta_upsert(&self, ent: &EntityData, relation: Relation) {
@@ -3160,7 +3181,6 @@ impl InMemoryGraph {
                 opaque_artifacts: &ent.opaque_artifacts,
                 changes: &chg.changes,
                 change_children: &chg.change_children,
-                branches: &chg.branches,
                 work_items: &wrk.work_items,
                 annotations: &wrk.annotations,
                 work_links: &wrk.work_links,
@@ -3215,6 +3235,7 @@ impl InMemoryGraph {
 
     /// Return the exact authority digest that persisted lexical/vector
     /// sidecars must match before they can answer queries.
+    #[cfg(any(feature = "vector", test))]
     pub(crate) fn retrieval_authority_hash(&self) -> [u8; 32] {
         let ent = self.entities.read();
         let chg = self.changes.read();
@@ -3309,7 +3330,6 @@ impl InMemoryGraph {
             opaque_artifacts: ent.opaque_artifacts.into_values().collect(),
             changes: chg.changes.into_iter().collect(),
             change_children: chg.change_children.into_iter().collect(),
-            branches: chg.branches.into_iter().collect(),
             work_items: wrk.work_items.into_iter().collect(),
             annotations: wrk.annotations.into_iter().collect(),
             work_links: wrk.work_links,
@@ -3330,6 +3350,7 @@ impl InMemoryGraph {
             sessions: ses.sessions.into_iter().collect(),
             intents: ses.intents.into_iter().collect(),
             downstream_warnings: ses.downstream_warnings,
+            repository_authority: None,
         }
     }
 
@@ -5707,6 +5728,7 @@ impl InMemoryGraph {
             entity_deltas: Vec::new(),
             relation_deltas: Vec::new(),
             tree_deltas: vec![tree_delta],
+            admission_policy_delta: None,
         })
         .expect("test artifact admission");
         artifact_id
@@ -5731,6 +5753,7 @@ impl InMemoryGraph {
                 artifact_id: artifact.artifact_id,
                 old: artifact.located_entry(),
             }],
+            admission_policy_delta: None,
         })
         .expect("test artifact removal");
         Some(artifact.entry)
@@ -5758,7 +5781,6 @@ impl std::fmt::Debug for InMemoryGraph {
             .field("entities", &ent.entities.len())
             .field("relations", &ent.relations.len())
             .field("changes", &chg.changes.len())
-            .field("branches", &chg.branches.len())
             .finish()
     }
 }
@@ -5791,108 +5813,6 @@ fn remove_relations_for_entity(ent: &mut EntityData, entity_id: &EntityId) -> Ve
     ent.outgoing.remove(entity_id);
     ent.incoming.remove(entity_id);
     removed
-}
-
-fn retire_entity_authority(
-    ent: &mut EntityData,
-    pending: &mut PendingGraphDelta,
-    entity_id: EntityId,
-    affected: &mut HashSet<EntityId>,
-    merkle_seeds: &mut HashSet<EntityId>,
-) {
-    merkle_seeds.insert(entity_id);
-    if let Some(entity) = ent.entities.remove(&entity_id) {
-        ent.indexes.remove(
-            &entity.id,
-            &entity.name,
-            entity.file_origin.as_ref(),
-            entity.kind,
-        );
-        if let Some(outgoing) = ent.outgoing.get(&entity_id) {
-            for relation_id in outgoing {
-                if let Some(relation) = ent.relations.get(relation_id) {
-                    if let Some(neighbor) = entity_neighbor_for_relation(relation, &entity_id) {
-                        affected.insert(neighbor);
-                        merkle_seeds.insert(neighbor);
-                    }
-                }
-            }
-        }
-        if let Some(incoming) = ent.incoming.get(&entity_id) {
-            for relation_id in incoming {
-                if let Some(relation) = ent.relations.get(relation_id) {
-                    if let Some(neighbor) = entity_neighbor_for_relation(relation, &entity_id) {
-                        affected.insert(neighbor);
-                        merkle_seeds.insert(neighbor);
-                    }
-                }
-            }
-        }
-    }
-
-    let removed_relations = remove_relations_for_entity(ent, &entity_id);
-    ent.entity_revisions.remove(&entity_id);
-    delta_map_remove(&mut pending.delta.entities, entity_id);
-    delta_map_remove(&mut pending.delta.entity_revisions, entity_id);
-    for relation in &removed_relations {
-        delta_map_remove(&mut pending.delta.relations, relation.id);
-        record_relation_edge_delta(pending, ent, relation);
-    }
-}
-
-fn retire_relations_for_artifacts(
-    ent: &mut EntityData,
-    pending: &mut PendingGraphDelta,
-    removed_artifact_ids: &HashSet<ArtifactId>,
-    content_changed_artifact_ids: &HashSet<ArtifactId>,
-    affected: &mut HashSet<EntityId>,
-    merkle_seeds: &mut HashSet<EntityId>,
-) {
-    let mut relation_ids = HashSet::new();
-    for artifact_id in removed_artifact_ids
-        .iter()
-        .chain(content_changed_artifact_ids)
-    {
-        let node = GraphNodeId::Artifact(*artifact_id);
-        relation_ids.extend(ent.node_outgoing.get(&node).into_iter().flatten().copied());
-        relation_ids.extend(ent.node_incoming.get(&node).into_iter().flatten().copied());
-    }
-
-    let mut relation_ids: Vec<RelationId> = relation_ids.into_iter().collect();
-    relation_ids.sort_unstable_by_key(|relation_id| *relation_id.0.as_bytes());
-    for relation_id in relation_ids {
-        let Some(relation) = ent.relations.get(&relation_id) else {
-            continue;
-        };
-        let mut incident_artifacts =
-            [relation.src, relation.dst]
-                .into_iter()
-                .filter_map(|node| match node {
-                    GraphNodeId::Artifact(artifact_id) => Some(artifact_id),
-                    _ => None,
-                });
-        let should_retire = incident_artifacts
-            .clone()
-            .any(|artifact_id| removed_artifact_ids.contains(&artifact_id))
-            || (matches!(
-                relation.origin,
-                RelationOrigin::Parsed | RelationOrigin::Inferred | RelationOrigin::Lsp
-            ) && incident_artifacts
-                .any(|artifact_id| content_changed_artifact_ids.contains(&artifact_id)));
-        if !should_retire {
-            continue;
-        }
-        let relation = ent
-            .relations
-            .remove(&relation_id)
-            .expect("relation remained present under the entity write lock");
-        let entity_ids = entity_ids_for_relation(&relation);
-        affected.extend(entity_ids.iter().copied());
-        merkle_seeds.extend(entity_ids);
-        remove_relation_indexes(ent, &relation);
-        delta_map_remove(&mut pending.delta.relations, relation.id);
-        record_relation_edge_delta(pending, ent, &relation);
-    }
 }
 
 fn graph_node_is_admitted(
@@ -5951,23 +5871,6 @@ fn tree_delta_invalidates_path_facets(delta: &TreeDelta) -> bool {
         ) => old != new,
         (Some(old), Some(new)) => old.entry != new.entry,
         (None, _) => false,
-    }
-}
-
-fn tree_delta_changes_content(delta: &TreeDelta) -> bool {
-    match (delta.old_state(), delta.new_state()) {
-        (
-            Some(LocatedEntry {
-                entry: TreeEntry::Blob { hash: old, .. },
-                ..
-            }),
-            Some(LocatedEntry {
-                entry: TreeEntry::Blob { hash: new, .. },
-                ..
-            }),
-        ) => old != new,
-        (Some(old), Some(new)) => old.entry != new.entry,
-        _ => false,
     }
 }
 
@@ -6958,6 +6861,14 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn apply_transaction_delta(&self, delta: &TransactionDelta) -> Result<(), KinDbError> {
+        kin_model::validate_transaction_delta(delta)?;
+        if delta.admission_policy_delta.is_some() {
+            return Err(KinDbError::StorageError(
+                "admission policy is repository authority; commit it through \
+                 commit_repository_transaction instead of mutating an InMemoryGraph"
+                    .to_string(),
+            ));
+        }
         let mut affected = HashSet::new();
         let mut deleted_entities = HashSet::new();
         let mut merkle_seeds = HashSet::new();
@@ -6975,61 +6886,23 @@ impl EntityStore for InMemoryGraph {
                 .apply(&delta.tree_deltas)
                 .map_err(tree_state_error)?;
 
-            let invalidating_file_ids: HashSet<FilePathId> = delta
-                .tree_deltas
-                .iter()
-                .filter(|tree_delta| tree_delta_invalidates_path_facets(tree_delta))
-                .filter_map(TreeDelta::old_state)
-                .filter_map(|old_state| file_path_for_repo_path(&old_state.path))
-                .collect();
-            let implicitly_retired_entity_ids: HashSet<EntityId> = ent
-                .entities
-                .values()
-                .filter(|entity| {
-                    entity
-                        .file_origin
-                        .as_ref()
-                        .is_some_and(|file_id| invalidating_file_ids.contains(file_id))
-                })
-                .map(|entity| entity.id)
-                .collect();
-            let removed_artifact_ids: HashSet<ArtifactId> = delta
-                .tree_deltas
-                .iter()
-                .filter(|tree_delta| {
-                    tree_delta.old_state().is_some() && tree_delta.new_state().is_none()
-                })
-                .map(TreeDelta::artifact_id)
-                .collect();
-            let content_changed_artifact_ids: HashSet<ArtifactId> = delta
-                .tree_deltas
-                .iter()
-                .filter(|tree_delta| tree_delta_changes_content(tree_delta))
-                .map(TreeDelta::artifact_id)
-                .collect();
-
-            // Validate all new semantic identities against the exact staged
-            // tree and the post-transaction entity set before any authority is
-            // changed. This prevents a tree transition, entity placement, or
-            // mixed-domain relation from being partially admitted.
-            let mut prospective_entity_ids: HashSet<EntityId> =
-                ent.entities.keys().copied().collect();
-            for entity_id in &implicitly_retired_entity_ids {
-                prospective_entity_ids.remove(entity_id);
-            }
+            // Validate every explicit old/new entity transition against one
+            // pre-transaction state before changing authority. A tree change
+            // never infers entity or relation deletion: those transitions must
+            // be present in the self-inverting semantic delta.
+            let mut prospective_entities = ent.entities.clone();
+            let mut entities_requiring_tree_validation = HashSet::new();
             for entity_delta in &delta.entity_deltas {
                 match entity_delta {
-                    EntityDelta::Added(entity) => {
-                        if let Some(file_id) = entity.file_origin.as_ref() {
-                            let path = repo_path_for_file_path(file_id)?;
-                            if staged_tree.artifact_id_at_path(&path).is_none() {
-                                return Err(KinDbError::StorageError(format!(
-                                    "transaction entity {} references repository path {} absent from the staged tree",
-                                    entity.id, file_id.0
-                                )));
-                            }
+                    EntityDelta::Added { new: entity } => {
+                        if prospective_entities.contains_key(&entity.id) {
+                            return Err(KinDbError::StorageError(format!(
+                                "transaction adds existing entity {}",
+                                entity.id
+                            )));
                         }
-                        prospective_entity_ids.insert(entity.id);
+                        prospective_entities.insert(entity.id, entity.clone());
+                        entities_requiring_tree_validation.insert(entity.id);
                     }
                     EntityDelta::Modified { old, new } => {
                         if old.id != new.id {
@@ -7038,33 +6911,104 @@ impl EntityStore for InMemoryGraph {
                                 old.id, new.id
                             )));
                         }
-                        if let Some(file_id) = new.file_origin.as_ref() {
-                            let path = repo_path_for_file_path(file_id)?;
-                            if staged_tree.artifact_id_at_path(&path).is_none() {
-                                return Err(KinDbError::StorageError(format!(
-                                    "transaction entity {} references repository path {} absent from the staged tree",
-                                    new.id, file_id.0
-                                )));
-                            }
+                        if prospective_entities.get(&old.id) != Some(old) {
+                            return Err(KinDbError::StorageError(format!(
+                                "transaction has stale old payload for entity {}",
+                                old.id
+                            )));
                         }
-                        prospective_entity_ids.insert(new.id);
+                        prospective_entities.insert(new.id, new.clone());
+                        entities_requiring_tree_validation.insert(new.id);
                     }
-                    EntityDelta::Removed(entity_id) => {
-                        prospective_entity_ids.remove(entity_id);
+                    EntityDelta::Removed { old } => {
+                        if prospective_entities.get(&old.id) != Some(old) {
+                            return Err(KinDbError::StorageError(format!(
+                                "transaction has stale old payload for removed entity {}",
+                                old.id
+                            )));
+                        }
+                        prospective_entities.remove(&old.id);
                     }
                 }
             }
+            let invalidated_paths: HashSet<_> = delta
+                .tree_deltas
+                .iter()
+                .filter_map(TreeDelta::old_state)
+                .filter_map(|old| file_path_for_repo_path(&old.path))
+                .collect();
+            entities_requiring_tree_validation.extend(prospective_entities.values().filter_map(
+                |entity| {
+                    entity
+                        .file_origin
+                        .as_ref()
+                        .is_some_and(|path| invalidated_paths.contains(path))
+                        .then_some(entity.id)
+                },
+            ));
+            for entity_id in entities_requiring_tree_validation {
+                let Some(entity) = prospective_entities.get(&entity_id) else {
+                    continue;
+                };
+                let Some(file_id) = entity.file_origin.as_ref() else {
+                    continue;
+                };
+                let path = repo_path_for_file_path(file_id)?;
+                if staged_tree.artifact_id_at_path(&path).is_none() {
+                    return Err(KinDbError::StorageError(format!(
+                        "transaction leaves entity {} on repository path {} absent from the staged tree; carry its exact entity removal or relocation in the same delta",
+                        entity.id, file_id.0
+                    )));
+                }
+            }
+            let prospective_entity_ids: HashSet<EntityId> =
+                prospective_entities.keys().copied().collect();
 
             let staged_artifact_ids: HashSet<ArtifactId> = staged_tree
                 .artifacts()
                 .map(|artifact| artifact.artifact_id)
                 .collect();
+            let mut prospective_relations = ent.relations.clone();
+            for relation_delta in &delta.relation_deltas {
+                match relation_delta {
+                    RelationDelta::Added { new } => {
+                        if prospective_relations.contains_key(&new.id) {
+                            return Err(KinDbError::StorageError(format!(
+                                "transaction adds existing relation {}",
+                                new.id
+                            )));
+                        }
+                        prospective_relations.insert(new.id, new.clone());
+                    }
+                    RelationDelta::Modified { old, new } => {
+                        if old.id != new.id {
+                            return Err(KinDbError::StorageError(format!(
+                                "transaction relation modification changes identity from {} to {}",
+                                old.id, new.id
+                            )));
+                        }
+                        if prospective_relations.get(&old.id) != Some(old) {
+                            return Err(KinDbError::StorageError(format!(
+                                "transaction has stale old payload for relation {}",
+                                old.id
+                            )));
+                        }
+                        prospective_relations.insert(new.id, new.clone());
+                    }
+                    RelationDelta::Removed { old } => {
+                        if prospective_relations.get(&old.id) != Some(old) {
+                            return Err(KinDbError::StorageError(format!(
+                                "transaction has stale old payload for removed relation {}",
+                                old.id
+                            )));
+                        }
+                        prospective_relations.remove(&old.id);
+                    }
+                }
+            }
             let work = self.work.read();
             let verification = self.verification.read();
-            for relation_delta in &delta.relation_deltas {
-                let RelationDelta::Added(relation) = relation_delta else {
-                    continue;
-                };
+            for relation in prospective_relations.values() {
                 for (side, node) in [("source", relation.src), ("destination", relation.dst)] {
                     if !graph_node_is_admitted(
                         node,
@@ -7088,37 +7032,6 @@ impl EntityStore for InMemoryGraph {
             // here would let a persistence detach split tree, facet, entity,
             // and relation effects across different durable deltas.
             let mut pending = self.pending_delta.lock();
-
-            // An invalidating exact-tree transition retires all semantic
-            // authority derived from the old bytes: entities placed at that
-            // path, their revisions, and every incident relation. A caller may
-            // re-admit replacements through explicit entity/relation deltas in
-            // this same transaction after the retirement.
-            let mut implicitly_retired_entity_ids: Vec<EntityId> =
-                implicitly_retired_entity_ids.into_iter().collect();
-            implicitly_retired_entity_ids.sort_unstable();
-            for entity_id in implicitly_retired_entity_ids {
-                retire_entity_authority(
-                    &mut ent,
-                    &mut pending,
-                    entity_id,
-                    &mut affected,
-                    &mut merkle_seeds,
-                );
-                deleted_entities.insert(entity_id);
-            }
-            // Artifact identity outlives a move and a same-ID content update.
-            // Removal retires every incident edge; content replacement retires
-            // only parser/inference/LSP evidence derived from the old bytes.
-            // Manual identity/workflow relations remain authoritative.
-            retire_relations_for_artifacts(
-                &mut ent,
-                &mut pending,
-                &removed_artifact_ids,
-                &content_changed_artifact_ids,
-                &mut affected,
-                &mut merkle_seeds,
-            );
 
             // 1. Retire path-keyed enrichment through the identity-bearing old
             // tree state before publishing the new tree. A later path lookup
@@ -7191,8 +7104,20 @@ impl EntityStore for InMemoryGraph {
             // 3. Process entity deltas.
             for ent_delta in &delta.entity_deltas {
                 match ent_delta {
-                    EntityDelta::Added(entity) | EntityDelta::Modified { new: entity, .. } => {
-                        if let Some(old) = ent.entities.remove(&entity.id) {
+                    EntityDelta::Added { new: entity } => {
+                        ent.indexes.insert(
+                            entity.id,
+                            &entity.name,
+                            entity.file_origin.as_ref(),
+                            entity.kind,
+                        );
+                        ent.entities.insert(entity.id, entity.clone());
+                        delta_map_upsert(&mut pending.delta.entities, entity.id, entity.clone());
+                        affected.insert(entity.id);
+                        merkle_seeds.insert(entity.id);
+                    }
+                    EntityDelta::Modified { old, new: entity } => {
+                        if ent.entities.remove(&entity.id).is_some() {
                             let name_changed = old.name != entity.name;
                             let file_changed = old.file_origin != entity.file_origin;
                             let kind_changed = old.kind != entity.kind;
@@ -7211,13 +7136,6 @@ impl EntityStore for InMemoryGraph {
                                     entity.kind,
                                 );
                             }
-                        } else {
-                            ent.indexes.insert(
-                                entity.id,
-                                &entity.name,
-                                entity.file_origin.as_ref(),
-                                entity.kind,
-                            );
                         }
 
                         ent.entities.insert(entity.id, entity.clone());
@@ -7225,15 +7143,14 @@ impl EntityStore for InMemoryGraph {
                         affected.insert(entity.id);
                         merkle_seeds.insert(entity.id);
                     }
-                    EntityDelta::Removed(id) => {
-                        retire_entity_authority(
-                            &mut ent,
-                            &mut pending,
-                            *id,
-                            &mut affected,
-                            &mut merkle_seeds,
-                        );
-                        deleted_entities.insert(*id);
+                    EntityDelta::Removed { old } => {
+                        ent.entities.remove(&old.id);
+                        ent.indexes
+                            .remove(&old.id, &old.name, old.file_origin.as_ref(), old.kind);
+                        delta_map_remove(&mut pending.delta.entities, old.id);
+                        affected.insert(old.id);
+                        merkle_seeds.insert(old.id);
+                        deleted_entities.insert(old.id);
                     }
                 }
             }
@@ -7241,14 +7158,7 @@ impl EntityStore for InMemoryGraph {
             // 4. Process relation deltas.
             for rel_delta in &delta.relation_deltas {
                 match rel_delta {
-                    RelationDelta::Added(relation) => {
-                        if let Some(old) = ent.relations.remove(&relation.id) {
-                            affected.extend(entity_ids_for_relation(&old));
-                            merkle_seeds.extend(entity_ids_for_relation(&old));
-                            remove_relation_indexes(&mut ent, &old);
-                            delta_map_remove(&mut pending.delta.relations, old.id);
-                            record_relation_edge_delta(&mut pending, &ent, &old);
-                        }
+                    RelationDelta::Added { new: relation } => {
                         insert_relation_indexes(&mut ent, relation);
                         ent.relations.insert(relation.id, relation.clone());
                         delta_map_upsert(
@@ -7260,14 +7170,26 @@ impl EntityStore for InMemoryGraph {
                         affected.extend(entity_ids_for_relation(relation));
                         merkle_seeds.extend(entity_ids_for_relation(relation));
                     }
-                    RelationDelta::Removed(id) => {
-                        if let Some(rel) = ent.relations.remove(id) {
-                            affected.extend(entity_ids_for_relation(&rel));
-                            merkle_seeds.extend(entity_ids_for_relation(&rel));
-                            remove_relation_indexes(&mut ent, &rel);
-                            delta_map_remove(&mut pending.delta.relations, rel.id);
-                            record_relation_edge_delta(&mut pending, &ent, &rel);
-                        }
+                    RelationDelta::Modified { old, new } => {
+                        ent.relations.remove(&old.id);
+                        affected.extend(entity_ids_for_relation(old));
+                        merkle_seeds.extend(entity_ids_for_relation(old));
+                        remove_relation_indexes(&mut ent, old);
+                        insert_relation_indexes(&mut ent, new);
+                        ent.relations.insert(new.id, new.clone());
+                        delta_map_upsert(&mut pending.delta.relations, new.id, new.clone());
+                        record_relation_edge_delta(&mut pending, &ent, old);
+                        record_relation_edge_delta(&mut pending, &ent, new);
+                        affected.extend(entity_ids_for_relation(new));
+                        merkle_seeds.extend(entity_ids_for_relation(new));
+                    }
+                    RelationDelta::Removed { old } => {
+                        ent.relations.remove(&old.id);
+                        affected.extend(entity_ids_for_relation(old));
+                        merkle_seeds.extend(entity_ids_for_relation(old));
+                        remove_relation_indexes(&mut ent, old);
+                        delta_map_remove(&mut pending.delta.relations, old.id);
+                        record_relation_edge_delta(&mut pending, &ent, old);
                     }
                 }
             }
@@ -7597,9 +7519,9 @@ impl ChangeStore for InMemoryGraph {
             .values()
             .filter(|change| {
                 change.entity_deltas.iter().any(|delta| match delta {
-                    EntityDelta::Added(e) => e.id == *id,
+                    EntityDelta::Added { new } => new.id == *id,
                     EntityDelta::Modified { old, new } => old.id == *id || new.id == *id,
-                    EntityDelta::Removed(eid) => eid == id,
+                    EntityDelta::Removed { old } => old.id == *id,
                 })
             })
             .cloned()
@@ -7661,8 +7583,8 @@ impl ChangeStore for InMemoryGraph {
     }
 
     fn create_change(&self, change: &SemanticChange) -> Result<(), KinDbError> {
-        validate_semantic_change(change)?;
         let payload = semantic_change_payload(change)?;
+        validate_semantic_change(change)?;
         let mut ent = self.entities.write();
         let mut chg = self.changes.write();
         if let Some(existing) = chg.changes.get(&change.id) {
@@ -7683,8 +7605,10 @@ impl ChangeStore for InMemoryGraph {
             .entity_deltas
             .iter()
             .map(|delta| match delta {
-                EntityDelta::Added(entity) | EntityDelta::Modified { new: entity, .. } => entity.id,
-                EntityDelta::Removed(id) => *id,
+                EntityDelta::Added { new: entity } | EntityDelta::Modified { new: entity, .. } => {
+                    entity.id
+                }
+                EntityDelta::Removed { old } => old.id,
             })
             .filter_map(|entity_id| {
                 ent.entity_revisions
@@ -7747,53 +7671,6 @@ impl ChangeStore for InMemoryGraph {
         // Reverse so oldest-first
         result.reverse();
         Ok(result)
-    }
-
-    // -----------------------------------------------------------------------
-    // Branch operations — changes lock only
-    // -----------------------------------------------------------------------
-
-    fn get_branch(&self, name: &BranchName) -> Result<Option<Branch>, KinDbError> {
-        Ok(self.changes.read().branches.get(name).cloned())
-    }
-
-    fn create_branch(&self, branch: &Branch) -> Result<(), KinDbError> {
-        let mut chg = self.changes.write();
-        if chg.branches.contains_key(&branch.name) {
-            return Err(KinDbError::DuplicateEntity(format!(
-                "branch '{}' already exists",
-                branch.name
-            )));
-        }
-        chg.branches.insert(branch.name.clone(), branch.clone());
-        self.record_branch_delta_upsert(branch.clone());
-        Ok(())
-    }
-
-    fn update_branch_head(
-        &self,
-        name: &BranchName,
-        new_head: &SemanticChangeId,
-    ) -> Result<(), KinDbError> {
-        let mut chg = self.changes.write();
-        match chg.branches.get_mut(name) {
-            Some(branch) => {
-                branch.head = *new_head;
-                self.record_branch_delta_upsert(branch.clone());
-                Ok(())
-            }
-            None => Err(KinDbError::NotFound(format!("branch '{}'", name))),
-        }
-    }
-
-    fn delete_branch(&self, name: &BranchName) -> Result<(), KinDbError> {
-        self.changes.write().branches.remove(name);
-        self.record_branch_delta_remove(name.clone());
-        Ok(())
-    }
-
-    fn list_branches(&self) -> Result<Vec<Branch>, KinDbError> {
-        Ok(self.changes.read().branches.values().cloned().collect())
     }
 }
 
@@ -7896,8 +7773,8 @@ impl InMemoryGraph {
         // cannot expose a partial batch or append a pending persistence delta.
         let mut validated = Vec::with_capacity(changes.len());
         for change in changes {
-            validate_semantic_change(&change)?;
             let payload = semantic_change_payload(&change)?;
+            validate_semantic_change(&change)?;
             validated.push((change, payload));
         }
 
@@ -7946,8 +7823,10 @@ impl InMemoryGraph {
         for change in unique_changes {
             superseded_revisions.extend(append_entity_revisions(&mut ent, &change));
             for entity_id in change.entity_deltas.iter().map(|delta| match delta {
-                EntityDelta::Added(entity) | EntityDelta::Modified { new: entity, .. } => entity.id,
-                EntityDelta::Removed(id) => *id,
+                EntityDelta::Added { new: entity } | EntityDelta::Modified { new: entity, .. } => {
+                    entity.id
+                }
+                EntityDelta::Removed { old } => old.id,
             }) {
                 // Sequential create_change records the first delta slot only
                 // once a revision chain exists. A removal before an add has no
@@ -9641,6 +9520,7 @@ mod tests {
                     artifact_id,
                     new: test_located(&file_id.0, regular),
                 }],
+                admission_policy_delta: None,
             })
             .unwrap();
         assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(regular));
@@ -9654,6 +9534,7 @@ mod tests {
                     old: test_located(&file_id.0, regular),
                     new: test_located(&file_id.0, executable),
                 }],
+                admission_policy_delta: None,
             })
             .unwrap();
         assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(executable));
@@ -9667,6 +9548,7 @@ mod tests {
                     old: test_located(&file_id.0, executable),
                     new: test_located(&file_id.0, symlink),
                 }],
+                admission_policy_delta: None,
             })
             .unwrap();
         assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(symlink));
@@ -9700,6 +9582,7 @@ mod tests {
                     old: test_located(&file_id.0, regular),
                     new: test_located(&file_id.0, executable),
                 }],
+                admission_policy_delta: None,
             })
             .unwrap();
 
@@ -9723,7 +9606,7 @@ mod tests {
     }
 
     #[test]
-    fn content_change_retires_entities_revisions_and_incident_relations() {
+    fn explicit_content_change_removals_preserve_semantic_revision_history() {
         let graph = InMemoryGraph::new();
         let changed_file = FilePathId::new("src/changed.rs");
         let neighbor_file = FilePathId::new("src/neighbor.rs");
@@ -9749,14 +9632,17 @@ mod tests {
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("tester"),
                 message: "record retired revision".into(),
-                entity_deltas: vec![EntityDelta::Added(retired.clone())],
+                entity_deltas: vec![EntityDelta::Added {
+                    new: retired.clone(),
+                }],
                 relation_deltas: Vec::new(),
                 tree_deltas: Vec::new(),
                 projected_files: vec![changed_file.clone()],
                 spec_link: None,
                 evidence: Vec::new(),
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
         assert!(graph
@@ -9767,13 +9653,18 @@ mod tests {
 
         graph
             .apply_transaction_delta(&TransactionDelta {
-                entity_deltas: Vec::new(),
-                relation_deltas: Vec::new(),
+                entity_deltas: vec![EntityDelta::Removed {
+                    old: retired.clone(),
+                }],
+                relation_deltas: vec![RelationDelta::Removed {
+                    old: relation.clone(),
+                }],
                 tree_deltas: vec![TreeDelta::Updated {
                     artifact_id,
                     old: test_located(&changed_file.0, old_entry),
                     new: test_located(&changed_file.0, new_entry),
                 }],
+                admission_policy_delta: None,
             })
             .unwrap();
 
@@ -9781,7 +9672,10 @@ mod tests {
         assert!(graph.get_entity(&neighbor.id).unwrap().is_some());
         assert_eq!(graph.relation_count(), 0);
         let snapshot = graph.to_snapshot();
-        assert!(!snapshot.entity_revisions.contains_key(&retired.id));
+        assert!(
+            snapshot.entity_revisions.contains_key(&retired.id),
+            "removing live state must not erase immutable semantic revision history"
+        );
         assert!(!snapshot.relations.contains_key(&relation.id));
         assert_eq!(
             graph.artifact_id_at_path(&test_repo_path(&changed_file.0)),
@@ -9793,7 +9687,7 @@ mod tests {
             .pending_delta_snapshot(0)
             .expect("retirement and tree replacement must share one delta");
         assert!(pending.entities.removed.contains(&retired.id));
-        assert!(pending.entity_revisions.removed.contains(&retired.id));
+        assert!(!pending.entity_revisions.removed.contains(&retired.id));
         assert!(pending.relations.removed.contains(&relation.id));
         assert_eq!(pending.resolved_tree.modified.len(), 1);
     }
@@ -9841,12 +9735,15 @@ mod tests {
         graph
             .apply_transaction_delta(&TransactionDelta {
                 entity_deltas: Vec::new(),
-                relation_deltas: Vec::new(),
+                relation_deltas: vec![RelationDelta::Removed {
+                    old: derived_relation.clone(),
+                }],
                 tree_deltas: vec![TreeDelta::Updated {
                     artifact_id,
                     old: test_located(&file_id.0, old_entry),
                     new: test_located(&file_id.0, new_entry),
                 }],
+                admission_policy_delta: None,
             })
             .unwrap();
 
@@ -9905,6 +9802,7 @@ mod tests {
                     old: test_located(old_path, entry),
                     new: test_located(new_path, entry),
                 }],
+                admission_policy_delta: None,
             })
             .unwrap();
 
@@ -9958,11 +9856,16 @@ mod tests {
         graph
             .apply_transaction_delta(&TransactionDelta {
                 entity_deltas: Vec::new(),
-                relation_deltas: Vec::new(),
+                relation_deltas: relations
+                    .iter()
+                    .cloned()
+                    .map(|old| RelationDelta::Removed { old })
+                    .collect(),
                 tree_deltas: vec![TreeDelta::Removed {
                     artifact_id,
                     old: test_located(artifact_path, entry),
                 }],
+                admission_policy_delta: None,
             })
             .unwrap();
 
@@ -9982,15 +9885,53 @@ mod tests {
 
         let error = graph
             .apply_transaction_delta(&TransactionDelta {
-                entity_deltas: vec![EntityDelta::Added(entity.clone())],
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity.clone(),
+                }],
                 relation_deltas: Vec::new(),
                 tree_deltas: Vec::new(),
+                admission_policy_delta: None,
             })
             .unwrap_err();
 
         assert!(error.to_string().contains("absent from the staged tree"));
         assert!(graph.get_entity(&entity.id).unwrap().is_none());
         assert!(graph.resolved_tree().is_empty());
+        assert!(!graph.has_pending_delta());
+    }
+
+    #[test]
+    fn tree_removal_requires_exact_entity_retirement_in_the_same_delta() {
+        let graph = InMemoryGraph::new();
+        let path = "src/owned.rs";
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x14; 32]), false);
+        let artifact_id = graph.admit_artifact_for_test(path, entry);
+        let entity = test_entity("owned", path);
+        graph.upsert_entity(&entity).unwrap();
+        graph.clear_pending_delta();
+
+        let error = graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Removed {
+                    artifact_id,
+                    old: test_located(path, entry),
+                }],
+                admission_policy_delta: None,
+            })
+            .expect_err("a tree transition cannot silently orphan semantic authority");
+
+        assert!(error
+            .to_string()
+            .contains("carry its exact entity removal or relocation"));
+        assert_eq!(
+            graph
+                .artifact_id_at_path(&test_repo_path(path))
+                .expect("tree authority must remain"),
+            artifact_id
+        );
+        assert_eq!(graph.get_entity(&entity.id).unwrap(), Some(entity));
         assert!(!graph.has_pending_delta());
     }
 
@@ -10004,12 +9945,15 @@ mod tests {
 
         let error = graph
             .apply_transaction_delta(&TransactionDelta {
-                entity_deltas: vec![EntityDelta::Added(entity.clone())],
-                relation_deltas: vec![RelationDelta::Added(relation)],
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity.clone(),
+                }],
+                relation_deltas: vec![RelationDelta::Added { new: relation }],
                 tree_deltas: vec![TreeDelta::Added {
                     artifact_id,
                     new: test_located("src/new.rs", entry),
                 }],
+                admission_policy_delta: None,
             })
             .unwrap_err();
 
@@ -10040,13 +9984,16 @@ mod tests {
 
         graph
             .apply_transaction_delta(&TransactionDelta {
-                entity_deltas: Vec::new(),
+                entity_deltas: vec![EntityDelta::Removed {
+                    old: entity.clone(),
+                }],
                 relation_deltas: Vec::new(),
                 tree_deltas: vec![TreeDelta::Updated {
                     artifact_id,
                     old: test_located(&file_id.0, old_entry),
                     new: test_located(&file_id.0, new_entry),
                 }],
+                admission_policy_delta: None,
             })
             .expect("derived cache failure cannot reverse committed authority");
 
@@ -10144,6 +10091,7 @@ mod tests {
                     old: test_located(&old_file_id.0, old_entry),
                     new: test_located(&new_file_id.0, new_entry),
                 }],
+                admission_policy_delta: None,
             })
             .unwrap();
 
@@ -10212,6 +10160,7 @@ mod tests {
                     artifact_id,
                     old: test_located(&file_id.0, entry),
                 }],
+                admission_policy_delta: None,
             })
             .unwrap();
 
@@ -10239,13 +10188,16 @@ mod tests {
 
         let error = graph
             .apply_transaction_delta(&TransactionDelta {
-                entity_deltas: vec![EntityDelta::Added(entity.clone())],
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity.clone(),
+                }],
                 relation_deltas: Vec::new(),
                 tree_deltas: vec![TreeDelta::Updated {
                     artifact_id,
                     old: test_located(&file_id.0, stale),
                     new: test_located(&file_id.0, replacement),
                 }],
+                admission_policy_delta: None,
             })
             .unwrap_err();
 
@@ -10310,6 +10262,7 @@ mod tests {
                     old: test_located(&file_id.0, stale),
                     new: test_located(&file_id.0, replacement),
                 }],
+                admission_policy_delta: None,
             })
             .unwrap_err();
 
@@ -11287,36 +11240,6 @@ mod tests {
     }
 
     #[test]
-    fn branch_operations() {
-        let graph = InMemoryGraph::new();
-        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([1; 32]));
-        let branch = Branch {
-            name: BranchName::new("main"),
-            head: change_id,
-        };
-
-        graph.create_branch(&branch).unwrap();
-        let fetched = graph.get_branch(&BranchName::new("main")).unwrap().unwrap();
-        assert_eq!(fetched.name.0, "main");
-
-        let new_head = SemanticChangeId::from_hash(Hash256::from_bytes([2; 32]));
-        graph
-            .update_branch_head(&BranchName::new("main"), &new_head)
-            .unwrap();
-        let updated = graph.get_branch(&BranchName::new("main")).unwrap().unwrap();
-        assert_eq!(updated.head, new_head);
-
-        let branches = graph.list_branches().unwrap();
-        assert_eq!(branches.len(), 1);
-
-        graph.delete_branch(&BranchName::new("main")).unwrap();
-        assert!(graph
-            .get_branch(&BranchName::new("main"))
-            .unwrap()
-            .is_none());
-    }
-
-    #[test]
     fn change_dag_operations() {
         let graph = InMemoryGraph::new();
 
@@ -11333,7 +11256,8 @@ mod tests {
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         });
         let genesis_id = genesis.id;
         graph.create_change(&genesis).unwrap();
@@ -11351,7 +11275,8 @@ mod tests {
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         });
         let child_id = child.id;
         graph.create_change(&child).unwrap();
@@ -11381,7 +11306,8 @@ mod tests {
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         });
 
         graph.create_change(&change).unwrap();
@@ -11422,19 +11348,20 @@ mod tests {
             timestamp: Timestamp::now(),
             author: AuthorId::new("agent"),
             message: "exact float payload".to_string(),
-            entity_deltas: vec![EntityDelta::Added(entity)],
+            entity_deltas: vec![EntityDelta::Added { new: entity }],
             relation_deltas: vec![],
             tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         });
         graph.create_change(&change).unwrap();
 
         let mut conflicting = change.clone();
-        let EntityDelta::Added(entity) = &mut conflicting.entity_deltas[0] else {
+        let EntityDelta::Added { new: entity } = &mut conflicting.entity_deltas[0] else {
             unreachable!("fixture contains one added entity")
         };
         entity.fingerprint.stability_score = -0.0;
@@ -11444,7 +11371,7 @@ mod tests {
         assert!(matches!(error, KinDbError::Model(_)));
 
         let stored = graph.get_change(&change.id).unwrap().unwrap();
-        let EntityDelta::Added(entity) = &stored.entity_deltas[0] else {
+        let EntityDelta::Added { new: entity } = &stored.entity_deltas[0] else {
             unreachable!("stored fixture contains one added entity")
         };
         assert_eq!(
@@ -11464,14 +11391,15 @@ mod tests {
             timestamp: Timestamp::now(),
             author: AuthorId::new("agent"),
             message: "invalid float payload".to_string(),
-            entity_deltas: vec![EntityDelta::Added(entity)],
+            entity_deltas: vec![EntityDelta::Added { new: entity }],
             relation_deltas: vec![],
             tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         };
 
         let error = graph
@@ -11491,17 +11419,17 @@ mod tests {
             timestamp: Timestamp::now(),
             author: AuthorId::new("agent"),
             message: "spoofed".to_string(),
-            entity_deltas: vec![EntityDelta::Added(test_entity(
-                "must_not_land",
-                "src/lib.rs",
-            ))],
+            entity_deltas: vec![EntityDelta::Added {
+                new: test_entity("must_not_land", "src/lib.rs"),
+            }],
             relation_deltas: vec![],
             tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         };
 
         let error = graph
@@ -11526,7 +11454,8 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         };
         let mut snapshot = GraphSnapshot::empty();
         snapshot.changes.insert(spoofed.id, spoofed);
@@ -11552,7 +11481,8 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         };
         graph.changes.write().changes.insert(spoofed.id, spoofed);
 
@@ -11581,7 +11511,8 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         });
         graph.create_change(&parent).unwrap();
         graph.clear_pending_delta();
@@ -11593,14 +11524,17 @@ mod tests {
             timestamp: Timestamp::now(),
             author: AuthorId::new("tester"),
             message: "child".into(),
-            entity_deltas: vec![EntityDelta::Added(entity.clone())],
+            entity_deltas: vec![EntityDelta::Added {
+                new: entity.clone(),
+            }],
             relation_deltas: Vec::new(),
             tree_deltas: Vec::new(),
             projected_files: vec![entity.file_origin.clone().unwrap()],
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         });
 
         let (at_revision_tx, at_revision_rx) = mpsc::channel();
@@ -11684,7 +11618,8 @@ mod tests {
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         };
 
         for _ in 0..2 {
@@ -11706,14 +11641,15 @@ mod tests {
             timestamp: Timestamp::now(),
             author: AuthorId::new("agent"),
             message: "first".to_string(),
-            entity_deltas: vec![EntityDelta::Added(entity)],
+            entity_deltas: vec![EntityDelta::Added { new: entity }],
             relation_deltas: vec![],
             tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         });
         let mut spoofed = seal_change(SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32])),
@@ -11728,20 +11664,10 @@ mod tests {
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         });
         spoofed.id = SemanticChangeId::from_hash(Hash256::from_bytes([0xff; 32]));
-        let branch = Branch {
-            name: BranchName::new("sentinel"),
-            head: SemanticChangeId::from_hash(Hash256::from_bytes([0xaa; 32])),
-        };
-        graph.create_branch(&branch).unwrap();
-        let pending_before = graph.take_pending_delta(0);
-        assert!(
-            pending_before.is_some(),
-            "sentinel branch records one delta"
-        );
-
         let error = graph
             .create_changes(vec![first, spoofed])
             .expect_err("a spoofed later item must reject the whole batch");
@@ -11751,13 +11677,6 @@ mod tests {
         assert!(snapshot.entity_revisions.is_empty());
         assert!(snapshot.change_children.is_empty());
         assert!(snapshot.resolved_tree.is_empty());
-        assert_eq!(
-            snapshot
-                .branches
-                .get(&branch.name)
-                .map(|stored| stored.head),
-            Some(branch.head)
-        );
         assert!(!graph.has_pending_delta());
     }
 
@@ -11772,17 +11691,18 @@ mod tests {
             timestamp: Timestamp::now(),
             author: AuthorId::new("agent"),
             message: "batch exact float payload".to_string(),
-            entity_deltas: vec![EntityDelta::Added(entity)],
+            entity_deltas: vec![EntityDelta::Added { new: entity }],
             relation_deltas: vec![],
             tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         });
         let mut conflicting = first.clone();
-        let EntityDelta::Added(entity) = &mut conflicting.entity_deltas[0] else {
+        let EntityDelta::Added { new: entity } = &mut conflicting.entity_deltas[0] else {
             unreachable!("fixture contains one added entity")
         };
         entity.fingerprint.stability_score = -0.0;
@@ -11806,14 +11726,17 @@ mod tests {
             timestamp: Timestamp::now(),
             author: AuthorId::new("agent"),
             message: "valid first entry".to_string(),
-            entity_deltas: vec![EntityDelta::Added(test_entity("valid", "src/valid.rs"))],
+            entity_deltas: vec![EntityDelta::Added {
+                new: test_entity("valid", "src/valid.rs"),
+            }],
             relation_deltas: vec![],
             tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         });
         let source = test_entity("source", "src/source.rs");
         let target = test_entity("target", "src/target.rs");
@@ -11826,19 +11749,20 @@ mod tests {
             author: AuthorId::new("agent"),
             message: "invalid later entry".to_string(),
             entity_deltas: vec![],
-            relation_deltas: vec![RelationDelta::Added(relation)],
+            relation_deltas: vec![RelationDelta::Added { new: relation }],
             tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         };
 
         let error = graph
             .create_changes(vec![valid, invalid])
             .expect_err("a later non-finite payload must reject the batch before mutation");
-        assert!(error.to_string().contains("non-finite confidence score"));
+        assert!(error.to_string().contains("non-finite relation confidence"));
         let snapshot = graph.to_snapshot();
         assert!(snapshot.changes.is_empty());
         assert!(snapshot.entity_revisions.is_empty());
@@ -11862,14 +11786,17 @@ mod tests {
             timestamp: timestamp.clone(),
             author: AuthorId::new("test"),
             message: "genesis".to_string(),
-            entity_deltas: vec![EntityDelta::Added(original.clone())],
+            entity_deltas: vec![EntityDelta::Added {
+                new: original.clone(),
+            }],
             relation_deltas: vec![],
             tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         });
         let genesis_id = genesis.id;
         let first_child = seal_change(SemanticChange {
@@ -11888,7 +11815,8 @@ mod tests {
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         });
         let first_child_id = first_child.id;
         let second_child = seal_change(SemanticChange {
@@ -11904,7 +11832,8 @@ mod tests {
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         });
         let second_child_id = second_child.id;
         let changes = vec![genesis, first_child, second_child];
@@ -12049,24 +11978,29 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             })
         };
         let changes = vec![
             make_change(
                 0x41,
                 "remove before history is available",
-                vec![EntityDelta::Removed(removed_then_added.id)],
+                vec![EntityDelta::Removed {
+                    old: removed_then_added.clone(),
+                }],
             ),
             make_change(
                 0x42,
                 "add another entity first",
-                vec![EntityDelta::Added(other)],
+                vec![EntityDelta::Added { new: other }],
             ),
             make_change(
                 0x43,
                 "add the previously removed entity",
-                vec![EntityDelta::Added(removed_then_added)],
+                vec![EntityDelta::Added {
+                    new: removed_then_added,
+                }],
             ),
         ];
 
@@ -12193,7 +12127,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12206,14 +12141,17 @@ mod tests {
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "add foo".to_string(),
-                entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity_v1.clone(),
+                }],
                 relation_deltas: vec![],
                 tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12239,7 +12177,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12275,7 +12214,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12288,14 +12228,17 @@ mod tests {
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "add foo".to_string(),
-                entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity_v1.clone(),
+                }],
                 relation_deltas: vec![],
                 tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12321,7 +12264,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12358,7 +12302,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12371,14 +12316,17 @@ mod tests {
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "add foo".to_string(),
-                entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity_v1.clone(),
+                }],
                 relation_deltas: vec![],
                 tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12403,7 +12351,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12440,7 +12389,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12453,14 +12403,17 @@ mod tests {
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "add foo".to_string(),
-                entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity_v1.clone(),
+                }],
                 relation_deltas: vec![],
                 tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12485,7 +12438,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12526,7 +12480,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12543,16 +12498,21 @@ mod tests {
                 author: AuthorId::new("test"),
                 message: "add graph".to_string(),
                 entity_deltas: vec![
-                    EntityDelta::Added(caller.clone()),
-                    EntityDelta::Added(callee.clone()),
+                    EntityDelta::Added {
+                        new: caller.clone(),
+                    },
+                    EntityDelta::Added {
+                        new: callee.clone(),
+                    },
                 ],
-                relation_deltas: vec![RelationDelta::Added(rel.clone())],
+                relation_deltas: vec![RelationDelta::Added { new: rel.clone() }],
                 tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12565,13 +12525,14 @@ mod tests {
                 author: AuthorId::new("test"),
                 message: "remove relation".to_string(),
                 entity_deltas: vec![],
-                relation_deltas: vec![RelationDelta::Removed(rel.id)],
+                relation_deltas: vec![RelationDelta::Removed { old: rel.clone() }],
                 tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12603,7 +12564,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12620,16 +12582,21 @@ mod tests {
                 author: AuthorId::new("test"),
                 message: "add graph".to_string(),
                 entity_deltas: vec![
-                    EntityDelta::Added(caller.clone()),
-                    EntityDelta::Added(callee.clone()),
+                    EntityDelta::Added {
+                        new: caller.clone(),
+                    },
+                    EntityDelta::Added {
+                        new: callee.clone(),
+                    },
                 ],
-                relation_deltas: vec![RelationDelta::Added(rel.clone())],
+                relation_deltas: vec![RelationDelta::Added { new: rel.clone() }],
                 tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12641,14 +12608,17 @@ mod tests {
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "remove callee".to_string(),
-                entity_deltas: vec![EntityDelta::Removed(callee.id)],
-                relation_deltas: vec![],
+                entity_deltas: vec![EntityDelta::Removed {
+                    old: callee.clone(),
+                }],
+                relation_deltas: vec![RelationDelta::Removed { old: rel.clone() }],
                 tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12661,7 +12631,7 @@ mod tests {
         assert!(!removed_state.entities.contains_key(&callee.id));
         assert!(
             removed_state.relations.is_empty(),
-            "dangling relations should be pruned when an entity is removed"
+            "entity and relation removal are both explicit in exact history"
         );
     }
 
@@ -12684,7 +12654,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12709,7 +12680,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12739,7 +12711,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12752,14 +12725,17 @@ mod tests {
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "add foo".to_string(),
-                entity_deltas: vec![EntityDelta::Added(entity.clone())],
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity.clone(),
+                }],
                 relation_deltas: vec![],
                 tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12783,7 +12759,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12807,7 +12784,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12838,7 +12816,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12851,14 +12830,17 @@ mod tests {
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "add foo".to_string(),
-                entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity_v1.clone(),
+                }],
                 relation_deltas: vec![],
                 tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12884,7 +12866,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12896,14 +12879,17 @@ mod tests {
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "remove foo".to_string(),
-                entity_deltas: vec![EntityDelta::Removed(entity_v1.id)],
+                entity_deltas: vec![EntityDelta::Removed {
+                    old: entity_v2.clone(),
+                }],
                 relation_deltas: vec![],
                 tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12944,7 +12930,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12960,16 +12947,21 @@ mod tests {
                 author: AuthorId::new("test"),
                 message: "add relation".to_string(),
                 entity_deltas: vec![
-                    EntityDelta::Added(caller.clone()),
-                    EntityDelta::Added(callee.clone()),
+                    EntityDelta::Added {
+                        new: caller.clone(),
+                    },
+                    EntityDelta::Added {
+                        new: callee.clone(),
+                    },
                 ],
-                relation_deltas: vec![RelationDelta::Added(rel.clone())],
+                relation_deltas: vec![RelationDelta::Added { new: rel.clone() }],
                 tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -12982,13 +12974,14 @@ mod tests {
                 author: AuthorId::new("test"),
                 message: "remove relation".to_string(),
                 entity_deltas: vec![],
-                relation_deltas: vec![RelationDelta::Removed(rel.id)],
+                relation_deltas: vec![RelationDelta::Removed { old: rel.clone() }],
                 tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -13023,7 +13016,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -13048,7 +13042,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -13072,7 +13067,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -13094,7 +13090,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -13129,7 +13126,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -13154,7 +13152,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -13178,7 +13177,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -13214,7 +13214,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -13239,7 +13240,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -13263,7 +13265,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -13773,6 +13776,7 @@ mod tests {
                         old: test_located(&original_path.0, entry),
                         new: test_located(&renamed_path.0, entry),
                     }],
+                    admission_policy_delta: None,
                 })
                 .unwrap();
         }
@@ -14071,7 +14075,7 @@ mod tests {
             message: "init".to_string(),
             entity_deltas: entities
                 .iter()
-                .map(|e| EntityDelta::Added(e.clone()))
+                .map(|e| EntityDelta::Added { new: e.clone() })
                 .collect(),
             relation_deltas: vec![],
             tree_deltas: vec![],
@@ -14079,7 +14083,8 @@ mod tests {
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         });
         graph.create_change(&change).unwrap();
         graph.batch_upsert_entities(entities).unwrap();
@@ -14921,7 +14926,8 @@ mod tests {
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
             },
         );
 
@@ -14945,7 +14951,8 @@ mod tests {
                     spec_link: None,
                     evidence: vec![],
                     risk_summary: None,
-                    authored_on: None,
+                    origin: kin_model::ChangeOrigin::Native,
+                    admission_policy_delta: None,
                 },
             );
             previous = id;

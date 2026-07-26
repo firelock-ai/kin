@@ -43,6 +43,10 @@ pub use storage::{
     AuthorityCommitDecision, AuthorityPublication, AuthorityReadLease, DurableAuthorityPersistence,
     VersionedAuthorityState,
 };
+pub use storage::{
+    ChangeAdmissionPolicy, PersistedRepositoryAuthority, RepositoryAuthorityManager,
+    RepositoryAuthorityState,
+};
 pub use storage::{LoadStrategy, SystemMemInfo, TieredConfig, TieredGraph};
 pub use store::{
     ChangeStore, EntityStore, GraphStore, ProvenanceStore, SessionStore, VerificationStore,

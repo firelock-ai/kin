@@ -12,6 +12,7 @@ pub mod index;
 mod local_journal;
 pub mod merkle;
 mod mmap;
+pub mod repository;
 mod snapshot;
 #[cfg(feature = "sql")]
 pub mod sql;
@@ -39,6 +40,10 @@ pub use merkle::{
     remove_entity_hash, update_entity_hash, verify_entity, verify_subgraph, EntityVerification,
     MerkleHash, RepoTruthHash, TamperedNode, VerificationReport, REPO_TRUTH_HASH_VERSION,
     RETRIEVAL_AUTHORITY_HASH_VERSION, ZERO_HASH,
+};
+pub use repository::{
+    ChangeAdmissionPolicy, PersistedRepositoryAuthority, RepositoryAuthorityManager,
+    RepositoryAuthorityState,
 };
 pub use snapshot::SnapshotManager;
 #[cfg(feature = "vector")]

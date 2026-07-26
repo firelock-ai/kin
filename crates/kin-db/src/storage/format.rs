@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::storage::change_validation::validate_semantic_change_entries;
+use crate::storage::repository::PersistedRepositoryAuthority;
 use crate::types::*;
 
 /// Statistics from a snapshot compaction pass.
@@ -71,7 +72,6 @@ pub struct GraphSnapshot {
     pub incoming: HashMap<EntityId, Vec<RelationId>>,
     pub changes: HashMap<SemanticChangeId, SemanticChange>,
     pub change_children: HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
-    pub branches: HashMap<BranchName, Branch>,
     pub work_items: HashMap<WorkId, WorkItem>,
     pub annotations: HashMap<AnnotationId, Annotation>,
     pub work_links: Vec<WorkLink>,
@@ -100,6 +100,23 @@ pub struct GraphSnapshot {
     pub intents: HashMap<IntentId, Intent>,
     pub downstream_warnings: Vec<(IntentId, EntityId, String)>,
     pub entity_revisions: HashMap<EntityId, Vec<EntityRevision>>,
+    /// One immutable, repository-scoped authority envelope.
+    ///
+    /// Legacy graph mutation paths leave this absent. Once present, refs,
+    /// operation receipts, workspaces, aliases, admission state, and every
+    /// root move only through a full repository transaction and full-snapshot
+    /// CAS; incremental graph deltas are forbidden.
+    #[serde(deserialize_with = "deserialize_required_repository_authority")]
+    pub repository_authority: Option<PersistedRepositoryAuthority>,
+}
+
+fn deserialize_required_repository_authority<'de, D>(
+    deserializer: D,
+) -> Result<Option<PersistedRepositoryAuthority>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::deserialize(deserializer)
 }
 
 /// Lightweight snapshot view for locate-only cold starts.
@@ -129,7 +146,7 @@ pub(crate) struct LocateGraphSnapshot {
 
 impl GraphSnapshot {
     /// Current format version.
-    pub const CURRENT_VERSION: u32 = 10;
+    pub const CURRENT_VERSION: u32 = 11;
 
     /// The only on-disk format version this pre-release binary accepts.
     pub const MIN_SUPPORTED_VERSION: u32 = Self::CURRENT_VERSION;
@@ -154,7 +171,6 @@ impl GraphSnapshot {
             incoming: HashMap::new(),
             changes: HashMap::new(),
             change_children: HashMap::new(),
-            branches: HashMap::new(),
             work_items: HashMap::new(),
             annotations: HashMap::new(),
             work_links: Vec::new(),
@@ -181,6 +197,7 @@ impl GraphSnapshot {
             intents: HashMap::new(),
             downstream_warnings: Vec::new(),
             entity_revisions: HashMap::new(),
+            repository_authority: None,
         }
     }
 
@@ -376,9 +393,9 @@ impl GraphSnapshot {
 
     /// Deserialize a snapshot from bytes (with header validation).
     ///
-    /// The pre-release v10 format is the first format with one validated,
-    /// identity-bearing universal repository tree. Earlier split tree/index
-    /// snapshots fail closed and must be rebuilt.
+    /// The pre-release v11 format removes graph-local branch authority in
+    /// preparation for one repository transaction envelope. Earlier snapshots
+    /// fail closed and must be rebuilt.
     pub fn from_bytes(data: &[u8]) -> Result<Self, crate::error::KinDbError> {
         Self::from_bytes_with_persisted_root_hash(data).map(|(snapshot, _)| snapshot)
     }
@@ -462,9 +479,9 @@ impl GraphSnapshot {
 
         match version {
             Self::CURRENT_VERSION => {
-                let checksum_end = Self::require_checksum_slot(data, body_len, "v10")?;
+                let checksum_end = Self::require_checksum_slot(data, body_len, "v11")?;
                 let body_checksum = if verify_checksum {
-                    Some(Self::verify_checksum(data, body_len, "v10")?)
+                    Some(Self::verify_checksum(data, body_len, "v11")?)
                 } else {
                     None
                 };
@@ -499,7 +516,11 @@ impl GraphSnapshot {
 
     pub(crate) fn validate_storage_admission(&self) -> Result<(), crate::error::KinDbError> {
         validate_semantic_change_entries(self.changes.iter(), "snapshot")?;
-        self.validate_enrichment_admission()
+        self.validate_enrichment_admission()?;
+        if let Some(authority) = &self.repository_authority {
+            authority.validate_against_snapshot(self)?;
+        }
+        Ok(())
     }
 
     fn validate_enrichment_admission(&self) -> Result<(), crate::error::KinDbError> {
@@ -850,6 +871,13 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                     });
                 }
 
+                if seq.size_hint() != Some(34) {
+                    return Err(serde::de::Error::invalid_length(
+                        seq.size_hint().unwrap_or_default(),
+                        &self,
+                    ));
+                }
+
                 let version = seq
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
@@ -871,7 +899,7 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(5, &self))?;
 
-                for index in 6..25 {
+                for index in 6..24 {
                     let _: IgnoredAny = seq
                         .next_element()?
                         .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
@@ -879,27 +907,30 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
 
                 let shallow_files = seq
                     .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(25, &self))?;
+                    .ok_or_else(|| serde::de::Error::invalid_length(24, &self))?;
                 let file_layouts = seq
                     .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(26, &self))?;
+                    .ok_or_else(|| serde::de::Error::invalid_length(25, &self))?;
                 let structured_artifacts = seq
                     .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(27, &self))?;
+                    .ok_or_else(|| serde::de::Error::invalid_length(26, &self))?;
                 let opaque_artifacts = seq
                     .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(28, &self))?;
+                    .ok_or_else(|| serde::de::Error::invalid_length(27, &self))?;
 
                 let resolved_tree = seq
                     .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(29, &self))?;
+                    .ok_or_else(|| serde::de::Error::invalid_length(28, &self))?;
 
-                for index in 30..33 {
+                for index in 29..32 {
                     let _: IgnoredAny = seq
                         .next_element()?
                         .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
                 }
                 let entity_revisions = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(32, &self))?;
+                let _: IgnoredAny = seq
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(33, &self))?;
 
@@ -955,7 +986,6 @@ pub struct BorrowedGraphSnapshot<'a> {
     // ChangeData fields
     pub changes: &'a hashbrown::HashMap<SemanticChangeId, SemanticChange>,
     pub change_children: &'a hashbrown::HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
-    pub branches: &'a hashbrown::HashMap<BranchName, Branch>,
     // WorkData fields
     pub work_items: &'a hashbrown::HashMap<WorkId, WorkItem>,
     pub annotations: &'a hashbrown::HashMap<AnnotationId, Annotation>,
@@ -1006,9 +1036,7 @@ impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
         state.serialize_field("changes", self.changes)?;
         // 7. change_children
         state.serialize_field("change_children", self.change_children)?;
-        // 8. branches
-        state.serialize_field("branches", self.branches)?;
-        // 9. work_items
+        // 8. work_items
         state.serialize_field("work_items", self.work_items)?;
         // 10. annotations
         state.serialize_field("annotations", self.annotations)?;
@@ -1069,6 +1097,11 @@ impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
         state.serialize_field("downstream_warnings", self.downstream_warnings)?;
         // 34. entity_revisions
         state.serialize_field("entity_revisions", self.entity_revisions)?;
+        // 34. Mutable live graphs are not repository transaction authority.
+        state.serialize_field(
+            "repository_authority",
+            &Option::<PersistedRepositoryAuthority>::None,
+        )?;
         state.end()
     }
 }
@@ -1273,14 +1306,17 @@ mod tests {
             timestamp: Timestamp::now(),
             author: AuthorId::new("tester"),
             message: "cochange".into(),
-            entity_deltas: vec![EntityDelta::Added(caller.clone())],
+            entity_deltas: vec![EntityDelta::Added {
+                new: caller.clone(),
+            }],
             relation_deltas: Vec::new(),
             tree_deltas: Vec::new(),
             projected_files: vec![FilePathId::new("src/main.rs")],
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
-            authored_on: Some(BranchName::new("main")),
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         });
 
         let mut snapshot = GraphSnapshot::empty();
@@ -1295,9 +1331,7 @@ mod tests {
         snapshot.incoming.insert(callee.id, vec![relation.id]);
         snapshot.changes.insert(change.id, change.clone());
         snapshot.entity_revisions =
-            kin_model::graph::derive_entity_revisions_from_changes(vec![change.clone()])
-                .into_iter()
-                .collect();
+            kin_model::graph::derive_entity_revisions_from_changes(vec![change.clone()]).unwrap();
         let file_id = FilePathId::new("src/main.rs");
         let assigned_artifact_id = ArtifactId::new();
         snapshot.shallow_files.push(ShallowTrackedFile {
@@ -1655,7 +1689,7 @@ mod tests {
 
         snap.version = 1;
         let error = snap.to_bytes().unwrap_err();
-        assert!(error.to_string().contains("exactly v10"));
+        assert!(error.to_string().contains("exactly v11"));
     }
 
     #[test]
@@ -1789,7 +1823,8 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
-            authored_on: Some(BranchName::new("main")),
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         });
         snapshot.changes.insert(change.id, change.clone());
         snapshot

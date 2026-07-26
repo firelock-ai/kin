@@ -11,7 +11,7 @@ use crate::engine::InMemoryGraph;
 use crate::error::KinDbError;
 use crate::storage::format::GraphSnapshot;
 use crate::storage::mmap;
-use crate::store::{ChangeStore, EntityStore};
+use crate::store::EntityStore;
 use crate::types::*;
 
 #[cfg(test)]
@@ -154,7 +154,6 @@ pub struct TieredGraph {
 struct ManagedHotScope {
     entity_ids: HashSet<EntityId>,
     relation_ids: HashSet<RelationId>,
-    branch_names: HashSet<BranchName>,
 }
 
 impl ManagedHotScope {
@@ -167,7 +166,6 @@ impl ManagedHotScope {
     fn record_snapshot(&mut self, snapshot: &GraphSnapshot) {
         self.entity_ids.extend(snapshot.entities.keys().copied());
         self.relation_ids.extend(snapshot.relations.keys().copied());
-        self.branch_names.extend(snapshot.branches.keys().cloned());
     }
 }
 
@@ -514,10 +512,6 @@ fn hydrate_graph_partial(
         }
     }
 
-    for branch in snapshot.branches.values() {
-        graph.create_branch(branch)?;
-    }
-
     Ok(graph)
 }
 
@@ -549,9 +543,6 @@ fn merge_hot_into_cold(
                 .map(|entity_id| !deleted_managed_entities.contains(&entity_id))
                 .unwrap_or(true)
     });
-    cold.branches
-        .retain(|branch_name, _| !scope.branch_names.contains(branch_name));
-
     cold.entities.extend(hot.entities);
     cold.relations
         .extend(hot.relations.into_iter().filter(|(_, relation)| {
@@ -568,7 +559,6 @@ fn merge_hot_into_cold(
         }));
     cold.changes.extend(hot.changes);
     cold.change_children.extend(hot.change_children);
-    cold.branches.extend(hot.branches);
     cold.work_items.extend(hot.work_items);
     cold.annotations.extend(hot.annotations);
 
@@ -881,13 +871,6 @@ mod tests {
         TieredConfig {
             max_hot_bytes: Some(file_size.saturating_mul(4).saturating_sub(1).max(1)),
             bytes_per_entity: 1,
-        }
-    }
-
-    fn test_branch(name: &str) -> Branch {
-        Branch {
-            name: BranchName::new(name),
-            head: SemanticChangeId::from_hash(Hash256::from_bytes([1; 32])),
         }
     }
 
@@ -1383,35 +1366,6 @@ mod tests {
                 .len(),
             expected
         );
-    }
-
-    #[test]
-    fn mmap_backed_save_persists_branch_deletion() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("graph.kndb");
-
-        let main = test_branch("main");
-        let feature = test_branch("feature/demo");
-        let mut snap = GraphSnapshot::empty();
-        snap.branches = [
-            (main.name.clone(), main.clone()),
-            (feature.name.clone(), feature.clone()),
-        ]
-        .into_iter()
-        .collect();
-        mmap::atomic_write(&path, &snap).unwrap();
-
-        let config = force_mmap_config_with_full_hot(&path);
-        let tiered = TieredGraph::open(&path, config.clone()).unwrap();
-        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
-
-        tiered.hot.delete_branch(&feature.name).unwrap();
-        tiered.save().unwrap();
-
-        assert!(tiered.hot.get_branch(&feature.name).unwrap().is_none());
-        let reopened = TieredGraph::open(&path, config).unwrap();
-        assert!(reopened.hot.get_branch(&feature.name).unwrap().is_none());
-        assert!(reopened.hot.get_branch(&main.name).unwrap().is_some());
     }
 
     #[test]

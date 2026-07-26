@@ -950,7 +950,7 @@ impl RepoTruthHash {
 /// with unchanged semantics — this hash folds that root in and then adds the
 /// canonical *content* of every other snapshot domain: the change DAG (ids,
 /// parents, message, author, timestamp, and all entity/relation/artifact
-/// deltas), branches, work, reviews, tests, contracts, verification,
+/// deltas), work, reviews, tests, contracts, verification,
 /// provenance, sessions, intents, files, and artifacts.
 ///
 /// Use this for bootstrap acceptance, optimistic concurrency, and cache
@@ -988,7 +988,6 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
         changes,
         // Inverse index over `changes[].parents`.
         change_children: _,
-        branches,
         work_items,
         annotations,
         work_links,
@@ -1017,6 +1016,7 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
         // Re-derived from `changes` whenever it is empty, so a load can
         // legitimately populate it on an otherwise unchanged repo.
         entity_revisions: _,
+        repository_authority,
     } = snapshot;
 
     let mut hasher = Sha256::new();
@@ -1034,8 +1034,6 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
     hash_map_domain(&mut hasher, "relations", relations);
 
     hash_map_domain(&mut hasher, "changes", changes);
-    hash_map_domain(&mut hasher, "branches", branches);
-
     hash_map_domain(&mut hasher, "work_items", work_items);
     hash_map_domain(&mut hasher, "annotations", annotations);
     hash_vec_domain(&mut hasher, "work_links", work_links);
@@ -1067,6 +1065,15 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
     hash_map_domain(&mut hasher, "sessions", sessions);
     hash_map_domain(&mut hasher, "intents", intents);
     hash_vec_domain(&mut hasher, "downstream_warnings", downstream_warnings);
+    if let Some(repository_authority) = repository_authority {
+        hash_domain_elements(
+            &mut hasher,
+            "repository_authority",
+            std::slice::from_ref(repository_authority),
+        );
+    } else {
+        hash_domain_count(&mut hasher, "repository_authority", 0);
+    }
 
     let result = hasher.finalize();
     let mut hash = [0u8; 32];
@@ -2087,7 +2094,8 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         };
         change.id =
             kin_model::compute_semantic_change_id(&change).expect("valid semantic change fixture");
@@ -2120,12 +2128,12 @@ mod tests {
         let before = snapshot_with_changes(vec![test_change(
             0x11,
             "add resolver target",
-            vec![EntityDelta::Added(original)],
+            vec![EntityDelta::Added { new: original }],
         )]);
         let after = snapshot_with_changes(vec![test_change(
             0x11,
             "add resolver target",
-            vec![EntityDelta::Added(rewritten)],
+            vec![EntityDelta::Added { new: rewritten }],
         )]);
 
         assert_eq!(
@@ -2186,9 +2194,27 @@ mod tests {
     #[test]
     fn repo_truth_hash_is_independent_of_change_insertion_order() {
         let changes = vec![
-            test_change(0x41, "first", vec![EntityDelta::Added(test_entity("a"))]),
-            test_change(0x42, "second", vec![EntityDelta::Added(test_entity("b"))]),
-            test_change(0x43, "third", vec![EntityDelta::Added(test_entity("c"))]),
+            test_change(
+                0x41,
+                "first",
+                vec![EntityDelta::Added {
+                    new: test_entity("a"),
+                }],
+            ),
+            test_change(
+                0x42,
+                "second",
+                vec![EntityDelta::Added {
+                    new: test_entity("b"),
+                }],
+            ),
+            test_change(
+                0x43,
+                "third",
+                vec![EntityDelta::Added {
+                    new: test_entity("c"),
+                }],
+            ),
         ];
         let mut reversed = changes.clone();
         reversed.reverse();
@@ -2232,8 +2258,8 @@ mod tests {
             vec![relation.clone()],
         );
         for change in [
-            test_change(0x61, "one", vec![EntityDelta::Added(entity_a)]),
-            test_change(0x62, "two", vec![EntityDelta::Added(entity_b)]),
+            test_change(0x61, "one", vec![EntityDelta::Added { new: entity_a }]),
+            test_change(0x62, "two", vec![EntityDelta::Added { new: entity_b }]),
         ] {
             snapshot.changes.insert(change.id, change);
         }
@@ -2273,12 +2299,12 @@ mod tests {
             compute_repo_truth_hash(&snapshot_with_changes(vec![test_change(
                 0x71,
                 "meta",
-                vec![EntityDelta::Added(forward)]
+                vec![EntityDelta::Added { new: forward }]
             )])),
             compute_repo_truth_hash(&snapshot_with_changes(vec![test_change(
                 0x71,
                 "meta",
-                vec![EntityDelta::Added(reverse)]
+                vec![EntityDelta::Added { new: reverse }]
             )])),
             "metadata key insertion order must not affect the repo truth hash"
         );
@@ -2556,6 +2582,9 @@ mod tests {
     fn repo_truth_elements_project_to_canonical_json() {
         let entity = test_entity("encodable");
         let other = test_entity("encodable_other");
+        let modified_old = test_entity("encodable_modified_old");
+        let mut modified_new = modified_old.clone();
+        modified_new.name = "encodable_modified_new".to_string();
         let relation = test_relation(entity.id, other.id, RelationKind::Calls);
         let mut snapshot =
             build_snapshot(vec![entity.clone(), other.clone()], vec![relation.clone()]);
@@ -2563,23 +2592,17 @@ mod tests {
             0x91,
             "encodable change",
             vec![
-                EntityDelta::Added(entity.clone()),
-                EntityDelta::Modified {
-                    old: entity.clone(),
-                    new: other.clone(),
+                EntityDelta::Added {
+                    new: entity.clone(),
                 },
-                EntityDelta::Removed(other.id),
+                EntityDelta::Modified {
+                    old: modified_old,
+                    new: modified_new,
+                },
+                EntityDelta::Removed { old: other.clone() },
             ],
         );
-        let change_id = change.id;
         snapshot.changes.insert(change.id, change);
-        snapshot.branches.insert(
-            BranchName("main".to_string()),
-            Branch {
-                name: BranchName("main".to_string()),
-                head: change_id,
-            },
-        );
         snapshot.admit_artifact_for_test(
             "src/main.rs".to_string(),
             crate::types::regular_tree_entry(7),
@@ -2589,7 +2612,6 @@ mod tests {
             ("entities", map_elements_encode(&snapshot.entities)),
             ("relations", map_elements_encode(&snapshot.relations)),
             ("changes", map_elements_encode(&snapshot.changes)),
-            ("branches", map_elements_encode(&snapshot.branches)),
             ("work_items", map_elements_encode(&snapshot.work_items)),
             ("annotations", map_elements_encode(&snapshot.annotations)),
             ("work_links", vec_elements_encode(&snapshot.work_links)),

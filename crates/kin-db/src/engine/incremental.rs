@@ -333,13 +333,14 @@ mod tests {
             .expect("the old exact artifact remains admitted");
         graph
             .apply_transaction_delta(&TransactionDelta {
-                entity_deltas: vec![EntityDelta::Added(e_a2.clone())],
-                relation_deltas: vec![RelationDelta::Added(rel2)],
+                entity_deltas: vec![EntityDelta::Added { new: e_a2.clone() }],
+                relation_deltas: vec![RelationDelta::Added { new: rel2 }],
                 tree_deltas: vec![TreeDelta::Updated {
                     artifact_id,
                     old: LocatedEntry::new(path("src/a.rs"), make_entry(1)),
                     new: LocatedEntry::new(path("src/a.rs"), make_entry(10)),
                 }],
+                admission_policy_delta: None,
             })
             .unwrap();
 
