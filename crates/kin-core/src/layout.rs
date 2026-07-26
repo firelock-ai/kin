@@ -8,7 +8,7 @@ use crate::error::KinError;
 /// Current `.kin/` directory schema version.
 ///
 /// Bump this when the layout changes in a way that requires migration.
-pub const KIN_LAYOUT_VERSION: u32 = 1;
+pub const KIN_LAYOUT_VERSION: u32 = 2;
 
 /// The `.kin/` directory layout.
 ///
@@ -123,11 +123,6 @@ impl KinLayout {
         self.kindb_dir().join("text-index")
     }
 
-    /// `.kin/objects/` — Content-addressable blob store.
-    pub fn objects_dir(&self) -> PathBuf {
-        self.root.join("objects")
-    }
-
     /// `.kin/stashes/` — Named overlay snapshots.
     pub fn stashes_dir(&self) -> PathBuf {
         self.root.join("stashes")
@@ -173,21 +168,6 @@ impl KinLayout {
         self.root.join("shallow")
     }
 
-    /// `.kin/HEAD` — current branch pointer.
-    pub fn head_path(&self) -> PathBuf {
-        self.root.join("HEAD")
-    }
-
-    /// `.kin/source-root/` — source files in Kin-native mode.
-    pub fn source_root_dir(&self) -> PathBuf {
-        self.root.join("source-root")
-    }
-
-    /// `.kin/mode` — file containing `native` or `compat`.
-    pub fn mode_path(&self) -> PathBuf {
-        self.root.join("mode")
-    }
-
     /// `.kin/version` — layout schema version marker.
     pub fn version_path(&self) -> PathBuf {
         self.root.join("version")
@@ -195,12 +175,11 @@ impl KinLayout {
 
     /// Read the schema version from the `.kin/version` file.
     ///
-    /// Returns `KIN_LAYOUT_VERSION` if the file does not exist (pre-versioning repos).
+    /// Returns version 1 if the file does not exist (pre-versioning repos).
     pub fn read_version(&self) -> Result<u32, KinError> {
         let path = self.version_path();
         if !path.exists() {
-            // Pre-versioning repo — treat as version 1 (current).
-            return Ok(KIN_LAYOUT_VERSION);
+            return Ok(1);
         }
         let text = std::fs::read_to_string(&path).map_err(|e| KinError::io(&path, e))?;
         text.trim().parse::<u32>().map_err(|_| {
@@ -210,10 +189,14 @@ impl KinLayout {
 
     /// Verify that this binary can read the `.kin/` directory.
     ///
-    /// Returns an error if the on-disk version is newer than what we support.
+    /// Returns an error unless the on-disk version is exactly current.
+    ///
+    /// Version 2 is the clean-slate repository-authority layout. Older
+    /// file/branch-authority layouts must not be served as if they carried v6
+    /// refs and workspaces.
     pub fn check_version(&self) -> Result<(), KinError> {
         let current = self.read_version()?;
-        if current > KIN_LAYOUT_VERSION {
+        if current != KIN_LAYOUT_VERSION {
             return Err(KinError::IncompatibleVersion {
                 found: current,
                 supported: KIN_LAYOUT_VERSION,
@@ -232,9 +215,9 @@ impl KinLayout {
     ///
     /// This is never a silent no-op:
     /// - a newer-than-supported layout is refused with [`KinError::IncompatibleVersion`];
-    /// - a pre-versioning repo (no `.kin/version`) is stamped at the current
-    ///   version — a real, idempotent action, since the first version is layout-
-    ///   compatible with an unmarked tree;
+    /// - a pre-versioning repo (no `.kin/version`) is treated as version 1 and
+    ///   refused because no compatibility migration can manufacture v6
+    ///   repository authority;
     /// - an older layout is walked forward one step at a time via [`Self::migrate_step`],
     ///   which transforms `v -> v+1` on disk or **loudly refuses** when no step is
     ///   registered for that version. An older layout is never accepted as-is.
@@ -242,14 +225,6 @@ impl KinLayout {
     /// When the on-disk version already equals [`KIN_LAYOUT_VERSION`] there is
     /// genuinely nothing to do and `Ok(())` is returned without touching disk.
     pub fn migrate(&self) -> Result<(), KinError> {
-        // A pre-versioning repo predates the marker entirely. `read_version`
-        // maps a missing file onto the current version, so detect absence
-        // directly and stamp the tree forward rather than assuming it.
-        if !self.version_path().exists() {
-            self.write_version(KIN_LAYOUT_VERSION)?;
-            return Ok(());
-        }
-
         let mut current = self.read_version()?;
         if current > KIN_LAYOUT_VERSION {
             return Err(KinError::IncompatibleVersion {
@@ -275,16 +250,15 @@ impl KinLayout {
     /// can never be served against a binary that does not know how to upgrade
     /// it.
     fn migrate_step(&self, from: u32) -> Result<(), KinError> {
-        match from {
-            // Register future migration steps here, lowest version first.
-            other => Err(KinError::Config(format!(
-                "no migration path for .kin/ layout version {other} -> {next}: \
-                 this repository predates a breaking layout change that this kin \
-                 build cannot auto-upgrade. Re-run `kin init` in a fresh checkout \
-                 or restore from a backup made with a matching kin version.",
-                next = other + 1,
-            ))),
-        }
+        // Register future migration steps here, lowest version first. Until
+        // one exists, every old authority is deliberately refused.
+        Err(KinError::Config(format!(
+            "no migration path for .kin/ layout version {from} -> {next}: \
+             this repository predates a breaking layout change that this kin \
+             build cannot auto-upgrade. Re-run `kin init` in a fresh checkout \
+             or restore from a backup made with a matching kin version.",
+            next = from + 1,
+        )))
     }
 
     /// `.kin/sync_state.json` — persisted sync state per remote.
@@ -319,7 +293,6 @@ impl KinLayout {
     pub fn all_dirs(&self) -> Vec<PathBuf> {
         vec![
             self.kindb_dir(),
-            self.objects_dir(),
             self.stashes_dir(),
             self.backups_dir(),
             self.projections_dir(),
@@ -384,15 +357,14 @@ mod tests {
             layout.kindb_head_generation_path(),
             PathBuf::from("/repo/.kin/kindb/head-generation")
         );
-        assert_eq!(layout.objects_dir(), PathBuf::from("/repo/.kin/objects"));
         assert_eq!(layout.working_dir(), Path::new("/repo"));
     }
 
     #[test]
     fn all_dirs_count() {
         let layout = KinLayout::new(PathBuf::from("/repo/.kin"));
-        // kindb, objects, stashes, backups, projections, docs, bench, runs, logs, adapters, shallow
-        assert_eq!(layout.all_dirs().len(), 11);
+        // kindb, stashes, backups, projections, docs, bench, runs, logs, adapters, shallow
+        assert_eq!(layout.all_dirs().len(), 10);
     }
 
     #[test]
@@ -489,12 +461,12 @@ mod tests {
     }
 
     #[test]
-    fn migrate_stamps_pre_versioning_repo() {
+    fn migrate_refuses_pre_versioning_repo_without_authority() {
         let (_dir, layout) = empty_kin_layout();
         assert!(!layout.version_path().exists());
-        layout.migrate().unwrap();
-        let stamped = std::fs::read_to_string(layout.version_path()).unwrap();
-        assert_eq!(stamped.trim(), KIN_LAYOUT_VERSION.to_string());
+        let error = layout.migrate().unwrap_err();
+        assert!(error.to_string().contains("no migration path"));
+        assert!(!layout.version_path().exists());
     }
 
     #[test]

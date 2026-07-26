@@ -8,7 +8,7 @@
 
 #[cfg(test)]
 use kin_model::Hash256;
-use kin_model::{EntityDelta, RelationDelta, SemanticChange, SemanticChangeId, TreeDelta};
+use kin_model::{SemanticChange, SemanticChangeId, TransactionDelta};
 
 use crate::{KinError, Result};
 
@@ -16,7 +16,7 @@ use crate::{KinError, Result};
 ///
 /// The existing `id` field is excluded to avoid a self-reference; every other
 /// serialized field participates, including all parents, author, timestamp,
-/// message, deltas, provenance links, risk, and authored branch. Native change
+/// message, deltas, provenance links, risk, origin, and admission policy. Native change
 /// constructors must use this after assembling the final payload so daemon
 /// exact-retry equality and ID authority describe the same bytes.
 pub fn compute_semantic_change_id(change: &SemanticChange) -> Result<SemanticChangeId> {
@@ -24,22 +24,18 @@ pub fn compute_semantic_change_id(change: &SemanticChange) -> Result<SemanticCha
         .map_err(|error| KinError::Other(error.to_string()))
 }
 
-/// Derive a deterministic content fingerprint from the complete delta payloads.
+/// Derive a deterministic content fingerprint from a complete transaction.
 ///
 /// Canonical encodings of independent deltas are sorted before hashing so their
-/// insertion order does not affect the result. If deltas overlap a replay
-/// target, their order is retained because graph replay is order-sensitive.
-/// Every field of every delta participates, including entity
+/// insertion order does not affect the result. Multiple deltas for one replay
+/// target are rejected rather than assigned an order-dependent identity. Every
+/// field of every delta participates, including entity
 /// bodies/fingerprints, relation evidence/confidence, and exact tree entry
 /// transitions. This is deliberately not an ID-only projection: two
 /// immutable `SemanticChange` records must never receive the same ID merely
 /// because they touch the same graph IDs or file paths.
-pub fn content_identity_from_deltas(
-    entity_deltas: &[EntityDelta],
-    relation_deltas: &[RelationDelta],
-    tree_deltas: &[TreeDelta],
-) -> Result<[u8; 32]> {
-    kin_model::content_identity_from_deltas(entity_deltas, relation_deltas, tree_deltas)
+pub fn content_identity_from_deltas(delta: &TransactionDelta) -> Result<[u8; 32]> {
+    kin_model::content_identity_from_deltas(delta)
         .map_err(|error| KinError::Other(error.to_string()))
 }
 
@@ -56,10 +52,10 @@ pub fn whoami() -> String {
 mod tests {
     use super::*;
     use kin_model::{
-        relation::GraphNodeId, ArtifactId, AuthorId, BranchName, Entity, EntityId, EntityKind,
-        EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm, LanguageId, LocatedEntry,
-        Relation, RelationId, RelationKind, RelationOrigin, RepoPath, SemanticFingerprint,
-        Timestamp, TreeEntry, Visibility,
+        relation::GraphNodeId, ArtifactId, AuthorId, ChangeOrigin, Entity, EntityDelta, EntityId,
+        EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm, GitObjectId,
+        LanguageId, LocatedEntry, Relation, RelationDelta, RelationId, RelationKind,
+        RelationOrigin, RepoPath, SemanticFingerprint, Timestamp, TreeDelta, TreeEntry, Visibility,
     };
 
     fn test_entity(id: EntityId, name: &str) -> Entity {
@@ -89,6 +85,25 @@ mod tests {
         }
     }
 
+    fn test_change() -> SemanticChange {
+        SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: Vec::new(),
+            timestamp: Timestamp::from(chrono::DateTime::UNIX_EPOCH),
+            author: AuthorId::new("kin"),
+            message: "fixture".to_string(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        }
+    }
+
     fn modified_tree(
         artifact_id: ArtifactId,
         path: &str,
@@ -111,9 +126,8 @@ mod tests {
 
     #[test]
     fn complete_change_identity_binds_provenance_but_excludes_existing_id() {
-        let mut original = crate::build_genesis_change();
+        let mut original = test_change();
         original.author = AuthorId::new("agent-a");
-        original.authored_on = Some(BranchName::new("main"));
         let original_id = compute_semantic_change_id(&original).unwrap();
 
         let mut different_author = original.clone();
@@ -123,11 +137,13 @@ mod tests {
             compute_semantic_change_id(&different_author).unwrap()
         );
 
-        let mut different_branch = original.clone();
-        different_branch.authored_on = Some(BranchName::new("feature"));
+        let mut different_origin = original.clone();
+        different_origin.origin = ChangeOrigin::GitCommit {
+            oid: GitObjectId::sha1([0x44; 20]),
+        };
         assert_ne!(
             original_id,
-            compute_semantic_change_id(&different_branch).unwrap()
+            compute_semantic_change_id(&different_origin).unwrap()
         );
 
         original.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x55; 32]));
@@ -135,8 +151,8 @@ mod tests {
     }
 
     #[test]
-    fn semantic_change_v5_hash_domain_has_a_pinned_fixture() {
-        let mut fixture = crate::build_genesis_change();
+    fn semantic_change_v6_hash_domain_has_a_pinned_fixture() {
+        let mut fixture = test_change();
         fixture.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x55; 32]));
         fixture.timestamp = Timestamp(
             chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
@@ -145,28 +161,27 @@ mod tests {
         );
         fixture.author = AuthorId::new("fixture");
         fixture.message = "phase two".to_string();
-        fixture.authored_on = Some(BranchName::new("main"));
 
         assert_eq!(
             compute_semantic_change_id(&fixture).unwrap().to_string(),
-            "4c2bb2dc66a780f9b807e0c08b0ab61d37ae0d861af9dea8347145932bf1f7c5",
-            "changing the kin-semantic-change-v5 domain or canonical fixture is a wire break"
+            "58af6c048bc950d7948d34594072e38e085f5f5de602591be06965b45b95712b",
+            "changing the kin-semantic-change-v6 domain or canonical fixture is a wire break"
         );
     }
 
     #[test]
     fn content_identity_empty_deltas_is_deterministic() {
-        let h1 = content_identity_from_deltas(&[], &[], &[]).unwrap();
-        let h2 = content_identity_from_deltas(&[], &[], &[]).unwrap();
+        let h1 = content_identity_from_deltas(&TransactionDelta::default()).unwrap();
+        let h2 = content_identity_from_deltas(&TransactionDelta::default()).unwrap();
         assert_eq!(h1, h2);
         assert_eq!(
             h1,
             [
-                0xe2, 0xe3, 0x49, 0x04, 0x8f, 0x3e, 0xed, 0x2e, 0xb2, 0xab, 0x77, 0x63, 0xdc, 0x51,
-                0xe7, 0xfd, 0xd0, 0x3f, 0xa6, 0x7c, 0xbb, 0xcc, 0x09, 0xe2, 0x07, 0xfd, 0xde, 0x68,
-                0x8c, 0x34, 0xf8, 0x8e,
+                0x0b, 0x42, 0xbc, 0x33, 0xa4, 0x38, 0xf5, 0x48, 0xa4, 0xff, 0x32, 0x36, 0xa4, 0x00,
+                0x1f, 0xab, 0xe7, 0x85, 0x55, 0x1f, 0xf1, 0xda, 0x5b, 0xa7, 0x41, 0xb8, 0x03, 0x16,
+                0x5f, 0xfa, 0x7a, 0x0d,
             ],
-            "changing the kin-content-v4 domain or canonical empty payload is a wire break"
+            "changing the kin-content-v5 domain or canonical empty payload is a wire break"
         );
     }
 
@@ -188,12 +203,21 @@ mod tests {
             false,
         );
 
-        let regular_id =
-            content_identity_from_deltas(&[], &[], std::slice::from_ref(&regular)).unwrap();
-        let executable_id =
-            content_identity_from_deltas(&[], &[], std::slice::from_ref(&executable)).unwrap();
-        let different_old_id =
-            content_identity_from_deltas(&[], &[], std::slice::from_ref(&different_old)).unwrap();
+        let regular_id = content_identity_from_deltas(&TransactionDelta {
+            tree_deltas: vec![regular.clone()],
+            ..TransactionDelta::default()
+        })
+        .unwrap();
+        let executable_id = content_identity_from_deltas(&TransactionDelta {
+            tree_deltas: vec![executable],
+            ..TransactionDelta::default()
+        })
+        .unwrap();
+        let different_old_id = content_identity_from_deltas(&TransactionDelta {
+            tree_deltas: vec![different_old],
+            ..TransactionDelta::default()
+        })
+        .unwrap();
         assert_ne!(regular_id, executable_id);
         assert_ne!(regular_id, different_old_id);
 
@@ -211,27 +235,25 @@ mod tests {
             new_hash,
             false,
         );
-        let first = content_identity_from_deltas(
-            &[],
-            &[],
-            &[
+        let first = content_identity_from_deltas(&TransactionDelta {
+            tree_deltas: vec![
                 regular.clone(),
                 ordered_executable.clone(),
                 ordered_different_old.clone(),
             ],
-        )
+            ..TransactionDelta::default()
+        })
         .unwrap();
-        let reordered = content_identity_from_deltas(
-            &[],
-            &[],
-            &[ordered_different_old, regular, ordered_executable],
-        )
+        let reordered = content_identity_from_deltas(&TransactionDelta {
+            tree_deltas: vec![ordered_different_old, regular, ordered_executable],
+            ..TransactionDelta::default()
+        })
         .unwrap();
         assert_eq!(first, reordered);
     }
 
     #[test]
-    fn content_identity_binds_order_for_duplicate_tree_targets() {
+    fn content_identity_rejects_duplicate_tree_targets() {
         let artifact_id = ArtifactId(uuid::Uuid::from_u128(4));
         let first_hash = Hash256::from_bytes([1; 32]);
         let second_hash = Hash256::from_bytes([2; 32]);
@@ -239,10 +261,14 @@ mod tests {
         let first = modified_tree(artifact_id, "src/lib.rs", first_hash, second_hash, false);
         let second = modified_tree(artifact_id, "src/lib.rs", second_hash, third_hash, false);
 
-        let forward =
-            content_identity_from_deltas(&[], &[], &[first.clone(), second.clone()]).unwrap();
-        let reversed = content_identity_from_deltas(&[], &[], &[second, first]).unwrap();
-        assert_ne!(forward, reversed);
+        let error = content_identity_from_deltas(&TransactionDelta {
+            tree_deltas: vec![first, second],
+            ..TransactionDelta::default()
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("more than one delta for artifact"));
     }
 
     #[test]
@@ -257,12 +283,21 @@ mod tests {
             new: LocatedEntry::new(path, TreeEntry::blob(hash, false)),
         };
 
-        let first =
-            content_identity_from_deltas(&[], &[], &[delta(first_id, utf8_path.clone())]).unwrap();
-        let other_identity =
-            content_identity_from_deltas(&[], &[], &[delta(second_id, utf8_path)]).unwrap();
-        let other_path =
-            content_identity_from_deltas(&[], &[], &[delta(first_id, byte_path)]).unwrap();
+        let first = content_identity_from_deltas(&TransactionDelta {
+            tree_deltas: vec![delta(first_id, utf8_path.clone())],
+            ..TransactionDelta::default()
+        })
+        .unwrap();
+        let other_identity = content_identity_from_deltas(&TransactionDelta {
+            tree_deltas: vec![delta(second_id, utf8_path)],
+            ..TransactionDelta::default()
+        })
+        .unwrap();
+        let other_path = content_identity_from_deltas(&TransactionDelta {
+            tree_deltas: vec![delta(first_id, byte_path)],
+            ..TransactionDelta::default()
+        })
+        .unwrap();
 
         assert_ne!(first, other_identity);
         assert_ne!(first, other_path);
@@ -287,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn content_identity_binds_order_for_cross_linked_entity_modifications() {
+    fn content_identity_rejects_identity_changing_entity_modifications() {
         let a = test_entity(EntityId::new(), "a");
         let b = test_entity(EntityId::new(), "b");
         let c = test_entity(EntityId::new(), "c");
@@ -297,10 +332,12 @@ mod tests {
         };
         let b_to_c = EntityDelta::Modified { old: b, new: c };
 
-        let forward =
-            content_identity_from_deltas(&[a_to_b.clone(), b_to_c.clone()], &[], &[]).unwrap();
-        let reversed = content_identity_from_deltas(&[b_to_c, a_to_b], &[], &[]).unwrap();
-        assert_ne!(forward, reversed);
+        let error = content_identity_from_deltas(&TransactionDelta {
+            entity_deltas: vec![a_to_b, b_to_c],
+            ..TransactionDelta::default()
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("changes identity"));
     }
 
     #[test]
@@ -316,9 +353,12 @@ mod tests {
             import_source: None,
             evidence: vec![],
         };
-        let error =
-            content_identity_from_deltas(&[], &[RelationDelta::Added(relation)], &[]).unwrap_err();
-        assert!(error.to_string().contains("non-finite confidence"));
+        let error = content_identity_from_deltas(&TransactionDelta {
+            relation_deltas: vec![RelationDelta::Added { new: relation }],
+            ..TransactionDelta::default()
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid confidence score"));
     }
 
     #[test]

@@ -6,8 +6,9 @@
 //! This crate orchestrates file parsing, blob storage, and graph updates.
 //! It also provides a file watcher for incremental re-indexing.
 //!
-//! Key design: the indexer updates the WorkingCopy overlay only. It does NOT
-//! create SemanticChange nodes — that is `kin commit`'s job.
+//! Key design: the indexer proposes deltas for an exact graph-owned
+//! `WorkspaceState`. It does not create `SemanticChange` history on its own;
+//! repository authority commits workspace and history transitions atomically.
 
 pub mod admission;
 pub mod artifacts;
@@ -25,7 +26,7 @@ pub use admission::{
     enforce_sensitive_admission, is_intrinsic_repository_control_path, AdmissionCase,
     AdmissionDecision, AdmissionDecisionReason, AdmissionMatcherError, AdmissionRuleProvenance,
     AdmissionRuleSource, ResolvedAdmissionMatcher, ResolvedAdmissionRuleSet,
-    SensitiveAdmissionError, SensitiveAdmissionGrant, SensitiveArtifactKind, SensitiveFindingKind,
+    SensitiveAdmissionError, SensitiveFindingKind,
 };
 pub use artifacts::extract_artifact;
 pub use classifier::{FileClassification, FileClassifier};

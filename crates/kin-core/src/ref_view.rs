@@ -5,8 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
 
-use kin_blobs::BlobStore;
-use kin_db::{GraphSnapshot, InMemoryGraph};
+use kin_db::{GraphSnapshot, InMemoryGraph, RepositoryAuthorityManager, StorageBackend};
 use kin_index::{
     build_projection_derived_relations_for_file, extract_artifact,
     link_cross_file_against_entities_with_completeness, FileClassification, FileClassifier,
@@ -22,7 +21,8 @@ use kin_parser::extract::{EMBEDDING_BODY_PREVIEW_KEY, FILE_SURFACE_CONTEXT_KEY};
 
 use crate::{KinError, Result};
 
-/// Build a read-only graph view resolved at a specific semantic ref.
+/// Build a read-only graph view resolved at a specific semantic ref from one
+/// coherent repository-authority generation.
 ///
 /// The returned graph contains:
 /// - entities and relations replayed as of `head`
@@ -32,11 +32,27 @@ use crate::{KinError, Result};
 /// - a fresh in-memory text index aligned with the historical view
 ///
 /// Embedding/vector state is intentionally not reconstructed yet.
-pub fn build_graph_at_ref(
-    graph: &InMemoryGraph,
-    blob_store: &BlobStore,
+pub fn build_graph_at_ref<B>(
+    authority: &RepositoryAuthorityManager<B>,
     head: &SemanticChangeId,
-) -> Result<InMemoryGraph> {
+) -> Result<InMemoryGraph>
+where
+    B: StorageBackend + ?Sized + 'static,
+{
+    let lease = authority.read_authority();
+    let graph = InMemoryGraph::from_snapshot(lease.snapshot().clone())
+        .map_err(|error| KinError::Graph(error.to_string()))?;
+    build_graph_at_ref_from_graph(&graph, authority, head)
+}
+
+fn build_graph_at_ref_from_graph<B>(
+    graph: &InMemoryGraph,
+    authority: &RepositoryAuthorityManager<B>,
+    head: &SemanticChangeId,
+) -> Result<InMemoryGraph>
+where
+    B: StorageBackend + ?Sized + 'static,
+{
     let build_start = std::time::Instant::now();
     let timing = std::env::var("KIN_SCOPE_TIMING").is_ok();
     let build_timeout_secs = std::env::var("KIN_BUILD_GRAPH_TIMEOUT_SECS")
@@ -56,7 +72,7 @@ pub fn build_graph_at_ref(
         );
     }
 
-    let reader = BlobReader::new(blob_store);
+    let reader = BlobReader::new(authority);
     let ref_file_tree = resolved.tree.clone();
     if timing {
         eprintln!(
@@ -75,36 +91,6 @@ pub fn build_graph_at_ref(
         .collect();
     snapshot.change_children = build_change_children(&changes);
     snapshot.resolved_tree = ref_file_tree.clone();
-    let mut branches = HashMap::new();
-    if let Ok(parent_branches) = graph.list_branches() {
-        let reachable_ids: HashSet<SemanticChangeId> = changes.iter().map(|c| c.id).collect();
-        for mut b in parent_branches {
-            let mut curr = b.head;
-            let mut found = false;
-            let mut visited = HashSet::new();
-            while !visited.contains(&curr) {
-                visited.insert(curr);
-                if reachable_ids.contains(&curr) {
-                    b.head = curr;
-                    found = true;
-                    break;
-                }
-                if let Ok(Some(change)) = graph.get_change(&curr) {
-                    if change.parents.is_empty() {
-                        break;
-                    }
-                    curr = change.parents[0];
-                } else {
-                    break;
-                }
-            }
-            if found {
-                branches.insert(b.name.clone(), b);
-            }
-        }
-    }
-    snapshot.branches = branches;
-
     let lifecycle = RefLifecycle::from_changes(&material_history);
     rebuild_entity_source_file_layouts(
         &mut snapshot,
@@ -167,21 +153,28 @@ pub fn filter_vector_results_to_scope(
 ///
 /// Historical query paths never repair or replace graph truth from Git or the
 /// working tree. A missing blob is a graph-integrity error.
-struct BlobReader<'a> {
-    blob_store: &'a BlobStore,
+struct BlobReader<'a, B: StorageBackend + ?Sized + 'static> {
+    authority: &'a RepositoryAuthorityManager<B>,
 }
 
-impl<'a> BlobReader<'a> {
-    fn new(blob_store: &'a BlobStore) -> Self {
-        Self { blob_store }
+impl<'a, B: StorageBackend + ?Sized + 'static> BlobReader<'a, B> {
+    fn new(authority: &'a RepositoryAuthorityManager<B>) -> Self {
+        Self { authority }
     }
 
-    fn read(&self, hash: &kin_blobs::Hash256, path: &RepoPath) -> Result<Vec<u8>> {
-        self.blob_store.read(hash).map_err(|error| {
-            KinError::Graph(format!(
-                "graph tree references missing or corrupt blob {hash} for {path}: {error}"
-            ))
-        })
+    fn read(&self, hash: &Hash256, path: &RepoPath) -> Result<Vec<u8>> {
+        self.authority
+            .load_source_blob(*hash)
+            .map_err(|error| {
+                KinError::Graph(format!(
+                    "repository authority could not read source blob {hash} for {path}: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                KinError::Graph(format!(
+                    "graph tree references missing source blob {hash} for {path}"
+                ))
+            })
     }
 }
 
@@ -205,10 +198,10 @@ impl RefLifecycle {
         for change in changes {
             reachable_changes.insert(change.id);
             for delta in &change.entity_deltas {
-                if let kin_model::EntityDelta::Removed(id) = delta {
-                    removed_entities.insert(*id);
+                if let kin_model::EntityDelta::Removed { old } = delta {
+                    removed_entities.insert(old.id);
                 }
-                if let kin_model::EntityDelta::Added(entity) = delta {
+                if let kin_model::EntityDelta::Added { new: entity } = delta {
                     // An entity re-added later overrides an earlier removal in
                     // the same reachable history.
                     removed_entities.remove(&entity.id);
@@ -247,7 +240,7 @@ where
     let mut ordered = Vec::new();
     enum Frame {
         Visit(SemanticChangeId),
-        Emit(SemanticChange),
+        Emit(Box<SemanticChange>),
     }
 
     let mut stack = vec![Frame::Visit(*head)];
@@ -262,8 +255,9 @@ where
                     .map_err(|err| KinError::Graph(err.to_string()))?
                 {
                     Some(change) => {
-                        stack.push(Frame::Emit(change.clone()));
-                        for parent in change.parents.iter().rev() {
+                        let parents = change.parents.clone();
+                        stack.push(Frame::Emit(Box::new(change)));
+                        for parent in parents.iter().rev() {
                             stack.push(Frame::Visit(*parent));
                         }
                     }
@@ -274,7 +268,7 @@ where
                     }
                 }
             }
-            Frame::Emit(change) => ordered.push(change),
+            Frame::Emit(change) => ordered.push(*change),
         }
     }
     Ok(ordered)
@@ -353,13 +347,16 @@ fn filter_temporal_cochange_relations(snapshot: &mut GraphSnapshot) {
     }
 }
 
-fn rebuild_non_entity_tracked_files(
+fn rebuild_non_entity_tracked_files<B>(
     snapshot: &mut GraphSnapshot,
     file_tree: &ResolvedTree,
-    reader: &BlobReader<'_>,
+    reader: &BlobReader<'_, B>,
     build_start: std::time::Instant,
     build_timeout_secs: f64,
-) -> Result<()> {
+) -> Result<()>
+where
+    B: StorageBackend + ?Sized + 'static,
+{
     let entity_paths: HashSet<String> = snapshot
         .entities
         .values()
@@ -444,14 +441,17 @@ fn rebuild_non_entity_tracked_files(
     Ok(())
 }
 
-fn rebuild_entity_source_file_layouts(
+fn rebuild_entity_source_file_layouts<B>(
     snapshot: &mut GraphSnapshot,
     file_tree: &ResolvedTree,
-    reader: &BlobReader<'_>,
+    reader: &BlobReader<'_, B>,
     lifecycle: &RefLifecycle,
     build_start: std::time::Instant,
     build_timeout_secs: f64,
-) -> Result<()> {
+) -> Result<()>
+where
+    B: StorageBackend + ?Sized + 'static,
+{
     let pipeline = IndexPipeline::new();
     let mut rebuilt_entities = Vec::new();
     let mut parsed_relations = Vec::new();
@@ -505,7 +505,7 @@ fn rebuild_entity_source_file_layouts(
             .cloned()
             .collect::<Vec<_>>();
         // Sort for deterministic reparse-to-persisted entity binding.
-        file_entities.sort_by(|a, b| ref_entity_order(a, b));
+        file_entities.sort_by(ref_entity_order);
         let indexed = if file_entities.is_empty()
             || should_probe_sparse_historical_source(&file_entities, content.len())
         {
@@ -529,26 +529,26 @@ fn rebuild_entity_source_file_layouts(
             None
         };
 
-        if let Some(indexed) = indexed.as_ref() {
-            if indexed.indexed_file.entities.is_empty() {
-                if !file_entities.is_empty() {
-                    let contextual_entities =
-                        enrich_entities_with_historical_source_context(&file_entities, &content);
-                    for entity in &contextual_entities {
-                        snapshot.entities.insert(entity.id, entity.clone());
-                    }
-                    snapshot.file_layouts.push(build_entity_file_layout(
-                        &file_id,
-                        &contextual_entities,
-                        content.len(),
-                        ParseCompleteness::Partial(
-                            "historical ref view layout derived from persisted entity spans and file-surface lexical context"
-                                .to_string(),
-                        ),
-                    ));
-                    continue;
-                }
+        if indexed
+            .as_ref()
+            .is_some_and(|indexed| indexed.indexed_file.entities.is_empty())
+            && !file_entities.is_empty()
+        {
+            let contextual_entities =
+                enrich_entities_with_historical_source_context(&file_entities, &content);
+            for entity in &contextual_entities {
+                snapshot.entities.insert(entity.id, entity.clone());
             }
+            snapshot.file_layouts.push(build_entity_file_layout(
+                &file_id,
+                &contextual_entities,
+                content.len(),
+                ParseCompleteness::Partial(
+                    "historical ref view layout derived from persisted entity spans and file-surface lexical context"
+                        .to_string(),
+                ),
+            ));
+            continue;
         }
 
         if file_entities.is_empty() {
@@ -1050,12 +1050,40 @@ fn summarize_shallow_items(items: impl IntoIterator<Item = String>) -> Vec<Strin
 mod tests {
     use super::*;
 
-    use kin_blobs::BlobStore;
+    use std::sync::Arc;
+
+    use kin_db::LocalFileBackend;
     use kin_model::{
         ArtifactId, AuthorId, Entity, EntityDelta, EntityKind, EntityRole, EntityStore,
-        FingerprintAlgorithm, GitObjectId, LanguageId, LocatedEntry, SemanticChange,
+        FingerprintAlgorithm, GitObjectId, LanguageId, LocatedEntry, RepositoryId, SemanticChange,
         SemanticFingerprint, SourceSpan, Timestamp, TreeDelta, Visibility,
     };
+
+    fn test_authority(root: &Path) -> RepositoryAuthorityManager<LocalFileBackend> {
+        RepositoryAuthorityManager::open(
+            RepositoryId::new("ref-view-test").unwrap(),
+            Arc::new(LocalFileBackend::new(root.join("kindb"))),
+        )
+        .unwrap()
+    }
+
+    fn save_source_blob(
+        authority: &RepositoryAuthorityManager<LocalFileBackend>,
+        data: &[u8],
+    ) -> Hash256 {
+        let digest = kin_blobs::digest(data);
+        authority.save_source_blob(digest, data).unwrap();
+        digest
+    }
+
+    #[test]
+    fn public_ref_view_reads_the_manager_owned_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let authority = test_authority(temp.path());
+        let absent = SemanticChangeId::from_hash(Hash256::from_bytes([0xa5; 32]));
+
+        assert!(build_graph_at_ref(&authority, &absent).is_err());
+    }
 
     fn create_fixture_change(
         graph: &InMemoryGraph,
@@ -1077,7 +1105,8 @@ mod tests {
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         };
         change.id = crate::compute_semantic_change_id(&change).unwrap();
         let id = change.id;
@@ -1115,12 +1144,12 @@ mod tests {
     fn build_graph_at_ref_reconstructs_historical_tracked_files() {
         let graph = InMemoryGraph::new();
         let temp = tempfile::tempdir().unwrap();
-        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
+        let authority = test_authority(temp.path());
 
         let genesis_id = create_fixture_change(&graph, vec![], "genesis", vec![], vec![]);
 
-        let readme_v1 = blob_store.write(b"Authentication guide for v1").unwrap();
-        let cargo_v1 = blob_store.write(b"[package]\nname = \"kin\"\n").unwrap();
+        let readme_v1 = save_source_blob(&authority, b"Authentication guide for v1");
+        let cargo_v1 = save_source_blob(&authority, b"[package]\nname = \"kin\"\n");
         let add_id = create_fixture_change(
             &graph,
             vec![genesis_id],
@@ -1132,7 +1161,7 @@ mod tests {
             ],
         );
 
-        let readme_v2 = blob_store.write(b"Deployment guide for v2").unwrap();
+        let readme_v2 = save_source_blob(&authority, b"Deployment guide for v2");
         let _head_id = create_fixture_change(
             &graph,
             vec![add_id],
@@ -1141,7 +1170,7 @@ mod tests {
             vec![modified(0x101, "README.md", readme_v1, readme_v2)],
         );
 
-        let historical = build_graph_at_ref(&graph, &blob_store, &add_id).unwrap();
+        let historical = build_graph_at_ref_from_graph(&graph, &authority, &add_id).unwrap();
 
         let structured = historical.list_structured_artifacts().unwrap();
         assert_eq!(structured.len(), 1);
@@ -1167,25 +1196,24 @@ mod tests {
     fn build_graph_at_ref_indexes_historical_source_text_for_entity_files() {
         let graph = InMemoryGraph::new();
         let temp = tempfile::tempdir().unwrap();
-        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
+        let authority = test_authority(temp.path());
 
         let genesis_id = create_fixture_change(&graph, vec![], "genesis", vec![], vec![]);
 
-        let source_hash = blob_store
-            .write(
-                b"int main(void) {\n  // --exit-status should return a distinct parse error code\n  return 0;\n}\n",
-            )
-            .unwrap();
+        let source_hash = save_source_blob(
+            &authority,
+            b"int main(void) {\n  // --exit-status should return a distinct parse error code\n  return 0;\n}\n",
+        );
         let main_entity = test_entity("main", "src/main.c");
         let add_id = create_fixture_change(
             &graph,
             vec![genesis_id],
             "add main",
-            vec![EntityDelta::Added(main_entity)],
+            vec![EntityDelta::Added { new: main_entity }],
             vec![added(0x103, "src/main.c", source_hash)],
         );
 
-        let historical = build_graph_at_ref(&graph, &blob_store, &add_id).unwrap();
+        let historical = build_graph_at_ref_from_graph(&graph, &authority, &add_id).unwrap();
 
         assert!(historical
             .list_opaque_artifacts()
@@ -1207,25 +1235,25 @@ mod tests {
     fn build_graph_at_ref_preserves_semantic_entity_identity_from_history() {
         let graph = InMemoryGraph::new();
         let temp = tempfile::tempdir().unwrap();
-        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
+        let authority = test_authority(temp.path());
 
         let genesis_id = create_fixture_change(&graph, vec![], "genesis", vec![], vec![]);
 
-        let current_hash = blob_store
-            .write(b"def processor():\n    return 'processor'\n")
-            .unwrap();
+        let current_hash =
+            save_source_blob(&authority, b"def processor():\n    return 'processor'\n");
         let processor = test_entity("processor", "src/lib.py");
         let auto_parse_id = create_fixture_change(
             &graph,
             vec![genesis_id],
             "auto-parse",
-            vec![EntityDelta::Added(processor.clone())],
+            vec![EntityDelta::Added {
+                new: processor.clone(),
+            }],
             vec![added(0x104, "src/lib.py", current_hash)],
         );
 
-        let historical_hash = blob_store
-            .write(b"def handler():\n    return 'handler'\n")
-            .unwrap();
+        let historical_hash =
+            save_source_blob(&authority, b"def handler():\n    return 'handler'\n");
         let historical_id = create_fixture_change(
             &graph,
             vec![auto_parse_id],
@@ -1234,7 +1262,7 @@ mod tests {
             vec![modified(0x104, "src/lib.py", current_hash, historical_hash)],
         );
 
-        let historical = build_graph_at_ref(&graph, &blob_store, &historical_id).unwrap();
+        let historical = build_graph_at_ref_from_graph(&graph, &authority, &historical_id).unwrap();
         let entities = historical.list_all_entities().unwrap();
         assert_eq!(entities.len(), 1);
         assert!(
@@ -1265,13 +1293,12 @@ mod tests {
     fn build_graph_at_ref_falls_back_to_blob_parsing_for_artifact_only_history() {
         let graph = InMemoryGraph::new();
         let temp = tempfile::tempdir().unwrap();
-        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
+        let authority = test_authority(temp.path());
 
         let genesis_id = create_fixture_change(&graph, vec![], "genesis", vec![], vec![]);
 
-        let historical_hash = blob_store
-            .write(b"def handler():\n    return 'handler'\n")
-            .unwrap();
+        let historical_hash =
+            save_source_blob(&authority, b"def handler():\n    return 'handler'\n");
         let historical_id = create_fixture_change(
             &graph,
             vec![genesis_id],
@@ -1280,7 +1307,7 @@ mod tests {
             vec![added(0x105, "src/lib.py", historical_hash)],
         );
 
-        let historical = build_graph_at_ref(&graph, &blob_store, &historical_id).unwrap();
+        let historical = build_graph_at_ref_from_graph(&graph, &authority, &historical_id).unwrap();
         let entities = historical.list_all_entities().unwrap();
         assert!(
             entities.iter().any(|entity| entity.name == "handler"),
@@ -1304,13 +1331,12 @@ mod tests {
     fn build_graph_at_ref_never_rewrites_dangling_file_origin_aliases() {
         let graph = InMemoryGraph::new();
         let temp = tempfile::tempdir().unwrap();
-        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
+        let authority = test_authority(temp.path());
 
         let genesis_id = create_fixture_change(&graph, vec![], "genesis", vec![], vec![]);
 
-        let source_hash = blob_store
-            .write(b"def processor():\n    return 'processor'\n")
-            .unwrap();
+        let source_hash =
+            save_source_blob(&authority, b"def processor():\n    return 'processor'\n");
         let mut aliased = test_entity("processor", "lib.py");
         aliased.file_origin = Some(FilePathId::new("lib.py"));
         aliased.span = Some(SourceSpan {
@@ -1326,11 +1352,13 @@ mod tests {
             &graph,
             vec![genesis_id],
             "aliased historical file",
-            vec![EntityDelta::Added(aliased.clone())],
+            vec![EntityDelta::Added {
+                new: aliased.clone(),
+            }],
             vec![added(0x106, "src/lib.py", source_hash)],
         );
 
-        let historical = build_graph_at_ref(&graph, &blob_store, &head_id).unwrap();
+        let historical = build_graph_at_ref_from_graph(&graph, &authority, &head_id).unwrap();
         let processor = historical
             .list_all_entities()
             .unwrap()
@@ -1353,13 +1381,12 @@ mod tests {
     fn build_graph_at_ref_never_rewrites_suffix_path_aliases() {
         let graph = InMemoryGraph::new();
         let temp = tempfile::tempdir().unwrap();
-        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
+        let authority = test_authority(temp.path());
 
         let genesis_id = create_fixture_change(&graph, vec![], "genesis", vec![], vec![]);
 
-        let source_hash = blob_store
-            .write(b"def processor():\n    return 'processor'\n")
-            .unwrap();
+        let source_hash =
+            save_source_blob(&authority, b"def processor():\n    return 'processor'\n");
         let mut aliased = test_entity("processor", "src/lib.py");
         aliased.file_origin = Some(FilePathId::new("src/lib.py"));
         aliased.span = Some(SourceSpan {
@@ -1375,11 +1402,13 @@ mod tests {
             &graph,
             vec![genesis_id],
             "suffix-aliased historical file",
-            vec![EntityDelta::Added(aliased.clone())],
+            vec![EntityDelta::Added {
+                new: aliased.clone(),
+            }],
             vec![added(0x107, "project/src/lib.py", source_hash)],
         );
 
-        let historical = build_graph_at_ref(&graph, &blob_store, &head_id).unwrap();
+        let historical = build_graph_at_ref_from_graph(&graph, &authority, &head_id).unwrap();
         let processor = historical
             .list_all_entities()
             .unwrap()
@@ -1397,7 +1426,7 @@ mod tests {
     fn build_graph_at_ref_enriches_sparse_historical_source_overlap() {
         let graph = InMemoryGraph::new();
         let temp = tempfile::tempdir().unwrap();
-        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
+        let authority = test_authority(temp.path());
 
         let genesis_id = create_fixture_change(&graph, vec![], "genesis", vec![], vec![]);
 
@@ -1408,17 +1437,19 @@ def helper_format(value):\n    return f\"fmt:{{value}}\"\n\n\
 def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
             "# preserved historical context\n".repeat(64)
         );
-        let historical_hash = blob_store.write(historical_source.as_bytes()).unwrap();
+        let historical_hash = save_source_blob(&authority, historical_source.as_bytes());
         let processor = test_entity("processor", "src/lib.py");
         let sparse_id = create_fixture_change(
             &graph,
             vec![genesis_id],
             "sparse imported history",
-            vec![EntityDelta::Added(processor.clone())],
+            vec![EntityDelta::Added {
+                new: processor.clone(),
+            }],
             vec![added(0x108, "src/lib.py", historical_hash)],
         );
 
-        let historical = build_graph_at_ref(&graph, &blob_store, &sparse_id).unwrap();
+        let historical = build_graph_at_ref_from_graph(&graph, &authority, &sparse_id).unwrap();
         let entities = historical.list_all_entities().unwrap();
         assert!(
             entities
@@ -1573,8 +1604,8 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
     fn historical_reads_do_not_reclassify_persisted_entity_roles() {
         let graph = InMemoryGraph::new();
         let temp = tempfile::tempdir().unwrap();
-        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
-        let source_hash = blob_store.write(b"int addReporter(void);").unwrap();
+        let authority = test_authority(temp.path());
+        let source_hash = save_source_blob(&authority, b"int addReporter(void);");
         let mut amalgamated = test_entity("addReporter", "single_include/catch.hpp");
         amalgamated.role = EntityRole::Source;
         let amalgamated_id = amalgamated.id;
@@ -1583,11 +1614,11 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
             &graph,
             vec![],
             "persist exact role",
-            vec![EntityDelta::Added(amalgamated)],
+            vec![EntityDelta::Added { new: amalgamated }],
             vec![added(0x109, "single_include/catch.hpp", source_hash)],
         );
 
-        let historical = build_graph_at_ref(&graph, &blob_store, &change_id).unwrap();
+        let historical = build_graph_at_ref_from_graph(&graph, &authority, &change_id).unwrap();
         let entity = historical.get_entity(&amalgamated_id).unwrap().unwrap();
         assert_eq!(
             EntityRole::Source,
@@ -1698,14 +1729,17 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
             timestamp: Timestamp::now(),
             author: AuthorId::new("test"),
             message: "create".into(),
-            entity_deltas: vec![EntityDelta::Added(victim.clone())],
+            entity_deltas: vec![EntityDelta::Added {
+                new: victim.clone(),
+            }],
             relation_deltas: vec![],
             tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         };
         let remove_change = SemanticChange {
             id: remove_id,
@@ -1713,14 +1747,17 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
             timestamp: Timestamp::now(),
             author: AuthorId::new("test"),
             message: "remove".into(),
-            entity_deltas: vec![EntityDelta::Removed(victim.id)],
+            entity_deltas: vec![EntityDelta::Removed {
+                old: victim.clone(),
+            }],
             relation_deltas: vec![],
             tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         };
 
         let lifecycle = RefLifecycle::from_changes(&[create_change, remove_change]);
@@ -1735,7 +1772,7 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
     fn build_graph_at_ref_reparses_fresh_when_persisted_entity_deleted_at_ref() {
         let graph = InMemoryGraph::new();
         let temp = tempfile::tempdir().unwrap();
-        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
+        let authority = test_authority(temp.path());
 
         let genesis_id = create_fixture_change(&graph, vec![], "genesis", vec![], vec![]);
 
@@ -1747,7 +1784,7 @@ def helper_format(value):\n    return value\n\n\
 def uri_encoder(value):\n    return value\n",
             "# preserved historical context\n".repeat(64)
         );
-        let stale_hash = blob_store.write(stale_source.as_bytes()).unwrap();
+        let stale_hash = save_source_blob(&authority, stale_source.as_bytes());
         let mut victim = test_entity("victim", "src/lib.py");
         // `created_in` participates in change identity, so use a real reachable
         // ancestor rather than manufacturing a self-referential change ID.
@@ -1756,7 +1793,9 @@ def uri_encoder(value):\n    return value\n",
             &graph,
             vec![genesis_id],
             "create victim",
-            vec![EntityDelta::Added(victim.clone())],
+            vec![EntityDelta::Added {
+                new: victim.clone(),
+            }],
             vec![added(0x10a, "src/lib.py", stale_hash)],
         );
 
@@ -1770,16 +1809,18 @@ def helper_format(value):\n    return value\n\n\
 def uri_encoder(value):\n    return value\n",
             "# preserved historical context\n".repeat(64)
         );
-        let new_hash = blob_store.write(new_source.as_bytes()).unwrap();
+        let new_hash = save_source_blob(&authority, new_source.as_bytes());
         let ref_id = create_fixture_change(
             &graph,
             vec![create_id],
             "remove victim, update source",
-            vec![EntityDelta::Removed(victim.id)],
+            vec![EntityDelta::Removed {
+                old: victim.clone(),
+            }],
             vec![modified(0x10a, "src/lib.py", stale_hash, new_hash)],
         );
 
-        let historical = build_graph_at_ref(&graph, &blob_store, &ref_id).unwrap();
+        let historical = build_graph_at_ref_from_graph(&graph, &authority, &ref_id).unwrap();
         let entities = historical.list_all_entities().unwrap();
         assert!(
             entities.iter().all(|entity| entity.id != victim.id),
@@ -1799,12 +1840,12 @@ def uri_encoder(value):\n    return value\n",
     fn build_graph_at_ref_never_routes_basename_collisions_by_path_similarity() {
         let graph = InMemoryGraph::new();
         let temp = tempfile::tempdir().unwrap();
-        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
+        let authority = test_authority(temp.path());
 
         let genesis_id = create_fixture_change(&graph, vec![], "genesis", vec![], vec![]);
 
-        let mod_a = blob_store.write(b"def alpha():\n    return 'a'\n").unwrap();
-        let mod_b = blob_store.write(b"def beta():\n    return 'b'\n").unwrap();
+        let mod_a = save_source_blob(&authority, b"def alpha():\n    return 'a'\n");
+        let mod_b = save_source_blob(&authority, b"def beta():\n    return 'b'\n");
 
         let mut entity_a = test_entity("alpha", "crates/a/src/mod.rs");
         entity_a.file_origin = Some(FilePathId::new("crates/a/src/mod.rs"));
@@ -1822,14 +1863,16 @@ def uri_encoder(value):\n    return value\n",
             &graph,
             vec![genesis_id],
             "collision",
-            vec![EntityDelta::Added(entity_a.clone())],
+            vec![EntityDelta::Added {
+                new: entity_a.clone(),
+            }],
             vec![
                 added(0x10b, "crates/a/src/mod.rs", mod_a),
                 added(0x10c, "crates/b/src/mod.rs", mod_b),
             ],
         );
 
-        let historical = build_graph_at_ref(&graph, &blob_store, &head_id).unwrap();
+        let historical = build_graph_at_ref_from_graph(&graph, &authority, &head_id).unwrap();
         let alpha = historical
             .list_all_entities()
             .unwrap()
@@ -1847,8 +1890,8 @@ def uri_encoder(value):\n    return value\n",
     fn historical_rename_keeps_artifact_identity_without_path_guessing() {
         let graph = InMemoryGraph::new();
         let temp = tempfile::tempdir().unwrap();
-        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
-        let resolver_blob = blob_store.write(b"exact bytes").unwrap();
+        let authority = test_authority(temp.path());
+        let resolver_blob = save_source_blob(&authority, b"exact bytes");
         let stable_id = ArtifactId(uuid::Uuid::from_u128(0xe1));
         let old = located("old/path/file.rs", resolver_blob);
         let new = located("new/path/file.rs", resolver_blob);
@@ -1875,7 +1918,7 @@ def uri_encoder(value):\n    return value\n",
             }],
         );
 
-        let historical = build_graph_at_ref(&graph, &blob_store, &rename_id).unwrap();
+        let historical = build_graph_at_ref_from_graph(&graph, &authority, &rename_id).unwrap();
         assert_eq!(historical.artifact_id_at_path(&new.path), Some(stable_id));
         assert_eq!(
             historical.artifact_id_at_path(&RepoPath::from_utf8("old/path/file.rs").unwrap()),
@@ -1892,13 +1935,13 @@ def uri_encoder(value):\n    return value\n",
     #[test]
     fn blob_reader_fails_loud_when_graph_blob_is_missing() {
         let temp = tempfile::tempdir().unwrap();
-        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
-        let reader = BlobReader::new(&blob_store);
+        let authority = test_authority(temp.path());
+        let reader = BlobReader::new(&authority);
         let missing = kin_blobs::Hash256::from_bytes([0xfe; 32]);
         let path = RepoPath::from_utf8("any/path").unwrap();
         let error = reader.read(&missing, &path).unwrap_err().to_string();
         assert!(
-            error.contains("graph tree references missing or corrupt blob")
+            error.contains("graph tree references missing source blob")
                 && error.contains("any/path"),
             "unexpected error: {error}"
         );
@@ -1908,8 +1951,8 @@ def uri_encoder(value):\n    return value\n",
     fn historical_view_preserves_non_utf8_paths_and_gitlinks_exactly() {
         let graph = InMemoryGraph::new();
         let temp = tempfile::tempdir().unwrap();
-        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
-        let blob_hash = blob_store.write(b"opaque bytes").unwrap();
+        let authority = test_authority(temp.path());
+        let blob_hash = save_source_blob(&authority, b"opaque bytes");
         let byte_path = RepoPath::from_bytes(b"assets/icon-\xff.bin".to_vec()).unwrap();
         let gitlink_path = RepoPath::from_utf8("vendor/runtime").unwrap();
         let blob_id = ArtifactId(uuid::Uuid::from_u128(0x91));
@@ -1933,7 +1976,7 @@ def uri_encoder(value):\n    return value\n",
             ],
         );
 
-        let historical = build_graph_at_ref(&graph, &blob_store, &head).unwrap();
+        let historical = build_graph_at_ref_from_graph(&graph, &authority, &head).unwrap();
         let byte_artifact = historical.resolved_artifact(&blob_id).unwrap();
         assert_eq!(byte_artifact.path, byte_path);
         assert_eq!(byte_artifact.entry, TreeEntry::blob(blob_hash, false));
@@ -1950,9 +1993,9 @@ def uri_encoder(value):\n    return value\n",
     fn historical_path_reuse_keeps_replacement_identity_distinct() {
         let graph = InMemoryGraph::new();
         let temp = tempfile::tempdir().unwrap();
-        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
-        let old_hash = blob_store.write(b"old").unwrap();
-        let new_hash = blob_store.write(b"new").unwrap();
+        let authority = test_authority(temp.path());
+        let old_hash = save_source_blob(&authority, b"old");
+        let new_hash = save_source_blob(&authority, b"new");
         let old_id = ArtifactId(uuid::Uuid::from_u128(0xa1));
         let new_id = ArtifactId(uuid::Uuid::from_u128(0xa2));
         let path = RepoPath::from_utf8("config/runtime.bin").unwrap();
@@ -1986,7 +2029,7 @@ def uri_encoder(value):\n    return value\n",
             ],
         );
 
-        let historical = build_graph_at_ref(&graph, &blob_store, &replace).unwrap();
+        let historical = build_graph_at_ref_from_graph(&graph, &authority, &replace).unwrap();
         assert_eq!(historical.artifact_id_at_path(&path), Some(new_id));
         assert!(historical.resolved_artifact(&old_id).is_none());
         assert!(graph
@@ -2007,11 +2050,11 @@ def uri_encoder(value):\n    return value\n",
     fn merge_state_is_first_parent_relative_with_both_revision_predecessors() {
         let graph = InMemoryGraph::new();
         let temp = tempfile::tempdir().unwrap();
-        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
-        let base_hash = blob_store.write(b"base").unwrap();
-        let first_hash = blob_store.write(b"first").unwrap();
-        let second_hash = blob_store.write(b"second").unwrap();
-        let merged_hash = blob_store.write(b"merged").unwrap();
+        let authority = test_authority(temp.path());
+        let base_hash = save_source_blob(&authority, b"base");
+        let first_hash = save_source_blob(&authority, b"first");
+        let second_hash = save_source_blob(&authority, b"second");
+        let merged_hash = save_source_blob(&authority, b"merged");
         let artifact_id = ArtifactId(uuid::Uuid::from_u128(0xb1));
         let path = RepoPath::from_utf8("compose.yaml").unwrap();
         let state = |hash| LocatedEntry::new(path.clone(), TreeEntry::blob(hash, false));
@@ -2060,7 +2103,7 @@ def uri_encoder(value):\n    return value\n",
             }],
         );
 
-        let historical = build_graph_at_ref(&graph, &blob_store, &merge).unwrap();
+        let historical = build_graph_at_ref_from_graph(&graph, &authority, &merge).unwrap();
         assert_eq!(
             historical.resolved_artifact(&artifact_id).unwrap().entry,
             TreeEntry::blob(merged_hash, false)

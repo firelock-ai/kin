@@ -33,13 +33,10 @@ pub enum KinError {
     #[error("model error: {0}")]
     Model(#[from] kin_model::ModelError),
 
-    #[error("blob error: {0}")]
-    Blob(#[from] kin_blobs::BlobError),
-
     #[error("graph error: {0}")]
     Graph(String),
 
-    #[error("incompatible .kin/ version: found v{found}, this binary supports up to v{supported}")]
+    #[error("incompatible .kin/ version: found v{found}, this binary requires v{supported}")]
     IncompatibleVersion { found: u32, supported: u32 },
 
     #[error("{0}")]
