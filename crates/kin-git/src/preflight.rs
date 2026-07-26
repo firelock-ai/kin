@@ -11,6 +11,7 @@
 //! gitlinks, and never manufactures an admission token.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -61,6 +62,9 @@ pub struct GitMigrationPreflightProof {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitIndexPreflightProof {
+    /// Whether a physical index file existed. Absence is admissible only for a
+    /// truly unborn HEAD whose expected materialized tree is empty.
+    pub present: bool,
     pub at_rest_checksum: Option<GitObjectId>,
     pub raw_file_hash: Hash256,
     pub logical_fingerprint: Hash256,
@@ -135,28 +139,88 @@ pub struct GitMigrationCompatibilityFacts {
     pub checkout_filters: Vec<GitCheckoutFilterFact>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GitRemoteMappingFacts {
     pub remotes: Vec<GitRemoteConfigFact>,
     pub branch_tracking: Vec<GitBranchTrackingFact>,
-    /// True when a later CLI mapper must explicitly translate coexistence
-    /// configuration. Raw URLs and arbitrary Git config are never captured.
-    pub mapper_required: bool,
+    /// Effective repository-local `remote.pushDefault`, if explicitly set.
+    pub remote_push_default: Option<Vec<u8>>,
+    /// Effective repository-local `push.default`, if explicitly set.
+    pub push_default: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl GitRemoteMappingFacts {
+    pub fn is_empty(&self) -> bool {
+        self.remotes.is_empty()
+            && self.branch_tracking.is_empty()
+            && self.remote_push_default.is_none()
+            && self.push_default.is_none()
+    }
+}
+
+impl fmt::Debug for GitRemoteMappingFacts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitRemoteMappingFacts")
+            .field("remote_count", &self.remotes.len())
+            .field("branch_tracking_count", &self.branch_tracking.len())
+            .field(
+                "remote_push_default_present",
+                &self.remote_push_default.is_some(),
+            )
+            .field("push_default_present", &self.push_default.is_some())
+            .field("values", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct GitRemoteConfigFact {
     pub name: Vec<u8>,
-    pub fetch_url_count: usize,
-    pub push_url_count: usize,
+    /// Ordered repository-local `remote.<name>.url` values.
+    pub fetch_urls: Vec<Vec<u8>>,
+    /// Ordered repository-local `remote.<name>.pushurl` values. An empty list
+    /// preserves the explicit absence that makes Git fall back to fetch URLs.
+    pub push_urls: Vec<Vec<u8>>,
+    /// Ordered repository-local `remote.<name>.fetch` refspecs.
+    pub fetch_refspecs: Vec<Vec<u8>>,
+    /// Ordered repository-local `remote.<name>.push` refspecs.
+    pub push_refspecs: Vec<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl fmt::Debug for GitRemoteConfigFact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitRemoteConfigFact")
+            .field("name", &String::from_utf8_lossy(&self.name))
+            .field("fetch_url_count", &self.fetch_urls.len())
+            .field("push_url_count", &self.push_urls.len())
+            .field("fetch_refspec_count", &self.fetch_refspecs.len())
+            .field("push_refspec_count", &self.push_refspecs.len())
+            .field("values", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct GitBranchTrackingFact {
     pub branch: Vec<u8>,
     pub remote: Option<Vec<u8>>,
     pub merge_refs: Vec<Vec<u8>>,
     pub push_remote: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for GitBranchTrackingFact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitBranchTrackingFact")
+            .field("branch", &String::from_utf8_lossy(&self.branch))
+            .field("remote_present", &self.remote.is_some())
+            .field("merge_ref_count", &self.merge_refs.len())
+            .field("push_remote_present", &self.push_remote.is_some())
+            .field("values", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,8 +349,13 @@ fn observe(
         });
     }
 
-    let remote_mapping = remote_mapping_facts(&repo);
-    let index_file = read_strict_index(&repo)?;
+    let remote_mapping = remote_mapping_facts(&repo)?;
+    let absent_index_allowed = matches!(snapshot.head, WorkspaceHead::Symbolic { .. })
+        && plan.workspace_seed.base_target.is_none()
+        && plan.workspace_seed.base_commit_oid.is_none()
+        && plan.workspace_seed.base_tree_hash.is_none()
+        && expected_entries.is_empty();
+    let (index_file, raw_index) = read_strict_index(&repo, absent_index_allowed)?;
     let ambient_repo = open_repo_with_user_ignore_config(&source_worktree)?;
     if stable_path(ambient_repo.git_dir()) != stable_path(repo.git_dir())
         || stable_path(ambient_repo.common_dir()) != stable_path(repo.common_dir())
@@ -295,7 +364,7 @@ fn observe(
             "resolved user ignore configuration opened a different Git repository",
         ));
     }
-    let index = prove_index(&index_file, expected_entries)?;
+    let index = prove_index(&index_file, raw_index.as_deref(), expected_entries)?;
     index_file
         .verify_extensions(true, &repo.objects)
         .map_err(|error| preflight_error(format!("verify Git index extensions: {error}")))?;
@@ -400,7 +469,10 @@ fn expected_index_entries(
     Ok(expected)
 }
 
-fn read_strict_index(repo: &gix::Repository) -> Result<gix::index::File> {
+fn read_strict_index(
+    repo: &gix::Repository,
+    absent_allowed: bool,
+) -> Result<(gix::index::File, Option<Vec<u8>>)> {
     if repo.config_snapshot().boolean("core.sparseCheckout") == Some(true)
         || repo.git_dir().join("info/sparse-checkout").exists()
     {
@@ -409,8 +481,17 @@ fn read_strict_index(repo: &gix::Repository) -> Result<gix::index::File> {
         ));
     }
     let index_path = repo.index_path();
-    let before = fs::read(&index_path).map_err(|error| GitError::io(&index_path, error))?;
-    let index = gix::index::File::at(
+    let before = match fs::symlink_metadata(&index_path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(preflight_error("Git index path is not a regular file"));
+            }
+            Some(fs::read(&index_path).map_err(|error| GitError::io(&index_path, error))?)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && absent_allowed => None,
+        Err(error) => return Err(GitError::io(&index_path, error)),
+    };
+    let index = gix::index::File::at_or_default(
         &index_path,
         repo.object_hash(),
         false,
@@ -420,17 +501,31 @@ fn read_strict_index(repo: &gix::Repository) -> Result<gix::index::File> {
     index
         .verify_entries()
         .map_err(|error| preflight_error(format!("verify Git index entries: {error}")))?;
-    let after = fs::read(&index_path).map_err(|error| GitError::io(&index_path, error))?;
-    if before != after {
-        return Err(preflight_error(
-            "Git index changed while it was being verified",
-        ));
+    match &before {
+        Some(before) => {
+            let after = fs::read(&index_path).map_err(|error| GitError::io(&index_path, error))?;
+            if before != &after {
+                return Err(preflight_error(
+                    "Git index changed while it was being verified",
+                ));
+            }
+        }
+        None => match fs::symlink_metadata(&index_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(preflight_error(
+                    "previously absent Git index appeared while it was being verified",
+                ));
+            }
+            Err(error) => return Err(GitError::io(&index_path, error)),
+        },
     }
-    Ok(index)
+    Ok((index, before))
 }
 
 fn prove_index(
     index: &gix::index::File,
+    raw_file: Option<&[u8]>,
     expected: &BTreeMap<RepoPath, ExpectedIndexEntry>,
 ) -> Result<GitIndexPreflightProof> {
     if index.is_sparse() {
@@ -493,10 +588,12 @@ fn prove_index(
             "index is missing committed path {missing}"
         )));
     }
-    let raw = fs::read(index.path()).map_err(|error| GitError::io(index.path(), error))?;
     Ok(GitIndexPreflightProof {
+        present: raw_file.is_some(),
         at_rest_checksum: index.checksum().map(git_object_id).transpose()?,
-        raw_file_hash: digest(&raw),
+        raw_file_hash: raw_file
+            .map(digest)
+            .unwrap_or_else(|| digest(b"kin.git.preflight.index.absent.v1")),
         logical_fingerprint: logical.finish(),
         entry_count: index.entries().len(),
         sparse: false,
@@ -715,11 +812,23 @@ fn prove_tracked_entry(
                     "gitlink {path} is not materialized as a directory"
                 )));
             }
+            let mut entries =
+                fs::read_dir(absolute_path).map_err(|error| GitError::io(absolute_path, error))?;
+            if entries
+                .next()
+                .transpose()
+                .map_err(|error| GitError::io(absolute_path, error))?
+                .is_some()
+            {
+                return Err(preflight_error(format!(
+                    "gitlink {path} has materialized nested-repository state; exact graph-native nested repository mapping is required before migration"
+                )));
+            }
             state.gitlink_count += 1;
             state.tracked_hash.u64(3);
             state.tracked_hash.bytes(target.as_bytes());
-            // Deliberately do not recurse. A gitlink is a leaf identity naming
-            // another repository, not an invitation to ingest that repository.
+            // An empty placeholder is only the worktree representation of the
+            // graph-owned pointer. Any nested state above fails closed.
         }
     }
     Ok(())
@@ -925,60 +1034,360 @@ fn checkout_filter_facts(repo: &gix::Repository) -> Vec<GitCheckoutFilterFact> {
     facts.into_values().collect()
 }
 
-fn remote_mapping_facts(repo: &gix::Repository) -> GitRemoteMappingFacts {
+fn remote_mapping_facts(repo: &gix::Repository) -> Result<GitRemoteMappingFacts> {
     let config = repo.config_snapshot();
-    let mut remotes = BTreeMap::<Vec<u8>, GitRemoteConfigFact>::new();
-    if let Some(sections) = config.plumbing().sections_by_name("remote") {
-        for section in sections {
-            let Some(name) = section.header().subsection_name() else {
-                continue;
-            };
-            let fact = remotes
-                .entry(name.to_vec())
-                .or_insert_with(|| GitRemoteConfigFact {
-                    name: name.to_vec(),
-                    fetch_url_count: 0,
-                    push_url_count: 0,
-                });
-            fact.fetch_url_count += section.values("url").len();
-            fact.push_url_count += section.values("pushurl").len();
+    let mut remotes = Vec::<GitRemoteConfigFact>::new();
+    let mut branch_tracking = Vec::<GitBranchTrackingFact>::new();
+    let mut remote_push_default = None;
+    let mut push_default = None;
+
+    for section in config.plumbing().sections().filter(|section| {
+        matches!(
+            section.meta().source,
+            gix::config::Source::Local | gix::config::Source::Worktree
+        )
+    }) {
+        let section_name = section
+            .header()
+            .name()
+            .to_str()
+            .map_err(|_| unsafe_git_config("non-UTF-8 section name"))?
+            .to_ascii_lowercase();
+        if section.meta().level != 0 || matches!(section_name.as_str(), "include" | "includeif") {
+            return Err(unsafe_git_config("repository-local include"));
+        }
+
+        match section_name.as_str() {
+            "remote" => {
+                if let Some(name) = section.header().subsection_name() {
+                    validate_safe_identifier(name, "remote name")?;
+                    reject_unknown_config_keys(section, &["url", "pushurl", "fetch", "push"])?;
+                    let fact = remote_fact_mut(&mut remotes, name);
+                    append_explicit_values(
+                        section,
+                        "url",
+                        &mut fact.fetch_urls,
+                        validate_safe_remote_url,
+                    )?;
+                    append_explicit_values(
+                        section,
+                        "pushurl",
+                        &mut fact.push_urls,
+                        validate_safe_remote_url,
+                    )?;
+                    append_explicit_values(section, "fetch", &mut fact.fetch_refspecs, |value| {
+                        validate_safe_refspec(value, gix::refspec::parse::Operation::Fetch)
+                    })?;
+                    append_explicit_values(section, "push", &mut fact.push_refspecs, |value| {
+                        validate_safe_refspec(value, gix::refspec::parse::Operation::Push)
+                    })?;
+                } else {
+                    reject_unknown_config_keys(section, &["pushdefault"])?;
+                    set_unique_explicit_value(
+                        section,
+                        "pushdefault",
+                        &mut remote_push_default,
+                        |value| validate_safe_identifier(value, "remote.pushDefault"),
+                    )?;
+                }
+            }
+            "branch" => {
+                let name = section
+                    .header()
+                    .subsection_name()
+                    .ok_or_else(|| unsafe_git_config("branch section without a name"))?;
+                validate_safe_branch_name(name)?;
+                reject_unknown_config_keys(section, &["remote", "merge", "pushremote"])?;
+                let fact = branch_fact_mut(&mut branch_tracking, name);
+                set_unique_explicit_value(section, "remote", &mut fact.remote, |value| {
+                    validate_safe_identifier(value, "branch remote")
+                })?;
+                append_explicit_values(section, "merge", &mut fact.merge_refs, |value| {
+                    validate_safe_merge_ref(value)
+                })?;
+                set_unique_explicit_value(section, "pushremote", &mut fact.push_remote, |value| {
+                    validate_safe_identifier(value, "branch pushRemote")
+                })?;
+            }
+            "push" => {
+                if section.header().subsection_name().is_some() {
+                    return Err(unsafe_git_config("named push section"));
+                }
+                reject_unknown_config_keys(section, &["default"])?;
+                set_unique_explicit_value(section, "default", &mut push_default, |value| {
+                    validate_push_default(value)
+                })?;
+            }
+            "core" => reject_transfer_core_keys(section)?,
+            "credential" | "http" | "https" | "url" | "protocol" | "transport" | "transfer"
+            | "fetch" | "receive" | "uploadpack" | "ssh" | "submodule" | "lfs" => {
+                return Err(unsafe_git_config("unsupported transfer-affecting section"));
+            }
+            _ => {}
         }
     }
-    let mut branches = BTreeMap::<Vec<u8>, GitBranchTrackingFact>::new();
-    if let Some(sections) = config.plumbing().sections_by_name("branch") {
-        for section in sections {
-            let Some(name) = section.header().subsection_name() else {
-                continue;
-            };
-            let fact = branches
-                .entry(name.to_vec())
-                .or_insert_with(|| GitBranchTrackingFact {
-                    branch: name.to_vec(),
-                    remote: None,
-                    merge_refs: Vec::new(),
-                    push_remote: None,
-                });
-            if let Some(remote) = section.value("remote") {
-                fact.remote = Some(remote.to_vec());
-            }
-            fact.merge_refs.extend(
-                section
-                    .values("merge")
-                    .into_iter()
-                    .map(|value| value.to_vec()),
-            );
-            if let Some(push_remote) = section.value("pushRemote") {
-                fact.push_remote = Some(push_remote.to_vec());
-            }
-        }
-    }
-    let remotes = remotes.into_values().collect::<Vec<_>>();
-    let branch_tracking = branches.into_values().collect::<Vec<_>>();
-    GitRemoteMappingFacts {
-        mapper_required: !remotes.is_empty() || !branch_tracking.is_empty(),
+
+    validate_remote_relationships(&remotes, &branch_tracking, remote_push_default.as_deref())?;
+    Ok(GitRemoteMappingFacts {
         remotes,
         branch_tracking,
+        remote_push_default,
+        push_default,
+    })
+}
+
+fn remote_fact_mut<'a>(
+    remotes: &'a mut Vec<GitRemoteConfigFact>,
+    name: &[u8],
+) -> &'a mut GitRemoteConfigFact {
+    if let Some(position) = remotes.iter().position(|remote| remote.name == name) {
+        return &mut remotes[position];
     }
+    remotes.push(GitRemoteConfigFact {
+        name: name.to_vec(),
+        fetch_urls: Vec::new(),
+        push_urls: Vec::new(),
+        fetch_refspecs: Vec::new(),
+        push_refspecs: Vec::new(),
+    });
+    remotes.last_mut().expect("remote was just inserted")
+}
+
+fn branch_fact_mut<'a>(
+    branches: &'a mut Vec<GitBranchTrackingFact>,
+    name: &[u8],
+) -> &'a mut GitBranchTrackingFact {
+    if let Some(position) = branches.iter().position(|branch| branch.branch == name) {
+        return &mut branches[position];
+    }
+    branches.push(GitBranchTrackingFact {
+        branch: name.to_vec(),
+        remote: None,
+        merge_refs: Vec::new(),
+        push_remote: None,
+    });
+    branches.last_mut().expect("branch was just inserted")
+}
+
+fn reject_unknown_config_keys(
+    section: &gix::config::file::Section<'_>,
+    allowed: &[&str],
+) -> Result<()> {
+    for name in section.value_names() {
+        let name = name.to_string();
+        if !allowed
+            .iter()
+            .any(|allowed| name.eq_ignore_ascii_case(allowed))
+        {
+            return Err(unsafe_git_config(
+                "unsupported transfer-affecting repository-local key",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_transfer_core_keys(section: &gix::config::file::Section<'_>) -> Result<()> {
+    const TRANSFER_KEYS: &[&str] = &[
+        "askpass",
+        "gitproxy",
+        "sshcommand",
+        "httpproxy",
+        "httpcookiefile",
+    ];
+    for name in section.value_names() {
+        let name = name.to_string();
+        if TRANSFER_KEYS
+            .iter()
+            .any(|blocked| name.eq_ignore_ascii_case(blocked))
+        {
+            return Err(unsafe_git_config("unsupported transfer-affecting core key"));
+        }
+    }
+    Ok(())
+}
+
+fn explicit_values(section: &gix::config::file::Section<'_>, key: &str) -> Result<Vec<Vec<u8>>> {
+    let occurrence_count = section
+        .value_names()
+        .filter(|name| name.to_string().eq_ignore_ascii_case(key))
+        .count();
+    let values = section
+        .values(key)
+        .into_iter()
+        .map(|value| value.to_vec())
+        .collect::<Vec<_>>();
+    if occurrence_count != values.len() {
+        return Err(unsafe_git_config(
+            "implicit repository-local transfer value",
+        ));
+    }
+    Ok(values)
+}
+
+fn append_explicit_values(
+    section: &gix::config::file::Section<'_>,
+    key: &str,
+    destination: &mut Vec<Vec<u8>>,
+    validate: impl Fn(&[u8]) -> Result<()>,
+) -> Result<()> {
+    for value in explicit_values(section, key)? {
+        validate(&value)?;
+        destination.push(value);
+    }
+    Ok(())
+}
+
+fn set_unique_explicit_value(
+    section: &gix::config::file::Section<'_>,
+    key: &str,
+    destination: &mut Option<Vec<u8>>,
+    validate: impl Fn(&[u8]) -> Result<()>,
+) -> Result<()> {
+    for value in explicit_values(section, key)? {
+        if destination.is_some() {
+            return Err(unsafe_git_config(
+                "duplicate scalar repository-local transfer value",
+            ));
+        }
+        validate(&value)?;
+        *destination = Some(value);
+    }
+    Ok(())
+}
+
+fn validate_safe_identifier(value: &[u8], label: &str) -> Result<()> {
+    let utf8 = std::str::from_utf8(value)
+        .map_err(|_| unsafe_git_config("non-UTF-8 repository-local transfer value"))?;
+    if utf8.is_empty()
+        || utf8.starts_with('-')
+        || utf8
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(unsafe_git_config(format!("unsafe {label}")));
+    }
+    Ok(())
+}
+
+fn validate_safe_branch_name(value: &[u8]) -> Result<()> {
+    validate_safe_identifier(value, "branch name")?;
+    let mut full = b"refs/heads/".to_vec();
+    full.extend_from_slice(value);
+    gix::validate::reference::name(full.as_bstr())
+        .map_err(|_| unsafe_git_config("invalid branch name"))?;
+    Ok(())
+}
+
+fn validate_safe_remote_url(value: &[u8]) -> Result<()> {
+    std::str::from_utf8(value).map_err(|_| unsafe_git_config("non-UTF-8 Git remote URL"))?;
+    if value.is_empty()
+        || value.starts_with(b"-")
+        || value
+            .iter()
+            .any(|byte| byte.is_ascii_control() || matches!(byte, b'?' | b'#'))
+    {
+        return Err(unsafe_git_config("unsafe Git remote URL"));
+    }
+    let parsed = gix::Url::try_from(value.as_bstr())
+        .map_err(|_| unsafe_git_config("unparseable Git remote URL"))?;
+    if parsed.user.is_some() || parsed.password.is_some() {
+        return Err(unsafe_git_config(
+            "credential or userinfo in Git remote URL",
+        ));
+    }
+    match parsed.scheme {
+        gix::url::Scheme::File => {}
+        gix::url::Scheme::Git
+        | gix::url::Scheme::Ssh
+        | gix::url::Scheme::Http
+        | gix::url::Scheme::Https => {
+            if parsed.host.as_deref().is_none_or(str::is_empty) {
+                return Err(unsafe_git_config("network Git remote URL without a host"));
+            }
+        }
+        gix::url::Scheme::Ext(_) => {
+            return Err(unsafe_git_config("unsupported custom Git remote scheme"));
+        }
+    }
+    if parsed.path_argument_safe().is_none() {
+        return Err(unsafe_git_config("unsafe Git remote path"));
+    }
+    Ok(())
+}
+
+fn validate_safe_refspec(value: &[u8], operation: gix::refspec::parse::Operation) -> Result<()> {
+    std::str::from_utf8(value).map_err(|_| unsafe_git_config("non-UTF-8 Git refspec"))?;
+    if value
+        .iter()
+        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(unsafe_git_config("unsafe Git refspec"));
+    }
+    gix::refspec::parse(value.as_bstr(), operation)
+        .map_err(|_| unsafe_git_config("invalid Git refspec"))?;
+    Ok(())
+}
+
+fn validate_safe_merge_ref(value: &[u8]) -> Result<()> {
+    std::str::from_utf8(value).map_err(|_| unsafe_git_config("non-UTF-8 branch merge ref"))?;
+    gix::validate::reference::name(value.as_bstr())
+        .map_err(|_| unsafe_git_config("invalid branch merge ref"))?;
+    Ok(())
+}
+
+fn validate_push_default(value: &[u8]) -> Result<()> {
+    std::str::from_utf8(value).map_err(|_| unsafe_git_config("non-UTF-8 push.default"))?;
+    if !matches!(
+        value,
+        b"nothing" | b"current" | b"upstream" | b"simple" | b"matching"
+    ) {
+        return Err(unsafe_git_config("unsupported push.default"));
+    }
+    Ok(())
+}
+
+fn validate_remote_relationships(
+    remotes: &[GitRemoteConfigFact],
+    branches: &[GitBranchTrackingFact],
+    remote_push_default: Option<&[u8]>,
+) -> Result<()> {
+    let remote_names = remotes
+        .iter()
+        .map(|remote| remote.name.as_slice())
+        .collect::<BTreeSet<_>>();
+    let known_remote = |candidate: &[u8]| candidate == b"." || remote_names.contains(candidate);
+    if remote_push_default.is_some_and(|name| !known_remote(name)) {
+        return Err(unsafe_git_config(
+            "remote.pushDefault names an unknown remote",
+        ));
+    }
+    for branch in branches {
+        if branch
+            .remote
+            .as_deref()
+            .is_some_and(|name| !known_remote(name))
+            || branch
+                .push_remote
+                .as_deref()
+                .is_some_and(|name| !known_remote(name))
+        {
+            return Err(unsafe_git_config("branch tracking names an unknown remote"));
+        }
+        if !branch.merge_refs.is_empty() && branch.remote.is_none() {
+            return Err(unsafe_git_config(
+                "branch merge refs require an explicit remote",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn unsafe_git_config(reason: impl Into<String>) -> GitError {
+    preflight_error(format!(
+        "repository-local Git transport configuration is outside Kin's safe exact subset ({})",
+        reason.into()
+    ))
 }
 
 fn fingerprint_snapshot(snapshot: &LosslessGitRepository) -> Hash256 {
@@ -1037,10 +1446,11 @@ fn fingerprint_plan(plan: &SemanticGitImportPlan) -> Result<Hash256> {
 }
 
 fn fingerprint_proof(proof: &GitMigrationPreflightProof) -> Hash256 {
-    let mut hash = FramedHash::new(b"kin.git.migration-preflight-proof.v1");
+    let mut hash = FramedHash::new(b"kin.git.migration-preflight-proof.v2");
     hash.bytes(proof.repository_id.as_str().as_bytes());
     hash.bytes(proof.snapshot_fingerprint.as_bytes());
     hash.bytes(proof.semantic_plan_fingerprint.as_bytes());
+    hash.u64(u64::from(proof.index.present));
     hash.bytes(proof.index.raw_file_hash.as_bytes());
     hash.bytes(proof.index.logical_fingerprint.as_bytes());
     hash.bytes(proof.tracked_worktree.fingerprint.as_bytes());
@@ -1048,8 +1458,10 @@ fn fingerprint_proof(proof: &GitMigrationPreflightProof) -> Hash256 {
     hash.u64(proof.remote_mapping.remotes.len() as u64);
     for remote in &proof.remote_mapping.remotes {
         hash.bytes(&remote.name);
-        hash.u64(remote.fetch_url_count as u64);
-        hash.u64(remote.push_url_count as u64);
+        encode_byte_values(&mut hash, &remote.fetch_urls);
+        encode_byte_values(&mut hash, &remote.push_urls);
+        encode_byte_values(&mut hash, &remote.fetch_refspecs);
+        encode_byte_values(&mut hash, &remote.push_refspecs);
     }
     hash.u64(proof.remote_mapping.branch_tracking.len() as u64);
     for branch in &proof.remote_mapping.branch_tracking {
@@ -1061,7 +1473,19 @@ fn fingerprint_proof(proof: &GitMigrationPreflightProof) -> Hash256 {
         }
         encode_optional_bytes(&mut hash, branch.push_remote.as_deref());
     }
+    encode_optional_bytes(
+        &mut hash,
+        proof.remote_mapping.remote_push_default.as_deref(),
+    );
+    encode_optional_bytes(&mut hash, proof.remote_mapping.push_default.as_deref());
     hash.finish()
+}
+
+fn encode_byte_values(hash: &mut FramedHash, values: &[Vec<u8>]) {
+    hash.u64(values.len() as u64);
+    for value in values {
+        hash.bytes(value);
+    }
 }
 
 fn open_repo_with_user_ignore_config(path: &Path) -> Result<gix::Repository> {
@@ -1509,12 +1933,6 @@ mod tests {
                 ],
             );
             commit(&repo, "add gitlink leaf");
-            fs::write(
-                repo.join("vendor/dependency/.git"),
-                b"gitdir: deliberately-not-opened\n",
-            )
-            .expect("nested git marker");
-            fs::write(repo.join("vendor/dependency/dirty.txt"), b"outside\n").expect("nested dirt");
 
             fs::create_dir_all(repo.join("ignored")).expect("ignored directory");
             fs::write(repo.join("ignored/cache.bin"), b"cache\n").expect("ignored cache");
@@ -1541,7 +1959,17 @@ mod tests {
                     "remote",
                     "add",
                     "origin",
-                    "https://secret-token@example.invalid/private/repo.git",
+                    "https://example.invalid/private/repo.git",
+                ],
+            );
+            git(
+                &repo,
+                &[
+                    "remote",
+                    "set-url",
+                    "--add",
+                    "origin",
+                    "https://mirror.example.invalid/private/repo.git",
                 ],
             );
             git(
@@ -1554,8 +1982,40 @@ mod tests {
                     "ssh://example.invalid/private/repo.git",
                 ],
             );
+            git(
+                &repo,
+                &[
+                    "remote",
+                    "set-url",
+                    "--add",
+                    "--push",
+                    "origin",
+                    "ssh://mirror.example.invalid/private/repo.git",
+                ],
+            );
+            git(
+                &repo,
+                &[
+                    "config",
+                    "--add",
+                    "remote.origin.fetch",
+                    "+refs/tags/*:refs/tags/*",
+                ],
+            );
+            git(
+                &repo,
+                &[
+                    "config",
+                    "--add",
+                    "remote.origin.push",
+                    "refs/heads/main:refs/heads/main",
+                ],
+            );
             git(&repo, &["config", "branch.main.remote", "origin"]);
             git(&repo, &["config", "branch.main.merge", "refs/heads/main"]);
+            git(&repo, &["config", "branch.main.pushRemote", "origin"]);
+            git(&repo, &["config", "remote.pushDefault", "origin"]);
+            git(&repo, &["config", "push.default", "simple"]);
 
             let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
             let (snapshot, plan) = snapshot_plan(&repo, &store);
@@ -1574,7 +2034,7 @@ mod tests {
     }
 
     #[test]
-    fn proves_clean_polyglot_non_code_raw_path_and_gitlink_workspace() {
+    fn proves_clean_polyglot_non_code_raw_path_and_unmaterialized_gitlink_workspace() {
         let fixture = Fixture::clean();
         let proof = fixture.preflight().expect("clean preflight");
 
@@ -1616,21 +2076,78 @@ mod tests {
         assert!(proof.compatibility.other_registered_worktrees.is_empty());
         assert!(proof.compatibility.local_hooks.is_empty());
         assert!(proof.compatibility.checkout_filters.is_empty());
-        assert!(proof.remote_mapping.mapper_required);
         assert_eq!(proof.remote_mapping.remotes.len(), 1);
         assert_eq!(proof.remote_mapping.remotes[0].name, b"origin");
-        assert_eq!(proof.remote_mapping.remotes[0].fetch_url_count, 1);
-        assert_eq!(proof.remote_mapping.remotes[0].push_url_count, 1);
+        assert_eq!(
+            proof.remote_mapping.remotes[0].fetch_urls,
+            vec![
+                b"https://example.invalid/private/repo.git".to_vec(),
+                b"https://mirror.example.invalid/private/repo.git".to_vec(),
+            ]
+        );
+        assert_eq!(
+            proof.remote_mapping.remotes[0].push_urls,
+            vec![
+                b"ssh://example.invalid/private/repo.git".to_vec(),
+                b"ssh://mirror.example.invalid/private/repo.git".to_vec(),
+            ]
+        );
+        assert_eq!(
+            proof.remote_mapping.remotes[0].fetch_refspecs,
+            vec![
+                b"+refs/heads/*:refs/remotes/origin/*".to_vec(),
+                b"+refs/tags/*:refs/tags/*".to_vec(),
+            ]
+        );
+        assert_eq!(
+            proof.remote_mapping.remotes[0].push_refspecs,
+            vec![b"refs/heads/main:refs/heads/main".to_vec()]
+        );
         assert_eq!(proof.remote_mapping.branch_tracking.len(), 1);
+        assert_eq!(
+            proof.remote_mapping.branch_tracking[0].remote,
+            Some(b"origin".to_vec())
+        );
         assert_eq!(
             proof.remote_mapping.branch_tracking[0].merge_refs,
             vec![b"refs/heads/main".to_vec()]
         );
-        assert!(!format!("{proof:?}").contains("secret-token"));
+        assert_eq!(
+            proof.remote_mapping.branch_tracking[0].push_remote,
+            Some(b"origin".to_vec())
+        );
+        assert_eq!(
+            proof.remote_mapping.remote_push_default,
+            Some(b"origin".to_vec())
+        );
+        assert_eq!(proof.remote_mapping.push_default, Some(b"simple".to_vec()));
+        let debug = format!("{proof:?}");
+        assert!(!debug.contains("example.invalid"));
+        assert!(!debug.contains("refs/heads/main"));
+        assert!(debug.contains("<redacted>"));
         assert_ne!(
             proof.observation_fingerprint,
             digest(b"kin.git.preflight.unset")
         );
+    }
+
+    #[test]
+    fn rejects_materialized_gitlink_state_instead_of_silently_skipping_it() {
+        let nested_marker = Fixture::clean();
+        fs::write(
+            nested_marker.repo.join("vendor/dependency/.git"),
+            b"gitdir: nested-admin\n",
+        )
+        .expect("nested marker");
+        assert_preflight_contains(&nested_marker, "materialized nested-repository state");
+
+        let nested_worktree = Fixture::clean();
+        fs::write(
+            nested_worktree.repo.join("vendor/dependency/dirty.txt"),
+            b"unmapped nested worktree\n",
+        )
+        .expect("nested file");
+        assert_preflight_contains(&nested_worktree, "materialized nested-repository state");
     }
 
     #[test]
@@ -1926,6 +2443,187 @@ mod tests {
     }
 
     #[test]
+    fn remote_value_drift_with_unchanged_counts_invalidates_preflight() {
+        let fixture = Fixture::clean();
+        let repo = fixture.repo.clone();
+        let error = preflight_git_migration_with_hook(
+            &fixture.repo,
+            &fixture.snapshot,
+            &fixture.plan,
+            &fixture.store,
+            move || {
+                git(&repo, &["config", "--unset-all", "remote.origin.url"]);
+                git(
+                    &repo,
+                    &[
+                        "config",
+                        "--add",
+                        "remote.origin.url",
+                        "https://changed.example.invalid/private/repo.git",
+                    ],
+                );
+                git(
+                    &repo,
+                    &[
+                        "config",
+                        "--add",
+                        "remote.origin.url",
+                        "https://mirror.example.invalid/private/repo.git",
+                    ],
+                );
+            },
+        )
+        .expect_err("same-count URL drift must invalidate the proof");
+        let message = error.to_string();
+        assert!(message.contains("changed during migration preflight"));
+        assert!(!message.contains("changed.example.invalid"));
+    }
+
+    #[test]
+    fn rejects_credentials_custom_schemes_and_transfer_overrides_without_disclosure() {
+        let cases = [
+            (
+                "remote.origin.url",
+                "https://super-secret@example.invalid/private/repo.git",
+                "super-secret",
+            ),
+            (
+                "remote.origin.url",
+                "https://example.invalid/repo.git?token=super-secret",
+                "super-secret",
+            ),
+            (
+                "remote.origin.url",
+                "https://example.invalid/repo.git#super-secret",
+                "super-secret",
+            ),
+            (
+                "remote.origin.url",
+                "credential-helper://example.invalid/super-secret",
+                "super-secret",
+            ),
+            ("credential.helper", "!super-secret", "super-secret"),
+            (
+                "http.extraHeader",
+                "Authorization: super-secret",
+                "super-secret",
+            ),
+            ("remote.origin.uploadpack", "super-secret", "super-secret"),
+        ];
+
+        for (case_index, (key, value, secret)) in cases.into_iter().enumerate() {
+            let (temp, repo) = config_only_repository();
+            git(
+                &repo,
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://example.invalid/repo.git",
+                ],
+            );
+            git(&repo, &["config", "--replace-all", key, value]);
+            let error = match remote_mapping_facts(&open_repo(&repo).expect("open config fixture"))
+            {
+                Ok(_) => panic!("unsafe transport config case {case_index} must reject"),
+                Err(error) => error,
+            };
+            let message = error.to_string();
+            assert!(message.contains("safe exact subset"), "{message}");
+            assert!(!message.contains(secret), "secret leaked in {message}");
+            drop(temp);
+        }
+
+        let (temp, repo) = config_only_repository();
+        git(
+            &repo,
+            &[
+                "config",
+                "url.https://rewritten.example.invalid/.insteadOf",
+                "https://example.invalid/",
+            ],
+        );
+        let error = remote_mapping_facts(&open_repo(&repo).expect("open rewrite fixture"))
+            .expect_err("URL rewrite must reject");
+        assert!(error.to_string().contains("safe exact subset"));
+        drop(temp);
+
+        let (temp, repo) = config_only_repository();
+        let included = temp.path().join("included-config");
+        fs::write(
+            &included,
+            b"[remote \"hidden\"]\nurl = https://example.invalid/\n",
+        )
+        .expect("included config");
+        git(
+            &repo,
+            &[
+                "config",
+                "include.path",
+                included.to_str().expect("UTF-8 test path"),
+            ],
+        );
+        let error = remote_mapping_facts(&open_repo(&repo).expect("open include fixture"))
+            .expect_err("local include must reject");
+        assert!(error.to_string().contains("safe exact subset"));
+    }
+
+    #[test]
+    fn rejects_non_utf8_remote_names_and_values() {
+        let (_temp, repo) = config_only_repository();
+        let config_path = repo.join(".git/config");
+        let mut config = fs::OpenOptions::new()
+            .append(true)
+            .open(&config_path)
+            .expect("open local config");
+        config
+            .write_all(b"\n[remote \"raw-\xff\"]\n\turl = https://example.invalid/repo.git\n")
+            .expect("append raw config");
+        drop(config);
+
+        let outcome = open_repo(&repo).and_then(|repo| remote_mapping_facts(&repo));
+        assert!(outcome.is_err(), "non-UTF-8 remote name must fail closed");
+    }
+
+    #[test]
+    fn absent_index_is_admitted_only_for_a_truly_unborn_empty_workspace() {
+        let (temp, repo) = config_only_repository();
+        assert!(!repo.join(".git/index").exists());
+        let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
+        let (snapshot, plan) = snapshot_plan(&repo, &store);
+
+        let proof =
+            preflight_git_migration(&repo, &snapshot, &plan, &store).expect("unborn preflight");
+        assert!(!proof.index.present);
+        assert_eq!(proof.index.entry_count, 0);
+        assert!(proof.base_target.is_none());
+        assert!(proof.base_commit_oid.is_none());
+        assert!(proof.base_tree_hash.is_none());
+
+        let (born_temp, born_repo) = config_only_repository();
+        git(
+            &born_repo,
+            &[
+                "commit",
+                "--allow-empty",
+                "--no-gpg-sign",
+                "-m",
+                "born empty",
+            ],
+        );
+        assert!(born_repo.join(".git/index").is_file());
+        let born_store = BlobStore::new(born_temp.path().join("cas")).expect("born blob store");
+        let (born_snapshot, born_plan) = snapshot_plan(&born_repo, &born_store);
+        assert!(born_plan.workspace_seed.base_target.is_some());
+        assert!(born_plan.workspace_seed.base_tree_hash.is_some());
+        assert!(born_plan.workspace_seed.base_tree.is_empty());
+        fs::remove_file(born_repo.join(".git/index")).expect("remove born empty index");
+        let error = preflight_git_migration(&born_repo, &born_snapshot, &born_plan, &born_store)
+            .expect_err("born empty repository without an index must reject");
+        assert!(error.to_string().contains("index"));
+    }
+
+    #[test]
     fn fails_when_source_or_local_ignore_inputs_change_during_preflight() {
         let source_change = Fixture::clean();
         let repo = source_change.repo.clone();
@@ -1973,6 +2671,15 @@ mod tests {
             capture_lossless_git_repository(repo, repository_id, store).expect("capture");
         let plan = plan_semantic_git_import(&snapshot, store).expect("plan");
         (snapshot, plan)
+    }
+
+    fn config_only_repository() -> (TempDir, PathBuf) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("source");
+        fs::create_dir(&repo).expect("source directory");
+        git(&repo, &["init", "--initial-branch=main"]);
+        configure_identity(&repo);
+        (temp, repo)
     }
 
     fn assert_preflight_contains(fixture: &Fixture, expected: &str) {
