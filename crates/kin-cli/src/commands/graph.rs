@@ -4,9 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
-use kin_model::{
-    Entity, EntityId, EntityKind, EntityRole, EntityStore, FilePathId, GraphStore, RelationKind,
-};
+use kin_model::{Entity, EntityId, EntityKind, EntityRole, EntityStore, GraphStore, RelationKind};
 use serde::{Deserialize, Serialize};
 
 use super::graph_health::inspect_graph;
@@ -903,9 +901,9 @@ mod tests {
     use super::*;
     use kin_model::{
         ArtifactId, AuthorId, Branch, BranchName, ChangeStore, Entity, EntityDelta, EntityMetadata,
-        FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, LocatedEntry, Relation, RelationId,
-        RelationOrigin, RepoPath, SemanticChange, SemanticChangeId, SemanticFingerprint,
-        SourceSpan, Timestamp, TreeDelta, TreeEntry, Visibility,
+        FilePathId, FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, LocatedEntry, Relation,
+        RelationId, RelationOrigin, RepoPath, SemanticChange, SemanticChangeId,
+        SemanticFingerprint, SourceSpan, Timestamp, TreeDelta, TreeEntry, Visibility,
     };
     use std::fs;
 
