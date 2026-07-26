@@ -59,6 +59,22 @@ impl RootBundle {
         }
         Ok(())
     }
+
+    /// Whether two authority bundles name the same replicated repository truth.
+    ///
+    /// `generation` advances for every repository transaction, including
+    /// local-only workspace transitions, and `local_state` deliberately roots
+    /// workspace/session/overlay authority. Neither field participates in
+    /// replica truth equality. Schema version and every replicated partition
+    /// remain exact.
+    pub fn has_same_replicated_truth(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.history == other.history
+            && self.ref_state == other.ref_state
+            && self.ref_log == other.ref_log
+            && self.collaboration == other.collaboration
+            && self.replication == other.replication
+    }
 }
 
 /// VFS/projection binding for one exact workspace snapshot.
@@ -969,6 +985,40 @@ mod tests {
             collaboration: root(4),
             replication: root(5),
             local_state: root(6),
+        }
+    }
+
+    #[test]
+    fn replicated_truth_equality_excludes_generation_and_local_state_only() {
+        let expected = roots();
+        let mut local_only = expected.clone();
+        local_only.generation = expected.generation + 9;
+        local_only.local_state = root(0x70);
+        assert!(expected.has_same_replicated_truth(&local_only));
+        assert_ne!(expected, local_only);
+
+        let mut variants = Vec::new();
+        let mut version = expected.clone();
+        version.version += 1;
+        variants.push(version);
+        let mut history = expected.clone();
+        history.history = root(0x71);
+        variants.push(history);
+        let mut ref_state = expected.clone();
+        ref_state.ref_state = root(0x72);
+        variants.push(ref_state);
+        let mut ref_log = expected.clone();
+        ref_log.ref_log = root(0x73);
+        variants.push(ref_log);
+        let mut collaboration = expected.clone();
+        collaboration.collaboration = root(0x74);
+        variants.push(collaboration);
+        let mut replication = expected.clone();
+        replication.replication = root(0x75);
+        variants.push(replication);
+
+        for changed in variants {
+            assert!(!expected.has_same_replicated_truth(&changed));
         }
     }
 
