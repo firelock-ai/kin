@@ -3299,11 +3299,12 @@ impl ProjectionRoot {
 
     fn open_existing_for_freeze(root: &Path, lock_deadline: std::time::Duration) -> Result<Self> {
         let capability = open_projection_root_nofollow(root)?;
+        let display_projection_control = root.join(".kin");
         let kin_control = open_directory_nofollow(&capability, std::ffi::OsStr::new(".kin"))
-            .map_err(|error| KinError::io(root.join(".kin"), error))?;
+            .map_err(|error| KinError::io(&display_projection_control, error))?;
         let kin_control_identity = tracked_open_directory_identity(&kin_control)
-            .map_err(|error| KinError::io(root.join(".kin"), error))?;
-        let display_control = root.join(".kin").join(RECONCILIATION_CONTROL_DIRECTORY);
+            .map_err(|error| KinError::io(&display_projection_control, error))?;
+        let display_control = display_projection_control.join(RECONCILIATION_CONTROL_DIRECTORY);
         let control = open_directory_nofollow(
             &kin_control,
             std::ffi::OsStr::new(RECONCILIATION_CONTROL_DIRECTORY),
@@ -3325,6 +3326,9 @@ impl ProjectionRoot {
             projection_lock,
             projection_lock_identity,
             display_root: root.to_path_buf(),
+            projection_control_name: std::ffi::OsString::from(".kin"),
+            display_projection_control,
+            repository_authority_kindb: Some(root.join(".kin").join("kindb")),
             kin_control_identity,
             control_identity,
             authority_key,
