@@ -10,30 +10,33 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-use crate::ids::{ContractId, EntityId, FilePathId, Hash256, SemanticChangeId, SessionId};
+use crate::ids::{
+    ContractId, EntityId, FilePathId, Hash256, RepositoryId, SemanticChangeId, SessionId,
+};
 use crate::relation::{RelationKind, RelationOrigin};
 use crate::session::{SessionCapabilities, SessionTransport};
 use crate::timestamp::Timestamp;
 use crate::work::WorkId;
+use crate::{RefName, RefTarget};
 
 /// Routable identity for a Kin graph.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GraphLocator {
     pub authority: String,
     pub organization_id: String,
-    pub repo_id: String,
+    pub repo_id: RepositoryId,
 }
 
 impl GraphLocator {
     pub fn new(
         authority: impl Into<String>,
         organization_id: impl Into<String>,
-        repo_id: impl Into<String>,
+        repo_id: RepositoryId,
     ) -> Self {
         Self {
             authority: authority.into().trim_end_matches('/').to_string(),
             organization_id: organization_id.into(),
-            repo_id: repo_id.into(),
+            repo_id,
         }
     }
 
@@ -149,8 +152,8 @@ pub struct GraphCapabilitySet {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphManifest {
     pub graph: GraphLocator,
-    pub default_branch: String,
-    pub head_change: Option<SemanticChangeId>,
+    pub default_ref: Option<RefName>,
+    pub head_target: Option<RefTarget>,
     pub graph_root_hash: Option<Hash256>,
     pub published_at: Timestamp,
     pub protocol_version: String,
@@ -165,13 +168,8 @@ pub struct SessionLease {
     pub graph: GraphLocator,
     pub transport: SessionTransport,
     pub capabilities: SessionCapabilities,
-    #[serde(default = "default_fence_epoch")]
     pub fence_epoch: u64,
     pub expires_at: Timestamp,
-}
-
-fn default_fence_epoch() -> u64 {
-    1
 }
 
 /// Cross-graph relation categories.
@@ -332,7 +330,11 @@ mod tests {
 
     #[test]
     fn graph_locator_roundtrip() {
-        let locator = GraphLocator::new("https://kinlab.example.com", "acme", "repo-1");
+        let locator = GraphLocator::new(
+            "https://kinlab.example.com",
+            "acme",
+            RepositoryId::new("repo-1").unwrap(),
+        );
         let json = serde_json::to_string(&locator).unwrap();
         let parsed: GraphLocator = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, locator);
@@ -344,7 +346,11 @@ mod tests {
 
     #[test]
     fn scope_ref_roundtrip() {
-        let graph = GraphLocator::new("https://kinlab.example.com", "acme", "repo-1");
+        let graph = GraphLocator::new(
+            "https://kinlab.example.com",
+            "acme",
+            RepositoryId::new("repo-1").unwrap(),
+        );
         let scope = ScopeRef::Work {
             graph,
             work_id: WorkId::new(),
@@ -372,11 +378,17 @@ mod tests {
 
     #[test]
     fn graph_manifest_roundtrip() {
-        let graph = GraphLocator::new("https://kinlab.example.com", "acme", "repo-1");
+        let graph = GraphLocator::new(
+            "https://kinlab.example.com",
+            "acme",
+            RepositoryId::new("repo-1").unwrap(),
+        );
         let manifest = GraphManifest {
             graph,
-            default_branch: "main".into(),
-            head_change: Some(SemanticChangeId::from_hash(Hash256::from_bytes([1; 32]))),
+            default_ref: Some(RefName::branch(b"main").unwrap()),
+            head_target: Some(RefTarget::change(SemanticChangeId::from_hash(
+                Hash256::from_bytes([1; 32]),
+            ))),
             graph_root_hash: Some(Hash256::from_bytes([2; 32])),
             published_at: Timestamp::now(),
             protocol_version: "1".into(),
@@ -392,13 +404,20 @@ mod tests {
         let json = serde_json::to_string(&manifest).unwrap();
         let parsed: GraphManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.graph, manifest.graph);
-        assert_eq!(parsed.default_branch, "main");
+        assert_eq!(
+            parsed.default_ref.unwrap(),
+            RefName::branch(b"main").unwrap()
+        );
         assert_eq!(parsed.protocol_version, "1");
     }
 
     #[test]
     fn session_lease_roundtrip() {
-        let graph = GraphLocator::new("https://kinlab.example.com", "acme", "repo-1");
+        let graph = GraphLocator::new(
+            "https://kinlab.example.com",
+            "acme",
+            RepositoryId::new("repo-1").unwrap(),
+        );
         let lease = SessionLease {
             session_id: SessionId::new(),
             actor: ActorRef::new("https://kinlab.example.com", "actor-1"),
@@ -416,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn session_lease_defaults_fence_epoch_for_legacy_payloads() {
+    fn session_lease_requires_fence_epoch() {
         let lease_json = serde_json::json!({
             "session_id": SessionId::new(),
             "actor": {
@@ -433,13 +452,16 @@ mod tests {
             "expires_at": Timestamp::now(),
         });
 
-        let parsed: SessionLease = serde_json::from_value(lease_json).unwrap();
-        assert_eq!(parsed.fence_epoch, 1);
+        assert!(serde_json::from_value::<SessionLease>(lease_json).is_err());
     }
 
     #[test]
     fn remote_relation_roundtrip() {
-        let graph = GraphLocator::new("https://kinlab.example.com", "acme", "repo-1");
+        let graph = GraphLocator::new(
+            "https://kinlab.example.com",
+            "acme",
+            RepositoryId::new("repo-1").unwrap(),
+        );
         let relation = RemoteRelation::new(
             "rel-1",
             RemoteRelationKind::DependsOn,

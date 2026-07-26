@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use crate::branch::Branch;
-use crate::change::{ArtifactDeltaKind, SemanticChange, SourceEntryKind, TransactionDelta};
+use crate::change::{ResolvedTree, SemanticChange, TransactionDelta, TreeEntry};
 use crate::entity::{Entity, EntityKind, EntityRole};
 use crate::error::ModelError;
 use crate::ids::*;
@@ -25,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 // subset of GraphStore.
 // ===========================================================================
 
-/// Core entity and relation CRUD plus graph traversal operations.
+/// Core entity, relation, and repository-tree operations.
 pub trait EntityStore: Send + Sync {
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -123,16 +122,11 @@ pub trait EntityStore: Send + Sync {
         &self,
     ) -> std::result::Result<Vec<crate::layout::OpaqueArtifact>, Self::Error>;
     fn delete_opaque_artifact(&self, file_id: &FilePathId) -> std::result::Result<(), Self::Error>;
-    /// Resolve a tracked file path to its graph-assigned `ArtifactId` via the
-    /// graph's artifact index, if the path is tracked. The default returns
-    /// `None` for stores that do not maintain an artifact index; the in-memory
-    /// graph overrides this with the real lookup so generic `GraphStore`
-    /// consumers obtain graph-assigned identity instead of re-deriving it from
-    /// the path (path derivation is deprecated — the graph owns artifact
-    /// identity).
-    fn artifact_id_for_path(&self, _path: &FilePathId) -> Option<crate::ArtifactId> {
-        None
-    }
+    /// Resolve an exact tracked path through graph-owned repository state.
+    ///
+    /// This is lookup-only. Artifact identities are assigned by explicit
+    /// admission/tree transactions, never by a path query.
+    fn artifact_id_at_path(&self, path: &crate::RepoPath) -> Option<crate::ArtifactId>;
     fn upsert_file_layout(
         &self,
         layout: &crate::layout::FileLayout,
@@ -143,42 +137,20 @@ pub trait EntityStore: Send + Sync {
     ) -> std::result::Result<Option<crate::layout::FileLayout>, Self::Error>;
     fn list_file_layouts(&self)
         -> std::result::Result<Vec<crate::layout::FileLayout>, Self::Error>;
-    fn get_file_hash(
+    fn get_tree_entry(
         &self,
         file_id: &FilePathId,
-    ) -> std::result::Result<Option<Hash256>, Self::Error>;
+    ) -> std::result::Result<Option<TreeEntry>, Self::Error>;
     fn delete_file_layout(&self, file_id: &FilePathId) -> std::result::Result<(), Self::Error>;
 
-    /// Apply multiple transactional mutations atomically to the graph store.
+    /// Apply entity, relation, and repository-tree mutations atomically.
+    ///
+    /// There is intentionally no partial default implementation: every store
+    /// must account for all three delta classes in one transaction.
     fn apply_transaction_delta(
         &self,
         delta: &TransactionDelta,
-    ) -> std::result::Result<(), Self::Error> {
-        for ent_delta in &delta.entity_deltas {
-            match ent_delta {
-                crate::change::EntityDelta::Added(entity) => {
-                    self.upsert_entity(entity)?;
-                }
-                crate::change::EntityDelta::Modified { old: _, new } => {
-                    self.upsert_entity(new)?;
-                }
-                crate::change::EntityDelta::Removed(id) => {
-                    self.remove_entity(id)?;
-                }
-            }
-        }
-        for rel_delta in &delta.relation_deltas {
-            match rel_delta {
-                crate::change::RelationDelta::Added(relation) => {
-                    self.upsert_relation(relation)?;
-                }
-                crate::change::RelationDelta::Removed(id) => {
-                    self.remove_relation(id)?;
-                }
-            }
-        }
-        Ok(())
-    }
+    ) -> std::result::Result<(), Self::Error>;
 
     /// Batch-insert entities with a single lock acquisition and one deferred
     /// text-index refresh.  The default falls back to per-entity `upsert_entity`.
@@ -245,7 +217,7 @@ pub trait EntityStore: Send + Sync {
     }
 }
 
-/// Semantic change DAG and branch operations.
+/// Immutable semantic change DAG operations.
 pub trait ChangeStore: Send + Sync {
     /// Store errors must be able to represent model-level history integrity
     /// failures surfaced by the default replay helpers.
@@ -260,7 +232,7 @@ pub trait ChangeStore: Send + Sync {
         id: &EntityId,
     ) -> std::result::Result<Vec<EntityRevision>, Self::Error> {
         let changes = self.get_entity_history(id)?;
-        Ok(derive_entity_revisions_from_changes(changes)
+        Ok(derive_entity_revisions_from_changes(changes)?
             .remove(id)
             .unwrap_or_default())
     }
@@ -284,8 +256,7 @@ pub trait ChangeStore: Send + Sync {
         id: &EntityId,
         head: &SemanticChangeId,
     ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
-        let (changes, _order) = collect_changes_topologically(self, head)?;
-        Ok(changes
+        Ok(collect_changes_first_parent(self, head)?
             .into_iter()
             .filter(|change| entity_is_touched_by_change(change, id))
             .collect())
@@ -296,7 +267,7 @@ pub trait ChangeStore: Send + Sync {
         head: &SemanticChangeId,
     ) -> std::result::Result<Vec<EntityRevision>, Self::Error> {
         let changes = self.get_entity_history_at(id, head)?;
-        Ok(derive_entity_revisions_from_changes(changes)
+        Ok(derive_entity_revisions_from_changes(changes)?
             .remove(id)
             .unwrap_or_default())
     }
@@ -316,8 +287,10 @@ pub trait ChangeStore: Send + Sync {
         id: &RelationId,
         head: &SemanticChangeId,
     ) -> std::result::Result<Vec<RelationRevision>, Self::Error> {
-        let (changes, _order) = collect_changes_topologically(self, head)?;
-        Ok(replay_relation_revisions(changes, id))
+        Ok(replay_relation_revisions(
+            collect_changes_first_parent(self, head)?,
+            id,
+        ))
     }
     fn resolve_relation_revision_at(
         &self,
@@ -332,22 +305,30 @@ pub trait ChangeStore: Send + Sync {
     }
     fn get_artifact_revisions_at(
         &self,
-        file_id: &FilePathId,
+        artifact_id: &crate::ArtifactId,
         head: &SemanticChangeId,
     ) -> std::result::Result<Vec<ArtifactRevision>, Self::Error> {
         let (changes, _order) = collect_changes_topologically(self, head)?;
-        Ok(replay_artifact_revisions(changes, file_id))
+        resolve_tree_states(&changes).map_err(Self::Error::from)?;
+        Ok(replay_artifact_revisions(&changes, artifact_id)
+            .map_err(Self::Error::from)?
+            .revisions)
     }
     fn resolve_artifact_revision_at(
         &self,
-        file_id: &FilePathId,
+        artifact_id: &crate::ArtifactId,
         head: &SemanticChangeId,
     ) -> std::result::Result<Option<ArtifactRevision>, Self::Error> {
-        Ok(self
-            .get_artifact_revisions_at(file_id, head)?
+        let (changes, _order) = collect_changes_topologically(self, head)?;
+        resolve_tree_states(&changes).map_err(Self::Error::from)?;
+        let replay = replay_artifact_revisions(&changes, artifact_id).map_err(Self::Error::from)?;
+        let Some(active_revision) = replay.active_at.get(head).copied().flatten() else {
+            return Ok(None);
+        };
+        Ok(replay
+            .revisions
             .into_iter()
-            .rev()
-            .find(|revision| revision.ended_by.is_none()))
+            .find(|revision| revision.revision_id == active_revision))
     }
     fn resolve_entity_at(
         &self,
@@ -362,25 +343,17 @@ pub trait ChangeStore: Send + Sync {
         &self,
         head: &SemanticChangeId,
     ) -> std::result::Result<ResolvedGraphState, Self::Error> {
-        let (changes, _order) = collect_changes_topologically(self, head)?;
-        Ok(replay_graph_state(changes))
+        let first_parent_history = collect_changes_first_parent(self, head)?;
+        let mut state = replay_graph_state(first_parent_history.clone())?;
+        state.tree = replay_tree(first_parent_history).map_err(Self::Error::from)?;
+        Ok(state)
     }
-    fn resolve_file_tree_at(
+    /// Resolve the exact repository tree at `head`.
+    fn resolve_tree_at(
         &self,
         head: &SemanticChangeId,
-    ) -> std::result::Result<HashMap<FilePathId, Hash256>, Self::Error> {
-        let (changes, _order) = collect_changes_topologically(self, head)?;
-        Ok(replay_file_tree(changes))
-    }
-    /// Resolve exact source entries at `head`, preserving Git-relevant entry
-    /// kinds. Historical deltas that predate mode capture return an explicit
-    /// incomplete resolution and must not be normalized by authority callers.
-    fn resolve_source_tree_at(
-        &self,
-        head: &SemanticChangeId,
-    ) -> std::result::Result<SourceTreeResolution, Self::Error> {
-        let (changes, _order) = collect_changes_topologically(self, head)?;
-        Ok(replay_source_tree(changes))
+    ) -> std::result::Result<ResolvedTree, Self::Error> {
+        replay_tree(collect_changes_first_parent(self, head)?).map_err(Self::Error::from)
     }
     /// Build a topological ordinal map for all changes reachable from `head`.
     ///
@@ -394,15 +367,6 @@ pub trait ChangeStore: Send + Sync {
         let (_changes, order) = collect_changes_topologically(self, head)?;
         Ok(order)
     }
-    fn get_branch(&self, name: &BranchName) -> std::result::Result<Option<Branch>, Self::Error>;
-    fn create_branch(&self, branch: &Branch) -> std::result::Result<(), Self::Error>;
-    fn update_branch_head(
-        &self,
-        name: &BranchName,
-        new_head: &SemanticChangeId,
-    ) -> std::result::Result<(), Self::Error>;
-    fn delete_branch(&self, name: &BranchName) -> std::result::Result<(), Self::Error>;
-    fn list_branches(&self) -> std::result::Result<Vec<Branch>, Self::Error>;
 }
 
 /// Work items, annotations, and work graph relationships.
@@ -742,7 +706,6 @@ pub trait GraphStore:
 /// A subgraph returned from neighborhood queries.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SubGraph {
-    #[serde(default)]
     pub nodes: Vec<GraphNodeId>,
     pub entities: HashMap<EntityId, Entity>,
     pub relations: Vec<Relation>,
@@ -751,59 +714,17 @@ pub struct SubGraph {
 /// Immutable committed graph state resolved at a specific semantic ref.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResolvedGraphState {
-    #[serde(default)]
     pub entities: HashMap<EntityId, Entity>,
-    #[serde(default)]
     pub relations: HashMap<RelationId, Relation>,
-    #[serde(default)]
     pub entity_revisions: HashMap<EntityId, Vec<EntityRevision>>,
-    #[serde(default)]
-    pub file_tree: HashMap<FilePathId, Hash256>,
+    pub tree: ResolvedTree,
     /// Entities that were explicitly removed by a semantic change.
     /// Maps entity ID to the removed entity and the change that removed it.
-    #[serde(default)]
     pub entity_tombstones: HashMap<EntityId, (Entity, SemanticChangeId)>,
     /// Relations that were explicitly removed by a semantic change or pruned
     /// because a referenced entity was removed.
     /// Maps relation ID to the removed relation and the change that caused removal.
-    #[serde(default)]
     pub relation_tombstones: HashMap<RelationId, (Relation, SemanticChangeId)>,
-}
-
-/// Content identity and exact Git-relevant kind for one resolved source entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResolvedSourceEntry {
-    pub hash: Hash256,
-    pub kind: SourceEntryKind,
-}
-
-/// Why an exact source tree could not be certified.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceTreeGapReason {
-    LegacyModeUnknown,
-    MissingContentHash,
-}
-
-/// First deterministic gap encountered while replaying exact source history.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SourceTreeGap {
-    pub file_id: FilePathId,
-    pub change_id: SemanticChangeId,
-    pub delta_kind: ArtifactDeltaKind,
-    pub reason: SourceTreeGapReason,
-}
-
-/// Fail-closed result of exact source-tree replay.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum SourceTreeResolution {
-    Exact {
-        entries: HashMap<FilePathId, ResolvedSourceEntry>,
-    },
-    Incomplete {
-        gaps: Vec<SourceTreeGap>,
-    },
 }
 
 /// Filter for querying entities.
@@ -865,7 +786,94 @@ fn collect_changes_topologically<G: ChangeStore + ?Sized>(
     Ok((ordered, change_order))
 }
 
-fn replay_graph_state<I>(changes: I) -> ResolvedGraphState
+/// Fetch the material state lineage for `head`.
+///
+/// Every change is interpreted relative to its first declared parent. Other
+/// parents remain ancestry and revision-contribution links; resolving state
+/// neither fetches nor implicitly unions them.
+fn collect_changes_first_parent<G: ChangeStore + ?Sized>(
+    store: &G,
+    head: &SemanticChangeId,
+) -> std::result::Result<Vec<SemanticChange>, G::Error> {
+    let mut seen = HashSet::new();
+    let mut reverse_history = Vec::new();
+    let mut current = Some(*head);
+
+    while let Some(change_id) = current {
+        if !seen.insert(change_id) {
+            return Err(ModelError::Conflict(format!(
+                "cycle in first-parent history at change {change_id}"
+            ))
+            .into());
+        }
+        let change = store
+            .get_change(&change_id)?
+            .ok_or_else(|| ModelError::ChangeNotFound(change_id.to_string()))?;
+        reverse_history.push(change.clone());
+        current = change.parents.first().copied();
+    }
+
+    reverse_history.reverse();
+    Ok(reverse_history)
+}
+
+/// Resolve every reachable change against its own first parent.
+///
+/// Keeping states keyed by change prevents deltas from divergent siblings
+/// from being folded together merely because both are ancestors of a merge.
+fn resolve_tree_states(
+    changes: &[SemanticChange],
+) -> std::result::Result<HashMap<SemanticChangeId, ResolvedTree>, ModelError> {
+    let mut states: HashMap<SemanticChangeId, ResolvedTree> = HashMap::new();
+
+    for change in changes {
+        for parent in &change.parents {
+            if !states.contains_key(parent) {
+                return Err(ModelError::ChangeNotFound(parent.to_string()));
+            }
+        }
+        let parent = change
+            .parents
+            .first()
+            .map(|parent| {
+                states
+                    .get(parent)
+                    .cloned()
+                    .ok_or_else(|| ModelError::ChangeNotFound(parent.to_string()))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let state = parent.apply(&change.tree_deltas).map_err(|error| {
+            ModelError::Conflict(format!(
+                "invalid repository tree transition in change {}: {error}",
+                change.id
+            ))
+        })?;
+        states.insert(change.id, state);
+    }
+
+    Ok(states)
+}
+
+fn replay_tree<I>(changes: I) -> std::result::Result<ResolvedTree, ModelError>
+where
+    I: IntoIterator<Item = SemanticChange>,
+{
+    let mut tree = ResolvedTree::default();
+
+    for change in changes {
+        tree = tree.apply(&change.tree_deltas).map_err(|error| {
+            ModelError::Conflict(format!(
+                "invalid repository tree transition in change {}: {error}",
+                change.id
+            ))
+        })?;
+    }
+
+    Ok(tree)
+}
+
+fn replay_graph_state<I>(changes: I) -> std::result::Result<ResolvedGraphState, ModelError>
 where
     I: IntoIterator<Item = SemanticChange>,
 {
@@ -875,7 +883,13 @@ where
         let change_id = change.id;
         for delta in change.entity_deltas {
             match delta {
-                crate::change::EntityDelta::Added(entity) => {
+                crate::change::EntityDelta::Added { new: entity } => {
+                    if state.entities.contains_key(&entity.id) {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} adds existing entity {}",
+                            entity.id
+                        )));
+                    }
                     let previous_revision = mark_matching_entity_revision_ended(
                         &mut state.entity_revisions,
                         &entity,
@@ -890,9 +904,22 @@ where
                             change_id,
                             previous_revision,
                         ));
+                    state.entity_tombstones.remove(&entity.id);
                     state.entities.insert(entity.id, entity);
                 }
                 crate::change::EntityDelta::Modified { old, new } => {
+                    if old.id != new.id {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} modifies entity {} into different identity {}",
+                            old.id, new.id
+                        )));
+                    }
+                    if state.entities.get(&old.id) != Some(&old) {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} has stale old payload for entity {}",
+                            old.id
+                        )));
+                    }
                     let previous_revision = mark_matching_entity_revision_ended(
                         &mut state.entity_revisions,
                         &old,
@@ -909,67 +936,91 @@ where
                         ));
                     state.entities.insert(new.id, new);
                 }
-                crate::change::EntityDelta::Removed(entity_id) => {
+                crate::change::EntityDelta::Removed { old } => {
+                    let entity_id = old.id;
+                    if state.entities.get(&entity_id) != Some(&old) {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} has stale old payload for removed entity {entity_id}"
+                        )));
+                    }
                     if let Some(entries) = state.entity_revisions.get_mut(&entity_id) {
                         if let Some(previous) = entries.last_mut() {
                             previous.mark_ended(change_id);
                         }
                     }
-                    if let Some(entity) = state.entities.remove(&entity_id) {
-                        state
-                            .entity_tombstones
-                            .insert(entity_id, (entity, change_id));
-                    }
-                    // Prune dangling relations and tombstone them.
-                    let dangling: Vec<RelationId> = state
-                        .relations
-                        .iter()
-                        .filter(|(_, rel)| relation_mentions_entity(rel, entity_id))
-                        .map(|(id, _)| *id)
-                        .collect();
-                    for rel_id in dangling {
-                        if let Some(relation) = state.relations.remove(&rel_id) {
-                            state
-                                .relation_tombstones
-                                .insert(rel_id, (relation, change_id));
-                        }
-                    }
+                    state.entities.remove(&entity_id);
+                    state.entity_tombstones.insert(entity_id, (old, change_id));
                 }
             }
         }
 
         for delta in change.relation_deltas {
             match delta {
-                crate::change::RelationDelta::Added(relation) => {
+                crate::change::RelationDelta::Added { new: relation } => {
+                    if state.relations.contains_key(&relation.id) {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} adds existing relation {}",
+                            relation.id
+                        )));
+                    }
+                    state.relation_tombstones.remove(&relation.id);
                     state.relations.insert(relation.id, relation);
                 }
-                crate::change::RelationDelta::Removed(relation_id) => {
-                    if let Some(relation) = state.relations.remove(&relation_id) {
-                        state
-                            .relation_tombstones
-                            .insert(relation_id, (relation, change_id));
+                crate::change::RelationDelta::Modified { old, new } => {
+                    if old.id != new.id {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} modifies relation {} into different identity {}",
+                            old.id, new.id
+                        )));
+                    }
+                    if state.relations.get(&old.id) != Some(&old) {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} has stale old payload for relation {}",
+                            old.id
+                        )));
+                    }
+                    state.relations.insert(new.id, new);
+                }
+                crate::change::RelationDelta::Removed { old } => {
+                    let relation_id = old.id;
+                    if state.relations.get(&relation_id) != Some(&old) {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} has stale old payload for removed relation {relation_id}"
+                        )));
+                    }
+                    state.relations.remove(&relation_id);
+                    state
+                        .relation_tombstones
+                        .insert(relation_id, (old, change_id));
+                }
+            }
+        }
+
+        for relation in state.relations.values() {
+            for node in [relation.src, relation.dst] {
+                if let GraphNodeId::Entity(entity_id) = node {
+                    if !state.entities.contains_key(&entity_id) {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} leaves relation {} dangling from entity {entity_id}; \
+                             relation removal must be explicit",
+                            relation.id
+                        )));
                     }
                 }
             }
         }
-
-        for delta in change.artifact_deltas {
-            if delta.kind.is_removed() {
-                state.file_tree.remove(&delta.file_id);
-            } else if let Some(hash) = delta.new_hash {
-                state.file_tree.insert(delta.file_id, hash);
-            }
-        }
     }
 
-    state
+    Ok(state)
 }
 
-pub fn derive_entity_revisions_from_changes<I>(changes: I) -> HashMap<EntityId, Vec<EntityRevision>>
+pub fn derive_entity_revisions_from_changes<I>(
+    changes: I,
+) -> std::result::Result<HashMap<EntityId, Vec<EntityRevision>>, ModelError>
 where
     I: IntoIterator<Item = SemanticChange>,
 {
-    replay_graph_state(changes).entity_revisions
+    Ok(replay_graph_state(changes)?.entity_revisions)
 }
 
 fn replay_relation_revisions<I>(changes: I, relation_id: &RelationId) -> Vec<RelationRevision>
@@ -983,7 +1034,9 @@ where
         let change_id = change.id;
         for delta in change.relation_deltas {
             match delta {
-                crate::change::RelationDelta::Added(relation) if relation.id == *relation_id => {
+                crate::change::RelationDelta::Added { new: relation }
+                    if relation.id == *relation_id =>
+                {
                     let previous_revision = active_revision
                         .and_then(|index| revisions.get_mut(index))
                         .map(|revision| {
@@ -997,7 +1050,20 @@ where
                     ));
                     active_revision = Some(revisions.len() - 1);
                 }
-                crate::change::RelationDelta::Removed(removed_id) if removed_id == *relation_id => {
+                crate::change::RelationDelta::Modified { old, new }
+                    if old.id == *relation_id && new.id == *relation_id =>
+                {
+                    let previous_revision = active_revision
+                        .take()
+                        .and_then(|index| revisions.get_mut(index))
+                        .map(|revision| {
+                            revision.mark_ended(change_id);
+                            revision.revision_id
+                        });
+                    revisions.push(RelationRevision::new(new, change_id, previous_revision));
+                    active_revision = Some(revisions.len() - 1);
+                }
+                crate::change::RelationDelta::Removed { old } if old.id == *relation_id => {
                     if let Some(index) = active_revision.take() {
                         if let Some(revision) = revisions.get_mut(index) {
                             revision.mark_ended(change_id);
@@ -1012,126 +1078,90 @@ where
     revisions
 }
 
-fn replay_artifact_revisions<I>(changes: I, file_id: &FilePathId) -> Vec<ArtifactRevision>
-where
-    I: IntoIterator<Item = SemanticChange>,
-{
-    let mut revisions: Vec<ArtifactRevision> = Vec::new();
-    let mut active_revision: Option<usize> = None;
+struct ArtifactRevisionReplay {
+    revisions: Vec<ArtifactRevision>,
+    active_at: HashMap<SemanticChangeId, Option<ArtifactRevisionId>>,
+}
+
+/// Replay one artifact's revision graph while keeping material state
+/// first-parent-relative.
+///
+/// A new revision points to the revisions active at each declared parent.
+/// Parent order is preserved and duplicate revision IDs are removed.
+fn replay_artifact_revisions(
+    changes: &[SemanticChange],
+    artifact_id: &crate::ArtifactId,
+) -> std::result::Result<ArtifactRevisionReplay, ModelError> {
+    let mut revisions = Vec::new();
+    let mut active_at = HashMap::new();
 
     for change in changes {
-        let change_id = change.id;
-        for delta in change.artifact_deltas {
-            if delta.file_id != *file_id {
-                continue;
+        for parent in &change.parents {
+            if !active_at.contains_key(parent) {
+                return Err(ModelError::ChangeNotFound(parent.to_string()));
             }
+        }
 
-            if delta.kind.is_removed() {
-                if let Some(index) = active_revision.take() {
-                    if let Some(revision) = revisions.get_mut(index) {
-                        revision.mark_ended(change_id);
+        let first_parent_active = change
+            .parents
+            .first()
+            .and_then(|parent| active_at.get(parent).copied().flatten());
+        let mut matching = change
+            .tree_deltas
+            .iter()
+            .filter(|delta| delta.artifact_id() == *artifact_id);
+        let delta = matching.next();
+        if matching.next().is_some() {
+            return Err(ModelError::Conflict(format!(
+                "tree transaction contains more than one delta for artifact {artifact_id:?} in change {}",
+                change.id
+            )));
+        }
+
+        let active = match delta {
+            None => first_parent_active,
+            Some(delta) => {
+                let Some(new) = delta.new_state() else {
+                    active_at.insert(change.id, None);
+                    continue;
+                };
+                let mut predecessor_revisions = Vec::new();
+                for parent in &change.parents {
+                    let Some(predecessor) = active_at.get(parent).copied().flatten() else {
+                        continue;
+                    };
+                    if !predecessor_revisions.contains(&predecessor) {
+                        predecessor_revisions.push(predecessor);
                     }
                 }
-                continue;
+                let revision = ArtifactRevision::new(
+                    *artifact_id,
+                    new.path.clone(),
+                    new.entry,
+                    change.id,
+                    predecessor_revisions,
+                );
+                let revision_id = revision.revision_id;
+                revisions.push(revision);
+                Some(revision_id)
             }
-            let Some(hash) = delta.new_hash else {
-                continue;
-            };
-            let previous_revision = active_revision
-                .and_then(|index| revisions.get_mut(index))
-                .map(|revision| {
-                    revision.mark_ended(change_id);
-                    revision.revision_id
-                });
-            revisions.push(ArtifactRevision::new(
-                delta.file_id,
-                hash,
-                delta.kind,
-                change_id,
-                previous_revision,
-            ));
-            active_revision = Some(revisions.len() - 1);
-        }
+        };
+        active_at.insert(change.id, active);
     }
 
-    revisions
-}
-
-fn replay_file_tree<I>(changes: I) -> HashMap<FilePathId, Hash256>
-where
-    I: IntoIterator<Item = SemanticChange>,
-{
-    let mut file_tree = HashMap::new();
-
-    for change in changes {
-        for delta in change.artifact_deltas {
-            if delta.kind.is_removed() {
-                file_tree.remove(&delta.file_id);
-            } else if let Some(hash) = delta.new_hash {
-                file_tree.insert(delta.file_id, hash);
-            }
-        }
-    }
-
-    file_tree
-}
-
-fn replay_source_tree<I>(changes: I) -> SourceTreeResolution
-where
-    I: IntoIterator<Item = SemanticChange>,
-{
-    let mut entries = HashMap::new();
-    let mut gaps: HashMap<FilePathId, SourceTreeGap> = HashMap::new();
-
-    for change in changes {
-        for delta in change.artifact_deltas {
-            if delta.kind.is_removed() {
-                entries.remove(&delta.file_id);
-                gaps.remove(&delta.file_id);
-                continue;
-            }
-            let resolution = match (delta.kind.source_entry_kind(), delta.new_hash) {
-                (Some(kind), Some(hash)) => Ok(ResolvedSourceEntry { hash, kind }),
-                (None, _) => Err(SourceTreeGapReason::LegacyModeUnknown),
-                (Some(_), None) => Err(SourceTreeGapReason::MissingContentHash),
-            };
-            match resolution {
-                Ok(entry) => {
-                    gaps.remove(&delta.file_id);
-                    entries.insert(delta.file_id, entry);
-                }
-                Err(reason) => {
-                    entries.remove(&delta.file_id);
-                    gaps.insert(
-                        delta.file_id.clone(),
-                        SourceTreeGap {
-                            file_id: delta.file_id,
-                            change_id: change.id,
-                            delta_kind: delta.kind,
-                            reason,
-                        },
-                    );
-                }
-            }
-        }
-    }
-
-    if gaps.is_empty() {
-        SourceTreeResolution::Exact { entries }
-    } else {
-        let mut gaps: Vec<_> = gaps.into_values().collect();
-        gaps.sort_by(|left, right| left.file_id.0.cmp(&right.file_id.0));
-        SourceTreeResolution::Incomplete { gaps }
-    }
+    Ok(ArtifactRevisionReplay {
+        revisions,
+        active_at,
+    })
 }
 
 fn entity_is_touched_by_change(change: &SemanticChange, entity_id: &EntityId) -> bool {
     change.entity_deltas.iter().any(|delta| match delta {
-        crate::change::EntityDelta::Added(entity) => entity.id == *entity_id,
+        crate::change::EntityDelta::Added { new } => new.id == *entity_id,
         crate::change::EntityDelta::Modified { old, new } => {
             old.id == *entity_id || new.id == *entity_id
         }
-        crate::change::EntityDelta::Removed(removed_id) => removed_id == entity_id,
+        crate::change::EntityDelta::Removed { old } => old.id == *entity_id,
     })
 }
 
@@ -1174,11 +1204,6 @@ fn entities_match_for_revision(left: &Entity, right: &Entity) -> bool {
         && left.doc_summary == right.doc_summary
         && left.metadata.extra == right.metadata.extra
         && left.lineage_parent == right.lineage_parent
-}
-
-fn relation_mentions_entity(relation: &Relation, entity_id: EntityId) -> bool {
-    matches!(relation.src, GraphNodeId::Entity(id) if id == entity_id)
-        || matches!(relation.dst, GraphNodeId::Entity(id) if id == entity_id)
 }
 
 // ===========================================================================
@@ -1329,6 +1354,9 @@ impl<G: EntityStore> EntityStore for &G {
     fn delete_opaque_artifact(&self, file_id: &FilePathId) -> std::result::Result<(), Self::Error> {
         (**self).delete_opaque_artifact(file_id)
     }
+    fn artifact_id_at_path(&self, path: &crate::RepoPath) -> Option<crate::ArtifactId> {
+        (**self).artifact_id_at_path(path)
+    }
     fn upsert_file_layout(
         &self,
         layout: &crate::layout::FileLayout,
@@ -1346,14 +1374,20 @@ impl<G: EntityStore> EntityStore for &G {
     ) -> std::result::Result<Vec<crate::layout::FileLayout>, Self::Error> {
         (**self).list_file_layouts()
     }
-    fn get_file_hash(
+    fn get_tree_entry(
         &self,
         file_id: &FilePathId,
-    ) -> std::result::Result<Option<Hash256>, Self::Error> {
-        (**self).get_file_hash(file_id)
+    ) -> std::result::Result<Option<TreeEntry>, Self::Error> {
+        (**self).get_tree_entry(file_id)
     }
     fn delete_file_layout(&self, file_id: &FilePathId) -> std::result::Result<(), Self::Error> {
         (**self).delete_file_layout(file_id)
+    }
+    fn apply_transaction_delta(
+        &self,
+        delta: &TransactionDelta,
+    ) -> std::result::Result<(), Self::Error> {
+        (**self).apply_transaction_delta(delta)
     }
 }
 
@@ -1388,25 +1422,6 @@ impl<G: ChangeStore> ChangeStore for &G {
         head: &SemanticChangeId,
     ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
         (**self).get_changes_since(base, head)
-    }
-    fn get_branch(&self, name: &BranchName) -> std::result::Result<Option<Branch>, Self::Error> {
-        (**self).get_branch(name)
-    }
-    fn create_branch(&self, branch: &Branch) -> std::result::Result<(), Self::Error> {
-        (**self).create_branch(branch)
-    }
-    fn update_branch_head(
-        &self,
-        name: &BranchName,
-        new_head: &SemanticChangeId,
-    ) -> std::result::Result<(), Self::Error> {
-        (**self).update_branch_head(name, new_head)
-    }
-    fn delete_branch(&self, name: &BranchName) -> std::result::Result<(), Self::Error> {
-        (**self).delete_branch(name)
-    }
-    fn list_branches(&self) -> std::result::Result<Vec<Branch>, Self::Error> {
-        (**self).list_branches()
     }
 }
 
@@ -1876,15 +1891,22 @@ impl<G: GraphStore> GraphStore for &G {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::change::{ArtifactDelta, EntityDelta, RelationDelta, SemanticChange};
+    use crate::change::{
+        EntityDelta, LocatedEntry, RelationDelta, SemanticChange, TreeDelta, TreeEntry,
+    };
     use crate::entity::{
         Entity, EntityKind, EntityMetadata, FingerprintAlgorithm, SemanticFingerprint, Visibility,
     };
     use crate::relation::{GraphNodeId, Relation, RelationKind, RelationOrigin};
     use crate::timestamp::Timestamp;
+    use crate::{ArtifactId, RepoPath};
 
     fn make_change_id(byte: u8) -> SemanticChangeId {
         SemanticChangeId::from_hash(Hash256::from_bytes([byte; 32]))
+    }
+
+    fn repo_path(path: &str) -> RepoPath {
+        RepoPath::from_utf8(path).unwrap()
     }
 
     fn make_entity(id: EntityId, name: &str) -> Entity {
@@ -1936,19 +1958,27 @@ mod tests {
     ) -> SemanticChange {
         SemanticChange {
             id,
+            origin: crate::ChangeOrigin::Native,
             parents,
             timestamp: Timestamp::now(),
             author: AuthorId("test".into()),
             message: "test change".into(),
             entity_deltas,
             relation_deltas,
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
+            admission_policy_delta: None,
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
         }
+    }
+
+    fn resolved_tree_at(changes: Vec<SemanticChange>, head: SemanticChangeId) -> ResolvedTree {
+        resolve_tree_states(&changes)
+            .unwrap()
+            .remove(&head)
+            .unwrap()
     }
 
     #[derive(Default)]
@@ -1957,9 +1987,12 @@ mod tests {
     }
 
     impl HistoryStore {
-        fn with_change(change: SemanticChange) -> Self {
+        fn from_changes(changes: impl IntoIterator<Item = SemanticChange>) -> Self {
             Self {
-                changes: HashMap::from([(change.id, change)]),
+                changes: changes
+                    .into_iter()
+                    .map(|change| (change.id, change))
+                    .collect(),
             }
         }
     }
@@ -2000,33 +2033,6 @@ mod tests {
         ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
             Ok(Vec::new())
         }
-
-        fn get_branch(
-            &self,
-            _name: &BranchName,
-        ) -> std::result::Result<Option<Branch>, Self::Error> {
-            Ok(None)
-        }
-
-        fn create_branch(&self, _branch: &Branch) -> std::result::Result<(), Self::Error> {
-            Ok(())
-        }
-
-        fn update_branch_head(
-            &self,
-            _name: &BranchName,
-            _new_head: &SemanticChangeId,
-        ) -> std::result::Result<(), Self::Error> {
-            Ok(())
-        }
-
-        fn delete_branch(&self, _name: &BranchName) -> std::result::Result<(), Self::Error> {
-            Ok(())
-        }
-
-        fn list_branches(&self) -> std::result::Result<Vec<Branch>, Self::Error> {
-            Ok(Vec::new())
-        }
     }
 
     fn assert_missing_change(error: ModelError, expected: SemanticChangeId) {
@@ -2045,211 +2051,475 @@ mod tests {
     }
 
     #[test]
-    fn resolve_source_tree_at_fails_closed_when_reachable_parent_is_missing() {
+    fn resolve_tree_at_fails_closed_when_first_parent_is_missing() {
+        let second_parent = make_change_id(239);
         let missing_parent = make_change_id(241);
         let head = make_change_id(242);
-        let store = HistoryStore::with_change(make_semantic_change(
-            head,
-            vec![missing_parent],
-            Vec::new(),
-            Vec::new(),
-        ));
+        let store = HistoryStore::from_changes([
+            make_semantic_change(second_parent, vec![], Vec::new(), Vec::new()),
+            make_semantic_change(
+                head,
+                vec![missing_parent, second_parent],
+                Vec::new(),
+                Vec::new(),
+            ),
+        ]);
 
-        let error = store.resolve_source_tree_at(&head).unwrap_err();
+        let error = store.resolve_tree_at(&head).unwrap_err();
 
         assert_missing_change(error, missing_parent);
     }
 
     #[test]
-    fn exact_source_tree_preserves_regular_executable_and_symlink_across_changes() {
+    fn state_resolution_needs_only_first_parent_but_lineage_needs_all_parents() {
+        let first_parent = make_change_id(243);
+        let missing_contributor = make_change_id(244);
+        let head = make_change_id(245);
+        let artifact_id = ArtifactId::new();
+        let entry = TreeEntry::blob(Hash256::from_bytes([0xf5; 32]), false);
+        let mut root = make_semantic_change(first_parent, vec![], vec![], vec![]);
+        root.tree_deltas = vec![TreeDelta::Added {
+            artifact_id,
+            new: LocatedEntry::new(repo_path("artifact"), entry),
+        }];
+        let merge = make_semantic_change(
+            head,
+            vec![first_parent, missing_contributor],
+            vec![],
+            vec![],
+        );
+        let store = HistoryStore::from_changes([root, merge]);
+
+        assert_eq!(
+            store
+                .resolve_tree_at(&head)
+                .unwrap()
+                .get(&artifact_id)
+                .map(|artifact| artifact.entry),
+            Some(entry)
+        );
+        let error = store
+            .resolve_artifact_revision_at(&artifact_id, &head)
+            .unwrap_err();
+        assert_missing_change(error, missing_contributor);
+    }
+
+    #[test]
+    fn divergent_sibling_state_is_not_folded_into_merge_result() {
+        let root_id = make_change_id(20);
+        let left_id = make_change_id(21);
+        let right_id = make_change_id(22);
+        let merge_id = make_change_id(23);
+        let shared = ArtifactId::new();
+        let right_only = ArtifactId::new();
+        let right_only_entity = make_entity(EntityId::new(), "right_only");
+        let base = TreeEntry::blob(Hash256::from_bytes([0x20; 32]), false);
+        let left = TreeEntry::blob(Hash256::from_bytes([0x21; 32]), false);
+        let right = TreeEntry::blob(Hash256::from_bytes([0x22; 32]), false);
+        let right_only_entry = TreeEntry::blob(Hash256::from_bytes([0x23; 32]), false);
+
+        let mut root = make_semantic_change(root_id, vec![], vec![], vec![]);
+        root.tree_deltas = vec![TreeDelta::Added {
+            artifact_id: shared,
+            new: LocatedEntry::new(repo_path("shared"), base),
+        }];
+        let mut left_change = make_semantic_change(left_id, vec![root_id], vec![], vec![]);
+        left_change.tree_deltas = vec![TreeDelta::Updated {
+            artifact_id: shared,
+            old: LocatedEntry::new(repo_path("shared"), base),
+            new: LocatedEntry::new(repo_path("shared"), left),
+        }];
+        let mut right_change = make_semantic_change(
+            right_id,
+            vec![root_id],
+            vec![EntityDelta::Added {
+                new: right_only_entity.clone(),
+            }],
+            vec![],
+        );
+        right_change.tree_deltas = vec![
+            TreeDelta::Updated {
+                artifact_id: shared,
+                old: LocatedEntry::new(repo_path("shared"), base),
+                new: LocatedEntry::new(repo_path("shared"), right),
+            },
+            TreeDelta::Added {
+                artifact_id: right_only,
+                new: LocatedEntry::new(repo_path("right-only"), right_only_entry),
+            },
+        ];
+        let merge = make_semantic_change(merge_id, vec![left_id, right_id], vec![], vec![]);
+        let store = HistoryStore::from_changes([root, left_change, right_change, merge]);
+
+        let tree = store.resolve_tree_at(&merge_id).unwrap();
+
+        assert_eq!(tree.get(&shared).map(|artifact| artifact.entry), Some(left));
+        assert!(tree.get(&right_only).is_none());
+        assert!(!store
+            .resolve_graph_at(&merge_id)
+            .unwrap()
+            .entities
+            .contains_key(&right_only_entity.id));
+    }
+
+    #[test]
+    fn explicit_merge_result_is_applied_relative_to_first_parent() {
+        let root_id = make_change_id(30);
+        let left_id = make_change_id(31);
+        let right_id = make_change_id(32);
+        let merge_id = make_change_id(33);
+        let artifact_id = ArtifactId::new();
+        let base = TreeEntry::blob(Hash256::from_bytes([0x30; 32]), false);
+        let left = TreeEntry::blob(Hash256::from_bytes([0x31; 32]), false);
+        let right = TreeEntry::blob(Hash256::from_bytes([0x32; 32]), false);
+        let merged = TreeEntry::blob(Hash256::from_bytes([0x33; 32]), false);
+
+        let mut root = make_semantic_change(root_id, vec![], vec![], vec![]);
+        root.tree_deltas = vec![TreeDelta::Added {
+            artifact_id,
+            new: LocatedEntry::new(repo_path("artifact"), base),
+        }];
+        let mut left_change = make_semantic_change(left_id, vec![root_id], vec![], vec![]);
+        left_change.tree_deltas = vec![TreeDelta::Updated {
+            artifact_id,
+            old: LocatedEntry::new(repo_path("artifact"), base),
+            new: LocatedEntry::new(repo_path("artifact"), left),
+        }];
+        let mut right_change = make_semantic_change(right_id, vec![root_id], vec![], vec![]);
+        right_change.tree_deltas = vec![TreeDelta::Updated {
+            artifact_id,
+            old: LocatedEntry::new(repo_path("artifact"), base),
+            new: LocatedEntry::new(repo_path("artifact"), right),
+        }];
+        let mut merge = make_semantic_change(merge_id, vec![left_id, right_id], vec![], vec![]);
+        merge.tree_deltas = vec![TreeDelta::Updated {
+            artifact_id,
+            old: LocatedEntry::new(repo_path("artifact"), left),
+            new: LocatedEntry::new(repo_path("artifact"), merged),
+        }];
+        let store = HistoryStore::from_changes([root, left_change, right_change, merge]);
+
+        let tree = store.resolve_tree_at(&merge_id).unwrap();
+
+        assert_eq!(
+            tree.get(&artifact_id).map(|artifact| artifact.entry),
+            Some(merged)
+        );
+    }
+
+    #[test]
+    fn exact_tree_preserves_regular_executable_and_symlink_across_changes() {
         let c1 = make_change_id(1);
         let c2 = make_change_id(2);
-        let regular = FilePathId::new("README.md");
-        let executable = FilePathId::new("bin/run");
-        let symlink = FilePathId::new("current");
+        let regular = ArtifactId::new();
+        let executable = ArtifactId::new();
+        let symlink = ArtifactId::new();
+        let regular_v1 = TreeEntry::blob(Hash256::from_bytes([1; 32]), false);
+        let executable_v1 = TreeEntry::blob(Hash256::from_bytes([2; 32]), true);
+        let symlink_v1 = TreeEntry::symlink(Hash256::from_bytes([3; 32]));
+        let regular_v2 = TreeEntry::blob(Hash256::from_bytes([4; 32]), false);
+        let executable_v2 = TreeEntry::blob(Hash256::from_bytes([5; 32]), true);
+        let symlink_v2 = TreeEntry::symlink(Hash256::from_bytes([6; 32]));
         let mut first = make_semantic_change(c1, vec![], vec![], vec![]);
-        first.artifact_deltas = vec![
-            ArtifactDelta {
-                file_id: regular.clone(),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(Hash256::from_bytes([1; 32])),
+        first.tree_deltas = vec![
+            TreeDelta::Added {
+                artifact_id: regular,
+                new: LocatedEntry::new(repo_path("README.md"), regular_v1),
             },
-            ArtifactDelta {
-                file_id: executable.clone(),
-                kind: ArtifactDeltaKind::AddedExecutableFile,
-                old_hash: None,
-                new_hash: Some(Hash256::from_bytes([2; 32])),
+            TreeDelta::Added {
+                artifact_id: executable,
+                new: LocatedEntry::new(repo_path("bin/run"), executable_v1),
             },
-            ArtifactDelta {
-                file_id: symlink.clone(),
-                kind: ArtifactDeltaKind::AddedSymlink,
-                old_hash: None,
-                new_hash: Some(Hash256::from_bytes([3; 32])),
+            TreeDelta::Added {
+                artifact_id: symlink,
+                new: LocatedEntry::new(repo_path("current"), symlink_v1),
             },
         ];
         let mut second = make_semantic_change(c2, vec![c1], vec![], vec![]);
-        second.artifact_deltas = vec![
-            ArtifactDelta {
-                file_id: regular.clone(),
-                kind: ArtifactDeltaKind::ModifiedRegularFile,
-                old_hash: Some(Hash256::from_bytes([1; 32])),
-                new_hash: Some(Hash256::from_bytes([4; 32])),
+        second.tree_deltas = vec![
+            TreeDelta::Updated {
+                artifact_id: regular,
+                old: LocatedEntry::new(repo_path("README.md"), regular_v1),
+                new: LocatedEntry::new(repo_path("README.md"), regular_v2),
             },
-            ArtifactDelta {
-                file_id: executable.clone(),
-                kind: ArtifactDeltaKind::ModifiedExecutableFile,
-                old_hash: Some(Hash256::from_bytes([2; 32])),
-                new_hash: Some(Hash256::from_bytes([5; 32])),
+            TreeDelta::Updated {
+                artifact_id: executable,
+                old: LocatedEntry::new(repo_path("bin/run"), executable_v1),
+                new: LocatedEntry::new(repo_path("bin/run"), executable_v2),
             },
-            ArtifactDelta {
-                file_id: symlink.clone(),
-                kind: ArtifactDeltaKind::ModifiedSymlink,
-                old_hash: Some(Hash256::from_bytes([3; 32])),
-                new_hash: Some(Hash256::from_bytes([6; 32])),
+            TreeDelta::Updated {
+                artifact_id: symlink,
+                old: LocatedEntry::new(repo_path("current"), symlink_v1),
+                new: LocatedEntry::new(repo_path("current"), symlink_v2),
             },
         ];
 
-        let SourceTreeResolution::Exact { entries } = replay_source_tree([first, second]) else {
-            panic!("known source modes must resolve exactly");
-        };
+        let entries = resolved_tree_at(vec![first, second], c2);
         assert_eq!(
-            entries.get(&regular),
-            Some(&ResolvedSourceEntry {
-                hash: Hash256::from_bytes([4; 32]),
-                kind: SourceEntryKind::File { executable: false },
-            })
+            entries.get(&regular).map(|value| value.entry),
+            Some(regular_v2)
         );
         assert_eq!(
-            entries.get(&executable),
-            Some(&ResolvedSourceEntry {
-                hash: Hash256::from_bytes([5; 32]),
-                kind: SourceEntryKind::File { executable: true },
-            })
+            entries.get(&executable).map(|value| value.entry),
+            Some(executable_v2)
         );
         assert_eq!(
-            entries.get(&symlink),
-            Some(&ResolvedSourceEntry {
-                hash: Hash256::from_bytes([6; 32]),
-                kind: SourceEntryKind::Symlink,
-            })
+            entries.get(&symlink).map(|value| value.entry),
+            Some(symlink_v2)
         );
     }
 
     #[test]
-    fn exact_source_tree_fails_closed_on_legacy_unknown_mode() {
-        let change_id = make_change_id(7);
-        let file_id = FilePathId::new("legacy.sh");
-        let mut change = make_semantic_change(change_id, vec![], vec![], vec![]);
-        change.artifact_deltas = vec![ArtifactDelta {
-            file_id: file_id.clone(),
-            kind: ArtifactDeltaKind::Added,
-            old_hash: None,
-            new_hash: Some(Hash256::from_bytes([7; 32])),
-        }];
-
-        assert_eq!(
-            replay_source_tree([change]),
-            SourceTreeResolution::Incomplete {
-                gaps: vec![SourceTreeGap {
-                    file_id,
-                    change_id,
-                    delta_kind: ArtifactDeltaKind::Added,
-                    reason: SourceTreeGapReason::LegacyModeUnknown,
-                }],
-            }
-        );
-    }
-
-    #[test]
-    fn later_exact_delta_replaces_legacy_unknown_gap() {
-        let c1 = make_change_id(8);
-        let c2 = make_change_id(9);
-        let file_id = FilePathId::new("legacy.sh");
-        let mut legacy = make_semantic_change(c1, vec![], vec![], vec![]);
-        legacy.artifact_deltas = vec![ArtifactDelta {
-            file_id: file_id.clone(),
-            kind: ArtifactDeltaKind::Added,
-            old_hash: None,
-            new_hash: Some(Hash256::from_bytes([8; 32])),
-        }];
-        let mut backfilled = make_semantic_change(c2, vec![c1], vec![], vec![]);
-        backfilled.artifact_deltas = vec![ArtifactDelta {
-            file_id: file_id.clone(),
-            kind: ArtifactDeltaKind::ModifiedExecutableFile,
-            old_hash: Some(Hash256::from_bytes([8; 32])),
-            new_hash: Some(Hash256::from_bytes([9; 32])),
-        }];
-
-        let SourceTreeResolution::Exact { entries } = replay_source_tree([legacy, backfilled])
-        else {
-            panic!("a later exact delta must replace the same path's legacy gap");
-        };
-        assert_eq!(
-            entries.get(&file_id),
-            Some(&ResolvedSourceEntry {
-                hash: Hash256::from_bytes([9; 32]),
-                kind: SourceEntryKind::File { executable: true },
-            })
-        );
-    }
-
-    #[test]
-    fn later_removal_clears_legacy_unknown_gap() {
-        let c1 = make_change_id(10);
-        let c2 = make_change_id(11);
-        let file_id = FilePathId::new("deleted-legacy-link");
-        let mut legacy = make_semantic_change(c1, vec![], vec![], vec![]);
-        legacy.artifact_deltas = vec![ArtifactDelta {
-            file_id: file_id.clone(),
-            kind: ArtifactDeltaKind::Added,
-            old_hash: None,
-            new_hash: Some(Hash256::from_bytes([10; 32])),
-        }];
+    fn exact_tree_tracks_and_removes_non_language_files() {
+        let c1 = make_change_id(7);
+        let c2 = make_change_id(8);
+        let compose = ArtifactId::new();
+        let dockerfile = ArtifactId::new();
+        let compose_entry = TreeEntry::blob(Hash256::from_bytes([7; 32]), false);
+        let dockerfile_entry = TreeEntry::blob(Hash256::from_bytes([8; 32]), false);
+        let mut added = make_semantic_change(c1, vec![], vec![], vec![]);
+        added.tree_deltas = vec![
+            TreeDelta::Added {
+                artifact_id: compose,
+                new: LocatedEntry::new(repo_path("compose.yaml"), compose_entry),
+            },
+            TreeDelta::Added {
+                artifact_id: dockerfile,
+                new: LocatedEntry::new(repo_path("Dockerfile"), dockerfile_entry),
+            },
+        ];
         let mut removed = make_semantic_change(c2, vec![c1], vec![], vec![]);
-        removed.artifact_deltas = vec![ArtifactDelta {
-            file_id,
-            kind: ArtifactDeltaKind::Removed,
-            old_hash: Some(Hash256::from_bytes([10; 32])),
-            new_hash: None,
+        removed.tree_deltas = vec![TreeDelta::Removed {
+            artifact_id: compose,
+            old: LocatedEntry::new(repo_path("compose.yaml"), compose_entry),
         }];
 
+        let entries = resolved_tree_at(vec![added, removed], c2);
+        assert!(entries.get(&compose).is_none());
         assert_eq!(
-            replay_source_tree([legacy, removed]),
-            SourceTreeResolution::Exact {
-                entries: HashMap::new()
-            }
+            entries.get(&dockerfile).map(|value| value.entry),
+            Some(dockerfile_entry)
         );
     }
 
     #[test]
-    fn remaining_legacy_gaps_are_sorted_stably_by_path() {
-        let change_id = make_change_id(12);
-        let mut change = make_semantic_change(change_id, vec![], vec![], vec![]);
-        change.artifact_deltas = vec![
-            ArtifactDelta {
-                file_id: FilePathId::new("z-last"),
-                kind: ArtifactDeltaKind::Added,
-                old_hash: None,
-                new_hash: Some(Hash256::from_bytes([12; 32])),
+    fn exact_tree_preserves_mode_only_changes() {
+        let c1 = make_change_id(9);
+        let c2 = make_change_id(10);
+        let artifact_id = ArtifactId::new();
+        let regular = TreeEntry::blob(Hash256::from_bytes([9; 32]), false);
+        let executable = TreeEntry::blob(Hash256::from_bytes([9; 32]), true);
+        let mut added = make_semantic_change(c1, vec![], vec![], vec![]);
+        added.tree_deltas = vec![TreeDelta::Added {
+            artifact_id,
+            new: LocatedEntry::new(repo_path("bin/run"), regular),
+        }];
+        let mut mode_changed = make_semantic_change(c2, vec![c1], vec![], vec![]);
+        mode_changed.tree_deltas = vec![TreeDelta::Updated {
+            artifact_id,
+            old: LocatedEntry::new(repo_path("bin/run"), regular),
+            new: LocatedEntry::new(repo_path("bin/run"), executable),
+        }];
+
+        assert_eq!(
+            resolved_tree_at(vec![added, mode_changed], c2)
+                .get(&artifact_id)
+                .map(|value| value.entry),
+            Some(executable)
+        );
+        assert!(matches!(
+            executable,
+            TreeEntry::Blob {
+                executable: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rename_preserves_artifact_identity_and_revision_lineage() {
+        let add_id = make_change_id(40);
+        let rename_id = make_change_id(41);
+        let artifact_id = ArtifactId::new();
+        let old_path = RepoPath::from_bytes(vec![b'o', b'l', b'd', b'/', 0xff]).unwrap();
+        let new_path = RepoPath::from_bytes(vec![b'n', b'e', b'w', b'/', 0xfe]).unwrap();
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x40; 32]), false);
+        let mut add = make_semantic_change(add_id, vec![], vec![], vec![]);
+        add.tree_deltas = vec![TreeDelta::Added {
+            artifact_id,
+            new: LocatedEntry::new(old_path.clone(), entry),
+        }];
+        let mut rename = make_semantic_change(rename_id, vec![add_id], vec![], vec![]);
+        rename.tree_deltas = vec![TreeDelta::Updated {
+            artifact_id,
+            old: LocatedEntry::new(old_path, entry),
+            new: LocatedEntry::new(new_path.clone(), entry),
+        }];
+        let store = HistoryStore::from_changes([add, rename]);
+
+        let revisions = store
+            .get_artifact_revisions_at(&artifact_id, &rename_id)
+            .unwrap();
+        let first = revisions
+            .iter()
+            .find(|revision| revision.introduced_by == add_id)
+            .unwrap();
+        let renamed = revisions
+            .iter()
+            .find(|revision| revision.introduced_by == rename_id)
+            .unwrap();
+        let active = store
+            .resolve_artifact_revision_at(&artifact_id, &rename_id)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(revisions.len(), 2);
+        assert_eq!(renamed.artifact_id, artifact_id);
+        assert_eq!(renamed.path, new_path);
+        assert_eq!(renamed.predecessor_revisions, vec![first.revision_id]);
+        assert_eq!(active.revision_id, renamed.revision_id);
+        assert_eq!(
+            store
+                .resolve_tree_at(&rename_id)
+                .unwrap()
+                .artifact_id_at_path(&renamed.path),
+            Some(artifact_id)
+        );
+    }
+
+    #[test]
+    fn path_reuse_does_not_join_distinct_artifact_lineages() {
+        let add_id = make_change_id(42);
+        let replace_id = make_change_id(43);
+        let old_artifact = ArtifactId::new();
+        let new_artifact = ArtifactId::new();
+        let old_entry = TreeEntry::blob(Hash256::from_bytes([0x42; 32]), false);
+        let new_entry = TreeEntry::blob(Hash256::from_bytes([0x43; 32]), false);
+        let reused_path = repo_path("README");
+        let mut add = make_semantic_change(add_id, vec![], vec![], vec![]);
+        add.tree_deltas = vec![TreeDelta::Added {
+            artifact_id: old_artifact,
+            new: LocatedEntry::new(reused_path.clone(), old_entry),
+        }];
+        let mut replace = make_semantic_change(replace_id, vec![add_id], vec![], vec![]);
+        replace.tree_deltas = vec![
+            TreeDelta::Removed {
+                artifact_id: old_artifact,
+                old: LocatedEntry::new(reused_path.clone(), old_entry),
             },
-            ArtifactDelta {
-                file_id: FilePathId::new("a-first"),
-                kind: ArtifactDeltaKind::Modified,
-                old_hash: None,
-                new_hash: Some(Hash256::from_bytes([13; 32])),
+            TreeDelta::Added {
+                artifact_id: new_artifact,
+                new: LocatedEntry::new(reused_path.clone(), new_entry),
             },
         ];
+        let store = HistoryStore::from_changes([add, replace]);
 
-        let SourceTreeResolution::Incomplete { gaps } = replay_source_tree([change]) else {
-            panic!("legacy modes must remain incomplete");
-        };
+        let new_revisions = store
+            .get_artifact_revisions_at(&new_artifact, &replace_id)
+            .unwrap();
+
+        assert_eq!(new_revisions.len(), 1);
+        assert!(new_revisions[0].predecessor_revisions.is_empty());
+        assert!(store
+            .resolve_artifact_revision_at(&old_artifact, &replace_id)
+            .unwrap()
+            .is_none());
         assert_eq!(
-            gaps.iter()
-                .map(|gap| gap.file_id.0.as_str())
-                .collect::<Vec<_>>(),
-            vec!["a-first", "z-last"]
+            store
+                .resolve_tree_at(&replace_id)
+                .unwrap()
+                .artifact_id_at_path(&reused_path),
+            Some(new_artifact)
         );
+    }
+
+    #[test]
+    fn merge_revision_records_all_parent_predecessors_in_parent_order() {
+        let root_id = make_change_id(50);
+        let left_id = make_change_id(51);
+        let right_id = make_change_id(52);
+        let merge_id = make_change_id(53);
+        let artifact_id = ArtifactId::new();
+        let base = TreeEntry::blob(Hash256::from_bytes([0x50; 32]), false);
+        let left = TreeEntry::blob(Hash256::from_bytes([0x51; 32]), false);
+        let right = TreeEntry::blob(Hash256::from_bytes([0x52; 32]), false);
+        let merged = TreeEntry::blob(Hash256::from_bytes([0x53; 32]), false);
+
+        let mut root = make_semantic_change(root_id, vec![], vec![], vec![]);
+        root.tree_deltas = vec![TreeDelta::Added {
+            artifact_id,
+            new: LocatedEntry::new(repo_path("artifact"), base),
+        }];
+        let mut left_change = make_semantic_change(left_id, vec![root_id], vec![], vec![]);
+        left_change.tree_deltas = vec![TreeDelta::Updated {
+            artifact_id,
+            old: LocatedEntry::new(repo_path("artifact"), base),
+            new: LocatedEntry::new(repo_path("artifact"), left),
+        }];
+        let mut right_change = make_semantic_change(right_id, vec![root_id], vec![], vec![]);
+        right_change.tree_deltas = vec![TreeDelta::Updated {
+            artifact_id,
+            old: LocatedEntry::new(repo_path("artifact"), base),
+            new: LocatedEntry::new(repo_path("artifact"), right),
+        }];
+        let mut merge = make_semantic_change(merge_id, vec![left_id, right_id], vec![], vec![]);
+        merge.tree_deltas = vec![TreeDelta::Updated {
+            artifact_id,
+            old: LocatedEntry::new(repo_path("artifact"), left),
+            new: LocatedEntry::new(repo_path("artifact"), merged),
+        }];
+        let store = HistoryStore::from_changes([root, left_change, right_change, merge]);
+
+        let revisions = store
+            .get_artifact_revisions_at(&artifact_id, &merge_id)
+            .unwrap();
+        let root_revision = revisions
+            .iter()
+            .find(|revision| revision.introduced_by == root_id)
+            .unwrap();
+        let left_revision = revisions
+            .iter()
+            .find(|revision| revision.introduced_by == left_id)
+            .unwrap();
+        let right_revision = revisions
+            .iter()
+            .find(|revision| revision.introduced_by == right_id)
+            .unwrap();
+        let merge_revision = revisions
+            .iter()
+            .find(|revision| revision.introduced_by == merge_id)
+            .unwrap();
+        let active = store
+            .resolve_artifact_revision_at(&artifact_id, &merge_id)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            left_revision.predecessor_revisions,
+            vec![root_revision.revision_id]
+        );
+        assert_eq!(
+            right_revision.predecessor_revisions,
+            vec![root_revision.revision_id]
+        );
+        assert_eq!(
+            merge_revision.predecessor_revisions,
+            vec![left_revision.revision_id, right_revision.revision_id]
+        );
+        assert_eq!(active.revision_id, merge_revision.revision_id);
+    }
+
+    #[test]
+    fn resolved_graph_state_requires_exact_tree_state() {
+        let payload_without_tree = serde_json::json!({
+            "entities": {},
+            "relations": {},
+            "entity_revisions": {},
+            "entity_tombstones": {},
+            "relation_tombstones": {}
+        });
+
+        assert!(serde_json::from_value::<ResolvedGraphState>(payload_without_tree).is_err());
     }
 
     #[test]
@@ -2267,24 +2537,30 @@ mod tests {
             make_semantic_change(
                 c1,
                 vec![],
-                vec![EntityDelta::Added(entity_a.clone())],
+                vec![EntityDelta::Added {
+                    new: entity_a.clone(),
+                }],
                 vec![],
             ),
             make_semantic_change(
                 c2,
                 vec![c1],
-                vec![EntityDelta::Added(entity_b.clone())],
+                vec![EntityDelta::Added {
+                    new: entity_b.clone(),
+                }],
                 vec![],
             ),
             make_semantic_change(
                 c3,
                 vec![c2],
-                vec![EntityDelta::Removed(entity_a_id)],
+                vec![EntityDelta::Removed {
+                    old: entity_a.clone(),
+                }],
                 vec![],
             ),
         ];
 
-        let state = replay_graph_state(changes);
+        let state = replay_graph_state(changes).unwrap();
 
         assert!(
             !state.entities.contains_key(&entity_a_id),
@@ -2320,11 +2596,21 @@ mod tests {
         let entity_b = make_entity(entity_b_id, "b");
 
         let changes = vec![
-            make_semantic_change(c1, vec![], vec![EntityDelta::Added(entity_a)], vec![]),
-            make_semantic_change(c2, vec![c1], vec![EntityDelta::Added(entity_b)], vec![]),
+            make_semantic_change(
+                c1,
+                vec![],
+                vec![EntityDelta::Added { new: entity_a }],
+                vec![],
+            ),
+            make_semantic_change(
+                c2,
+                vec![c1],
+                vec![EntityDelta::Added { new: entity_b }],
+                vec![],
+            ),
         ];
 
-        let state = replay_graph_state(changes);
+        let state = replay_graph_state(changes).unwrap();
 
         assert!(state.entities.contains_key(&entity_a_id));
         assert!(state.entities.contains_key(&entity_b_id));
@@ -2347,17 +2633,29 @@ mod tests {
         let relation = make_relation(rel_id, entity_a_id, entity_b_id);
 
         let changes = vec![
-            make_semantic_change(c1, vec![], vec![EntityDelta::Added(entity_a)], vec![]),
+            make_semantic_change(
+                c1,
+                vec![],
+                vec![EntityDelta::Added { new: entity_a }],
+                vec![],
+            ),
             make_semantic_change(
                 c2,
                 vec![c1],
-                vec![EntityDelta::Added(entity_b)],
-                vec![RelationDelta::Added(relation)],
+                vec![EntityDelta::Added { new: entity_b }],
+                vec![RelationDelta::Added {
+                    new: relation.clone(),
+                }],
             ),
-            make_semantic_change(c3, vec![c2], vec![], vec![RelationDelta::Removed(rel_id)]),
+            make_semantic_change(
+                c3,
+                vec![c2],
+                vec![],
+                vec![RelationDelta::Removed { old: relation }],
+            ),
         ];
 
-        let state = replay_graph_state(changes);
+        let state = replay_graph_state(changes).unwrap();
 
         assert!(
             !state.relations.contains_key(&rel_id),
@@ -2373,7 +2671,7 @@ mod tests {
     }
 
     #[test]
-    fn dangling_relation_tombstoned_on_entity_removal() {
+    fn entity_removal_requires_explicit_relation_removal() {
         let c1 = make_change_id(1);
         let c2 = make_change_id(2);
         let c3 = make_change_id(3);
@@ -2387,35 +2685,144 @@ mod tests {
         let relation = make_relation(rel_id, entity_a_id, entity_b_id);
 
         let changes = vec![
-            make_semantic_change(c1, vec![], vec![EntityDelta::Added(entity_a)], vec![]),
+            make_semantic_change(
+                c1,
+                vec![],
+                vec![EntityDelta::Added {
+                    new: entity_a.clone(),
+                }],
+                vec![],
+            ),
             make_semantic_change(
                 c2,
                 vec![c1],
-                vec![EntityDelta::Added(entity_b)],
-                vec![RelationDelta::Added(relation)],
+                vec![EntityDelta::Added { new: entity_b }],
+                vec![RelationDelta::Added { new: relation }],
             ),
             make_semantic_change(
                 c3,
                 vec![c2],
-                vec![EntityDelta::Removed(entity_a_id)],
+                vec![EntityDelta::Removed { old: entity_a }],
                 vec![],
             ),
         ];
 
-        let state = replay_graph_state(changes);
+        let error = replay_graph_state(changes).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("relation removal must be explicit"));
+    }
 
-        assert!(
-            state.entity_tombstones.contains_key(&entity_a_id),
-            "entity A should be tombstoned"
+    #[test]
+    fn exact_graph_and_tree_deltas_are_self_inverting() {
+        let entity_id = EntityId::new();
+        let mut old_entity = make_entity(entity_id, "old_name");
+        let mut new_entity = old_entity.clone();
+        new_entity.name = "new_name".to_string();
+
+        let other_id = EntityId::new();
+        let relation_id = RelationId::new();
+        let old_relation = make_relation(relation_id, entity_id, other_id);
+        let mut new_relation = old_relation.clone();
+        new_relation.confidence = 0.75;
+
+        let artifact_id = ArtifactId::new();
+        let old_entry = LocatedEntry::new(
+            repo_path("compose.yaml"),
+            TreeEntry::blob(Hash256::from_bytes([0x91; 32]), false),
         );
-        assert!(
-            state.relation_tombstones.contains_key(&rel_id),
-            "relation should be tombstoned because entity A was removed"
+        let new_entry = LocatedEntry::new(
+            RepoPath::from_bytes(b"infra/compose-\xff.yaml".to_vec()).unwrap(),
+            TreeEntry::symlink(Hash256::from_bytes([0x92; 32])),
         );
-        let (_, removal_change) = state.relation_tombstones.get(&rel_id).unwrap();
-        assert_eq!(
-            *removal_change, c3,
-            "dangling relation tombstone should reference the change that removed the entity"
-        );
+        let delta = TransactionDelta {
+            entity_deltas: vec![EntityDelta::Modified {
+                old: old_entity.clone(),
+                new: new_entity,
+            }],
+            relation_deltas: vec![RelationDelta::Modified {
+                old: old_relation,
+                new: new_relation,
+            }],
+            tree_deltas: vec![TreeDelta::Updated {
+                artifact_id,
+                old: old_entry.clone(),
+                new: new_entry,
+            }],
+            admission_policy_delta: None,
+        };
+
+        crate::validate_transaction_delta(&delta).unwrap();
+        assert_eq!(delta.inverse().inverse(), delta);
+
+        let base = ResolvedTree::from_artifacts([crate::ResolvedArtifact::new(
+            artifact_id,
+            old_entry.path.clone(),
+            old_entry.entry,
+        )])
+        .unwrap();
+        let changed = base.apply(&delta.tree_deltas).unwrap();
+        assert_eq!(changed.apply(&delta.inverse().tree_deltas).unwrap(), base);
+
+        old_entity.name = "stale_old_payload".to_string();
+        let mut wrong_identity = old_entity.clone();
+        wrong_identity.id = EntityId::new();
+        let invalid = TransactionDelta {
+            entity_deltas: vec![EntityDelta::Modified {
+                old: old_entity,
+                new: wrong_identity,
+            }],
+            ..TransactionDelta::default()
+        };
+        assert!(crate::validate_transaction_delta(&invalid).is_err());
+    }
+
+    #[test]
+    fn exact_inverse_readdition_clears_entity_and_relation_tombstones() {
+        let c1 = make_change_id(41);
+        let c2 = make_change_id(42);
+        let c3 = make_change_id(43);
+        let entity_a = make_entity(EntityId::new(), "a");
+        let entity_b = make_entity(EntityId::new(), "b");
+        let relation = make_relation(RelationId::new(), entity_a.id, entity_b.id);
+        let removal = TransactionDelta {
+            entity_deltas: vec![EntityDelta::Removed {
+                old: entity_a.clone(),
+            }],
+            relation_deltas: vec![RelationDelta::Removed {
+                old: relation.clone(),
+            }],
+            ..TransactionDelta::default()
+        };
+        let restoration = removal.inverse();
+
+        let changes = vec![
+            make_semantic_change(
+                c1,
+                Vec::new(),
+                vec![
+                    EntityDelta::Added {
+                        new: entity_a.clone(),
+                    },
+                    EntityDelta::Added { new: entity_b },
+                ],
+                vec![RelationDelta::Added {
+                    new: relation.clone(),
+                }],
+            ),
+            make_semantic_change(c2, vec![c1], removal.entity_deltas, removal.relation_deltas),
+            make_semantic_change(
+                c3,
+                vec![c2],
+                restoration.entity_deltas,
+                restoration.relation_deltas,
+            ),
+        ];
+
+        let state = replay_graph_state(changes).unwrap();
+        assert_eq!(state.entities.get(&entity_a.id), Some(&entity_a));
+        assert_eq!(state.relations.get(&relation.id), Some(&relation));
+        assert!(!state.entity_tombstones.contains_key(&entity_a.id));
+        assert!(!state.relation_tombstones.contains_key(&relation.id));
     }
 }

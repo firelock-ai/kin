@@ -21,8 +21,8 @@ pub struct GraphStats {
     pub opaque_artifact_count: usize,
     /// Number of persisted file layouts.
     pub file_layout_count: usize,
-    /// Number of file content hashes recorded.
-    pub file_hash_count: usize,
+    /// Number of exact entries in the graph-owned working tree.
+    pub working_tree_entry_count: usize,
     /// Number of entities currently visible in the committed text index.
     pub text_indexed_entity_count: usize,
     /// Text index coverage relative to total entities.
@@ -46,6 +46,5 @@ pub struct GraphStats {
     /// Total relation count across all kinds.
     pub total_relations: usize,
     /// Entity counts keyed by EntityRole debug name (e.g. "Source", "Test").
-    #[serde(default)]
     pub role_counts: HashMap<String, usize>,
 }

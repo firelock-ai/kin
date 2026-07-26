@@ -40,6 +40,84 @@ fn main() {
             "SemanticChange",
             serde_json::to_string_pretty(&schema_for!(kin_model::SemanticChange)).unwrap(),
         ),
+        (
+            "TreeEntry",
+            serde_json::to_string_pretty(&schema_for!(kin_model::TreeEntry)).unwrap(),
+        ),
+        (
+            "RepoPath",
+            serde_json::to_string_pretty(&schema_for!(kin_model::RepoPath)).unwrap(),
+        ),
+        (
+            "GitObjectId",
+            serde_json::to_string_pretty(&schema_for!(kin_model::GitObjectId)).unwrap(),
+        ),
+        (
+            "GitExternalAuthority",
+            serde_json::to_string_pretty(&schema_for!(kin_model::GitExternalAuthority)).unwrap(),
+        ),
+        (
+            "GitExternalAuthorityDelta",
+            serde_json::to_string_pretty(&schema_for!(kin_model::GitExternalAuthorityDelta))
+                .unwrap(),
+        ),
+        (
+            "LocatedEntry",
+            serde_json::to_string_pretty(&schema_for!(kin_model::LocatedEntry)).unwrap(),
+        ),
+        (
+            "ResolvedArtifact",
+            serde_json::to_string_pretty(&schema_for!(kin_model::ResolvedArtifact)).unwrap(),
+        ),
+        (
+            "ResolvedTree",
+            serde_json::to_string_pretty(&schema_for!(kin_model::ResolvedTree)).unwrap(),
+        ),
+        (
+            "TreeDelta",
+            serde_json::to_string_pretty(&schema_for!(kin_model::TreeDelta)).unwrap(),
+        ),
+        (
+            "TransactionDelta",
+            serde_json::to_string_pretty(&schema_for!(kin_model::TransactionDelta)).unwrap(),
+        ),
+        // Repository authority
+        (
+            "RefName",
+            serde_json::to_string_pretty(&schema_for!(kin_model::RefName)).unwrap(),
+        ),
+        (
+            "RefTarget",
+            serde_json::to_string_pretty(&schema_for!(kin_model::RefTarget)).unwrap(),
+        ),
+        (
+            "RepositoryRefState",
+            serde_json::to_string_pretty(&schema_for!(kin_model::RepositoryRefState)).unwrap(),
+        ),
+        (
+            "WorkspaceState",
+            serde_json::to_string_pretty(&schema_for!(kin_model::WorkspaceState)).unwrap(),
+        ),
+        (
+            "WorkspaceMutation",
+            serde_json::to_string_pretty(&schema_for!(kin_model::WorkspaceMutation)).unwrap(),
+        ),
+        (
+            "WorkspaceTreeArtifact",
+            serde_json::to_string_pretty(&schema_for!(kin_model::WorkspaceTreeArtifact)).unwrap(),
+        ),
+        (
+            "WorkspaceTreeSnapshot",
+            serde_json::to_string_pretty(&schema_for!(kin_model::WorkspaceTreeSnapshot)).unwrap(),
+        ),
+        (
+            "RepositoryTransaction",
+            serde_json::to_string_pretty(&schema_for!(kin_model::RepositoryTransaction)).unwrap(),
+        ),
+        (
+            "SharedAdmissionPolicy",
+            serde_json::to_string_pretty(&schema_for!(kin_model::SharedAdmissionPolicy)).unwrap(),
+        ),
         // Work graph
         (
             "WorkItem",

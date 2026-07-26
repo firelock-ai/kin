@@ -7,12 +7,10 @@ use uuid::Uuid;
 
 use crate::ids::{ArtifactRevisionId, EntityId, EntityRevisionId, FilePathId};
 
-const ARTIFACT_NAMESPACE: Uuid = Uuid::from_u128(0x91c11f2ce3d14f8b8a9f0fb8b1972b3a);
-
-/// Deterministic ID for retrievable non-entity graph objects.
+/// Stable graph-assigned identity for a retrievable non-entity artifact.
 ///
-/// Artifact IDs are derived from graph-owned file paths so the same tracked
-/// artifact produces the same retrieval ID across re-index and re-init.
+/// A path is a mutable location, not an identity seed. Importers allocate an
+/// ID once and persist the path-to-ID association in graph state.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
 )]
@@ -23,36 +21,6 @@ impl ArtifactId {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
-    }
-
-    /// Deterministic minting seed (UUIDv5 of the path) for artifact identity.
-    ///
-    /// This is the low-level primitive the **graph assigner** and the **v7→v8
-    /// migration** use to mint / reproduce stable `ArtifactId`s. Ordinary code
-    /// must NOT mint or re-derive identity from a path — resolve the
-    /// graph-assigned id via `EntityStore::artifact_id_for_path` (the artifact
-    /// index) instead. Hidden from the public API surface; exposed only so the
-    /// assigner/migration in sibling crates can mint deterministically.
-    #[doc(hidden)]
-    pub fn seed_from_path(path: &str) -> Self {
-        Self(Uuid::new_v5(&ARTIFACT_NAMESPACE, path.as_bytes()))
-    }
-
-    /// Deterministic minting seed from a `FilePathId`. See [`Self::seed_from_path`].
-    #[doc(hidden)]
-    pub fn seed_from_file_id(file_id: &FilePathId) -> Self {
-        Self::seed_from_path(&file_id.0)
-    }
-
-    /// DEPRECATED: Use graph-assigned IDs via the artifact index lookup.
-    #[deprecated(note = "use graph-assigned ArtifactId via artifact_index lookup")]
-    pub fn from_path(path: &str) -> Self {
-        Self::seed_from_path(path)
-    }
-
-    #[deprecated(note = "use graph-assigned ArtifactId via artifact_index lookup")]
-    pub fn from_file_id(file_id: &FilePathId) -> Self {
-        Self::seed_from_file_id(file_id)
     }
 }
 
@@ -113,18 +81,13 @@ mod tests {
     use super::{ArtifactId, RetrievalKey};
 
     #[test]
-    fn artifact_id_is_deterministic_for_same_path() {
-        let left = ArtifactId::seed_from_path("src/lib.rs");
-        let right = ArtifactId::seed_from_path("src/lib.rs");
-        let other = ArtifactId::seed_from_path("src/main.rs");
-
-        assert_eq!(left, right);
-        assert_ne!(left, other);
+    fn artifact_id_is_graph_assigned() {
+        assert_ne!(ArtifactId::new(), ArtifactId::new());
     }
 
     #[test]
     fn retrieval_key_roundtrips_through_json() {
-        let key = RetrievalKey::Artifact(ArtifactId::seed_from_path("Makefile"));
+        let key = RetrievalKey::Artifact(ArtifactId::new());
         let json = serde_json::to_string(&key).unwrap();
         let parsed: RetrievalKey = serde_json::from_str(&json).unwrap();
 

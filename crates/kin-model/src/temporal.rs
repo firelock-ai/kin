@@ -5,26 +5,26 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::{
-    ArtifactDeltaKind, ArtifactRevisionId, Entity, EntityId, EntityRevisionId, FilePathId, Hash256,
-    Relation, RelationId, RelationRevisionId, SemanticChangeId,
+    ArtifactId, ArtifactRevisionId, Entity, EntityId, EntityRevisionId, LocatedEntry, Relation,
+    RelationId, RelationRevisionId, RepoPath, SemanticChangeId, TreeEntry,
 };
+
+const ARTIFACT_REVISION_DOMAIN: &[u8] = b"kin.artifact-revision.v2\0";
 
 /// Immutable entity state introduced by a semantic change.
 ///
-/// `EntityId` remains the stable anchor identity for migration compatibility.
-/// Each revision identifies one committed shape for that anchor.
+/// `EntityId` is the stable anchor identity; each revision identifies one
+/// committed shape for that anchor.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EntityRevision {
     pub revision_id: EntityRevisionId,
     pub entity_id: EntityId,
     pub entity: Entity,
     pub introduced_by: SemanticChangeId,
-    #[serde(default)]
     pub previous_revision: Option<EntityRevisionId>,
-    #[serde(default)]
     pub ended_by: Option<SemanticChangeId>,
 }
 
@@ -68,9 +68,7 @@ pub struct RelationRevision {
     pub relation_id: RelationId,
     pub relation: Relation,
     pub introduced_by: SemanticChangeId,
-    #[serde(default)]
     pub previous_revision: Option<RelationRevisionId>,
-    #[serde(default)]
     pub ended_by: Option<SemanticChangeId>,
 }
 
@@ -107,43 +105,50 @@ impl PartialEq for RelationRevision {
     }
 }
 
-/// Immutable tracked-file content revision introduced by a semantic change.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+/// Immutable tracked-file tree entry introduced by a semantic change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactRevision {
     pub revision_id: ArtifactRevisionId,
-    pub file_id: FilePathId,
-    pub content_hash: Hash256,
-    pub kind: ArtifactDeltaKind,
+    pub artifact_id: ArtifactId,
+    pub path: RepoPath,
+    pub entry: TreeEntry,
     pub introduced_by: SemanticChangeId,
-    #[serde(default)]
-    pub previous_revision: Option<ArtifactRevisionId>,
-    #[serde(default)]
-    pub ended_by: Option<SemanticChangeId>,
+    /// Revisions active for this artifact at the declared parents, in parent
+    /// order with duplicates removed. A merge can therefore preserve multiple
+    /// predecessor lines without changing first-parent state semantics.
+    pub predecessor_revisions: Vec<ArtifactRevisionId>,
 }
 
 impl ArtifactRevision {
     pub fn new(
-        file_id: FilePathId,
-        content_hash: Hash256,
-        kind: ArtifactDeltaKind,
+        artifact_id: ArtifactId,
+        path: RepoPath,
+        entry: TreeEntry,
         introduced_by: SemanticChangeId,
-        previous_revision: Option<ArtifactRevisionId>,
+        mut predecessor_revisions: Vec<ArtifactRevisionId>,
     ) -> Self {
-        let revision_id =
-            ArtifactRevisionId::for_artifact_change(&file_id, &introduced_by, &content_hash);
+        let mut seen_predecessors = BTreeSet::new();
+        predecessor_revisions.retain(|revision_id| seen_predecessors.insert(*revision_id));
+        let located = LocatedEntry::new(path.clone(), entry);
+        let revision_id = ArtifactRevisionId::for_artifact_change(
+            &artifact_id,
+            &introduced_by,
+            &located,
+            &predecessor_revisions,
+        );
         Self {
             revision_id,
-            file_id,
-            content_hash,
-            kind,
+            artifact_id,
+            path,
+            entry,
             introduced_by,
-            previous_revision,
-            ended_by: None,
+            predecessor_revisions,
         }
     }
 
-    pub fn mark_ended(&mut self, change_id: SemanticChangeId) {
-        self.ended_by.get_or_insert(change_id);
+    pub fn located_entry(&self) -> LocatedEntry {
+        LocatedEntry::new(self.path.clone(), self.entry)
     }
 }
 
@@ -167,20 +172,61 @@ impl RelationRevisionId {
 
 impl ArtifactRevisionId {
     pub fn for_artifact_change(
-        file_id: &FilePathId,
+        artifact_id: &ArtifactId,
         change_id: &SemanticChangeId,
-        content_hash: &Hash256,
+        located: &LocatedEntry,
+        predecessor_revisions: &[ArtifactRevisionId],
     ) -> Self {
+        let mut seen_predecessors = BTreeSet::new();
+        let canonical_predecessors: Vec<_> = predecessor_revisions
+            .iter()
+            .copied()
+            .filter(|revision_id| seen_predecessors.insert(*revision_id))
+            .collect();
         let mut hasher = Sha256::new();
-        hasher.update(file_id.0.as_bytes());
+        hasher.update(ARTIFACT_REVISION_DOMAIN);
+        hasher.update(artifact_id.0.as_bytes());
         hasher.update(change_id.0.as_bytes());
-        hasher.update(content_hash.as_bytes());
+        hasher.update((located.path.as_bytes().len() as u64).to_be_bytes());
+        hasher.update(located.path.as_bytes());
+        match located.entry {
+            TreeEntry::Blob {
+                hash,
+                executable: false,
+            } => {
+                hasher.update([0]);
+                hasher.update(hash.as_bytes());
+            }
+            TreeEntry::Blob {
+                hash,
+                executable: true,
+            } => {
+                hasher.update([1]);
+                hasher.update(hash.as_bytes());
+            }
+            TreeEntry::Symlink { target_blob } => {
+                hasher.update([2]);
+                hasher.update(target_blob.as_bytes());
+            }
+            TreeEntry::Gitlink { target } => {
+                hasher.update([3]);
+                hasher.update([match target {
+                    crate::GitObjectId::Sha1(_) => 1,
+                    crate::GitObjectId::Sha256(_) => 2,
+                }]);
+                hasher.update(target.as_bytes());
+            }
+        }
+        hasher.update((canonical_predecessors.len() as u64).to_be_bytes());
+        for predecessor in canonical_predecessors {
+            hasher.update(predecessor.0.as_bytes());
+        }
         Self::from_hash(kin_blobs::Hash256::from_bytes(hasher.finalize().into()))
     }
 }
 
-/// Check whether an entity (or relation/artifact revision) was active at a
-/// given reference change, using the topological ordinal map.
+/// Check whether an entity or relation revision was active at a given
+/// reference change, using the topological ordinal map.
 ///
 /// Returns `true` when:
 /// - `introduced_ord <= ref_ord`, AND
@@ -286,6 +332,123 @@ mod tests {
         revision.mark_ended(later);
 
         assert_eq!(revision.ended_by, Some(remove));
+    }
+
+    #[test]
+    fn artifact_revision_identity_includes_anchor_path_and_exact_tree_mode() {
+        let artifact_id = ArtifactId::new();
+        let change = SemanticChangeId::from_hash(Hash256::from_bytes([0x51; 32]));
+        let blob_hash = Hash256::from_bytes([0x52; 32]);
+        let regular = LocatedEntry::new(
+            RepoPath::from_utf8("bin/run").unwrap(),
+            TreeEntry::blob(blob_hash, false),
+        );
+        let executable = LocatedEntry::new(
+            RepoPath::from_utf8("bin/run").unwrap(),
+            TreeEntry::blob(blob_hash, true),
+        );
+        let renamed = LocatedEntry::new(
+            RepoPath::from_utf8("bin/renamed").unwrap(),
+            TreeEntry::blob(blob_hash, false),
+        );
+
+        let regular_id =
+            ArtifactRevisionId::for_artifact_change(&artifact_id, &change, &regular, &[]);
+        let executable_id =
+            ArtifactRevisionId::for_artifact_change(&artifact_id, &change, &executable, &[]);
+        let renamed_id =
+            ArtifactRevisionId::for_artifact_change(&artifact_id, &change, &renamed, &[]);
+        let other_artifact_id =
+            ArtifactRevisionId::for_artifact_change(&ArtifactId::new(), &change, &regular, &[]);
+        let first_parent = ArtifactRevisionId::from_hash(Hash256::from_bytes([0x53; 32]));
+        let second_parent = ArtifactRevisionId::from_hash(Hash256::from_bytes([0x54; 32]));
+        let lineage_id = ArtifactRevisionId::for_artifact_change(
+            &artifact_id,
+            &change,
+            &regular,
+            &[first_parent, second_parent],
+        );
+        let reversed_lineage_id = ArtifactRevisionId::for_artifact_change(
+            &artifact_id,
+            &change,
+            &regular,
+            &[second_parent, first_parent],
+        );
+        let duplicate_lineage_id = ArtifactRevisionId::for_artifact_change(
+            &artifact_id,
+            &change,
+            &regular,
+            &[first_parent, second_parent, first_parent],
+        );
+
+        assert_ne!(regular_id, executable_id);
+        assert_ne!(regular_id, renamed_id);
+        assert_ne!(regular_id, other_artifact_id);
+        assert_ne!(regular_id, lineage_id);
+        assert_ne!(lineage_id, reversed_lineage_id);
+        assert_eq!(lineage_id, duplicate_lineage_id);
+    }
+
+    #[test]
+    fn artifact_revision_hash_encoding_is_version_pinned() {
+        let artifact_id = ArtifactId(uuid::Uuid::from_u128(1));
+        let change = SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32]));
+        let located = LocatedEntry::new(
+            RepoPath::from_bytes(vec![b'a', 0xff]).unwrap(),
+            TreeEntry::symlink(Hash256::from_bytes([0x22; 32])),
+        );
+        let predecessor = ArtifactRevisionId::from_hash(Hash256::from_bytes([0x33; 32]));
+
+        let revision_id = ArtifactRevisionId::for_artifact_change(
+            &artifact_id,
+            &change,
+            &located,
+            &[predecessor],
+        );
+
+        assert_eq!(
+            revision_id.to_string(),
+            "e858852f60cf556541aceaf7e9351ac874fb5557ef4e0cbbdab41489172cd54d"
+        );
+    }
+
+    #[test]
+    fn artifact_revision_uses_explicit_predecessor_lineage() {
+        let artifact_id = ArtifactId::new();
+        let introduced_by = SemanticChangeId::from_hash(Hash256::from_bytes([0x61; 32]));
+        let first_parent = ArtifactRevisionId::from_hash(Hash256::from_bytes([0x62; 32]));
+        let second_parent = ArtifactRevisionId::from_hash(Hash256::from_bytes([0x63; 32]));
+        let revision = ArtifactRevision::new(
+            artifact_id,
+            RepoPath::from_utf8("compose.yaml").unwrap(),
+            TreeEntry::blob(Hash256::from_bytes([0x64; 32]), false),
+            introduced_by,
+            vec![first_parent, second_parent, first_parent],
+        );
+
+        assert_eq!(revision.artifact_id, artifact_id);
+        assert_eq!(
+            revision.predecessor_revisions,
+            vec![first_parent, second_parent]
+        );
+
+        let encoded = serde_json::to_value(&revision).unwrap();
+        assert_eq!(
+            encoded["path"],
+            serde_json::json!({ "bytes_hex": "636f6d706f73652e79616d6c" })
+        );
+        assert!(encoded.get("file_id").is_none());
+        assert!(encoded.get("previous_revision").is_none());
+
+        let legacy = serde_json::json!({
+            "revision_id": revision.revision_id,
+            "file_id": "compose.yaml",
+            "entry": revision.entry,
+            "introduced_by": revision.introduced_by,
+            "previous_revision": first_parent,
+            "ended_by": null
+        });
+        assert!(serde_json::from_value::<ArtifactRevision>(legacy).is_err());
     }
 
     fn make_change_order() -> (

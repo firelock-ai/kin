@@ -8,7 +8,8 @@ substrate.
 It defines the graph objects that the public Kin stack uses across the local
 engine, CLI, daemon, MCP server, projection layer, and supporting crates:
 
-- entities, artifacts, relations, revisions, and retrieval keys
+- entities, relations, revisions, and retrieval keys
+- exact tree entries and deltas for every tracked path, regardless of language
 - sessions, intents, locks, traffic reports, and coordination events
 - review, work, provenance, verification, and temporal records
 - projection, reconciliation, preset, and policy types

@@ -43,7 +43,6 @@ impl ParseCompleteness {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileLayout {
     pub file_id: FilePathId,
-    #[serde(default)]
     pub parse_completeness: ParseCompleteness,
     pub imports: ImportSection,
     /// Interleaved entities and trivia.
@@ -95,7 +94,6 @@ pub struct StructuredArtifact {
     pub file_id: FilePathId,
     pub kind: ArtifactKind,
     pub content_hash: Hash256,
-    #[serde(default)]
     pub text_preview: Option<String>,
 }
 
@@ -116,7 +114,6 @@ pub struct OpaqueArtifact {
     pub file_id: FilePathId,
     pub content_hash: Hash256,
     pub mime_type: Option<String>,
-    #[serde(default)]
     pub text_preview: Option<String>,
 }
 
@@ -129,9 +126,7 @@ pub struct ShallowTrackedFile {
     pub import_count: usize,
     pub syntax_hash: Hash256,
     pub signature_hash: Option<Hash256>,
-    #[serde(default)]
     pub declaration_names: Vec<String>,
-    #[serde(default)]
     pub import_paths: Vec<String>,
 }
 
@@ -171,5 +166,22 @@ mod tests {
             ParseCompleteness::Failed("broken".to_string()).bucket(),
             "failed"
         );
+    }
+
+    #[test]
+    fn file_layout_requires_parse_completeness() {
+        let layout = FileLayout {
+            file_id: FilePathId::new("compose.yaml"),
+            parse_completeness: ParseCompleteness::Full,
+            imports: ImportSection {
+                byte_range: 0..0,
+                items: Vec::new(),
+            },
+            regions: Vec::new(),
+        };
+        let mut value = serde_json::to_value(layout).unwrap();
+        value.as_object_mut().unwrap().remove("parse_completeness");
+        let error = serde_json::from_value::<FileLayout>(value).unwrap_err();
+        assert!(error.to_string().contains("parse_completeness"));
     }
 }
