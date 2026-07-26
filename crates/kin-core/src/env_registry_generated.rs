@@ -99,6 +99,7 @@ pub const GENERATED_KNOBS: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_LOCATE_FLOOR_PRECOMP", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: floor precomp" },
     EnvVarSpec { name: "KIN_LOCATE_FORCE_LOCAL", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: force local" },
     EnvVarSpec { name: "KIN_LOCATE_FRAMEWORK_NOISE_PENALTY", kind: Kind::NonNegF32, default: "0.03", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: framework noise penalty" },
+    EnvVarSpec { name: "KIN_LOCATE_FUSED_DECLARATION_CAP", kind: Kind::Usize, default: "8", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: fused declaration cap" },
     EnvVarSpec { name: "KIN_LOCATE_GRAPH_BLEND", kind: Kind::NonNegF32, default: "0.10", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: graph blend" },
     EnvVarSpec { name: "KIN_LOCATE_GRAPH_NAME_MATCH_LIMIT", kind: Kind::Usize, default: "16", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: graph name match limit" },
     EnvVarSpec { name: "KIN_LOCATE_GRAPH_ONLY_PROJECTION_FLOOR", kind: Kind::NonNegF32, default: "0.25", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: graph only projection floor" },

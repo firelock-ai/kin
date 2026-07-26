@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (408 total, 304 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (409 total, 305 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -302,6 +302,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_FLOOR_PRECOMP` | bool | true | correctness | locate tuning knob: floor precomp |
 | `KIN_LOCATE_FORCE_LOCAL` | bool | false | correctness | locate tuning knob: force local |
 | `KIN_LOCATE_FRAMEWORK_NOISE_PENALTY` | float>=0 | 0.03 | correctness | locate tuning knob: framework noise penalty |
+| `KIN_LOCATE_FUSED_DECLARATION_CAP` | usize | 8 | correctness | locate tuning knob: fused declaration cap |
 | `KIN_LOCATE_GRAPH_BLEND` | float>=0 | 0.10 | correctness | locate tuning knob: graph blend |
 | `KIN_LOCATE_GRAPH_NAME_MATCH_LIMIT` | usize | 16 | correctness | locate tuning knob: graph name match limit |
 | `KIN_LOCATE_GRAPH_ONLY_PROJECTION_FLOOR` | float>=0 | 0.25 | correctness | locate tuning knob: graph only projection floor |
