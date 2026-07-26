@@ -123,7 +123,7 @@ fn generate_graph(n: usize, rels_per_entity: usize) -> InMemoryGraph {
         ..kin_db::GraphSnapshot::empty()
     };
 
-    InMemoryGraph::from_snapshot(snapshot)
+    InMemoryGraph::from_snapshot(snapshot).expect("generated benchmark snapshot is valid")
 }
 
 fn bench_entity_lookup(graph: &InMemoryGraph, entity_ids: &[EntityId], label: &str) {
@@ -338,7 +338,8 @@ fn bench_snapshot_index_build(n: usize, label: &str) {
     };
 
     let start = Instant::now();
-    let _graph = InMemoryGraph::from_snapshot(snapshot);
+    let _graph =
+        InMemoryGraph::from_snapshot(snapshot).expect("generated benchmark snapshot is valid");
     let elapsed = start.elapsed();
     println!("  {label} from_snapshot ({n} entities): {elapsed:?}");
 }

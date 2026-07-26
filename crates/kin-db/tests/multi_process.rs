@@ -157,9 +157,12 @@ fn generation_staleness_detection() {
     // Second save with correct expected generation succeeds with different
     // content, so a later same-byte replay cannot be an exact idempotent retry.
     let mut replacement = GraphSnapshot::empty();
-    replacement
-        .file_hashes
-        .insert("replacement.rs".to_string(), [1; 32]);
+    replacement.resolved_tree = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+        ArtifactId::new(),
+        RepoPath::from_utf8("replacement.rs").unwrap(),
+        TreeEntry::blob(Hash256::from_bytes([1; 32]), false),
+    )])
+    .unwrap();
     let replacement_bytes = replacement.to_bytes().unwrap();
     let gen2 = backend
         .save_snapshot("test", &replacement_bytes, gen1)
@@ -269,7 +272,7 @@ fn delta_round_trip_preserves_data() {
 
     let loaded_delta = GraphSnapshotDelta::from_bytes(&deltas[0].0).unwrap();
     let mut applied = snapshot.clone();
-    apply_graph_delta(&mut applied, &loaded_delta);
+    apply_graph_delta(&mut applied, &loaded_delta).unwrap();
 
     assert_eq!(applied.entities.len(), 2);
     assert!(applied.entities.contains_key(&e1.id));

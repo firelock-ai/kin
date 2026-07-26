@@ -2,12 +2,14 @@
 // Copyright 2026 Firelock, LLC
 
 use hashbrown::HashMap as FastHashMap;
-use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::de::{IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use crate::storage::change_validation::validate_semantic_change_entries;
+use crate::storage::repository::PersistedRepositoryAuthority;
 use crate::types::*;
 
 /// Statistics from a snapshot compaction pass.
@@ -22,10 +24,6 @@ pub struct CompactionStats {
     pub orphaned_outgoing_cleaned: usize,
     /// Incoming edge-list entries cleaned (non-existent entities or relations).
     pub orphaned_incoming_cleaned: usize,
-    /// Test coverage entries removed (non-existent test or entity/contract/work).
-    pub orphaned_test_coverage_removed: usize,
-    /// Verification run references removed (non-existent run, entity, or work).
-    pub orphaned_verification_refs_removed: usize,
     /// Mock hints removed (non-existent test).
     pub orphaned_mock_hints_removed: usize,
     /// Downstream warnings removed (non-existent intent or entity).
@@ -48,8 +46,6 @@ impl CompactionStats {
         self.orphaned_relations_removed
             + self.orphaned_outgoing_cleaned
             + self.orphaned_incoming_cleaned
-            + self.orphaned_test_coverage_removed
-            + self.orphaned_verification_refs_removed
             + self.orphaned_mock_hints_removed
             + self.orphaned_downstream_warnings_removed
             + self.orphaned_approvals_removed
@@ -67,6 +63,7 @@ impl CompactionStats {
 /// This is the on-disk format. We use std::collections::HashMap here
 /// (not hashbrown) for stable serde compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GraphSnapshot {
     pub version: u32,
     pub entities: HashMap<EntityId, Entity>,
@@ -75,80 +72,51 @@ pub struct GraphSnapshot {
     pub incoming: HashMap<EntityId, Vec<RelationId>>,
     pub changes: HashMap<SemanticChangeId, SemanticChange>,
     pub change_children: HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
-    pub branches: HashMap<BranchName, Branch>,
-    #[serde(default)]
     pub work_items: HashMap<WorkId, WorkItem>,
-    #[serde(default)]
     pub annotations: HashMap<AnnotationId, Annotation>,
-    #[serde(default)]
     pub work_links: Vec<WorkLink>,
-    #[serde(default)]
     pub reviews: HashMap<ReviewId, Review>,
-    #[serde(default)]
     pub review_decisions: HashMap<ReviewId, Vec<ReviewDecision>>,
-    #[serde(default)]
     pub review_notes: Vec<ReviewNote>,
-    #[serde(default)]
     pub review_discussions: Vec<ReviewDiscussion>,
-    #[serde(default)]
     pub review_assignments: HashMap<ReviewId, Vec<ReviewAssignment>>,
-    #[serde(default)]
     pub test_cases: HashMap<TestId, TestCase>,
-    #[serde(default)]
     pub assertions: HashMap<AssertionId, Assertion>,
-    #[serde(default)]
     pub verification_runs: HashMap<VerificationRunId, VerificationRun>,
-    #[serde(default)]
-    pub test_covers_entity: Vec<(TestId, EntityId)>,
-    #[serde(default)]
-    pub test_covers_contract: Vec<(TestId, ContractId)>,
-    #[serde(default)]
-    pub test_verifies_work: Vec<(TestId, WorkId)>,
-    #[serde(default)]
-    pub run_proves_entity: Vec<(VerificationRunId, EntityId)>,
-    #[serde(default)]
-    pub run_proves_work: Vec<(VerificationRunId, WorkId)>,
-    #[serde(default)]
     pub mock_hints: Vec<MockHint>,
-    #[serde(default)]
     pub contracts: HashMap<ContractId, Contract>,
-    #[serde(default)]
     pub actors: HashMap<ActorId, Actor>,
-    #[serde(default)]
     pub delegations: Vec<Delegation>,
-    #[serde(default)]
     pub approvals: Vec<Approval>,
-    #[serde(default)]
     pub audit_events: Vec<AuditEvent>,
-    #[serde(default)]
     pub shallow_files: Vec<ShallowTrackedFile>,
-    #[serde(default)]
     pub file_layouts: Vec<FileLayout>,
-    #[serde(default)]
     pub structured_artifacts: Vec<StructuredArtifact>,
-    #[serde(default)]
     pub opaque_artifacts: Vec<OpaqueArtifact>,
-    #[serde(default)]
-    pub file_hashes: HashMap<String, [u8; 32]>,
-    #[serde(default)]
+    /// Exact graph-owned repository tree. Artifact identity, byte-exact path,
+    /// content identity, and materialization kind are one validated authority.
+    pub resolved_tree: ResolvedTree,
     pub sessions: HashMap<SessionId, AgentSession>,
-    #[serde(default)]
     pub intents: HashMap<IntentId, Intent>,
-    #[serde(default)]
     pub downstream_warnings: Vec<(IntentId, EntityId, String)>,
-    #[serde(default)]
     pub entity_revisions: HashMap<EntityId, Vec<EntityRevision>>,
-    #[serde(default)]
-    pub entity_tombstones: HashMap<EntityId, (Entity, SemanticChangeId)>,
-    #[serde(default)]
-    pub relation_tombstones: HashMap<RelationId, (Relation, SemanticChangeId)>,
-    /// Topological ordinal map for temporal scope queries.
-    /// Maps each `SemanticChangeId` to its position in the DAG
-    /// (0 = oldest/genesis, N = newest/head).
-    #[serde(default)]
-    pub change_order: HashMap<SemanticChangeId, u64>,
-    #[serde(default)]
-    pub artifact_index: HashMap<FilePathId, ArtifactId>,
+    /// One immutable, repository-scoped authority envelope.
+    ///
+    /// Legacy graph mutation paths leave this absent. Once present, refs,
+    /// operation receipts, workspaces, aliases, admission state, and every
+    /// root move only through a full repository transaction and full-snapshot
+    /// CAS; incremental graph deltas are forbidden.
+    #[serde(deserialize_with = "deserialize_required_repository_authority")]
+    pub repository_authority: Option<PersistedRepositoryAuthority>,
+}
+
+fn deserialize_required_repository_authority<'de, D>(
+    deserializer: D,
+) -> Result<Option<PersistedRepositoryAuthority>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::deserialize(deserializer)
 }
 
 /// Lightweight snapshot view for locate-only cold starts.
@@ -168,154 +136,29 @@ pub(crate) struct LocateGraphSnapshot {
     pub entities: FastHashMap<EntityId, Entity>,
     pub relations: FastHashMap<RelationId, Relation>,
     pub changes: FastHashMap<SemanticChangeId, SemanticChange>,
+    pub entity_revisions: FastHashMap<EntityId, Vec<EntityRevision>>,
     pub shallow_files: Vec<ShallowTrackedFile>,
     pub file_layouts: Vec<FileLayout>,
     pub structured_artifacts: Vec<StructuredArtifact>,
     pub opaque_artifacts: Vec<OpaqueArtifact>,
-    #[serde(default)]
-    pub artifact_index: FastHashMap<FilePathId, ArtifactId>,
-}
-
-fn relation_kind_used_by_locate(kind: RelationKind) -> bool {
-    matches!(
-        kind,
-        RelationKind::Calls
-            | RelationKind::Includes
-            | RelationKind::UsesMacro
-            | RelationKind::Imports
-            | RelationKind::References
-            | RelationKind::Implements
-            | RelationKind::Extends
-            | RelationKind::Contains
-            | RelationKind::Tests
-            | RelationKind::DependsOn
-            | RelationKind::CoChanges
-    )
-}
-
-struct FilteredLocateRelation(Option<Relation>);
-
-impl<'de> Deserialize<'de> for FilteredLocateRelation {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct FilteredLocateRelationVisitor;
-
-        impl<'de> Visitor<'de> for FilteredLocateRelationVisitor {
-            type Value = FilteredLocateRelation;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("Relation sequence")
-            }
-
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                let id = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
-                let kind = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
-
-                if !relation_kind_used_by_locate(kind) {
-                    for index in 2..8 {
-                        let _: IgnoredAny = seq
-                            .next_element()?
-                            .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
-                    }
-                    while let Some(_) = seq.next_element::<IgnoredAny>()? {}
-                    return Ok(FilteredLocateRelation(None));
-                }
-
-                let src = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
-                let dst = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(3, &self))?;
-                let confidence = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(4, &self))?;
-                let origin = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(5, &self))?;
-                let created_in = seq.next_element()?.unwrap_or(None);
-                let import_source = seq.next_element()?.unwrap_or(None);
-                while let Some(_) = seq.next_element::<IgnoredAny>()? {}
-
-                Ok(FilteredLocateRelation(Some(Relation {
-                    id,
-                    kind,
-                    src,
-                    dst,
-                    confidence,
-                    origin,
-                    created_in,
-                    import_source,
-                    evidence: Vec::new(),
-                })))
-            }
-        }
-
-        deserializer.deserialize_seq(FilteredLocateRelationVisitor)
-    }
-}
-
-struct FilteredLocateRelationMap(FastHashMap<RelationId, Relation>);
-
-impl<'de> Deserialize<'de> for FilteredLocateRelationMap {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct FilteredLocateRelationMapVisitor;
-
-        impl<'de> Visitor<'de> for FilteredLocateRelationMapVisitor {
-            type Value = FilteredLocateRelationMap;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("relation map")
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut relations = FastHashMap::with_capacity(map.size_hint().unwrap_or(0));
-                while let Some(_relation_id) = map.next_key::<RelationId>()? {
-                    if let Some(relation) = map.next_value::<FilteredLocateRelation>()?.0 {
-                        relations.insert(relation.id, relation);
-                    }
-                }
-                Ok(FilteredLocateRelationMap(relations))
-            }
-        }
-
-        deserializer.deserialize_map(FilteredLocateRelationMapVisitor)
-    }
+    pub resolved_tree: ResolvedTree,
 }
 
 impl GraphSnapshot {
     /// Current format version.
-    pub const CURRENT_VERSION: u32 = 8;
+    pub const CURRENT_VERSION: u32 = 11;
 
-    /// Oldest on-disk format version this binary can load (directly or via
-    /// migration). Snapshots below this predate a schema we no longer read and
-    /// must be rebuilt.
-    pub const MIN_SUPPORTED_VERSION: u32 = 1;
+    /// The only on-disk format version this pre-release binary accepts.
+    pub const MIN_SUPPORTED_VERSION: u32 = Self::CURRENT_VERSION;
 
     /// Magic bytes for the file header: "KNDB"
     pub const MAGIC: [u8; 4] = *b"KNDB";
 
-    /// Size of the checksum appended to v3+ snapshots.
+    /// Size of the checksum appended to every current snapshot.
     pub const CHECKSUM_LEN: usize = 32;
 
-    /// Optional trailer magic that binds a persisted graph root hash to the
-    /// already-verified snapshot body checksum without changing the v6 body
-    /// layout. Older readers ignore these trailing bytes.
+    /// Optional trailer magic that binds a persisted graph-root cache value to
+    /// the already-verified snapshot body checksum.
     const ROOT_HASH_TRAILER_MAGIC: [u8; 4] = *b"KRTH";
     const ROOT_HASH_TRAILER_LEN: usize = 4 + 32 + 32;
 
@@ -328,7 +171,6 @@ impl GraphSnapshot {
             incoming: HashMap::new(),
             changes: HashMap::new(),
             change_children: HashMap::new(),
-            branches: HashMap::new(),
             work_items: HashMap::new(),
             annotations: HashMap::new(),
             work_links: Vec::new(),
@@ -340,11 +182,6 @@ impl GraphSnapshot {
             test_cases: HashMap::new(),
             assertions: HashMap::new(),
             verification_runs: HashMap::new(),
-            test_covers_entity: Vec::new(),
-            test_covers_contract: Vec::new(),
-            test_verifies_work: Vec::new(),
-            run_proves_entity: Vec::new(),
-            run_proves_work: Vec::new(),
             mock_hints: Vec::new(),
             contracts: HashMap::new(),
             actors: HashMap::new(),
@@ -355,16 +192,42 @@ impl GraphSnapshot {
             file_layouts: Vec::new(),
             structured_artifacts: Vec::new(),
             opaque_artifacts: Vec::new(),
-            file_hashes: HashMap::new(),
+            resolved_tree: ResolvedTree::default(),
             sessions: HashMap::new(),
             intents: HashMap::new(),
             downstream_warnings: Vec::new(),
             entity_revisions: HashMap::new(),
-            entity_tombstones: HashMap::new(),
-            relation_tombstones: HashMap::new(),
-            change_order: HashMap::new(),
-            artifact_index: HashMap::new(),
+            repository_authority: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admit_artifact_for_test(&mut self, path: String, entry: TreeEntry) -> ArtifactId {
+        let path = RepoPath::from_utf8(&path).expect("valid test repository path");
+        let existing = self.resolved_tree.artifact_at_path(&path).cloned();
+        let artifact_id = existing
+            .as_ref()
+            .map(|artifact| artifact.artifact_id)
+            .unwrap_or_else(ArtifactId::new);
+        let mut artifacts: Vec<_> = self.resolved_tree.clone().into_artifacts().collect();
+        artifacts.retain(|artifact| artifact.artifact_id != artifact_id);
+        artifacts.push(ResolvedArtifact::new(artifact_id, path, entry));
+        self.resolved_tree =
+            ResolvedTree::from_artifacts(artifacts).expect("valid test repository tree");
+        artifact_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tree_entry_for_test(&self, path: &str) -> Option<TreeEntry> {
+        let path = RepoPath::from_utf8(path).ok()?;
+        self.resolved_tree
+            .artifact_at_path(&path)
+            .map(|artifact| artifact.entry)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_artifact_path_for_test(&self, path: &str) -> bool {
+        self.tree_entry_for_test(path).is_some()
     }
 
     /// Compact the snapshot by removing orphaned data.
@@ -372,8 +235,6 @@ impl GraphSnapshot {
     /// Performs garbage collection across all cross-referenced collections:
     /// - Relations whose src or dst entity no longer exists
     /// - Outgoing/incoming edge lists referencing non-existent entities or relations
-    /// - Test coverage entries for non-existent tests, entities, contracts, or work items
-    /// - Verification run references for non-existent runs, entities, or work items
     /// - Mock hints for non-existent tests
     /// - Downstream warnings for non-existent intents or entities
     /// - Approvals for non-existent changes
@@ -397,29 +258,9 @@ impl GraphSnapshot {
         // 1. Remove orphaned relations (missing node on either endpoint)
         let before = self.relations.len();
         let artifact_ids: HashSet<ArtifactId> = self
-            .artifact_index
-            .values()
-            .copied()
-            .chain(
-                self.shallow_files
-                    .iter()
-                    .map(|file| ArtifactId::seed_from_file_id(&file.file_id)),
-            )
-            .chain(
-                self.file_layouts
-                    .iter()
-                    .map(|layout| ArtifactId::seed_from_file_id(&layout.file_id)),
-            )
-            .chain(
-                self.structured_artifacts
-                    .iter()
-                    .map(|artifact| ArtifactId::seed_from_file_id(&artifact.file_id)),
-            )
-            .chain(
-                self.opaque_artifacts
-                    .iter()
-                    .map(|artifact| ArtifactId::seed_from_file_id(&artifact.file_id)),
-            )
+            .resolved_tree
+            .artifacts()
+            .map(|artifact| artifact.artifact_id)
             .collect();
         self.relations.retain(|_, rel| {
             graph_node_exists(
@@ -461,57 +302,26 @@ impl GraphSnapshot {
         self.incoming.retain(|_, rels| !rels.is_empty());
         stats.orphaned_incoming_cleaned = before.saturating_sub(self.incoming.len());
 
-        // 4. Clean legacy test coverage entries
-        let mut coverage_removed = 0usize;
-        let before = self.test_covers_entity.len();
-        self.test_covers_entity
-            .retain(|(tid, eid)| test_ids.contains(tid) && entity_ids.contains(eid));
-        coverage_removed += before - self.test_covers_entity.len();
-
-        let before = self.test_covers_contract.len();
-        self.test_covers_contract
-            .retain(|(tid, cid)| test_ids.contains(tid) && contract_ids.contains(cid));
-        coverage_removed += before - self.test_covers_contract.len();
-
-        let before = self.test_verifies_work.len();
-        self.test_verifies_work
-            .retain(|(tid, wid)| test_ids.contains(tid) && work_ids.contains(wid));
-        coverage_removed += before - self.test_verifies_work.len();
-        stats.orphaned_test_coverage_removed = coverage_removed;
-
-        // 5. Clean legacy verification run references
-        let mut vr_removed = 0usize;
-        let before = self.run_proves_entity.len();
-        self.run_proves_entity
-            .retain(|(rid, eid)| run_ids.contains(rid) && entity_ids.contains(eid));
-        vr_removed += before - self.run_proves_entity.len();
-
-        let before = self.run_proves_work.len();
-        self.run_proves_work
-            .retain(|(rid, wid)| run_ids.contains(rid) && work_ids.contains(wid));
-        vr_removed += before - self.run_proves_work.len();
-        stats.orphaned_verification_refs_removed = vr_removed;
-
-        // 6. Clean mock hints for non-existent tests
+        // 4. Clean mock hints for non-existent tests
         let before = self.mock_hints.len();
         self.mock_hints
             .retain(|hint| test_ids.contains(&hint.test_id));
         stats.orphaned_mock_hints_removed = before - self.mock_hints.len();
 
-        // 7. Clean downstream warnings for non-existent intents or entities
+        // 5. Clean downstream warnings for non-existent intents or entities
         let intent_ids: HashSet<IntentId> = self.intents.keys().copied().collect();
         let before = self.downstream_warnings.len();
         self.downstream_warnings
             .retain(|(iid, eid, _)| intent_ids.contains(iid) && entity_ids.contains(eid));
         stats.orphaned_downstream_warnings_removed = before - self.downstream_warnings.len();
 
-        // 8. Clean approvals for non-existent changes
+        // 6. Clean approvals for non-existent changes
         let change_ids: HashSet<SemanticChangeId> = self.changes.keys().copied().collect();
         let before = self.approvals.len();
         self.approvals.retain(|a| change_ids.contains(&a.change_id));
         stats.orphaned_approvals_removed = before - self.approvals.len();
 
-        // 9. Clean delegations for non-existent actors
+        // 7. Clean delegations for non-existent actors
         let actor_ids: HashSet<ActorId> = self.actors.keys().copied().collect();
         let before = self.delegations.len();
         self.delegations
@@ -549,20 +359,17 @@ impl GraphSnapshot {
         &self,
         persisted_root_hash: Option<[u8; 32]>,
     ) -> Result<Vec<u8>, crate::error::KinDbError> {
-        let body = if self.version == Self::CURRENT_VERSION {
-            // Fast path: version matches, serialize directly without cloning.
-            // This saves ~200MB+ of peak memory for graphs with >500K entities.
-            rmp_serde::to_vec(self).map_err(|e| {
-                crate::error::KinDbError::StorageError(format!("serialization failed: {e}"))
-            })?
-        } else {
-            // Slow path: version mismatch, must clone and update version.
-            let mut snapshot = self.clone();
-            snapshot.version = Self::CURRENT_VERSION;
-            rmp_serde::to_vec(&snapshot).map_err(|e| {
-                crate::error::KinDbError::StorageError(format!("serialization failed: {e}"))
-            })?
-        };
+        if self.version != Self::CURRENT_VERSION {
+            return Err(crate::error::KinDbError::StorageError(format!(
+                "refusing to serialize snapshot body version {}; current schema is exactly v{}",
+                self.version,
+                Self::CURRENT_VERSION
+            )));
+        }
+        self.validate_storage_admission()?;
+        let body = rmp_serde::to_vec(self).map_err(|e| {
+            crate::error::KinDbError::StorageError(format!("serialization failed: {e}"))
+        })?;
 
         let trailer_len = persisted_root_hash
             .map(|_| Self::ROOT_HASH_TRAILER_LEN)
@@ -586,8 +393,9 @@ impl GraphSnapshot {
 
     /// Deserialize a snapshot from bytes (with header validation).
     ///
-    /// - v1/v2: no checksum
-    /// - v3+: checksum verified; returns error on mismatch
+    /// The pre-release v11 format removes graph-local branch authority in
+    /// preparation for one repository transaction envelope. Earlier snapshots
+    /// fail closed and must be rebuilt.
     pub fn from_bytes(data: &[u8]) -> Result<Self, crate::error::KinDbError> {
         Self::from_bytes_with_persisted_root_hash(data).map(|(snapshot, _)| snapshot)
     }
@@ -613,33 +421,10 @@ impl GraphSnapshot {
             Self::decode_frame(data, verify_checksum)?
         };
         let snapshot = match frame.version {
-            1 => {
-                let legacy: GraphSnapshotV1 = rmp_serde::from_slice(frame.body).map_err(|e| {
-                    crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
-                })?;
-                legacy.into()
-            }
-            2 => rmp_serde::from_slice(frame.body).map_err(|e| {
-                crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
-            })?,
-            3 => Self::decode_v3_snapshot(frame.body)?,
-            4 => Self::decode_v4_snapshot(frame.body)?,
-            5 => {
-                let migrated = super::migration::migrate(frame.body, 5, Self::CURRENT_VERSION)?;
-                Self::decode_current_snapshot(&migrated)?
-            }
-            6 => {
-                let migrated = super::migration::migrate(frame.body, 6, Self::CURRENT_VERSION)?;
-                Self::decode_current_snapshot(&migrated)?
-            }
-            7 => {
-                let migrated = super::migration::migrate(frame.body, 7, Self::CURRENT_VERSION)?;
-                Self::decode_current_snapshot(&migrated)?
-            }
-            8 => Self::decode_current_snapshot(frame.body)?,
+            Self::CURRENT_VERSION => Self::decode_current_snapshot(frame.body)?,
             _ => unreachable!("decode_frame validates supported versions"),
         };
-
+        snapshot.validate_storage_admission()?;
         let persisted_root_hash = if verify_checksum {
             Self::decode_root_hash_trailer(data, &frame)?
         } else {
@@ -693,86 +478,10 @@ impl GraphSnapshot {
         let body = &data[16..body_end];
 
         match version {
-            1 | 2 => Ok(SnapshotFrame {
-                version,
-                body,
-                body_checksum: None,
-                checksum_end: 16 + body_len,
-            }),
-            3 => {
-                let checksum_end = Self::require_checksum_slot(data, body_len, "v3")?;
+            Self::CURRENT_VERSION => {
+                let checksum_end = Self::require_checksum_slot(data, body_len, "v11")?;
                 let body_checksum = if verify_checksum {
-                    Some(Self::verify_checksum(data, body_len, "v3")?)
-                } else {
-                    None
-                };
-                Ok(SnapshotFrame {
-                    version,
-                    body,
-                    body_checksum,
-                    checksum_end,
-                })
-            }
-            4 => {
-                let checksum_end = Self::require_checksum_slot(data, body_len, "v4")?;
-                let body_checksum = if verify_checksum {
-                    Some(Self::verify_checksum(data, body_len, "v4")?)
-                } else {
-                    None
-                };
-                Ok(SnapshotFrame {
-                    version,
-                    body,
-                    body_checksum,
-                    checksum_end,
-                })
-            }
-            5 => {
-                let checksum_end = Self::require_checksum_slot(data, body_len, "v5")?;
-                let body_checksum = if verify_checksum {
-                    Some(Self::verify_checksum(data, body_len, "v5")?)
-                } else {
-                    None
-                };
-                Ok(SnapshotFrame {
-                    version,
-                    body,
-                    body_checksum,
-                    checksum_end,
-                })
-            }
-            6 => {
-                let checksum_end = Self::require_checksum_slot(data, body_len, "v6")?;
-                let body_checksum = if verify_checksum {
-                    Some(Self::verify_checksum(data, body_len, "v6")?)
-                } else {
-                    None
-                };
-                Ok(SnapshotFrame {
-                    version,
-                    body,
-                    body_checksum,
-                    checksum_end,
-                })
-            }
-            7 => {
-                let checksum_end = Self::require_checksum_slot(data, body_len, "v7")?;
-                let body_checksum = if verify_checksum {
-                    Some(Self::verify_checksum(data, body_len, "v7")?)
-                } else {
-                    None
-                };
-                Ok(SnapshotFrame {
-                    version,
-                    body,
-                    body_checksum,
-                    checksum_end,
-                })
-            }
-            8 => {
-                let checksum_end = Self::require_checksum_slot(data, body_len, "v8")?;
-                let body_checksum = if verify_checksum {
-                    Some(Self::verify_checksum(data, body_len, "v8")?)
+                    Some(Self::verify_checksum(data, body_len, "v11")?)
                 } else {
                     None
                 };
@@ -805,32 +514,46 @@ impl GraphSnapshot {
         })
     }
 
-    fn decode_v3_snapshot(body: &[u8]) -> Result<Self, crate::error::KinDbError> {
-        match Self::decode_current_snapshot(body) {
-            Ok(snapshot) => Ok(snapshot),
-            Err(current_err) => {
-                let legacy: GraphSnapshotV3Legacy = rmp_serde::from_slice(body).map_err(|e| {
-                    crate::error::KinDbError::StorageError(format!(
-                        "deserialization failed: {e}; current-layout decode also failed: {current_err}"
-                    ))
-                })?;
-                Ok(legacy.into())
-            }
+    pub(crate) fn validate_storage_admission(&self) -> Result<(), crate::error::KinDbError> {
+        validate_semantic_change_entries(self.changes.iter(), "snapshot")?;
+        self.validate_enrichment_admission()?;
+        if let Some(authority) = &self.repository_authority {
+            authority.validate_against_snapshot(self)?;
         }
+        Ok(())
     }
 
-    fn decode_v4_snapshot(body: &[u8]) -> Result<Self, crate::error::KinDbError> {
-        match Self::decode_current_snapshot(body) {
-            Ok(snapshot) => Ok(snapshot),
-            Err(current_err) => {
-                let legacy: GraphSnapshotV4Legacy = rmp_serde::from_slice(body).map_err(|e| {
-                    crate::error::KinDbError::StorageError(format!(
-                        "deserialization failed: {e}; current-layout decode also failed: {current_err}"
-                    ))
-                })?;
-                Ok(legacy.into())
+    fn validate_enrichment_admission(&self) -> Result<(), crate::error::KinDbError> {
+        let file_ids = self
+            .shallow_files
+            .iter()
+            .map(|file| &file.file_id)
+            .chain(self.file_layouts.iter().map(|layout| &layout.file_id))
+            .chain(
+                self.structured_artifacts
+                    .iter()
+                    .map(|artifact| &artifact.file_id),
+            )
+            .chain(
+                self.opaque_artifacts
+                    .iter()
+                    .map(|artifact| &artifact.file_id),
+            );
+        for file_id in file_ids {
+            let path = RepoPath::from_utf8(&file_id.0).map_err(|error| {
+                crate::error::KinDbError::StorageError(format!(
+                    "semantic enrichment has invalid repository path {}: {error}",
+                    file_id.0
+                ))
+            })?;
+            if self.resolved_tree.artifact_id_at_path(&path).is_none() {
+                return Err(crate::error::KinDbError::StorageError(format!(
+                    "semantic enrichment exists without admitted repository identity at {}",
+                    file_id.0
+                )));
             }
         }
+        Ok(())
     }
 
     fn verify_checksum(
@@ -980,39 +703,10 @@ impl LocateGraphSnapshot {
             GraphSnapshot::decode_frame(data, verify_checksum)?
         };
         let snapshot = match frame.version {
-            6 => {
-                let migrated =
-                    super::migration::migrate(frame.body, 6, GraphSnapshot::CURRENT_VERSION)?;
-                GraphSnapshot::decode_current_snapshot(&migrated)?.into()
-            }
-            7 => {
-                let migrated =
-                    super::migration::migrate(frame.body, 7, GraphSnapshot::CURRENT_VERSION)?;
-                GraphSnapshot::decode_current_snapshot(&migrated)?.into()
-            }
-            8 => Self::decode_current_snapshot(frame.body)?,
-            1 => {
-                let legacy: GraphSnapshotV1 = rmp_serde::from_slice(frame.body).map_err(|e| {
-                    crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
-                })?;
-                GraphSnapshot::from(legacy).into()
-            }
-            2 => {
-                let snapshot: GraphSnapshot = rmp_serde::from_slice(frame.body).map_err(|e| {
-                    crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
-                })?;
-                snapshot.into()
-            }
-            3 => GraphSnapshot::decode_v3_snapshot(frame.body)?.into(),
-            4 => GraphSnapshot::decode_v4_snapshot(frame.body)?.into(),
-            5 => {
-                let migrated =
-                    super::migration::migrate(frame.body, 5, GraphSnapshot::CURRENT_VERSION)?;
-                GraphSnapshot::decode_current_snapshot(&migrated)?.into()
-            }
+            GraphSnapshot::CURRENT_VERSION => Self::decode_current_snapshot(frame.body)?,
             _ => unreachable!("decode_frame validates supported versions"),
         };
-
+        snapshot.validate_storage_admission()?;
         let persisted_root_hash = if verify_checksum {
             GraphSnapshot::decode_root_hash_trailer(data, &frame)?
         } else {
@@ -1026,6 +720,44 @@ impl LocateGraphSnapshot {
         rmp_serde::from_slice(body).map_err(|e| {
             crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
         })
+    }
+
+    pub(crate) fn validate_storage_admission(&self) -> Result<(), crate::error::KinDbError> {
+        validate_semantic_change_entries(self.changes.iter(), "locate snapshot")?;
+        self.validate_enrichment_admission()
+    }
+
+    fn validate_enrichment_admission(&self) -> Result<(), crate::error::KinDbError> {
+        let file_ids = self
+            .shallow_files
+            .iter()
+            .map(|file| &file.file_id)
+            .chain(self.file_layouts.iter().map(|layout| &layout.file_id))
+            .chain(
+                self.structured_artifacts
+                    .iter()
+                    .map(|artifact| &artifact.file_id),
+            )
+            .chain(
+                self.opaque_artifacts
+                    .iter()
+                    .map(|artifact| &artifact.file_id),
+            );
+        for file_id in file_ids {
+            let path = RepoPath::from_utf8(&file_id.0).map_err(|error| {
+                crate::error::KinDbError::StorageError(format!(
+                    "semantic enrichment has invalid repository path {}: {error}",
+                    file_id.0
+                ))
+            })?;
+            if self.resolved_tree.artifact_id_at_path(&path).is_none() {
+                return Err(crate::error::KinDbError::StorageError(format!(
+                    "semantic enrichment exists without admitted repository identity at {}",
+                    file_id.0
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1045,11 +777,12 @@ impl From<GraphSnapshot> for LocateGraphSnapshot {
             entities: value.entities.into_iter().collect(),
             relations: value.relations.into_iter().collect(),
             changes: value.changes.into_iter().collect(),
+            entity_revisions: value.entity_revisions.into_iter().collect(),
             shallow_files: value.shallow_files,
             file_layouts: value.file_layouts,
             structured_artifacts: value.structured_artifacts,
             opaque_artifacts: value.opaque_artifacts,
-            artifact_index: value.artifact_index.into_iter().collect(),
+            resolved_tree: value.resolved_tree,
         }
     }
 }
@@ -1061,11 +794,12 @@ impl From<LocateGraphSnapshot> for GraphSnapshot {
         snapshot.entities = value.entities.into_iter().collect();
         snapshot.relations = value.relations.into_iter().collect();
         snapshot.changes = value.changes.into_iter().collect();
+        snapshot.entity_revisions = value.entity_revisions.into_iter().collect();
         snapshot.shallow_files = value.shallow_files;
         snapshot.file_layouts = value.file_layouts;
         snapshot.structured_artifacts = value.structured_artifacts;
         snapshot.opaque_artifacts = value.opaque_artifacts;
-        snapshot.artifact_index = value.artifact_index.into_iter().collect();
+        snapshot.resolved_tree = value.resolved_tree;
         snapshot
     }
 }
@@ -1088,6 +822,62 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
             where
                 A: SeqAccess<'de>,
             {
+                // The locate cache persists the compact ten-field projection,
+                // while mmap cold-open decodes the canonical 34-field graph
+                // snapshot directly. Both are current formats; distinguish
+                // them by their explicit MessagePack sequence width.
+                if seq.size_hint() == Some(10) {
+                    let version = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                    let entities = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                    let relations = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+                    let changes = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(3, &self))?;
+                    let entity_revisions = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(4, &self))?;
+                    let shallow_files = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(5, &self))?;
+                    let file_layouts = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(6, &self))?;
+                    let structured_artifacts = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(7, &self))?;
+                    let opaque_artifacts = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(8, &self))?;
+                    let resolved_tree = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(9, &self))?;
+                    return Ok(LocateGraphSnapshot {
+                        version,
+                        entities,
+                        relations,
+                        changes,
+                        entity_revisions,
+                        shallow_files,
+                        file_layouts,
+                        structured_artifacts,
+                        opaque_artifacts,
+                        resolved_tree,
+                    });
+                }
+
+                if seq.size_hint() != Some(34) {
+                    return Err(serde::de::Error::invalid_length(
+                        seq.size_hint().unwrap_or_default(),
+                        &self,
+                    ));
+                }
+
                 let version = seq
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
@@ -1097,7 +887,6 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                 let relations = seq
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
-                let FilteredLocateRelationMap(relations) = relations;
 
                 let _: IgnoredAny = seq
                     .next_element()?
@@ -1110,7 +899,7 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(5, &self))?;
 
-                for index in 6..30 {
+                for index in 6..24 {
                     let _: IgnoredAny = seq
                         .next_element()?
                         .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
@@ -1118,37 +907,44 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
 
                 let shallow_files = seq
                     .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(30, &self))?;
+                    .ok_or_else(|| serde::de::Error::invalid_length(24, &self))?;
                 let file_layouts = seq
                     .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(31, &self))?;
+                    .ok_or_else(|| serde::de::Error::invalid_length(25, &self))?;
                 let structured_artifacts = seq
                     .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(32, &self))?;
+                    .ok_or_else(|| serde::de::Error::invalid_length(26, &self))?;
                 let opaque_artifacts = seq
                     .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(33, &self))?;
+                    .ok_or_else(|| serde::de::Error::invalid_length(27, &self))?;
 
-                // Everything after opaque_artifacts (file_hashes, sessions,
-                // intents, downstream_warnings, entity_revisions, the tombstone
-                // maps, change_order, artifact_index) is drained rather than
-                // read by index. Those trailing fields grow over time and the
-                // borrowed save path stops before artifact_index, so any fixed
-                // position drifts against the canonical layout. artifact_index
-                // is rebuilt from artifact file paths in from_locate_snapshot,
-                // so locate starts from an empty map here.
-                while let Some(_) = seq.next_element::<IgnoredAny>()? {}
+                let resolved_tree = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(28, &self))?;
+
+                for index in 29..32 {
+                    let _: IgnoredAny = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
+                }
+                let entity_revisions = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(32, &self))?;
+                let _: IgnoredAny = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(33, &self))?;
 
                 Ok(LocateGraphSnapshot {
                     version,
                     entities,
                     relations,
                     changes,
+                    entity_revisions,
                     shallow_files,
                     file_layouts,
                     structured_artifacts,
                     opaque_artifacts,
-                    artifact_index: FastHashMap::default(),
+                    resolved_tree,
                 })
             }
         }
@@ -1173,7 +969,7 @@ struct SnapshotFrame<'a> {
 /// (hashbrown maps + vecs), we avoid the ~18 GB clone that `to_snapshot()`
 /// materialises for large graphs.
 ///
-/// The `Serialize` impl manually writes 39 fields in the same positional
+/// The `Serialize` impl manually writes 34 fields in the same positional
 /// order as the derive(Serialize) on `GraphSnapshot`, so the resulting
 /// msgpack is byte-for-byte compatible with the owned version.
 pub struct BorrowedGraphSnapshot<'a> {
@@ -1182,7 +978,7 @@ pub struct BorrowedGraphSnapshot<'a> {
     pub relations: &'a hashbrown::HashMap<RelationId, Relation>,
     pub outgoing: &'a hashbrown::HashMap<EntityId, Vec<RelationId>>,
     pub incoming: &'a hashbrown::HashMap<EntityId, Vec<RelationId>>,
-    pub file_hashes: &'a hashbrown::HashMap<String, [u8; 32]>,
+    pub resolved_tree: &'a ResolvedTree,
     pub shallow_files: &'a hashbrown::HashMap<FilePathId, ShallowTrackedFile>,
     pub file_layouts: &'a hashbrown::HashMap<FilePathId, FileLayout>,
     pub structured_artifacts: &'a hashbrown::HashMap<FilePathId, StructuredArtifact>,
@@ -1190,7 +986,6 @@ pub struct BorrowedGraphSnapshot<'a> {
     // ChangeData fields
     pub changes: &'a hashbrown::HashMap<SemanticChangeId, SemanticChange>,
     pub change_children: &'a hashbrown::HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
-    pub branches: &'a hashbrown::HashMap<BranchName, Branch>,
     // WorkData fields
     pub work_items: &'a hashbrown::HashMap<WorkId, WorkItem>,
     pub annotations: &'a hashbrown::HashMap<AnnotationId, Annotation>,
@@ -1222,10 +1017,10 @@ pub struct BorrowedGraphSnapshot<'a> {
 impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        // Must produce exactly 39 fields in the same order as GraphSnapshot's
+        // Must produce exactly 34 fields in the same order as GraphSnapshot's
         // derive(Serialize).  rmp_serde serializes structs as arrays, so
         // position (not name) determines the mapping.
-        let mut state = serializer.serialize_struct("GraphSnapshot", 39)?;
+        let mut state = serializer.serialize_struct("GraphSnapshot", 34)?;
 
         // 1. version
         state.serialize_field("version", &GraphSnapshot::CURRENT_VERSION)?;
@@ -1241,9 +1036,7 @@ impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
         state.serialize_field("changes", self.changes)?;
         // 7. change_children
         state.serialize_field("change_children", self.change_children)?;
-        // 8. branches
-        state.serialize_field("branches", self.branches)?;
-        // 9. work_items
+        // 8. work_items
         state.serialize_field("work_items", self.work_items)?;
         // 10. annotations
         state.serialize_field("annotations", self.annotations)?;
@@ -1268,54 +1061,47 @@ impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
         state.serialize_field("assertions", self.assertions)?;
         // 19. verification_runs
         state.serialize_field("verification_runs", self.verification_runs)?;
-        // 20-24. coverage vecs — empty in to_snapshot()
-        let empty_tid_eid: &[(TestId, EntityId)] = &[];
-        let empty_tid_cid: &[(TestId, ContractId)] = &[];
-        let empty_tid_wid: &[(TestId, WorkId)] = &[];
-        let empty_rid_eid: &[(VerificationRunId, EntityId)] = &[];
-        let empty_rid_wid: &[(VerificationRunId, WorkId)] = &[];
-        state.serialize_field("test_covers_entity", empty_tid_eid)?;
-        state.serialize_field("test_covers_contract", empty_tid_cid)?;
-        state.serialize_field("test_verifies_work", empty_tid_wid)?;
-        state.serialize_field("run_proves_entity", empty_rid_eid)?;
-        state.serialize_field("run_proves_work", empty_rid_wid)?;
-        // 25. mock_hints
+        // 20. mock_hints
         state.serialize_field("mock_hints", self.mock_hints)?;
-        // 26. contracts
+        // 21. contracts
         state.serialize_field("contracts", self.contracts)?;
-        // 27. actors
+        // 22. actors
         state.serialize_field("actors", self.actors)?;
-        // 28. delegations
+        // 23. delegations
         state.serialize_field("delegations", self.delegations)?;
-        // 29. approvals
+        // 24. approvals
         state.serialize_field("approvals", self.approvals)?;
-        // 30. audit_events
+        // 25. audit_events
         state.serialize_field("audit_events", self.audit_events)?;
-        // 31. shallow_files  (HashMap values → seq)
+        // 26. shallow_files  (HashMap values → seq)
         state.serialize_field("shallow_files", &HashMapValuesAsSeq(self.shallow_files))?;
-        // 32. file_layouts  (HashMap values → seq)
+        // 27. file_layouts  (HashMap values → seq)
         state.serialize_field("file_layouts", &HashMapValuesAsSeq(self.file_layouts))?;
-        // 33. structured_artifacts  (HashMap values → seq)
+        // 28. structured_artifacts  (HashMap values → seq)
         state.serialize_field(
             "structured_artifacts",
             &HashMapValuesAsSeq(self.structured_artifacts),
         )?;
-        // 34. opaque_artifacts  (HashMap values → seq)
+        // 29. opaque_artifacts  (HashMap values → seq)
         state.serialize_field(
             "opaque_artifacts",
             &HashMapValuesAsSeq(self.opaque_artifacts),
         )?;
-        // 35. file_hashes
-        state.serialize_field("file_hashes", self.file_hashes)?;
-        // 36. sessions
+        // 30. resolved_tree
+        state.serialize_field("resolved_tree", self.resolved_tree)?;
+        // 31. sessions
         state.serialize_field("sessions", self.sessions)?;
-        // 37. intents
+        // 32. intents
         state.serialize_field("intents", self.intents)?;
-        // 38. downstream_warnings
+        // 33. downstream_warnings
         state.serialize_field("downstream_warnings", self.downstream_warnings)?;
-        // 39. entity_revisions
+        // 34. entity_revisions
         state.serialize_field("entity_revisions", self.entity_revisions)?;
-
+        // 34. Mutable live graphs are not repository transaction authority.
+        state.serialize_field(
+            "repository_authority",
+            &Option::<PersistedRepositoryAuthority>::None,
+        )?;
         state.end()
     }
 }
@@ -1340,6 +1126,7 @@ impl<'a> BorrowedGraphSnapshot<'a> {
         &self,
         persisted_root_hash: Option<[u8; 32]>,
     ) -> Result<Vec<u8>, crate::error::KinDbError> {
+        self.validate_storage_admission()?;
         let body = rmp_serde::to_vec(self).map_err(|e| {
             crate::error::KinDbError::StorageError(format!("serialization failed: {e}"))
         })?;
@@ -1361,6 +1148,31 @@ impl<'a> BorrowedGraphSnapshot<'a> {
         }
 
         Ok(buf)
+    }
+
+    fn validate_storage_admission(&self) -> Result<(), crate::error::KinDbError> {
+        validate_semantic_change_entries(self.changes.iter(), "borrowed snapshot")?;
+        for file_id in self
+            .shallow_files
+            .keys()
+            .chain(self.file_layouts.keys())
+            .chain(self.structured_artifacts.keys())
+            .chain(self.opaque_artifacts.keys())
+        {
+            let path = RepoPath::from_utf8(&file_id.0).map_err(|error| {
+                crate::error::KinDbError::StorageError(format!(
+                    "semantic enrichment has invalid repository path {}: {error}",
+                    file_id.0
+                ))
+            })?;
+            if self.resolved_tree.artifact_id_at_path(&path).is_none() {
+                return Err(crate::error::KinDbError::StorageError(format!(
+                    "semantic enrichment exists without admitted repository identity at {}",
+                    file_id.0
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1393,291 +1205,9 @@ fn graph_node_exists(
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct GraphSnapshotV1 {
-    version: u32,
-    entities: HashMap<EntityId, Entity>,
-    relations: HashMap<RelationId, LegacyEntityRelation>,
-    outgoing: HashMap<EntityId, Vec<RelationId>>,
-    incoming: HashMap<EntityId, Vec<RelationId>>,
-    changes: HashMap<SemanticChangeId, SemanticChange>,
-    change_children: HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
-    branches: HashMap<BranchName, Branch>,
-}
-
-impl From<GraphSnapshotV1> for GraphSnapshot {
-    fn from(value: GraphSnapshotV1) -> Self {
-        let mut snapshot = GraphSnapshot::empty();
-        snapshot.entities = value.entities;
-        snapshot.relations = value
-            .relations
-            .into_iter()
-            .map(|(relation_id, relation)| (relation_id, relation.into()))
-            .collect();
-        snapshot.outgoing = value.outgoing;
-        snapshot.incoming = value.incoming;
-        snapshot.changes = value.changes;
-        snapshot.change_children = value.change_children;
-        snapshot.branches = value.branches;
-        snapshot
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct LegacyEntityRelation {
-    pub(crate) id: RelationId,
-    pub(crate) kind: RelationKind,
-    pub(crate) src: EntityId,
-    pub(crate) dst: EntityId,
-    pub(crate) confidence: f32,
-    pub(crate) origin: RelationOrigin,
-    pub(crate) created_in: Option<SemanticChangeId>,
-    #[serde(default)]
-    pub(crate) import_source: Option<String>,
-}
-
-impl From<LegacyEntityRelation> for Relation {
-    fn from(value: LegacyEntityRelation) -> Self {
-        Self {
-            id: value.id,
-            kind: value.kind,
-            src: GraphNodeId::Entity(value.src),
-            dst: GraphNodeId::Entity(value.dst),
-            confidence: value.confidence,
-            origin: value.origin,
-            created_in: value.created_in,
-            import_source: value.import_source,
-            evidence: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct GraphSnapshotV3Legacy {
-    version: u32,
-    entities: HashMap<EntityId, Entity>,
-    relations: HashMap<RelationId, LegacyEntityRelation>,
-    outgoing: HashMap<EntityId, Vec<RelationId>>,
-    incoming: HashMap<EntityId, Vec<RelationId>>,
-    changes: HashMap<SemanticChangeId, SemanticChange>,
-    change_children: HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
-    branches: HashMap<BranchName, Branch>,
-    #[serde(default)]
-    work_items: HashMap<WorkId, WorkItem>,
-    #[serde(default)]
-    annotations: HashMap<AnnotationId, Annotation>,
-    #[serde(default)]
-    work_links: Vec<WorkLink>,
-    #[serde(default)]
-    test_cases: HashMap<TestId, TestCase>,
-    #[serde(default)]
-    assertions: HashMap<AssertionId, Assertion>,
-    #[serde(default)]
-    verification_runs: HashMap<VerificationRunId, VerificationRun>,
-    #[serde(default)]
-    test_covers_entity: Vec<(TestId, EntityId)>,
-    #[serde(default)]
-    test_covers_contract: Vec<(TestId, ContractId)>,
-    #[serde(default)]
-    test_verifies_work: Vec<(TestId, WorkId)>,
-    #[serde(default)]
-    run_proves_entity: Vec<(VerificationRunId, EntityId)>,
-    #[serde(default)]
-    run_proves_work: Vec<(VerificationRunId, WorkId)>,
-    #[serde(default)]
-    mock_hints: Vec<MockHint>,
-    #[serde(default)]
-    contracts: HashMap<ContractId, Contract>,
-    #[serde(default)]
-    actors: HashMap<ActorId, Actor>,
-    #[serde(default)]
-    delegations: Vec<Delegation>,
-    #[serde(default)]
-    approvals: Vec<Approval>,
-    #[serde(default)]
-    audit_events: Vec<AuditEvent>,
-    #[serde(default)]
-    shallow_files: Vec<ShallowTrackedFile>,
-    #[serde(default)]
-    structured_artifacts: Vec<StructuredArtifact>,
-    #[serde(default)]
-    opaque_artifacts: Vec<OpaqueArtifact>,
-    #[serde(default)]
-    file_hashes: HashMap<String, [u8; 32]>,
-    #[serde(default)]
-    sessions: HashMap<SessionId, AgentSession>,
-    #[serde(default)]
-    intents: HashMap<IntentId, Intent>,
-    #[serde(default)]
-    downstream_warnings: Vec<(IntentId, EntityId, String)>,
-}
-
-impl From<GraphSnapshotV3Legacy> for GraphSnapshot {
-    fn from(value: GraphSnapshotV3Legacy) -> Self {
-        let mut snapshot = GraphSnapshot::empty();
-        snapshot.entities = value.entities;
-        snapshot.relations = value
-            .relations
-            .into_iter()
-            .map(|(relation_id, relation)| (relation_id, relation.into()))
-            .collect();
-        snapshot.outgoing = value.outgoing;
-        snapshot.incoming = value.incoming;
-        snapshot.changes = value.changes;
-        snapshot.change_children = value.change_children;
-        snapshot.branches = value.branches;
-        snapshot.work_items = value.work_items;
-        snapshot.annotations = value.annotations;
-        snapshot.work_links = value.work_links;
-        snapshot.test_cases = value.test_cases;
-        snapshot.assertions = value.assertions;
-        snapshot.verification_runs = value.verification_runs;
-        snapshot.test_covers_entity = value.test_covers_entity;
-        snapshot.test_covers_contract = value.test_covers_contract;
-        snapshot.test_verifies_work = value.test_verifies_work;
-        snapshot.run_proves_entity = value.run_proves_entity;
-        snapshot.run_proves_work = value.run_proves_work;
-        snapshot.mock_hints = value.mock_hints;
-        snapshot.contracts = value.contracts;
-        snapshot.actors = value.actors;
-        snapshot.delegations = value.delegations;
-        snapshot.approvals = value.approvals;
-        snapshot.audit_events = value.audit_events;
-        snapshot.shallow_files = value.shallow_files;
-        snapshot.structured_artifacts = value.structured_artifacts;
-        snapshot.opaque_artifacts = value.opaque_artifacts;
-        snapshot.file_hashes = value.file_hashes;
-        snapshot.sessions = value.sessions;
-        snapshot.intents = value.intents;
-        snapshot.downstream_warnings = value.downstream_warnings;
-        snapshot
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct GraphSnapshotV4Legacy {
-    pub(crate) version: u32,
-    pub(crate) entities: HashMap<EntityId, Entity>,
-    pub(crate) relations: HashMap<RelationId, LegacyEntityRelation>,
-    pub(crate) outgoing: HashMap<EntityId, Vec<RelationId>>,
-    pub(crate) incoming: HashMap<EntityId, Vec<RelationId>>,
-    pub(crate) changes: HashMap<SemanticChangeId, SemanticChange>,
-    pub(crate) change_children: HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
-    pub(crate) branches: HashMap<BranchName, Branch>,
-    #[serde(default)]
-    pub(crate) work_items: HashMap<WorkId, WorkItem>,
-    #[serde(default)]
-    pub(crate) annotations: HashMap<AnnotationId, Annotation>,
-    #[serde(default)]
-    pub(crate) work_links: Vec<WorkLink>,
-    #[serde(default)]
-    pub(crate) reviews: HashMap<ReviewId, Review>,
-    #[serde(default)]
-    pub(crate) review_decisions: HashMap<ReviewId, Vec<ReviewDecision>>,
-    #[serde(default)]
-    pub(crate) review_notes: Vec<ReviewNote>,
-    #[serde(default)]
-    pub(crate) review_discussions: Vec<ReviewDiscussion>,
-    #[serde(default)]
-    pub(crate) review_assignments: HashMap<ReviewId, Vec<ReviewAssignment>>,
-    #[serde(default)]
-    pub(crate) test_cases: HashMap<TestId, TestCase>,
-    #[serde(default)]
-    pub(crate) assertions: HashMap<AssertionId, Assertion>,
-    #[serde(default)]
-    pub(crate) verification_runs: HashMap<VerificationRunId, VerificationRun>,
-    #[serde(default)]
-    pub(crate) test_covers_entity: Vec<(TestId, EntityId)>,
-    #[serde(default)]
-    pub(crate) test_covers_contract: Vec<(TestId, ContractId)>,
-    #[serde(default)]
-    pub(crate) test_verifies_work: Vec<(TestId, WorkId)>,
-    #[serde(default)]
-    pub(crate) run_proves_entity: Vec<(VerificationRunId, EntityId)>,
-    #[serde(default)]
-    pub(crate) run_proves_work: Vec<(VerificationRunId, WorkId)>,
-    #[serde(default)]
-    pub(crate) mock_hints: Vec<MockHint>,
-    #[serde(default)]
-    pub(crate) contracts: HashMap<ContractId, Contract>,
-    #[serde(default)]
-    pub(crate) actors: HashMap<ActorId, Actor>,
-    #[serde(default)]
-    pub(crate) delegations: Vec<Delegation>,
-    #[serde(default)]
-    pub(crate) approvals: Vec<Approval>,
-    #[serde(default)]
-    pub(crate) audit_events: Vec<AuditEvent>,
-    #[serde(default)]
-    pub(crate) shallow_files: Vec<ShallowTrackedFile>,
-    #[serde(default)]
-    pub(crate) file_layouts: Vec<FileLayout>,
-    #[serde(default)]
-    pub(crate) structured_artifacts: Vec<StructuredArtifact>,
-    #[serde(default)]
-    pub(crate) opaque_artifacts: Vec<OpaqueArtifact>,
-    #[serde(default)]
-    pub(crate) file_hashes: HashMap<String, [u8; 32]>,
-    #[serde(default)]
-    pub(crate) sessions: HashMap<SessionId, AgentSession>,
-    #[serde(default)]
-    pub(crate) intents: HashMap<IntentId, Intent>,
-    #[serde(default)]
-    pub(crate) downstream_warnings: Vec<(IntentId, EntityId, String)>,
-}
-
-impl From<GraphSnapshotV4Legacy> for GraphSnapshot {
-    fn from(value: GraphSnapshotV4Legacy) -> Self {
-        let mut snapshot = GraphSnapshot::empty();
-        snapshot.entities = value.entities;
-        snapshot.relations = value
-            .relations
-            .into_iter()
-            .map(|(relation_id, relation)| (relation_id, relation.into()))
-            .collect();
-        snapshot.outgoing = value.outgoing;
-        snapshot.incoming = value.incoming;
-        snapshot.changes = value.changes;
-        snapshot.change_children = value.change_children;
-        snapshot.branches = value.branches;
-        snapshot.work_items = value.work_items;
-        snapshot.annotations = value.annotations;
-        snapshot.work_links = value.work_links;
-        snapshot.reviews = value.reviews;
-        snapshot.review_decisions = value.review_decisions;
-        snapshot.review_notes = value.review_notes;
-        snapshot.review_discussions = value.review_discussions;
-        snapshot.review_assignments = value.review_assignments;
-        snapshot.test_cases = value.test_cases;
-        snapshot.assertions = value.assertions;
-        snapshot.verification_runs = value.verification_runs;
-        snapshot.test_covers_entity = value.test_covers_entity;
-        snapshot.test_covers_contract = value.test_covers_contract;
-        snapshot.test_verifies_work = value.test_verifies_work;
-        snapshot.run_proves_entity = value.run_proves_entity;
-        snapshot.run_proves_work = value.run_proves_work;
-        snapshot.mock_hints = value.mock_hints;
-        snapshot.contracts = value.contracts;
-        snapshot.actors = value.actors;
-        snapshot.delegations = value.delegations;
-        snapshot.approvals = value.approvals;
-        snapshot.audit_events = value.audit_events;
-        snapshot.shallow_files = value.shallow_files;
-        snapshot.file_layouts = value.file_layouts;
-        snapshot.structured_artifacts = value.structured_artifacts;
-        snapshot.opaque_artifacts = value.opaque_artifacts;
-        snapshot.file_hashes = value.file_hashes;
-        snapshot.sessions = value.sessions;
-        snapshot.intents = value.intents;
-        snapshot.downstream_warnings = value.downstream_warnings;
-        snapshot
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kin_model::{EntityStore, VerificationStore};
 
     /// Regression (found by fuzzing): a snapshot header whose body_len is near
     /// usize::MAX must be rejected with an error, never wrap `16 + body_len`
@@ -1723,6 +1253,23 @@ mod tests {
         }
     }
 
+    fn seal_change(mut change: SemanticChange) -> SemanticChange {
+        change.id =
+            kin_model::compute_semantic_change_id(&change).expect("valid semantic change fixture");
+        change
+    }
+
+    fn encode_snapshot_without_admission_validation(snapshot: &GraphSnapshot) -> Vec<u8> {
+        let body = rmp_serde::to_vec(snapshot).unwrap();
+        let mut bytes = Vec::with_capacity(16 + body.len() + GraphSnapshot::CHECKSUM_LEN);
+        bytes.extend_from_slice(&GraphSnapshot::MAGIC);
+        bytes.extend_from_slice(&GraphSnapshot::CURRENT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(&Sha256::digest(&body));
+        bytes
+    }
+
     fn test_relation(src: EntityId, dst: EntityId) -> Relation {
         Relation {
             id: RelationId::new(),
@@ -1742,31 +1289,53 @@ mod tests {
         let caller = test_entity("caller");
         let callee = test_entity("callee");
         let relation = test_relation(caller.id, callee.id);
-        let change = SemanticChange {
+        let non_legacy_locate_relation = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::SendsMessage,
+            src: GraphNodeId::Entity(callee.id),
+            dst: GraphNodeId::Entity(caller.id),
+            confidence: 0.75,
+            origin: RelationOrigin::Inferred,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let change = seal_change(SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([9; 32])),
             parents: Vec::new(),
             timestamp: Timestamp::now(),
             author: AuthorId::new("tester"),
             message: "cochange".into(),
-            entity_deltas: vec![EntityDelta::Added(caller.clone())],
+            entity_deltas: vec![EntityDelta::Added {
+                new: caller.clone(),
+            }],
             relation_deltas: Vec::new(),
-            artifact_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
             projected_files: vec![FilePathId::new("src/main.rs")],
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
-            authored_on: Some(BranchName::new("main")),
-        };
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        });
 
         let mut snapshot = GraphSnapshot::empty();
         snapshot.entities.insert(caller.id, caller.clone());
         snapshot.entities.insert(callee.id, callee.clone());
         snapshot.relations.insert(relation.id, relation.clone());
+        snapshot.relations.insert(
+            non_legacy_locate_relation.id,
+            non_legacy_locate_relation.clone(),
+        );
         snapshot.outgoing.insert(caller.id, vec![relation.id]);
         snapshot.incoming.insert(callee.id, vec![relation.id]);
         snapshot.changes.insert(change.id, change.clone());
+        snapshot.entity_revisions =
+            kin_model::graph::derive_entity_revisions_from_changes(vec![change.clone()]).unwrap();
+        let file_id = FilePathId::new("src/main.rs");
+        let assigned_artifact_id = ArtifactId::new();
         snapshot.shallow_files.push(ShallowTrackedFile {
-            file_id: FilePathId::new("src/main.rs"),
+            file_id: file_id.clone(),
             language_hint: "rust".into(),
             declaration_count: 2,
             import_count: 0,
@@ -1775,6 +1344,12 @@ mod tests {
             declaration_names: vec!["caller".into(), "callee".into()],
             import_paths: Vec::new(),
         });
+        snapshot.resolved_tree = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+            assigned_artifact_id,
+            RepoPath::from_utf8(&file_id.0).unwrap(),
+            TreeEntry::blob(Hash256::from_bytes([1; 32]), false),
+        )])
+        .unwrap();
 
         let persisted_root_hash = [7; 32];
         let bytes = snapshot
@@ -1785,14 +1360,35 @@ mod tests {
 
         assert_eq!(decoded_root_hash, Some(persisted_root_hash));
         assert_eq!(locate_snapshot.entities.len(), 2);
-        assert_eq!(locate_snapshot.relations.len(), 1);
+        assert_eq!(locate_snapshot.relations.len(), 2);
+        assert_eq!(
+            locate_snapshot
+                .relations
+                .get(&non_legacy_locate_relation.id)
+                .map(|relation| relation.kind),
+            Some(RelationKind::SendsMessage)
+        );
         assert_eq!(locate_snapshot.changes.len(), 1);
+        assert!(!locate_snapshot.entity_revisions.is_empty());
         assert_eq!(locate_snapshot.shallow_files.len(), 1);
+        assert_eq!(
+            locate_snapshot
+                .resolved_tree
+                .artifact_id_at_path(&RepoPath::from_utf8(&file_id.0).unwrap()),
+            Some(assigned_artifact_id)
+        );
 
         let decoded: GraphSnapshot = locate_snapshot.into();
         assert_eq!(decoded.entities.len(), 2);
-        assert_eq!(decoded.relations.len(), 1);
+        assert_eq!(decoded.relations.len(), 2);
         assert_eq!(decoded.changes.len(), 1);
+        assert!(!decoded.entity_revisions.is_empty());
+        assert_eq!(
+            decoded
+                .resolved_tree
+                .artifact_id_at_path(&RepoPath::from_utf8(&file_id.0).unwrap()),
+            Some(assigned_artifact_id)
+        );
         assert!(decoded.outgoing.is_empty());
         assert!(decoded.incoming.is_empty());
         assert!(decoded.work_items.is_empty());
@@ -1807,6 +1403,47 @@ mod tests {
         assert_eq!(stats.total_removed(), 0);
         assert_eq!(stats.entities_before, 0);
         assert_eq!(stats.relations_before, 0);
+    }
+
+    #[test]
+    fn snapshot_deserialization_rejects_duplicate_artifact_identity_assignments() {
+        let snapshot = GraphSnapshot::empty();
+        let artifact_id = ArtifactId::new();
+        let mut encoded = serde_json::to_value(snapshot).unwrap();
+        encoded["resolved_tree"] = serde_json::json!({
+            "artifacts": [
+                ResolvedArtifact::new(
+                    artifact_id,
+                    RepoPath::from_utf8("compose.yaml").unwrap(),
+                    TreeEntry::blob(Hash256::from_bytes([1; 32]), false),
+                ),
+                ResolvedArtifact::new(
+                    artifact_id,
+                    RepoPath::from_utf8("Cargo.lock").unwrap(),
+                    TreeEntry::blob(Hash256::from_bytes([2; 32]), false),
+                ),
+            ]
+        });
+
+        let error = serde_json::from_value::<GraphSnapshot>(encoded).unwrap_err();
+        assert!(error.to_string().contains("more than once"));
+    }
+
+    #[test]
+    fn snapshot_rejects_semantic_enrichment_without_tree_admission() {
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.structured_artifacts.push(StructuredArtifact {
+            file_id: FilePathId::new("compose.yaml"),
+            kind: ArtifactKind::ComposeFile,
+            content_hash: Hash256::from_bytes([7; 32]),
+            text_preview: Some("services:".into()),
+        });
+
+        let error = snapshot.to_bytes().unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("without admitted repository identity"));
     }
 
     #[test]
@@ -1871,9 +1508,19 @@ mod tests {
                 parse_completeness: ParseCompleteness::Full,
             });
         }
-        snap.artifact_index
-            .insert(generated_path.clone(), generated_id);
-        snap.artifact_index.insert(source_path.clone(), source_id);
+        snap.resolved_tree = ResolvedTree::from_artifacts([
+            ResolvedArtifact::new(
+                generated_id,
+                RepoPath::from_utf8(&generated_path.0).unwrap(),
+                TreeEntry::blob(Hash256::from_bytes([1; 32]), false),
+            ),
+            ResolvedArtifact::new(
+                source_id,
+                RepoPath::from_utf8(&source_path.0).unwrap(),
+                TreeEntry::blob(Hash256::from_bytes([2; 32]), false),
+            ),
+        ])
+        .unwrap();
 
         let relation = Relation {
             id: RelationId::new(),
@@ -1891,38 +1538,6 @@ mod tests {
         let stats = snap.compact();
         assert_eq!(stats.orphaned_relations_removed, 0);
         assert_eq!(snap.relations.len(), 1);
-    }
-
-    #[test]
-    fn compact_removes_orphaned_test_coverage() {
-        let mut snap = GraphSnapshot::empty();
-
-        let e1 = test_entity("covered");
-        snap.entities.insert(e1.id, e1.clone());
-
-        let dead_test = TestId::new();
-        let live_test = TestId::new();
-        snap.test_cases.insert(
-            live_test,
-            TestCase {
-                test_id: live_test,
-                name: "live_test".into(),
-                language: "rust".into(),
-                kind: TestKind::Unit,
-                scopes: vec![],
-                runner: TestRunner::Cargo,
-                file_origin: None,
-            },
-        );
-
-        // One valid coverage entry, one orphaned (dead_test doesn't exist)
-        snap.test_covers_entity.push((live_test, e1.id));
-        snap.test_covers_entity.push((dead_test, e1.id));
-
-        let stats = snap.compact();
-        assert_eq!(stats.orphaned_test_coverage_removed, 1);
-        assert_eq!(snap.test_covers_entity.len(), 1);
-        assert_eq!(snap.test_covers_entity[0].0, live_test);
     }
 
     #[test]
@@ -1959,98 +1574,6 @@ mod tests {
         let stats = snap.compact();
         assert_eq!(stats.orphaned_downstream_warnings_removed, 1);
         assert!(snap.downstream_warnings.is_empty());
-    }
-
-    #[test]
-    fn from_bytes_reads_v4_entity_relations_and_legacy_coverage() {
-        let e1 = test_entity("covered");
-        let e2 = test_entity("callee");
-        let test_id = TestId::new();
-        let relation_id = RelationId::new();
-        let legacy = GraphSnapshotV4Legacy {
-            version: 4,
-            entities: HashMap::from([(e1.id, e1.clone()), (e2.id, e2.clone())]),
-            relations: HashMap::from([(
-                relation_id,
-                LegacyEntityRelation {
-                    id: relation_id,
-                    kind: RelationKind::Calls,
-                    src: e1.id,
-                    dst: e2.id,
-                    confidence: 1.0,
-                    origin: RelationOrigin::Parsed,
-                    created_in: None,
-                    import_source: None,
-                },
-            )]),
-            outgoing: HashMap::from([(e1.id, vec![relation_id])]),
-            incoming: HashMap::from([(e2.id, vec![relation_id])]),
-            changes: HashMap::new(),
-            change_children: HashMap::new(),
-            branches: HashMap::new(),
-            work_items: HashMap::new(),
-            annotations: HashMap::new(),
-            work_links: Vec::new(),
-            reviews: HashMap::new(),
-            review_decisions: HashMap::new(),
-            review_notes: Vec::new(),
-            review_discussions: Vec::new(),
-            review_assignments: HashMap::new(),
-            test_cases: HashMap::from([(
-                test_id,
-                TestCase {
-                    test_id,
-                    name: "test_target".into(),
-                    language: "rust".into(),
-                    kind: TestKind::Unit,
-                    scopes: vec![],
-                    runner: TestRunner::Cargo,
-                    file_origin: None,
-                },
-            )]),
-            assertions: HashMap::new(),
-            verification_runs: HashMap::new(),
-            test_covers_entity: vec![(test_id, e1.id)],
-            test_covers_contract: Vec::new(),
-            test_verifies_work: Vec::new(),
-            run_proves_entity: Vec::new(),
-            run_proves_work: Vec::new(),
-            mock_hints: Vec::new(),
-            contracts: HashMap::new(),
-            actors: HashMap::new(),
-            delegations: Vec::new(),
-            approvals: Vec::new(),
-            audit_events: Vec::new(),
-            shallow_files: Vec::new(),
-            file_layouts: Vec::new(),
-            structured_artifacts: Vec::new(),
-            opaque_artifacts: Vec::new(),
-            file_hashes: HashMap::new(),
-            sessions: HashMap::new(),
-            intents: HashMap::new(),
-            downstream_warnings: Vec::new(),
-        };
-        let body = rmp_serde::to_vec(&legacy).unwrap();
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&GraphSnapshot::MAGIC);
-        bytes.extend_from_slice(&4u32.to_le_bytes());
-        bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&body);
-        bytes.extend_from_slice(&Sha256::digest(&body));
-
-        let snapshot = GraphSnapshot::from_bytes(&bytes).unwrap();
-        let relation = snapshot.relations.get(&relation_id).unwrap();
-        assert_eq!(relation.src, GraphNodeId::Entity(e1.id));
-        assert_eq!(relation.dst, GraphNodeId::Entity(e2.id));
-        assert_eq!(snapshot.test_covers_entity, vec![(test_id, e1.id)]);
-
-        let graph = crate::InMemoryGraph::from_snapshot(snapshot);
-        let tests = graph.get_tests_for_entity(&e1.id).unwrap();
-        assert_eq!(tests.len(), 1);
-        let traversal = graph
-            .traverse(&GraphNodeId::Test(test_id), &[RelationKind::Covers], 1)
-            .unwrap();
-        assert!(traversal.nodes.contains(&GraphNodeId::Entity(e1.id)));
     }
 
     #[test]
@@ -2122,15 +1645,12 @@ mod tests {
         let rel = test_relation(e1.id, dead_entity);
         snap.relations.insert(rel.id, rel);
 
-        let dead_test = TestId::new();
-        snap.test_covers_entity.push((dead_test, e1.id));
-
         let dead_intent = IntentId::new();
         snap.downstream_warnings
             .push((dead_intent, e1.id, "orphan".into()));
 
         let stats = snap.compact();
-        assert!(stats.total_removed() >= 3);
+        assert!(stats.total_removed() >= 2);
         assert!(!stats.is_clean());
     }
 
@@ -2159,24 +1679,17 @@ mod tests {
     }
 
     #[test]
-    fn to_bytes_fast_path_avoids_clone() {
-        // Verify that the fast path (version == CURRENT_VERSION) produces
-        // identical output to the slow path
+    fn to_bytes_rejects_noncurrent_body_version() {
         let mut snap = GraphSnapshot::empty();
         let e = test_entity("fast_path");
         snap.entities.insert(e.id, e);
 
         assert_eq!(snap.version, GraphSnapshot::CURRENT_VERSION);
-        let fast_bytes = snap.to_bytes().unwrap();
+        assert!(snap.to_bytes().is_ok());
 
-        // Force slow path by changing version
         snap.version = 1;
-        let slow_bytes = snap.to_bytes().unwrap();
-
-        // Both should produce valid current-version output
-        let fast_loaded = GraphSnapshot::from_bytes(&fast_bytes).unwrap();
-        let slow_loaded = GraphSnapshot::from_bytes(&slow_bytes).unwrap();
-        assert_eq!(fast_loaded.entities.len(), slow_loaded.entities.len());
+        let error = snap.to_bytes().unwrap_err();
+        assert!(error.to_string().contains("exactly v11"));
     }
 
     #[test]
@@ -2187,6 +1700,96 @@ mod tests {
         let loaded = GraphSnapshot::from_bytes(&bytes).unwrap();
         assert_eq!(loaded.version, GraphSnapshot::CURRENT_VERSION);
         assert!(loaded.entities.is_empty());
+    }
+
+    #[test]
+    fn roundtrip_preserves_executable_symlink_and_unsupported_paths() {
+        let mut snapshot = GraphSnapshot::empty();
+        let executable = TreeEntry::blob(Hash256::from_bytes([0x41; 32]), true);
+        let symlink = TreeEntry::symlink(Hash256::from_bytes([0x42; 32]));
+        let opaque = TreeEntry::blob(Hash256::from_bytes([0x43; 32]), false);
+        snapshot.resolved_tree = ResolvedTree::from_artifacts([
+            ResolvedArtifact::new(
+                ArtifactId::new(),
+                RepoPath::from_utf8("scripts/deploy").unwrap(),
+                executable,
+            ),
+            ResolvedArtifact::new(
+                ArtifactId::new(),
+                RepoPath::from_utf8("current-config").unwrap(),
+                symlink,
+            ),
+            ResolvedArtifact::new(
+                ArtifactId::new(),
+                RepoPath::from_utf8("assets/model.unsupported").unwrap(),
+                opaque,
+            ),
+        ])
+        .unwrap();
+
+        let loaded = GraphSnapshot::from_bytes(&snapshot.to_bytes().unwrap()).unwrap();
+
+        assert_eq!(
+            loaded
+                .resolved_tree
+                .artifact_at_path(&RepoPath::from_utf8("scripts/deploy").unwrap())
+                .map(|artifact| artifact.entry),
+            Some(executable)
+        );
+        assert_eq!(
+            loaded
+                .resolved_tree
+                .artifact_at_path(&RepoPath::from_utf8("current-config").unwrap())
+                .map(|artifact| artifact.entry),
+            Some(symlink)
+        );
+        assert_eq!(
+            loaded
+                .resolved_tree
+                .artifact_at_path(&RepoPath::from_utf8("assets/model.unsupported").unwrap())
+                .map(|artifact| artifact.entry),
+            Some(opaque)
+        );
+    }
+
+    #[test]
+    fn current_snapshot_requires_every_persisted_field() {
+        let encoded = serde_json::to_value(GraphSnapshot::empty()).unwrap();
+        let fields: Vec<String> = encoded
+            .as_object()
+            .expect("snapshot serializes as a map")
+            .keys()
+            .cloned()
+            .collect();
+
+        for field in fields {
+            let mut missing = encoded.clone();
+            missing
+                .as_object_mut()
+                .expect("snapshot serializes as a map")
+                .remove(&field);
+
+            let error = serde_json::from_value::<GraphSnapshot>(missing).unwrap_err();
+            assert!(
+                error.to_string().contains(&field),
+                "missing {field} should fail explicitly: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_snapshot_rejects_unknown_persisted_fields() {
+        let mut encoded = serde_json::to_value(GraphSnapshot::empty()).unwrap();
+        encoded
+            .as_object_mut()
+            .expect("snapshot serializes as a map")
+            .insert("working_tree".to_string(), serde_json::json!([]));
+
+        let error = serde_json::from_value::<GraphSnapshot>(encoded).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown field `working_tree`"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -2202,6 +1805,43 @@ mod tests {
         // Version in header should match the current format version.
         let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
         assert_eq!(version, GraphSnapshot::CURRENT_VERSION);
+    }
+
+    #[test]
+    fn snapshot_decode_rejects_corrupted_semantic_change_identity() {
+        let mut snapshot = GraphSnapshot::empty();
+        let change = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x91; 32])),
+            parents: Vec::new(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("tester"),
+            message: "valid before corruption".into(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        });
+        snapshot.changes.insert(change.id, change.clone());
+        snapshot
+            .changes
+            .get_mut(&change.id)
+            .unwrap()
+            .message
+            .push_str(" after id was sealed");
+
+        let bytes = encode_snapshot_without_admission_validation(&snapshot);
+        let error = GraphSnapshot::from_bytes(&bytes)
+            .expect_err("checksum-valid snapshot corruption must fail identity validation");
+        assert!(error.to_string().contains("recomputes to"));
+
+        let error = GraphSnapshot::from_bytes_with_persisted_root_hash_unverified(&bytes)
+            .expect_err("the mmap checksum shortcut must still validate change identity");
+        assert!(error.to_string().contains("recomputes to"));
     }
 
     #[test]
@@ -2291,35 +1931,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_v1_snapshot_with_new_fields_defaulted() {
-        let legacy = GraphSnapshotV1 {
-            version: 1,
-            entities: HashMap::new(),
-            relations: HashMap::new(),
-            outgoing: HashMap::new(),
-            incoming: HashMap::new(),
-            changes: HashMap::new(),
-            change_children: HashMap::new(),
-            branches: HashMap::new(),
-        };
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&GraphSnapshot::MAGIC);
-        bytes.extend_from_slice(&1u32.to_le_bytes());
-        let body = rmp_serde::to_vec(&legacy).unwrap();
-        bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
-        bytes.extend(body);
-
-        let loaded = GraphSnapshot::from_bytes(&bytes).unwrap();
-        assert_eq!(loaded.version, GraphSnapshot::CURRENT_VERSION);
-        assert!(loaded.work_items.is_empty());
-        assert!(loaded.shallow_files.is_empty());
-        assert!(loaded.sessions.is_empty());
-    }
-
-    #[test]
-    fn loads_v2_snapshot_without_checksum() {
-        // v2 snapshots have no checksum — must still load
+    fn rejects_v2_snapshot_without_inventing_tree_modes() {
         let snap = GraphSnapshot::empty();
         let mut snapshot = snap.clone();
         snapshot.version = 2;
@@ -2331,8 +1943,11 @@ mod tests {
         bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
         bytes.extend(body);
 
-        let loaded = GraphSnapshot::from_bytes(&bytes).unwrap();
-        assert!(loaded.entities.is_empty());
+        let error = GraphSnapshot::from_bytes(&bytes).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::KinDbError::IncompatibleSnapshotVersion { found: 2, .. }
+        ));
     }
 
     /// A snapshot written by an older Kin (schema predating the supported
@@ -2371,8 +1986,8 @@ mod tests {
             "missing supported-range wording: {msg}"
         );
         assert!(
-            msg.contains("kin migrate") || msg.contains("kin embed --rebuild"),
-            "missing remediation command: {msg}"
+            msg.contains("reinitialize") && msg.contains("exact file modes"),
+            "missing exact-tree remediation: {msg}"
         );
     }
 
@@ -2407,61 +2022,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_legacy_v3_snapshot_from_before_review_fields() {
-        let legacy = GraphSnapshotV3Legacy {
-            version: 3,
-            entities: HashMap::new(),
-            relations: HashMap::new(),
-            outgoing: HashMap::new(),
-            incoming: HashMap::new(),
-            changes: HashMap::new(),
-            change_children: HashMap::new(),
-            branches: HashMap::new(),
-            work_items: HashMap::new(),
-            annotations: HashMap::new(),
-            work_links: Vec::new(),
-            test_cases: HashMap::new(),
-            assertions: HashMap::new(),
-            verification_runs: HashMap::new(),
-            test_covers_entity: Vec::new(),
-            test_covers_contract: Vec::new(),
-            test_verifies_work: Vec::new(),
-            run_proves_entity: Vec::new(),
-            run_proves_work: Vec::new(),
-            mock_hints: Vec::new(),
-            contracts: HashMap::new(),
-            actors: HashMap::new(),
-            delegations: Vec::new(),
-            approvals: Vec::new(),
-            audit_events: Vec::new(),
-            shallow_files: Vec::new(),
-            structured_artifacts: Vec::new(),
-            opaque_artifacts: Vec::new(),
-            file_hashes: HashMap::new(),
-            sessions: HashMap::new(),
-            intents: HashMap::new(),
-            downstream_warnings: Vec::new(),
-        };
-
-        let body = rmp_serde::to_vec(&legacy).unwrap();
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&GraphSnapshot::MAGIC);
-        bytes.extend_from_slice(&3u32.to_le_bytes());
-        bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&body);
-        bytes.extend_from_slice(&Sha256::digest(&body));
-
-        let loaded = GraphSnapshot::from_bytes(&bytes).unwrap();
-        assert_eq!(loaded.version, GraphSnapshot::CURRENT_VERSION);
-        assert!(loaded.reviews.is_empty());
-        assert!(loaded.review_decisions.is_empty());
-        assert!(loaded.review_notes.is_empty());
-        assert!(loaded.review_discussions.is_empty());
-        assert!(loaded.review_assignments.is_empty());
-    }
-
-    #[test]
-    fn loads_current_layout_v3_snapshot_and_upgrades_on_write() {
+    fn rejects_current_layout_body_with_v3_envelope() {
         let mut snapshot = GraphSnapshot::empty();
         snapshot.version = 3;
         let body = rmp_serde::to_vec(&snapshot).unwrap();
@@ -2473,17 +2034,20 @@ mod tests {
         bytes.extend_from_slice(&body);
         bytes.extend_from_slice(&Sha256::digest(&body));
 
-        let loaded = GraphSnapshot::from_bytes(&bytes).unwrap();
-        assert_eq!(loaded.version, 3);
-
-        let rewritten = loaded.to_bytes().unwrap();
-        let rewritten_version = u32::from_le_bytes(rewritten[4..8].try_into().unwrap());
-        assert_eq!(rewritten_version, GraphSnapshot::CURRENT_VERSION);
+        let error = GraphSnapshot::from_bytes(&bytes).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::KinDbError::IncompatibleSnapshotVersion { found: 3, .. }
+        ));
     }
 
     #[test]
     fn snapshot_roundtrips_file_layouts() {
         let mut snapshot = GraphSnapshot::empty();
+        snapshot.admit_artifact_for_test(
+            "src/lib.rs".to_string(),
+            crate::types::regular_tree_entry(1),
+        );
         snapshot.file_layouts.push(FileLayout {
             file_id: FilePathId::new("src/lib.rs"),
             parse_completeness: ParseCompleteness::Partial("1 parse error range(s)".into()),
@@ -2508,48 +2072,5 @@ mod tests {
         let mut data = vec![0u8; 64];
         data[0..4].copy_from_slice(b"XXXX");
         assert!(GraphSnapshot::from_bytes(&data).is_err());
-    }
-
-    #[test]
-    fn tombstone_snapshot_roundtrip() {
-        let mut snapshot = GraphSnapshot::empty();
-        let entity = test_entity("removed_fn");
-        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xAA; 32]));
-        let relation = test_relation(entity.id, EntityId::new());
-        let rel_id = relation.id;
-
-        snapshot
-            .entity_tombstones
-            .insert(entity.id, (entity.clone(), change_id));
-        snapshot
-            .relation_tombstones
-            .insert(rel_id, (relation.clone(), change_id));
-
-        let bytes = snapshot.to_bytes().unwrap();
-        let loaded = GraphSnapshot::from_bytes(&bytes).unwrap();
-
-        assert_eq!(loaded.entity_tombstones.len(), 1);
-        let (loaded_entity, loaded_change) = loaded.entity_tombstones.get(&entity.id).unwrap();
-        assert_eq!(loaded_entity.name, "removed_fn");
-        assert_eq!(*loaded_change, change_id);
-
-        assert_eq!(loaded.relation_tombstones.len(), 1);
-        let (loaded_rel, loaded_rel_change) = loaded.relation_tombstones.get(&rel_id).unwrap();
-        assert_eq!(loaded_rel.id, rel_id);
-        assert_eq!(*loaded_rel_change, change_id);
-    }
-
-    #[test]
-    fn tombstone_fields_default_empty_on_legacy_snapshot() {
-        // A snapshot without tombstone fields should deserialize with empty tombstones.
-        let snapshot = GraphSnapshot::empty();
-        assert!(snapshot.entity_tombstones.is_empty());
-        assert!(snapshot.relation_tombstones.is_empty());
-
-        // Serialize and deserialize — tombstones should remain empty.
-        let bytes = snapshot.to_bytes().unwrap();
-        let loaded = GraphSnapshot::from_bytes(&bytes).unwrap();
-        assert!(loaded.entity_tombstones.is_empty());
-        assert!(loaded.relation_tombstones.is_empty());
     }
 }

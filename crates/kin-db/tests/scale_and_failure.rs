@@ -116,7 +116,6 @@ fn generate_snapshot(n: usize, rels_per_entity: usize) -> (GraphSnapshot, Vec<En
         incoming,
         changes: HashMap::new(),
         change_children: HashMap::new(),
-        branches: HashMap::new(),
         work_items: HashMap::new(),
         annotations: HashMap::new(),
         work_links: Vec::new(),
@@ -128,11 +127,6 @@ fn generate_snapshot(n: usize, rels_per_entity: usize) -> (GraphSnapshot, Vec<En
         test_cases: HashMap::new(),
         assertions: HashMap::new(),
         verification_runs: HashMap::new(),
-        test_covers_entity: Vec::new(),
-        test_covers_contract: Vec::new(),
-        test_verifies_work: Vec::new(),
-        run_proves_entity: Vec::new(),
-        run_proves_work: Vec::new(),
         mock_hints: Vec::new(),
         contracts: HashMap::new(),
         actors: HashMap::new(),
@@ -143,14 +137,11 @@ fn generate_snapshot(n: usize, rels_per_entity: usize) -> (GraphSnapshot, Vec<En
         file_layouts: Vec::new(),
         structured_artifacts: Vec::new(),
         opaque_artifacts: Vec::new(),
-        file_hashes: HashMap::new(),
+        resolved_tree: ResolvedTree::default(),
         sessions: HashMap::new(),
         intents: HashMap::new(),
         downstream_warnings: Vec::new(),
-        entity_tombstones: HashMap::new(),
-        relation_tombstones: HashMap::new(),
-        change_order: HashMap::new(),
-        artifact_index: HashMap::new(),
+        repository_authority: None,
     };
 
     (snapshot, entity_ids)
@@ -161,7 +152,7 @@ fn generate_snapshot(n: usize, rels_per_entity: usize) -> (GraphSnapshot, Vec<En
 fn scale_100k_entities() {
     let (snapshot, entity_ids) = generate_snapshot(100_000, 2);
     let start = Instant::now();
-    let graph = InMemoryGraph::from_snapshot(snapshot);
+    let graph = InMemoryGraph::from_snapshot(snapshot).unwrap();
     let hydrate_time = start.elapsed();
 
     // Hydration smoke guard (not a perf benchmark): catches gross regressions
@@ -227,7 +218,7 @@ fn save_reload_no_drift_100_cycles() {
 
     // Save initial snapshot.
     {
-        let graph = InMemoryGraph::from_snapshot(initial_snapshot);
+        let graph = InMemoryGraph::from_snapshot(initial_snapshot).unwrap();
         let mgr = SnapshotManager::new(&path);
         mgr.swap(graph);
         mgr.save().unwrap();
@@ -293,8 +284,8 @@ fn corrupt_snapshot_detected() {
         mgr.save().unwrap();
     }
 
-    // Corrupt the immutable snapshot named by authority. The canonical path is
-    // only a compatibility projection and cannot override committed truth.
+    // Corrupt the immutable snapshot named by authority. The logical namespace
+    // path contains no graph bytes and cannot override committed truth.
     let authoritative_path = authoritative_snapshot_path(&path);
     let mut bytes = std::fs::read(&authoritative_path).unwrap();
     assert!(bytes.len() > 40, "snapshot should be non-trivial");

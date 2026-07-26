@@ -8,7 +8,7 @@
 //! computed by diffing two `GraphSnapshot` instances and can be applied to
 //! a base snapshot to reconstruct the target state.
 //!
-//! Wire format (v1):
+//! Wire format:
 //!   [4B magic "KNDD"] [4B version LE] [8B body_len LE] [body ...] [32B SHA-256]
 //!
 //! The body is MessagePack-serialized `GraphSnapshotDelta`.
@@ -20,6 +20,7 @@ use std::hash::Hash;
 
 use crate::error::KinDbError;
 use crate::storage::backend::Generation;
+use crate::storage::change_validation::validate_semantic_change_entries;
 use crate::storage::format::GraphSnapshot;
 use crate::types::*;
 
@@ -29,6 +30,7 @@ use crate::types::*;
 
 /// Delta for a HashMap-based collection: added, modified, and removed entries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CollectionDelta<K, V> {
     pub added: Vec<(K, V)>,
     /// Modified entries carry only the new value (caller has the old from base).
@@ -60,6 +62,7 @@ impl<K, V> CollectionDelta<K, V> {
 /// We track added and removed items; for simplicity in ordered collections
 /// we store full replacement when items are reordered.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VecDelta<V> {
     pub added: Vec<V>,
     pub removed: Vec<V>,
@@ -93,6 +96,7 @@ impl<V> VecDelta<V> {
 /// Contains granular changes for every collection in the snapshot. Applying
 /// this delta to the base snapshot reconstructs the target snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GraphSnapshotDelta {
     /// The generation of the base snapshot this delta was computed from.
     pub base_generation: Generation,
@@ -106,9 +110,6 @@ pub struct GraphSnapshotDelta {
     // Change history
     pub changes: CollectionDelta<SemanticChangeId, SemanticChange>,
     pub change_children: CollectionDelta<SemanticChangeId, Vec<SemanticChangeId>>,
-
-    // Branches
-    pub branches: CollectionDelta<BranchName, Branch>,
 
     // Work graph
     pub work_items: CollectionDelta<WorkId, WorkItem>,
@@ -126,11 +127,6 @@ pub struct GraphSnapshotDelta {
     pub test_cases: CollectionDelta<TestId, TestCase>,
     pub assertions: CollectionDelta<AssertionId, Assertion>,
     pub verification_runs: CollectionDelta<VerificationRunId, VerificationRun>,
-    pub test_covers_entity: VecDelta<(TestId, EntityId)>,
-    pub test_covers_contract: VecDelta<(TestId, ContractId)>,
-    pub test_verifies_work: VecDelta<(TestId, WorkId)>,
-    pub run_proves_entity: VecDelta<(VerificationRunId, EntityId)>,
-    pub run_proves_work: VecDelta<(VerificationRunId, WorkId)>,
     pub mock_hints: VecDelta<MockHint>,
 
     // Contracts
@@ -144,21 +140,15 @@ pub struct GraphSnapshotDelta {
 
     // File tracking
     pub shallow_files: VecDelta<ShallowTrackedFile>,
-    #[serde(default)]
     pub file_layouts: VecDelta<FileLayout>,
-    #[serde(default)]
     pub structured_artifacts: VecDelta<StructuredArtifact>,
-    #[serde(default)]
     pub opaque_artifacts: VecDelta<OpaqueArtifact>,
-    pub file_hashes: CollectionDelta<String, [u8; 32]>,
-    #[serde(default)]
-    pub artifact_index: CollectionDelta<FilePathId, ArtifactId>,
+    pub resolved_tree: CollectionDelta<ArtifactId, LocatedEntry>,
 
     // Sessions/intents
     pub sessions: CollectionDelta<SessionId, AgentSession>,
     pub intents: CollectionDelta<IntentId, Intent>,
     pub downstream_warnings: VecDelta<(IntentId, EntityId, String)>,
-    #[serde(default)]
     pub entity_revisions: CollectionDelta<EntityId, Vec<EntityRevision>>,
 }
 
@@ -167,7 +157,7 @@ impl GraphSnapshotDelta {
     pub const MAGIC: [u8; 4] = *b"KNDD";
 
     /// Current delta format version.
-    pub const CURRENT_VERSION: u32 = 1;
+    pub const CURRENT_VERSION: u32 = 4;
 
     /// Size of the SHA-256 checksum appended to the wire format.
     pub const CHECKSUM_LEN: usize = 32;
@@ -182,7 +172,6 @@ impl GraphSnapshotDelta {
             incoming: CollectionDelta::default(),
             changes: CollectionDelta::default(),
             change_children: CollectionDelta::default(),
-            branches: CollectionDelta::default(),
             work_items: CollectionDelta::default(),
             annotations: CollectionDelta::default(),
             work_links: VecDelta::default(),
@@ -194,11 +183,6 @@ impl GraphSnapshotDelta {
             test_cases: CollectionDelta::default(),
             assertions: CollectionDelta::default(),
             verification_runs: CollectionDelta::default(),
-            test_covers_entity: VecDelta::default(),
-            test_covers_contract: VecDelta::default(),
-            test_verifies_work: VecDelta::default(),
-            run_proves_entity: VecDelta::default(),
-            run_proves_work: VecDelta::default(),
             mock_hints: VecDelta::default(),
             contracts: CollectionDelta::default(),
             actors: CollectionDelta::default(),
@@ -209,8 +193,7 @@ impl GraphSnapshotDelta {
             file_layouts: VecDelta::default(),
             structured_artifacts: VecDelta::default(),
             opaque_artifacts: VecDelta::default(),
-            file_hashes: CollectionDelta::default(),
-            artifact_index: CollectionDelta::default(),
+            resolved_tree: CollectionDelta::default(),
             sessions: CollectionDelta::default(),
             intents: CollectionDelta::default(),
             downstream_warnings: VecDelta::default(),
@@ -226,7 +209,6 @@ impl GraphSnapshotDelta {
             && self.incoming.is_empty()
             && self.changes.is_empty()
             && self.change_children.is_empty()
-            && self.branches.is_empty()
             && self.work_items.is_empty()
             && self.annotations.is_empty()
             && self.work_links.is_empty()
@@ -238,11 +220,6 @@ impl GraphSnapshotDelta {
             && self.test_cases.is_empty()
             && self.assertions.is_empty()
             && self.verification_runs.is_empty()
-            && self.test_covers_entity.is_empty()
-            && self.test_covers_contract.is_empty()
-            && self.test_verifies_work.is_empty()
-            && self.run_proves_entity.is_empty()
-            && self.run_proves_work.is_empty()
             && self.mock_hints.is_empty()
             && self.contracts.is_empty()
             && self.actors.is_empty()
@@ -253,8 +230,7 @@ impl GraphSnapshotDelta {
             && self.file_layouts.is_empty()
             && self.structured_artifacts.is_empty()
             && self.opaque_artifacts.is_empty()
-            && self.file_hashes.is_empty()
-            && self.artifact_index.is_empty()
+            && self.resolved_tree.is_empty()
             && self.sessions.is_empty()
             && self.intents.is_empty()
             && self.downstream_warnings.is_empty()
@@ -266,7 +242,6 @@ impl GraphSnapshotDelta {
         self.entities.change_count()
             + self.relations.change_count()
             + self.changes.change_count()
-            + self.branches.change_count()
             + self.work_items.change_count()
             + self.annotations.change_count()
             + self.reviews.change_count()
@@ -278,14 +253,25 @@ impl GraphSnapshotDelta {
             + self.contracts.change_count()
             + self.actors.change_count()
             + self.file_layouts.change_count()
-            + self.file_hashes.change_count()
-            + self.artifact_index.change_count()
+            + self.resolved_tree.change_count()
             + self.sessions.change_count()
             + self.intents.change_count()
     }
 
+    fn validate_semantic_changes(&self) -> Result<(), KinDbError> {
+        validate_semantic_change_entries(
+            self.changes
+                .added
+                .iter()
+                .chain(&self.changes.modified)
+                .map(|(key, change)| (key, change)),
+            "snapshot delta",
+        )
+    }
+
     /// Serialize the delta to bytes with header and SHA-256 checksum.
     pub fn to_bytes(&self) -> Result<Vec<u8>, KinDbError> {
+        self.validate_semantic_changes()?;
         let mut buf = Vec::new();
         buf.extend_from_slice(&Self::MAGIC);
         buf.extend_from_slice(&Self::CURRENT_VERSION.to_le_bytes());
@@ -357,8 +343,10 @@ impl GraphSnapshotDelta {
             ));
         }
 
-        rmp_serde::from_slice(body)
-            .map_err(|e| KinDbError::StorageError(format!("delta deserialization failed: {e}")))
+        let delta: Self = rmp_serde::from_slice(body)
+            .map_err(|e| KinDbError::StorageError(format!("delta deserialization failed: {e}")))?;
+        delta.validate_semantic_changes()?;
+        Ok(delta)
     }
 }
 
@@ -486,6 +474,20 @@ pub fn compute_graph_delta(
     new: &GraphSnapshot,
     base_generation: Generation,
 ) -> GraphSnapshotDelta {
+    assert!(
+        old.repository_authority.is_none() && new.repository_authority.is_none(),
+        "repository-authority snapshots require one full-snapshot transaction CAS"
+    );
+    let old_tree: HashMap<ArtifactId, LocatedEntry> = old
+        .resolved_tree
+        .artifacts()
+        .map(|artifact| (artifact.artifact_id, artifact.located_entry()))
+        .collect();
+    let new_tree: HashMap<ArtifactId, LocatedEntry> = new
+        .resolved_tree
+        .artifacts()
+        .map(|artifact| (artifact.artifact_id, artifact.located_entry()))
+        .collect();
     GraphSnapshotDelta {
         base_generation,
         entities: diff_maps(&old.entities, &new.entities),
@@ -494,7 +496,6 @@ pub fn compute_graph_delta(
         incoming: diff_maps_eq(&old.incoming, &new.incoming),
         changes: diff_maps(&old.changes, &new.changes),
         change_children: diff_maps_eq(&old.change_children, &new.change_children),
-        branches: diff_maps(&old.branches, &new.branches),
         work_items: diff_maps(&old.work_items, &new.work_items),
         annotations: diff_maps(&old.annotations, &new.annotations),
         work_links: diff_vecs(&old.work_links, &new.work_links),
@@ -506,11 +507,6 @@ pub fn compute_graph_delta(
         test_cases: diff_maps(&old.test_cases, &new.test_cases),
         assertions: diff_maps(&old.assertions, &new.assertions),
         verification_runs: diff_maps(&old.verification_runs, &new.verification_runs),
-        test_covers_entity: diff_vecs(&old.test_covers_entity, &new.test_covers_entity),
-        test_covers_contract: diff_vecs(&old.test_covers_contract, &new.test_covers_contract),
-        test_verifies_work: diff_vecs(&old.test_verifies_work, &new.test_verifies_work),
-        run_proves_entity: diff_vecs(&old.run_proves_entity, &new.run_proves_entity),
-        run_proves_work: diff_vecs(&old.run_proves_work, &new.run_proves_work),
         mock_hints: diff_vecs(&old.mock_hints, &new.mock_hints),
         contracts: diff_maps(&old.contracts, &new.contracts),
         actors: diff_maps(&old.actors, &new.actors),
@@ -521,8 +517,7 @@ pub fn compute_graph_delta(
         file_layouts: diff_vecs(&old.file_layouts, &new.file_layouts),
         structured_artifacts: diff_vecs(&old.structured_artifacts, &new.structured_artifacts),
         opaque_artifacts: diff_vecs(&old.opaque_artifacts, &new.opaque_artifacts),
-        file_hashes: diff_maps_eq(&old.file_hashes, &new.file_hashes),
-        artifact_index: diff_maps(&old.artifact_index, &new.artifact_index),
+        resolved_tree: diff_maps_eq(&old_tree, &new_tree),
         sessions: diff_maps(&old.sessions, &new.sessions),
         intents: diff_maps(&old.intents, &new.intents),
         downstream_warnings: diff_vecs(&old.downstream_warnings, &new.downstream_warnings),
@@ -572,78 +567,123 @@ where
     vec.extend(delta.added.iter().cloned());
 }
 
+fn apply_resolved_tree_delta(
+    tree: &ResolvedTree,
+    delta: &CollectionDelta<ArtifactId, LocatedEntry>,
+) -> Result<ResolvedTree, KinDbError> {
+    let mut seen = std::collections::HashSet::with_capacity(delta.change_count());
+    for artifact_id in delta
+        .added
+        .iter()
+        .map(|(artifact_id, _)| artifact_id)
+        .chain(delta.modified.iter().map(|(artifact_id, _)| artifact_id))
+        .chain(delta.removed.iter())
+    {
+        if !seen.insert(*artifact_id) {
+            return Err(KinDbError::StorageError(format!(
+                "repository-tree persistence delta repeats artifact {artifact_id:?}"
+            )));
+        }
+    }
+
+    let mut by_id: HashMap<ArtifactId, LocatedEntry> = tree
+        .artifacts()
+        .map(|artifact| (artifact.artifact_id, artifact.located_entry()))
+        .collect();
+    for artifact_id in &delta.removed {
+        by_id.remove(artifact_id);
+    }
+    for (artifact_id, located) in delta.added.iter().chain(&delta.modified) {
+        by_id.insert(*artifact_id, located.clone());
+    }
+
+    ResolvedTree::from_artifacts(by_id.into_iter().map(|(artifact_id, located)| {
+        ResolvedArtifact::new(artifact_id, located.path, located.entry)
+    }))
+    .map_err(|error| {
+        KinDbError::StorageError(format!(
+            "repository-tree persistence delta violates identity/path authority: {error}"
+        ))
+    })
+}
+
 /// Apply a `GraphSnapshotDelta` to a `GraphSnapshot`, mutating it in place.
 ///
 /// After application, the snapshot is equivalent to the target state that
 /// the delta was computed from.
-pub fn apply_graph_delta(snapshot: &mut GraphSnapshot, delta: &GraphSnapshotDelta) {
+pub fn apply_graph_delta(
+    snapshot: &mut GraphSnapshot,
+    delta: &GraphSnapshotDelta,
+) -> Result<(), KinDbError> {
+    if snapshot.repository_authority.is_some() {
+        return Err(KinDbError::StorageError(
+            "repository-authority snapshots cannot be mutated through incremental graph deltas"
+                .to_string(),
+        ));
+    }
+    delta.validate_semantic_changes()?;
+    // Apply into a private candidate so repository identity/path truth and
+    // every enrichment that depends on it are validated as one state
+    // transition. No snapshot domain becomes visible on any failure.
+    let mut staged = snapshot.clone();
+    staged.resolved_tree =
+        apply_resolved_tree_delta(&snapshot.resolved_tree, &delta.resolved_tree)?;
+
     // Core graph
-    apply_map_delta(&mut snapshot.entities, &delta.entities);
-    apply_map_delta(&mut snapshot.relations, &delta.relations);
-    apply_map_delta(&mut snapshot.outgoing, &delta.outgoing);
-    apply_map_delta(&mut snapshot.incoming, &delta.incoming);
+    apply_map_delta(&mut staged.entities, &delta.entities);
+    apply_map_delta(&mut staged.relations, &delta.relations);
+    apply_map_delta(&mut staged.outgoing, &delta.outgoing);
+    apply_map_delta(&mut staged.incoming, &delta.incoming);
 
     // Change history
-    apply_map_delta(&mut snapshot.changes, &delta.changes);
-    apply_map_delta(&mut snapshot.change_children, &delta.change_children);
-
-    // Branches
-    apply_map_delta(&mut snapshot.branches, &delta.branches);
+    apply_map_delta(&mut staged.changes, &delta.changes);
+    apply_map_delta(&mut staged.change_children, &delta.change_children);
 
     // Work graph
-    apply_map_delta(&mut snapshot.work_items, &delta.work_items);
-    apply_map_delta(&mut snapshot.annotations, &delta.annotations);
-    apply_vec_delta(&mut snapshot.work_links, &delta.work_links);
+    apply_map_delta(&mut staged.work_items, &delta.work_items);
+    apply_map_delta(&mut staged.annotations, &delta.annotations);
+    apply_vec_delta(&mut staged.work_links, &delta.work_links);
 
     // Reviews
-    apply_map_delta(&mut snapshot.reviews, &delta.reviews);
-    apply_map_delta(&mut snapshot.review_decisions, &delta.review_decisions);
-    apply_vec_delta(&mut snapshot.review_notes, &delta.review_notes);
-    apply_vec_delta(&mut snapshot.review_discussions, &delta.review_discussions);
-    apply_map_delta(&mut snapshot.review_assignments, &delta.review_assignments);
+    apply_map_delta(&mut staged.reviews, &delta.reviews);
+    apply_map_delta(&mut staged.review_decisions, &delta.review_decisions);
+    apply_vec_delta(&mut staged.review_notes, &delta.review_notes);
+    apply_vec_delta(&mut staged.review_discussions, &delta.review_discussions);
+    apply_map_delta(&mut staged.review_assignments, &delta.review_assignments);
 
     // Verification
-    apply_map_delta(&mut snapshot.test_cases, &delta.test_cases);
-    apply_map_delta(&mut snapshot.assertions, &delta.assertions);
-    apply_map_delta(&mut snapshot.verification_runs, &delta.verification_runs);
-    apply_vec_delta(&mut snapshot.test_covers_entity, &delta.test_covers_entity);
-    apply_vec_delta(
-        &mut snapshot.test_covers_contract,
-        &delta.test_covers_contract,
-    );
-    apply_vec_delta(&mut snapshot.test_verifies_work, &delta.test_verifies_work);
-    apply_vec_delta(&mut snapshot.run_proves_entity, &delta.run_proves_entity);
-    apply_vec_delta(&mut snapshot.run_proves_work, &delta.run_proves_work);
-    apply_vec_delta(&mut snapshot.mock_hints, &delta.mock_hints);
+    apply_map_delta(&mut staged.test_cases, &delta.test_cases);
+    apply_map_delta(&mut staged.assertions, &delta.assertions);
+    apply_map_delta(&mut staged.verification_runs, &delta.verification_runs);
+    apply_vec_delta(&mut staged.mock_hints, &delta.mock_hints);
 
     // Contracts
-    apply_map_delta(&mut snapshot.contracts, &delta.contracts);
+    apply_map_delta(&mut staged.contracts, &delta.contracts);
 
     // Provenance
-    apply_map_delta(&mut snapshot.actors, &delta.actors);
-    apply_vec_delta(&mut snapshot.delegations, &delta.delegations);
-    apply_vec_delta(&mut snapshot.approvals, &delta.approvals);
-    apply_vec_delta(&mut snapshot.audit_events, &delta.audit_events);
+    apply_map_delta(&mut staged.actors, &delta.actors);
+    apply_vec_delta(&mut staged.delegations, &delta.delegations);
+    apply_vec_delta(&mut staged.approvals, &delta.approvals);
+    apply_vec_delta(&mut staged.audit_events, &delta.audit_events);
 
     // File tracking
-    apply_vec_delta(&mut snapshot.shallow_files, &delta.shallow_files);
-    apply_vec_delta(&mut snapshot.file_layouts, &delta.file_layouts);
+    apply_vec_delta(&mut staged.shallow_files, &delta.shallow_files);
+    apply_vec_delta(&mut staged.file_layouts, &delta.file_layouts);
     apply_vec_delta(
-        &mut snapshot.structured_artifacts,
+        &mut staged.structured_artifacts,
         &delta.structured_artifacts,
     );
-    apply_vec_delta(&mut snapshot.opaque_artifacts, &delta.opaque_artifacts);
-    apply_map_delta(&mut snapshot.file_hashes, &delta.file_hashes);
-    apply_map_delta(&mut snapshot.artifact_index, &delta.artifact_index);
+    apply_vec_delta(&mut staged.opaque_artifacts, &delta.opaque_artifacts);
 
     // Sessions/intents
-    apply_map_delta(&mut snapshot.sessions, &delta.sessions);
-    apply_map_delta(&mut snapshot.intents, &delta.intents);
-    apply_vec_delta(
-        &mut snapshot.downstream_warnings,
-        &delta.downstream_warnings,
-    );
-    apply_map_delta(&mut snapshot.entity_revisions, &delta.entity_revisions);
+    apply_map_delta(&mut staged.sessions, &delta.sessions);
+    apply_map_delta(&mut staged.intents, &delta.intents);
+    apply_vec_delta(&mut staged.downstream_warnings, &delta.downstream_warnings);
+    apply_map_delta(&mut staged.entity_revisions, &delta.entity_revisions);
+
+    staged.validate_storage_admission()?;
+    *snapshot = staged;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -653,6 +693,39 @@ pub fn apply_graph_delta(snapshot: &mut GraphSnapshot, delta: &GraphSnapshotDelt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seal_change(mut change: SemanticChange) -> SemanticChange {
+        change.id =
+            kin_model::compute_semantic_change_id(&change).expect("valid semantic change fixture");
+        change
+    }
+
+    fn encode_delta_without_admission_validation(delta: &GraphSnapshotDelta) -> Vec<u8> {
+        let body = rmp_serde::to_vec(delta).unwrap();
+        let mut bytes = Vec::with_capacity(16 + body.len() + GraphSnapshotDelta::CHECKSUM_LEN);
+        bytes.extend_from_slice(&GraphSnapshotDelta::MAGIC);
+        bytes.extend_from_slice(&GraphSnapshotDelta::CURRENT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(&Sha256::digest(&body));
+        bytes
+    }
+
+    fn path(value: &str) -> RepoPath {
+        RepoPath::from_utf8(value).unwrap()
+    }
+
+    fn tree(entries: Vec<(ArtifactId, &str, TreeEntry)>) -> ResolvedTree {
+        ResolvedTree::from_artifacts(entries.into_iter().map(|(artifact_id, path, entry)| {
+            ResolvedArtifact::new(artifact_id, self::path(path), entry)
+        }))
+        .unwrap()
+    }
+
+    fn entry_at(tree: &ResolvedTree, value: &str) -> Option<TreeEntry> {
+        tree.artifact_at_path(&path(value))
+            .map(|artifact| artifact.entry)
+    }
 
     /// Regression (found by fuzzing): a delta header whose body_len is near
     /// usize::MAX must error, never wrap `16 + body_len + CHECKSUM_LEN` and
@@ -669,6 +742,54 @@ mod tests {
             result.is_err(),
             "overflowing body_len must error, not panic"
         );
+    }
+
+    #[test]
+    fn delta_decode_and_apply_reject_corrupted_semantic_change_identity_atomically() {
+        let mut change = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x92; 32])),
+            parents: Vec::new(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("tester"),
+            message: "valid before corruption".into(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        });
+        change.message.push_str(" after id was sealed");
+        let mut delta = GraphSnapshotDelta::empty(0);
+        delta.changes.added.push((change.id, change));
+
+        let bytes = encode_delta_without_admission_validation(&delta);
+        let error = GraphSnapshotDelta::from_bytes(&bytes)
+            .expect_err("checksum-valid delta corruption must fail identity validation");
+        assert!(error.to_string().contains("recomputes to"));
+
+        let mut snapshot = GraphSnapshot::empty();
+        let before = snapshot.to_bytes().unwrap();
+        let error = apply_graph_delta(&mut snapshot, &delta)
+            .expect_err("direct delta application must enforce the same identity boundary");
+        assert!(error.to_string().contains("recomputes to"));
+        assert_eq!(snapshot.to_bytes().unwrap(), before);
+    }
+
+    #[test]
+    fn delta_v2_is_rejected_without_legacy_decode() {
+        let delta = GraphSnapshotDelta::empty(0);
+        let mut bytes = delta.to_bytes().unwrap();
+        bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
+
+        let error = GraphSnapshotDelta::from_bytes(&bytes).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("unsupported delta version: 2 (expected 4)"));
     }
 
     // -- Helpers -----------------------------------------------------------
@@ -860,7 +981,7 @@ mod tests {
 
         // Apply delta to old → should match new
         let mut result = old.clone();
-        apply_graph_delta(&mut result, &delta);
+        apply_graph_delta(&mut result, &delta).unwrap();
 
         assert_eq!(result.entities.len(), 2);
         assert_eq!(result.entities.get(&id_a).unwrap().name, "fn_a_v2");
@@ -892,62 +1013,146 @@ mod tests {
         assert_eq!(delta.relations.added.len(), 1);
 
         let mut result = old.clone();
-        apply_graph_delta(&mut result, &delta);
+        apply_graph_delta(&mut result, &delta).unwrap();
         assert_eq!(result.relations.len(), 1);
         assert!(result.relations.contains_key(&rel_id));
     }
 
     #[test]
-    fn compute_and_apply_branch_delta() {
+    fn compute_and_apply_exact_resolved_tree_delta() {
         let mut old = GraphSnapshot::empty();
         let mut new = GraphSnapshot::empty();
+        let stable_id = ArtifactId::new();
+        let mode_id = ArtifactId::new();
+        let link_id = ArtifactId::new();
+        let stable = regular_tree_entry(1);
+        let mode_before = TreeEntry::blob(Hash256::from_bytes([2; 32]), false);
+        let mode_after = TreeEntry::blob(Hash256::from_bytes([2; 32]), true);
+        let symlink = TreeEntry::symlink(Hash256::from_bytes([3; 32]));
 
-        let branch_name = BranchName::new("main");
-        let old_branch = Branch {
-            name: branch_name.clone(),
-            head: SemanticChangeId(Hash256::from_bytes([1; 32])),
-        };
-        let new_branch = Branch {
-            head: SemanticChangeId(Hash256::from_bytes([2; 32])),
-            ..old_branch.clone()
-        };
+        old.resolved_tree = tree(vec![
+            (stable_id, "a.rs", stable),
+            (mode_id, "b.rs", mode_before),
+        ]);
 
-        old.branches.insert(branch_name.clone(), old_branch);
-        new.branches.insert(branch_name.clone(), new_branch);
+        new.resolved_tree = tree(vec![
+            (stable_id, "a.rs", stable),
+            (mode_id, "b.rs", mode_after),
+            (link_id, "link", symlink),
+        ]);
 
         let delta = compute_graph_delta(&old, &new, 1);
-        assert_eq!(delta.branches.modified.len(), 1);
+        assert_eq!(delta.resolved_tree.added.len(), 1);
+        assert_eq!(delta.resolved_tree.modified.len(), 1);
+        assert!(delta.resolved_tree.removed.is_empty());
 
         let mut result = old.clone();
-        apply_graph_delta(&mut result, &delta);
+        apply_graph_delta(&mut result, &delta).unwrap();
+        assert_eq!(entry_at(&result.resolved_tree, "a.rs"), Some(stable));
+        assert_eq!(entry_at(&result.resolved_tree, "b.rs"), Some(mode_after));
+        assert_eq!(entry_at(&result.resolved_tree, "link"), Some(symlink));
+    }
+
+    #[test]
+    fn resolved_tree_delta_applies_identity_swap_atomically() {
+        let left = ArtifactId::new();
+        let right = ArtifactId::new();
+        let left_entry = regular_tree_entry(1);
+        let right_entry = regular_tree_entry(2);
+        let mut old = GraphSnapshot::empty();
+        old.resolved_tree = tree(vec![(left, "a", left_entry), (right, "b", right_entry)]);
+        let mut new = GraphSnapshot::empty();
+        new.resolved_tree = tree(vec![(left, "b", left_entry), (right, "a", right_entry)]);
+
+        let delta = compute_graph_delta(&old, &new, 1);
+        let mut result = old;
+        apply_graph_delta(&mut result, &delta).unwrap();
+
         assert_eq!(
-            result.branches.get(&branch_name).unwrap().head,
-            SemanticChangeId(Hash256::from_bytes([2; 32]))
+            result.resolved_tree.artifact_id_at_path(&path("a")),
+            Some(right)
+        );
+        assert_eq!(
+            result.resolved_tree.artifact_id_at_path(&path("b")),
+            Some(left)
         );
     }
 
     #[test]
-    fn compute_and_apply_file_hash_delta() {
-        let mut old = GraphSnapshot::empty();
-        let mut new = GraphSnapshot::empty();
+    fn invalid_resolved_tree_delta_is_atomic_across_snapshot_domains() {
+        let artifact_id = ArtifactId::new();
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.resolved_tree = tree(vec![(
+            artifact_id,
+            "a",
+            crate::types::regular_tree_entry(1),
+        )]);
+        let before = snapshot.clone();
+        let mut delta = GraphSnapshotDelta::empty(0);
+        delta.entities.added.push(make_entity("must_not_land"));
+        delta.resolved_tree.modified.push((
+            artifact_id,
+            LocatedEntry::new(path("b"), crate::types::regular_tree_entry(2)),
+        ));
+        delta.resolved_tree.removed.push(artifact_id);
 
-        old.file_hashes.insert("a.rs".to_string(), [1; 32]);
-        old.file_hashes.insert("b.rs".to_string(), [2; 32]);
+        let error = apply_graph_delta(&mut snapshot, &delta).unwrap_err();
 
-        new.file_hashes.insert("a.rs".to_string(), [1; 32]); // unchanged
-        new.file_hashes.insert("b.rs".to_string(), [99; 32]); // modified
-        new.file_hashes.insert("c.rs".to_string(), [3; 32]); // added
+        assert!(error.to_string().contains("repeats artifact"));
+        assert_eq!(snapshot.resolved_tree, before.resolved_tree);
+        assert_eq!(snapshot.entities.len(), before.entities.len());
+    }
 
-        let delta = compute_graph_delta(&old, &new, 1);
-        assert_eq!(delta.file_hashes.added.len(), 1);
-        assert_eq!(delta.file_hashes.modified.len(), 1);
-        assert!(delta.file_hashes.removed.is_empty());
+    #[test]
+    fn delta_cannot_orphan_semantic_enrichment() {
+        let artifact_id = ArtifactId::new();
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.resolved_tree = tree(vec![(
+            artifact_id,
+            "compose.yaml",
+            crate::types::regular_tree_entry(1),
+        )]);
+        snapshot.structured_artifacts.push(StructuredArtifact {
+            file_id: FilePathId::new("compose.yaml"),
+            kind: ArtifactKind::ComposeFile,
+            content_hash: Hash256::from_bytes([1; 32]),
+            text_preview: Some("services:".into()),
+        });
+        let before = snapshot.clone();
+        let mut delta = GraphSnapshotDelta::empty(0);
+        delta.entities.added.push(make_entity("must_not_land"));
+        delta.resolved_tree.removed.push(artifact_id);
 
-        let mut result = old.clone();
-        apply_graph_delta(&mut result, &delta);
-        assert_eq!(result.file_hashes.get("a.rs"), Some(&[1; 32]));
-        assert_eq!(result.file_hashes.get("b.rs"), Some(&[99; 32]));
-        assert_eq!(result.file_hashes.get("c.rs"), Some(&[3; 32]));
+        let error = apply_graph_delta(&mut snapshot, &delta).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("without admitted repository identity"));
+        assert_eq!(snapshot.resolved_tree, before.resolved_tree);
+        assert_eq!(snapshot.entities.len(), before.entities.len());
+        assert_eq!(
+            snapshot.structured_artifacts.len(),
+            before.structured_artifacts.len()
+        );
+        assert_eq!(
+            snapshot.structured_artifacts[0].content_hash,
+            before.structured_artifacts[0].content_hash
+        );
+    }
+
+    #[test]
+    fn current_delta_rejects_unknown_persisted_fields() {
+        let mut encoded = serde_json::to_value(GraphSnapshotDelta::empty(0)).unwrap();
+        encoded
+            .as_object_mut()
+            .expect("delta serializes as a map")
+            .insert("working_tree".to_string(), serde_json::json!({}));
+
+        let error = serde_json::from_value::<GraphSnapshotDelta>(encoded).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown field `working_tree`"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -1043,7 +1248,18 @@ mod tests {
         old.relations.insert(rel_id, relation.clone());
         old.outgoing.insert(id_a, vec![rel_id]);
         old.incoming.insert(id_b, vec![rel_id]);
-        old.file_hashes.insert("src/lib.rs".to_string(), [1; 32]);
+        let lib_id = ArtifactId::new();
+        let new_id = ArtifactId::new();
+        let makefile_id = ArtifactId::new();
+        let logo_id = ArtifactId::new();
+        old.resolved_tree = tree(vec![
+            (lib_id, "src/lib.rs", crate::types::regular_tree_entry(1)),
+            (
+                makefile_id,
+                "Makefile",
+                TreeEntry::blob(Hash256::from_bytes([7; 32]), false),
+            ),
+        ]);
         old.structured_artifacts.push(StructuredArtifact {
             file_id: FilePathId::new("Makefile"),
             kind: ArtifactKind::Makefile,
@@ -1063,8 +1279,20 @@ mod tests {
         new.relations.insert(rel2_id, relation2);
         new.outgoing.insert(id_a, vec![rel2_id]);
         new.incoming.insert(id_c, vec![rel2_id]);
-        new.file_hashes.insert("src/lib.rs".to_string(), [2; 32]);
-        new.file_hashes.insert("src/new.rs".to_string(), [3; 32]);
+        new.resolved_tree = tree(vec![
+            (lib_id, "src/lib.rs", crate::types::regular_tree_entry(2)),
+            (new_id, "src/new.rs", crate::types::regular_tree_entry(3)),
+            (
+                makefile_id,
+                "Makefile",
+                TreeEntry::blob(Hash256::from_bytes([8; 32]), false),
+            ),
+            (
+                logo_id,
+                "assets/logo.svg",
+                TreeEntry::blob(Hash256::from_bytes([9; 32]), false),
+            ),
+        ]);
         new.structured_artifacts.push(StructuredArtifact {
             file_id: FilePathId::new("Makefile"),
             kind: ArtifactKind::Makefile,
@@ -1084,7 +1312,7 @@ mod tests {
         let loaded_delta = GraphSnapshotDelta::from_bytes(&bytes).unwrap();
 
         let mut result = old.clone();
-        apply_graph_delta(&mut result, &loaded_delta);
+        apply_graph_delta(&mut result, &loaded_delta).unwrap();
 
         // Verify result matches new
         assert_eq!(result.entities.len(), new.entities.len());
@@ -1094,9 +1322,15 @@ mod tests {
         assert_eq!(result.relations.len(), new.relations.len());
         assert!(result.relations.contains_key(&rel2_id));
         assert!(!result.relations.contains_key(&rel_id));
-        assert_eq!(result.file_hashes.len(), 2);
-        assert_eq!(result.file_hashes.get("src/lib.rs"), Some(&[2; 32]));
-        assert_eq!(result.file_hashes.get("src/new.rs"), Some(&[3; 32]));
+        assert_eq!(result.resolved_tree.len(), 4);
+        assert_eq!(
+            entry_at(&result.resolved_tree, "src/lib.rs"),
+            Some(regular_tree_entry(2))
+        );
+        assert_eq!(
+            entry_at(&result.resolved_tree, "src/new.rs"),
+            Some(regular_tree_entry(3))
+        );
         assert_eq!(result.structured_artifacts.len(), 1);
         assert_eq!(
             result.structured_artifacts[0].content_hash,
