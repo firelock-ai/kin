@@ -8,8 +8,8 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 use crate::{
-    ArtifactDeltaKind, ArtifactRevisionId, Entity, EntityId, EntityRevisionId, FilePathId, Hash256,
-    Relation, RelationId, RelationRevisionId, SemanticChangeId,
+    ArtifactRevisionId, Entity, EntityId, EntityRevisionId, FilePathId, Relation, RelationId,
+    RelationRevisionId, SemanticChangeId, TreeEntry, TreeEntryKind,
 };
 
 /// Immutable entity state introduced by a semantic change.
@@ -107,13 +107,12 @@ impl PartialEq for RelationRevision {
     }
 }
 
-/// Immutable tracked-file content revision introduced by a semantic change.
+/// Immutable tracked-file tree entry introduced by a semantic change.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ArtifactRevision {
     pub revision_id: ArtifactRevisionId,
     pub file_id: FilePathId,
-    pub content_hash: Hash256,
-    pub kind: ArtifactDeltaKind,
+    pub entry: TreeEntry,
     pub introduced_by: SemanticChangeId,
     #[serde(default)]
     pub previous_revision: Option<ArtifactRevisionId>,
@@ -124,18 +123,15 @@ pub struct ArtifactRevision {
 impl ArtifactRevision {
     pub fn new(
         file_id: FilePathId,
-        content_hash: Hash256,
-        kind: ArtifactDeltaKind,
+        entry: TreeEntry,
         introduced_by: SemanticChangeId,
         previous_revision: Option<ArtifactRevisionId>,
     ) -> Self {
-        let revision_id =
-            ArtifactRevisionId::for_artifact_change(&file_id, &introduced_by, &content_hash);
+        let revision_id = ArtifactRevisionId::for_artifact_change(&file_id, &introduced_by, &entry);
         Self {
             revision_id,
             file_id,
-            content_hash,
-            kind,
+            entry,
             introduced_by,
             previous_revision,
             ended_by: None,
@@ -169,12 +165,17 @@ impl ArtifactRevisionId {
     pub fn for_artifact_change(
         file_id: &FilePathId,
         change_id: &SemanticChangeId,
-        content_hash: &Hash256,
+        entry: &TreeEntry,
     ) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(file_id.0.as_bytes());
         hasher.update(change_id.0.as_bytes());
-        hasher.update(content_hash.as_bytes());
+        hasher.update(entry.blob_hash.as_bytes());
+        match entry.kind {
+            TreeEntryKind::Regular { executable: false } => hasher.update([0]),
+            TreeEntryKind::Regular { executable: true } => hasher.update([1]),
+            TreeEntryKind::Symlink => hasher.update([2]),
+        }
         Self::from_hash(kin_blobs::Hash256::from_bytes(hasher.finalize().into()))
     }
 }
@@ -286,6 +287,20 @@ mod tests {
         revision.mark_ended(later);
 
         assert_eq!(revision.ended_by, Some(remove));
+    }
+
+    #[test]
+    fn artifact_revision_identity_includes_exact_tree_mode() {
+        let file_id = FilePathId::new("bin/run");
+        let change = SemanticChangeId::from_hash(Hash256::from_bytes([0x51; 32]));
+        let blob_hash = Hash256::from_bytes([0x52; 32]);
+        let regular = TreeEntry::regular(blob_hash, false);
+        let executable = TreeEntry::regular(blob_hash, true);
+
+        let regular_id = ArtifactRevisionId::for_artifact_change(&file_id, &change, &regular);
+        let executable_id = ArtifactRevisionId::for_artifact_change(&file_id, &change, &executable);
+
+        assert_ne!(regular_id, executable_id);
     }
 
     fn make_change_order() -> (

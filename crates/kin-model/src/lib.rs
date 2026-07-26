@@ -4,7 +4,8 @@
 //! Canonical types for Kin semantic VCS.
 //!
 //! This crate defines all shared types used across the Kin codebase:
-//! entities, relations, contracts, semantic changes, branches, and more.
+//! entities, relations, exact repository trees, semantic changes, branches,
+//! contracts, and more.
 
 pub mod branch;
 pub mod change;
@@ -35,8 +36,8 @@ pub mod work;
 // Re-export all public types at crate root for convenience.
 pub use branch::{Branch, GraphOverlay, MergeState, WorkingCopy};
 pub use change::{
-    ArtifactDelta, ArtifactDeltaKind, EntityDelta, RelationDelta, SemanticChange, SourceEntryKind,
-    TransactionDelta,
+    EntityDelta, RelationDelta, SemanticChange, TransactionDelta, TreeDelta, TreeEntry,
+    TreeEntryKind,
 };
 pub use conflict::{ConflictKind, ConflictObject};
 pub use context::{
@@ -56,9 +57,8 @@ pub use federation::{
     RemoteRelationOrigin, ScopeRef, SessionLease,
 };
 pub use graph::{
-    ChangeStore, EntityFilter, EntityStore, GraphStore, ProvenanceStore, ResolvedSourceEntry,
-    ReviewStore, SessionStore, SourceTreeGap, SourceTreeGapReason, SourceTreeResolution, SubGraph,
-    VerificationStore, WorkStore,
+    ChangeStore, EntityFilter, EntityStore, GraphStore, ProvenanceStore, ReviewStore, SessionStore,
+    SubGraph, VerificationStore, WorkStore,
 };
 pub use ids::{
     ArtifactRevisionId, AuthorId, BranchId, BranchName, ConflictId, ContractId, EntityId,

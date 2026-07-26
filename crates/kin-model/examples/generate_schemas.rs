@@ -40,6 +40,30 @@ fn main() {
             "SemanticChange",
             serde_json::to_string_pretty(&schema_for!(kin_model::SemanticChange)).unwrap(),
         ),
+        (
+            "TreeEntry",
+            serde_json::to_string_pretty(&schema_for!(kin_model::TreeEntry)).unwrap(),
+        ),
+        (
+            "TreeEntryKind",
+            serde_json::to_string_pretty(&schema_for!(kin_model::TreeEntryKind)).unwrap(),
+        ),
+        (
+            "TreeDelta",
+            serde_json::to_string_pretty(&schema_for!(kin_model::TreeDelta)).unwrap(),
+        ),
+        (
+            "TransactionDelta",
+            serde_json::to_string_pretty(&schema_for!(kin_model::TransactionDelta)).unwrap(),
+        ),
+        (
+            "GraphOverlay",
+            serde_json::to_string_pretty(&schema_for!(kin_model::GraphOverlay)).unwrap(),
+        ),
+        (
+            "WorkingCopy",
+            serde_json::to_string_pretty(&schema_for!(kin_model::WorkingCopy)).unwrap(),
+        ),
         // Work graph
         (
             "WorkItem",
