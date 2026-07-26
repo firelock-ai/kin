@@ -2,11 +2,145 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "kin://contracts/shadow-gate-report",
   "type": "object",
+  "$defs": {
+    "hash256": {
+      "type": "array",
+      "minItems": 32,
+      "maxItems": 32,
+      "items": { "type": "integer", "minimum": 0, "maximum": 255 }
+    },
+    "repoPath": {
+      "type": "object",
+      "required": ["bytes_hex"],
+      "properties": {
+        "bytes_hex": {
+          "type": "string",
+          "pattern": "^(?:[0-9a-f]{2})+$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "gitObjectId": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["algorithm", "bytes"],
+          "properties": {
+            "algorithm": { "const": "sha1" },
+            "bytes": {
+              "type": "array",
+              "minItems": 20,
+              "maxItems": 20,
+              "items": { "type": "integer", "minimum": 0, "maximum": 255 }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["algorithm", "bytes"],
+          "properties": {
+            "algorithm": { "const": "sha256" },
+            "bytes": { "$ref": "#/$defs/hash256" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "treeEntry": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type", "hash", "executable"],
+          "properties": {
+            "type": { "const": "blob" },
+            "hash": { "$ref": "#/$defs/hash256" },
+            "executable": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["type", "target_blob"],
+          "properties": {
+            "type": { "const": "symlink" },
+            "target_blob": { "$ref": "#/$defs/hash256" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["type", "target"],
+          "properties": {
+            "type": { "const": "gitlink" },
+            "target": { "$ref": "#/$defs/gitObjectId" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "locatedEntry": {
+      "type": "object",
+      "required": ["path", "entry"],
+      "properties": {
+        "path": { "$ref": "#/$defs/repoPath" },
+        "entry": { "$ref": "#/$defs/treeEntry" }
+      },
+      "additionalProperties": false
+    },
+    "artifactChange": {
+      "type": "object",
+      "required": ["artifact_id", "operation", "old", "new", "aspects"],
+      "properties": {
+        "artifact_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "operation": {
+          "type": "string",
+          "enum": ["added", "updated", "removed"]
+        },
+        "old": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/locatedEntry" }
+          ]
+        },
+        "new": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/locatedEntry" }
+          ]
+        },
+        "aspects": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "added",
+              "removed",
+              "renamed",
+              "blob_content_changed",
+              "executable_mode_changed",
+              "symlink_target_changed",
+              "gitlink_target_changed",
+              "entry_type_changed"
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
   "required": [
     "schema_version",
     "mode",
     "input",
     "changed_entities",
+    "changed_artifacts",
+    "artifact_activity",
     "blast_radius",
     "policy",
     "repair_context",
@@ -14,7 +148,7 @@
     "audit"
   ],
   "properties": {
-    "schema_version": { "type": "integer", "enum": [1] },
+    "schema_version": { "type": "integer", "enum": [2] },
     "mode": { "type": "string", "enum": ["shadow"] },
     "input": {
       "type": "object",
@@ -52,6 +186,25 @@
           "signature_changed": { "type": "boolean" },
           "visibility_changed": { "type": "boolean" }
         }
+      }
+    },
+    "changed_artifacts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/artifactChange" }
+    },
+    "artifact_activity": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["change_id", "transition"],
+        "properties": {
+          "change_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "transition": { "$ref": "#/$defs/artifactChange" }
+        },
+        "additionalProperties": false
       }
     },
     "blast_radius": {

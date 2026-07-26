@@ -19,10 +19,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use kin_blobs::{BlobStore, Hash256};
+use kin_model::change::{LocatedEntry, ResolvedTree, TreeEntry};
 use kin_model::entity::{Entity, EntityRole};
 use kin_model::graph::GraphStore;
-use kin_model::ids::{EntityId, SemanticChangeId};
+use kin_model::ids::{EntityId, GitObjectId, RepoPath, SemanticChangeId};
 use kin_model::timestamp::Timestamp;
+use kin_model::ArtifactId;
 use serde::{Deserialize, Serialize};
 
 use crate::diff::{self, EntityChangeKind, SemanticDiff};
@@ -36,7 +38,7 @@ use crate::ReviewError;
 
 /// Version of the shadow gate report payload schema. Mirrored by
 /// `packages/boundary-contracts/schemas/shadow-gate-report.schema.json`.
-pub const SHADOW_GATE_REPORT_SCHEMA_VERSION: u32 = 1;
+pub const SHADOW_GATE_REPORT_SCHEMA_VERSION: u32 = 2;
 
 /// Enforcement label carried by every shadow report.
 pub const SHADOW_ENFORCEMENT_REPORT_ONLY: &str = "report_only";
@@ -121,6 +123,57 @@ pub struct ShadowChangedEntity {
     pub role: EntityRole,
 }
 
+/// Range-level operation for one identity-bearing repository artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowArtifactOperation {
+    Added,
+    Updated,
+    Removed,
+}
+
+/// Independently reviewable aspect of an exact repository-tree transition.
+///
+/// A transition may carry more than one aspect: a stable artifact can move,
+/// change blob content, and become executable in the same update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowArtifactAspect {
+    Added,
+    Removed,
+    Renamed,
+    BlobContentChanged,
+    ExecutableModeChanged,
+    SymlinkTargetChanged,
+    GitlinkTargetChanged,
+    EntryTypeChanged,
+}
+
+/// Exact net base-to-head transition for one stable artifact identity.
+///
+/// Paths remain byte-exact [`RepoPath`] values inside [`LocatedEntry`].
+/// Presentation happens only at the report formatter boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowArtifactChange {
+    pub artifact_id: ArtifactId,
+    pub operation: ShadowArtifactOperation,
+    pub old: Option<LocatedEntry>,
+    pub new: Option<LocatedEntry>,
+    pub aspects: Vec<ShadowArtifactAspect>,
+}
+
+/// One committed tree delta in the reviewed range.
+///
+/// This is provenance, not the net diff. It deliberately preserves
+/// intermediate activity (including add-then-remove or edit-then-revert)
+/// that disappears when the exact base and head trees converge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowArtifactActivity {
+    /// Canonical lowercase-hex semantic change ID.
+    pub change_id: String,
+    pub transition: ShadowArtifactChange,
+}
+
 use crate::inline::is_non_contract_surface_role;
 
 /// One entity reached by blast-radius traversal, with the graph relationship
@@ -144,7 +197,7 @@ pub struct ShadowWorkItem {
     pub status: String,
 }
 
-/// Cross-repo federation section. v1 reports single-repo blast radius only
+/// Cross-repo federation section. v2 reports single-repo blast radius only
 /// and labels the cross-repo section explicitly instead of implying coverage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShadowCrossRepo {
@@ -233,6 +286,8 @@ pub struct ShadowRepairItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShadowEvidenceGap {
     /// "artifact_only_change" | "entity_inert_change" | "missing_span"
+    /// | "artifact_structure_change" | "artifact_path_unrepresentable"
+    /// | "artifact_range_only_activity"
     /// | "actor_attribution_unavailable" | "impact_signal_absent"
     /// | "deep_history_impact_ceiling" | "cross_repo_not_evaluated"
     /// | "ref_state_unavailable" | "base_not_on_head_ancestry"
@@ -304,6 +359,10 @@ pub struct ShadowGateReport {
     pub mode: String,
     pub input: ShadowInputEcho,
     pub changed_entities: Vec<ShadowChangedEntity>,
+    /// Exact net artifact diff derived from resolved base and head trees.
+    pub changed_artifacts: Vec<ShadowArtifactChange>,
+    /// Exact committed artifact deltas in the reviewed range.
+    pub artifact_activity: Vec<ShadowArtifactActivity>,
     pub blast_radius: ShadowBlastRadius,
     pub policy: ShadowPolicyResult,
     pub repair_context: Vec<ShadowRepairItem>,
@@ -540,6 +599,143 @@ fn assemble_report<G: GraphStore>(
     assemble_report_with_changes(store, request, review, range_gap, &changes, at_head, None)
 }
 
+fn artifact_transition(
+    artifact_id: ArtifactId,
+    old: Option<LocatedEntry>,
+    new: Option<LocatedEntry>,
+) -> Option<ShadowArtifactChange> {
+    let operation = match (&old, &new) {
+        (None, Some(_)) => ShadowArtifactOperation::Added,
+        (Some(_), Some(_)) => ShadowArtifactOperation::Updated,
+        (Some(_), None) => ShadowArtifactOperation::Removed,
+        (None, None) => return None,
+    };
+    let aspects = match (&old, &new) {
+        (None, Some(_)) => vec![ShadowArtifactAspect::Added],
+        (Some(_), None) => vec![ShadowArtifactAspect::Removed],
+        (Some(old), Some(new)) => {
+            let mut aspects = Vec::new();
+            if old.path != new.path {
+                aspects.push(ShadowArtifactAspect::Renamed);
+            }
+            match (old.entry, new.entry) {
+                (
+                    TreeEntry::Blob {
+                        hash: old_hash,
+                        executable: old_executable,
+                    },
+                    TreeEntry::Blob {
+                        hash: new_hash,
+                        executable: new_executable,
+                    },
+                ) => {
+                    if old_hash != new_hash {
+                        aspects.push(ShadowArtifactAspect::BlobContentChanged);
+                    }
+                    if old_executable != new_executable {
+                        aspects.push(ShadowArtifactAspect::ExecutableModeChanged);
+                    }
+                }
+                (
+                    TreeEntry::Symlink {
+                        target_blob: old_target,
+                    },
+                    TreeEntry::Symlink {
+                        target_blob: new_target,
+                    },
+                ) => {
+                    if old_target != new_target {
+                        aspects.push(ShadowArtifactAspect::SymlinkTargetChanged);
+                    }
+                }
+                (
+                    TreeEntry::Gitlink { target: old_target },
+                    TreeEntry::Gitlink { target: new_target },
+                ) => {
+                    if old_target != new_target {
+                        aspects.push(ShadowArtifactAspect::GitlinkTargetChanged);
+                    }
+                }
+                _ => aspects.push(ShadowArtifactAspect::EntryTypeChanged),
+            }
+            aspects
+        }
+        (None, None) => unreachable!("operation excludes an empty transition"),
+    };
+
+    Some(ShadowArtifactChange {
+        artifact_id,
+        operation,
+        old,
+        new,
+        aspects,
+    })
+}
+
+/// Compare exact resolved base and head trees by stable identity.
+///
+/// Path equality never participates in identity and path reuse by a new
+/// artifact therefore remains an explicit remove-plus-add.
+fn collect_changed_artifacts(
+    base: &ResolvedTree,
+    head: &ResolvedTree,
+) -> Vec<ShadowArtifactChange> {
+    let artifact_ids: BTreeSet<ArtifactId> = base
+        .artifacts()
+        .map(|artifact| artifact.artifact_id)
+        .chain(head.artifacts().map(|artifact| artifact.artifact_id))
+        .collect();
+
+    artifact_ids
+        .into_iter()
+        .filter_map(|artifact_id| {
+            let old = base
+                .get(&artifact_id)
+                .map(|artifact| artifact.located_entry());
+            let new = head
+                .get(&artifact_id)
+                .map(|artifact| artifact.located_entry());
+            if old == new {
+                return None;
+            }
+            artifact_transition(artifact_id, old, new)
+        })
+        .collect()
+}
+
+/// Preserve every exact tree delta declared by an in-range semantic change.
+///
+/// This channel is intentionally separate from [`collect_changed_artifacts`]:
+/// branch activity and reverted/intermediate transitions are provenance, not
+/// the authoritative net base-to-head tree.
+fn collect_artifact_activity(
+    changes: &[kin_model::change::SemanticChange],
+) -> Vec<ShadowArtifactActivity> {
+    let mut activity = Vec::new();
+    for change in changes {
+        for delta in &change.tree_deltas {
+            let transition = artifact_transition(
+                delta.artifact_id(),
+                delta.old_state().cloned(),
+                delta.new_state().cloned(),
+            )
+            .expect("a tree delta always has an old or new state");
+            activity.push(ShadowArtifactActivity {
+                change_id: change.id.to_string(),
+                transition,
+            });
+        }
+    }
+    activity.sort_by(|left, right| {
+        left.change_id.cmp(&right.change_id).then_with(|| {
+            left.transition
+                .artifact_id
+                .cmp(&right.transition.artifact_id)
+        })
+    });
+    activity
+}
+
 fn assemble_report_with_changes<G: GraphStore>(
     store: &G,
     request: &ShadowRequest,
@@ -550,13 +746,32 @@ fn assemble_report_with_changes<G: GraphStore>(
     at_base: Option<&GraphAtRef<'_, G>>,
 ) -> Result<ShadowGateReport, ReviewError> {
     let changed_entities = collect_changed_entities(store, &review, at_base)?;
+    let changed_artifacts = if at_base.is_some() && at_head.is_some() {
+        let base_tree = store
+            .resolve_tree_at(&request.resolved_base)
+            .map_err(ReviewError::graph)?;
+        let head_tree = store
+            .resolve_tree_at(&request.resolved_head)
+            .map_err(ReviewError::graph)?;
+        collect_changed_artifacts(&base_tree, &head_tree)
+    } else {
+        Vec::new()
+    };
+    let artifact_activity = collect_artifact_activity(changes);
     let blast_radius = collect_blast_radius(&review);
     // No blob reader is reachable here: the shadow entry points take only the
     // graph store, and threading a real reader would change their public
     // signature and their out-of-crate callers. The toolchain-surface channel
     // is therefore inert on this path (blobs = None) until that wiring lands.
-    let (mut evidence_gaps, toolchain_findings) =
-        collect_evidence_gaps(&review, changes, &changed_entities, at_head, None);
+    let (mut evidence_gaps, toolchain_findings) = collect_evidence_gaps(
+        &review,
+        changes,
+        &changed_entities,
+        &changed_artifacts,
+        &artifact_activity,
+        at_head,
+        None,
+    );
     if let Some(gap) = range_gap {
         // The generic empty-impact gap advises verifying relation ingestion,
         // which misleads here: impact was not computed at all. The specific
@@ -608,6 +823,8 @@ fn assemble_report_with_changes<G: GraphStore>(
             author: request.author.clone(),
         },
         changed_entities,
+        changed_artifacts,
+        artifact_activity,
         blast_radius,
         policy,
         repair_context,
@@ -776,7 +993,7 @@ fn collect_blast_radius(review: &Review) -> ShadowBlastRadius {
         total_affected: impact.total_affected(),
         cross_repo: ShadowCrossRepo {
             status: "not_evaluated".to_string(),
-            detail: "cross-repo federation is not evaluated by shadow report v1; blast radius \
+            detail: "cross-repo federation is not evaluated by shadow report v2; blast radius \
                      covers this repository only"
                 .to_string(),
             nodes: Vec::new(),
@@ -849,6 +1066,15 @@ fn is_blocking(kind: InlineCommentKind) -> bool {
 ///   non-source artifacts stays reported but does not demote — those files
 ///   are EXPECTED to carry no entities, and demoting on them turns every
 ///   docs-only change into a false attention signal.
+/// - `artifact_structure_change`: a stable artifact was added, removed,
+///   moved, had its executable mode changed, changed entry type, or changed a
+///   symlink/gitlink target. Entity deltas do not encode those repository-tree
+///   facts, so entity review cannot prove the effect of the exact transition.
+/// - `artifact_path_unrepresentable`: an exact repository path is not UTF-8,
+///   so the string-based entity/source classifier cannot prove its coverage.
+/// - `artifact_range_only_activity`: committed tree activity converged back
+///   to the base state and is absent from the net diff. It remains history and
+///   cannot be certified as no activity.
 /// - `ref_state_unavailable`: the graph state at the reviewed head ref could
 ///   not be materialized, so blast radius and impact were not computed at
 ///   all. The gate cannot certify `pass` over an impact surface it never
@@ -869,11 +1095,16 @@ fn is_blocking(kind: InlineCommentKind) -> bool {
 ///   historical-substrate ceiling. Absence of evidence is not
 ///   evidence of risk, so it makes the ceiling attributable without changing
 ///   the verdict.
-/// - Structural v1 limits (cross-repo not evaluated, attribution
+/// - Structural report limits (cross-repo not evaluated, attribution
 ///   unavailable) are constant framing, reported but never demoting.
 fn gap_blocks_pass(gap: &ShadowEvidenceGap) -> bool {
     match gap.kind.as_str() {
-        "missing_span" | "ref_state_unavailable" | "base_not_on_head_ancestry" => true,
+        "missing_span"
+        | "ref_state_unavailable"
+        | "base_not_on_head_ancestry"
+        | "artifact_structure_change"
+        | "artifact_path_unrepresentable"
+        | "artifact_range_only_activity" => true,
         "artifact_only_change" => artifact_subject_is_source_class(&gap.subject),
         _ => false,
     }
@@ -1411,6 +1642,140 @@ fn toolchain_surface_finding(
     })
 }
 
+fn lower_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut bytes_hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(bytes_hex, "{byte:02x}");
+    }
+    bytes_hex
+}
+
+fn repo_path_subject(path: &RepoPath) -> String {
+    if let Some(path) = path.as_utf8() {
+        return path.to_string();
+    }
+    let bytes_hex = lower_hex(path.as_bytes());
+    format!("non_utf8_path(bytes_hex={bytes_hex})")
+}
+
+fn tree_entry_description(entry: TreeEntry) -> String {
+    match entry {
+        TreeEntry::Blob { hash, executable } => {
+            format!("blob(hash={hash}, executable={executable})")
+        }
+        TreeEntry::Symlink { target_blob } => {
+            format!("symlink(target_blob={target_blob})")
+        }
+        TreeEntry::Gitlink {
+            target: GitObjectId::Sha1(target),
+        } => format!("gitlink(sha1={})", lower_hex(&target)),
+        TreeEntry::Gitlink {
+            target: GitObjectId::Sha256(target),
+        } => format!("gitlink(sha256={})", lower_hex(&target)),
+    }
+}
+
+fn located_entry_description(entry: &LocatedEntry) -> String {
+    format!(
+        "{} {}",
+        repo_path_subject(&entry.path),
+        tree_entry_description(entry.entry)
+    )
+}
+
+fn artifact_aspect_label(aspect: ShadowArtifactAspect) -> &'static str {
+    match aspect {
+        ShadowArtifactAspect::Added => "added",
+        ShadowArtifactAspect::Removed => "removed",
+        ShadowArtifactAspect::Renamed => "renamed",
+        ShadowArtifactAspect::BlobContentChanged => "blob_content_changed",
+        ShadowArtifactAspect::ExecutableModeChanged => "executable_mode_changed",
+        ShadowArtifactAspect::SymlinkTargetChanged => "symlink_target_changed",
+        ShadowArtifactAspect::GitlinkTargetChanged => "gitlink_target_changed",
+        ShadowArtifactAspect::EntryTypeChanged => "entry_type_changed",
+    }
+}
+
+fn artifact_operation_label(operation: ShadowArtifactOperation) -> &'static str {
+    match operation {
+        ShadowArtifactOperation::Added => "added",
+        ShadowArtifactOperation::Updated => "updated",
+        ShadowArtifactOperation::Removed => "removed",
+    }
+}
+
+fn artifact_change_detail(change: &ShadowArtifactChange) -> String {
+    let aspects = change
+        .aspects
+        .iter()
+        .copied()
+        .map(artifact_aspect_label)
+        .collect::<Vec<_>>()
+        .join(",");
+    let old = change
+        .old
+        .as_ref()
+        .map(located_entry_description)
+        .unwrap_or_else(|| "<absent>".to_string());
+    let new = change
+        .new
+        .as_ref()
+        .map(located_entry_description)
+        .unwrap_or_else(|| "<absent>".to_string());
+    format!(
+        "artifact {} {}; aspects=[{}]; old={old}; new={new}",
+        change.artifact_id.0,
+        artifact_operation_label(change.operation),
+        aspects
+    )
+}
+
+fn artifact_change_path(change: &ShadowArtifactChange) -> Option<&RepoPath> {
+    change
+        .new
+        .as_ref()
+        .or(change.old.as_ref())
+        .map(|state| &state.path)
+}
+
+fn artifact_change_has_non_utf8_path(change: &ShadowArtifactChange) -> bool {
+    change
+        .old
+        .iter()
+        .chain(change.new.iter())
+        .any(|state| state.path.as_utf8().is_none())
+}
+
+fn artifact_change_matches_entity_file(
+    change: &ShadowArtifactChange,
+    entity_files: &BTreeSet<String>,
+) -> bool {
+    change
+        .old
+        .iter()
+        .chain(change.new.iter())
+        .filter_map(|state| state.path.as_utf8())
+        .any(|path| entity_files.contains(path))
+}
+
+fn artifact_change_is_blob_content_only(change: &ShadowArtifactChange) -> bool {
+    change.aspects.as_slice() == [ShadowArtifactAspect::BlobContentChanged]
+}
+
+fn artifact_blob_hash_pair(change: &ShadowArtifactChange) -> Option<(Hash256, Hash256)> {
+    match (
+        change.old.as_ref().map(|state| state.entry),
+        change.new.as_ref().map(|state| state.entry),
+    ) {
+        (Some(TreeEntry::Blob { hash: old, .. }), Some(TreeEntry::Blob { hash: new, .. })) => {
+            Some((old, new))
+        }
+        _ => None,
+    }
+}
+
 /// Collect evidence gaps for the report, plus any toolchain-surface findings
 /// discovered while classifying inert source edits.
 ///
@@ -1424,78 +1789,136 @@ fn collect_evidence_gaps<G: GraphStore>(
     review: &Review,
     changes: &[kin_model::change::SemanticChange],
     changed_entities: &[ShadowChangedEntity],
+    changed_artifacts: &[ShadowArtifactChange],
+    artifact_activity: &[ShadowArtifactActivity],
     at_head: Option<&GraphAtRef<'_, G>>,
     blobs: Option<&BlobStore>,
 ) -> (Vec<ShadowEvidenceGap>, Vec<InlineComment>) {
     let mut gaps = Vec::new();
     let mut toolchain_findings: Vec<InlineComment> = Vec::new();
 
-    // Files whose exact tree changes have no corresponding entity delta are
-    // invisible to blast radius and policy. Retain each file's net old->new
-    // blob hashes across the range — first old, last new, folded in stable
-    // slice order — so an inert source edit can be inspected for
-    // toolchain-directive churn. A mode-only delta is retained even when its
-    // two blob hashes match. Ordered by file (BTreeMap) so both the gaps and
-    // any findings emit deterministically.
+    // Net tree changes whose exact old/new path does not match a changed
+    // entity are invisible to semantic blast radius and policy. Identity,
+    // location, and entry kind remain separate throughout this classification.
     let entity_files: BTreeSet<String> = changed_entities
         .iter()
         .filter_map(|entity| entity.file.clone())
         .collect();
-    let mut tree_hashes: BTreeMap<String, (Option<Hash256>, Option<Hash256>)> = BTreeMap::new();
-    for change in changes {
-        for delta in &change.tree_deltas {
-            let file = delta.file_id().to_string();
-            if entity_files.contains(&file)
-                || semantic_removed_entity_accounts_for_artifact_file(&file, changed_entities)
-            {
-                continue;
-            }
-            let old_hash = delta.old_entry().map(|entry| entry.blob_hash);
-            let new_hash = delta.new_entry().map(|entry| entry.blob_hash);
-            let entry = tree_hashes.entry(file).or_insert((old_hash, new_hash));
-            entry.1 = new_hash;
+
+    for change in changed_artifacts {
+        // A matching entity delta accounts only for a Blob->Blob content
+        // edit. Entity records do not encode repository moves, executable
+        // mode, entry type, symlink targets, gitlink targets, or whole-artifact
+        // admission/removal, so those aspects must remain explicit even when
+        // one parsed entity happens to share the path.
+        if artifact_change_is_blob_content_only(change)
+            && artifact_change_matches_entity_file(change, &entity_files)
+        {
+            continue;
         }
-    }
-    for (file, (old_hash, new_hash)) in &tree_hashes {
-        // A source-class file whose raw bytes changed but whose entities the
-        // graph DID capture at head is an inert edit — a comment, formatting,
-        // or preprocessor-only change that altered no entity — not an
-        // unparsed artifact. Report it with a non-demoting kind so a real
-        // source file with living entities does not flip the verdict merely
-        // for a comment touch. Genuinely uncaptured files (no entity anchored
-        // at head, or head state unavailable) keep the demoting kind.
-        let inert_source_edit = artifact_subject_is_source_class(file)
-            && at_head.is_some_and(|at| at.has_entity_in_file(file));
-        let (kind, detail) = if inert_source_edit {
-            // The edit altered no entity, but if it changed inline lint or
-            // deprecation directives it shifted what the toolchain enforces —
-            // review-worthy on its own. Surface that as a normal warning
-            // finding (not an evidence-gap demotion) when a blob reader is
-            // available to diff the two revisions hash-addressed.
-            if let Some(blobs) = blobs {
-                if let Some(finding) = toolchain_surface_finding(blobs, file, *old_hash, *new_hash)
-                {
-                    toolchain_findings.push(finding);
-                }
-            }
+
+        let path =
+            artifact_change_path(change).expect("every artifact change has an old or new location");
+        let subject = repo_path_subject(path);
+        let detail = artifact_change_detail(change);
+        let (kind, detail) = if artifact_change_has_non_utf8_path(change) {
             (
-                "entity_inert_change",
-                "source file changed but no semantic entity was altered (comment, formatting, or \
-                 preprocessor-only edit); entities for this file remain captured at head, so the \
-                 change is inert rather than an unparsed-source gap",
+                "artifact_path_unrepresentable",
+                format!(
+                    "{detail}; at least one path is not UTF-8, so entity matching and \
+                     source classification cannot prove its semantic impact"
+                ),
+            )
+        } else if !artifact_change_is_blob_content_only(change) {
+            (
+                "artifact_structure_change",
+                format!(
+                    "{detail}; semantic entity deltas do not encode or prove this exact \
+                     add/remove/move/mode/type/target transition"
+                ),
             )
         } else {
-            (
-                "artifact_only_change",
-                "file changed but no semantic entities were captured for it (unsupported \
-                 language or unparsed artifact); its impact is NOT included in the blast radius \
-                 or policy result",
-            )
+            let file = path
+                .as_utf8()
+                .expect("non-UTF8 paths were classified above");
+            let inert_source_edit = artifact_subject_is_source_class(file)
+                && at_head.is_some_and(|at| at.has_entity_in_file(file));
+            if inert_source_edit {
+                // Only a Blob->Blob content edit has hashes that can support a
+                // directive diff. Symlink targets and gitlinks are never read
+                // as source content.
+                if let (Some(blobs), Some((old_hash, new_hash))) =
+                    (blobs, artifact_blob_hash_pair(change))
+                {
+                    if let Some(finding) =
+                        toolchain_surface_finding(blobs, file, Some(old_hash), Some(new_hash))
+                    {
+                        toolchain_findings.push(finding);
+                    }
+                }
+                (
+                    "entity_inert_change",
+                    format!(
+                        "{detail}; the exact Blob content changed without a semantic entity \
+                         delta, while entities for this UTF-8 source path remain captured at \
+                         head"
+                    ),
+                )
+            } else {
+                (
+                    "artifact_only_change",
+                    format!(
+                        "{detail}; exact Blob content changed without a matching semantic entity \
+                         delta, so its impact is not included in semantic blast radius"
+                    ),
+                )
+            }
         };
         gaps.push(ShadowEvidenceGap {
             kind: kind.to_string(),
-            subject: file.clone(),
-            detail: detail.to_string(),
+            subject,
+            detail,
+        });
+    }
+
+    // Exact range activity can converge back to the base tree. Preserve and
+    // demote that case separately: absence from the net diff is not evidence
+    // that no artifact entered history or changed in an intermediate commit.
+    let net_artifact_ids: BTreeSet<ArtifactId> = changed_artifacts
+        .iter()
+        .map(|change| change.artifact_id)
+        .collect();
+    let mut range_only: BTreeMap<ArtifactId, Vec<&ShadowArtifactActivity>> = BTreeMap::new();
+    for activity in artifact_activity {
+        if !net_artifact_ids.contains(&activity.transition.artifact_id) {
+            range_only
+                .entry(activity.transition.artifact_id)
+                .or_default()
+                .push(activity);
+        }
+    }
+    for (artifact_id, activity) in range_only {
+        let subject = activity
+            .last()
+            .and_then(|event| artifact_change_path(&event.transition))
+            .map(repo_path_subject)
+            .unwrap_or_else(|| format!("artifact:{}", artifact_id.0));
+        let change_ids = activity
+            .iter()
+            .map(|event| event.change_id.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        gaps.push(ShadowEvidenceGap {
+            kind: "artifact_range_only_activity".to_string(),
+            subject,
+            detail: format!(
+                "artifact {} has {} exact tree transition(s) in changes [{}], but its resolved \
+                 base and head states are identical or both absent; the activity remains review \
+                 provenance and cannot be treated as proof of no change",
+                artifact_id.0,
+                activity.len(),
+                change_ids
+            ),
         });
     }
 
@@ -1569,37 +1992,12 @@ fn collect_evidence_gaps<G: GraphStore>(
     gaps.push(ShadowEvidenceGap {
         kind: "cross_repo_not_evaluated".to_string(),
         subject: "blast_radius.cross_repo".to_string(),
-        detail: "cross-repo federation is not evaluated by shadow report v1; consumers in other \
+        detail: "cross-repo federation is not evaluated by shadow report v2; consumers in other \
                  repositories are not represented in this report"
             .to_string(),
     });
 
     (gaps, toolchain_findings)
-}
-
-fn semantic_removed_entity_accounts_for_artifact_file(
-    file: &str,
-    changed_entities: &[ShadowChangedEntity],
-) -> bool {
-    changed_entities.iter().any(|entity| {
-        entity.change == "removed"
-            && entity.kind != "unknown"
-            && entity.role == EntityRole::Source
-            && entity
-                .file
-                .as_deref()
-                .is_some_and(|entity_file| same_filename(entity_file, file))
-    })
-}
-
-fn same_filename(left: &str, right: &str) -> bool {
-    let left = std::path::Path::new(left)
-        .file_name()
-        .and_then(|name| name.to_str());
-    let right = std::path::Path::new(right)
-        .file_name()
-        .and_then(|name| name.to_str());
-    left.is_some() && left == right
 }
 
 fn actor_kind_label(actor: &str) -> &'static str {
@@ -1713,6 +2111,54 @@ pub fn format_shadow_report(report: &ShadowGateReport) -> String {
         );
     }
 
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "Changed artifacts ({} net):",
+        report.changed_artifacts.len()
+    );
+    for change in &report.changed_artifacts {
+        let aspects = change
+            .aspects
+            .iter()
+            .copied()
+            .map(artifact_aspect_label)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            out,
+            "  {} {} [{}]",
+            match change.operation {
+                ShadowArtifactOperation::Added => "+",
+                ShadowArtifactOperation::Removed => "-",
+                ShadowArtifactOperation::Updated => "~",
+            },
+            change.artifact_id.0,
+            aspects
+        );
+        if let Some(old) = &change.old {
+            let _ = writeln!(out, "    old: {}", located_entry_description(old));
+        }
+        if let Some(new) = &change.new {
+            let _ = writeln!(out, "    new: {}", located_entry_description(new));
+        }
+    }
+
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "Artifact activity ({} committed transition(s)):",
+        report.artifact_activity.len()
+    );
+    for activity in &report.artifact_activity {
+        let _ = writeln!(
+            out,
+            "  {} {}",
+            activity.change_id,
+            artifact_change_detail(&activity.transition)
+        );
+    }
+
     let radius = &report.blast_radius;
     let _ = writeln!(out);
     let _ = writeln!(
@@ -1814,7 +2260,9 @@ pub fn format_shadow_report(report: &ShadowGateReport) -> String {
 mod tests {
     use super::*;
     use kin_db::InMemoryGraph;
-    use kin_model::change::{EntityDelta, RelationDelta, SemanticChange, TreeDelta, TreeEntry};
+    use kin_model::change::{
+        EntityDelta, LocatedEntry, RelationDelta, SemanticChange, TreeDelta, TreeEntry,
+    };
     use kin_model::entity::{
         Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint,
         SourceSpan, Visibility,
@@ -1823,6 +2271,7 @@ mod tests {
     use kin_model::ids::*;
     use kin_model::relation::{GraphNodeId, Relation, RelationKind, RelationOrigin};
     use kin_model::timestamp::Timestamp;
+    use kin_model::ArtifactId;
 
     fn entity_with_span(name: &str, file: &str, start_line: u32, role: EntityRole) -> Entity {
         let file_id = FilePathId::new(file);
@@ -1886,6 +2335,51 @@ mod tests {
             risk_summary: None,
             authored_on: None,
         }
+    }
+
+    fn repo_path(path: &str) -> RepoPath {
+        RepoPath::from_utf8(path).expect("valid test repository path")
+    }
+
+    fn tree_add(artifact_id: ArtifactId, path: &str, entry: TreeEntry) -> TreeDelta {
+        TreeDelta::Added {
+            artifact_id,
+            new: LocatedEntry::new(repo_path(path), entry),
+        }
+    }
+
+    fn tree_update(
+        artifact_id: ArtifactId,
+        old_path: &str,
+        old_entry: TreeEntry,
+        new_path: &str,
+        new_entry: TreeEntry,
+    ) -> TreeDelta {
+        TreeDelta::Updated {
+            artifact_id,
+            old: LocatedEntry::new(repo_path(old_path), old_entry),
+            new: LocatedEntry::new(repo_path(new_path), new_entry),
+        }
+    }
+
+    fn tree_remove(artifact_id: ArtifactId, path: &str, entry: TreeEntry) -> TreeDelta {
+        TreeDelta::Removed {
+            artifact_id,
+            old: LocatedEntry::new(repo_path(path), entry),
+        }
+    }
+
+    fn tree_with_exact_path(
+        artifact_id: ArtifactId,
+        path: RepoPath,
+        entry: TreeEntry,
+    ) -> ResolvedTree {
+        ResolvedTree::default()
+            .apply(&[TreeDelta::Added {
+                artifact_id,
+                new: LocatedEntry::new(path, entry),
+            }])
+            .unwrap()
     }
 
     fn relation(src: &Entity, dst: &Entity, kind: RelationKind) -> Relation {
@@ -2152,6 +2646,9 @@ mod tests {
         let graph = InMemoryGraph::new();
         let entity = entity_with_span("helper", "src/lib.rs", 1, EntityRole::Source);
         graph.upsert_entity(&entity).unwrap();
+        let artifact_id = ArtifactId::new();
+        let old_entry = TreeEntry::blob(Hash256::from_bytes([7; 32]), false);
+        let new_entry = TreeEntry::blob(Hash256::from_bytes([8; 32]), false);
 
         let base_id = change_id(3);
         let head_id = change_id(4);
@@ -2160,7 +2657,7 @@ mod tests {
             vec![],
             vec![EntityDelta::Added(entity.clone())],
             vec![],
-            vec![],
+            vec![tree_add(artifact_id, "config/policy.yaml", old_entry)],
         );
         let head = change_with_deltas(
             head_id,
@@ -2170,11 +2667,13 @@ mod tests {
                 new: entity,
             }],
             vec![],
-            vec![TreeDelta::Modified {
-                file_id: FilePathId::new("config/policy.yaml"),
-                old_entry: TreeEntry::regular(Hash256::from_bytes([7; 32]), false),
-                new_entry: TreeEntry::regular(Hash256::from_bytes([8; 32]), false),
-            }],
+            vec![tree_update(
+                artifact_id,
+                "config/policy.yaml",
+                old_entry,
+                "config/policy.yaml",
+                new_entry,
+            )],
         );
         graph.create_change(&base).unwrap();
         graph.create_change(&head).unwrap();
@@ -2207,27 +2706,332 @@ mod tests {
     #[test]
     fn mode_only_tree_delta_is_not_dropped_from_evidence_gaps() {
         let hash = Hash256::from_bytes([0x44; 32]);
-        let change = change_with_deltas(
-            change_id(5),
-            vec![],
-            vec![],
-            vec![],
-            vec![TreeDelta::Modified {
-                file_id: FilePathId::new("bin/run"),
-                old_entry: TreeEntry::regular(hash, false),
-                new_entry: TreeEntry::regular(hash, true),
-            }],
-        );
+        let artifact_id = ArtifactId::new();
+        let regular = TreeEntry::blob(hash, false);
+        let executable = TreeEntry::blob(hash, true);
+        let base_tree = ResolvedTree::default()
+            .apply(&[tree_add(artifact_id, "bin/run", regular)])
+            .unwrap();
+        let delta = tree_update(artifact_id, "bin/run", regular, "bin/run", executable);
+        let head_tree = base_tree.apply(std::slice::from_ref(&delta)).unwrap();
+        let change = change_with_deltas(change_id(5), vec![], vec![], vec![], vec![delta]);
+        let changed_artifacts = collect_changed_artifacts(&base_tree, &head_tree);
+        let artifact_activity = collect_artifact_activity(std::slice::from_ref(&change));
 
-        let (gaps, findings) =
-            collect_evidence_gaps::<InMemoryGraph>(&empty_review(), &[change], &[], None, None);
+        let (gaps, findings) = collect_evidence_gaps::<InMemoryGraph>(
+            &empty_review(),
+            &[change],
+            &[],
+            &changed_artifacts,
+            &artifact_activity,
+            None,
+            None,
+        );
 
         assert!(
             gaps.iter()
-                .any(|gap| gap.kind == "artifact_only_change" && gap.subject == "bin/run"),
+                .any(|gap| gap.kind == "artifact_structure_change" && gap.subject == "bin/run"),
             "an executable-bit-only tree transition must remain review-visible"
         );
+        assert!(gaps
+            .iter()
+            .find(|gap| gap.kind == "artifact_structure_change")
+            .is_some_and(gap_blocks_pass));
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn exact_artifact_diff_distinguishes_rename_edit_and_mode() {
+        let artifact_id = ArtifactId::new();
+        let old_entry = TreeEntry::blob(Hash256::from_bytes([0x31; 32]), false);
+        let edited_entry = TreeEntry::blob(Hash256::from_bytes([0x32; 32]), false);
+        let executable_entry = TreeEntry::blob(Hash256::from_bytes([0x32; 32]), true);
+        let base = tree_with_exact_path(artifact_id, repo_path("src/old.rs"), old_entry);
+
+        let renamed = base
+            .apply(&[tree_update(
+                artifact_id,
+                "src/old.rs",
+                old_entry,
+                "src/new.rs",
+                old_entry,
+            )])
+            .unwrap();
+        let pure_rename = collect_changed_artifacts(&base, &renamed);
+        assert_eq!(pure_rename.len(), 1);
+        assert_eq!(pure_rename[0].artifact_id, artifact_id);
+        assert_eq!(pure_rename[0].aspects, vec![ShadowArtifactAspect::Renamed]);
+        assert_eq!(
+            pure_rename[0].old.as_ref().unwrap().path,
+            repo_path("src/old.rs")
+        );
+        assert_eq!(
+            pure_rename[0].new.as_ref().unwrap().path,
+            repo_path("src/new.rs")
+        );
+
+        let renamed_and_edited = base
+            .apply(&[tree_update(
+                artifact_id,
+                "src/old.rs",
+                old_entry,
+                "src/new.rs",
+                edited_entry,
+            )])
+            .unwrap();
+        let rename_edit = collect_changed_artifacts(&base, &renamed_and_edited);
+        assert_eq!(
+            rename_edit[0].aspects,
+            vec![
+                ShadowArtifactAspect::Renamed,
+                ShadowArtifactAspect::BlobContentChanged,
+            ]
+        );
+
+        let mode_base = tree_with_exact_path(artifact_id, repo_path("src/new.rs"), edited_entry);
+        let mode_head = mode_base
+            .apply(&[tree_update(
+                artifact_id,
+                "src/new.rs",
+                edited_entry,
+                "src/new.rs",
+                executable_entry,
+            )])
+            .unwrap();
+        let mode = collect_changed_artifacts(&mode_base, &mode_head);
+        assert_eq!(
+            mode[0].aspects,
+            vec![ShadowArtifactAspect::ExecutableModeChanged]
+        );
+        assert_eq!(mode[0].artifact_id, artifact_id);
+
+        for change in [&pure_rename[0], &rename_edit[0]] {
+            let (gaps, _) = collect_evidence_gaps::<InMemoryGraph>(
+                &empty_review(),
+                &[],
+                &[],
+                std::slice::from_ref(change),
+                &[],
+                None,
+                None,
+            );
+            assert!(gaps
+                .iter()
+                .find(|gap| gap.kind == "artifact_structure_change")
+                .is_some_and(gap_blocks_pass));
+        }
+    }
+
+    #[test]
+    fn exact_artifact_diff_distinguishes_entry_types_and_targets() {
+        let artifact_id = ArtifactId::new();
+        let blob = TreeEntry::blob(Hash256::from_bytes([0x41; 32]), false);
+        let symlink_a = TreeEntry::symlink(Hash256::from_bytes([0x42; 32]));
+        let symlink_b = TreeEntry::symlink(Hash256::from_bytes([0x43; 32]));
+        let gitlink_a = TreeEntry::gitlink(GitObjectId::sha1([0x44; 20]));
+        let gitlink_b = TreeEntry::gitlink(GitObjectId::sha1([0x45; 20]));
+
+        let blob_tree = tree_with_exact_path(artifact_id, repo_path("vendor/ref"), blob);
+        let symlink_tree = blob_tree
+            .apply(&[tree_update(
+                artifact_id,
+                "vendor/ref",
+                blob,
+                "vendor/ref",
+                symlink_a,
+            )])
+            .unwrap();
+        let type_change = collect_changed_artifacts(&blob_tree, &symlink_tree);
+        assert_eq!(
+            type_change[0].aspects,
+            vec![ShadowArtifactAspect::EntryTypeChanged]
+        );
+        assert_eq!(
+            artifact_blob_hash_pair(&type_change[0]),
+            None,
+            "a symlink target blob is not source-file content"
+        );
+
+        let symlink_head = symlink_tree
+            .apply(&[tree_update(
+                artifact_id,
+                "vendor/ref",
+                symlink_a,
+                "vendor/ref",
+                symlink_b,
+            )])
+            .unwrap();
+        let symlink_change = collect_changed_artifacts(&symlink_tree, &symlink_head);
+        assert_eq!(
+            symlink_change[0].aspects,
+            vec![ShadowArtifactAspect::SymlinkTargetChanged]
+        );
+        assert_eq!(artifact_blob_hash_pair(&symlink_change[0]), None);
+
+        let gitlink_tree =
+            tree_with_exact_path(artifact_id, repo_path("vendor/submodule"), gitlink_a);
+        let gitlink_head = gitlink_tree
+            .apply(&[tree_update(
+                artifact_id,
+                "vendor/submodule",
+                gitlink_a,
+                "vendor/submodule",
+                gitlink_b,
+            )])
+            .unwrap();
+        let gitlink_change = collect_changed_artifacts(&gitlink_tree, &gitlink_head);
+        assert_eq!(
+            gitlink_change[0].aspects,
+            vec![ShadowArtifactAspect::GitlinkTargetChanged]
+        );
+        assert_eq!(artifact_blob_hash_pair(&gitlink_change[0]), None);
+
+        for change in [&type_change[0], &symlink_change[0], &gitlink_change[0]] {
+            let (gaps, findings) = collect_evidence_gaps::<InMemoryGraph>(
+                &empty_review(),
+                &[],
+                &[],
+                std::slice::from_ref(change),
+                &[],
+                None,
+                None,
+            );
+            assert!(gaps
+                .iter()
+                .find(|gap| gap.kind == "artifact_structure_change")
+                .is_some_and(gap_blocks_pass));
+            assert!(
+                findings.is_empty(),
+                "non-Blob transitions must never be content-diffed"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_artifact_diff_preserves_add_remove_and_path_reuse_identity() {
+        let removed_id = ArtifactId::new();
+        let added_id = ArtifactId::new();
+        let path = repo_path("compose.yaml");
+        let old_entry = TreeEntry::blob(Hash256::from_bytes([0x51; 32]), false);
+        let new_entry = TreeEntry::blob(Hash256::from_bytes([0x52; 32]), false);
+        let base = tree_with_exact_path(removed_id, path.clone(), old_entry);
+        let head = ResolvedTree::default()
+            .apply(&[TreeDelta::Added {
+                artifact_id: added_id,
+                new: LocatedEntry::new(path, new_entry),
+            }])
+            .unwrap();
+
+        let changes = collect_changed_artifacts(&base, &head);
+        assert_eq!(changes.len(), 2);
+        let added = changes
+            .iter()
+            .find(|change| change.artifact_id == added_id)
+            .unwrap();
+        let removed = changes
+            .iter()
+            .find(|change| change.artifact_id == removed_id)
+            .unwrap();
+        assert_eq!(added.operation, ShadowArtifactOperation::Added);
+        assert_eq!(added.aspects, vec![ShadowArtifactAspect::Added]);
+        assert_eq!(removed.operation, ShadowArtifactOperation::Removed);
+        assert_eq!(removed.aspects, vec![ShadowArtifactAspect::Removed]);
+        assert_ne!(added.artifact_id, removed.artifact_id);
+    }
+
+    #[test]
+    fn non_utf8_artifact_paths_are_exact_and_fail_closed() {
+        let artifact_id = ArtifactId::new();
+        let old_path = RepoPath::from_bytes(vec![b's', b'r', b'c', b'/', 0xff]).unwrap();
+        let new_path = RepoPath::from_bytes(vec![b's', b'r', b'c', b'/', 0xfe]).unwrap();
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x61; 32]), false);
+        let base = tree_with_exact_path(artifact_id, old_path.clone(), entry);
+        let head = base
+            .apply(&[TreeDelta::Updated {
+                artifact_id,
+                old: LocatedEntry::new(old_path, entry),
+                new: LocatedEntry::new(new_path, entry),
+            }])
+            .unwrap();
+        let changes = collect_changed_artifacts(&base, &head);
+
+        let json = serde_json::to_value(&changes[0]).unwrap();
+        assert!(json["artifact_id"].as_str().is_some());
+        assert_eq!(json["old"]["path"]["bytes_hex"], "7372632fff");
+        assert_eq!(json["new"]["path"]["bytes_hex"], "7372632ffe");
+        let human = artifact_change_detail(&changes[0]);
+        assert!(human.contains("non_utf8_path(bytes_hex=7372632fff)"));
+        assert!(human.contains("non_utf8_path(bytes_hex=7372632ffe)"));
+        assert!(
+            !human.contains('\u{fffd}'),
+            "non-UTF8 paths must never be rendered through lossy replacement"
+        );
+
+        let (gaps, _) = collect_evidence_gaps::<InMemoryGraph>(
+            &empty_review(),
+            &[],
+            &[],
+            &changes,
+            &[],
+            None,
+            None,
+        );
+        let gap = gaps
+            .iter()
+            .find(|gap| gap.kind == "artifact_path_unrepresentable")
+            .expect("non-UTF8 authority path must remain an explicit gap");
+        assert_eq!(gap.subject, "non_utf8_path(bytes_hex=7372632ffe)");
+        assert!(gap_blocks_pass(gap));
+    }
+
+    #[test]
+    fn converged_range_activity_remains_exact_and_fail_closed() {
+        let artifact_id = ArtifactId::new();
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x71; 32]), false);
+        let add_id = change_id(0x71);
+        let remove_id = change_id(0x72);
+        let add = change_with_deltas(
+            add_id,
+            vec![],
+            vec![],
+            vec![],
+            vec![tree_add(artifact_id, "scratch.bin", entry)],
+        );
+        let remove = change_with_deltas(
+            remove_id,
+            vec![add_id],
+            vec![],
+            vec![],
+            vec![tree_remove(artifact_id, "scratch.bin", entry)],
+        );
+        let activity = collect_artifact_activity(&[remove, add]);
+
+        assert_eq!(activity.len(), 2);
+        assert_eq!(activity[0].transition.artifact_id, artifact_id);
+        assert_eq!(activity[1].transition.artifact_id, artifact_id);
+        assert!(activity
+            .iter()
+            .any(|event| event.transition.operation == ShadowArtifactOperation::Added));
+        assert!(activity
+            .iter()
+            .any(|event| event.transition.operation == ShadowArtifactOperation::Removed));
+
+        let (gaps, _) = collect_evidence_gaps::<InMemoryGraph>(
+            &empty_review(),
+            &[],
+            &[],
+            &[],
+            &activity,
+            None,
+            None,
+        );
+        let gap = gaps
+            .iter()
+            .find(|gap| gap.kind == "artifact_range_only_activity")
+            .expect("converged range activity must not disappear behind an empty net diff");
+        assert!(gap_blocks_pass(gap));
+        assert!(gap.detail.contains(&add_id.to_string()));
+        assert!(gap.detail.contains(&remove_id.to_string()));
     }
 
     #[test]
@@ -2238,6 +3042,9 @@ mod tests {
         let graph = InMemoryGraph::new();
         let entity = entity_with_span("helper", "src/lib.rs", 1, EntityRole::Source);
         graph.upsert_entity(&entity).unwrap();
+        let artifact_id = ArtifactId::new();
+        let old_entry = TreeEntry::blob(Hash256::from_bytes([9; 32]), false);
+        let new_entry = TreeEntry::blob(Hash256::from_bytes([10; 32]), false);
 
         let base_id = change_id(6);
         let head_id = change_id(7);
@@ -2246,7 +3053,7 @@ mod tests {
             vec![],
             vec![EntityDelta::Added(entity.clone())],
             vec![],
-            vec![],
+            vec![tree_add(artifact_id, "src/legacy.c", old_entry)],
         );
         let head = change_with_deltas(
             head_id,
@@ -2256,11 +3063,13 @@ mod tests {
                 new: entity,
             }],
             vec![],
-            vec![TreeDelta::Modified {
-                file_id: FilePathId::new("src/legacy.c"),
-                old_entry: TreeEntry::regular(Hash256::from_bytes([9; 32]), false),
-                new_entry: TreeEntry::regular(Hash256::from_bytes([10; 32]), false),
-            }],
+            vec![tree_update(
+                artifact_id,
+                "src/legacy.c",
+                old_entry,
+                "src/legacy.c",
+                new_entry,
+            )],
         );
         graph.create_change(&base).unwrap();
         graph.create_change(&head).unwrap();
@@ -2397,6 +3206,8 @@ mod tests {
             &review_with_impact(ImpactReport::default()),
             &deep,
             &changed,
+            &[],
+            &[],
             None,
             None,
         );
@@ -2412,6 +3223,8 @@ mod tests {
             &review_with_impact(ImpactReport::default()),
             &shallow,
             &changed,
+            &[],
+            &[],
             None,
             None,
         );
@@ -2434,6 +3247,8 @@ mod tests {
             &review_with_impact(nonempty),
             &deep,
             &changed,
+            &[],
+            &[],
             None,
             None,
         );
@@ -3863,6 +4678,9 @@ mod tests {
         let app = entity_with_span("app", "src/app.rs", 1, EntityRole::Source);
         graph.upsert_entity(&sensor).unwrap();
         graph.upsert_entity(&app).unwrap();
+        let artifact_id = ArtifactId::new();
+        let old_entry = TreeEntry::blob(Hash256::from_bytes([11; 32]), false);
+        let new_entry = TreeEntry::blob(Hash256::from_bytes([12; 32]), false);
 
         let base_id = change_id(0x61);
         let head_id = change_id(0x62);
@@ -3874,7 +4692,7 @@ mod tests {
                 EntityDelta::Added(app.clone()),
             ],
             vec![],
-            vec![],
+            vec![tree_add(artifact_id, "src/sensor.c", old_entry)],
         );
         let head = change_with_deltas(
             head_id,
@@ -3884,11 +4702,13 @@ mod tests {
                 new: app,
             }],
             vec![],
-            vec![TreeDelta::Modified {
-                file_id: FilePathId::new("src/sensor.c"),
-                old_entry: TreeEntry::regular(Hash256::from_bytes([11; 32]), false),
-                new_entry: TreeEntry::regular(Hash256::from_bytes([12; 32]), false),
-            }],
+            vec![tree_update(
+                artifact_id,
+                "src/sensor.c",
+                old_entry,
+                "src/sensor.c",
+                new_entry,
+            )],
         );
         graph.create_change(&base).unwrap();
         graph.create_change(&head).unwrap();
@@ -3913,11 +4733,12 @@ mod tests {
     }
 
     #[test]
-    fn removed_entity_under_historical_path_accounts_for_source_artifact_delta() {
-        // Historical rename shape: the source file changed at its current path,
-        // but the removed entity still carries the pre-rename file origin. The
-        // semantic diff did capture the deletion, so the artifact delta must
-        // not be treated as unparsed source.
+    fn removed_entity_under_historical_path_does_not_hide_structural_move() {
+        // Historical rename shape: the exact artifact moves while the removed
+        // entity still carries the pre-rename file origin. Exact old-path
+        // equality accounts for the entity content, but an entity delta does
+        // not prove the move or the artifact's new bytes. The structural
+        // transition therefore remains visible and fail-closed.
         let graph = InMemoryGraph::new();
         let legacy = entity_with_span(
             "animate",
@@ -3926,6 +4747,9 @@ mod tests {
             EntityRole::Source,
         );
         graph.upsert_entity(&legacy).unwrap();
+        let artifact_id = ArtifactId::new();
+        let old_entry = TreeEntry::blob(Hash256::from_bytes([21; 32]), false);
+        let new_entry = TreeEntry::blob(Hash256::from_bytes([22; 32]), false);
 
         let base_id = change_id(0x71);
         let head_id = change_id(0x72);
@@ -3934,31 +4758,36 @@ mod tests {
             vec![],
             vec![EntityDelta::Added(legacy.clone())],
             vec![],
-            vec![],
+            vec![tree_add(artifact_id, "src/shared/keyed-each.js", old_entry)],
         );
         let head = change_with_deltas(
             head_id,
             vec![base_id],
             vec![EntityDelta::Removed(legacy.id)],
             vec![],
-            vec![TreeDelta::Modified {
-                file_id: FilePathId::new("src/internal/keyed-each.js"),
-                old_entry: TreeEntry::regular(Hash256::from_bytes([21; 32]), false),
-                new_entry: TreeEntry::regular(Hash256::from_bytes([22; 32]), false),
-            }],
+            vec![tree_update(
+                artifact_id,
+                "src/shared/keyed-each.js",
+                old_entry,
+                "src/internal/keyed-each.js",
+                new_entry,
+            )],
         );
         graph.create_change(&base).unwrap();
         graph.create_change(&head).unwrap();
 
         let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
 
-        assert!(
-            !report.evidence_gaps.iter().any(|gap| {
-                gap.kind == "artifact_only_change" && gap.subject == "src/internal/keyed-each.js"
-            }),
-            "a captured removed entity under a historical path must account for the source delta"
-        );
-        assert_eq!(report.policy.verdict, ShadowGateVerdict::Pass);
+        let gap = report
+            .evidence_gaps
+            .iter()
+            .find(|gap| {
+                gap.kind == "artifact_structure_change"
+                    && gap.subject == "src/internal/keyed-each.js"
+            })
+            .expect("the move-plus-edit must remain explicit despite an old-path entity match");
+        assert!(gap_blocks_pass(gap));
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::NeedsAttention);
     }
 
     #[test]
@@ -4234,33 +5063,50 @@ mod tests {
         // none altered).
         let graph = InMemoryGraph::new();
         let sensor = entity_with_span("sensor", "src/sensor.c", 2, EntityRole::Source);
+        let artifact_id = ArtifactId::new();
+        let old_entry = TreeEntry::blob(old_hash, false);
+        let new_entry = TreeEntry::blob(new_hash, false);
         let base_id = change_id(0x91);
         let base = change_with_deltas(
             base_id,
             vec![],
             vec![EntityDelta::Added(sensor.clone())],
             vec![],
-            vec![],
+            vec![tree_add(artifact_id, "src/sensor.c", old_entry)],
         );
         graph.create_change(&base).unwrap();
         let at_head = GraphAtRef::materialize(&graph, &base_id).unwrap();
 
+        let delta = tree_update(
+            artifact_id,
+            "src/sensor.c",
+            old_entry,
+            "src/sensor.c",
+            new_entry,
+        );
         let changes = vec![change_with_deltas(
             change_id(0x92),
             vec![base_id],
             vec![],
             vec![],
-            vec![TreeDelta::Modified {
-                file_id: FilePathId::new("src/sensor.c"),
-                old_entry: TreeEntry::regular(old_hash, false),
-                new_entry: TreeEntry::regular(new_hash, false),
-            }],
+            vec![delta.clone()],
         )];
+        let base_tree = graph.resolve_tree_at(&base_id).unwrap();
+        let head_tree = base_tree.apply(&[delta]).unwrap();
+        let changed_artifacts = collect_changed_artifacts(&base_tree, &head_tree);
+        let artifact_activity = collect_artifact_activity(&changes);
 
         let review = empty_review();
 
-        let (gaps, findings) =
-            collect_evidence_gaps(&review, &changes, &[], Some(&at_head), Some(&blobs));
+        let (gaps, findings) = collect_evidence_gaps(
+            &review,
+            &changes,
+            &[],
+            &changed_artifacts,
+            &artifact_activity,
+            Some(&at_head),
+            Some(&blobs),
+        );
         assert!(
             gaps.iter()
                 .any(|gap| gap.kind == "entity_inert_change" && gap.subject == "src/sensor.c"),
@@ -4275,8 +5121,15 @@ mod tests {
 
         // No blob reader → the branch cannot inspect directives, so it stays
         // silent even though the inert-edit gap is unchanged.
-        let (gaps_no_blob, findings_no_blob) =
-            collect_evidence_gaps(&review, &changes, &[], Some(&at_head), None);
+        let (gaps_no_blob, findings_no_blob) = collect_evidence_gaps(
+            &review,
+            &changes,
+            &[],
+            &changed_artifacts,
+            &artifact_activity,
+            Some(&at_head),
+            None,
+        );
         assert!(gaps_no_blob
             .iter()
             .any(|gap| gap.kind == "entity_inert_change" && gap.subject == "src/sensor.c"));

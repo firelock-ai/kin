@@ -725,7 +725,9 @@ mod tests {
         Visibility,
     };
     use kin_model::ids::*;
-    use kin_model::{EntityStore, LocatedEntry, TransactionDelta, TreeDelta, TreeEntry};
+    use kin_model::{
+        ArtifactId, EntityStore, LocatedEntry, TransactionDelta, TreeDelta, TreeEntry,
+    };
 
     fn admit_test_artifact(graph: &kin_db::InMemoryGraph, path: &str) -> ArtifactId {
         let path = RepoPath::from_utf8(path).expect("valid test repository path");
