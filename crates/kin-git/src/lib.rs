@@ -38,7 +38,7 @@ pub use preflight::{
     IgnoredLocalWorktreeFact,
 };
 pub use repository_export::{
-    export_repository_to_git, RepositoryGitCommitBinding, RepositoryGitExportPlan,
-    RepositoryGitExportResult,
+    export_repository_to_git, verify_repository_git_export, RepositoryGitCommitBinding,
+    RepositoryGitExportPlan, RepositoryGitExportProof, RepositoryGitExportResult,
 };
 pub use semantic_import::{plan_semantic_git_import, GitWorkspaceSeed, SemanticGitImportPlan};

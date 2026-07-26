@@ -52,6 +52,19 @@ pub struct RepositoryGitExportResult {
     /// re-import as the same semantic history. A commit's `kin-change-id`
     /// header is only a hint; it is never sufficient admission authority.
     pub change_commits: Vec<RepositoryGitCommitBinding>,
+    /// Exact reachable objects, refs, and HEAD recaptured from the staged
+    /// repository before publication.
+    pub proof: RepositoryGitExportProof,
+}
+
+/// Exact semantic proof for one repository-v6 Git export.
+///
+/// The proof deliberately excludes local Git config and index bytes. Callers
+/// may finish those ordinary-worktree surfaces after export, then bind the
+/// complete staged directory through `kin-core` before authority handoff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryGitExportProof {
+    expected: LosslessGitRepository,
 }
 
 /// One exact commit identity produced or reused by repository export.
@@ -105,21 +118,114 @@ where
         return Err(error);
     }
 
-    let (imported_commits_reused, native_commits_written, refs_written, change_commits) = result;
+    let (imported_commits_reused, native_commits_written, refs_written, change_commits, proof) =
+        result;
     Ok(RepositoryGitExportResult {
         git_repo_path: output_path.to_path_buf(),
         imported_commits_reused,
         native_commits_written,
         refs_written,
         change_commits,
+        proof,
     })
+}
+
+/// Recapture `repo_path` and require exact semantic equality with a prior
+/// repository-v6 export proof.
+///
+/// Object bodies are verified into an isolated sibling CAS. The repository is
+/// read twice by the lossless capture boundary, so ref or object drift during
+/// verification fails closed.
+pub fn verify_repository_git_export(
+    repo_path: &Path,
+    proof: &RepositoryGitExportProof,
+    expected_tree: &ResolvedTree,
+) -> Result<()> {
+    reject_external_staged_git_object_sources(repo_path)?;
+    let repository_parent = repo_path.parent().ok_or_else(|| {
+        GitError::InvalidSnapshot(format!(
+            "Git proof target {} has no parent",
+            repo_path.display()
+        ))
+    })?;
+    let proof_parent = if repo_path.file_name() == Some(std::ffi::OsStr::new(".git")) {
+        repository_parent.parent().ok_or_else(|| {
+            GitError::InvalidSnapshot(format!(
+                "Git proof target {} has no external proof directory parent",
+                repo_path.display()
+            ))
+        })?
+    } else {
+        repository_parent
+    };
+    let proof_directory = tempfile::Builder::new()
+        .prefix(".kin-export-reverify.")
+        .tempdir_in(proof_parent)
+        .map_err(|error| GitError::io(proof_parent, error))?;
+    let proof_store = kin_blobs::BlobStore::new(proof_directory.path().to_path_buf())?;
+    let actual = capture_lossless_git_repository(
+        repo_path,
+        proof.expected.repository_id.clone(),
+        &proof_store,
+    )?;
+    reject_external_staged_git_object_sources(repo_path)?;
+    if actual != proof.expected {
+        return Err(GitError::InvalidSnapshot(
+            "staged Git repository no longer matches its exact repository-v6 export proof"
+                .to_string(),
+        ));
+    }
+    let semantic = crate::semantic_import::plan_semantic_git_import(&actual, &proof_store)?;
+    let actual_tree = &semantic.workspace_seed.base_tree;
+    if actual_tree.len() != expected_tree.len()
+        || actual_tree
+            .artifacts_by_path()
+            .zip(expected_tree.artifacts_by_path())
+            .any(|(actual, expected)| {
+                actual.path != expected.path || actual.entry != expected.entry
+            })
+    {
+        return Err(GitError::InvalidSnapshot(
+            "staged Git repository HEAD tree does not match the graph-owned projection tree"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_external_staged_git_object_sources(repo_path: &Path) -> Result<()> {
+    for relative in [
+        "objects/info/alternates",
+        "objects/info/http-alternates",
+        "commondir",
+        "gitdir",
+    ] {
+        let path = repo_path.join(relative);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(GitError::io(&path, error)),
+            Ok(_) => {
+                return Err(GitError::InvalidSnapshot(format!(
+                    "staged Git repository uses external repository/object indirection at {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn build_staging_projection<L>(
     plan: &RepositoryGitExportPlan,
     source: &mut L,
     staging: &Path,
-) -> Result<(usize, usize, usize, Vec<RepositoryGitCommitBinding>)>
+) -> Result<(
+    usize,
+    usize,
+    usize,
+    Vec<RepositoryGitCommitBinding>,
+    RepositoryGitExportProof,
+)>
 where
     L: GitObjectBodyLoader,
 {
@@ -237,7 +343,9 @@ where
         .map_err(|error| GitError::Git(format!("write projected refs and HEAD: {error}")))?;
     drop(repo);
 
-    prove_staging_projection(plan, &projected_refs, &projected_head, staging)?;
+    let proof = RepositoryGitExportProof {
+        expected: prove_staging_projection(plan, &projected_refs, &projected_head, staging)?,
+    };
     let origin_by_change = plan
         .changes
         .iter()
@@ -259,6 +367,7 @@ where
         native_commits_written,
         projected_refs.refs.len(),
         change_commits,
+        proof,
     ))
 }
 
@@ -822,7 +931,7 @@ fn prove_staging_projection(
     refs: &RepositoryRefState,
     head: &WorkspaceHead,
     staging: &Path,
-) -> Result<()> {
+) -> Result<LosslessGitRepository> {
     let proof_path = staging.join(".kin-export-proof-cas");
     let proof_store = kin_blobs::BlobStore::new(proof_path.clone())?;
     let recaptured =
@@ -837,7 +946,7 @@ fn prove_staging_projection(
     }
     drop(proof_store);
     fs::remove_dir_all(&proof_path).map_err(|error| GitError::io(&proof_path, error))?;
-    Ok(())
+    Ok(recaptured)
 }
 
 fn gix_kind(kind: ExternalObjectKind) -> gix::objs::Kind {
@@ -1090,6 +1199,7 @@ mod tests {
             risk_summary: None,
         };
         native.id = compute_semantic_change_id(&native).unwrap();
+        let expected_tree = base_tree.apply(&native.tree_deltas).unwrap();
 
         let mut refs = imported.refs.clone();
         let main = refs
@@ -1114,6 +1224,11 @@ mod tests {
         let exported = root.path().join("export.git");
         let mut loader = StoreLoader { store: &store };
         let result = export_repository_to_git(&export_plan, &mut loader, &exported).unwrap();
+        verify_repository_git_export(&exported, &result.proof, &expected_tree).unwrap();
+        let wrong_tree = ResolvedTree::default();
+        let error = verify_repository_git_export(&exported, &result.proof, &wrong_tree)
+            .expect_err("the export proof must bind the graph-owned HEAD tree");
+        assert!(error.to_string().contains("graph-owned projection tree"));
         assert_eq!(result.imported_commits_reused, 1);
         assert_eq!(result.native_commits_written, 1);
         assert_eq!(result.refs_written, 1);
@@ -1191,6 +1306,18 @@ mod tests {
             .permissions()
             .mode();
         assert_ne!(script_mode & 0o111, 0);
+        git_bare(
+            &exported,
+            &["update-ref", "refs/heads/unproved", "refs/heads/main"],
+        );
+        let error = verify_repository_git_export(&exported, &result.proof, &expected_tree)
+            .expect_err("a new ref must invalidate the exact repository export proof");
+        assert!(
+            error
+                .to_string()
+                .contains("exact repository-v6 export proof"),
+            "unexpected export proof error: {error}"
+        );
 
         let mut tampered_change = imported.changes[0].clone();
         tampered_change.message.push_str(" but not from raw Git");
@@ -1241,6 +1368,7 @@ mod tests {
         let exported = root.path().join("unborn.git");
         let mut loader = StoreLoader { store: &store };
         let result = export_repository_to_git(&plan, &mut loader, &exported).unwrap();
+        verify_repository_git_export(&exported, &result.proof, &ResolvedTree::default()).unwrap();
         assert_eq!(result.imported_commits_reused, 0);
         assert_eq!(result.native_commits_written, 0);
         assert_eq!(result.refs_written, 0);

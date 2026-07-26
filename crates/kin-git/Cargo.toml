@@ -21,8 +21,8 @@ hex = { workspace = true }
 rayon = { workspace = true }
 uuid = { workspace = true, features = ["v5"] }
 rustix = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
 serde_json = { workspace = true }
