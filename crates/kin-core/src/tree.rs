@@ -1175,6 +1175,11 @@ impl ExactProjectionFreeze {
             self.projection
                 .persist_exact_eject_journal(&eject_journal, false)?;
             if let Some(previous) = previous_git.as_ref() {
+                // Record intent before entering a helper whose post-rename
+                // validation can fail after an uncertain internal restore.
+                // A conservative outer rollback may then retain the journal,
+                // but it must never delete the only durable recovery proof.
+                previous_git_archived = true;
                 self.projection.move_retained_git_entry_exact(
                     NamedEntryLocation {
                         parent: &self.projection.root,
@@ -1187,13 +1192,13 @@ impl ExactProjectionFreeze {
                     previous,
                     &self.projection.display_root.join(".git"),
                 )?;
-                previous_git_archived = true;
             }
             hook(ExactProjectionEjectHookPoint::AfterPreviousGitArchived);
 
             eject_journal.phase = ExactEjectJournalPhase::StageInstallPending;
             self.projection
                 .persist_exact_eject_journal(&eject_journal, false)?;
+            staged_git_installed = true;
             self.projection
                 .move_open_directory_from_expected_source_exact(
                     NamedEntryLocation {
@@ -1208,7 +1213,6 @@ impl ExactProjectionFreeze {
                     staged_git.identity,
                     &staged_git.display_path,
                 )?;
-            staged_git_installed = true;
             hook(ExactProjectionEjectHookPoint::AfterStagedGitInstalled);
 
             // Moving `.git` is outside the repository tree proof, but the full
@@ -1222,6 +1226,7 @@ impl ExactProjectionFreeze {
             eject_journal.phase = ExactEjectJournalPhase::DetachPending;
             self.projection
                 .persist_exact_eject_journal(&eject_journal, false)?;
+            kin_detached = true;
             self.projection
                 .move_open_directory_from_expected_source_exact(
                     NamedEntryLocation {
@@ -1236,7 +1241,6 @@ impl ExactProjectionFreeze {
                     self.projection.kin_control_identity,
                     &self.projection.display_root.join(".kin"),
                 )?;
-            kin_detached = true;
             hook(ExactProjectionEjectHookPoint::AfterKinDetached);
 
             self.revalidate_resolved_tree_from_blobs_retained(verification, tree, blobs)?;
