@@ -550,6 +550,59 @@ impl ExactSessionProjection {
             Err(unsupported_safe_projection_error())
         }
     }
+
+    /// Bind a child process to the retained session directory capability.
+    ///
+    /// On Unix the child performs `fchdir` against a cloned retained
+    /// directory handle after `fork` and before `exec`. A concurrent rename or
+    /// replacement of the ambient display path therefore cannot redirect the
+    /// process into attacker-controlled content after revalidation.
+    ///
+    /// Platforms without a handle-relative child working-directory primitive
+    /// fail before spawn instead of falling back to `Command::current_dir`.
+    pub fn configure_command_current_dir(&self, command: &mut std::process::Command) -> Result<()> {
+        self.revalidate()?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::process::CommandExt;
+
+            let root = self
+                .projection
+                .root
+                .try_clone()
+                .map_err(|error| KinError::io(&self.display_root, error))?;
+            let identity = tracked_open_directory_identity(&root)
+                .map_err(|error| KinError::io(&self.display_root, error))?;
+            if identity != self.session_identity {
+                return Err(KinError::Other(format!(
+                    "retained session execution root identity changed at {}",
+                    self.display_root.display()
+                )));
+            }
+            // SAFETY: `pre_exec` runs in the child after fork. The closure only
+            // calls the async-signal-safe `fchdir(2)` on an already-open fd and
+            // constructs an `io::Error` from errno on failure. Owning `root`
+            // inside the closure keeps that exact directory alive until the
+            // child has changed directory.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fchdir(root.as_raw_fd()) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = command;
+            Err(KinError::Other(
+                "capability-bound session execution is unsupported on this platform".to_string(),
+            ))
+        }
+    }
 }
 
 impl std::fmt::Debug for ExactProjectionVerification {

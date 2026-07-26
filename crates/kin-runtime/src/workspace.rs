@@ -85,6 +85,15 @@ impl MaterializedWorkspace {
         self.projection.revalidate()
     }
 
+    /// Configure a child to enter the retained session directory by
+    /// capability, never by reopening the ambient display path.
+    pub(crate) fn configure_command_current_dir(
+        &self,
+        command: &mut std::process::Command,
+    ) -> kin_core::Result<()> {
+        self.projection.configure_command_current_dir(command)
+    }
+
     /// Return which runtime-owned source path produced this workspace.
     pub fn source_kind(&self) -> MaterializationSourceKind {
         MaterializationSourceKind::ExactTree
